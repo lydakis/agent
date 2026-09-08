@@ -64,8 +64,40 @@ wire method names.
 | Release runtime | Retain bot history while reclaiming inactive execution resources. |
 
 One active turn per bot is the initial policy. Parallel mutations use distinct
-bots. Native subagents are descendants with their own activity and resource
-accounting, not invisible additional capacity.
+bots.
+
+## One agent primitive
+
+A named agent (called a bot in the prototype protocol) is the unit of execution.
+"Subagent" describes a delegation relationship between ordinary named agents;
+it does not require a separate execution class or a built-in recursive planner.
+Bob can use the CLI to create Alice with fresh history, or fork one of Bob's
+retained checkpoints as Alice. Both use the same submit, inspect, follow,
+resume, and interrupt operations available to any controlling program.
+
+The CLI must attach to the shared service so delegation does not start another
+full harness per agent. The current stdio prototype does not yet provide this
+attachment path. A fork shares immutable conversation ancestry and starts an
+independent continuation; it does not clone a process or a workspace.
+
+Record delegation provenance separately from fork ancestry: a freshly created
+helper has a creator but no inherited conversation. Delegated work must remain
+visible in resource accounting and subject to admission limits. Define explicit
+cancellation scope before exposing group operations; interrupting Bob must not
+silently imply interrupting Alice. A parent relationship grants no additional
+permissions.
+
+Keep a small set of execution and context-access primitives. Models can build
+scripts and tools in the supplied workspace and choose how to coordinate agents.
+A tool catalog, workflow engine, or per-agent language kernel is not a core
+requirement. The harness still owns durable state, provider protocol fidelity,
+event delivery, cancellation, and resource bounds. Those guarantees must survive
+the model stopping or failing.
+
+Borrow programmatic context-access and evaluation patterns from the
+[Prime Intellect investigation](PRIME_INTELLECT.md), then measure their cost and
+task quality here. Optional context-processing tools can use ordinary named
+agents for delegation; they do not need a second agent lifecycle.
 
 ## Forking from history
 
@@ -190,6 +222,11 @@ Broad model support means extensible provider adapters with capability discovery
 not identical semantics for every model. Keep model calls distinct from tools
 and the scheduler. Validate a second provider before freezing the adapter
 contract, including streaming, tool calls, usage, and incompatible context.
+The goal is to accommodate any model through adapters without baking one model's
+prompt format or tool strategy into the core. Preserve provider-specific content
+and advertise supported modalities and tool capabilities; reject unsupported
+operations explicitly. Broad compatibility is a design goal, not a claim about
+the current Responses-only prototype.
 
 ## Performance model
 

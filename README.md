@@ -7,6 +7,11 @@ that work, fork earlier conversation checkpoints to explore alternatives, and
 follow activity as an ordered stream of events. Programs are the consumers.
 Human-readable service logs are an optional view of that stream.
 
+The named agent is the single execution unit. In the intended design, an agent
+delegates by using the same CLI or protocol as any other program to create or
+fork another named agent. Models choose their tools and coordination strategies;
+the minimal core supplies durable lifecycle, provider access, and bounded execution.
+
 The reason to build this is efficient execution of many **active** agents. A
 common command syntax around one full harness process per bot is not enough.
 The ambition is thousands of active conversations; no capacity claim has been
@@ -27,8 +32,8 @@ automatic daemon startup, dedicated file-edit tools, and compaction are not impl
 - Live activity and replay after reconnecting: messages, tool calls and results,
   errors, state changes, approvals, and usage where the backend exposes them.
 - Programmatic steering, interruption, and completion with clear semantics.
-- Extensible model/provider support with explicit capabilities and supported
-  authentication paths.
+- Broad model support through provider adapters, with explicit capabilities and
+  supported authentication paths. The prototype currently implements a Responses subset.
 - Full-access tool execution initially, with an extensible permission boundary.
 
 The selected experiment is our own compact Rust model/tool loop, using Tokio,

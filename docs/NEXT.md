@@ -115,6 +115,11 @@ tool outcomes remain explicit; caller-directed resolution is future work.
    measure fixed active context against growing stored histories before adding
    recursive context-processing machinery.
 3. Add Unix-socket attachment and race-safe automatic daemon startup.
+   Exercise delegation through the same client: a program running in Bob's
+   workspace creates Alice fresh and forks a retained checkpoint as another
+   named agent, submits work, and follows both results. Verify independent
+   continuation, explicit cancellation scope, and shared admission/resource
+   limits. Use ordinary agent operations rather than a separate subagent engine.
 4. Validate a second provider, then add usage/context budget accounting before
    freezing the provider interface. Current live-provider behavior is unverified.
 5. Extend measured tools and recovery semantics, slow-reader and sustained-load
