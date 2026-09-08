@@ -1,0 +1,267 @@
+# Performance measurement tools
+
+Status, 2026-09-07: the measurement kit runs Pi's real agent core and Responses
+transport, and one shared native Codex app-server, against a local synthetic
+Responses SSE endpoint. The original binary transport client remains a calibration
+target. The new Rust core runs the same workload through its shared provider
+transport and history implementation. These experiments measure
+ephemeral text conversations, not durable agent capacity or model quality.
+
+## Reuse decision
+
+Use [psutil](https://pypi.org/project/psutil/7.2.2/) for process counters, and
+existing profilers for CPU stacks and allocations. The local code provides the
+synthetic workload and correlates its events, provider counters, and resource
+samples. See [reuse assessment](REUSE.md) before expanding this tooling.
+
+Python is the external test driver, not a choice for the Agent execution core.
+The Python measurement dependency is pinned in `bench/requirements.txt`. Pi's
+adapter dependencies are pinned in `bench/adapters/package.json` and its pnpm
+lockfile. These are benchmark dependencies, not a selection of the product runtime.
+No profiler is installed globally and no model credentials are needed.
+
+## Run and compare
+
+Run from the repository root on macOS or Linux with Python 3.11 or later:
+
+```sh
+uv --cache-dir .local/uv-cache venv .local/venv --python python3
+uv --cache-dir .local/uv-cache pip install --python .local/venv/bin/python --only-binary :all: -r bench/requirements.txt
+.local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --out .local/bench/baseline
+.local/venv/bin/python -m bench run --out .local/bench/candidate
+.local/venv/bin/python -m bench compare .local/bench/baseline/result.json .local/bench/candidate/result.json
+```
+
+Output directories must be new and under ignored `.local/`. Each contains the
+workload, per-run sampled counters, provider counters, and a versioned result.
+Raw target stdout/stderr and command arguments are not retained. Target stdout
+is reserved for the benchmark event protocol; malformed output fails the run.
+The fixture uses only synthetic history and response data over loopback HTTP.
+Custom target commands run with the caller's environment and existing permissions;
+the driver neither inspects nor records credential values.
+
+The default is one excluded warmup and three measured runs. Each run starts a
+fresh target and a separate fixture provider. Existing output is never overwritten.
+Failed runs return nonzero and are retained as failures, not compared as wins.
+Comparisons require matching workload, host/platform, observer code and version,
+sampling settings, limits, warmup count, and observed external-power state.
+Target labels and revisions may differ. Feature profiles and engine must match
+for regression percentages. Use `--exploratory` for unmatched observations; it
+lists gaps and omits rankings. Missing historical profiles fail closed by default.
+Configured provider concurrency must be achieved even in exploratory mode.
+See [COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md). CPU load and temperature are uncontrolled:
+medians and ranges describe these runs, not statistical confidence or significance.
+
+```sh
+.local/venv/bin/python -m bench run --out .local/bench/adapter \
+  --label example-adapter --revision immutable-target-revision \
+  --workload bench/workloads/smoke.json --repeat 5 \
+  --timeout 30 --rss-limit-mib 1024 --process-limit 64 \
+  -- executable-and-adapter-arguments
+```
+
+The custom command must implement the binary fixture contract below.
+For standalone startup timing use Hyperfine instead. Profiling should be a
+separate run, since profilers change execution cost and latency.
+
+## Real-engine adapters
+
+Install Pi's pinned packages with Node.js 22.19 or later and pnpm. The Codex adapter
+uses an installed native executable; the validated version is `codex-cli 0.153.1`.
+For npm installations the runner resolves the native executable inside that
+package, bypassing the launcher. Ambiguous layouts fail explicitly.
+
+```sh
+pnpm --dir bench/adapters install --frozen-lockfile --ignore-scripts
+CARGO_HOME=.local/cargo cargo build --release --locked
+AGENT_BENCH_TEST_ENGINES=1 AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --engine pi --out .local/bench/pi
+.local/venv/bin/python -m bench run --engine codex --out .local/bench/codex
+.local/venv/bin/python -m bench run --engine rust --out .local/bench/rust
+.local/venv/bin/python -m bench compare --exploratory .local/bench/pi/result.json .local/bench/codex/result.json
+.local/venv/bin/python -m bench.matrix --out .local/bench/engine-matrix
+```
+
+`bench.matrix` defaults to Pi, Codex, and Rust (72 runs, 54 measured). Use
+`--engines pi rust` to select a pair. Rust-only runs need no Node installation.
+It is a fixed screening experiment: 1, 8, and 32 agents; 4 KiB and
+64 KiB of new user text per turn; three turns; twenty 256-byte output deltas per
+turn, spaced 25 ms apart. Histories grow across turns. It runs engines sequentially,
+alternates their order across cases, and takes three measured fresh-process runs
+after one excluded run for each engine/case. Each run has a 30-second timeout,
+512 MiB sampled RSS guard per tree, and 16-process guard. Counters are sampled
+every 100 ms and trees discovered every 500 ms. A failed run stops the matrix. Cross-engine output is exploratory and omits
+percentage rankings because the loaded capabilities and execution boundaries differ.
+
+These bounds are an initial screen, not final product acceptance criteria. A
+candidate must complete every turn and retain every prior user and assistant
+message. Achieved provider concurrency and sampling warnings accompany comparisons.
+Reject a performance conclusion if fewer streams overlap than claimed. No result
+from this screen alone decides historical forks, recovery, or thousand-agent capacity.
+
+The Pi adapter creates multiple `Agent` instances in one Node process using the
+published `@earendil-works/pi-agent-core` and `pi-ai` 0.85.1 packages. It supplies
+Pi's actual `openai-responses` stream function, not a replacement transport or
+model/tool loop. The Codex adapter is a Node JSON-RPC client controlling multiple
+threads on one native app-server. **Target RSS/CPU includes the adapter process**:
+one process for Pi or Rust, two for Codex in validated runs. This is the cost of the tested
+deployment arrangement, not an isolated per-engine or per-agent allocation count.
+
+All three use ephemeral state, the same short base instruction and synthetic prompts,
+HTTP/1.1 over loopback, and no tool calls. Pi and Rust declare no tools; Codex still has
+native protocol, context, and harness machinery. Its adapter disables shell tools,
+plugins, hooks, remote model discovery, request compression, and WebSockets, but
+does not claim to make its internal work or advertised tool schemas identical to
+Pi's. Request bytes include each candidate's native serialization and overhead.
+This is comparable conversation work, not complete feature parity or default CLI
+performance. Full access is configured inside the caller's existing permissions.
+
+Engine subprocesses get a small environment allowlist and fresh private HOME,
+CODEX_HOME, and workspace folders under the ignored capture. Personal credentials,
+proxies, Node injection options, and user configuration are not forwarded. Native
+synthetic state may remain in these folders. Raw target output remains suppressed;
+adapter failures record only static diagnostic categories. Binary custom commands
+retain the separate caller-environment behavior described above.
+
+Provenance records Node version/hash, Pi versions/lock hash or Codex version/native
+binary hash, and a fingerprint of benchmark Python, adapter sources, and lockfiles.
+Rust records its version, release binary SHA-256, and Cargo.lock SHA-256. Its
+benchmark bypasses SQLite; durable-service measurements must be labeled separately.
+Change the output directory for every run. The source audit revisions in RUNTIMES
+are separate evidence and must not be assumed identical to an installed binary.
+
+## What is measured
+
+| Field | Meaning and limits |
+| --- | --- |
+| Target/provider peak RSS | Maximum sampled sum across each owned process tree. Shared pages can be counted more than once; this is neither private memory nor PSS. |
+| Observed CPU seconds | Sum of the last observed user+system CPU counters for each process lifetime. Exited processes retain their last observation, but work after the last sample and unseen short-lived children is missed. |
+| Processes | Peak sampled live count; configured agent concurrency is separate. |
+| Provider peak active requests | Simultaneously streaming fixture requests actually observed by the provider. This is not proof of active agent capacity. |
+| Ready and turn/first-chunk timings | Observed at the driver's stdout reader using a monotonic clock. Includes event transport and observer scheduling. Adapters normalize engine deltas to logical fixture chunks; first-chunk time is time to a full logical chunk, not necessarily the first token. |
+| Provider bytes and connections | HTTP request/response body bytes and connections that served requests. Excludes HTTP headers, TCP/TLS overhead, retransmits, unrelated target networking, and model token counts. |
+| Observer overhead | Driver CPU, sampled driver RSS, and time spent sampling. Provider resources are reported separately. These cannot simply be subtracted to undo observer-induced contention. |
+
+Missing metrics are explicit: private/PSS memory, exact process-tree CPU,
+allocation counts, wire bytes, admission latency, and cancellation latency are
+not measured in this first slice. Timeout cleanup is tested, but is not an
+engine cancellation-latency measurement.
+
+Resource counters are sampled every 100 ms by default. Tree discovery is more
+expensive and defaults to once a second plus startup/exit. Observed descendants
+remain tracked after reparenting; unseen children that spawn, detach, and exit
+between discovery passes can be missed. `--interval` and `--discovery-interval`
+control this tradeoff. Resource limits are sampled guards, not OS-enforced hard
+limits. A run can transiently exceed them between observations. CPU sampling
+of very short commands is unsuitable; fewer than two live samples fails the run.
+
+Both target and provider have the declared time/resource guard context: the
+timeout covers target execution; provider startup has a separate five-second
+deadline. RSS/process guards apply separately to the target and provider trees
+during execution. Cleanup sends termination, then kill, to owned groups and
+observed descendants that changed groups. It cannot promise cleanup of an
+unobserved daemon that escaped the ancestry and process group before discovery.
+
+The report flags sampler wall time above 10% of target wall time. Before using
+small differences to guide optimization, inspect observer overhead and provider
+load, use longer runs, and calibrate at multiple sample intervals. The fixture
+provider can itself become a bottleneck. This host's macOS process APIs and
+loopback networking require execution outside the Codex sandbox; permission
+failures must be resolved explicitly, not converted into zero resource use.
+
+## Fixture and event contract
+
+Workloads set concurrency, turns per agent, chunks per turn, bytes per chunk,
+delay before each chunk, and history bytes per request. Responses and history
+are deterministic ASCII `x` bytes. TCP packet boundaries are not chunk boundaries.
+The v1 workload caps total turns at 100,000, chunks at 1,000,000, and request
+history/response payload totals at 512 MiB each. Explicit workload edits are
+required for larger tests. No fork, tool, reconnect, or slow-follower scenario is
+claimed yet.
+
+The driver supplies `AGENT_BENCH_PORT` and `AGENT_BENCH_WORKLOAD` (JSON). A target
+posts `{"history":"..."}` to `http://127.0.0.1:PORT/stream`, with a Content-Length
+header. The body must contain exactly the declared synthetic history. Responses
+have a Content-Length header and streamed binary body; persistent connections
+are supported. This remains the binary calibration endpoint.
+
+The real-engine mode instead accepts `POST /v1/responses` with a Content-Length
+request and returns HTTP chunked SSE: response creation, message/content creation,
+text deltas, finalized text/item, and a completed response. It is a text-only
+protocol subset, not a general OpenAI emulator. It rejects tool-call histories,
+retries, hidden previous-response references, missing history, and cross-agent
+messages. Native system/developer and environment context may accompany the
+validated synthetic conversation. Token usage is a fixed placeholder and must
+not be interpreted as measured token usage or cost.
+
+Model workloads additionally cap output text at 1 MiB per turn, estimated full
+history at 8 MiB per request, and cumulative history resend volume at 512 MiB.
+The server rejects request bodies above 16 MiB. Response body counts include SSE
+envelopes and repeated final text; `output_text_bytes` counts generated text once.
+Both modes validate that text total against the adapter's delivered byte count.
+
+Target stdout emits newline-delimited JSON, at most 64 KiB per line:
+
+```json
+{"event":"ready"}
+{"event":"turn_start","agent":"bob","turn":"0"}
+{"event":"chunk","agent":"bob","turn":"0","seq":0,"bytes":256}
+{"event":"turn_end","agent":"bob","turn":"0"}
+```
+
+Emit every declared chunk with a contiguous zero-based sequence before ending
+the turn. Agent and turn IDs are nonempty strings up to 128 characters. Each
+agent must complete its declared number of turns, without overlapping turns on
+the same identity. Completion validates event totals against the provider's
+completed requests and delivered text count. Report validation failures and
+nonzero target exits even if timing or memory appears better.
+
+## Next useful extensions
+
+Add fixed tool-call fixtures, durable fork/resume cases, cancellation, and slow
+readers as distinct contracts. Retained text history is now checked on every
+model request; durable history and fork sharing remain unmeasured.
+Use the existing profiler appropriate to a demonstrated hotspot. A new engine
+requires a measured advantage or a feature gap after that reuse assessment.
+
+
+## Rust lifecycle and feature costs
+
+```sh
+.local/venv/bin/python -m bench.lifecycle --agents 32 --mode text --tools echo --out .local/bench/durable-text
+.local/venv/bin/python -m bench.lifecycle --agents 32 --mode echo --tools echo --out .local/bench/durable-echo
+.local/venv/bin/python -m bench.lifecycle --agents 32 --mode shell --tools echo,shell --out .local/bench/durable-shell
+```
+
+These exercise the real JSONL service, SQLite FULL durability, tool round trips,
+kill/restart, exact resume/replay/item retrieval, idempotent submission, and
+historical forks. Shell mode validates an actual workspace artifact; forked
+workspaces must remain untouched. The separate fixture validates every prior
+message and tool result. Tests separately cover independent fork continuation
+and cancellation; this performance workload does not time those operations.
+
+The observer/controller and provider are separate from the charged native
+process plus its descendants. Sampling is every 200 ms, including recursive child
+discovery, with a wider group scan every 500 ms. Each idle observation lasts 450 ms. Short-lived processes can still
+be missed and observed CPU is a lower bound. Limits are 30 seconds, 512 MiB per
+target/provider tree, 48 target processes. Each case has one excluded warmup and
+three measured runs. A full service startup happens before its first sample;
+reported peak RSS cannot exclude earlier transient peaks. Idle phase samples
+show retained RSS, not live heap allocation.
+
+`--binary PATH` selects a preserved Rust executable in both streaming and
+lifecycle modes. Its binary hash identifies the artifact. In streaming override
+mode the original Cargo.lock hash is unknown and recorded as null. Never attach
+the current lockfile to an older executable as build provenance.
+
+Lifecycle results have a separate schema and cannot be passed to streaming
+`bench compare`. Different modes are feature-cost observations, not like-for-like
+speedups. Compare lifecycle revisions only with the same mode, toolset, complete
+workload, host/power, observer fingerprint, bounds, successful runs, and achieved
+concurrency. See [the recorded measurements](LIFECYCLE_MEASUREMENTS.md).
+
+Benchmark failures from Rust can now include a strictly whitelisted stage/code
+and numeric OS error. URLs, error messages, stderr, prompts, and credentials are
+not retained as diagnostic data. The new observer fingerprint means older and
+newer captures must not be silently combined.

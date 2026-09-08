@@ -1,0 +1,2 @@
+# Measurement tooling only; not an Agent runtime dependency.
+psutil==7.2.2

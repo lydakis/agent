@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "concurrency": 4,
+  "turns": 3,
+  "chunks": 20,
+  "chunk_bytes": 256,
+  "chunk_delay_ms": 10,
+  "history_bytes": 4096
+}
