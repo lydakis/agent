@@ -14,11 +14,16 @@ def profile(engine):
                   'ephemeral_threads', 'native_schema_and_context_overhead',
                   'disabled_optional_features_not_proven_unallocated'],
         'fixture': ['python_binary_transport_calibration_client'],
+        'fx': ['node_runtime', 'native_libfx_addon', 'thread_per_agent',
+               'acp_bridge_and_host_fetch', 'in_memory_conversations', 'no_tools_registered'],
     }
     if engine not in footprints:
         raise ValueError('unknown benchmark profile')
     if engine == 'fixture':
         common = {'scenario': 'binary_transport_calibration_v1', 'durability': 'none'}
+    if engine == 'fx':
+        common = {**common, 'provider': 'loopback_http1_gateway_sse',
+                  'retries': 'one_pre_output_transport_retry_available_but_rejected_by_fixture'}
     return {'version': 1, 'contract': common, 'footprint': footprints[engine],
             'not_exercised': ['durable_resume', 'historical_fork', 'tools', 'compaction',
                               'slow_consumer', 'cancellation', 'live_provider_auth', 'tls']}

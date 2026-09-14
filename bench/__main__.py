@@ -67,7 +67,7 @@ def run(args):
         if args.command or args.revision:
             raise ValueError("engine adapters resolve their own command and revision")
         validate_responses_workload(config)
-        args.protocol = "responses"
+        args.protocol = "gateway" if args.engine == 'fx' else "responses"
         command, metadata, args.codex_executable = engine_target(args.engine, root, args.binary)
         revision = digest(metadata)
     probe = Tree(os.getpid()).sample(snapshot())
@@ -118,7 +118,7 @@ def main():
     run_parser.add_argument("--workload", type=Path, default=Path("bench/workloads/smoke.json"))
     run_parser.add_argument("--out", type=Path, required=True)
     run_parser.add_argument("--label")
-    run_parser.add_argument("--engine", choices=("fixture", "pi", "codex", "rust"), default="fixture")
+    run_parser.add_argument("--engine", choices=("fixture", "pi", "codex", "rust", "fx"), default="fixture")
     run_parser.add_argument("--revision")
     run_parser.add_argument('--binary',type=Path,help='explicit Rust binary; historical Cargo.lock is unknown')
     run_parser.add_argument("--repeat", type=bounded_int(1, 30), default=3)

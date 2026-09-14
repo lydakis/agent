@@ -12,7 +12,7 @@ from .report import compare
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--engines", nargs='+', choices=('pi', 'codex', 'rust'),
+    parser.add_argument("--engines", nargs='+', choices=('pi', 'codex', 'rust', 'fx'),
                         default=['pi', 'codex', 'rust'])
     args = parser.parse_args()
     print('Exploratory cross-engine screen: unequal feature footprints; no efficiency ranking.', flush=True)

@@ -131,6 +131,54 @@ benchmark bypasses SQLite; durable-service measurements must be labeled separate
 Change the output directory for every run. The source audit revisions in RUNTIMES
 are separate evidence and must not be assumed identical to an installed binary.
 
+## FX native embedded core
+
+Added 2026-09-12. `libfx` is pinned to 0.0.8 in the benchmark dependency lockfile.
+Install the locked benchmark dependencies and run:
+
+```sh
+pnpm --dir bench/adapters install --frozen-lockfile --ignore-scripts
+AGENT_BENCH_TEST_FX=1 .local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --engine fx --out .local/bench/fx
+.local/venv/bin/python -m bench.matrix --engines rust fx --out .local/bench/fx-matrix
+```
+
+This explicitly selects FX's native addon and fails if it is unavailable; there
+is no automatic WebAssembly fallback. Node, the native addon, bridge threads,
+and their allocations are inside the target boundary. The CLI is not launched
+and built-in tools are unavailable. Every agent has its own in-memory conversation, the same
+short instructions and empty tool list as Rust, and full history is verified
+on every turn. No checkpoint export, disk persistence, compaction, tool calls,
+or cancellation-latency measurement is part of this screen.
+
+FX's real serialization/parser/loop use Gateway SSE. The adapter's host-fetch
+callback permits only the synthetic chat endpoint and redirects the known
+model-catalog request to the fixture. It rejects all other destinations. It does
+not translate the model request into Responses or replace FX's model loop.
+The fixture accepts Gateway's text-only request shape, then uses the existing
+Responses transcript ledger to reject missing history, cross-agent messages,
+retries, and overlapping turns. Output text and per-delta delays are identical;
+Gateway and Responses framing, metadata, and terminal payloads differ.
+
+Catalog GETs have separate request and response-byte counters. Their response
+bytes and connections are also included in the overall provider counters; the
+`requests` and `completed_requests` counters count inference POSTs only. These
+body counts exclude HTTP headers, framing, TLS, and real provider traffic.
+FX's available pre-output transport retry remains an unexercised difference;
+the transcript ledger rejects repeated accepted inference requests.
+
+`bench compare --exploratory` permits the specific Responses/Gateway protocol
+difference and lists it as a gap. All host, workload, observer, and sampling
+checks still apply, and the report never emits efficiency percentages across
+these protocols. The matrix remains 1/8/32 simultaneous streams, two history
+sizes, one excluded warmup and three measured fresh processes per engine/case.
+The native addon hash, SDK JavaScript hashes, Node hash/version, package version,
+release-source reference, and dependency-lock hash are retained as provenance.
+The release-source reference identifies the upstream tag, not a reproducible
+build attestation for the downloaded npm artifact.
+
+See [FX measurements](FX_MEASUREMENTS.md) for observations and contribution ideas.
+
 ## What is measured
 
 | Field | Meaning and limits |
@@ -138,6 +186,7 @@ are separate evidence and must not be assumed identical to an installed binary.
 | Target/provider peak RSS | Maximum sampled sum across each owned process tree. Shared pages can be counted more than once; this is neither private memory nor PSS. |
 | Observed CPU seconds | Sum of the last observed user+system CPU counters for each process lifetime. Exited processes retain their last observation, but work after the last sample and unseen short-lived children is missed. |
 | Processes | Peak sampled live count; configured agent concurrency is separate. |
+| Threads | Peak sampled thread count summed across the target tree. Includes Node/native bridge workers for FX; this is not an allocation or stack-memory measurement. |
 | Provider peak active requests | Simultaneously streaming fixture requests actually observed by the provider. This is not proof of active agent capacity. |
 | Ready and turn/first-chunk timings | Observed at the driver's stdout reader using a monotonic clock. Includes event transport and observer scheduling. Adapters normalize engine deltas to logical fixture chunks; first-chunk time is time to a full logical chunk, not necessarily the first token. |
 | Provider bytes and connections | HTTP request/response body bytes and connections that served requests. Excludes HTTP headers, TCP/TLS overhead, retransmits, unrelated target networking, and model token counts. |

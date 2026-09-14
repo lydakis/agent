@@ -10,6 +10,7 @@ own only the agent lifecycle and execution behavior being investigated.
 
 | Candidate | Relevant evidence | What must be established before selecting |
 | --- | --- | --- |
+| FX native embedded core | [Pinned benchmark](FX_MEASUREMENTS.md): `libfx` 0.0.8, native addon plus Node, Gateway SSE. | Compare the same conversation workload; separately establish durability, historical forks, long histories, and total coding-tool costs before considering reuse. |
 | Prime Agent / nano-rlm | [Source assessment](PRIME_INTELLECT.md): programmatic RLM context, headless operation, and explicit persistence differences. | Full process-tree costs and long-history behavior under matched contracts. Reuse design ideas; retain the selected Rust core. |
 | Codex app-server | Shared services and threads in source; 0.153.1 completed the synthetic matrix through 32 simultaneous streams. Lower one-agent CPU than Pi in this setup. | History-fork granularity, unload/recovery, model coverage, and resource cost under equivalent durable/tool workloads. |
 | Pi core and model packages | Published 0.85.1 completed the same matrix; lower sampled RSS and CPU at 8 and 32 streams. | Copying/allocation hotspots, backpressure, durable historical forks, and provider fidelity. |

@@ -34,10 +34,18 @@ def values(runs, path):
 def compare(base, candidate, *, exploratory=False):
     if base.get("schema") != 1 or candidate.get("schema") != 1:
         raise ValueError("unsupported result schema")
+    compatibility_gaps = []
     if base["compatibility"] != candidate["compatibility"]:
-        raise ValueError("workload, host, observer, or sampling settings differ")
+        a, b = dict(base['compatibility']), dict(candidate['compatibility'])
+        protocols = {a.pop('provider_protocol', None), b.pop('provider_protocol', None)}
+        # Same semantic fixture, different native wire protocols. This exception
+        # never relaxes host/workload/observer matching or permits a ranking.
+        if not exploratory or a != b or protocols != {'responses', 'gateway'}:
+            raise ValueError("workload, host, observer, or sampling settings differ")
+        compatibility_gaps.append('provider_protocol differs: Responses SSE versus Gateway SSE; '
+                                  'serialization, catalog work, and wire bytes are not equivalent')
     left, right = comparison_runs(base), comparison_runs(candidate)
-    gaps = differences(base, candidate)
+    gaps = differences(base, candidate) + compatibility_gaps
     if gaps and not exploratory:
         raise ValueError('feature profiles differ or are unknown; use --exploratory for unranked observations')
     for result, runs in ((base, left), (candidate, right)):

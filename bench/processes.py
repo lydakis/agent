@@ -14,6 +14,7 @@ class Process:
     rss: int | None
     cpu: float | None
     birth: str
+    threads: int | None = None
 
 
 def snapshot(trees=(), *, scan_groups=True):
@@ -48,13 +49,13 @@ def snapshot(trees=(), *, scan_groups=True):
 
 def counters(row):
     if row.rss is not None and row.cpu is not None:
-        return row.rss, row.cpu
+        return row.rss, row.cpu, row.threads
     process = psutil.Process(row.pid)
     with process.oneshot():
         if str(process.create_time()) != row.birth:
             raise psutil.NoSuchProcess(row.pid)
         cpu = process.cpu_times()
-        return process.memory_info().rss, cpu.user + cpu.system
+        return process.memory_info().rss, cpu.user + cpu.system, process.num_threads()
 
 
 class Tree:
@@ -83,13 +84,19 @@ class Tree:
         rss_total = 0
         unreadable = 0
         live = 0
+        thread_total = 0
+        threads_known = True
         for row in members:
             self.known[row.pid] = row.birth
             key = (row.pid, row.birth)
             try:
-                rss, cpu = counters(row)
+                rss, cpu, threads = counters(row)
                 live += 1
                 rss_total += rss
+                if threads is None:
+                    threads_known = False
+                else:
+                    thread_total += threads
                 self.cpu[key] = max(self.cpu.get(key, 0), cpu)
             except psutil.NoSuchProcess:
                 continue
@@ -97,6 +104,7 @@ class Tree:
                 unreadable += 1
         return {"processes": live + unreadable,
                 "rss_bytes": None if unreadable else rss_total,
+                "threads": thread_total if threads_known and not unreadable else None,
                 "unreadable_processes": unreadable,
                 "observed_cpu_seconds": sum(self.cpu.values()),
                 "pss_bytes": None, "private_bytes": None}

@@ -61,6 +61,7 @@ Agent does not provide a sandbox.
 - [Next decisions](docs/NEXT.md): remaining implementation and measurement work.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
 - [Rust measurements](docs/RUST_MEASUREMENTS.md): exploratory observations, with unequal feature footprints.
+- [FX measurements](docs/FX_MEASUREMENTS.md): native embedded FX versus Rust with identical conversation content and explicit protocol differences.
 - [Comparison contract](docs/COMPARISON_CONTRACT.md): feature inventory and enforced comparison rules.
 - [Long histories](docs/LONG_HISTORY.md): full retained conversation versus bounded model context.
 - [Durable measurements](docs/LIFECYCLE_MEASUREMENTS.md): Rust feature costs and matched regressions.

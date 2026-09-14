@@ -8,6 +8,7 @@ import signal
 
 from .config import workload
 from .responses import Frames, Transcript
+from . import gateway
 
 
 async def headers(reader):
@@ -26,6 +27,8 @@ async def serve(config, stats_path, protocol="binary"):
              "connections_used": 0, "peak_active_requests": 0,
              "request_body_bytes": 0, "response_body_bytes": 0,
              "output_text_bytes": 0, "invalid_requests": 0}
+    if protocol == 'gateway':
+        stats.update(catalog_requests=0, catalog_response_body_bytes=0)
     transcript = Transcript(config)
     active = 0
     handlers = set()
@@ -40,7 +43,22 @@ async def serve(config, stats_path, protocol="binary"):
         try:
             while True:
                 line, fields = await headers(reader)
-                route = "/stream" if protocol == "binary" else "/v1/responses"
+                if protocol == 'gateway' and line == 'GET /v1/models HTTP/1.1':
+                    if 'transfer-encoding' in fields or int(fields.get('content-length', 0)) != 0:
+                        raise ValueError('unexpected catalog body')
+                    frame = json.dumps(gateway.catalog(), separators=(',', ':')).encode()
+                    writer.write((f'HTTP/1.1 200 OK\r\nContent-Length: {len(frame)}\r\n'
+                                  'Content-Type: application/json\r\n\r\n').encode() + frame)
+                    await writer.drain()
+                    stats['catalog_requests'] += 1
+                    stats['catalog_response_body_bytes'] += len(frame)
+                    stats['response_body_bytes'] += len(frame)
+                    if not counted_connection:
+                        stats['connections_used'] += 1
+                        counted_connection = True
+                    continue
+                route = {'binary': '/stream', 'responses': '/v1/responses',
+                         'gateway': '/v1/gateway'}[protocol]
                 if line != f"POST {route} HTTP/1.1" or "transfer-encoding" in fields:
                     raise ValueError("unsupported fixture request")
                 size = int(fields["content-length"])
@@ -49,7 +67,9 @@ async def serve(config, stats_path, protocol="binary"):
                     raise ValueError("fixture request body too large")
                 body = await reader.readexactly(size)
                 request = json.loads(body)
-                if protocol == "responses":
+                if protocol == 'gateway':
+                    agent, turn = transcript.accept(gateway.normalize(request, fields))
+                elif protocol == "responses":
                     agent, turn = transcript.accept(request)
                 elif request != {"history": "x" * config["history_bytes"]}:
                     raise ValueError("fixture history mismatch")
@@ -70,19 +90,25 @@ async def serve(config, stats_path, protocol="binary"):
                 else:
                     writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
                                  b"Content-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")
-                    frames = ((delay, ("event: " + event["type"] + "\ndata: " +
+                    source = (gateway.Frames(config) if protocol == 'gateway'
+                              else Frames(config, agent, turn))
+                    frames = ((delay, (("" if protocol == 'gateway' else "event: " + event["type"] + "\n") + "data: " +
                                json.dumps(event, separators=(",", ":")) + "\n\n").encode())
-                              for delay, event in Frames(config, agent, turn).events())
+                              for delay, event in source.events())
                 for delay, frame in frames:
                     if delay:
                         await asyncio.sleep(delay)
-                    if protocol == "responses":
+                    if protocol != "binary":
                         writer.write(f"{len(frame):x}\r\n".encode() + frame + b"\r\n")
                     else:
                         writer.write(frame)
                     await writer.drain()
                     stats["response_body_bytes"] += len(frame)
-                if protocol == "responses":
+                if protocol != "binary":
+                    if protocol == 'gateway':
+                        frame = b'data: [DONE]\n\n'
+                        writer.write(f'{len(frame):x}\r\n'.encode() + frame + b'\r\n')
+                        stats['response_body_bytes'] += len(frame)
                     writer.write(b"0\r\n\r\n")
                     await writer.drain()
                     transcript.complete(agent, turn)
@@ -125,6 +151,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--workload", required=True)
     parser.add_argument("--stats", required=True)
-    parser.add_argument("--protocol", choices=("binary", "responses"), default="binary")
+    parser.add_argument("--protocol", choices=("binary", "responses", "gateway"), default="binary")
     args = parser.parse_args()
     asyncio.run(serve(workload(args.workload), args.stats, args.protocol))

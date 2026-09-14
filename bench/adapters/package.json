@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "libfx": "0.0.8",
     "@earendil-works/pi-agent-core": "0.85.1",
     "@earendil-works/pi-ai": "0.85.1"
   }

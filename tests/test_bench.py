@@ -16,6 +16,7 @@ class ProcessTests(unittest.TestCase):
         with patch('bench.processes.counters', side_effect=psutil.AccessDenied(10)):
             result = Tree(10).sample([row])
         self.assertIsNone(result['rss_bytes'])
+        self.assertIsNone(result['threads'])
         self.assertEqual(result['unreadable_processes'], 1)
 
     def test_kernel_pid_never_becomes_a_tree_root_via_getpgid_zero(self):
@@ -28,18 +29,20 @@ class ProcessTests(unittest.TestCase):
 
     def test_process_tree_includes_reparented_group_and_descendants_only(self):
         tree = Tree(10)
-        rows = [Process(10, 1, 10, 100, 0.2, "a"),
-                Process(11, 10, 11, 200, 0.4, "b"),
-                Process(12, 1, 10, 300, 0.1, "c"),
-                Process(99, 1, 99, 900, 9, "d")]
+        rows = [Process(10, 1, 10, 100, 0.2, "a", 2),
+                Process(11, 10, 11, 200, 0.4, "b", 3),
+                Process(12, 1, 10, 300, 0.1, "c", 1),
+                Process(99, 1, 99, 900, 9, "d", 9)]
         result = tree.sample(rows)
         self.assertEqual(result["processes"], 3)
         self.assertEqual(result["rss_bytes"], 600)
+        self.assertEqual(result['threads'], 6)
         self.assertAlmostEqual(result["observed_cpu_seconds"], 0.7)
         # Keep observed descendants after reparenting, but do not follow PID reuse.
         result = tree.sample([Process(11, 1, 11, 250, 0.6, "b"),
                               Process(10, 1, 99, 1000, 9, "new")])
         self.assertEqual(result["rss_bytes"], 250)
+        self.assertIsNone(result['threads'])
         self.assertAlmostEqual(result["observed_cpu_seconds"], 0.9)
 
     def test_reused_child_pid_is_counted_as_new_process_when_still_owned(self):
@@ -133,6 +136,22 @@ class ReportTests(unittest.TestCase):
         changed = {**base, "runs": [{"status": "timeout"}]}
         with self.assertRaises(ValueError):
             compare(base, changed)
+
+    def test_only_explicit_model_protocol_difference_can_be_exploratory(self):
+        base, fx = self.result(), self.result('fx')
+        base['compatibility']['provider_protocol'] = 'responses'
+        fx['compatibility']['provider_protocol'] = 'gateway'
+        with self.assertRaises(ValueError):
+            compare(base, fx)
+        report = compare(base, fx, exploratory=True)
+        self.assertTrue(any('provider_protocol' in gap for gap in report['feature_gaps']))
+        self.assertNotIn('change_percent', report['metrics']['peak_target_rss_bytes'])
+        for key, value in (('provider_protocol', 'binary'), ('host_id', 'other'),
+                           ('observer_sha256', 'other'), ('workload', 'other')):
+            changed = deepcopy(fx)
+            changed['compatibility'][key] = value
+            with self.assertRaises(ValueError):
+                compare(base, changed, exploratory=True)
 
 
 if __name__ == "__main__":

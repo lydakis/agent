@@ -57,6 +57,21 @@ consumer pace, and process accounting. Mark unsupported semantics explicitly.
 Different durability guarantees must not be relabeled equivalent simply because
 both implementations write files.
 
+## FX embedded comparison
+
+The 2026-09-12 adapter adds the pinned native `libfx` 0.0.8 core, with Node and
+its native bridge charged to the target. It exercises ephemeral text history
+with no registered tools. Persistence, checkpoints, compaction, host tools, and
+the CLI's broader provider/permission behavior are outside this screen.
+
+FX uses Gateway SSE; Rust uses Responses SSE. Both fixture paths validate the
+same complete synthetic conversation and deliver identical text at the same
+scheduled delta intervals. Framing, terminal payloads, catalog requests, native
+serialization, and residual runtime capabilities differ. The specific protocol
+pair is allowed only in exploratory comparisons, with the difference listed;
+all remaining compatibility fields must still match. No percentage ranking is
+produced. See [FX measurements](FX_MEASUREMENTS.md).
+
 ## How to attribute feature cost
 
 1. Use the same binary/runtime configuration with one optional feature changed,

@@ -78,7 +78,8 @@ class EngineIntegrationTests(unittest.TestCase):
         config = workload(root / 'bench/workloads/smoke.json')
         options = SimpleNamespace(timeout=20, interval=.1, discovery_interval=.25,
                                   rss_limit_mib=512, process_limit=16,
-                                  protocol='responses', codex_executable=executable)
+                                  protocol='gateway' if engine == 'fx' else 'responses',
+                                  codex_executable=executable)
         # All native state is synthetic; no personal configuration is passed.
         with tempfile.TemporaryDirectory(dir=root / '.local') as directory:
             path = Path(directory)
@@ -93,6 +94,10 @@ class EngineIntegrationTests(unittest.TestCase):
         self.assertGreater(result['provider']['response_body_bytes'], 61440)
         self.assertEqual(result['target']['processes'], 2 if engine == 'codex' else 1)
         self.assertEqual(metadata['durability'], 'ephemeral')
+        if engine == 'fx':
+            self.assertEqual(result['provider']['catalog_requests'], 4)
+            self.assertEqual(metadata['backend'], 'native')
+            self.assertGreater(result['target']['threads'], 4)
 
     def test_pi_core_with_real_responses_transport(self):
         self.check_engine('pi')
@@ -102,3 +107,10 @@ class EngineIntegrationTests(unittest.TestCase):
 
     def test_rust_core_with_real_responses_transport(self):
         self.check_engine('rust')
+
+
+@unittest.skipUnless(os.environ.get('AGENT_BENCH_TEST_FX') == '1',
+                     'set AGENT_BENCH_TEST_FX=1 with pinned libfx installed')
+class FxIntegrationTests(unittest.TestCase):
+    def test_native_fx_with_real_gateway_transport_and_retained_history(self):
+        EngineIntegrationTests.check_engine(self, 'fx')

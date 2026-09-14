@@ -86,8 +86,8 @@ def run_once(command, config, options, directory, index):
     sample_wall = 0
     sample_count = target_sample_count = 0
     observer_peak_rss = 0
-    peaks = {"target": {"rss_bytes": 0, "processes": 0},
-             "provider": {"rss_bytes": 0, "processes": 0}}
+    peaks = {"target": {"rss_bytes": 0, "processes": 0, "threads": 0},
+             "provider": {"rss_bytes": 0, "processes": 0, "threads": 0}}
     counters = {}
     stats_path = directory / f"provider-{index}.json"
     workload_path = directory / "workload.json"
@@ -138,7 +138,7 @@ def run_once(command, config, options, directory, index):
         port = provider_ready(provider)
         env = {**os.environ, "AGENT_BENCH_PORT": str(port),
                "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
-        if protocol == "responses":
+        if protocol != "binary":
             state = (directory / f"state-{index}").resolve()
             for name in ("home", "codex", "workspace"):
                 (state / name).mkdir(parents=True)

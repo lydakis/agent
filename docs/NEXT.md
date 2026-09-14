@@ -91,6 +91,11 @@ The [Prime Intellect investigation](PRIME_INTELLECT.md) adds Prime Agent as a
 long-history reference and Verifiers v1 as a candidate evaluation adapter. It
 does not establish resource measurements or change the selected Rust core.
 
+The [FX native screen](FX_MEASUREMENTS.md) adds a pinned embedded-core baseline
+and possible upstream benchmark contributions. Gateway/Responses protocol and
+resident feature differences remain explicit; this does not change the selected
+Rust experiment or establish parity for durable/tool-equipped agents.
+
 Implemented: explicit comparison profiles, sanitized benchmark failure codes,
 opt-in bounded shell execution with process-group cancellation, bounded request
 startup, and a Rust-only

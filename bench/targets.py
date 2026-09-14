@@ -2,6 +2,8 @@
 
 import hashlib
 import os
+import json
+import platform
 from pathlib import Path
 import shutil
 import subprocess
@@ -40,7 +42,6 @@ def engine_target(engine, root, binary=None):
     command = [node, str(root / "bench" / "adapters" / f"{engine}.mjs")]
     executable = None
     if engine == "pi":
-        import json
         packages = root / "bench/adapters/node_modules/@earendil-works"
         for package in ("pi-agent-core", "pi-ai"):
             path = packages / package / "package.json"
@@ -51,6 +52,23 @@ def engine_target(engine, root, binary=None):
                 raise ValueError("Pi installed version differs from benchmark pin")
             metadata[package] = version
         metadata["dependency_lock_sha256"] = file_hash(root / "bench/adapters/pnpm-lock.yaml")
+    elif engine == 'fx':
+        package = root / 'bench/adapters/node_modules/libfx'
+        if not (package / 'package.json').exists():
+            raise ValueError('install the pinned benchmark adapter dependencies first')
+        version = json.loads((package / 'package.json').read_text())['version']
+        if version != '0.0.8':
+            raise ValueError('FX installed version differs from benchmark pin')
+        arch = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64', 'AMD64': 'x64'}.get(platform.machine())
+        system = {'Darwin': 'darwin', 'Linux': 'linux'}.get(platform.system())
+        addon = package / f'libfx.{system}-{arch}.node'
+        if not addon.exists():
+            raise ValueError('FX pinned native addon unavailable on this platform')
+        metadata.update(libfx_version=version, backend='native',
+                        release_source_revision='43c11dcc34a94a76df870af70bdb824579bf18a0',
+                        native_addon_sha256=file_hash(addon),
+                        sdk_sources_sha256={p.name: file_hash(p) for p in sorted(package.glob('*.js'))},
+                        dependency_lock_sha256=file_hash(root / 'bench/adapters/pnpm-lock.yaml'))
     elif engine == "codex":
         executable = shutil.which("codex")
         if not executable:
