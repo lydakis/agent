@@ -9,10 +9,9 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
 
 from bench.targets import clean_env
-from bench.runtime_client import Client
+from bench.runtime_client import Client, serve_args
 
 
 class Model(http.server.BaseHTTPRequestHandler):
@@ -34,6 +33,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.server.release_headers.wait(timeout=5)
             if user == 'wait':
                 time.sleep(5)
+            if user == 'burst':
+                time.sleep(.3)  # Allow the CLI to attach its live follower.
             last = request['input'][-1]
             if last.get('type') == 'function_call_output':
                 text = 'echo:' + last['output']
@@ -64,6 +65,14 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Transfer-Encoding', 'chunked')
             self.end_headers()
+            if user == 'burst':
+                text = 'reply:burst'
+                deltas = [{'type': 'response.output_text.delta', 'delta': ''}] * 2000
+                frames = deltas + events
+                body = b''.join(('data: ' + json.dumps(e) + '\n\n').encode() for e in frames)
+                self.wfile.write(f'{len(body):x}\r\n'.encode() + body + b'\r\n0\r\n\r\n')
+                self.wfile.flush()
+                return
             if user == 'gate':
                 self.wfile.flush()
                 self.server.all_streaming.wait(timeout=5)
@@ -80,8 +89,118 @@ class Model(http.server.BaseHTTPRequestHandler):
             pass
 
 
+class AnthropicModel(http.server.BaseHTTPRequestHandler):
+    """Synthetic Anthropic Messages endpoint: thinking, text, tool_use, tool_result."""
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        try:
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            self.server.requests.put(request)
+            assert self.path == '/v1/messages'
+            assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
+            assert self.headers.get('anthropic-version') == '2023-06-01'
+            assert request['model'] == 'synthetic-claude' and request['stream'] and request['max_tokens'] > 0
+            assert isinstance(request['system'], str)
+            assert [t['name'] for t in request['tools']] == ['echo', 'shell']
+            assert 'input_schema' in request['tools'][0]
+            last = request['messages'][-1]
+            assert last['role'] == 'user'
+            blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': 'sig-1'}]
+            if last['content'][0]['type'] == 'tool_result':
+                blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
+                stop = 'end_turn'
+            else:
+                user = last['content'][0]['text']
+                if user.startswith('tool:'):
+                    blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
+                    stop = 'tool_use'
+                else:
+                    blocks.append({'type': 'text', 'text': 'reply:' + user})
+                    stop = 'end_turn'
+            events = [('message_start', {'message': {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}})]
+            for index, block in enumerate(blocks):
+                start = {**block, 'thinking': ''} if block['type'] == 'thinking' else (
+                    {**block, 'text': ''} if block['type'] == 'text' else {**block, 'input': {}})
+                events.append(('content_block_start', {'index': index, 'content_block': start}))
+                if block['type'] == 'thinking':
+                    events.append(('content_block_delta', {'index': index, 'delta': {'type': 'thinking_delta', 'thinking': block['thinking']}}))
+                    events.append(('content_block_delta', {'index': index, 'delta': {'type': 'signature_delta', 'signature': block['signature']}}))
+                elif block['type'] == 'text':
+                    for part in (block['text'][:3], block['text'][3:]):
+                        events.append(('content_block_delta', {'index': index, 'delta': {'type': 'text_delta', 'text': part}}))
+                else:
+                    payload = json.dumps(block['input'])
+                    for part in (payload[:4], payload[4:]):
+                        events.append(('content_block_delta', {'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': part}}))
+                events.append(('content_block_stop', {'index': index}))
+            events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': {'output_tokens': 7}}))
+            events.append(('message_stop', {}))
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            for kind, body in events:
+                frame = f'event: {kind}\ndata: {json.dumps({"type": kind, **body})}\n\n'.encode()
+                self.wfile.write(f'{len(frame):x}\r\n'.encode() + frame + b'\r\n')
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
-class RuntimeTests(unittest.TestCase):
+class AnthropicRuntimeTests(unittest.TestCase):
+    def test_messages_family_round_trips_thinking_tools_and_usage(self):
+        root = Path(__file__).resolve().parent.parent
+        temp = tempfile.TemporaryDirectory(dir=root / '.local')
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name)
+        model = http.server.ThreadingHTTPServer(('127.0.0.1', 0), AnthropicModel)
+        model.requests = queue.Queue()
+        model.daemon_threads = True
+        threading.Thread(target=model.serve_forever, daemon=True).start()
+        self.addCleanup(model.server_close)
+        self.addCleanup(model.shutdown)
+        env = {**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}
+        client = Client(root / '.local/target/release/agent', path / 'state.sqlite',
+                        f'http://127.0.0.1:{model.server_port}/v1', 'echo,shell', model='synthetic-claude',
+                        key_env='ANTHROPIC_TEST_KEY', env=env, provider='anthropic', family='anthropic')
+        self.addCleanup(client.close)
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:shared')['result']['turn']
+        finished = client.finished(turn)
+        self.assertEqual(finished['data']['status'], 'completed')
+        deltas = [m for m in client.saved if m.get('event') in ('text_delta', 'thinking_delta')]
+        self.assertEqual([d['event'] for d in deltas][:2], ['thinking_delta', 'thinking_delta'])
+        self.assertEqual(''.join(d['text'] for d in deltas if d['event'] == 'text_delta'), 'echo:shared')
+        usage = [m for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual(len(usage), 2)
+        self.assertEqual(usage[0]['data'], {'input_tokens': 5, 'output_tokens': 7, 'cached_input_tokens': 2})
+        first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
+        self.assertEqual(first['thinking'], {'type': 'enabled', 'budget_tokens': 2048})
+        self.assertEqual(first['messages'], [{'role': 'user', 'content': [{'type': 'text', 'text': 'tool:shared'}]}])
+        assistant = second['messages'][1]
+        self.assertEqual(assistant['role'], 'assistant')
+        self.assertEqual(assistant['content'][0], {'type': 'thinking', 'thinking': 'plan', 'signature': 'sig-1'})
+        self.assertEqual(assistant['content'][1]['input'], {'text': 'shared'})
+        self.assertEqual(second['messages'][2]['content'][0],
+                         {'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'shared'})
+        self.assertEqual(len(second['messages']), 3)
+        # The store is bound to the provider family; resume and replay are exact.
+        state = client.request('resume', bot='Bob')['result']
+        self.assertEqual((state['provider'], state['family'], state['model'], state['reasoning']),
+                         ('anthropic', 'anthropic', 'synthetic-claude', 'low'))
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(path), reasoning='max')['error'],
+                         'invalid_reasoning_level')
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(path), model='openai/x')['error'],
+                         'provider_unavailable')
+
+
+class ModelFixture(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parent.parent
         self.temp = tempfile.TemporaryDirectory(dir=root / '.local')
@@ -103,6 +222,18 @@ class RuntimeTests(unittest.TestCase):
         client = Client(self.binary, self.path / 'state.sqlite', self.url, tools)
         self.addCleanup(client.close)
         return client
+
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class RuntimeTests(ModelFixture):
+    def test_stdio_shutdown_exits_and_releases_store_without_stdin_eof(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        self.assertTrue(client.request('shutdown')['result']['shutting_down'])
+        self.assertEqual(client.process.wait(timeout=2), 0)
+        restarted = self.client()
+        self.assertIn('result', restarted.request('bots'))
 
     def test_request_startup_is_bounded_but_established_streams_are_not(self):
         self.model.release_headers = threading.Event()
@@ -151,6 +282,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn('second', json.dumps(alt_history))
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
         self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
+
+    def test_turn_overrides_workspace_and_model_within_the_family(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        other = self.path / 'other'
+        other.mkdir()
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='shell:printf x > marker',
+                              workspace=str(other), model='openai/synthetic-model')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertTrue((other / 'marker').exists())
+        self.assertFalse((self.path / 'marker').exists())
+        self.assertEqual(client.request('submit', bot='Bob', request_id='w', prompt='shell:printf x > marker',
+                                        workspace=str(self.path))['error'], 'idempotency_conflict')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='m', prompt='hi',
+                                        model='anthropic/claude')['error'], 'provider_unavailable')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='m', prompt='hi',
+                                        workspace='relative/path')['error'], 'workspace_must_exist_and_be_absolute')
+        self.assertEqual(client.request('resume', bot='Bob')['result']['workspace'], str(self.path.resolve()))
+        # A bot created without a workspace must be given one per submission.
+        self.assertIsNone(client.request('create', bot='Nomad')['result']['workspace'])
+        self.assertEqual(client.request('submit', bot='Nomad', request_id='n', prompt='hi')['error'], 'workspace_required')
+        turn = client.request('submit', bot='Nomad', request_id='n2', prompt='hi', workspace=str(other))['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_interrupt_and_crash_recovery_are_explicit(self):
         client = self.client()
@@ -206,10 +360,9 @@ class RuntimeTests(unittest.TestCase):
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='running', prompt='wait')['result']['turn']
         self.model.requests.get(timeout=3)
-        second = subprocess.run([str(self.binary), 'serve', '--store', str(self.path / 'state.sqlite'),
-                                 '--base-url', self.url, '--model', 'synthetic-model'],
+        second = subprocess.run([str(self.binary), *serve_args(self.path / 'state.sqlite', self.url)],
                                 input='', capture_output=True, text=True, timeout=5, env=clean_env())
-        self.assertEqual(second.returncode, 1)
+        self.assertEqual(second.returncode, 75)
         self.assertIn('store_already_owned', second.stderr)
         self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'running')
         client.request('interrupt', bot='Bob', turn=turn)
@@ -227,10 +380,9 @@ class RuntimeTests(unittest.TestCase):
             else:
                 os.link(self.path / 'state.sqlite', alias)
             try:
-                second = subprocess.run([str(self.binary), 'serve', '--store', str(alias),
-                    '--base-url', self.url, '--model', 'synthetic-model'], input='',
+                second = subprocess.run([str(self.binary), *serve_args(alias, self.url)], input='',
                     capture_output=True, text=True, timeout=5, env=clean_env())
-                self.assertEqual(second.returncode, 1, kind)
+                self.assertEqual(second.returncode, 75 if kind == 'symlink' else 1, kind)
                 self.assertIn('store_already_owned' if kind == 'symlink'
                               else 'store_hard_links_unsupported', second.stderr)
                 self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'running')
@@ -278,8 +430,7 @@ class RuntimeTests(unittest.TestCase):
         resumed.close()
         link = self.path / 'hardlink.sqlite'
         os.link(self.path / 'state.sqlite', link)
-        rejected = subprocess.run([str(self.binary), 'serve', '--store', str(link),
-            '--base-url', self.url, '--model', 'synthetic-model'], input='',
+        rejected = subprocess.run([str(self.binary), *serve_args(link, self.url)], input='',
             capture_output=True, text=True, timeout=5, env=clean_env())
         self.assertEqual(rejected.returncode, 1)
         self.assertIn('store_hard_links_unsupported', rejected.stderr)
@@ -288,13 +439,10 @@ class RuntimeTests(unittest.TestCase):
         sentinel = 'synthetic-test-value-not-a-credential'
         self.model.expected_authorization = 'Bearer ' + sentinel
         self.model.auth_checks = []
-        original = subprocess.Popen
-        def launch(args, **kwargs):
-            kwargs['env'] = {**kwargs['env'], 'AGENT_TEST_FAKE_KEY': sentinel,
-                             'AGENT_TEST_ALLOWED': 'preserved'}
-            return original([*args, '--key-env', 'AGENT_TEST_FAKE_KEY'], **kwargs)
-        with patch('bench.runtime_client.subprocess.Popen', side_effect=launch):
-            client = self.client('echo,shell')
+        env = {**clean_env(), 'AGENT_TEST_FAKE_KEY': sentinel, 'AGENT_TEST_ALLOWED': 'preserved'}
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell',
+                        key_env='AGENT_TEST_FAKE_KEY', env=env)
+        self.addCleanup(client.close)
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='env',
             prompt='shell:printf "%s:%s" "${AGENT_TEST_FAKE_KEY-unset}" "$AGENT_TEST_ALLOWED"')['result']['turn']

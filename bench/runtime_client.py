@@ -6,12 +6,20 @@ import threading
 import time
 from .targets import clean_env
 
+def serve_args(path, url, tools="echo", model="synthetic-model", key_env=None,
+               provider="openai", family="responses"):
+    """Arguments for a stdio service bound to one synthetic provider endpoint."""
+    spec = f'{provider}={family},{url}' + (f',{key_env}' if key_env else '')
+    return ['serve', '--store', str(path), '--provider', spec, '--model', f'{provider}/{model}', '--tools', tools]
+
+
 class Client:
-    def __init__(self, binary, path, url, tools="echo", model="synthetic-model"):
-        self.process = subprocess.Popen([str(binary), 'serve', '--store', str(path),
-                                         '--base-url', url, '--model', model] + (['--tools', tools] if tools != 'echo' else []),
+    def __init__(self, binary, path, url, tools="echo", model="synthetic-model", key_env=None, env=None,
+                 provider="openai", family="responses"):
+        self.process = subprocess.Popen([str(binary), *serve_args(path, url, tools, model, key_env, provider, family)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, env=clean_env(), start_new_session=True)
+                                        stderr=subprocess.DEVNULL, text=True, env=env or clean_env(),
+                                        start_new_session=True)
         self.queue = queue.Queue()
         self.saved = []
         self.next_id = 0

@@ -13,7 +13,7 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
         )
         .unwrap();
     let output: Value =
-        serde_json::from_str(&tools.execute(prepared, &cwd).await.unwrap()).unwrap();
+        serde_json::from_str(&tools.execute(prepared, &cwd).await.unwrap().output).unwrap();
     assert_eq!(output["stdout"], "out");
     assert_eq!(output["stderr"], "err");
     assert_eq!(output["exit_code"], 7);
@@ -49,7 +49,7 @@ async fn shell_timeout_and_output_overflow_are_bounded() {
         )
         .await
         .unwrap();
-        assert_eq!(result.unwrap_err().0, error);
+        assert_eq!(result.unwrap_err().code, error);
     }
 }
 
@@ -62,10 +62,193 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
     let echo = tools
         .prepare("echo", &json!({"text":sentinel}).to_string())
         .unwrap();
-    assert!(tools.execute(echo, &std::env::temp_dir()).await.unwrap() == "[REDACTED]");
+    assert!(
+        tools
+            .execute(echo, &std::env::temp_dir())
+            .await
+            .unwrap()
+            .output
+            == "[REDACTED]"
+    );
     let shell = tools.prepare("shell", &json!({"command": "printf '%s' 'synthetic-\"test-value'; printf '%s' 'synthetic-\"test-value' >&2"}).to_string()).unwrap();
-    let output = tools.execute(shell, &std::env::temp_dir()).await.unwrap();
+    let output = tools
+        .execute(shell, &std::env::temp_dir())
+        .await
+        .unwrap()
+        .output;
     let result: Value = serde_json::from_str(&output).unwrap();
     assert!(result["stdout"] == "[REDACTED]");
     assert!(result["stderr"] == "[REDACTED]");
+    let binary = tools
+        .prepare(
+            "shell",
+            &json!({"command":"printf '\\377'; printf 'synthetic-\"test-value'"}).to_string(),
+        )
+        .unwrap();
+    let outcome = tools.execute(binary, &std::env::temp_dir()).await.unwrap();
+    let result: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert_eq!(result["stdout"], "\u{fffd}[REDACTED]");
+}
+
+#[tokio::test]
+async fn file_tools_read_write_and_edit_within_the_workspace() {
+    let tools = Registry::new("read,write,edit,shell").unwrap();
+    let dir = std::env::temp_dir().join(format!("agent-file-tools-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = tools
+        .prepare(
+            "write",
+            &json!({"path":"src/lib.rs","content":"one\ntwo\nthree\n"}).to_string(),
+        )
+        .unwrap();
+    assert!(
+        tools
+            .execute(write, &dir)
+            .await
+            .unwrap()
+            .output
+            .contains("wrote")
+    );
+    std::os::unix::fs::symlink("src/lib.rs", dir.join("alias.rs")).unwrap();
+    let read = tools
+        .prepare(
+            "read",
+            &json!({"path":"alias.rs","offset":2,"limit":1}).to_string(),
+        )
+        .unwrap();
+    let shown = tools.execute(read, &dir).await.unwrap().output;
+    assert!(shown.starts_with("     2\ttwo\n"), "{shown}");
+    assert!(shown.contains("showing lines 2-2 of 3"));
+    let ambiguous = tools
+        .prepare(
+            "edit",
+            &json!({"path":"src/lib.rs","old":"\n","new":" "}).to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        tools.execute(ambiguous, &dir).await.unwrap_err().code,
+        "edit_target_ambiguous"
+    );
+    let edit = tools
+        .prepare(
+            "edit",
+            &json!({"path":"alias.rs","old":"two","new":"2"}).to_string(),
+        )
+        .unwrap();
+    assert!(
+        tools
+            .execute(edit, &dir)
+            .await
+            .unwrap()
+            .output
+            .contains("replaced 1")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+        "one\n2\nthree\n"
+    );
+    // Expansion must be rejected without mutating the file. A separate
+    // allocation probe verifies that rejection precedes building the output.
+    let oversized = tools
+        .prepare(
+            "edit",
+            &json!({"path":"src/lib.rs",
+        "old":"\n","new":"x".repeat(1024*1024),"replace_all":true})
+            .to_string(),
+        )
+        .unwrap();
+    // Three replacements fit; five replacements exceed the file bound.
+    std::fs::write(dir.join("src/lib.rs"), "a\nb\nc\nd\ne\n").unwrap();
+    assert_eq!(
+        tools.execute(oversized, &dir).await.unwrap_err().code,
+        "tool_output_limit"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+        "a\nb\nc\nd\ne\n"
+    );
+    let rewrite = tools
+        .prepare(
+            "write",
+            &json!({"path":"alias.rs","content":"short"}).to_string(),
+        )
+        .unwrap();
+    tools.execute(rewrite, &dir).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+        "short"
+    );
+    assert!(dir.join("alias.rs").is_symlink());
+    let missing = tools
+        .prepare("read", &json!({"path":"nope.txt"}).to_string())
+        .unwrap();
+    assert_eq!(
+        tools.execute(missing, &dir).await.unwrap_err().code,
+        "file_unreadable"
+    );
+    // Oversized shell output keeps a preview and retains the full stream.
+    let big = tools
+        .prepare(
+            "shell",
+            &json!({"command":"head -c 200000 /dev/zero | tr '\\0' 'y'"}).to_string(),
+        )
+        .unwrap();
+    let outcome = tools.execute(big, &dir).await.unwrap();
+    let result: Value = serde_json::from_str(&outcome.output).unwrap();
+    assert!(result["stdout"].as_str().unwrap().contains("bytes omitted"));
+    assert_eq!(outcome.artifacts[0].0, "stdout");
+    assert_eq!(outcome.artifacts[0].1.len(), 200000);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn read_distinguishes_long_lines_from_eof_and_keeps_pages_bounded() {
+    let tools = Registry::new("read").unwrap();
+    let dir = std::env::temp_dir().join(format!("agent-read-lines-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let read = |offset| {
+        tools
+            .prepare("read", &json!({"path":"data","offset":offset}).to_string())
+            .unwrap()
+    };
+    std::fs::write(dir.join("data"), "x".repeat(80_000)).unwrap();
+    let error = tools.execute(read(1), &dir).await.unwrap_err();
+    assert_eq!(error.code, "read_line_too_long");
+    assert!(error.detail.unwrap().contains("line 1"));
+    assert!(
+        tools
+            .execute(read(2), &dir)
+            .await
+            .unwrap()
+            .output
+            .contains("past the last line 1")
+    );
+    std::fs::write(
+        dir.join("data"),
+        format!("ok\n{}\ntail\n", "x".repeat(80_000)),
+    )
+    .unwrap();
+    let page = tools.execute(read(1), &dir).await.unwrap().output;
+    assert!(page.starts_with("     1\tok\n"));
+    assert!(page.contains("offset=2"));
+    assert_eq!(
+        tools.execute(read(2), &dir).await.unwrap_err().code,
+        "read_line_too_long"
+    );
+    assert!(
+        tools
+            .execute(read(3), &dir)
+            .await
+            .unwrap()
+            .output
+            .contains("tail")
+    );
+    std::fs::write(dir.join("data"), "abcdefgh\n".repeat(5000)).unwrap();
+    let page = tools
+        .prepare("read", &json!({"path":"data","limit":5000}).to_string())
+        .unwrap();
+    let output = tools.execute(page, &dir).await.unwrap().output;
+    assert!(output.len() <= agent_runtime::tools::PREVIEW_BYTES);
+    assert!(output.contains("continue with offset="));
+    std::fs::remove_dir_all(dir).unwrap();
 }

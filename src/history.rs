@@ -1,6 +1,5 @@
 use crate::{Result, fail};
 use bytes::Bytes;
-use serde_json::json;
 use std::sync::Arc;
 
 pub const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
@@ -31,7 +30,7 @@ impl History {
         let bytes = self
             .bytes()
             .checked_add(item.len())
-            .ok_or(crate::Error("history_limit".into()))?;
+            .ok_or(crate::Error::new("history_limit"))?;
         let len = self.len() + 1;
         if bytes > MAX_HISTORY_BYTES || len > MAX_ITEMS {
             return fail("history_limit");
@@ -43,13 +42,6 @@ impl History {
             len,
         }));
         Ok(())
-    }
-    pub fn user(&mut self, text: &str) -> Result<()> {
-        self.append(
-            serde_json::to_vec(&json!({"role":"user","content":[
-            {"type":"input_text","text":text}]}))?
-            .into(),
-        )
     }
     pub fn items(&self) -> Vec<Bytes> {
         let mut items = Vec::with_capacity(self.len());
@@ -82,11 +74,14 @@ mod tests {
     #[test]
     fn historical_forks_share_bytes_but_append_independently() {
         let mut bob = History::default();
-        bob.user("before").unwrap();
+        bob.append(Bytes::from_static(b"before")).unwrap();
         let checkpoint = bob.clone();
-        bob.user("original direction").unwrap();
+        bob.append(Bytes::from_static(b"original direction"))
+            .unwrap();
         let mut branch = checkpoint.clone();
-        branch.user("alternative direction").unwrap();
+        branch
+            .append(Bytes::from_static(b"alternative direction"))
+            .unwrap();
         assert_eq!(checkpoint.len(), 1);
         assert_eq!(bob.items()[0].as_ptr(), branch.items()[0].as_ptr());
         assert_ne!(bob.items()[1], branch.items()[1]);
@@ -94,7 +89,7 @@ mod tests {
     #[test]
     fn history_limit_rejects_without_changing_the_checkpoint() {
         let mut history = History::default();
-        history.user("kept").unwrap();
+        history.append(Bytes::from_static(b"kept")).unwrap();
         assert!(
             history
                 .append(vec![b'x'; MAX_HISTORY_BYTES].into())

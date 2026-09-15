@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 mod db;
-pub use db::{Bot, Database, Started};
+pub use db::{Binding, Bot, Database, Started, TurnContext, TurnOptions};
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
 #[derive(Clone)]
@@ -18,7 +18,7 @@ pub struct Store {
 
 impl From<rusqlite::Error> for Error {
     fn from(_: rusqlite::Error) -> Self {
-        Self("storage_error".into())
+        Self::new("storage_error")
     }
 }
 
@@ -47,7 +47,7 @@ impl Store {
                                 .filter(|p| !p.as_os_str().is_empty())
                                 .unwrap_or(Path::new("."));
                             std::fs::canonicalize(parent)?
-                                .join(path.file_name().ok_or(Error("invalid_store_path".into()))?)
+                                .join(path.file_name().ok_or(Error::new("invalid_store_path"))?)
                         }
                         Err(error) => return Err(error.into()),
                     };
@@ -62,7 +62,7 @@ impl Store {
                         .write(true)
                         .open(lock_path)?;
                     lock.try_lock()
-                        .map_err(|_| Error("store_already_owned".into()))?;
+                        .map_err(|_| Error::new("store_already_owned"))?;
                     // SQLite WAL sidecars cannot safely follow hard-link aliases.
                     #[cfg(unix)]
                     match std::fs::metadata(&path) {
@@ -92,7 +92,7 @@ impl Store {
             })?;
         opened
             .await
-            .map_err(|_| Error("storage_worker_failed".into()))??;
+            .map_err(|_| Error::new("storage_worker_failed"))??;
         Ok(Self { sender })
     }
 
@@ -106,9 +106,9 @@ impl Store {
                 let _ = sender.send(operation(db));
             }))
             .await
-            .map_err(|_| Error("storage_worker_failed".into()))?;
+            .map_err(|_| Error::new("storage_worker_failed"))?;
         receiver
             .await
-            .map_err(|_| Error("storage_worker_failed".into()))?
+            .map_err(|_| Error::new("storage_worker_failed"))?
     }
 }

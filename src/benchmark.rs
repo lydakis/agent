@@ -1,4 +1,11 @@
-use agent_runtime::{Error, Result, fail, history::History, output::Output, provider::Provider};
+use agent_runtime::{
+    Error, Result,
+    codec::Family,
+    fail,
+    history::History,
+    output::Output,
+    provider::{Delta, Provider, Request, Transport},
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::task::JoinSet;
@@ -14,7 +21,7 @@ struct Workload {
 
 pub async fn run(output: Output) -> Result<()> {
     let config: Workload = serde_json::from_str(
-        &std::env::var("AGENT_BENCH_WORKLOAD").map_err(|_| Error("missing_workload".into()))?,
+        &std::env::var("AGENT_BENCH_WORKLOAD").map_err(|_| Error::new("missing_workload"))?,
     )?;
     if config.concurrency == 0
         || config.concurrency > 4096
@@ -31,18 +38,18 @@ pub async fn run(output: Output) -> Result<()> {
         return fail("workload_limit");
     }
     let port: u16 = std::env::var("AGENT_BENCH_PORT")
-        .map_err(|_| Error("missing_port".into()))?
+        .map_err(|_| Error::new("missing_port"))?
         .parse()
-        .map_err(|_| Error("invalid_port".into()))?;
+        .map_err(|_| Error::new("invalid_port"))?;
     if port == 0 {
         return fail("invalid_port");
     }
     let provider = Provider::new(
+        Transport::new()?,
+        Family::Responses,
         &format!("http://127.0.0.1:{port}/v1"),
-        "bench-model",
-        "Complete the synthetic benchmark turn.",
-        json!([]),
         None,
+        &[],
     )?;
     let mut jobs = JoinSet::new();
     output.send(json!({"event":"ready"})).await?;
@@ -63,35 +70,51 @@ pub async fn run(output: Output) -> Result<()> {
                 output
                     .send(json!({"event":"turn_start","agent":agent,"turn":turn}))
                     .await?;
-                history.user(&format!(
-                    "BENCH agent={agent} turn={turn}\n{}",
-                    "x".repeat(history_bytes)
-                ))?;
+                history.append(
+                    Family::Responses
+                        .user_item(&format!(
+                            "BENCH agent={agent} turn={turn}\n{}",
+                            "x".repeat(history_bytes)
+                        ))?
+                        .into(),
+                )?;
                 let mut bytes = 0;
                 let mut seq = 0;
                 let response = provider
-                    .complete(&history, |text| {
-                        let output = output.clone();
-                        let agent = agent.clone();
-                        let turn = turn.clone();
-                        let valid = text.bytes().all(|b| b == b'x');
-                        bytes += text.len();
-                        let first = seq;
-                        seq = bytes / chunk_bytes;
-                        let (seq, bytes) = (seq, bytes);
-                        async move {
-                            if !valid || bytes > chunks * chunk_bytes {
-                                return fail("invalid_benchmark_output");
-                            }
-                            for index in first..seq {
-                                output
-                                    .send(json!({"event":"chunk","agent":agent,"turn":turn,
+                    .complete(
+                        Request {
+                            model: "bench-model",
+                            instructions: "Complete the synthetic benchmark turn.",
+                            reasoning: None,
+                            history: &history,
+                        },
+                        |delta| {
+                            let text = match delta {
+                                Delta::Text(text) => text,
+                                Delta::Thinking(_) => String::new(),
+                            };
+                            let output = output.clone();
+                            let agent = agent.clone();
+                            let turn = turn.clone();
+                            let valid = text.bytes().all(|b| b == b'x');
+                            bytes += text.len();
+                            let first = seq;
+                            seq = bytes / chunk_bytes;
+                            let (seq, bytes) = (seq, bytes);
+                            async move {
+                                if !valid || bytes > chunks * chunk_bytes {
+                                    return fail("invalid_benchmark_output");
+                                }
+                                for index in first..seq {
+                                    output
+                                        .send(json!({"event":"chunk","agent":agent,"turn":turn,
                                 "seq":index,"bytes":chunk_bytes}))
-                                    .await?;
+                                        .await?;
+                                }
+                                Ok(())
                             }
-                            Ok(())
-                        }
-                    })
+                        },
+                    )
                     .await?;
                 if bytes != chunks * chunk_bytes || !response.calls.is_empty() {
                     return fail("incomplete_benchmark");
@@ -107,7 +130,7 @@ pub async fn run(output: Output) -> Result<()> {
         });
     }
     while let Some(result) = jobs.join_next().await {
-        result.map_err(|_| Error("task_failed".into()))??;
+        result.map_err(|_| Error::new("task_failed"))??;
     }
     Ok(())
 }

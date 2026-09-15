@@ -1,27 +1,69 @@
 use crate::{
-    Error, Result, fail,
+    Error, Result,
+    codec::Family,
+    fail,
     history::{History, MAX_HISTORY_BYTES, MAX_ITEMS},
-    provider::ToolCall,
+    provider::{ToolCall, Usage},
+    tools::Outcome,
 };
 use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
     pub head: Option<i64>,
-    pub workspace: String,
+    /// Default directory for submissions that name none; a bot need not have one.
+    pub workspace: Option<String>,
     pub status: String,
     pub running_turn: Option<i64>,
+    pub provider: String,
+    pub family: String,
+    pub model: String,
+    pub instructions: String,
+    pub reasoning: Option<String>,
 }
+impl Bot {
+    pub fn family(&self) -> Result<Family> {
+        Family::parse(&self.family).ok_or(Error::new("store_family_unsupported"))
+    }
+}
+/// Provider binding chosen at creation; immutable for the bot's lifetime.
+pub struct Binding<'a> {
+    pub provider: &'a str,
+    pub family: Family,
+    pub model: &'a str,
+    pub instructions: &'a str,
+    pub reasoning: Option<&'a str>,
+}
+#[derive(Debug)]
 pub struct Started {
     pub turn: i64,
     pub fresh: bool,
+    /// The durable `accepted` entry, present only for fresh submissions.
+    pub entry: Option<Value>,
+}
+/// Per-turn overrides of the bot's defaults, recorded with the turn.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct TurnOptions {
+    pub workspace: Option<String>,
+    pub model: Option<String>,
+}
+/// Where and with which model a turn runs.
+pub struct TurnContext {
+    pub bot: String,
+    pub workspace: String,
+    pub model: String,
 }
 pub struct Database {
     conn: Connection,
+}
+
+/// Durable events and their live copies share one shape.
+fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
+    json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
 }
 
 impl Database {
@@ -32,13 +74,18 @@ impl Database {
             CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS bots(name TEXT PRIMARY KEY, head INTEGER REFERENCES nodes(id),
-                workspace TEXT NOT NULL, status TEXT NOT NULL, running_turn INTEGER);
+                workspace TEXT, status TEXT NOT NULL, running_turn INTEGER,
+                provider TEXT NOT NULL, family TEXT NOT NULL, model TEXT NOT NULL,
+                instructions TEXT NOT NULL, reasoning TEXT);
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
-                request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL, UNIQUE(bot,request_id));
+                request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
+                workspace TEXT, model TEXT, UNIQUE(bot,request_id));
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
+            CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
+                stream TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);")?;
@@ -60,69 +107,157 @@ impl Database {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for turn in pending {
-            db.finish(turn, Some("process_interrupted"))?;
+            db.finish(turn, Some(&Error::new("process_interrupted")))?;
         }
         Ok(db)
     }
 
+    fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
+        Ok(Bot {
+            name: r.get(0)?,
+            head: r.get(1)?,
+            workspace: r.get(2)?,
+            status: r.get(3)?,
+            running_turn: r.get(4)?,
+            provider: r.get(5)?,
+            family: r.get(6)?,
+            model: r.get(7)?,
+            instructions: r.get(8)?,
+            reasoning: r.get(9)?,
+        })
+    }
+    const COLUMNS: &str =
+        "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning";
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
-                "SELECT name,head,workspace,status,running_turn FROM bots WHERE name=?",
+                &format!("SELECT {} FROM bots WHERE name=?", Self::COLUMNS),
                 [name],
-                |r| {
-                    Ok(Bot {
-                        name: r.get(0)?,
-                        head: r.get(1)?,
-                        workspace: r.get(2)?,
-                        status: r.get(3)?,
-                        running_turn: r.get(4)?,
-                    })
-                },
+                Self::row,
             )
             .optional()?
-            .ok_or(Error("bot_not_found".into()))
+            .ok_or(Error::new("bot_not_found"))
     }
-    pub fn create(&mut self, name: &str, workspace: &str) -> Result<Bot> {
-        if self
+    /// Bounded keyset pages. Full instructions remain available through inspect.
+    pub fn list(&self, after: Option<&str>, limit: usize) -> Result<Value> {
+        if !(1..=256).contains(&limit) || after.is_some_and(|s| s.len() > 128) {
+            return fail("invalid_bot_page");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning
+             FROM bots WHERE name > ? ORDER BY name LIMIT ?",
+        )?;
+        let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
+        let mut bots = Vec::new();
+        let mut bytes = 0;
+        let mut more = false;
+        while let Some(r) = rows.next()? {
+            let bot = json!({"name":r.get::<_, String>(0)?,"head":r.get::<_, Option<i64>>(1)?,
+                "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
+                "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
+                "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
+                "reasoning":r.get::<_, Option<String>>(8)?});
+            let size = crate::output::encoded_len(&bot)? + 1;
+            if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
+                if bots.is_empty() {
+                    return fail("bot_page_item_limit");
+                }
+                more = true;
+                break;
+            }
+            bytes += size;
+            bots.push(bot);
+        }
+        let next = more.then(|| bots.last().unwrap()["name"].clone());
+        Ok(json!({"bots":bots,"next_after":next}))
+    }
+    fn exists(&self, name: &str) -> Result<bool> {
+        Ok(self
             .conn
             .query_row("SELECT 1 FROM bots WHERE name=?", [name], |_| Ok(()))
             .optional()?
-            .is_some()
-        {
+            .is_some())
+    }
+    pub fn create(
+        &mut self,
+        name: &str,
+        workspace: Option<&str>,
+        binding: Binding<'_>,
+    ) -> Result<Bot> {
+        if self.exists(name)? {
             return fail("bot_exists");
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL)",
-            params![name, workspace],
+            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?)",
+            params![
+                name,
+                workspace,
+                binding.provider,
+                binding.family.name(),
+                binding.model,
+                binding.instructions,
+                binding.reasoning
+            ],
         )?;
-        event(&tx, name, None, "created", json!({}))?;
+        event(
+            &tx,
+            name,
+            None,
+            "created",
+            json!({"model":format!("{}/{}", binding.provider, binding.model)}),
+        )?;
         tx.commit()?;
         self.inspect(name)
     }
     pub fn load(&self, name: &str) -> Result<History> {
-        let mut next = self.inspect(name)?.head;
-        let mut items = Vec::new();
+        let head = self.inspect(name)?.head;
+        let mut history = History::default();
+        let Some(head) = head else {
+            return Ok(history);
+        };
+        let mut statement = self.conn.prepare(
+            "WITH RECURSIVE chain(id,parent,item,depth) AS (
+                SELECT id,parent,item,depth FROM nodes WHERE id=?
+                UNION ALL SELECT n.id,n.parent,n.item,n.depth FROM nodes n JOIN chain c ON n.id=c.parent)
+             SELECT item FROM chain ORDER BY depth",
+        )?;
+        let mut rows = statement.query([head])?;
         let mut bytes = 0;
-        let mut statement = self
-            .conn
-            .prepare("SELECT parent,item FROM nodes WHERE id=?")?;
-        while let Some(id) = next {
-            let (parent, item): (Option<i64>, Vec<u8>) =
-                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        while let Some(row) = rows.next()? {
+            let item: Vec<u8> = row.get(0)?;
             bytes += item.len();
-            if bytes > MAX_HISTORY_BYTES || items.len() >= MAX_ITEMS {
+            if bytes > MAX_HISTORY_BYTES || history.len() >= MAX_ITEMS {
                 return fail("history_limit");
             }
-            items.push(Bytes::from(item));
-            next = parent;
-        }
-        let mut history = History::default();
-        for item in items.into_iter().rev() {
-            history.append(item)?;
+            history.append(Bytes::from(item))?;
         }
         Ok(history)
+    }
+    /// Is `node` on the path from `head` back to the root?
+    fn in_lineage(&self, head: Option<i64>, node: i64) -> Result<bool> {
+        let Some(head) = head else {
+            return Ok(false);
+        };
+        let depth: Option<i64> = self
+            .conn
+            .query_row("SELECT depth FROM nodes WHERE id=?", [node], |r| r.get(0))
+            .optional()?;
+        let Some(depth) = depth else {
+            return Ok(false);
+        };
+        Ok(self
+            .conn
+            .query_row(
+                "WITH RECURSIVE chain(id,parent,depth) AS (
+                    SELECT id,parent,depth FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?3)
+                 SELECT 1 FROM chain WHERE id=?2 LIMIT 1",
+                params![head, node, depth],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
     pub fn begin(
         &mut self,
@@ -130,20 +265,34 @@ impl Database {
         request_id: &str,
         prompt: &str,
         capacity: bool,
+        options: &TurnOptions,
     ) -> Result<Started> {
-        let prior: Option<(i64, String)> = self
+        let prior: Option<(i64, String, TurnOptions)> = self
             .conn
             .query_row(
-                "SELECT id,prompt FROM turns WHERE bot=? AND request_id=?",
+                "SELECT id,prompt,workspace,model FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        TurnOptions {
+                            workspace: r.get(2)?,
+                            model: r.get(3)?,
+                        },
+                    ))
+                },
             )
             .optional()?;
-        if let Some((turn, saved)) = prior {
-            if saved != prompt {
+        if let Some((turn, saved, saved_options)) = prior {
+            if saved != prompt || saved_options != *options {
                 return fail("idempotency_conflict");
             }
-            return Ok(Started { turn, fresh: false });
+            return Ok(Started {
+                turn,
+                fresh: false,
+                entry: None,
+            });
         }
         // Admission applies only to new work, before any durable mutation.
         if !capacity {
@@ -156,13 +305,17 @@ impl Database {
         if bot.status == "uncertain" {
             return fail("tool_outcome_uncertain");
         }
-        let item = serde_json::to_vec(
-            &json!({"role":"user","content":[{"type":"input_text","text":prompt}]}),
-        )?;
+        let workspace = options
+            .workspace
+            .as_deref()
+            .or(bot.workspace.as_deref())
+            .ok_or(Error::new("workspace_required"))?
+            .to_owned();
+        let item = bot.family()?.user_item(prompt)?;
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO turns(bot,request_id,prompt,status) VALUES (?,?,?,'running')",
-            params![name, request_id, prompt],
+            "INSERT INTO turns(bot,request_id,prompt,status,workspace,model) VALUES (?,?,?,'running',?,?)",
+            params![name, request_id, prompt, options.workspace, options.model],
         )?;
         let turn = tx.last_insert_rowid();
         let head = node(&tx, bot.head, &item)?;
@@ -170,24 +323,39 @@ impl Database {
             "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
             params![head, turn, name],
         )?;
-        event(
-            &tx,
-            name,
-            Some(turn),
-            "accepted",
-            json!({"request_id":request_id,"node":head}),
-        )?;
+        let data = json!({"request_id":request_id,"node":head,
+            "workspace":workspace,
+            "model":options.model.clone().unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model))});
+        let cursor = event(&tx, name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
-        Ok(Started { turn, fresh: true })
+        Ok(Started {
+            turn,
+            fresh: true,
+            entry: Some(entry(cursor, name, Some(turn), "accepted", data)),
+        })
     }
-    pub fn append(&mut self, turn: i64, items: Vec<Bytes>, calls: &[ToolCall]) -> Result<()> {
+    pub fn append(
+        &mut self,
+        turn: i64,
+        items: Vec<Bytes>,
+        calls: &[ToolCall],
+        usage: Option<&Usage>,
+    ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         let tx = self.conn.transaction()?;
         let mut head = bot.head;
+        let mut entries = Vec::new();
         for item in items {
             let id = node(&tx, head, &item)?;
             head = Some(id);
-            event(&tx, &bot.name, Some(turn), "message", json!({"node":id}))?;
+            let data = json!({"node":id});
+            let cursor = event(&tx, &bot.name, Some(turn), "message", data.clone())?;
+            entries.push(entry(cursor, &bot.name, Some(turn), "message", data));
+        }
+        if let Some(usage) = usage {
+            let data = serde_json::to_value(usage)?;
+            let cursor = event(&tx, &bot.name, Some(turn), "usage", data.clone())?;
+            entries.push(entry(cursor, &bot.name, Some(turn), "usage", data));
         }
         for call in calls {
             tx.execute(
@@ -200,33 +368,33 @@ impl Database {
             params![head, bot.name],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(entries)
     }
-    pub fn tool_start(&mut self, turn: i64, call_id: &str, name: &str) -> Result<()> {
+    pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
         let bot = self.active(turn)?;
         let tx = self.conn.transaction()?;
         if tx.execute(
             "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
-            params![turn, call_id],
+            params![turn, call.call_id],
         )? != 1
         {
             return fail("invalid_tool_state");
         }
-        event(
-            &tx,
-            &bot.name,
-            Some(turn),
-            "tool_started",
-            json!({"call_id":call_id,"name":name}),
-        )?;
+        let preview: String = call.arguments.chars().take(2048).collect();
+        let data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
+            "arguments_truncated":preview.len() < call.arguments.len()});
+        let cursor = event(&tx, &bot.name, Some(turn), "tool_started", data.clone())?;
         tx.commit()?;
-        Ok(())
+        Ok(entry(cursor, &bot.name, Some(turn), "tool_started", data))
     }
-    pub fn tool_finish(&mut self, turn: i64, call_id: &str, output: &str) -> Result<Bytes> {
+    pub fn tool_finish(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        outcome: &Outcome,
+    ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
-        let item = serde_json::to_vec(
-            &json!({"type":"function_call_output","call_id":call_id,"output":output}),
-        )?;
+        let item = bot.family()?.tool_result_item(call_id, &outcome.output)?;
         let tx = self.conn.transaction()?;
         if tx.execute(
             "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'",
@@ -235,20 +403,41 @@ impl Database {
         {
             return fail("invalid_tool_state");
         }
+        for (stream, data) in &outcome.artifacts {
+            tx.execute(
+                "INSERT INTO artifacts VALUES (?,?,?,?)",
+                params![turn, call_id, stream, data],
+            )?;
+        }
         let head = node(&tx, bot.head, &item)?;
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
             params![head, bot.name],
         )?;
-        event(
-            &tx,
-            &bot.name,
-            Some(turn),
-            "tool_completed",
-            json!({"call_id":call_id,"node":head}),
-        )?;
+        let artifacts: Vec<&str> = outcome.artifacts.iter().map(|(s, _)| *s).collect();
+        let data = json!({"call_id":call_id,"node":head,"artifacts":artifacts});
+        let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
         tx.commit()?;
-        Ok(item.into())
+        Ok((
+            item.into(),
+            entry(cursor, &bot.name, Some(turn), "tool_completed", data),
+        ))
+    }
+    /// The workspace and model reference a running turn must use.
+    pub fn context(&self, turn: i64) -> Result<TurnContext> {
+        let (workspace, model): (Option<String>, Option<String>) = self.conn.query_row(
+            "SELECT workspace,model FROM turns WHERE id=?",
+            [turn],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let bot = self.active(turn)?;
+        Ok(TurnContext {
+            workspace: workspace
+                .or(bot.workspace)
+                .ok_or(Error::new("workspace_required"))?,
+            model: model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
+            bot: bot.name,
+        })
     }
     fn active(&self, turn: i64) -> Result<Bot> {
         let name: String =
@@ -260,18 +449,19 @@ impl Database {
         }
         Ok(bot)
     }
-    pub fn finish(&mut self, turn: i64, error: Option<&str>) -> Result<Value> {
+    pub fn finish(&mut self, turn: i64, error: Option<&Error>) -> Result<Value> {
         let bot = self.active(turn)?;
         let pending: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status!='completed')",
             [turn],
             |r| r.get(0),
         )?;
+        let code = error.map(|e| e.code.as_str());
         let status = if pending {
             "uncertain"
-        } else if matches!(error, Some("process_interrupted" | "cancelled")) {
+        } else if matches!(code, Some("process_interrupted" | "cancelled")) {
             "interrupted"
-        } else if error.is_some() {
+        } else if code.is_some() {
             "failed"
         } else {
             "completed"
@@ -291,17 +481,18 @@ impl Database {
                 params![bot.name, bot.head],
             )?;
         }
-        let data = json!({"status":status,"checkpoint":if status == "completed" { bot.head } else { None },"error":error});
+        let data = json!({"status":status,"checkpoint":if status == "completed" { bot.head } else { None },
+            "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
-        Ok(json!({"event":"turn_finished","bot":bot.name,"turn":turn,"cursor":cursor,"data":data}))
+        Ok(entry(cursor, &bot.name, Some(turn), "turn_finished", data))
     }
     pub fn fork(
         &mut self,
         source: &str,
         checkpoint: i64,
         name: &str,
-        workspace: &str,
+        workspace: Option<&str>,
     ) -> Result<Bot> {
         let parent = self.inspect(source)?;
         if self
@@ -316,37 +507,25 @@ impl Database {
         {
             return fail("invalid_checkpoint");
         }
-        let mut next = parent.head;
-        let mut found = false;
-        for _ in 0..MAX_ITEMS {
-            match next {
-                Some(id) if id == checkpoint => {
-                    found = true;
-                    break;
-                }
-                Some(id) => {
-                    next =
-                        self.conn
-                            .query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?
-                }
-                None => break,
-            }
-        }
-        if !found {
+        if !self.in_lineage(parent.head, checkpoint)? {
             return fail("checkpoint_not_in_source_history");
         }
-        if self
-            .conn
-            .query_row("SELECT 1 FROM bots WHERE name=?", [name], |_| Ok(()))
-            .optional()?
-            .is_some()
-        {
+        if self.exists(name)? {
             return fail("bot_exists");
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,?,?,'idle',NULL)",
-            params![name, checkpoint, workspace],
+            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?)",
+            params![
+                name,
+                checkpoint,
+                workspace,
+                parent.provider,
+                parent.family,
+                parent.model,
+                parent.instructions,
+                parent.reasoning
+            ],
         )?;
         tx.execute(
             "INSERT INTO checkpoints VALUES (?,?)",
@@ -379,9 +558,14 @@ impl Database {
         while let Some(row) = rows.next()? {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
-            let entry = json!({"cursor":next,"bot":name,"turn":row.get::<_, Option<i64>>(1)?,
-                "event":row.get::<_, String>(2)?,"data":serde_json::from_str::<Value>(&data)?});
-            let size = crate::output::encoded_len(&entry)? + 1;
+            let item = entry(
+                next,
+                name,
+                row.get::<_, Option<i64>>(1)?,
+                &row.get::<_, String>(2)?,
+                serde_json::from_str::<Value>(&data)?,
+            );
+            let size = crate::output::encoded_len(&item)? + 1;
             if bytes + size > byte_limit {
                 if events.is_empty() {
                     return fail("event_page_item_limit");
@@ -390,25 +574,87 @@ impl Database {
             }
             bytes += size;
             cursor = next;
-            events.push(entry);
+            events.push(item);
         }
         Ok(json!({"events":events,"next_cursor":cursor}))
     }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
-        let mut next = self.inspect(name)?.head;
-        for _ in 0..MAX_ITEMS {
-            let Some(id) = next else { break };
-            let (parent, item): (Option<i64>, Vec<u8>) =
-                self.conn
-                    .query_row("SELECT parent,item FROM nodes WHERE id=?", [id], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })?;
-            if id == wanted {
-                return Ok(serde_json::from_slice(&item)?);
-            }
-            next = parent;
+        let head = self.inspect(name)?.head;
+        if !self.in_lineage(head, wanted)? {
+            return fail("item_not_in_bot_history");
         }
-        fail("item_not_in_bot_history")
+        let item: Vec<u8> =
+            self.conn
+                .query_row("SELECT item FROM nodes WHERE id=?", [wanted], |r| r.get(0))?;
+        Ok(serde_json::from_slice(&item)?)
+    }
+    pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
+        let owner: Option<String> = self
+            .conn
+            .query_row("SELECT bot FROM turns WHERE id=?", [turn], |r| r.get(0))
+            .optional()?;
+        if owner.as_deref() != Some(name) {
+            return fail("turn_not_found");
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT stream,data FROM artifacts WHERE turn=? AND call_id=?")?;
+        let mut rows = statement.query(params![turn, call_id])?;
+        let mut streams = serde_json::Map::new();
+        while let Some(row) = rows.next()? {
+            let data: Vec<u8> = row.get(1)?;
+            streams.insert(
+                row.get::<_, String>(0)?,
+                Value::String(String::from_utf8_lossy(&data).into_owned()),
+            );
+        }
+        if streams.is_empty() {
+            return fail("artifact_not_found");
+        }
+        Ok(Value::Object(streams))
+    }
+
+    /// Byte-addressed UTF-8 pages. SQL slicing bounds the bytes returned to
+    /// Rust instead of assembling every retained stream in one response.
+    pub fn artifact_page(
+        &self,
+        name: &str,
+        turn: i64,
+        call_id: &str,
+        stream: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Value> {
+        if !(4..=64 * 1024).contains(&limit) || offset > i64::MAX as u64 - 1 {
+            return fail("invalid_artifact_page");
+        }
+        let owner: Option<String> = self
+            .conn
+            .query_row("SELECT bot FROM turns WHERE id=?", [turn], |r| r.get(0))
+            .optional()?;
+        if owner.as_deref() != Some(name) {
+            return fail("turn_not_found");
+        }
+        let row: Option<(i64, Vec<u8>)> = self.conn.query_row(
+            "SELECT length(data),substr(data,?,?) FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
+            params![offset as i64 + 1, limit as i64, turn, call_id, stream],
+            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let (total, bytes) = row.ok_or(Error::new("artifact_not_found"))?;
+        let total = u64::try_from(total).map_err(|_| Error::new("storage_error"))?;
+        if offset > total {
+            return fail("invalid_artifact_page");
+        }
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(error) if error.error_len().is_none() => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()])
+                    .map_err(|_| Error::new("invalid_artifact_page"))?
+            }
+            Err(_) => return fail("invalid_artifact_page"),
+        };
+        let next = offset + text.len() as u64;
+        Ok(json!({"stream":stream,"offset":offset,"text":text,
+            "next_offset":next,"total_bytes":total,"done":next == total}))
     }
 }
 
