@@ -8,8 +8,10 @@ fastest harness. The [first measurements](RUST_MEASUREMENTS.md) passed it.
 
 ## Build and validate
 
-Rust 1.92 or later is required. Dependencies are locked; build outputs and the
-optional repository-local Cargo cache stay under ignored `.local/`.
+Development builds use Rust 1.98.0, pinned in `rust-toolchain.toml` with Clippy
+and rustfmt. The declared minimum supported Rust version remains 1.92.
+Dependencies are locked; build outputs and the optional repository-local Cargo
+cache stay under ignored `.local/`.
 
 ```sh
 CARGO_HOME=.local/cargo cargo build --release --locked
@@ -186,6 +188,41 @@ available for recovery.
 The fan-out that deadlocked when waiting held a shell slot now completes under
 a process budget of two, because waiters hold nothing.
 
+## Accounting and budgets
+
+Provider-reported usage records a durable `usage` event, and the store keeps running
+totals: per turn (`input_tokens`, `output_tokens`, `model_rounds`, `started_ms`,
+`finished_ms`) and per bot (`tokens_used`). `create` and `fork` accept
+`budget_tokens`, a lifetime cap on input plus output tokens for that bot. The
+cap is checked before each model call and before each submission: a
+submission on an exhausted bot fails with `budget_exhausted`, and a turn whose
+next call would exceed the cap ends as `failed` with `budget_exhausted` after
+any tool already planned has run, so the bot is never left uncertain. One
+call may overshoot the cap. Forks start at zero with their own optional cap.
+Reported usage from failed or incomplete calls is charged without accepting their
+output into history. Such calls count in `model_rounds` when usage is reported.
+Cancellation and failures before a usage report is returned can leave usage
+unaccounted for; these totals are not a reconciliation of provider billing.
+Successful calls retain their single atomic transcript/usage commit; budget
+checks use the turn's running total without an extra database read per round.
+
+`turns` (protocol) and `agent turns --bot NAME` list a bot's turns with status,
+effective workspace and model, tokens, rounds, timing, and a prompt preview,
+paged by `after`. `result` and `agent result --bot NAME --turn N` return a
+finished turn's outcome in the same shape a `wait` produces, or its live status
+without blocking; the command exits 0 only for a completed turn. Both query
+commands restart an idle daemon using the supplied provider/tool configuration
+(or provider environment defaults), honor `--no-spawn`, and refuse missing stores.
+They do not submit new model work; existing parked work may resume on startup.
+
+A truncated shell result names its retained streams as `artifacts`, for
+example `["12/call_abc/stdout"]`, and the model can page through one with
+`read` by passing `artifact` instead of `path`. Artifact reads allow the producing
+bot or a branch containing the original tool-result node. Historical forks can
+read inherited outputs, but cannot read later source turns or unrelated branches.
+Line pages are assembled on the storage worker; only the bounded page crosses
+into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
+
 ## Limits
 
 Three daemon limits are flags on `serve`, forwarded by the client that starts
@@ -197,6 +234,8 @@ bound; the operating system is then the only limit.
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. | 64 |
+| `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
+| `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 
 Parked agents cost a store row and a registry entry. An agent in a model call
 costs its loaded history and a connection; that, not these limits, bounds how
@@ -255,9 +294,12 @@ A turn may override the model within the same family (`submit` with `model`, or
 conversation is not implemented; it would be an explicit lossy fork that
 discards provider-specific state such as thinking signatures.
 
-`reasoning` maps to Responses `reasoning.effort` with summaries requested, and to
-Anthropic extended thinking with 2,048, 8,192, or 16,384 budget tokens under a
-32,768 `max_tokens` ceiling. Reasoning summaries and thinking stream as
+`reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
+`reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
+(`thinking.type: adaptive` with summarized display) plus `output_config.effort`
+under a 32,768 `max_tokens` ceiling. Known legacy Claude ids (Haiku 4.5, 4.5 and
+older) instead get the budget form with 2,048, 8,192, or 16,384 tokens, since
+current models reject budgets and older ones require them. Reasoning summaries and thinking stream as
 `thinking_delta` events; Anthropic thinking blocks and signatures are stored in
 the assistant item so tool-using turns continue correctly. Usage is recorded as a
 durable `usage` event per model call. HTTP requests have a 10 second connect
@@ -413,9 +455,12 @@ process. A second owner fails before it can mark the first owner's work
 interrupted. Ownership uses the canonical database path with an appended
 `.owner-lock` suffix; symlinks resolve to the same lock and hard-linked database
 files are rejected. Do not replace or rename the database or its lock while
-open. The stored provider/tool configuration (schema 5) must match at reopen;
-stores from earlier prototypes are rejected with
-`store_configuration_mismatch` rather than migrated.
+open. The schema version lives in SQLite's `user_version`; a store created
+before versioning is refused with `store_schema_unsupported`, one written by a
+newer binary with `store_schema_newer`, and an older versioned store will be
+migrated in order once a migration exists. The stored provider and tool
+configuration must still match at reopen, or `store_configuration_mismatch`
+is returned.
 
 Accepted user input is committed before the submission response. Provider output,
 usage, and tool plans are committed before tool dispatch. Tool intent is

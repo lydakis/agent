@@ -121,10 +121,10 @@ calls) and the three configurable daemon limits in place of fixed constants; see
 [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results). Still to measure:
 bytes per parked turn versus per live process, on the lifecycle screen.
 
-1. Run the first live Anthropic task through the daemon with a stated
-   call/token cap, mirroring the [OpenAI daemon run](OPENAI_SMOKE.md#daemon-live-run):
-   file and shell tools, a continuation turn that resends stored thinking
-   blocks with signatures, and a detach-plus-wait delegation. Then a bounded
+1. Prompt caching on the Anthropic adapter: the [live run](ANTHROPIC_SMOKE.md)
+   showed zero cache reads because no `cache_control` breakpoints are sent.
+   Add breakpoints on the system prompt and the last history item, verify
+   `cache_read_input_tokens` on a continuation turn. Then a bounded
    multi-agent run on either provider (tens of concurrent bots) to observe the
    64-request startup bound, header latency, and idle-timeout adequacy for
    long thinking. Preserve failures.
@@ -135,13 +135,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    Add bounded model-facing history retrieval and branch-aware fact checks;
    measure fixed active context against growing stored histories before adding
    recursive context-processing machinery.
-3. Daemon lifecycle: idle exit after a configurable quiet period, an explicit
-   store schema migration path (older prototype stores are rejected), and a
-   measured slow-follower screen for the lag/drop policy.
+3. A measured slow-follower screen for the lag/drop policy, and a parked-agent
+   screen on the lifecycle tool with retained versus live memory separated.
+   Idle exit, schema versioning, budgets, turn listings, `result`, and
+   model-facing artifact reads are implemented.
 4. Provider interface: decide whether cross-family handoff (thinking rendered
    as text, tool history preserved) is worth a translation step, then freeze
-   the adapter contract. Add model-facing artifact retrieval so a bot can read
-   a truncated tool output it produced.
+   the adapter contract.
 5. Extend measured tools and recovery semantics, slow-reader and sustained-load
    tests. Profile CPU/allocations to explain regressions; compare matched revisions.
 6. Add equivalent lifecycle adapters for Pi/Codex only where native semantics can

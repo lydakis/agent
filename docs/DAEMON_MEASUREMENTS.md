@@ -224,3 +224,53 @@ The local observer fingerprint matches all six captures. A preceding job,
 acknowledgment fix was identified; its output is excluded. No remote source
 changes were applied locally. Only documentation/comment changes followed the
 final measured snapshot.
+
+## Accounting and artifact regression screen
+
+Observed 2026-09-15 on Darwin arm64, external power, Rust 1.98.0, Python
+3.12.9 and psutil 7.2.2. This compares the working-tree binary before and after
+fixing incomplete-call accounting, idle-daemon result lookup, and inherited
+artifact access. It is a same-engine regression screen, not a capacity claim.
+
+Both binaries used the unchanged `bench.lifecycle` socket workload: 32 agents,
+three turns each, one echo call per turn, all five file/echo/shell tools
+registered, one follower per bot, SQLite FULL durability, replay, restart and
+historical forks. Each run completed 192 provider calls and 96 tool results,
+reached 32 concurrent provider requests, and passed follower/replay equality.
+The observer reported no quality warnings. Tool subprocess cost is not exercised
+by this echo workload.
+
+Six measured runs per binary, plus two excluded warmups each: an initial
+three-run screen followed by three alternating before/after pairs to check a
+slow tail-latency observation. All measurements are retained, including that
+observation. Values below are medians, with the full measured range in parentheses.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.12 (17.03–17.17) | 17.00 (16.86–17.03) |
+| Observed target CPU, seconds | 0.303 (0.273–0.310) | 0.290 (0.280–0.313) |
+| Per-run p95 turn latency, ms | 594.6 (590.8–602.0) | 594.4 (588.3–651.1) |
+| Provider request body bytes per run | 3,254,232 | 3,254,232 |
+| Provider response body bytes per run | 2,948,154 | 2,948,154 |
+
+This screen shows preserved median latency and network traffic, with slightly
+lower sampled memory and median CPU. CPU ranges overlap, and the after binary
+had one slower p95 sample; these results do not establish a general speedup or
+an improved worst-case bound. Host exclusivity was not established.
+
+The successful-call path still uses one atomic transcript/usage commit.
+Budget checks no longer fetch and copy bot metadata on every model round.
+Model-facing artifact line pages are assembled on the storage worker, so the
+async runtime receives the bounded page instead of the whole retained blob.
+The echo screen does not quantify that artifact-read improvement. Dedicated
+regressions verify failed-call accounting, idle query restart, inherited output
+access and rejection of later source turns.
+
+Raw captures and the alternating driver are under ignored `.local/review-fixes/`.
+The initial screens use `python -m bench.lifecycle --agents 32 --mode echo
+--tools echo,shell,read,write,edit --transport socket --repeat 3`, with separate
+`--binary` and `--out` paths. Both records have identical workload, observer,
+host, transport and sampling settings. Binary SHA-256:
+
+- Before: `7dad3b893e7b3a77d10620c710fa9c33a716d860b55370d5e16f8536fe0e7afe`
+- After: `b20d0b20159e3aa64a1d5e860a56cf9f85215d8536d121a4128b89d56326358f`

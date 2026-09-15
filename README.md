@@ -25,10 +25,10 @@ live follow, shell/read/write/edit tools with retained artifacts, delegation to
 other named agents through the same client, and two provider families (OpenAI
 Responses and compatible gateways, Anthropic Messages) with streamed thinking
 and usage. Its protocol is experimental. The daemon has completed a bounded
-[live OpenAI run](docs/OPENAI_SMOKE.md#daemon-live-run) covering file and shell
-tools, stored reasoning items across turns, and delegation through detach and
-wait; Anthropic checks still use synthetic endpoints. Compaction,
-cross-provider handoff, and MCP are not implemented.
+[live OpenAI run](docs/OPENAI_SMOKE.md#daemon-live-run) and a
+[live Anthropic run](docs/ANTHROPIC_SMOKE.md) covering file and shell tools,
+stored reasoning and thinking across turns, and delegation through detach and
+wait. Compaction, cross-provider handoff, and MCP are not implemented.
 
 ## What matters
 
@@ -68,6 +68,7 @@ Agent does not provide a sandbox.
 - [Next decisions](docs/NEXT.md): remaining implementation and measurement work.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
 - [Rust measurements](docs/RUST_MEASUREMENTS.md): exploratory observations, with unequal feature footprints.
+- [Anthropic live run](docs/ANTHROPIC_SMOKE.md): the daemon against Sonnet 5, Opus 5, and Fable 5.1, with the adaptive-thinking fix it forced.
 - [FX measurements](docs/FX_MEASUREMENTS.md): native embedded FX versus Rust with identical conversation content and explicit protocol differences.
 - [Comparison contract](docs/COMPARISON_CONTRACT.md): feature inventory and enforced comparison rules.
 - [Long histories](docs/LONG_HISTORY.md): full retained conversation versus bounded model context.
