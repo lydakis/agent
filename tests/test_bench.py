@@ -11,11 +11,31 @@ from bench.profiles import profile
 
 
 class ProcessTests(unittest.TestCase):
+    def test_detailed_memory_is_opt_in_and_never_substitutes_missing_values(self):
+        rows = [Process(10, 1, 10, 100, .2, 'a'), Process(11, 10, 10, 200, .1, 'b')]
+        with patch('bench.processes.detailed_memory', side_effect=[(60, 30), (80, 40)]) as measure:
+            self.assertIsNone(Tree(10).sample(rows)['pss_bytes'])
+            measure.assert_not_called()
+            result = Tree(10).sample(rows, memory_detail=True)
+            self.assertEqual(result['pss_bytes'], 140)
+            self.assertEqual(result['private_bytes'], 70)
+        with patch('bench.processes.detailed_memory', side_effect=[(None, 30), (None, 40)]):
+            result = Tree(10).sample(rows, memory_detail=True)
+            self.assertIsNone(result['pss_bytes'])
+            self.assertEqual(result['private_bytes'], 70)
+        for failure in (psutil.AccessDenied(11), psutil.NoSuchProcess(11)):
+            with patch('bench.processes.detailed_memory', side_effect=[(60, 30), failure]):
+                result = Tree(10).sample(rows, memory_detail=True)
+                self.assertIsNone(result['pss_bytes'])
+                self.assertIsNone(result['private_bytes'])
+                self.assertEqual(result['rss_bytes'], 300)
+
     def test_denied_counters_are_unavailable_instead_of_zero(self):
         row = Process(10, 1, 10, None, None, "a")
         with patch('bench.processes.counters', side_effect=psutil.AccessDenied(10)):
             result = Tree(10).sample([row])
         self.assertIsNone(result['rss_bytes'])
+        self.assertIsNone(result['root_rss_bytes'])
         self.assertIsNone(result['threads'])
         self.assertEqual(result['unreadable_processes'], 1)
 
@@ -36,12 +56,14 @@ class ProcessTests(unittest.TestCase):
         result = tree.sample(rows)
         self.assertEqual(result["processes"], 3)
         self.assertEqual(result["rss_bytes"], 600)
+        self.assertEqual(result["root_rss_bytes"], 100)
         self.assertEqual(result['threads'], 6)
         self.assertAlmostEqual(result["observed_cpu_seconds"], 0.7)
         # Keep observed descendants after reparenting, but do not follow PID reuse.
         result = tree.sample([Process(11, 1, 11, 250, 0.6, "b"),
                               Process(10, 1, 99, 1000, 9, "new")])
         self.assertEqual(result["rss_bytes"], 250)
+        self.assertEqual(result["root_rss_bytes"], 0)
         self.assertIsNone(result['threads'])
         self.assertAlmostEqual(result["observed_cpu_seconds"], 0.9)
 

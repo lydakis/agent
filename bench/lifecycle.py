@@ -15,11 +15,12 @@ from .events import percentiles
 from .processes import Tree, snapshot
 from .runner import provider_ready, stop
 from .runtime_client import Client
+from .socket_client import SocketClient
 from .targets import clean_env, file_hash
 from .responses import prompt
 
 
-def run_once(binary, directory, config, mode, toolset):
+def run_once(binary, directory, config, mode, toolset, transport='stdio', memory_detail=False):
     workload = directory / 'workload.json'
     workload.write_text(json.dumps(config))
     stats_path = directory / 'provider.json'
@@ -43,12 +44,16 @@ def run_once(binary, directory, config, mode, toolset):
                 rows = snapshot([*current, provider_tree], scan_groups=before >= next_group_scan)
                 if before >= next_group_scan:
                     next_group_scan = before + .5
-                target = [tree.sample(rows) for tree in current]
+                target = [tree.sample(rows, memory_detail=memory_detail) for tree in current]
                 fixture = provider_tree.sample(rows)
                 if fixture['unreadable_processes'] or any(r['unreadable_processes'] for r in target):
                     raise RuntimeError('unavailable counters')
                 row = {'elapsed':before-started, 'phase':phase,
                        'rss_bytes':sum(r['rss_bytes'] for r in target),
+                       'daemon_rss_bytes':sum(r['root_rss_bytes'] for r in target),
+                       'pss_bytes':sum(r['pss_bytes'] for r in target) if all(r['pss_bytes'] is not None for r in target) else None,
+                       'private_bytes':sum(r['private_bytes'] for r in target) if all(r['private_bytes'] is not None for r in target) else None,
+                       'threads':sum(r['threads'] for r in target) if all(r['threads'] is not None for r in target) else None,
                        'cpu_seconds':sum(r['observed_cpu_seconds'] for r in target),
                        'processes':sum(r['processes'] for r in target),
                        'provider_rss_bytes':fixture['rss_bytes'],
@@ -71,7 +76,8 @@ def run_once(binary, directory, config, mode, toolset):
     try:
         url = f'http://127.0.0.1:{provider_ready(provider)}/v1'
         def connect():
-            client = Client(binary, directory/'state.sqlite', url, tools=toolset)
+            controller = SocketClient if transport == 'socket' else Client
+            client = controller(binary, directory/'state.sqlite', url, tools=toolset)
             clients.append(client)
             trees.append(Tree(client.process.pid))
             return client
@@ -107,6 +113,8 @@ def run_once(binary, directory, config, mode, toolset):
         time.sleep(.45)
         pages = {str(agent):client.request('events', bot=str(agent), after=0, limit=256)['result']
                  for agent in range(config['concurrency'])}
+        if transport == 'socket':
+            client.verify_followers(pages)
         phase = 'restart_resume_replay_fork'
         before = time.monotonic()
         client.close(kill=True)
@@ -127,6 +135,8 @@ def run_once(binary, directory, config, mode, toolset):
             assert not (branch/'artifact').exists()
         lifecycle_ms = (time.monotonic()-before)*1000
         phase = 'forked_idle'
+        if transport == 'socket':
+            client.verify_followers(pages)
         time.sleep(.45)
         result = dict(status='ok', create_all_ms=create_ms, restart_ready_ms=restart_ms,
                       resume_replay_item_duplicate_fork_all_ms=lifecycle_ms,
@@ -150,6 +160,8 @@ def run_once(binary, directory, config, mode, toolset):
         result['status'] = 'provider_workload_mismatch'
     (directory/'samples.json').write_text(json.dumps(samples))
     result.update(provider=stats, target_peak_rss_bytes=max((s['rss_bytes'] for s in samples),default=0),
+                  daemon_peak_rss_bytes=max((s['daemon_rss_bytes'] for s in samples),default=0),
+                  target_peak_threads=max((s['threads'] for s in samples if s['threads'] is not None),default=None),
                   target_observed_cpu_seconds=max((s['cpu_seconds'] for s in samples),default=0),
                   target_peak_processes=max((s['processes'] for s in samples),default=0),
                   provider_peak_rss_bytes=max((s['provider_rss_bytes'] for s in samples),default=0),
@@ -169,23 +181,27 @@ def main():
     parser.add_argument('--binary',type=Path,default=Path('.local/target/release/agent'))
     parser.add_argument('--agents',type=int,choices=(1,8,32),default=8)
     parser.add_argument('--mode',choices=('text','echo','shell'),default='shell')
-    parser.add_argument('--tools',choices=('echo','echo,shell'),default='echo,shell')
+    parser.add_argument('--tools',choices=('echo','echo,shell','echo,shell,read,write,edit'),default='echo,shell')
     parser.add_argument('--repeat',type=int,choices=range(1,6),default=3)
+    parser.add_argument('--transport', choices=('stdio', 'socket'), default='stdio')
+    parser.add_argument('--memory-detail', action='store_true', help='sample PSS/USS where supported; adds observer overhead')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()
     if Path.cwd() != root or not out.is_relative_to(root/'.local'):
         parser.error('run from repository root with a new output under .local')
-    if args.mode == 'shell' and args.tools != 'echo,shell':
+    if args.mode == 'shell' and 'shell' not in args.tools.split(','):
         parser.error('shell workload requires the shell tool')
     out.mkdir(parents=True,exist_ok=False)
     config = dict(version=1,concurrency=args.agents,turns=3,chunks=20,chunk_bytes=256,
                   chunk_delay_ms=25,history_bytes=4096)
     sources = {str(p.relative_to(root)):file_hash(p) for p in sorted((root/'bench').glob('*.py'))}
     battery = psutil.sensors_battery()
-    record = dict(schema='rust_lifecycle_v1',binary_sha256=file_hash(args.binary),
+    record = dict(schema='rust_lifecycle_v2',binary_sha256=file_hash(args.binary),
                   created_at=datetime.now(timezone.utc).isoformat(),
                   observer_sha256=digest(sources),workload=config,toolset=args.tools,mode=args.mode,
+                  transport=args.transport,followers_per_bot=1 if args.transport == 'socket' else 0,
+                  memory_detail=args.memory_detail,
                   contract='sqlite_full; exact resume/replay; historical completed fork; no repeated tools',
                   host=dict(system=platform.system(),architecture=platform.machine(),host_id=digest(platform.node()),
                             python=platform.python_version(),psutil=psutil.__version__,external_power=battery.power_plugged if battery else None),
@@ -193,7 +209,7 @@ def main():
     for index in range(args.repeat+1):
         directory = out/f'run-{index}'
         directory.mkdir()
-        run = run_once(args.binary.resolve(),directory,config,args.mode,args.tools)
+        run = run_once(args.binary.resolve(),directory,config,args.mode,args.tools,args.transport,args.memory_detail)
         run['warmup'] = index == 0
         record['runs'].append(run)
         (out/'result.json').write_text(json.dumps(record,indent=2))

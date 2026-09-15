@@ -283,12 +283,28 @@ requires a measured advantage or a feature gap after that reuse assessment.
 .local/venv/bin/python -m bench.lifecycle --agents 32 --mode shell --tools echo,shell --out .local/bench/durable-shell
 ```
 
-These exercise the real JSONL service, SQLite FULL durability, tool round trips,
+By default these drive the stdio service (`agent serve` without `--socket`, bound to the
+synthetic Responses provider through `--provider openai=responses,URL`) and
+exercise SQLite FULL durability, tool round trips,
 kill/restart, exact resume/replay/item retrieval, idempotent submission, and
 historical forks. Shell mode validates an actual workspace artifact; forked
 workspaces must remain untouched. The separate fixture validates every prior
 message and tool result. Tests separately cover independent fork continuation
 and cancellation; this performance workload does not time those operations.
+
+Pass `--transport socket` to measure the Unix-socket daemon with one independent
+follower connection per bot. Every follower's durable stream is checked against
+database replay, before and after restart. The controller and follower readers
+run in the Python observer; these measurements do not include Rust CLI processes.
+For all built-in tool schemas, use `--tools echo,shell,read,write,edit`. Shell mode
+executes shell tools; read/write/edit are registered but are not exercised here.
+Results use `rust_lifecycle_v2` and record transport, follower count, peak sampled
+daemon RSS separately from its descendant tree, and tree thread counts.
+
+```sh
+.local/venv/bin/python -m bench.lifecycle --transport socket --agents 32 \
+  --mode shell --tools echo,shell,read,write,edit --out .local/bench/socket-32
+```
 
 The observer/controller and provider are separate from the charged native
 process plus its descendants. Sampling is every 200 ms, including recursive child
@@ -307,10 +323,19 @@ the current lockfile to an older executable as build provenance.
 Lifecycle results have a separate schema and cannot be passed to streaming
 `bench compare`. Different modes are feature-cost observations, not like-for-like
 speedups. Compare lifecycle revisions only with the same mode, toolset, complete
-workload, host/power, observer fingerprint, bounds, successful runs, and achieved
+workload, transport/follower count, host/power, observer fingerprint, bounds, successful runs, and achieved
 concurrency. See [the recorded measurements](LIFECYCLE_MEASUREMENTS.md).
 
 Benchmark failures from Rust can now include a strictly whitelisted stage/code
 and numeric OS error. URLs, error messages, stderr, prompts, and credentials are
 not retained as diagnostic data. The new observer fingerprint means older and
 newer captures must not be silently combined.
+
+## Optional detailed memory counters
+
+`bench.lifecycle --memory-detail` adds `pss_bytes` and `private_bytes` to each
+target-tree sample and records the option in the result. PSS apportions shared
+resident pages among processes; private bytes are USS. Unsupported, denied, or
+racing reads produce null rather than zero or a partial total. RSS remains
+available independently. These counters require more observer work and are off
+by default. Do not compare timing directly across different sampling modes.

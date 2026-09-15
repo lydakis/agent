@@ -58,6 +58,15 @@ def counters(row):
         return process.memory_info().rss, cpu.user + cpu.system, process.num_threads()
 
 
+def detailed_memory(row):
+    """Slow, opt-in counters. PSS apportions shared pages; USS is private memory."""
+    process = psutil.Process(row.pid)
+    if str(process.create_time()) != row.birth:
+        raise psutil.NoSuchProcess(row.pid)
+    info = process.memory_full_info()
+    return getattr(info, 'pss', None), getattr(info, 'uss', None)
+
+
 class Tree:
     def __init__(self, root):
         if root <= 1:
@@ -79,13 +88,16 @@ class Tree:
             selected = expanded
         return [row for row in eligible if row.pid in selected]
 
-    def sample(self, rows):
+    def sample(self, rows, *, memory_detail=False):
         members = self.members(rows)
         rss_total = 0
+        root_rss = 0
         unreadable = 0
         live = 0
         thread_total = 0
         threads_known = True
+        pss_total = private_total = 0
+        pss_known = private_known = memory_detail
         for row in members:
             self.known[row.pid] = row.birth
             key = (row.pid, row.birth)
@@ -93,18 +105,31 @@ class Tree:
                 rss, cpu, threads = counters(row)
                 live += 1
                 rss_total += rss
+                if row.pid == self.root:
+                    root_rss = rss
                 if threads is None:
                     threads_known = False
                 else:
                     thread_total += threads
                 self.cpu[key] = max(self.cpu.get(key, 0), cpu)
+                if memory_detail:
+                    try:
+                        pss, private = detailed_memory(row)
+                        pss_known &= pss is not None
+                        private_known &= private is not None
+                        pss_total += pss or 0
+                        private_total += private or 0
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, NotImplementedError):
+                        pss_known = private_known = False
             except psutil.NoSuchProcess:
                 continue
             except psutil.AccessDenied:
                 unreadable += 1
         return {"processes": live + unreadable,
                 "rss_bytes": None if unreadable else rss_total,
+                "root_rss_bytes": None if unreadable else root_rss,
                 "threads": thread_total if threads_known and not unreadable else None,
                 "unreadable_processes": unreadable,
                 "observed_cpu_seconds": sum(self.cpu.values()),
-                "pss_bytes": None, "private_bytes": None}
+                "pss_bytes": pss_total if pss_known and not unreadable else None,
+                "private_bytes": private_total if private_known and not unreadable else None}
