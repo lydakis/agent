@@ -152,7 +152,7 @@ class SocketAndCliTests(ModelFixture):
         with sockets.socket(sockets.AF_UNIX) as sock:
             sock.connect(str(self.socket))
             ready = json.loads(sock.makefile('r').readline())
-        self.assertEqual(set(ready['limits']), {'processes', 'active', 'connecting'})
+        self.assertTrue({'processes', 'active', 'connecting', 'output_tokens', 'idle_exit_seconds'} <= set(ready['limits']))
         self.assertIn('wait', ready['capabilities'])
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
@@ -313,7 +313,8 @@ class CliTests(ModelFixture):
             bootstrap.close()
             with sqlite3.connect(path) as db:
                 for n in range(1, 1025):
-                    db.execute("INSERT INTO bots VALUES (?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
+                    db.execute("INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning)"
+                               " VALUES (?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
                                (f'old-{n}', directory, n))
                     db.execute("INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model) VALUES (?,?,'old','check','running',?,'openai/synthetic-model')",
                                (n, f'old-{n}', directory))

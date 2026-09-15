@@ -62,6 +62,15 @@ class Model(http.server.BaseHTTPRequestHandler):
                 command = user.split(':', 1)[1]
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'bg-1',
                            'arguments': json.dumps({'command': command, 'timeout_ms': 5000, 'background': True})}]
+            elif user.startswith('readart:'):
+                text = ''
+                reference, _, rest = user[8:].partition(' ')
+                arguments = {'artifact': reference}
+                if rest:
+                    offset, limit = rest.split(',')
+                    arguments.update(offset=int(offset), limit=int(limit))
+                output = [{'type': 'function_call', 'name': 'read', 'call_id': 'readart-1',
+                           'arguments': json.dumps(arguments)}]
             elif user.startswith('wait:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
@@ -102,7 +111,12 @@ class Model(http.server.BaseHTTPRequestHandler):
             if text:
                 events.append({'type': 'response.output_text.delta', 'delta': text})
             if user != 'truncate':
-                events.append({'type': 'response.completed', 'response': {'status': 'completed', 'output': output}})
+                events.append({'type': 'response.completed', 'response': {'status': 'completed', 'output': output,
+                    'usage': {'input_tokens': 100, 'output_tokens': 10, 'input_tokens_details': {'cached_tokens': 0}}}})
+            if user == 'incomplete':
+                events = [{'type': 'response.incomplete', 'response': {'status': 'incomplete',
+                    'incomplete_details': {'reason': 'max_output_tokens'}, 'output': [],
+                    'usage': {'input_tokens': 100, 'output_tokens': 10}}}]
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Transfer-Encoding', 'chunked')
@@ -162,7 +176,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     stop = 'tool_use'
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
-                    stop = 'end_turn'
+                    stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
             events = [('message_start', {'message': {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}})]
             for index, block in enumerate(blocks):
                 start = {**block, 'thinking': ''} if block['type'] == 'thinking' else (
@@ -223,7 +237,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(usage), 2)
         self.assertEqual(usage[0]['data'], {'input_tokens': 5, 'output_tokens': 7, 'cached_input_tokens': 2})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
-        self.assertEqual(first['thinking'], {'type': 'enabled', 'budget_tokens': 2048})
+        self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized'})
+        self.assertEqual(first['output_config'], {'effort': 'low'})
         self.assertEqual(first['messages'], [{'role': 'user', 'content': [{'type': 'text', 'text': 'tool:shared'}]}])
         assistant = second['messages'][1]
         self.assertEqual(assistant['role'], 'assistant')
@@ -236,10 +251,16 @@ class AnthropicRuntimeTests(unittest.TestCase):
         state = client.request('resume', bot='Bob')['result']
         self.assertEqual((state['provider'], state['family'], state['model'], state['reasoning']),
                          ('anthropic', 'anthropic', 'synthetic-claude', 'low'))
-        self.assertEqual(client.request('create', bot='Bad', workspace=str(path), reasoning='max')['error'],
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(path), reasoning='extreme')['error'],
                          'invalid_reasoning_level')
         self.assertEqual(client.request('create', bot='Bad', workspace=str(path), model='openai/x')['error'],
                          'provider_unavailable')
+        client.request('create', bot='Capped', workspace=str(path), budget_tokens=10)
+        capped = client.request('submit', bot='Capped', request_id='cap', prompt='incomplete')['result']['turn']
+        self.assertEqual(client.finished(capped)['data']['error'], 'provider_incomplete')
+        self.assertEqual(client.request('resume', bot='Capped')['result']['tokens_used'], 12)
+        self.assertEqual(client.request('submit', bot='Capped', request_id='retry', prompt='hello')['error'],
+                         'budget_exhausted')
 
 
 class ModelFixture(unittest.TestCase):

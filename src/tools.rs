@@ -75,10 +75,10 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read a UTF-8 text file with line numbers. Paths are relative to the workspace unless absolute. Use offset (1-based line) and limit (lines, default 500) to page through large files.",
-                json!({"type":"object","properties":{"path":{"type":"string"},
+                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts. Use offset (1-based line) and limit (lines, default 500) to page.",
+                json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
-                "required":["path"],"additionalProperties":false}),
+                "additionalProperties":false}),
             ),
             Tool::Write => (
                 "Create or overwrite a file with the given content, creating parent directories. Content is limited to 1 MiB.",
@@ -131,7 +131,7 @@ pub enum Prepared {
         timeout_ms: Option<u64>,
     },
     Read {
-        path: String,
+        source: ReadSource,
         offset: usize,
         limit: usize,
     },
@@ -145,6 +145,38 @@ pub enum Prepared {
         new: String,
         replace_all: bool,
     },
+}
+
+/// What a `read` call reads: a workspace file, or a retained tool output
+/// that only the runtime can fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSource {
+    Path(String),
+    Artifact {
+        turn: i64,
+        call_id: String,
+        stream: String,
+    },
+}
+impl ReadSource {
+    /// `TURN/CALL_ID/STREAM`, the reference a truncated result lists.
+    pub fn parse_artifact(text: &str) -> Result<ReadSource> {
+        let mut parts = text.splitn(3, '/');
+        if let (Some(turn), Some(call_id), Some(stream)) =
+            (parts.next(), parts.next(), parts.next())
+            && let Ok(turn) = turn.parse::<i64>()
+            && turn > 0
+            && !call_id.is_empty()
+            && matches!(stream, "stdout" | "stderr")
+        {
+            return Ok(ReadSource::Artifact {
+                turn,
+                call_id: call_id.into(),
+                stream: stream.into(),
+            });
+        }
+        crate::fail_with("invalid_artifact_reference", text)
+    }
 }
 
 /// Model-facing result text plus any full outputs that were truncated.
@@ -254,7 +286,8 @@ impl Registry {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Read {
-            path: String,
+            path: Option<String>,
+            artifact: Option<String>,
             #[serde(default = "one")]
             offset: usize,
             #[serde(default = "default_limit")]
@@ -335,12 +368,19 @@ impl Registry {
             }
             Tool::Read => {
                 let args: Read = serde_json::from_str(args).map_err(invalid)?;
-                path(&args.path)?;
                 if args.offset == 0 || !(1..=5000).contains(&args.limit) {
                     return fail("invalid_tool_arguments");
                 }
+                let source = match (args.path, args.artifact) {
+                    (Some(file), None) => {
+                        path(&file)?;
+                        ReadSource::Path(file)
+                    }
+                    (None, Some(reference)) => ReadSource::parse_artifact(&reference)?,
+                    _ => return fail("invalid_tool_arguments"),
+                };
                 Prepared::Read {
-                    path: args.path,
+                    source,
                     offset: args.offset,
                     limit: args.limit,
                 }
@@ -394,51 +434,19 @@ impl Registry {
                 Ok(self.shell_outcome(stdout, stderr, status))
             }
             Prepared::Read {
-                path,
+                source: ReadSource::Artifact { .. },
+                ..
+            } => fail("artifact_requires_runtime"),
+            Prepared::Read {
+                source: ReadSource::Path(path),
                 offset,
                 limit,
             } => {
                 let bytes = read_bounded(&resolve(workspace, &path)).await?;
                 let text = String::from_utf8_lossy(&bytes);
-                let total = text.lines().count();
-                let mut output = String::new();
-                let mut shown = 0;
-                for (index, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
-                    // Reserve space for continuation/line-count notices. Check
-                    // lengths before copying a potentially multi-megabyte line.
-                    let prefix = format!("{:>6}\t", index + 1);
-                    let entry_bytes = prefix.len() + line.len() + 1;
-                    if output.len() + entry_bytes > PREVIEW_BYTES - 128 {
-                        if shown == 0 {
-                            return crate::fail_with(
-                                "read_line_too_long",
-                                format!(
-                                    "line {} exceeds the read page budget; use a byte-oriented tool to inspect it",
-                                    index + 1
-                                ),
-                            );
-                        }
-                        output.push_str(&format!(
-                            "[truncated at line {}; continue with offset={}]\n",
-                            index + 1,
-                            index + 1
-                        ));
-                        break;
-                    }
-                    output.push_str(&prefix);
-                    output.push_str(line);
-                    output.push('\n');
-                    shown += 1;
-                }
-                if offset > total && total > 0 {
-                    output = format!("[offset {offset} is past the last line {total}]\n");
-                } else if shown < total - (offset - 1).min(total) {
-                    output.push_str(&format!(
-                        "[showing lines {offset}-{} of {total}]\n",
-                        offset + shown - 1
-                    ));
-                }
-                Ok(Outcome::text(self.redact(output)))
+                Ok(Outcome::text(
+                    self.redact(page_lines(&text, offset, limit)?),
+                ))
             }
             Prepared::Write { path, content } => {
                 let target = resolve(workspace, &path);
@@ -558,6 +566,57 @@ impl Registry {
     }
 }
 
+/// Number lines from a 1-based offset within the page budget. A single line
+/// beyond the budget is an explicit error rather than a silent cut.
+pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
+    let total = text.lines().count();
+    let mut output = String::new();
+    let mut shown = 0;
+    for (index, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+        // Reserve space for continuation/line-count notices. Check
+        // lengths before copying a potentially multi-megabyte line.
+        let prefix = format!("{:>6}\t", index + 1);
+        let entry_bytes = prefix.len() + line.len() + 1;
+        if output.len() + entry_bytes > PREVIEW_BYTES - 128 {
+            if shown == 0 {
+                return crate::fail_with(
+                    "read_line_too_long",
+                    format!(
+                        "line {} exceeds the read page budget; use a byte-oriented tool to inspect it",
+                        index + 1
+                    ),
+                );
+            }
+            output.push_str(&format!(
+                "[truncated at line {}; continue with offset={}]\n",
+                index + 1,
+                index + 1
+            ));
+            break;
+        }
+        output.push_str(&prefix);
+        output.push_str(line);
+        output.push('\n');
+        shown += 1;
+    }
+    if offset > total && total > 0 {
+        output = format!("[offset {offset} is past the last line {total}]\n");
+    } else if shown < total - (offset - 1).min(total) {
+        output.push_str(&format!(
+            "[showing lines {offset}-{} of {total}]\n",
+            offset + shown - 1
+        ));
+    }
+    Ok(output)
+}
+
+/// Redaction for runtime-produced text, such as artifact pages.
+impl Registry {
+    pub fn redact_text(&self, text: String) -> String {
+        self.redact(text)
+    }
+}
+
 fn resolve(workspace: &Path, path: &str) -> PathBuf {
     workspace.join(path)
 }
@@ -576,7 +635,7 @@ fn truncate(text: &str) -> String {
     let tail_start = boundary(text, text.len() - half);
     let omitted = text.len() - head.len() - (text.len() - tail_start);
     format!(
-        "{head}\n[... {omitted} bytes omitted; full output retained as an artifact ...]\n{}",
+        "{head}\n[... {omitted} bytes omitted; the full output is retained: see this result's artifacts and read them with the read tool ...]\n{}",
         &text[tail_start..]
     )
 }

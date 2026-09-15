@@ -57,6 +57,7 @@ enum Command {
         model: Option<String>,
         instructions: Option<String>,
         reasoning: Option<String>,
+        budget_tokens: Option<u64>,
     },
     Resume {
         bot: String,
@@ -66,6 +67,19 @@ enum Command {
         checkpoint: i64,
         bot: String,
         workspace: Option<String>,
+        budget_tokens: Option<u64>,
+    },
+    /// A bot's turns with status, workspace, model, tokens, and timing.
+    Turns {
+        bot: String,
+        #[serde(default)]
+        after: i64,
+        limit: Option<usize>,
+    },
+    /// A turn's outcome without waiting: the wait payload, or its live status.
+    Result {
+        bot: String,
+        turn: i64,
     },
     Submit {
         bot: String,
@@ -193,6 +207,11 @@ pub struct Configuration {
     pub max_active: Option<usize>,
     /// Provider requests awaiting response headers; default 64; zero unbounded.
     pub max_connecting: Option<usize>,
+    /// Generated tokens per Responses call, including reasoning; none by default.
+    pub max_output_tokens: Option<u32>,
+    /// Exit a socket daemon after this many seconds with no sessions, no
+    /// active turns, and no running background commands; none by default.
+    pub idle_exit: Option<u64>,
 }
 
 pub struct Limits {
@@ -269,13 +288,13 @@ pub async fn run(config: Configuration) -> Result<()> {
         if let (Some(env), Some(value)) = (&spec.key_env, &key) {
             credentials.push((env.clone(), value.clone()));
         }
-        if providers
-            .insert(
-                spec.name.clone(),
-                Provider::new(transport.clone(), spec.family, &spec.url, key, &schemas)?,
-            )
-            .is_some()
+        let mut provider = Provider::new(transport.clone(), spec.family, &spec.url, key, &schemas)?;
+        if let Some(cap) = config.max_output_tokens
+            && spec.family == Family::Responses
         {
+            provider = provider.with_max_output_tokens(cap)?;
+        }
+        if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
         binding.insert(
@@ -292,7 +311,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             return fail_with("provider_unavailable", provider);
         }
     }
-    let binding = json!({"schema":5,"providers":binding,"tools":registry.names()}).to_string();
+    let binding = json!({"providers":binding,"tools":registry.names()}).to_string();
     let store = Store::open(&config.store, binding).await?;
     let mut environment = vec![
         (
@@ -321,8 +340,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_completed_checkpoint","submit","interrupt","events","item","artifact","follow","bots","wait"],
-        "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting},
+        "capabilities":["create","resume","fork_completed_checkpoint","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
+        "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
+            "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit},
+        "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":provider_names,"default_model":config.model,
         "durability":"sqlite_full","partial_text_durable":false});
     let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
@@ -400,6 +421,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
     };
+    let idle_exit = config
+        .idle_exit
+        .filter(|_| config.socket.is_some())
+        .map(Duration::from_secs);
+    let mut last_activity = std::time::Instant::now();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -414,11 +440,22 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
+            _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
+                // Idle means no client, no live turn, and no running command.
+                // Parked turns are durable and resume on the next start.
+                let running = service.store.call(|db| db.running_processes()).await?;
+                if sessions.is_empty() && service.active.is_empty() && running == 0 {
+                    if last_activity.elapsed() >= idle_exit.unwrap() { break; }
+                } else {
+                    last_activity = std::time::Instant::now();
+                }
+            }
             Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
                 service.resume(bot, turn).await?;
             }
             message = inbound.recv() => {
                 let Some(message) = message else { break };
+                last_activity = std::time::Instant::now();
                 match message {
                     Inbound::Open(id, output) => {
                         let _ = output.try_send(ready.clone());
@@ -537,7 +574,11 @@ impl Service {
                 model,
                 instructions,
                 reasoning,
+                budget_tokens,
             } => {
+                if budget_tokens == Some(0) {
+                    return fail("invalid_budget");
+                }
                 name(&bot)?;
                 let path = path.as_deref().map(workspace).transpose()?;
                 let reference = model
@@ -550,7 +591,7 @@ impl Service {
                     .ok_or(Error::with("provider_unavailable", provider))?
                     .family();
                 if let Some(level) = &reasoning
-                    && !matches!(level.as_str(), "low" | "medium" | "high")
+                    && !matches!(level.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
                 {
                     return fail("invalid_reasoning_level");
                 }
@@ -571,8 +612,26 @@ impl Service {
                                 model: &model,
                                 instructions: &instructions,
                                 reasoning: reasoning.as_deref(),
+                                budget_tokens,
                             },
                         )?)?)
+                    })
+                    .await
+            }
+            Command::Turns { bot, after, limit } => {
+                store
+                    .call(move |db| db.turns(&bot, after, limit.unwrap_or(64)))
+                    .await
+            }
+            Command::Result { bot, turn } => {
+                store
+                    .call(move |db| match db.turn_outcome(&bot, turn)? {
+                        Some(outcome) => Ok(outcome),
+                        None => {
+                            let context = db.context(turn)?;
+                            let status = db.inspect(&context.bot)?.status;
+                            Ok(json!({"turn":turn,"status":status,"finished":false}))
+                        }
                     })
                     .await
             }
@@ -622,7 +681,11 @@ impl Service {
                 checkpoint,
                 bot,
                 workspace: path,
+                budget_tokens,
             } => {
+                if budget_tokens == Some(0) {
+                    return fail("invalid_budget");
+                }
                 name(&bot)?;
                 let path = path.as_deref().map(workspace).transpose()?;
                 store
@@ -632,6 +695,7 @@ impl Service {
                             checkpoint,
                             &bot,
                             path.as_deref(),
+                            budget_tokens,
                         )?)?)
                     })
                     .await
@@ -843,6 +907,7 @@ mod tests {
                         model: "synthetic-model",
                         instructions: "test",
                         reasoning: None,
+                        budget_tokens: None,
                     },
                 )?;
                 let turn = db
@@ -954,6 +1019,7 @@ mod tests {
             model: "synthetic-model",
             instructions: "test",
             reasoning: None,
+            budget_tokens: None,
         };
         let turn = store
             .call(move |db| {

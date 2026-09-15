@@ -25,6 +25,7 @@ fn binding() -> Binding<'static> {
         model: "synthetic-model",
         instructions: "test",
         reasoning: None,
+        budget_tokens: None,
     }
 }
 fn result(output: &str) -> Outcome {
@@ -55,10 +56,11 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     db.append(second, vec![assistant("answer two")], &[], None)
         .unwrap();
     db.finish(second, None).unwrap();
-    db.fork("Bob", checkpoint, "Alternative", None).unwrap();
+    db.fork("Bob", checkpoint, "Alternative", None, None)
+        .unwrap();
     assert_eq!(db.load("Alternative").unwrap().len(), 2);
     assert_eq!(db.load("Bob").unwrap().len(), 4);
-    assert!(db.fork("Bob", checkpoint - 1, "bad", None).is_err());
+    assert!(db.fork("Bob", checkpoint - 1, "bad", None, None).is_err());
     // The fork carries no default directory; each of its turns names one.
     assert_eq!(
         db.begin(
@@ -413,4 +415,80 @@ fn bot_pages_obey_byte_budget_without_loading_instructions() {
     assert_eq!(bots.len() + rest["bots"].as_array().unwrap().len(), 140);
     assert!(rest["next_after"].is_null());
     assert_eq!(db.inspect("bot-000").unwrap().instructions, instructions);
+}
+
+#[test]
+fn budgets_count_tokens_and_turn_listings_carry_accounting() {
+    use agent_runtime::provider::Usage;
+    let mut db = db();
+    let mut capped = binding();
+    capped.budget_tokens = Some(150);
+    db.create("Bob", Some("/synthetic"), capped).unwrap();
+    let turn = db
+        .begin("Bob", "r1", "work", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let usage = Usage {
+        input_tokens: 100,
+        output_tokens: 20,
+        cached_input_tokens: 0,
+    };
+    db.append(turn, vec![assistant("one")], &[], Some(&usage))
+        .unwrap();
+    assert_eq!(db.inspect("Bob").unwrap().tokens_used, 120);
+    db.finish(turn, None).unwrap();
+    // Below the cap, a second turn is admitted; its own call pushes past it.
+    let second = db
+        .begin("Bob", "r2", "more", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    db.append(second, vec![assistant("two")], &[], Some(&usage))
+        .unwrap();
+    db.finish(second, None).unwrap();
+    assert_eq!(
+        db.begin("Bob", "r3", "again", true, &TurnOptions::default())
+            .unwrap_err()
+            .code,
+        "budget_exhausted"
+    );
+    let page = db.turns("Bob", 0, 1).unwrap();
+    let first = &page["turns"][0];
+    assert_eq!(
+        (
+            first["turn"].as_i64(),
+            first["input_tokens"].as_i64(),
+            first["output_tokens"].as_i64()
+        ),
+        (Some(turn), Some(100), Some(20))
+    );
+    assert_eq!(first["status"], "completed");
+    assert!(first["started_ms"].as_i64().unwrap() <= first["finished_ms"].as_i64().unwrap());
+    assert_eq!(page["next_after"], turn);
+    let rest = db.turns("Bob", turn, 64).unwrap();
+    assert_eq!(rest["turns"].as_array().unwrap().len(), 1);
+    assert!(rest["next_after"].is_null());
+}
+
+#[test]
+fn stores_carry_a_schema_version_and_refuse_unversioned_or_newer_ones() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE bots(name TEXT PRIMARY KEY)")
+        .unwrap();
+    assert_eq!(
+        Database::initialize(conn, "test").err().unwrap().code,
+        "store_schema_unsupported"
+    );
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "user_version", Database::SCHEMA + 1)
+        .unwrap();
+    assert_eq!(
+        Database::initialize(conn, "test").err().unwrap().code,
+        "store_schema_newer"
+    );
+    let conn = Connection::open_in_memory().unwrap();
+    let version: i32 = {
+        let _db = Database::initialize(conn, "test").unwrap();
+        Database::SCHEMA
+    };
+    assert_eq!(version, Database::SCHEMA);
 }

@@ -14,7 +14,7 @@ use agent_runtime::{
     history::History,
     provider::{Delta, Provider, Request as ModelRequest, ToolCall},
     store::Store,
-    tools::{Outcome, Prepared, Registry},
+    tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use serde_json::json;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -117,9 +117,25 @@ impl Turn {
                 return Ok(Round::Parked);
             }
         }
+        let mut tokens_used = record.tokens_used;
         for _ in context.model_rounds..MAX_ROUNDS {
+            // The budget is checked before each call, so one call may overshoot.
+            if record
+                .budget_tokens
+                .is_some_and(|budget| tokens_used >= budget)
+            {
+                return Err(Error::with(
+                    "budget_exhausted",
+                    format!(
+                        "{} of {} tokens used",
+                        tokens_used,
+                        record.budget_tokens.unwrap_or(0)
+                    ),
+                ));
+            }
+            let mut reported_usage = None;
             let response = provider
-                .complete(
+                .complete_accounted(
                     ModelRequest {
                         model,
                         instructions: &record.instructions,
@@ -136,15 +152,35 @@ impl Turn {
                             json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"text":text}),
                         )
                     },
+                    &mut reported_usage,
                 )
-                .await?;
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    self.failed_usage(reported_usage).await?;
+                    return Err(error);
+                }
+            };
+            if let Some(usage) = &response.usage {
+                tokens_used = tokens_used
+                    .saturating_add(usage.input_tokens)
+                    .saturating_add(usage.output_tokens);
+            }
             let items = response.items.clone();
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
             let entries = self
                 .store
                 .call(move |db| db.append(turn, items, &calls, usage.as_ref()))
-                .await?;
+                .await;
+            let entries = match entries {
+                Ok(entries) => entries,
+                Err(error) => {
+                    self.failed_usage(response.usage.clone()).await?;
+                    return Err(error);
+                }
+            };
             for entry in entries {
                 self.hub.durable(&self.bot, entry).await?;
             }
@@ -162,6 +198,18 @@ impl Turn {
             }
         }
         fail("tool_round_limit")
+    }
+
+    async fn failed_usage(&self, usage: Option<agent_runtime::provider::Usage>) -> Result<()> {
+        if let Some(usage) = usage {
+            let turn = self.turn;
+            let entry = self
+                .store
+                .call(move |db| db.failed_usage(turn, &usage))
+                .await?;
+            self.hub.durable(&self.bot, entry).await?;
+        }
+        Ok(())
     }
 
     /// Run planned calls in order. Returns true when a wait parked the turn;
@@ -204,8 +252,30 @@ impl Turn {
                     self.background(&call.call_id, command, workspace.to_path_buf(), timeout_ms)
                         .await?
                 }
+                Ok(Prepared::Read {
+                    source:
+                        ReadSource::Artifact {
+                            turn: owner,
+                            call_id: ref_call,
+                            stream,
+                        },
+                    offset,
+                    limit,
+                }) => {
+                    let bot = self.bot.clone();
+                    let text = self
+                        .store
+                        .call(move |db| {
+                            db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
+                        })
+                        .await;
+                    match text {
+                        Ok(page) => Outcome::text(self.registry.redact_text(page)),
+                        Err(error) => failure(error),
+                    }
+                }
                 Ok(prepared) => match self.registry.execute(prepared, workspace).await {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => annotate(outcome, turn, &call.call_id),
                     Err(error) if error.code == "tool_scheduler_closed" => return Err(error),
                     Err(error) => failure(error),
                 },
@@ -284,19 +354,23 @@ impl Turn {
         let (sender, receiver) = oneshot::channel();
         self.registry
             .background(command, workspace, timeout_ms, sender);
-        let (store, handles, failures) = (
+        let (store, handles, failures, call_id_for_refs) = (
             self.store.clone(),
             self.handles.clone(),
             self.background_failures.clone(),
+            call_id.to_owned(),
         );
         tokio::spawn(async move {
             let result = receiver.await.unwrap_or_else(|_| fail("process_lost"));
             let (value, artifacts) = match result {
-                Ok(outcome) => (
-                    serde_json::from_str(&outcome.output)
-                        .unwrap_or(json!({"output":outcome.output})),
-                    outcome.artifacts,
-                ),
+                Ok(outcome) => {
+                    let outcome = annotate(outcome, turn, &call_id_for_refs);
+                    (
+                        serde_json::from_str(&outcome.output)
+                            .unwrap_or(json!({"output":outcome.output})),
+                        outcome.artifacts,
+                    )
+                }
                 Err(error) => (
                     json!({"error":error.code,"detail":error.detail}),
                     Vec::new(),
@@ -320,6 +394,26 @@ impl Turn {
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
     }
+}
+
+/// Name retained streams in the model-facing result so the model can read
+/// them back: `TURN/CALL_ID/STREAM`.
+fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
+    if outcome.artifacts.is_empty() {
+        return outcome;
+    }
+    let refs: Vec<String> = outcome
+        .artifacts
+        .iter()
+        .map(|(stream, _)| format!("{turn}/{call_id}/{stream}"))
+        .collect();
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&outcome.output)
+        && value.is_object()
+    {
+        value["artifacts"] = json!(refs);
+        outcome.output = value.to_string();
+    }
+    outcome
 }
 
 fn failure(error: Error) -> Outcome {

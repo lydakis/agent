@@ -14,10 +14,13 @@ const USAGE: &str = "usage:
   agent follow --bot NAME [--after N] replay then stream a bot's events as JSONL
   agent fork --source NAME --checkpoint N --bot NAME [--workspace DIR]
   agent interrupt --bot NAME
+  agent turns --bot NAME [--after N]     list a bot's turns with status, tokens, and timing
+  agent result --bot NAME --turn N       a turn's outcome without waiting
   agent wait [--timeout-ms N] HANDLE...  block until turn:BOT/N or proc:N handles resolve
   agent ls | agent shutdown
   agent serve --store PATH [--socket PATH] --provider SPEC... [--model P/M] [--tools LIST]
               [--max-processes N] [--max-active N] [--max-connecting N]   (0 = unbounded)
+              [--max-output-tokens N] [--idle-exit SECONDS]
   agent benchmark | agent --version
 options: --store PATH --model PROVIDER/MODEL --provider SPEC --tools LIST --workspace DIR
          --bot NAME --instructions TEXT --instructions-file F --reasoning low|medium|high
@@ -83,9 +86,10 @@ fn run() -> Result<i32> {
                 .map_err(|_| Error::new("output_worker_failed"))??;
             result.map(|_| 0)
         }
-        Some("run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown" | "wait") => {
-            client::main(args)
-        }
+        Some(
+            "run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown" | "wait" | "turns"
+            | "result",
+        ) => client::main(args),
         _ => fail_with("usage", USAGE),
     }
 }
@@ -106,6 +110,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_processes = None;
     let mut max_active = None;
     let mut max_connecting = None;
+    let mut max_output_tokens = None;
+    let mut idle_exit = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -128,6 +134,17 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     _ => max_connecting = Some(parsed),
                 }
             }
+            "--max-output-tokens" => {
+                max_output_tokens = Some(value.parse::<u32>().ok().filter(|n| *n > 0).ok_or(
+                    Error::with("usage", "--max-output-tokens needs a positive integer"),
+                )?)
+            }
+            "--idle-exit" => {
+                let seconds: u64 = value
+                    .parse()
+                    .map_err(|_| Error::with("usage", "--idle-exit needs seconds (0 disables)"))?;
+                idle_exit = (seconds > 0).then_some(seconds);
+            }
             _ => return fail_with("usage", USAGE),
         }
     }
@@ -144,5 +161,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_processes,
         max_active,
         max_connecting,
+        max_output_tokens,
+        idle_exit,
     })
 }

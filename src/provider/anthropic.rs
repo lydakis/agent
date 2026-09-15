@@ -148,6 +148,9 @@ impl State {
             _ => Ok(None), // ping, content_block_stop, unknown metadata
         }
     }
+    pub fn usage(&self) -> Option<Usage> {
+        self.saw_usage.then(|| self.usage.clone())
+    }
     pub fn finish(self) -> Result<Completion> {
         if !self.done {
             return fail("missing_completion");
@@ -262,10 +265,13 @@ mod tests {
             &mut state,
             &[
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":12}}}"#,
                 r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":1}}"#,
                 r#"{"type":"message_stop"}"#,
             ],
         );
+        assert_eq!(state.usage().unwrap().input_tokens, 12);
+        assert_eq!(state.usage().unwrap().output_tokens, 1);
         assert_eq!(state.finish().unwrap_err().code, "provider_incomplete");
         assert_eq!(
             State::default().finish().unwrap_err().code,

@@ -22,6 +22,7 @@ pub struct State {
     text: String,
     thinking: usize,
     completion: Option<Completion>,
+    usage: Option<Usage>,
 }
 
 impl State {
@@ -49,11 +50,19 @@ impl State {
             }
             "response.completed" => {
                 let raw = event.response.ok_or(Error::new("missing_response"))?;
-                self.completion = Some(parse_completion(raw, &self.text)?);
+                self.completion = Some(parse_completion_with_usage(
+                    raw,
+                    &self.text,
+                    &mut self.usage,
+                )?);
                 Ok(None)
             }
             "error" | "response.failed" | "response.incomplete" => {
                 let value: Value = serde_json::from_slice(frame).unwrap_or(Value::Null);
+                self.usage = value["response"]
+                    .get("usage")
+                    .filter(|v| !v.is_null())
+                    .map(parse_usage);
                 let detail = detail_of(&value)
                     .or_else(|| detail_of(&value["response"]))
                     .or_else(|| {
@@ -71,12 +80,24 @@ impl State {
             _ => Ok(None),
         }
     }
+    pub fn usage(&self) -> Option<Usage> {
+        self.usage.clone()
+    }
     pub fn finish(self) -> Result<Completion> {
         self.completion.ok_or(Error::new("missing_completion"))
     }
 }
 
+#[cfg(test)]
 fn parse_completion(raw: &RawValue, streamed: &str) -> Result<Completion> {
+    parse_completion_with_usage(raw, streamed, &mut None)
+}
+
+fn parse_completion_with_usage(
+    raw: &RawValue,
+    streamed: &str,
+    reported: &mut Option<Usage>,
+) -> Result<Completion> {
     #[derive(Deserialize)]
     struct Response<'a> {
         status: &'a str,
@@ -85,6 +106,7 @@ fn parse_completion(raw: &RawValue, streamed: &str) -> Result<Completion> {
         usage: Option<Value>,
     }
     let response: Response<'_> = serde_json::from_str(raw.get())?;
+    *reported = response.usage.as_ref().map(parse_usage);
     if response.status != "completed" {
         return fail("provider_incomplete");
     }
@@ -129,18 +151,22 @@ fn parse_completion(raw: &RawValue, streamed: &str) -> Result<Completion> {
     if text != streamed {
         return fail("stream_terminal_mismatch");
     }
-    let usage = response.usage.map(|usage| Usage {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-        cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-    });
+    let usage = reported.clone();
     Ok(Completion {
         items,
         calls,
         usage,
     })
+}
+
+fn parse_usage(usage: &Value) -> Usage {
+    Usage {
+        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0),
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +176,11 @@ mod tests {
     fn inconsistent_terminal_text_and_duplicate_tool_ids_fail() {
         let text = RawValue::from_string(r#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"wrong"}]}]}"#.into()).unwrap();
         assert!(parse_completion(&text, "expected").is_err());
+        let mut state = State::default();
+        assert!(state.frame(br#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"unstreamed"}]}],"usage":{"input_tokens":10,"output_tokens":2}}}"#).is_err());
+        assert_eq!(state.usage().unwrap().input_tokens, 10);
+        assert_eq!(state.usage().unwrap().output_tokens, 2);
+
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
     }

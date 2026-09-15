@@ -103,6 +103,12 @@ impl Parser {
             Parser::Anthropic(state) => state.frame(frame),
         }
     }
+    fn usage(&self) -> Option<Usage> {
+        match self {
+            Parser::Responses(state) => state.usage(),
+            Parser::Anthropic(state) => state.usage(),
+        }
+    }
     fn finish(self) -> Result<Completion> {
         match self {
             Parser::Responses(state) => state.finish(),
@@ -184,6 +190,8 @@ impl Provider {
             tools: Option<&'a RawValue>,
             #[serde(skip_serializing_if = "Option::is_none")]
             thinking: Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            output_config: Option<Value>,
         }
         let (mut bytes, field) = match self.family {
             Family::Responses => (
@@ -209,14 +217,25 @@ impl Provider {
                     system: request.instructions,
                     stream: true,
                     tools: self.has_tools.then_some(&*self.tools),
+                    // Current Claude models take adaptive thinking with an
+                    // effort level and reject budgets; Haiku 4.5 and older
+                    // models still need an explicit budget.
                     thinking: request.reasoning.map(|level| {
-                        let budget = match level {
-                            "low" => 2048,
-                            "medium" => 8192,
-                            _ => 16384,
-                        };
-                        json!({"type":"enabled","budget_tokens":budget})
+                        if legacy_thinking(request.model) {
+                            let budget = match level {
+                                "low" => 2048,
+                                "medium" => 8192,
+                                _ => 16384,
+                            };
+                            json!({"type":"enabled","budget_tokens":budget})
+                        } else {
+                            json!({"type":"adaptive","display":"summarized"})
+                        }
                     }),
+                    output_config: request
+                        .reasoning
+                        .filter(|_| !legacy_thinking(request.model))
+                        .map(|level| json!({"effort":level})),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -251,12 +270,33 @@ impl Provider {
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        self.complete_inner(request, delta)
+        self.complete_accounted(request, delta, &mut None).await
+    }
+
+    /// Also return provider-reported usage when a stream or completion fails.
+    /// Successful callers still commit usage with their accepted transcript.
+    pub async fn complete_accounted<F, Fut>(
+        &self,
+        request: Request<'_>,
+        delta: F,
+        usage: &mut Option<Usage>,
+    ) -> Result<Completion>
+    where
+        F: FnMut(Delta) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        *usage = None;
+        self.complete_inner(request, delta, usage)
             .await
             .map_err(|error| sanitize_error(error, self.key.as_deref()))
     }
 
-    async fn complete_inner<F, Fut>(&self, request: Request<'_>, mut delta: F) -> Result<Completion>
+    async fn complete_inner<F, Fut>(
+        &self,
+        request: Request<'_>,
+        mut delta: F,
+        usage: &mut Option<Usage>,
+    ) -> Result<Completion>
     where
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
@@ -309,30 +349,53 @@ impl Provider {
             Family::Responses => Parser::Responses(responses::State::default()),
             Family::Anthropic => Parser::Anthropic(anthropic::State::default()),
         };
-        let mut total = 0usize;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
-            total += chunk.len();
-            if total > 16 * 1024 * 1024 {
-                return fail("provider_response_limit");
-            }
-            for byte in chunk {
-                let Some(frame) = decoder.byte(byte)? else {
-                    continue;
-                };
-                if frame == b"[DONE]" {
-                    continue;
+        let result = async {
+            let mut total = 0usize;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
+                total += chunk.len();
+                if total > 16 * 1024 * 1024 {
+                    return fail("provider_response_limit");
                 }
-                if let Some(part) = parser.frame(&frame)? {
-                    delta(part).await?;
+                for byte in chunk {
+                    let Some(frame) = decoder.byte(byte)? else {
+                        continue;
+                    };
+                    if frame == b"[DONE]" {
+                        continue;
+                    }
+                    if let Some(part) = parser.frame(&frame)? {
+                        delta(part).await?;
+                    }
                 }
             }
+            if !decoder.is_empty() {
+                return fail("truncated_sse_frame");
+            }
+            Ok(())
         }
-        if !decoder.is_empty() {
-            return fail("truncated_sse_frame");
-        }
+        .await;
+        *usage = parser.usage();
+        result?;
         parser.finish()
     }
+}
+
+/// Model ids that predate adaptive thinking and still require a token budget.
+fn legacy_thinking(model: &str) -> bool {
+    [
+        "claude-haiku-4-5",
+        "claude-sonnet-4-5",
+        "claude-opus-4-5",
+        "claude-opus-4-1",
+        "claude-sonnet-4-",
+        "claude-opus-4-0",
+        "claude-3-",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+        && !model.starts_with("claude-sonnet-4-6")
+        && !model.starts_with("claude-opus-4-6")
 }
 
 // Preserve only stage, timeout classification, and numeric OS code. Reqwest's
@@ -456,7 +519,20 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
         assert!(text.ends_with(",\"messages\":["));
-        assert!(text.contains("\"budget_tokens\":2048"));
+        assert!(text.contains("\"type\":\"adaptive\""));
+        assert!(text.contains("\"effort\":\"low\""));
+        assert!(!text.contains("budget_tokens"));
+        let legacy = provider
+            .prefix(&Request {
+                model: "claude-haiku-4-5-20251001",
+                instructions: "i",
+                reasoning: Some("low"),
+                history: &history,
+            })
+            .unwrap();
+        let legacy = String::from_utf8(legacy).unwrap();
+        assert!(legacy.contains("\"budget_tokens\":2048"));
+        assert!(!legacy.contains("output_config"));
         assert!(!text.contains("\"tools\""));
         assert_eq!(provider.url.path(), "/messages");
         let responses =

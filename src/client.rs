@@ -42,6 +42,8 @@ struct Options {
     detach: bool,
     no_spawn: bool,
     timeout_ms: Option<u64>,
+    budget_tokens: Option<u64>,
+    turn: Option<i64>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
@@ -67,6 +69,8 @@ fn parse(args: &[String]) -> Result<Options> {
         detach: false,
         no_spawn: false,
         timeout_ms: None,
+        budget_tokens: None,
+        turn: None,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
     };
@@ -115,11 +119,27 @@ fn parse(args: &[String]) -> Result<Options> {
                                 Error::with("usage", "--timeout-ms needs an integer")
                             })?)
                     }
-                    "--max-processes" | "--max-active" | "--max-connecting" => {
+                    "--max-processes"
+                    | "--max-active"
+                    | "--max-connecting"
+                    | "--max-output-tokens"
+                    | "--idle-exit" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
                         options.daemon_flags.push((flag.to_owned(), value));
+                    }
+                    "--budget-tokens" => {
+                        options.budget_tokens = Some(value.parse().map_err(|_| {
+                            Error::with("usage", "--budget-tokens needs an integer")
+                        })?)
+                    }
+                    "--turn" => {
+                        options.turn = Some(
+                            value
+                                .parse()
+                                .map_err(|_| Error::with("usage", "--turn needs an integer"))?,
+                        )
                     }
                     "--after" => {
                         options.after = value
@@ -286,6 +306,14 @@ impl Connection {
     }
 }
 
+fn ensure_existing_daemon(options: &Options) -> Result<Connection> {
+    // Inspection must never initialize a replacement store for a missing one.
+    if !options.store.is_file() {
+        return fail("store_not_found");
+    }
+    ensure_daemon(options)
+}
+
 fn ensure_daemon(options: &Options) -> Result<Connection> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let connect = || match Connection::connect_until(&options.socket, deadline) {
@@ -394,6 +422,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "fork" => fork(&options),
         "interrupt" => interrupt(&options),
         "wait" => wait(&options),
+        "turns" => turns(&options),
+        "result" => result(&options),
         "ls" => list(&options),
         "shutdown" => {
             let mut connection = Connection::connect(&options.socket)?;
@@ -434,7 +464,8 @@ fn run(options: &Options) -> Result<i32> {
         connection.request(
             "create",
             json!({"bot":bot,"workspace":workspace,"model":options.model,
-                "instructions":options.instructions,"reasoning":options.reasoning}),
+                "instructions":options.instructions,"reasoning":options.reasoning,
+                "budget_tokens":options.budget_tokens}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
@@ -506,7 +537,8 @@ fn fork(options: &Options) -> Result<i32> {
     let result = connection.request(
         "fork",
         json!({"source":source,"checkpoint":checkpoint,"bot":bot,
-            "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?}),
+            "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
+            "budget_tokens":options.budget_tokens}),
     )?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(0)
@@ -545,6 +577,77 @@ fn wait(options: &Options) -> Result<i32> {
                 .all(|v| v.get("error").is_none_or(Value::is_null))
         });
     Ok(if clean { 0 } else { 1 })
+}
+
+/// A bot's turns, paged through completely; JSON array or a table.
+fn turns(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "turns needs --bot"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    let mut after = json!(options.after);
+    let mut first = true;
+    if !options.pretty {
+        print!("[");
+    }
+    loop {
+        let page = connection.request("turns", json!({"bot":bot,"after":after,"limit":64}))?;
+        let turns = page["turns"]
+            .as_array()
+            .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        for turn in turns {
+            if options.pretty {
+                println!(
+                    "{:>6} {:<11} in {:>7} out {:>6} rounds {:>3}  {}  {}",
+                    turn["turn"],
+                    turn["status"].as_str().unwrap_or(""),
+                    turn["input_tokens"],
+                    turn["output_tokens"],
+                    turn["model_rounds"],
+                    turn["workspace"].as_str().unwrap_or("-"),
+                    turn["prompt_preview"]
+                        .as_str()
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect::<String>()
+                );
+            } else {
+                if !first {
+                    print!(",");
+                }
+                print!("{turn}");
+                first = false;
+            }
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    if !options.pretty {
+        println!("]");
+    }
+    Ok(0)
+}
+
+/// A finished turn's outcome, or its live status. Exit 0 only when completed.
+fn result(options: &Options) -> Result<i32> {
+    let (Some(bot), Some(turn)) = (&options.bot, options.turn) else {
+        return fail_with("usage", "result needs --bot and --turn");
+    };
+    let mut connection = ensure_existing_daemon(options)?;
+    let outcome = connection.request("result", json!({"bot":bot,"turn":turn}))?;
+    println!("{outcome}");
+    Ok(if outcome["status"] == "completed" {
+        0
+    } else {
+        1
+    })
 }
 
 fn list(options: &Options) -> Result<i32> {
