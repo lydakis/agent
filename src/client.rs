@@ -456,7 +456,7 @@ fn run(options: &Options) -> Result<i32> {
     let mut renderer = Renderer::new(options.pretty, Some(turn));
     if options.pretty {
         eprintln!(
-            "agent: {bot} turn {turn}{}",
+            "agent: {bot} turn {turn}{} in {workspace}",
             if created { " (new bot)" } else { "" }
         );
     }

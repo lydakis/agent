@@ -52,7 +52,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_not_found', missing.stderr)
         first = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', 'hello')
         self.assertIn('reply:hello', first.stdout)
-        self.assertIn('turn 1 (new bot)', first.stderr)
+        self.assertIn('turn 1 (new bot) in ' + str(self.path.resolve()), first.stderr)
         self.assertIn('completed', first.stderr)
         self.assertTrue(self.socket.exists())
         second = self.agent('run', '--store', str(self.store), '--bot', 'Bob', 'tool:again')
