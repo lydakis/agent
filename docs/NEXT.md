@@ -114,16 +114,13 @@ tools, per-turn workspace and model, review fixes) is described in
 [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md) and the bounded live check in
 [OPENAI_SMOKE.md](OPENAI_SMOKE.md). Git history carries the per-fix detail.
 
-0. Deferred tool results with turn handles. A tool call may return a pending
-   handle instead of a result; the turn suspends on the handle, releasing its
-   in-memory history, and resumes when the handle resolves. Handles are process
-   exits (background shell with bounded buffering and artifact spill) or peer
-   turns (`run --detach` prints a bot/turn handle that `wait` resolves from the
-   daemon's own turn-finished event, with no process or thread per waiter).
-   Waiters have no fixed limit; live child processes keep a configurable
-   budget. A turn suspended on a process handle across restart becomes
-   uncertain; one suspended on a turn handle resumes waiting. Measure bytes
-   per suspended agent separately from bytes per live process before landing.
+Implemented next: deferred tool results (`wait` as a tool, a protocol op, and a
+CLI command; `shell` `background`; turn and process handles with durable
+process results; parked turns that survive restart and resume their remaining
+calls) and the three configurable daemon limits in place of fixed constants; see
+[RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results). Still to measure:
+bytes per parked turn versus per live process, on the lifecycle screen.
+
 1. Extend the OpenAI adapter probe to a bounded real daemon task, and run the
    first live Anthropic task, each with a stated call/token cap
    (for example `agent run --model anthropic/... --pretty -- "..."` in a

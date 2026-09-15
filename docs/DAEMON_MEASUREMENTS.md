@@ -74,6 +74,33 @@ Observer SHA-256: `dce0b7ebb97edb7feeef672c933577d0cd0258bd8359f8394b3d7bd2a4e5e
 This binary precedes the output-buffer optimization below; it must not be used
 as evidence of that optimization's effect on daemon RSS or PSS.
 
+## Parked turns
+
+Observed 2026-09-15 on Darwin arm64 (10 logical CPUs, 32 GiB, external power)
+with an ad hoc probe, not the lifecycle screen: one stdio daemon with
+`echo,shell,wait` and `--max-active 0`; one anchor bot whose model call is held
+open by the synthetic provider; N bots each submitting one turn whose only tool
+call is `wait` on the anchor's turn handle. Daemon RSS was sampled by psutil
+after all bots existed (baseline), one second after the Nth `turn_waiting`
+event, and one second after the anchor was released and every waiter finished.
+
+| Parked turns | Baseline RSS | Parked RSS | Bytes per parked turn | Threads | After all finished |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | 10.69 MiB | 13.27 MiB | 5,407 | 4 | 23.92 MiB |
+| 2,000 | 12.52 MiB | 35.58 MiB | 12,091 | 4 | 41.34 MiB |
+| 4,000 | 12.58 MiB | 51.05 MiB | 10,084 | 4 | 51.05 MiB |
+
+Parking 4,000 turns took 20 seconds, about 5 ms each, dominated by one model
+call and three `synchronous=FULL` commits per park. Thread count did not grow.
+RSS did not fall after the waiters finished, so the per-turn figure is the
+allocator's high-water mark from processing each turn (history load, request
+body, parser buffers), not the live state of a parked turn, which is a store
+row and a registry entry of a few hundred bytes. Separating retained from live
+memory needs the instrumented-allocator probe used for the tool-output change,
+and this probe should move onto the lifecycle screen with the binary and
+observer hashes recorded. Binary SHA-256 for these runs:
+`5bd96bc606ef8a413bbf6f73a76ab157534c0bee542e9c85933f392201560ffe`.
+
 ## Contract
 
 Each case creates 1, 8, or 32 named bots, each with its own synthetic workspace,

@@ -110,12 +110,102 @@ client. A controller can inspect metadata through `ls` or observe events through
 
 Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`, and
 `AGENT_SOCKET` when a socket is configured. Default instructions use
-`"$AGENT_BIN" run --detach --new --bot NAME -- TASK` to submit peer work and
-`"$AGENT_BIN" ls` to inspect progress. `AGENT_SHELL_CONTEXT=1` tells the CLI to
-reject blocking `run` and `follow` before submitting work: otherwise waiting
-callers can occupy every shell permit needed by the agents they await. This is
+`"$AGENT_BIN" run --detach --new --bot NAME -- TASK` to submit peer work and the
+`wait` tool to collect it. `AGENT_SHELL_CONTEXT=1` tells the CLI to reject
+blocking `run` and `follow` inside a shell tool: a blocked client would hold a
+process-budget unit while waiting, which is exactly what `wait` avoids. This is
 an execution-context guard, not a permission or agent-identity boundary. Arbitrary
 shell synchronization can still block; this does not sandbox external commands.
+
+## Deferred tool results
+
+A tool call may finish later than the model call that made it. Two tools
+produce handles, and one consumes them:
+
+- `shell` with `background: true` starts the command and immediately returns
+  `proc:N`. The command holds one unit of the process budget while it runs;
+  its bounded output and artifacts are recorded when it exits.
+- `agent run --detach` prints the peer turn's handle, `turn:BOT/N`, from the
+  `submit` response.
+- `wait` takes up to 64 handles and an optional `timeout_ms`. It parks the turn:
+  the turn's task ends, its in-memory history is dropped, the store records
+  `waiting` with the handles, deadline, and any tool calls that followed the
+  wait in the same model response, and a small registry entry remains. Nothing
+  polls and no process or thread exists per waiter. When every handle resolves
+  (or the deadline passes), the daemon spawns a task that reloads the history,
+  records the wait result as the tool result, runs the remaining calls, and
+  continues the turn.
+- Programs outside a tool use the same mechanism through the `wait` protocol
+  op, or `agent wait HANDLE...` which prints the same result and exits 1 when
+  anything is pending or errored. Inside a shell tool that command is refused,
+  because a blocked client would hold a process-budget unit.
+
+A peer handle resolves from the daemon's own `turn_finished` for that turn and
+reports its status, checkpoint, error, and final assistant text (up to 16 KiB).
+A process handle reports the same stdout, stderr, and exit code a foreground
+`shell` would. Unresolved handles at the deadline are returned as
+`{"pending": true}` and remain valid for a later wait. A turn cannot wait on
+itself; unknown handles resolve to errors rather than blocking.
+Malformed handles return `invalid_handle`; numeric IDs use the exact decimal
+form printed by the runtime, without leading zeros or a plus sign. A rejected
+wait tool call does not skip the other calls in its model response. Protocol
+wait results larger than the response limit return `response_size_limit`;
+callers can retrieve them in smaller batches. A connection that cannot accept
+the response is closed so the caller can reconnect and retry.
+For a stdio owner, failed wait delivery exits the daemon with an error and
+closes stdout, even if the client keeps stdin open or stops reading output.
+
+Background commands are rows in a `processes` table with store-wide ids, so a
+`proc:` handle is unique for the store's lifetime, its result is durable and
+can be waited on more than once, and daemon memory holds only in-flight
+commands. Completion commits the result and its overflow artifacts in one
+transaction before waking waiters. A persistence failure stops the daemon with
+an error and disconnects clients. After storage is repaired, restart marks an
+unrecorded completion as `process_lost`; it never reruns the command, whose
+external effects may already have happened.
+Waiters share immutable completed outcomes, including when they register after
+completion. The last waiter releases the shared outcome; the daemon does not
+cache past results indefinitely. Turn outcome queries use an index on turn,
+event kind, and cursor rather than scanning unrelated agents' events.
+Parked turns survive a daemon restart: they are re-registered at
+startup, peer handles resolve from durable state (a peer interrupted by the
+restart reports `interrupted`), and commands that were still running resolve
+to `process_lost` because they died with the daemon. Interrupting a parked
+turn ends it as `interrupted`: the wait and any planned calls behind it get a
+`cancelled` tool result in the same transaction, so the conversation stays
+valid and the bot is not left uncertain. A bot whose turn is parked reports
+status `waiting` and stays busy.
+Interrupts reconcile durable state even when the parked task has exited but
+its completion has not yet been processed by the service loop.
+Live followers receive each cancellation's `tool_completed` event before
+`turn_finished`, in the same cursor order as durable replay.
+Completed or disconnected request waiters release their timers. Shutdown clears
+pending request waiters before draining stdout; durable parked turns remain
+available for recovery.
+
+The fan-out that deadlocked when waiting held a shell slot now completes under
+a process budget of two, because waiters hold nothing.
+
+## Limits
+
+Three daemon limits are flags on `serve`, forwarded by the client that starts
+the daemon, and reported in the `ready` event as `limits`. Zero removes a
+bound; the operating system is then the only limit.
+
+| Flag | Bounds | Default |
+| --- | --- | --- |
+| `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
+| `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
+| `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. | 64 |
+
+Parked agents cost a store row and a registry entry. An agent in a model call
+costs its loaded history and a connection; that, not these limits, bounds how
+many agents can be mid-call at once until request bodies stream from disk.
+Resolved waits queue until `--max-active` has capacity, including after restart.
+Interrupting a queued turn cancels that turn without starting its continuation.
+The 200-provider-round budget belongs to the durable turn, so parking or
+restarting the daemon does not replenish it. The counter commits with each
+model response, without an additional disk commit.
 
 ## Providers and models
 
@@ -194,9 +284,9 @@ transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of loaded history per bot, 256 KiB input
 prompt, 64 KiB instructions, 512 KiB terminal provider output, 2 MiB SSE frame,
-16 MiB response stream, 200 provider rounds per turn, and 1,024 active turns.
-Provider startup admits at most 64 requests awaiting response headers, with a
-60-second admission timeout. The permit is released before reading SSE. This
+16 MiB response stream, 200 provider rounds per turn, and the configurable
+active-turn, process, and connection-startup bounds below. Provider startup
+admission has a 60-second timeout. The permit is released before reading SSE. This
 smooths connection bursts while allowing more established streams, but a
 provider that delays headers will limit admission; live-provider tuning remains
 open. The benchmark mode accepts up to 4,096 agents, subject to its additional
@@ -284,7 +374,9 @@ repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
 delivered only to live followers and carry `durable:false`. Durable event kinds
 are `created`, `forked`, `accepted`, `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview), `tool_completed` (with retained artifact
-names), and `turn_finished` (with status, checkpoint, error code, and detail).
+names), `turn_waiting` and `turn_resumed` (a parked turn's handles and its
+wake-up), and `turn_finished` (with status, checkpoint, error code, and detail).
+A `submit` response includes the turn's `handle`, `turn:BOT/N`.
 
 For bounded artifact retrieval, specify a `stream` from `tool_completed`, a
 UTF-8 byte `offset` (default 0), and a byte `limit` (4 through 65,536, default
@@ -321,7 +413,7 @@ process. A second owner fails before it can mark the first owner's work
 interrupted. Ownership uses the canonical database path with an appended
 `.owner-lock` suffix; symlinks resolve to the same lock and hard-linked database
 files are rejected. Do not replace or rename the database or its lock while
-open. The stored provider/tool configuration (schema 3) must match at reopen;
+open. The stored provider/tool configuration (schema 5) must match at reopen;
 stores from earlier prototypes are rejected with
 `store_configuration_mismatch` rather than migrated.
 
@@ -361,7 +453,7 @@ on storage-related or OS memory. Durable performance needs its own benchmark.
 
 ## Tools and validation scope
 
-`--tools` names any subset of `echo`, `shell`, `read`, `write`, and `edit`. The
+`--tools` names any subset of `echo`, `shell`, `read`, `write`, `edit`, and `wait`. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, timeout, output
 overflow) returns an error result to the model and the turn continues. Only a
@@ -370,7 +462,8 @@ A store remains bound to its tool set; changing it requires a new store.
 
 `shell` runs a noninteractive `/bin/sh` command in the bot workspace with
 `timeout_ms` (default 120 s, maximum 600 s). Commands are at most 16 KiB. At most
-16 shell commands run at once across the service. stdout and stderr are each
+`--max-processes` child processes run at once across the service, foreground or
+background; waiting never counts. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Results include separate output, exit code, and
