@@ -108,10 +108,28 @@ the protocol, also settle durable/live event alignment, slow-consumer handling,
 store versioning, and total versus idle provider deadlines. Conservative uncertain
 tool outcomes remain explicit; caller-directed resolution is future work.
 
-1. Validate provider startup/admission on bounded real-provider workloads. The
-   synthetic 1,000-stream reset reproducer, host backlog evidence, and bounded
-   startup results are recorded in LIFECYCLE_MEASUREMENTS.md. Preserve failures;
-   do not claim that this validates 1,000 durable/tool-equipped agents.
+The 2026-09-14 slice (daemon, `agent` client, two provider families, file
+tools, per-turn workspace and model, review fixes) is described in
+[RUST_PROTOTYPE.md](RUST_PROTOTYPE.md), with measurements in
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md) and the bounded live check in
+[OPENAI_SMOKE.md](OPENAI_SMOKE.md). Git history carries the per-fix detail.
+
+0. Deferred tool results with turn handles. A tool call may return a pending
+   handle instead of a result; the turn suspends on the handle, releasing its
+   in-memory history, and resumes when the handle resolves. Handles are process
+   exits (background shell with bounded buffering and artifact spill) or peer
+   turns (`run --detach` prints a bot/turn handle that `wait` resolves from the
+   daemon's own turn-finished event, with no process or thread per waiter).
+   Waiters have no fixed limit; live child processes keep a configurable
+   budget. A turn suspended on a process handle across restart becomes
+   uncertain; one suspended on a turn handle resumes waiting. Measure bytes
+   per suspended agent separately from bytes per live process before landing.
+1. Extend the OpenAI adapter probe to a bounded real daemon task, and run the
+   first live Anthropic task, each with a stated call/token cap
+   (for example `agent run --model anthropic/... --pretty -- "..."` in a
+   scratch checkout). Record admission behavior, header latency against the
+   64-request startup bound, idle-timeout adequacy for long thinking, actual
+   usage events, and any provider error details. Preserve failures.
 2. Separate long-term conversation storage from bounded model context. Implement
    indexed history access and context selection before claiming long-history
    support. Follow [LONG_HISTORY.md](LONG_HISTORY.md), including preserved fork
@@ -119,14 +137,13 @@ tool outcomes remain explicit; caller-directed resolution is future work.
    Add bounded model-facing history retrieval and branch-aware fact checks;
    measure fixed active context against growing stored histories before adding
    recursive context-processing machinery.
-3. Add Unix-socket attachment and race-safe automatic daemon startup.
-   Exercise delegation through the same client: a program running in Bob's
-   workspace creates Alice fresh and forks a retained checkpoint as another
-   named agent, submits work, and follows both results. Verify independent
-   continuation, explicit cancellation scope, and shared admission/resource
-   limits. Use ordinary agent operations rather than a separate subagent engine.
-4. Validate a second provider, then add usage/context budget accounting before
-   freezing the provider interface. Current live-provider behavior is unverified.
+3. Daemon lifecycle: idle exit after a configurable quiet period, an explicit
+   store schema migration path (older prototype stores are rejected), and a
+   measured slow-follower screen for the lag/drop policy.
+4. Provider interface: decide whether cross-family handoff (thinking rendered
+   as text, tool history preserved) is worth a translation step, then freeze
+   the adapter contract. Add model-facing artifact retrieval so a bot can read
+   a truncated tool output it produced.
 5. Extend measured tools and recovery semantics, slow-reader and sustained-load
    tests. Profile CPU/allocations to explain regressions; compare matched revisions.
 6. Add equivalent lifecycle adapters for Pi/Codex only where native semantics can
