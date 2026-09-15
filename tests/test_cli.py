@@ -94,6 +94,67 @@ class SocketAndCliTests(ModelFixture):
             time.sleep(.01)
         self.assertFalse(self.socket.exists())
 
+    def test_detached_peer_handle_is_collected_by_wait(self):
+        common = [*self.common[:-2], '--tools', 'echo,shell,wait']
+        nested = '"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- hello'
+        bob = self.agent('run', *common, '--new', '--bot', 'Bob', f'shell:{nested}')
+        events = [json.loads(line) for line in bob.stdout.splitlines()]
+        node = next(e['data']['node'] for e in events if e['event'] == 'tool_completed')
+        with_socket = ['--store', str(self.store)]
+        # The shell tool's stdout is the detach JSON, including the turn handle.
+        import socket as sockets
+        with sockets.socket(sockets.AF_UNIX) as sock:
+            sock.connect(str(self.socket))
+            reader = sock.makefile('r')
+            reader.readline()
+            sock.sendall((json.dumps({'id': 1, 'op': 'item', 'bot': 'Bob', 'node': node}) + '\n').encode())
+            shell_result = json.loads(json.loads(reader.readline())['result']['output'])
+        handle = json.loads(shell_result['stdout'])['handle']
+        self.assertTrue(handle.startswith('turn:Alice/'), handle)
+        waited = self.agent('run', *with_socket, '--bot', 'Bob', 'wait:' + handle)
+        kinds = [json.loads(line)['event'] for line in waited.stdout.splitlines()]
+        self.assertIn('turn_waiting', kinds)
+        self.assertIn('turn_resumed', kinds)
+        self.assertEqual(kinds[-1], 'turn_finished')
+        node = next(json.loads(l)['data']['node'] for l in waited.stdout.splitlines()
+                    if json.loads(l)['event'] == 'tool_completed')
+        with sockets.socket(sockets.AF_UNIX) as sock:
+            sock.connect(str(self.socket))
+            reader = sock.makefile('r')
+            reader.readline()
+            sock.sendall((json.dumps({'id': 1, 'op': 'item', 'bot': 'Bob', 'node': node}) + '\n').encode())
+            outcome = json.loads(json.loads(reader.readline())['result']['output'])
+        self.assertEqual(outcome['results'][handle]['text'], 'reply:hello')
+        self.assertEqual(outcome['results'][handle]['status'], 'completed')
+
+    def test_cli_wait_blocks_outside_tools_and_is_refused_inside_them(self):
+        common = [*self.common[:-2], '--tools', 'echo,shell,wait']
+        detached = self.agent('run', *common, '--detach', '--new', '--bot', 'Alice', 'slow')
+        handle = json.loads(detached.stdout)['handle']
+        waited = self.agent('wait', '--store', str(self.store), handle)
+        result = json.loads(waited.stdout)
+        self.assertEqual(result['pending'], [])
+        self.assertEqual(result['results'][handle]['text'], 'reply:slow')
+        pending = self.agent('run', '--store', str(self.store), '--detach', '--bot', 'Alice', 'wait')
+        again = json.loads(pending.stdout)['handle']
+        timed = self.agent('wait', '--store', str(self.store), '--timeout-ms', '200', again, check=False)
+        self.assertEqual(timed.returncode, 1)
+        self.assertEqual(json.loads(timed.stdout)['pending'], [again])
+        inside = subprocess.run([*self.base, 'wait', '--store', str(self.store), again],
+                                env={**clean_env(), 'AGENT_SHELL_CONTEXT': '1'}, capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(inside.returncode, 0)
+        self.assertIn('blocking_tool_client', inside.stderr)
+        self.agent('interrupt', '--store', str(self.store), '--bot', 'Alice')
+        final = json.loads(self.agent('wait', '--store', str(self.store), again, check=False).stdout)
+        self.assertEqual(final['results'][again]['status'], 'interrupted')
+        # The daemon reports its resolved limits.
+        import socket as sockets
+        with sockets.socket(sockets.AF_UNIX) as sock:
+            sock.connect(str(self.socket))
+            ready = json.loads(sock.makefile('r').readline())
+        self.assertEqual(set(ready['limits']), {'processes', 'active', 'connecting'})
+        self.assertIn('wait', ready['capabilities'])
+
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob', 'burst', check=False, timeout=4)
         self.assertEqual(run.returncode, 1)
@@ -254,7 +315,7 @@ class CliTests(ModelFixture):
                 for n in range(1, 1025):
                     db.execute("INSERT INTO bots VALUES (?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
                                (f'old-{n}', directory, n))
-                    db.execute("INSERT INTO turns VALUES (?,?,'old','check','running',?,'openai/synthetic-model')",
+                    db.execute("INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model) VALUES (?,?,'old','check','running',?,'openai/synthetic-model')",
                                (n, f'old-{n}', directory))
             barrier = threading.Barrier(16)
             common = ['--store', str(path), '--provider', 'openai=responses,'+self.url,

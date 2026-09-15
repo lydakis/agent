@@ -45,7 +45,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         .turn;
     db.append(first, vec![assistant("answer one")], &[], None)
         .unwrap();
-    let checkpoint = db.finish(first, None).unwrap()["data"]["checkpoint"]
+    let checkpoint = db.finish(first, None).unwrap().last().unwrap()["data"]["checkpoint"]
         .as_i64()
         .unwrap();
     let second = db
@@ -201,6 +201,8 @@ fn unrecorded_tool_outcomes_block_automatic_reexecution() {
     db.tool_start(turn, &call).unwrap();
     assert_eq!(
         db.finish(turn, Some(&Error::new("process_interrupted")))
+            .unwrap()
+            .last()
             .unwrap()["data"]["status"],
         "uncertain"
     );
@@ -234,7 +236,7 @@ fn tool_results_and_cursor_events_commit_together() {
     assert!(db.tool_start(turn, &call).is_err());
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     assert_eq!(
-        db.finish(turn, None).unwrap()["data"]["status"],
+        db.finish(turn, None).unwrap().last().unwrap()["data"]["status"],
         "completed"
     );
     assert!(

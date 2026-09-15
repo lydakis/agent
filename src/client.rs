@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_TOOLS: &str = "shell,read,write,edit";
+const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn startup_remaining(deadline: Instant) -> Result<Duration> {
@@ -41,6 +41,9 @@ struct Options {
     new: bool,
     detach: bool,
     no_spawn: bool,
+    timeout_ms: Option<u64>,
+    /// Daemon limits forwarded when this client starts the daemon.
+    daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
 }
 
@@ -63,6 +66,8 @@ fn parse(args: &[String]) -> Result<Options> {
         new: false,
         detach: false,
         no_spawn: false,
+        timeout_ms: None,
+        daemon_flags: Vec::new(),
         positional: Vec::new(),
     };
     let mut iter = args.iter();
@@ -104,6 +109,18 @@ fn parse(args: &[String]) -> Result<Options> {
                             })?)
                     }
                     "--request-id" => options.request_id = Some(value),
+                    "--timeout-ms" => {
+                        options.timeout_ms =
+                            Some(value.parse().map_err(|_| {
+                                Error::with("usage", "--timeout-ms needs an integer")
+                            })?)
+                    }
+                    "--max-processes" | "--max-active" | "--max-connecting" => {
+                        value.parse::<usize>().map_err(|_| {
+                            Error::with("usage", format!("{flag} needs an integer"))
+                        })?;
+                        options.daemon_flags.push((flag.to_owned(), value));
+                    }
                     "--after" => {
                         options.after = value
                             .parse()
@@ -310,6 +327,9 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     for provider in &options.providers {
         command.arg("--provider").arg(provider);
     }
+    for (flag, value) in &options.daemon_flags {
+        command.arg(flag).arg(value);
+    }
     if let Some(model) = &options.model {
         command.arg("--model").arg(model);
     }
@@ -361,11 +381,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     let command = args[0].as_str();
     let options = parse(&args[1..])?;
     if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
-        && (command == "follow" || (command == "run" && !options.detach))
+        && (command == "follow" || command == "wait" || (command == "run" && !options.detach))
     {
         return fail_with(
             "blocking_tool_client",
-            "use run --detach to submit peer work, then ls to inspect status; blocking clients cannot hold a shell slot while waiting for peer tools",
+            "use run --detach to submit peer work and the wait tool to collect it; a blocking client would hold a process-budget unit while waiting",
         );
     }
     match command {
@@ -373,6 +393,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "follow" => follow(&options),
         "fork" => fork(&options),
         "interrupt" => interrupt(&options),
+        "wait" => wait(&options),
         "ls" => list(&options),
         "shutdown" => {
             let mut connection = Connection::connect(&options.socket)?;
@@ -504,6 +525,26 @@ fn interrupt(options: &Options) -> Result<i32> {
     };
     connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
     Ok(0)
+}
+
+/// Block until every handle resolves, then print the same result the wait
+/// tool would receive. Exit 1 if any handle is still pending or errored.
+fn wait(options: &Options) -> Result<i32> {
+    if options.positional.is_empty() {
+        return fail_with("usage", "wait needs at least one handle");
+    }
+    let mut connection = Connection::connect(&options.socket)?;
+    let result = connection.request(
+        "wait",
+        json!({"handles":options.positional,"timeout_ms":options.timeout_ms}),
+    )?;
+    println!("{result}");
+    let clean = result["pending"].as_array().is_some_and(Vec::is_empty)
+        && result["results"].as_object().is_some_and(|r| {
+            r.values()
+                .all(|v| v.get("error").is_none_or(Value::is_null))
+        });
+    Ok(if clean { 0 } else { 1 })
 }
 
 fn list(options: &Options) -> Result<i32> {

@@ -26,7 +26,9 @@ pub struct Transport {
     starting: Semaphore,
 }
 impl Transport {
-    pub fn new() -> Result<Arc<Self>> {
+    /// `max_connecting` bounds requests awaiting response headers; zero means
+    /// no bound beyond the operating system.
+    pub fn new(max_connecting: usize) -> Result<Arc<Self>> {
         // No total deadline: long generations are legitimate. Idle reads are
         // bounded so a stalled stream cannot hold a turn forever.
         let client = reqwest::Client::builder()
@@ -40,7 +42,11 @@ impl Transport {
             .map_err(|_| Error::new("http_client_init"))?;
         Ok(Arc::new(Self {
             client,
-            starting: Semaphore::new(64),
+            starting: Semaphore::new(if max_connecting == 0 {
+                Semaphore::MAX_PERMITS
+            } else {
+                max_connecting.min(Semaphore::MAX_PERMITS)
+            }),
         }))
     }
 }
@@ -73,7 +79,7 @@ pub struct Completion {
     pub calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
 }
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
     pub name: String,
     pub call_id: String,
@@ -430,7 +436,7 @@ mod tests {
 
     #[test]
     fn request_prefix_streams_history_after_family_specific_fields() {
-        let transport = Transport::new().unwrap();
+        let transport = Transport::new(64).unwrap();
         let provider = Provider::new(
             transport.clone(),
             Family::Anthropic,

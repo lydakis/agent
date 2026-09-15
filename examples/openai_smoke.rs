@@ -23,7 +23,7 @@ async fn run() -> Result<()> {
     let key = std::env::var("OPENAI_API_KEY").map_err(|_| Error::new("missing_key"))?;
     let tools = Registry::new("echo")?;
     let provider = Provider::new(
-        Transport::new()?,
+        Transport::new(64)?,
         family,
         "https://api.openai.com/v1",
         Some(key),

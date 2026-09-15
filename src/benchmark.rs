@@ -45,7 +45,7 @@ pub async fn run(output: Output) -> Result<()> {
         return fail("invalid_port");
     }
     let provider = Provider::new(
-        Transport::new()?,
+        Transport::new(64)?,
         Family::Responses,
         &format!("http://127.0.0.1:{port}/v1"),
         None,

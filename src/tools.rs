@@ -25,6 +25,9 @@ const FILE_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
+const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
+/// Simultaneously running child processes, foreground or background.
+pub const DEFAULT_PROCESS_BUDGET: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
@@ -33,6 +36,7 @@ enum Tool {
     Read,
     Write,
     Edit,
+    Wait,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -42,6 +46,7 @@ impl Tool {
             "read" => Tool::Read,
             "write" => Tool::Write,
             "edit" => Tool::Edit,
+            "wait" => Tool::Wait,
             _ => return None,
         })
     }
@@ -52,6 +57,7 @@ impl Tool {
             Tool::Read => "read",
             Tool::Write => "write",
             Tool::Edit => "edit",
+            Tool::Wait => "wait",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -62,9 +68,10 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive /bin/sh command in the workspace. No background jobs survive the call. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s.",
+                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
-                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS}},
+                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
+                "background":{"type":"boolean"}},
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
@@ -83,6 +90,12 @@ impl Tool {
                 json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},
                 "new":{"type":"string"},"replace_all":{"type":"boolean"}},
                 "required":["path","old","new"],"additionalProperties":false}),
+            ),
+            Tool::Wait => (
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait.",
+                json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
+                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_WAIT_TIMEOUT_MS}},
+                "required":["handles"],"additionalProperties":false}),
             ),
         };
         ToolSchema {
@@ -110,6 +123,12 @@ pub enum Prepared {
     Shell {
         command: String,
         timeout_ms: u64,
+        background: bool,
+    },
+    /// Resolved by the runtime, never by the registry.
+    Wait {
+        handles: Vec<String>,
+        timeout_ms: Option<u64>,
     },
     Read {
         path: String,
@@ -135,7 +154,7 @@ pub struct Outcome {
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
 }
 impl Outcome {
-    fn text(output: String) -> Self {
+    pub fn text(output: String) -> Self {
         Self {
             output,
             artifacts: Vec::new(),
@@ -158,13 +177,23 @@ impl Registry {
         }
         Ok(Self {
             tools,
-            slots: Arc::new(Semaphore::new(16)),
+            slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             credentials: Arc::new(Vec::new()),
             environment: Arc::new(Vec::new()),
         })
     }
     /// Exact occurrences of these values are redacted from tool results and the
     /// named variables are removed from shell environments.
+    /// Bound on simultaneously running child processes. Waiting never counts.
+    /// Zero removes the bound; the operating system is then the only limit.
+    pub fn with_process_budget(mut self, budget: usize) -> Self {
+        self.slots = Arc::new(Semaphore::new(if budget == 0 {
+            Semaphore::MAX_PERMITS
+        } else {
+            budget.min(Semaphore::MAX_PERMITS)
+        }));
+        self
+    }
     /// Variables added to every shell child, such as the store and binary
     /// paths a bot needs to delegate through the same daemon.
     pub fn with_environment(mut self, environment: Vec<(String, String)>) -> Self {
@@ -213,6 +242,14 @@ impl Registry {
             command: String,
             #[serde(default = "default_timeout")]
             timeout_ms: u64,
+            #[serde(default)]
+            background: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wait {
+            handles: Vec<String>,
+            timeout_ms: Option<u64>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -277,6 +314,23 @@ impl Registry {
                 Prepared::Shell {
                     command: args.command,
                     timeout_ms: args.timeout_ms,
+                    background: args.background,
+                }
+            }
+            Tool::Wait => {
+                let args: Wait = serde_json::from_str(args).map_err(invalid)?;
+                if args.handles.is_empty()
+                    || args.handles.len() > 64
+                    || args.handles.iter().any(|h| h.len() > 256)
+                    || args
+                        .timeout_ms
+                        .is_some_and(|t| !(1..=MAX_WAIT_TIMEOUT_MS).contains(&t))
+                {
+                    return fail("invalid_tool_arguments");
+                }
+                Prepared::Wait {
+                    handles: args.handles,
+                    timeout_ms: args.timeout_ms,
                 }
             }
             Tool::Read => {
@@ -322,8 +376,13 @@ impl Registry {
         match tool {
             Prepared::Echo(text) => Ok(Outcome::text(self.redact(text))),
             Prepared::Shell {
+                background: true, ..
+            } => fail("background_requires_runtime"),
+            Prepared::Wait { .. } => fail("wait_requires_runtime"),
+            Prepared::Shell {
                 command,
                 timeout_ms,
+                background: false,
             } => {
                 let _slot = self
                     .slots
@@ -332,29 +391,7 @@ impl Registry {
                     .map_err(|_| Error::new("tool_scheduler_closed"))?;
                 let (stdout, stderr, status) =
                     shell(&command, workspace, Duration::from_millis(timeout_ms), self).await?;
-                let mut artifacts = Vec::new();
-                let mut preview = |name: &'static str, bytes: Vec<u8>| {
-                    // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
-                    // bytes still get the same lossy decoding as before.
-                    let text = String::from_utf8(bytes).unwrap_or_else(|error| {
-                        String::from_utf8_lossy(error.as_bytes()).into_owned()
-                    });
-                    let mut text = self.redact(text);
-                    if text.len() <= PREVIEW_BYTES {
-                        return text;
-                    }
-                    let shown = truncate(&text);
-                    // read_to_end may have reserved beyond the output length.
-                    // Do not retain that spare capacity while storage catches up.
-                    text.shrink_to_fit();
-                    artifacts.push((name, text.into_bytes()));
-                    shown
-                };
-                let output =
-                    json!({"stdout":preview("stdout", stdout),"stderr":preview("stderr", stderr),
-                    "exit_code":status.code(),"success":status.success()})
-                    .to_string();
-                Ok(Outcome { output, artifacts })
+                Ok(self.shell_outcome(stdout, stderr, status))
             }
             Prepared::Read {
                 path,
@@ -454,6 +491,70 @@ impl Registry {
                 )))
             }
         }
+    }
+}
+
+impl Registry {
+    fn shell_outcome(
+        &self,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        status: std::process::ExitStatus,
+    ) -> Outcome {
+        let mut artifacts = Vec::new();
+        let mut preview = |name: &'static str, bytes: Vec<u8>| {
+            // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
+            // bytes still get the same lossy decoding as before.
+            let text = String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+            let mut text = self.redact(text);
+            if text.len() <= PREVIEW_BYTES {
+                return text;
+            }
+            let shown = truncate(&text);
+            // read_to_end may have reserved beyond the output length.
+            // Do not retain that spare capacity while storage catches up.
+            text.shrink_to_fit();
+            artifacts.push((name, text.into_bytes()));
+            shown
+        };
+        let output = json!({"stdout":preview("stdout", stdout),"stderr":preview("stderr", stderr),
+            "exit_code":status.code(),"success":status.success()})
+        .to_string();
+        Outcome { output, artifacts }
+    }
+
+    /// Start a command whose result is delivered later. The process budget is
+    /// acquired inside the task, so starting never blocks the caller; the
+    /// result carries the same bounded preview and artifacts as a foreground
+    /// command, or the error a foreground command would have returned.
+    pub fn background(
+        &self,
+        command: String,
+        workspace: PathBuf,
+        timeout_ms: u64,
+        done: tokio::sync::oneshot::Sender<Result<Outcome>>,
+    ) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let _slot = registry
+                    .slots
+                    .acquire()
+                    .await
+                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let (stdout, stderr, status) = shell(
+                    &command,
+                    &workspace,
+                    Duration::from_millis(timeout_ms),
+                    &registry,
+                )
+                .await?;
+                Ok(registry.shell_outcome(stdout, stderr, status))
+            }
+            .await;
+            let _ = done.send(result);
+        });
     }
 }
 

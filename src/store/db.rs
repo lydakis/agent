@@ -51,8 +51,21 @@ pub struct TurnOptions {
     pub workspace: Option<String>,
     pub model: Option<String>,
 }
+/// A turn parked on handles; it holds no task or memory until they resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Waiting {
+    pub turn: i64,
+    pub bot: String,
+    pub call_id: String,
+    pub handles: Vec<String>,
+    pub deadline_ms: Option<u64>,
+    /// Tool calls from the same model response that follow the wait.
+    #[serde(default)]
+    pub pending: Vec<ToolCall>,
+}
 /// Where and with which model a turn runs.
 pub struct TurnContext {
+    pub model_rounds: usize,
     pub bot: String,
     pub workspace: String,
     pub model: String,
@@ -79,16 +92,20 @@ impl Database {
                 instructions TEXT NOT NULL, reasoning TEXT);
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
-                workspace TEXT, model TEXT, UNIQUE(bot,request_id));
+                workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(bot,request_id));
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
+            CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
+                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 stream TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);")?;
+            CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
+            CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);")?;
         let saved: Option<String> = conn
             .query_row("SELECT value FROM configuration", [], |r| r.get(0))
             .optional()?;
@@ -99,8 +116,15 @@ impl Database {
             Some(saved) if saved != configuration => return fail("store_configuration_mismatch"),
             _ => {}
         }
+        // Background commands died with the previous daemon; their handles
+        // must report loss rather than resolve to some later command.
+        conn.execute(
+            "UPDATE processes SET status='lost',result=? WHERE status='running'",
+            [json!({"error":"process_lost"}).to_string()],
+        )?;
         let mut db = Self { conn };
-        // A committed tool intent without a result is never automatically retried.
+        // A committed tool intent without a result is never automatically
+        // retried. Turns parked on handles keep their state and resume.
         let pending: Vec<i64> = db
             .conn
             .prepare("SELECT id FROM turns WHERE status='running'")?
@@ -367,6 +391,12 @@ impl Database {
             "UPDATE bots SET head=? WHERE name=?",
             params![head, bot.name],
         )?;
+        // A successful response consumes a round in the same durable commit
+        // as its messages and tool plans. Failed requests end the turn.
+        tx.execute(
+            "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
+            [turn],
+        )?;
         tx.commit()?;
         Ok(entries)
     }
@@ -425,13 +455,15 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
-        let (workspace, model): (Option<String>, Option<String>) = self.conn.query_row(
-            "SELECT workspace,model FROM turns WHERE id=?",
-            [turn],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        let (workspace, model, model_rounds): (Option<String>, Option<String>, usize) =
+            self.conn.query_row(
+                "SELECT workspace,model,model_rounds FROM turns WHERE id=?",
+                [turn],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, u32>(2)? as usize)),
+            )?;
         let bot = self.active(turn)?;
         Ok(TurnContext {
+            model_rounds,
             workspace: workspace
                 .or(bot.workspace)
                 .ok_or(Error::new("workspace_required"))?,
@@ -449,10 +481,40 @@ impl Database {
         }
         Ok(bot)
     }
-    pub fn finish(&mut self, turn: i64, error: Option<&Error>) -> Result<Value> {
+    /// End a turn and return every committed event in cursor order.
+    pub fn finish(&mut self, turn: i64, error: Option<&Error>) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
-        let pending: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status!='completed')",
+        let waiting = self.waiting(turn)?;
+        let tx = self.conn.transaction()?;
+        let mut head = bot.head;
+        let mut entries = Vec::new();
+        if waiting.is_some() {
+            // A parked turn's wait, and the planned calls behind it, never had
+            // an external effect. Answer them so the conversation stays valid
+            // for continuation, instead of leaving the bot uncertain.
+            let unanswered: Vec<String> = tx
+                .prepare("SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
+                .query_map([turn], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let family = bot.family()?;
+            for call_id in unanswered {
+                let output = json!({"error":"cancelled","detail":"turn interrupted while parked"})
+                    .to_string();
+                let item = family.tool_result_item(&call_id, &output)?;
+                let id = node(&tx, head, &item)?;
+                head = Some(id);
+                tx.execute(
+                    "UPDATE tools SET status='completed' WHERE turn=? AND call_id=?",
+                    params![turn, call_id],
+                )?;
+                let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":true});
+                let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
+                entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
+            }
+            tx.execute("UPDATE turns SET waiting=NULL WHERE id=?", [turn])?;
+        }
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
             [turn],
             |r| r.get(0),
         )?;
@@ -466,26 +528,224 @@ impl Database {
         } else {
             "completed"
         };
-        let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE turns SET status=? WHERE id=?",
             params![status, turn],
         )?;
         tx.execute(
-            "UPDATE bots SET running_turn=NULL,status=? WHERE name=?",
-            params![status, bot.name],
+            "UPDATE bots SET head=?,running_turn=NULL,status=? WHERE name=?",
+            params![head, status, bot.name],
         )?;
         if status == "completed" {
             tx.execute(
                 "INSERT INTO checkpoints VALUES (?,?)",
-                params![bot.name, bot.head],
+                params![bot.name, head],
             )?;
         }
-        let data = json!({"status":status,"checkpoint":if status == "completed" { bot.head } else { None },
+        let data = json!({"status":status,"checkpoint":if status == "completed" { head } else { None },
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
-        Ok(entry(cursor, &bot.name, Some(turn), "turn_finished", data))
+        entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
+        Ok(entries)
+    }
+    fn waiting(&self, turn: i64) -> Result<Option<Waiting>> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row("SELECT bot,waiting FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((bot, Some(encoded))) = row else {
+            return Ok(None);
+        };
+        let mut waiting: Waiting = serde_json::from_str(&encoded)?;
+        waiting.turn = turn;
+        waiting.bot = bot;
+        Ok(Some(waiting))
+    }
+    /// Park a running turn on handles while its wait call is executing.
+    pub fn suspend(
+        &mut self,
+        turn: i64,
+        call_id: &str,
+        handles: &[String],
+        deadline_ms: Option<u64>,
+        pending: &[ToolCall],
+    ) -> Result<Value> {
+        let bot = self.active(turn)?;
+        let executing: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND call_id=? AND status='executing')",
+            params![turn, call_id],
+            |r| r.get(0),
+        )?;
+        if !executing || bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: call_id.into(),
+            handles: handles.to_vec(),
+            deadline_ms,
+            pending: pending.to_vec(),
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms});
+        let cursor = event(&tx, &bot.name, Some(turn), "turn_waiting", data.clone())?;
+        tx.commit()?;
+        Ok(entry(cursor, &bot.name, Some(turn), "turn_waiting", data))
+    }
+    /// Every parked turn, for re-registration after a restart.
+    pub fn waiting_turns(&self) -> Result<Vec<Waiting>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id FROM turns WHERE status='waiting' ORDER BY id")?;
+        let ids = statement
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .filter_map(|id| self.waiting(id).transpose())
+            .collect()
+    }
+    /// Bring a parked turn back to running; the caller then records the wait result.
+    pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value)> {
+        let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
+        let bot = self.active(turn)?;
+        if bot.status != "waiting" {
+            return fail("turn_not_waiting");
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE turns SET status='running',waiting=NULL WHERE id=?",
+            [turn],
+        )?;
+        tx.execute("UPDATE bots SET status='running' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":waiting.call_id});
+        let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
+        tx.commit()?;
+        Ok((
+            waiting,
+            entry(cursor, &bot.name, Some(turn), "turn_resumed", data),
+        ))
+    }
+    /// A finished turn's outcome for a waiter: terminal status, error, and the
+    /// final assistant text, bounded. `None` while the turn is still going.
+    pub fn turn_outcome(&self, name: &str, turn: i64) -> Result<Option<Value>> {
+        let owner: Option<(String, String)> = self
+            .conn
+            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((owner, status)) = owner else {
+            return fail("turn_not_found");
+        };
+        if owner != name {
+            return fail("turn_not_found");
+        }
+        if status == "running" || status == "waiting" {
+            return Ok(None);
+        }
+        let finished: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM events WHERE turn=? AND kind='turn_finished' ORDER BY id DESC LIMIT 1",
+                [turn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut outcome: Value = match finished {
+            Some(data) => serde_json::from_str(&data)?,
+            None => json!({"status":status}),
+        };
+        let last: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT data FROM events WHERE turn=? AND kind='message' ORDER BY id DESC LIMIT 1",
+                [turn],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+            .and_then(|data| data["node"].as_i64());
+        let text = match last {
+            Some(node) => {
+                let item: Vec<u8> =
+                    self.conn
+                        .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+                let item: Value = serde_json::from_slice(&item)?;
+                assistant_text(&item)
+            }
+            None => String::new(),
+        };
+        let bounded: String = text.chars().take(16 * 1024).collect();
+        outcome["text_truncated"] = json!(bounded.len() < text.len());
+        outcome["text"] = json!(bounded);
+        outcome["turn"] = json!(turn);
+        Ok(Some(outcome))
+    }
+    /// Register a background command. Ids are unique for the store's lifetime,
+    /// so a handle never resolves to a later command after a restart.
+    pub fn process_start(&mut self, turn: i64, call_id: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO processes(turn,call_id,status) VALUES (?,?,'running')",
+            params![turn, call_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    /// The outcome and its overflow become visible in one transaction.
+    pub fn process_finish(
+        &mut self,
+        id: i64,
+        result: &Value,
+        artifacts: &[(&str, Vec<u8>)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        if tx.execute(
+            "UPDATE processes SET status='finished',result=? WHERE id=? AND status='running'",
+            params![result.to_string(), id],
+        )? != 1
+        {
+            return fail("invalid_process_state");
+        }
+        if !artifacts.is_empty() {
+            let (turn, call_id): (i64, String) =
+                tx.query_row("SELECT turn,call_id FROM processes WHERE id=?", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            for (stream, data) in artifacts {
+                tx.execute(
+                    "INSERT INTO artifacts VALUES (?,?,?,?)",
+                    params![turn, call_id, stream, data],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// `None` for an unknown id; otherwise the status and any recorded result.
+    pub fn process_result(&self, id: i64) -> Result<Option<(String, Option<Value>)>> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT status,result FROM processes WHERE id=?",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some((status, result)) => Ok(Some((
+                status,
+                result.map(|r| serde_json::from_str(&r)).transpose()?,
+            ))),
+        }
     }
     pub fn fork(
         &mut self,
@@ -656,6 +916,21 @@ impl Database {
         Ok(json!({"stream":stream,"offset":offset,"text":text,
             "next_offset":next,"total_bytes":total,"done":next == total}))
     }
+}
+
+/// Text of an assistant item in either family encoding; other content is skipped.
+fn assistant_text(item: &Value) -> String {
+    let mut text = String::new();
+    if let Some(content) = item["content"].as_array() {
+        for part in content {
+            if let Some(piece) = part["text"].as_str()
+                && matches!(part["type"].as_str(), Some("output_text" | "text"))
+            {
+                text.push_str(piece);
+            }
+        }
+    }
+    text
 }
 
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {

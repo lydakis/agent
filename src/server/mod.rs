@@ -1,5 +1,6 @@
 //! One process hosts every bot. Client sessions (stdio or Unix socket) speak
 //! the same JSONL protocol; turns run as tasks; events fan out through a hub.
+mod handles;
 mod hub;
 mod session;
 mod socket;
@@ -14,6 +15,7 @@ use agent_runtime::{
     store::{Binding, Store, TurnOptions},
     tools::Registry,
 };
+use handles::{Completion, Handles, Waiter};
 use hub::{Hub, replay};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -33,9 +35,11 @@ use turn::Turn;
 const DEFAULT_INSTRUCTIONS: &str = "You are a software engineering agent working in the current workspace. \
 Complete the requested task using the available tools, verify your work, and finish with a short summary. \
 To delegate a subtask to another agent with its own conversation, run \
-\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it returns a durable turn handle immediately. \
+\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
-Use \"$AGENT_BIN\" ls to inspect peer status. Blocking run/follow inside a shell tool is rejected. \
+Collect results with the wait tool on that handle; it returns the peer's status and final text. \
+Long commands can run with shell background=true and be collected the same way. \
+Blocking run/follow inside a shell tool is rejected. \
 Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an earlier checkpoint.";
 
 #[derive(Deserialize)]
@@ -99,6 +103,12 @@ enum Command {
     },
     Unfollow {
         bot: String,
+    },
+    /// Block this request until the handles resolve; the response carries
+    /// the same result shape as the wait tool.
+    Wait {
+        handles: Vec<String>,
+        timeout_ms: Option<u64>,
     },
     Bots {
         after: Option<String>,
@@ -177,6 +187,28 @@ pub struct Configuration {
     pub model: Option<String>,
     pub instructions: Option<String>,
     pub tools: String,
+    /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
+    pub max_processes: Option<usize>,
+    /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
+    pub max_active: Option<usize>,
+    /// Provider requests awaiting response headers; default 64; zero unbounded.
+    pub max_connecting: Option<usize>,
+}
+
+pub struct Limits {
+    pub processes: usize,
+    pub active: usize,
+    pub connecting: usize,
+}
+impl Limits {
+    pub fn resolve(config: &Configuration) -> Limits {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Limits {
+            processes: config.max_processes.unwrap_or(64 * cpus),
+            active: config.max_active.unwrap_or(4096),
+            connecting: config.max_connecting.unwrap_or(64),
+        }
+    }
 }
 
 fn name(value: &str) -> Result<()> {
@@ -206,13 +238,20 @@ struct Service {
     hub: Hub,
     default_model: Option<String>,
     default_instructions: String,
-    active: HashMap<String, (i64, watch::Sender<bool>)>,
-    jobs: JoinSet<(String, i64, Result<()>)>,
+    handles: Handles,
+    background_failures: mpsc::UnboundedSender<Error>,
+    limit_active: usize,
+    /// Per bot: the running turn, the task owning it, and its cancel signal.
+    /// A parked turn's task ends while a resumed task may already own the slot.
+    active: HashMap<String, (i64, u64, watch::Sender<bool>)>,
+    next_task: u64,
+    jobs: JoinSet<(String, i64, u64, Result<()>)>,
     replays: JoinSet<()>,
 }
 
 pub async fn run(config: Configuration) -> Result<()> {
-    let transport = Transport::new()?;
+    let limits = Limits::resolve(&config);
+    let transport = Transport::new(limits.connecting)?;
     let registry = Registry::new(&config.tools)?;
     let schemas = registry.schemas();
     let mut providers = HashMap::new();
@@ -253,7 +292,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             return fail_with("provider_unavailable", provider);
         }
     }
-    let binding = json!({"schema":3,"providers":binding,"tools":registry.names()}).to_string();
+    let binding = json!({"schema":5,"providers":binding,"tools":registry.names()}).to_string();
     let store = Store::open(&config.store, binding).await?;
     let mut environment = vec![
         (
@@ -276,12 +315,14 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     let registry = registry
         .exclude_credentials(credentials)
-        .with_environment(environment);
+        .with_environment(environment)
+        .with_process_budget(limits.processes);
     let hub = Hub::default();
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_completed_checkpoint","submit","interrupt","events","item","artifact","follow","bots"],
+        "capabilities":["create","resume","fork_completed_checkpoint","submit","interrupt","events","item","artifact","follow","bots","wait"],
+        "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting},
         "tools":registry.names(),"providers":provider_names,"default_model":config.model,
         "durability":"sqlite_full","partial_text_durable":false});
     let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
@@ -320,8 +361,27 @@ pub async fn run(config: Configuration) -> Result<()> {
         stdio_reader(sender.clone());
         stdout.send(ready.clone()).await?;
     }
+    let mut stdout_closed = stdout.subscribe_closed();
     drop(stdout);
     drop(sender);
+    let (resume_sender, mut resumes) = mpsc::unbounded_channel();
+    let (failure_sender, mut failures) = mpsc::unbounded_channel();
+    let handles = Handles::new(resume_sender);
+    // Turns parked before a restart keep waiting; their processes are gone.
+    for waiting in store.call(|db| db.waiting_turns()).await? {
+        handles
+            .attach(
+                &store,
+                Waiter::Turn(waiting.turn),
+                &waiting.handles,
+                waiting.deadline_ms,
+                Completion::Resume {
+                    bot: waiting.bot.clone(),
+                    turn: waiting.turn,
+                },
+            )
+            .await;
+    }
     let mut service = Service {
         store,
         providers: Arc::new(providers),
@@ -332,7 +392,11 @@ pub async fn run(config: Configuration) -> Result<()> {
             .instructions
             .clone()
             .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned()),
+        handles,
+        background_failures: failure_sender,
+        limit_active: limits.active,
         active: HashMap::new(),
+        next_task: 0,
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
     };
@@ -340,14 +404,19 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
         tokio::select! {
+            _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
+            Some(error) = failures.recv() => return Err(error),
             _ = service.replays.join_next(), if !service.replays.is_empty() => {}
             joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
-                let (bot, turn, result) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
-                if service.active.get(&bot).is_some_and(|(id,_)| *id == turn) { service.active.remove(&bot); }
+                let (bot, _turn, task, result) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                if service.active.get(&bot).is_some_and(|(_, owner, _)| *owner == task) { service.active.remove(&bot); }
                 result?;
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
+            Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
+                service.resume(bot, turn).await?;
+            }
             message = inbound.recv() => {
                 let Some(message) = message else { break };
                 match message {
@@ -358,6 +427,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     Inbound::Closed(id) => {
                         sessions.remove(&id);
                         service.hub.close_session(id);
+                        service.handles.close_session(id);
                         if id == 0 && stdio_owner { break; }
                     }
                     Inbound::Request(id, request) => {
@@ -365,7 +435,8 @@ pub async fn run(config: Configuration) -> Result<()> {
                         let (request_id, result, shutting_down) = match request {
                             Ok(request) if request.id.is_u64() || request.id.as_str().is_some_and(|id| id.len() <= 128) => {
                                 let shutting_down = matches!(request.command, Command::Shutdown);
-                                let result = service.dispatch(request.command, id, &output).await;
+                                let result = service.dispatch(request.command, id, &output, request.id.clone()).await;
+                                if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                 (request.id, result, shutting_down)
                             }
                             Ok(_) => (Value::Null, fail("invalid_request_id"), false),
@@ -378,6 +449,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                         } else if output.try_respond(request_id, result).is_err() {
                             sessions.remove(&id);
                             service.hub.close_session(id);
+                            service.handles.close_session(id);
                             output.close();
                         }
                         if shutting_down {
@@ -391,12 +463,13 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
         }
     }
-    for (_, cancel) in service.active.values() {
+    for (_, _, cancel) in service.active.values() {
         let _ = cancel.send(true);
     }
     while let Some(result) = service.jobs.join_next().await {
-        result.map_err(|_| Error::new("turn_task_failed"))?.2?;
+        result.map_err(|_| Error::new("turn_task_failed"))?.3?;
     }
+    service.handles.shutdown();
     service.replays.abort_all();
     while service.replays.join_next().await.is_some() {}
     drop(sessions);
@@ -411,7 +484,51 @@ pub async fn run(config: Configuration) -> Result<()> {
 }
 
 impl Service {
-    async fn dispatch(&mut self, command: Command, session: u64, output: &Output) -> Result<Value> {
+    fn has_capacity(&self) -> bool {
+        self.limit_active == 0 || self.active.len() < self.limit_active
+    }
+
+    async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
+        let name = bot.clone();
+        let state = self.store.call(move |db| db.inspect(&name)).await?;
+        // The wake-up may have queued before an interrupt or a new turn.
+        if state.status == "waiting" && state.running_turn == Some(turn) {
+            self.spawn(bot, turn, true);
+        }
+        Ok(())
+    }
+
+    /// Run a turn as a task: fresh after submission, or resuming a parked one.
+    fn spawn(&mut self, bot: String, turn: i64, resume: bool) {
+        let (cancel, cancelled) = watch::channel(false);
+        self.next_task += 1;
+        let task_id = self.next_task;
+        self.active.insert(bot.clone(), (turn, task_id, cancel));
+        let task = Turn {
+            bot,
+            turn,
+            store: self.store.clone(),
+            providers: self.providers.clone(),
+            registry: self.registry.clone(),
+            hub: self.hub.clone(),
+            handles: self.handles.clone(),
+            background_failures: self.background_failures.clone(),
+            resume,
+        };
+        self.jobs.spawn(async move {
+            let (bot, id) = (task.bot.clone(), task.turn);
+            let result = task.execute(cancelled).await;
+            (bot, id, task_id, result)
+        });
+    }
+
+    async fn dispatch(
+        &mut self,
+        command: Command,
+        session: u64,
+        output: &Output,
+        request_id: Value,
+    ) -> Result<Value> {
         let store = &self.store;
         match command {
             Command::Create {
@@ -463,6 +580,37 @@ impl Service {
                 store
                     .call(move |db| Ok(serde_json::to_value(db.inspect(&bot)?)?))
                     .await
+            }
+            Command::Wait {
+                handles,
+                timeout_ms,
+            } => {
+                if handles.is_empty() || handles.len() > 64 {
+                    return fail("invalid_handles");
+                }
+                if timeout_ms.is_some_and(|t| t == 0 || t > 86_400_000) {
+                    return fail("invalid_timeout");
+                }
+                for handle in &handles {
+                    handles::Handle::parse(handle)?;
+                }
+                let waiter = self.handles.request_waiter();
+                let deadline = timeout_ms.map(|t| handles::now_ms() + t);
+                self.handles
+                    .attach(
+                        store,
+                        waiter,
+                        &handles,
+                        deadline,
+                        Completion::Respond {
+                            session,
+                            output: output.clone(),
+                            request: request_id,
+                        },
+                    )
+                    .await;
+                // The response is sent by the completion, not by this dispatch.
+                Err(Error::new("deferred"))
             }
             Command::Bots { after, limit } => {
                 store
@@ -570,7 +718,7 @@ impl Service {
                         None => None,
                     },
                 };
-                let capacity = self.active.len() < 1024;
+                let capacity = self.has_capacity();
                 let (b, r) = (bot.clone(), request_id.clone());
                 let started = store
                     .call(move |db| db.begin(&b, &r, &prompt, capacity, &options))
@@ -581,38 +729,47 @@ impl Service {
                     self.hub.durable(&bot, entry).await?;
                 }
                 if started.fresh {
-                    let (cancel, cancelled) = watch::channel(false);
-                    self.active.insert(bot.clone(), (started.turn, cancel));
-                    let turn = Turn {
-                        bot: bot.clone(),
-                        turn: started.turn,
-                        store: store.clone(),
-                        providers: self.providers.clone(),
-                        registry: self.registry.clone(),
-                        hub: self.hub.clone(),
-                    };
-                    self.jobs.spawn(async move {
-                        let (bot, id) = (turn.bot.clone(), turn.turn);
-                        let result = turn.execute(cancelled).await;
-                        (bot, id, result)
-                    });
+                    self.spawn(bot.clone(), started.turn, false);
                 }
                 Ok(
                     json!({"bot":bot,"turn":started.turn,"request_id":request_id,
-                    "duplicate":!started.fresh,"cursor":cursor}),
+                    "duplicate":!started.fresh,"cursor":cursor,
+                    "handle":format!("turn:{bot}/{}", started.turn)}),
                 )
             }
             Command::Interrupt { bot, turn } => {
-                let Some((running, cancel)) = self.active.get(&bot) else {
+                if let Some((running, _, cancel)) = self.active.get(&bot) {
+                    if *running != turn {
+                        return fail("stale_turn");
+                    }
+                    if cancel.send(true).is_ok() {
+                        return Ok(json!({"interrupt_requested":true,"turn":turn}));
+                    }
+                    // The task exited but its JoinSet result has not been reaped.
+                    // Release its slot; the result still gets checked by the loop.
+                    self.active.remove(&bot);
+                }
+                // A parked turn has no task; confirm durable state and end it.
+                let check = bot.clone();
+                let state = store.call(move |db| db.inspect(&check)).await?;
+                if state.running_turn.is_none() {
                     return fail("no_active_turn");
-                };
-                if *running != turn {
+                }
+                if state.running_turn != Some(turn) || state.status != "waiting" {
                     return fail("stale_turn");
                 }
-                cancel
-                    .send(true)
-                    .map_err(|_| Error::new("no_active_turn"))?;
-                Ok(json!({"interrupt_requested":true,"turn":turn}))
+                self.handles.forget(Waiter::Turn(turn));
+                let entries = store
+                    .call(move |db| db.finish(turn, Some(&Error::new("cancelled"))))
+                    .await?;
+                for entry in entries {
+                    self.hub.durable(&bot, entry).await?;
+                }
+                let name = bot.clone();
+                if let Some(outcome) = store.call(move |db| db.turn_outcome(&name, turn)).await? {
+                    self.handles.turn_finished(&bot, turn, outcome);
+                }
+                Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
             }
             Command::Shutdown => Ok(json!({"shutting_down":true})),
         }
@@ -667,6 +824,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupt_reconciles_a_parked_task_before_it_is_reaped() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-parked-interrupt-test-{}",
+            std::process::id()
+        ));
+        let store = Store::open(&dir.join("state.sqlite"), "test".into())
+            .await
+            .unwrap();
+        let turn = store
+            .call(|db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic-model",
+                        instructions: "test",
+                        reasoning: None,
+                    },
+                )?;
+                let turn = db
+                    .begin("Bob", "first", "work", true, &TurnOptions::default())?
+                    .turn;
+                let call = agent_runtime::provider::ToolCall {
+                    name: "wait".into(),
+                    call_id: "wait-1".into(),
+                    arguments: r#"{"handles":["proc:1"]}"#.into(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                db.tool_start(turn, &call)?;
+                db.suspend(turn, &call.call_id, &["proc:1".into()], None, &[])?;
+                Ok(turn)
+            })
+            .await
+            .unwrap();
+        let (cancel, cancelled) = watch::channel(false);
+        let mut service = Service {
+            store: store.clone(),
+            providers: Arc::new(HashMap::new()),
+            registry: Registry::new("wait").unwrap(),
+            hub: Hub::default(),
+            default_model: None,
+            default_instructions: "test".into(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1,
+            active: HashMap::from([("Bob".into(), (turn, 1, cancel))]),
+            next_task: 1,
+            jobs: JoinSet::new(),
+            replays: JoinSet::new(),
+        };
+        service.jobs.spawn(async move {
+            drop(cancelled);
+            ("Bob".into(), turn, 1, Ok(()))
+        });
+        service.active["Bob"].2.closed().await;
+        let output = Output::writer(tokio::io::sink());
+        let stale = service
+            .dispatch(
+                Command::Interrupt {
+                    bot: "Bob".into(),
+                    turn: turn + 1,
+                },
+                0,
+                &output,
+                Value::Null,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code, "stale_turn");
+        let reply = service
+            .dispatch(
+                Command::Interrupt {
+                    bot: "Bob".into(),
+                    turn,
+                },
+                0,
+                &output,
+                Value::Null,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply["parked"], true);
+        assert!(service.has_capacity());
+        assert_eq!(service.jobs.join_next().await.unwrap().unwrap().1, turn);
+        store
+            .call(move |db| {
+                let state = db.inspect("Bob")?;
+                assert_eq!(state.status, "interrupted");
+                assert_eq!(state.running_turn, None);
+                let events = db.events("Bob", 0, 256)?;
+                let events = events["events"].as_array().unwrap();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e["event"] == "turn_finished")
+                        .count(),
+                    1
+                );
+                let completed = events
+                    .iter()
+                    .find(|e| e["event"] == "tool_completed")
+                    .unwrap();
+                assert_eq!(completed["data"]["cancelled"], true);
+                db.begin("Bob", "second", "continue", true, &TurnOptions::default())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn saturated_dispatch_reconciles_duplicates_but_rejects_new_work() {
         let dir = std::env::temp_dir().join(format!("agent-admission-test-{}", std::process::id()));
         let store = Store::open(&dir.join("state.sqlite"), "test".into())
@@ -691,7 +967,7 @@ mod tests {
             .unwrap();
         let registry = Registry::new("echo").unwrap();
         let provider = Provider::new(
-            Transport::new().unwrap(),
+            Transport::new(64).unwrap(),
             Family::Responses,
             "http://127.0.0.1:1/v1",
             None,
@@ -706,9 +982,13 @@ mod tests {
             hub: Hub::default(),
             default_model: None,
             default_instructions: "test".into(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1024,
             active: (0..1024)
-                .map(|index| (index.to_string(), (turn, watch::channel(false).0)))
+                .map(|index| (index.to_string(), (turn, 0, watch::channel(false).0)))
                 .collect(),
+            next_task: 0,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
         };
@@ -723,6 +1003,7 @@ mod tests {
                 },
                 0,
                 &output,
+                Value::Null,
             )
             .await
             .unwrap();
@@ -739,6 +1020,7 @@ mod tests {
                 },
                 0,
                 &output,
+                Value::Null,
             )
             .await
             .unwrap_err();

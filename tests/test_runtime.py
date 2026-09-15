@@ -35,11 +35,53 @@ class Model(http.server.BaseHTTPRequestHandler):
                 time.sleep(5)
             if user == 'burst':
                 time.sleep(.3)  # Allow the CLI to attach its live follower.
+            if user == 'slow':
+                time.sleep(.5)
             last = request['input'][-1]
-            if last.get('type') == 'function_call_output':
+            if user.startswith('waitgate:') and last.get('type') == 'function_call_output':
+                self.server.wait_resumed.put(request['instructions'])
+                self.server.release_waiters.wait(timeout=5)
+            if user.startswith('budget:'):
+                count = sum(i.get('type') == 'function_call' for i in request['input']) + 1
+                text = '' if count <= 205 else 'done'
+                output = ([{'type': 'function_call', 'name': 'wait', 'call_id': f'budget-{count}',
+                            'arguments': json.dumps({'handles': [user[7:] if count == 100 else 'proc:999']})}]
+                          if count <= 205 else [{'type': 'message', 'role': 'assistant',
+                                                 'content': [{'type': 'output_text', 'text': text}]}])
+            elif last.get('type') == 'function_call_output' and user.startswith('bgwait:') and '"handle"' in last['output']:
+                # Second step of a start-then-wait turn: park on the process handle.
+                text = ''
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
+            elif last.get('type') == 'function_call_output':
                 text = 'echo:' + last['output']
                 output = [{'id': 'msg_echo', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
+            elif user.startswith('bg:') or user.startswith('bgwait:'):
+                text = ''
+                command = user.split(':', 1)[1]
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'bg-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 5000, 'background': True})}]
+            elif user.startswith('wait:'):
+                text = ''
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': user[5:].split(',')})}]
+            elif user.startswith('waitgate:'):
+                text = ''
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': [user[9:]]})}]
+            elif user.startswith('waitthen:'):
+                # One response with a wait followed by another call.
+                text = ''
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': user[9:].split(',')})},
+                          {'type': 'function_call', 'name': 'echo', 'call_id': 'after-1',
+                           'arguments': json.dumps({'text': 'after-the-wait'})}]
+            elif user.startswith('waitt:'):
+                text = ''
+                timeout, handles = user[6:].split(':', 1)
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': handles.split(','), 'timeout_ms': int(timeout)})}]
             elif user.startswith('shell:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
@@ -79,7 +121,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             for event in events:
                 frame = ('data: ' + json.dumps(event, ensure_ascii=False) + '\r\n\r\n').encode()
                 # Split inside UTF-8 sequences and SSE line boundaries.
-                chunk_size = 8192 if user == 'large-call-id' else 7
+                chunk_size = 8192 if user == 'large-call-id' or user.startswith('budget:') else 7
                 for offset in range(0, len(frame), chunk_size):
                     part = frame[offset:offset + chunk_size]
                     self.wfile.write(f'{len(part):x}\r\n'.encode() + part + b'\r\n')

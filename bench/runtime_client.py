@@ -7,16 +7,17 @@ import time
 from .targets import clean_env
 
 def serve_args(path, url, tools="echo", model="synthetic-model", key_env=None,
-               provider="openai", family="responses"):
+               provider="openai", family="responses", extra=()):
     """Arguments for a stdio service bound to one synthetic provider endpoint."""
     spec = f'{provider}={family},{url}' + (f',{key_env}' if key_env else '')
-    return ['serve', '--store', str(path), '--provider', spec, '--model', f'{provider}/{model}', '--tools', tools]
+    return ['serve', '--store', str(path), '--provider', spec, '--model', f'{provider}/{model}',
+            '--tools', tools, *extra]
 
 
 class Client:
     def __init__(self, binary, path, url, tools="echo", model="synthetic-model", key_env=None, env=None,
-                 provider="openai", family="responses"):
-        self.process = subprocess.Popen([str(binary), *serve_args(path, url, tools, model, key_env, provider, family)],
+                 provider="openai", family="responses", extra=()):
+        self.process = subprocess.Popen([str(binary), *serve_args(path, url, tools, model, key_env, provider, family, extra)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True, env=env or clean_env(),
                                         start_new_session=True)

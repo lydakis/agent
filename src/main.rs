@@ -14,8 +14,10 @@ const USAGE: &str = "usage:
   agent follow --bot NAME [--after N] replay then stream a bot's events as JSONL
   agent fork --source NAME --checkpoint N --bot NAME [--workspace DIR]
   agent interrupt --bot NAME
+  agent wait [--timeout-ms N] HANDLE...  block until turn:BOT/N or proc:N handles resolve
   agent ls | agent shutdown
   agent serve --store PATH [--socket PATH] --provider SPEC... [--model P/M] [--tools LIST]
+              [--max-processes N] [--max-active N] [--max-connecting N]   (0 = unbounded)
   agent benchmark | agent --version
 options: --store PATH --model PROVIDER/MODEL --provider SPEC --tools LIST --workspace DIR
          --bot NAME --instructions TEXT --instructions-file F --reasoning low|medium|high
@@ -81,7 +83,9 @@ fn run() -> Result<i32> {
                 .map_err(|_| Error::new("output_worker_failed"))??;
             result.map(|_| 0)
         }
-        Some("run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown") => client::main(args),
+        Some("run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown" | "wait") => {
+            client::main(args)
+        }
         _ => fail_with("usage", USAGE),
     }
 }
@@ -99,6 +103,9 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut model = None;
     let mut tools = None;
     let mut instructions = None;
+    let mut max_processes = None;
+    let mut max_active = None;
+    let mut max_connecting = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -111,6 +118,16 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--model" => model = Some(value.clone()),
             "--tools" => tools = Some(value.clone()),
             "--instructions" => instructions = Some(value.clone()),
+            "--max-processes" | "--max-active" | "--max-connecting" => {
+                let parsed: usize = value
+                    .parse()
+                    .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
+                match flag.as_str() {
+                    "--max-processes" => max_processes = Some(parsed),
+                    "--max-active" => max_active = Some(parsed),
+                    _ => max_connecting = Some(parsed),
+                }
+            }
             _ => return fail_with("usage", USAGE),
         }
     }
@@ -124,5 +141,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         model,
         instructions,
         tools: tools.unwrap_or_else(|| "echo".into()),
+        max_processes,
+        max_active,
+        max_connecting,
     })
 }

@@ -88,6 +88,13 @@ impl Output {
         self.closed.send_replace(true);
     }
 
+    /// Observe closure without retaining a sender to the output worker.
+    /// The stdio owner must exit when closed, since a blocking stdout write
+    /// cannot be cancelled by the socket writer's async close path.
+    pub fn subscribe_closed(&self) -> watch::Receiver<bool> {
+        self.closed.subscribe()
+    }
+
     /// Wait until accepted packets have been written, before ending the runtime.
     pub async fn drain(&self) -> Result<()> {
         let (done, drained) = oneshot::channel();
