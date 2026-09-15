@@ -121,12 +121,13 @@ calls) and the three configurable daemon limits in place of fixed constants; see
 [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results). Still to measure:
 bytes per parked turn versus per live process, on the lifecycle screen.
 
-1. Extend the OpenAI adapter probe to a bounded real daemon task, and run the
-   first live Anthropic task, each with a stated call/token cap
-   (for example `agent run --model anthropic/... --pretty -- "..."` in a
-   scratch checkout). Record admission behavior, header latency against the
-   64-request startup bound, idle-timeout adequacy for long thinking, actual
-   usage events, and any provider error details. Preserve failures.
+1. Run the first live Anthropic task through the daemon with a stated
+   call/token cap, mirroring the [OpenAI daemon run](OPENAI_SMOKE.md#daemon-live-run):
+   file and shell tools, a continuation turn that resends stored thinking
+   blocks with signatures, and a detach-plus-wait delegation. Then a bounded
+   multi-agent run on either provider (tens of concurrent bots) to observe the
+   64-request startup bound, header latency, and idle-timeout adequacy for
+   long thinking. Preserve failures.
 2. Separate long-term conversation storage from bounded model context. Implement
    indexed history access and context selection before claiming long-history
    support. Follow [LONG_HISTORY.md](LONG_HISTORY.md), including preserved fork

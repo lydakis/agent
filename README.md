@@ -24,9 +24,10 @@ named bots, restart/resume, historical checkpoints, cancellation, replay with
 live follow, shell/read/write/edit tools with retained artifacts, delegation to
 other named agents through the same client, and two provider families (OpenAI
 Responses and compatible gateways, Anthropic Messages) with streamed thinking
-and usage. Its protocol is experimental. The OpenAI adapter has passed a bounded
-[live tool and history-continuation probe](docs/OPENAI_SMOKE.md); daemon lifecycle
-and Anthropic checks still use synthetic endpoints. Compaction,
+and usage. Its protocol is experimental. The daemon has completed a bounded
+[live OpenAI run](docs/OPENAI_SMOKE.md#daemon-live-run) covering file and shell
+tools, stored reasoning items across turns, and delegation through detach and
+wait; Anthropic checks still use synthetic endpoints. Compaction,
 cross-provider handoff, and MCP are not implemented.
 
 ## What matters
