@@ -10,15 +10,15 @@ Matching prompts and responses is necessary, but insufficient.
 | Capability | Our Rust prototype | Pi core/model packages tested | Codex app-server tested |
 | --- | --- | --- | --- |
 | Text streaming and retained history | Implemented; exercised | Implemented; exercised | Implemented; exercised |
-| Named durable identities | SQLite service; bypassed by streaming benchmark | Not provided by this in-memory Agent adapter; coding-agent session layer not loaded | Native threads; benchmark requests ephemeral threads |
+| Named durable identities | SQLite service; exercised (one bot per agent, FULL durability) | Not provided by this in-memory Agent adapter; coding-agent session layer not loaded | Native threads; benchmark requests ephemeral threads |
 | Restart/resume, historical forks | Completed checkpoints, replay, idempotent submit; behavior tested separately | Not exercised or wired into this adapter | Native resume/fork API; not exercised by this adapter |
 | Tool loop | Echo; now optional bounded shell | Generic tools, execution modes, hooks and tool events available; empty tool set in screen | Native coding/tool machinery; shell execution disabled in screen |
 | Steering and interruption | Exact-turn cancellation; no mid-turn steering | Abort, steering/follow-up queues | Turn steering/interrupt APIs |
 | Models and modalities | One Responses subset; text and opaque reasoning preservation; no validated live provider | Broader provider routing, thinking, image input, usage accounting | Broader native model/transport/context machinery; one synthetic provider selected |
 | Permissions | Full registered-tool access; caller host permissions | Generic before/after tool hooks; application policy outside measured core | Native policy/approval/sandbox architecture, configured full access for screen |
-| Context management | Hard 8 MiB/4,096-item history cap; no compaction | Context transformation hooks in core; application session compaction not measured | Native context/compaction machinery; compaction not triggered in short screen |
+| Context management | Unbounded stored history; per-request window of whole turns (default 8 MiB/4,096 items) with an omission note and a history-read tool; no compaction | Context transformation hooks in core; application session compaction not measured | Native context/compaction machinery; compaction not triggered in short screen |
 | Extensions and integrations | No MCP, skills, hooks, plugins | Coding-agent application not loaded; do not attribute its features to the tested core | Optional integrations disabled; disabled does not prove zero retained allocation |
-| Client/runtime boundary | Native process; benchmark bypasses service protocol and SQLite | Node runtime plus Agent/core/model packages in one process | Node JSON-RPC client plus native app-server, both charged to target |
+| Client/runtime boundary | Native daemon driven over its stdio JSONL protocol by the observer; only the daemon charged | Node runtime plus Agent/core/model packages in one process | Node JSON-RPC client plus native app-server, both charged to target |
 
 Evidence reviewed locally 2026-09-07: our source and adapters; installed Pi core
 and model package READMEs/distribution at **0.85.1**; Codex source at

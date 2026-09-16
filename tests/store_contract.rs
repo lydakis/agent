@@ -28,6 +28,14 @@ fn binding() -> Binding<'static> {
         budget_tokens: None,
     }
 }
+/// Every stored item of a bot, through the same window the runtime streams.
+fn stored(db: &mut Database, name: &str) -> Vec<Value> {
+    let Some(window) = db.window(name, i64::MAX, i64::MAX).unwrap() else {
+        return Vec::new();
+    };
+    let joined = db.items_by_ids(&window.ids).unwrap();
+    serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap()
+}
 fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
@@ -58,8 +66,8 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     db.finish(second, None).unwrap();
     db.fork("Bob", Some(checkpoint), "Alternative", None, None)
         .unwrap();
-    assert_eq!(db.load("Alternative").unwrap().len(), 2);
-    assert_eq!(db.load("Bob").unwrap().len(), 4);
+    assert_eq!(stored(&mut db, "Alternative").len(), 2);
+    assert_eq!(stored(&mut db, "Bob").len(), 4);
     assert!(
         db.fork("Bob", Some(checkpoint + 1000), "bad", None, None)
             .is_err()
@@ -88,10 +96,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     db.append(alt, vec![assistant("another direction")], &[], None)
         .unwrap();
     db.finish(alt, None).unwrap();
-    assert_ne!(
-        db.load("Alternative").unwrap().items(),
-        db.load("Bob").unwrap().items()
-    );
+    assert_ne!(stored(&mut db, "Alternative"), stored(&mut db, "Bob"));
     let events = db.events("Alternative", 0, 2).unwrap();
     let cursor = events["next_cursor"].as_i64().unwrap();
     let following = db.events("Alternative", cursor, 256).unwrap();
@@ -137,7 +142,7 @@ fn submission_is_idempotent_and_conflicting_or_overlapping_work_is_rejected() {
             .unwrap()
             .fresh
     );
-    assert_eq!(db.load("Bob").unwrap().len(), 2);
+    assert_eq!(stored(&mut db, "Bob").len(), 2);
     assert!(
         db.append(started.turn, vec![assistant("late")], &[], None)
             .is_err()
@@ -473,7 +478,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
 }
 
 #[test]
-fn stores_carry_a_schema_version_and_refuse_unversioned_or_newer_ones() {
+fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("CREATE TABLE bots(name TEXT PRIMARY KEY)")
         .unwrap();
@@ -494,6 +499,96 @@ fn stores_carry_a_schema_version_and_refuse_unversioned_or_newer_ones() {
         Database::SCHEMA
     };
     assert_eq!(version, Database::SCHEMA);
+    // A version-6 store (no turn ordinals) is migrated forward at open:
+    // ordinals are rebuilt from the accepted events, so windows and history
+    // reads work on the old data.
+    let path = std::env::temp_dir().join(format!("agent-migrate-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=3 {
+            converse(&mut db, "Bob", n);
+        }
+        db.fork("Bob", None, "branch", Some("/synthetic"), None)
+            .unwrap();
+        converse(&mut db, "branch", 4);
+        converse(&mut db, "Bob", 5);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX nodes_turn_seq; ALTER TABLE nodes DROP COLUMN turn;
+             ALTER TABLE nodes DROP COLUMN turn_seq; ALTER TABLE bots DROP COLUMN context_start;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+    }
+    // A late malformed event must roll back earlier streamed backfill as well
+    // as the DDL, so repairing that event permits a clean retry.
+    let conn = Connection::open(&path).unwrap();
+    let (event, saved): (i64, String) = conn
+        .query_row(
+            "SELECT id,data FROM events WHERE kind='accepted' ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    conn.execute("UPDATE events SET data='{}' WHERE id=?", [event])
+        .unwrap();
+    assert_eq!(
+        Database::initialize(conn, "test").err().unwrap().code,
+        "store_migration_invalid_event"
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('nodes') WHERE name='turn_seq'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    conn.execute(
+        "UPDATE events SET data=? WHERE id=?",
+        rusqlite::params![saved, event],
+    )
+    .unwrap();
+    drop(conn);
+    let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+    assert!(
+        db.history_read("Bob", 3, 0, 1024).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("r3")
+    );
+    assert!(
+        db.history_read("branch", 4, 0, 1024).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("p4")
+    );
+    assert!(
+        db.history_read("Bob", 4, 0, 1024).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("p5")
+    );
+    let window = db.window("branch", i64::MAX, 3).unwrap().unwrap();
+    assert_eq!((window.omitted_items, window.omitted_turns), (6, 3));
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(path.with_file_name(format!(
+            "{}{suffix}",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+    }
 }
 
 #[test]
@@ -541,12 +636,12 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
         .fork("Bob", Some(answered), "branch", None, None)
         .unwrap();
     assert_eq!(branch.head, Some(answered));
-    assert_eq!(db.load("branch").unwrap().len(), 4);
+    assert_eq!(stored(&mut db, "branch").len(), 4);
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     let tip = db.fork("Bob", None, "tip", None, None).unwrap();
     assert_eq!(tip.head, db.inspect("Bob").unwrap().head);
-    assert_eq!(db.load("tip").unwrap().len(), 5);
+    assert_eq!(stored(&mut db, "tip").len(), 5);
     // Branches are independent of the source and of each other.
     let b = db
         .begin(
@@ -564,9 +659,35 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
     db.append(b, vec![assistant("branch reply")], &[], None)
         .unwrap();
     db.finish(b, None).unwrap();
-    assert_eq!(db.load("branch").unwrap().len(), 6);
-    assert_eq!(db.load("Bob").unwrap().len(), 5);
-    assert_eq!(db.load("tip").unwrap().len(), 5);
+    assert_eq!(stored(&mut db, "branch").len(), 6);
+    assert_eq!(stored(&mut db, "Bob").len(), 5);
+    assert_eq!(stored(&mut db, "tip").len(), 5);
+    // Historical reads honor the exact fork cut, even after both branches
+    // acquire different turns with the same ordinal.
+    converse(&mut db, "Bob", 2);
+    let branch_first = db.history_read("branch", 1, 0, 65536).unwrap();
+    assert_eq!(branch_first["items"], 4);
+    assert!(!branch_first["text"].as_str().unwrap().contains("done"));
+    assert_eq!(db.history_read("Bob", 1, 0, 65536).unwrap()["items"], 5);
+    let branch_second = db.history_read("branch", 2, 0, 65536).unwrap();
+    assert_eq!(branch_second["items"], 2);
+    assert!(
+        branch_second["text"]
+            .as_str()
+            .unwrap()
+            .contains("branch reply")
+    );
+    assert!(!branch_second["text"].as_str().unwrap().contains("r2"));
+    assert!(
+        db.history_read("Bob", 2, 0, 65536).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("r2")
+    );
+    assert_eq!(
+        db.history_read("Bob", i64::MAX, 0, 65536).unwrap_err().code,
+        "turn_not_in_history"
+    );
 }
 
 #[test]
@@ -620,12 +741,14 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
             );
         } else {
             db.fork("Bob", Some(node), "answered", None, None).unwrap();
-            assert_eq!(db.load("answered").unwrap().items()[1], reasoning);
+            assert_eq!(
+                serde_json::to_vec(&stored(&mut db, "answered")[1]).unwrap(),
+                reasoning
+            );
             // A validated intermediate checkpoint is also safe for another branch.
             db.fork("answered", None, "nested", None, None).unwrap();
         }
     }
-    // A checkpoint from an older binary is not proof that reasoning is paired.
     // A reasoning-only completion must not bypass the boundary check either.
     db.append(turn, vec![reasoning], &[], None).unwrap();
     db.finish(turn, None).unwrap();
@@ -695,7 +818,286 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             );
         } else {
             db.fork("Bob", Some(node), "answered", None, None).unwrap();
-            assert_eq!(db.load("answered").unwrap().len(), 6);
+            assert_eq!(stored(&mut db, "answered").len(), 6);
         }
+    }
+}
+
+fn user(text: &str) -> Bytes {
+    Family::Responses.user_item(text).unwrap().into()
+}
+/// One finished turn: the prompt then an assistant reply.
+fn converse(db: &mut Database, bot: &str, n: usize) {
+    let turn = db
+        .begin(
+            bot,
+            &format!("r{n}"),
+            &format!("p{n}"),
+            true,
+            &TurnOptions::default(),
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant(&format!("r{n}"))], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+}
+
+#[test]
+fn context_windows_start_at_turn_boundaries_and_move_with_hysteresis() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=10 {
+        converse(&mut db, "Bob", n);
+    }
+    // Unbounded: every item, nothing omitted, and the byte count matches the
+    // encoded items exactly (the request Content-Length depends on it).
+    let all = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!(all.ids.len(), 20);
+    assert_eq!((all.omitted_items, all.omitted_turns), (0, 0));
+    let joined = db.items_by_ids(&all.ids).unwrap();
+    assert_eq!(joined.len() as i64, all.item_bytes + 19);
+    let parsed: Vec<Value> = serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap();
+    assert_eq!(parsed[0]["content"][0]["text"], "p1");
+    assert_eq!(parsed[19]["content"][0]["text"], "r10");
+    // Five items allow two turns, but the start lands at the oldest turn
+    // boundary within three quarters of the budget: only the newest turn.
+    let bounded = db.window("Bob", i64::MAX, 5).unwrap().unwrap();
+    assert_eq!(bounded.ids, all.ids[18..]);
+    assert_eq!((bounded.omitted_items, bounded.omitted_turns), (18, 9));
+    // The start is persisted and stays while the window still fits.
+    converse(&mut db, "Bob", 11);
+    let grown = db.window("Bob", i64::MAX, 5).unwrap().unwrap();
+    assert_eq!(grown.ids[0], bounded.ids[0]);
+    assert_eq!(grown.ids.len(), 4);
+    // Overflow moves the start forward again, to a turn boundary.
+    converse(&mut db, "Bob", 12);
+    let moved = db.window("Bob", i64::MAX, 5).unwrap().unwrap();
+    assert_eq!(moved.ids.len(), 2);
+    assert_eq!((moved.omitted_items, moved.omitted_turns), (22, 11));
+    // Bytes bound the same way; a turn that cannot fit alone is an error
+    // rather than a silently truncated request.
+    let small = db
+        .window("Bob", all.item_bytes / 5, i64::MAX)
+        .unwrap()
+        .unwrap();
+    assert!(small.ids.len() >= 2 && small.ids.len().is_multiple_of(2));
+    assert_eq!(
+        db.window("Bob", 10, i64::MAX).unwrap_err().code,
+        "context_limit"
+    );
+    // A running turn's own items are always part of its window.
+    let turn = db
+        .begin("Bob", "live", "p13", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("partial"), user("more")], &[], None)
+        .unwrap();
+    let live = db.window("Bob", i64::MAX, 5).unwrap().unwrap();
+    assert_eq!(live.ids.len(), 5);
+    assert_eq!(
+        db.window("Bob", i64::MAX, 2).unwrap_err().code,
+        "context_limit"
+    );
+    assert!(db.window("Nobody", i64::MAX, i64::MAX).is_err());
+}
+
+#[test]
+fn history_reads_one_turn_by_ordinal_along_the_lineage() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Empty", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    let first = db.history_read("Bob", 1, 0, 64 * 1024).unwrap();
+    assert_eq!(first["turn"], 1);
+    assert_eq!(first["items"], 2);
+    assert_eq!(first["truncated"], false);
+    let text = first["text"].as_str().unwrap();
+    assert!(text.contains("p1") && text.contains("r1") && !text.contains("p2"));
+    let last = db.history_read("Bob", 3, 0, 64 * 1024).unwrap();
+    assert!(last["text"].as_str().unwrap().contains("r3"));
+    let clipped = db.history_read("Bob", 2, 0, 12).unwrap();
+    assert_eq!(clipped["truncated"], true);
+    assert!(clipped["items"].as_i64().unwrap() < 2);
+    assert_eq!(
+        db.history_read("Bob", 4, 0, 1024).unwrap_err().code,
+        "turn_not_in_history"
+    );
+    assert_eq!(
+        db.history_read("Empty", 1, 0, 1024).unwrap_err().code,
+        "turn_not_in_history"
+    );
+    // A fork shares the numbering of its source up to the fork point and
+    // continues it; the source never sees the branch's turns.
+    db.fork("Bob", None, "branch", Some("/synthetic"), None)
+        .unwrap();
+    converse(&mut db, "branch", 4);
+    assert!(
+        db.history_read("branch", 1, 0, 1024).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("p1")
+    );
+    assert!(
+        db.history_read("branch", 4, 0, 1024).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("p4")
+    );
+    assert_eq!(
+        db.history_read("Bob", 4, 0, 1024).unwrap_err().code,
+        "turn_not_in_history"
+    );
+    let window = db.window("branch", i64::MAX, 3).unwrap().unwrap();
+    assert_eq!((window.omitted_items, window.omitted_turns), (6, 3));
+}
+
+#[test]
+fn history_preserves_content_beyond_the_preview() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let prompt = format!("{} final fact", "é🦀".repeat(1000));
+    let turn = db
+        .begin("Bob", "long", &prompt, true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let reasoning: Bytes = serde_json::to_vec(&json!({"type":"reasoning","id":"rs_1",
+        "summary":[{"type":"summary_text","text":"Résumé 🦀"}],
+        "encrypted_content":"opaque-and-large".repeat(16384)}))
+    .unwrap()
+    .into();
+    db.append(turn, vec![reasoning, assistant("done")], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    let replay = db.items_by_ids(&window.ids).unwrap();
+    let page = db.history_read("Bob", 1, 0, 65536).unwrap();
+    assert!(page["text"].as_str().unwrap().contains("final fact"));
+    // The reading view keeps reasoning summaries but excludes opaque state.
+    assert!(!page["text"].as_str().unwrap().contains("encrypted_content"));
+    assert_eq!(page["truncated"], false);
+    let full = page["text"].as_str().unwrap();
+    let mut joined = String::new();
+    let mut offset = 0;
+    loop {
+        let page = db.history_read("Bob", 1, offset, 97).unwrap();
+        let text = page["text"].as_str().unwrap();
+        assert!(text.len() <= 97 && !text.is_empty());
+        assert_eq!(page["offset"], offset);
+        assert_eq!(page["next_offset"], offset + text.len() as u64);
+        joined.push_str(text);
+        offset = page["next_offset"].as_u64().unwrap();
+        if page["done"] == true {
+            assert_eq!(page["truncated"], false);
+            break;
+        }
+        assert_eq!(page["truncated"], true);
+    }
+    assert_eq!(joined, full);
+    let records: Vec<Value> = joined
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records[0]["content"][0]["text"], prompt);
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[1]["summary"][0]["text"], "Résumé 🦀");
+    assert_eq!(records[1]["type"], "reasoning");
+    assert_eq!(db.items_by_ids(&window.ids).unwrap(), replay);
+    assert!(
+        String::from_utf8(replay)
+            .unwrap()
+            .contains("opaque-and-large")
+    );
+    assert_eq!(db.history_read("Bob", 1, offset, 97).unwrap()["text"], "");
+    assert_eq!(
+        db.history_read("Bob", 1, offset + 1, 97).unwrap_err().code,
+        "invalid_history_page"
+    );
+    let unicode_offset = full.find('é').unwrap() as u64 + 1;
+    assert_eq!(
+        db.history_read("Bob", 1, unicode_offset, 97)
+            .unwrap_err()
+            .code,
+        "invalid_history_page"
+    );
+}
+
+#[test]
+fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
+    let mut db = db();
+    for (name, family, item) in [
+        (
+            "Bob",
+            Family::Responses,
+            r#"{
+                "type":"reasoning",
+                "summary":[{"type":"summary_text","text":"é🦀\nnext"}],
+                "extra":{"encrypted_content":"nested"}
+            }"#,
+        ),
+        (
+            "Alice",
+            Family::Anthropic,
+            r#"{
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"é🦀","signature":"signed"},
+                    {"type":"redacted_thinking","data":"opaque"}
+                ],
+                "encrypted_content":"not-a-reasoning-item"
+            }"#,
+        ),
+        (
+            "Eve",
+            Family::Responses,
+            r#"{ "type":"message", "role":"assistant", "content":[{"type":"output_text","text":"one\né🦀"}] }"#,
+        ),
+    ] {
+        db.create(
+            name,
+            Some("/synthetic"),
+            Binding {
+                family,
+                ..binding()
+            },
+        )
+        .unwrap();
+        let turn = db
+            .begin(name, "r1", "prompt", true, &TurnOptions::default())
+            .unwrap()
+            .turn;
+        db.append(turn, vec![Bytes::from_static(item.as_bytes())], &[], None)
+            .unwrap();
+        db.finish(turn, None).unwrap();
+        let window = db.window(name, i64::MAX, i64::MAX).unwrap().unwrap();
+        let replay = db.items_by_ids(&window.ids).unwrap();
+        assert!(replay.ends_with(item.as_bytes()));
+        let mut joined = String::new();
+        let mut offset = 0;
+        let mut completed_items = 0;
+        loop {
+            let page = db.history_read(name, 1, offset, 4).unwrap();
+            completed_items += page["items"].as_u64().unwrap();
+            joined.push_str(page["text"].as_str().unwrap());
+            if page["done"] == true {
+                break;
+            }
+            let next = page["next_offset"].as_u64().unwrap();
+            assert!(next > offset);
+            offset = next;
+        }
+        let records: Vec<Value> = joined
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(completed_items, 2);
+        assert_eq!(records[1], serde_json::from_str::<Value>(item).unwrap());
+        if !item.contains(['\r', '\n']) {
+            assert_eq!(joined.lines().nth(1).unwrap(), item);
+        }
+        assert_eq!(db.items_by_ids(&window.ids).unwrap(), replay);
     }
 }

@@ -71,6 +71,16 @@ class Model(http.server.BaseHTTPRequestHandler):
                     arguments.update(offset=int(offset), limit=int(limit))
                 output = [{'type': 'function_call', 'name': 'read', 'call_id': 'readart-1',
                            'arguments': json.dumps(arguments)}]
+            elif user.startswith('history:') and last.get('type') != 'function_call_output':
+                text = ''
+                output = [{'type': 'function_call', 'name': 'history', 'call_id': 'history-1',
+                           'arguments': json.dumps({'turn': int(user[8:].split(',')[0]),
+                                                    'offset': int(user.split(',')[1]) if ',' in user else 0,
+                                                    **({'limit': int(user.split(',')[2])} if user.count(',') == 2 else {})})}]
+                if getattr(self.server, 'history_prefill', 0):
+                    text = 'p' * self.server.history_prefill
+                    output.insert(0, {'type': 'message', 'role': 'assistant',
+                                      'content': [{'type': 'output_text', 'text': text}]})
             elif user.startswith('wait:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
@@ -107,6 +117,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = 'reply:' + user
                 output = [{'id': 'msg_text', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
+            if getattr(self.server, 'history_reasoning', None):
+                output.insert(0, self.server.history_reasoning)
             events = [{'type': 'response.created', 'response': {'id': 'response_test'}}]
             if text:
                 events.append({'type': 'response.output_text.delta', 'delta': text})
@@ -133,7 +145,9 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 self.server.all_streaming.wait(timeout=5)
             for event in events:
-                frame = ('data: ' + json.dumps(event, ensure_ascii=False) + '\r\n\r\n').encode()
+                encoded = json.dumps(event, ensure_ascii=False,
+                                     indent=2 if getattr(self.server, 'history_multiline', False) else None)
+                frame = (''.join('data: ' + line + '\r\n' for line in encoded.split('\n')) + '\r\n').encode()
                 # Split inside UTF-8 sequences and SSE line boundaries.
                 chunk_size = 8192 if user == 'large-call-id' or user.startswith('budget:') else 7
                 for offset in range(0, len(frame), chunk_size):
@@ -289,8 +303,8 @@ class ModelFixture(unittest.TestCase):
         self.binary = root / '.local/target/release/agent'
         self.url = f'http://127.0.0.1:{self.model.server_port}/v1'
 
-    def client(self, tools="echo"):
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools)
+    def client(self, tools="echo", extra=()):
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools, extra=extra)
         self.addCleanup(client.close)
         return client
 
@@ -563,6 +577,101 @@ class RuntimeTests(ModelFixture):
                 self.assertFalse(sentinel in json.dumps(item))
         self.assertEqual(len(self.model.auth_checks), 4)
         self.assertTrue(all(self.model.auth_checks))
+
+    def test_history_pages_recover_an_omitted_long_message(self):
+        client = self.client(tools='echo,history', extra=('--context-items', '6'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        prompt = 'é🦀"\\' * 9000 + ' final fact'
+        reasoning = {'type': 'reasoning', 'id': 'rs_history',
+                     'summary': [{'type': 'summary_text', 'text': 'Résumé 🦀'}],
+                     'encrypted_content': 'opaque-state' * 10000}
+        for n, text in enumerate((prompt, 'next', 'next again', 'omit the first turn')):
+            self.model.history_reasoning = reasoning if n == 0 else None
+            self.model.history_multiline = n == 0
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=text)['result']['turn']
+            finished = client.finished(turn)['data']
+            self.assertEqual(finished['status'], 'completed', finished)
+        seed_requests = [self.model.requests.get(timeout=1) for _ in range(4)]
+        self.assertIn(reasoning, seed_requests[1]['input'])
+        client.request('shutdown')
+        client.close()
+        client = self.client(tools='echo,history', extra=('--context-items', '6', '--context-bytes', '65536'))
+        offset, pieces, completed_items = 0, [], 0
+        while True:
+            while not self.model.requests.empty():
+                self.model.requests.get()
+            # Exercise remaining space after substantial work in this same turn.
+            self.model.history_prefill = 56000 if len(pieces) == 1 else 0
+            turn = client.request('submit', bot='Bob', request_id=f'page-{offset}',
+                                  prompt=f'history:1,{offset}' + (',97' if offset == 0 else ''))['result']['turn']
+            finished = client.finished(turn)['data']
+            self.assertEqual(finished['status'], 'completed', finished)
+            requests = []
+            while not self.model.requests.empty():
+                requests.append(self.model.requests.get())
+            result = next(item for item in reversed(requests[-1]['input'])
+                          if item.get('type') == 'function_call_output'
+                          and item.get('call_id') == 'history-1')
+            page = json.loads(result['output'])
+            completed_items += page['items']
+            self.assertEqual(page['offset'], offset)
+            self.assertLessEqual(len(page['text'].encode()), 97 if offset == 0 else 65536)
+            for request in requests:
+                inputs = request['input'][1:] if request['input'][0].get('content', [{}])[0].get('text', '').startswith('[context note]') else request['input']
+                self.assertLessEqual(sum(len(json.dumps(i, ensure_ascii=False, separators=(',', ':')).encode()) for i in inputs), 65536)
+            pieces.append(page['text'])
+            if page['done']:
+                break
+            self.assertTrue(page['truncated'])
+            self.assertGreater(page['next_offset'], offset)
+            offset = page['next_offset']
+        records = [json.loads(line) for line in ''.join(pieces).splitlines()]
+        self.assertEqual(completed_items, len(records))
+        self.assertGreater(len(pieces), 1)
+        self.assertEqual(records[0]['content'][0]['text'], prompt)
+        self.assertEqual(records[1], {k: v for k, v in reasoning.items() if k != 'encrypted_content'})
+        self.assertEqual(records[2]['content'][0]['text'], 'reply:' + prompt)
+
+    def test_long_history_is_windowed_at_turn_boundaries_and_readable_by_ordinal(self):
+        client = self.client(tools='echo,history', extra=('--context-items', '6'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        for n in range(1, 6):
+            turn = client.request('submit', bot='Bob', request_id=f'p{n}', prompt=f'p{n}')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        # Turn 4's request is the first that overflows six items; from then on
+        # the model sees an explicit note and the newest whole turns only.
+        texts = [[i['content'][0]['text'] for i in r['input'] if i.get('role') == 'user'] for r in requests]
+        self.assertEqual(texts[2], ['p1', 'p2', 'p3'])
+        self.assertEqual(texts[3][1:], ['p3', 'p4'])
+        self.assertTrue(texts[3][0].startswith('[context note] 2 earlier turn(s) with 4 messages'))
+        self.assertEqual(texts[4][1:], ['p3', 'p4', 'p5'])  # start held: still fits
+        self.assertNotIn('reply:p2', json.dumps(requests[4]['input']))
+        self.assertEqual(len(requests[4]['input']), 6)
+        # Stored history is complete regardless of the window.
+        self.assertEqual(len(client.request('events', bot='Bob', after=0, limit=256)['result']['events']), 5 * 4 + 1)
+        turn = client.request('submit', bot='Bob', request_id='h', prompt='history:1')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        final = client.request('result', bot='Bob', turn=turn)['result']['text']
+        self.assertTrue(final.startswith('echo:'))
+        read = json.loads(final[5:])
+        self.assertEqual(read['turn'], 1)
+        self.assertIn('p1', read['text'])
+        self.assertIn('reply:p1', read['text'])
+        self.assertNotIn('p2', read['text'])
+        turn = client.request('submit', bot='Bob', request_id='h9', prompt='history:9')['result']['turn']
+        client.finished(turn)
+        self.assertIn('turn_not_in_history', client.request('result', bot='Bob', turn=turn)['result']['text'])
+        # A fork sees the same lineage and computes its own window over it.
+        client.request('fork', source='Bob', bot='branch', workspace=str(self.path))
+        turn = client.request('submit', bot='branch', request_id='b', prompt='history:2')['result']['turn']
+        client.finished(turn)
+        self.assertIn('reply:p2', client.request('result', bot='branch', turn=turn)['result']['text'])
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
 
     def test_premature_provider_eof_cannot_be_a_successful_checkpoint(self):
         client = self.client()

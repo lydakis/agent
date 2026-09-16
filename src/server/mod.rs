@@ -213,12 +213,19 @@ pub struct Configuration {
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
+    /// Model context per request: newest turns within these bounds. Stored
+    /// history itself is unbounded. Defaults 8 MiB and 4,096 items.
+    pub context_bytes: Option<usize>,
+    pub context_items: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
 pub struct Limits {
     pub processes: usize,
     pub active: usize,
     pub connecting: usize,
+    pub context_bytes: usize,
+    pub context_items: usize,
 }
 impl Limits {
     pub fn resolve(config: &Configuration) -> Limits {
@@ -227,6 +234,8 @@ impl Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
             active: config.max_active.unwrap_or(4096),
             connecting: config.max_connecting.unwrap_or(64),
+            context_bytes: config.context_bytes.unwrap_or(8 * 1024 * 1024).max(1024),
+            context_items: config.context_items.unwrap_or(4096).max(2),
         }
     }
 }
@@ -260,6 +269,7 @@ struct Service {
     default_instructions: String,
     handles: Handles,
     background_failures: mpsc::UnboundedSender<Error>,
+    limits: Limits,
     limit_active: usize,
     /// Per bot: the running turn, the task owning it, and its cancel signal.
     /// A parked turn's task ends while a resumed task may already own the slot.
@@ -341,9 +351,10 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
-            "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit},
+            "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
+            "context_bytes":limits.context_bytes,"context_items":limits.context_items},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":provider_names,"default_model":config.model,
         "durability":"sqlite_full","partial_text_durable":false});
@@ -416,6 +427,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned()),
         handles,
         background_failures: failure_sender,
+        limits,
         limit_active: limits.active,
         active: HashMap::new(),
         next_task: 0,
@@ -551,6 +563,8 @@ impl Service {
             hub: self.hub.clone(),
             handles: self.handles.clone(),
             background_failures: self.background_failures.clone(),
+            context_bytes: self.limits.context_bytes,
+            context_items: self.limits.context_items,
             resume,
         };
         self.jobs.spawn(async move {
@@ -938,6 +952,13 @@ mod tests {
             default_model: None,
             default_instructions: "test".into(),
             handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                processes: 16,
+                active: 1024,
+                connecting: 64,
+                context_bytes: 8 << 20,
+                context_items: 4096,
+            },
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1,
             active: HashMap::from([("Bob".into(), (turn, 1, cancel))]),
@@ -1050,6 +1071,13 @@ mod tests {
             default_model: None,
             default_instructions: "test".into(),
             handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                processes: 16,
+                active: 1024,
+                connecting: 64,
+                context_bytes: 8 << 20,
+                context_items: 4096,
+            },
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
             active: (0..1024)

@@ -1,4 +1,5 @@
 import unittest
+import os
 from copy import deepcopy
 from unittest.mock import patch
 
@@ -138,7 +139,7 @@ class ReportTests(unittest.TestCase):
     def test_durability_mismatch_missing_profile_and_underload_cannot_be_ranked(self):
         base = self.result()
         changed = deepcopy(base)
-        changed['target_metadata']['comparison_profile']['contract']['durability'] = 'sqlite_full'
+        changed['target_metadata']['comparison_profile']['contract']['durability'] = 'ephemeral'
         for candidate in (changed, {**base, 'target_metadata': {}}):
             with self.assertRaises(ValueError):
                 compare(base, candidate)
@@ -174,6 +175,35 @@ class ReportTests(unittest.TestCase):
             changed['compatibility'][key] = value
             with self.assertRaises(ValueError):
                 compare(base, changed, exploratory=True)
+
+
+
+
+class DaemonRunnerTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1',
+                         'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+    def test_large_daemon_deltas_are_normalized_after_framing(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from bench.runner import run_once
+        binary = Path('.local/target/release/agent').resolve()
+        options = SimpleNamespace(protocol='responses', driver='daemon', timeout=15,
+                                  interval=.05, discovery_interval=.2,
+                                  rss_limit_mib=512, process_limit=16)
+        # One reaches the old complete-line bound; the other also exceeds it
+        # while the newline is still in a later pipe read.
+        for chunk_bytes in (65536, 131072):
+            with self.subTest(chunk_bytes=chunk_bytes), TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                config = dict(version=1, concurrency=1, turns=2, chunks=3,
+                              chunk_bytes=chunk_bytes, chunk_delay_ms=100, history_bytes=32)
+                (directory / 'workload.json').write_text(json.dumps(config))
+                result = run_once([str(binary), 'serve', '--model', 'openai/bench-model', '--tools', 'echo'],
+                                  config, options, directory, 0)
+                self.assertEqual(result['status'], 'ok', result)
+                self.assertEqual(result['events']['stream_payload_bytes'], 6 * chunk_bytes)
 
 
 if __name__ == "__main__":

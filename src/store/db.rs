@@ -2,7 +2,6 @@ use crate::{
     Error, Result,
     codec::Family,
     fail, fail_with,
-    history::{History, MAX_HISTORY_BYTES, MAX_ITEMS},
     provider::{ToolCall, Usage},
     tools::Outcome,
 };
@@ -64,8 +63,17 @@ pub struct Waiting {
     pub handles: Vec<String>,
     pub deadline_ms: Option<u64>,
     /// Tool calls from the same model response that follow the wait.
-    #[serde(default)]
     pub pending: Vec<ToolCall>,
+}
+/// The bounded request context: ordered node ids and exact item bytes.
+#[derive(Debug)]
+pub struct Window {
+    pub family: Family,
+    pub ids: Vec<i64>,
+    /// Sum of item lengths, without separators.
+    pub item_bytes: i64,
+    pub omitted_items: i64,
+    pub omitted_turns: i64,
 }
 /// Where and with which model a turn runs.
 pub struct TurnContext {
@@ -85,10 +93,9 @@ fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> 
 
 impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
-    /// before versioning (user_version 0 with tables) are rejected; a newer
-    /// store than this binary is rejected; an older versioned store would be
-    /// migrated in order here once a migration exists.
-    pub const SCHEMA: i32 = 6;
+    /// before versioning and stores from newer binaries are rejected; an older
+    /// versioned store is migrated forward, one version at a time, at open.
+    pub const SCHEMA: i32 = 7;
 
     pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
         conn.execute_batch(
@@ -101,6 +108,8 @@ impl Database {
             [],
             |r| r.get(0),
         )?;
+        // Initialize a fresh store atomically; existing stores must match.
+        let tx = conn.unchecked_transaction()?;
         match version {
             0 if has_tables => {
                 return fail_with(
@@ -114,24 +123,21 @@ impl Database {
                     format!("store schema {v}, binary supports {}", Self::SCHEMA),
                 );
             }
-            v if v != 0 && v < Self::SCHEMA => {
-                // No migrations are defined yet; each future one goes here in order.
-                return fail_with(
-                    "store_schema_unsupported",
-                    format!("store schema {v} has no migration to {}", Self::SCHEMA),
-                );
-            }
+            v if v != 0 && v < Self::SCHEMA => migrate(&tx, v)?,
             _ => {}
         }
-        conn.execute_batch("
+        tx.execute_batch("
             CREATE TABLE IF NOT EXISTS configuration(value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
-                item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL);
+                item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
+                turn INTEGER, turn_seq INTEGER);
+            CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE TABLE IF NOT EXISTS bots(name TEXT PRIMARY KEY, head INTEGER REFERENCES nodes(id),
                 workspace TEXT, status TEXT NOT NULL, running_turn INTEGER,
                 provider TEXT NOT NULL, family TEXT NOT NULL, model TEXT NOT NULL,
                 instructions TEXT NOT NULL, reasoning TEXT,
-                budget_tokens INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0);
+                budget_tokens INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0,
+                context_start INTEGER REFERENCES nodes(id));
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
                 workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
@@ -151,17 +157,20 @@ impl Database {
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);")?;
-        conn.pragma_update(None, "user_version", Self::SCHEMA)?;
-        let saved: Option<String> = conn
+        if version != Self::SCHEMA {
+            tx.pragma_update(None, "user_version", Self::SCHEMA)?;
+        }
+        let saved: Option<String> = tx
             .query_row("SELECT value FROM configuration", [], |r| r.get(0))
             .optional()?;
         match saved {
             None => {
-                conn.execute("INSERT INTO configuration VALUES (?)", [configuration])?;
+                tx.execute("INSERT INTO configuration VALUES (?)", [configuration])?;
             }
             Some(saved) if saved != configuration => return fail("store_configuration_mismatch"),
             _ => {}
         }
+        tx.commit()?;
         // Background commands died with the previous daemon; their handles
         // must report loss rather than resolve to some later command.
         conn.execute(
@@ -261,7 +270,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0)",
+            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL)",
             params![
                 name,
                 workspace,
@@ -282,30 +291,6 @@ impl Database {
         )?;
         tx.commit()?;
         self.inspect(name)
-    }
-    pub fn load(&self, name: &str) -> Result<History> {
-        let head = self.inspect(name)?.head;
-        let mut history = History::default();
-        let Some(head) = head else {
-            return Ok(history);
-        };
-        let mut statement = self.conn.prepare(
-            "WITH RECURSIVE chain(id,parent,item,depth) AS (
-                SELECT id,parent,item,depth FROM nodes WHERE id=?
-                UNION ALL SELECT n.id,n.parent,n.item,n.depth FROM nodes n JOIN chain c ON n.id=c.parent)
-             SELECT item FROM chain ORDER BY depth",
-        )?;
-        let mut rows = statement.query([head])?;
-        let mut bytes = 0;
-        while let Some(row) = rows.next()? {
-            let item: Vec<u8> = row.get(0)?;
-            bytes += item.len();
-            if bytes > MAX_HISTORY_BYTES || history.len() >= MAX_ITEMS {
-                return fail("history_limit");
-            }
-            history.append(Bytes::from(item))?;
-        }
-        Ok(history)
     }
     /// Is `node` on the path from `head` back to the root?
     fn in_lineage(&self, head: Option<i64>, node: i64) -> Result<bool> {
@@ -332,6 +317,299 @@ impl Database {
             .optional()?
             .is_some())
     }
+    /// The bounded model context for the bot's next request: the newest
+    /// turns that fit `context_bytes` and `context_items`, starting at a turn
+    /// boundary. The start is persisted and only moves when the budget is
+    /// exceeded, then jumps back to about three quarters of the budget so the
+    /// cached prefix stays stable across many turns.
+    pub fn window(
+        &mut self,
+        name: &str,
+        context_bytes: i64,
+        context_items: i64,
+    ) -> Result<Option<Window>> {
+        // Heads only append and forks clear context_start, so the saved start
+        // remains in this bot's ancestry. Read its accounting without walking
+        // that ancestry or copying unrelated bot metadata such as instructions.
+        struct State {
+            head: Option<i64>,
+            family: String,
+            total: i64,
+            depth: i64,
+            start: Option<i64>,
+            start_depth: i64,
+            before: i64,
+            turn_seq: i64,
+        }
+        let state = self
+            .conn
+            .prepare_cached(
+                "SELECT b.head,b.family,COALESCE(h.total_bytes,0),COALESCE(h.depth,0),
+                    s.id,COALESCE(s.depth,0),COALESCE(p.total_bytes,0),COALESCE(s.turn_seq,1)
+             FROM bots b LEFT JOIN nodes h ON h.id=b.head
+             LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+             WHERE b.name=?",
+            )?
+            .query_row([name], |r| {
+                Ok(State {
+                    head: r.get(0)?,
+                    family: r.get(1)?,
+                    total: r.get(2)?,
+                    depth: r.get(3)?,
+                    start: r.get(4)?,
+                    start_depth: r.get(5)?,
+                    before: r.get(6)?,
+                    turn_seq: r.get(7)?,
+                })
+            })
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        let Some(head) = state.head else {
+            return Ok(None);
+        };
+        let head_total = state.total;
+        let head_depth = state.depth;
+        let current = state
+            .start
+            .map(|start| (start, state.start_depth, state.before, state.turn_seq));
+        let fits = |depth: i64, before: i64| {
+            head_total - before <= context_bytes && head_depth - depth < context_items
+        };
+        let chosen = match current {
+            Some((start, depth, before, seq)) if fits(depth, before) => (start, depth, before, seq),
+            _ => {
+                // Walk back from the head over turn starts while the tail
+                // still fits, keeping the oldest boundary under the target.
+                let target_bytes = context_bytes / 4 * 3;
+                let target_items = context_items / 4 * 3;
+                let mut statement = self.conn.prepare_cached(
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq) AS (
+                        SELECT id,parent,depth,total_bytes,turn_seq FROM nodes WHERE id=?1
+                        UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
+                        WHERE ?2 - c.total_bytes <= ?3 AND ?4 - c.depth <= ?5)
+                     SELECT c.id,c.depth,COALESCE(p.total_bytes,0),c.turn_seq FROM chain c LEFT JOIN nodes p ON p.id=c.parent
+                     WHERE c.turn_seq IS NOT NULL ORDER BY c.depth DESC",
+                )?;
+                let candidates = statement.query_map(
+                    params![head, head_total, context_bytes, head_depth, context_items],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )?;
+                let mut pick = None;
+                for candidate in candidates {
+                    let (id, depth, before, seq) = candidate?;
+                    if !fits(depth, before) {
+                        break;
+                    }
+                    let within_target =
+                        head_total - before <= target_bytes && head_depth - depth < target_items;
+                    if within_target || pick.is_none() {
+                        pick = Some((id, depth, before, seq));
+                    }
+                    if !within_target {
+                        break;
+                    }
+                }
+                let Some(pick) = pick else {
+                    return fail_with(
+                        "context_limit",
+                        "the current turn alone exceeds the context budget",
+                    );
+                };
+                self.conn.execute(
+                    "UPDATE bots SET context_start=? WHERE name=?",
+                    params![pick.0, name],
+                )?;
+                pick
+            }
+        };
+        let (_, start_depth, before, turn_seq) = chosen;
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth) AS (
+                SELECT id,parent,depth FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
+             SELECT id FROM chain ORDER BY depth",
+        )?;
+        let ids: Vec<i64> = statement
+            .query_map(params![head, start_depth], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Some(Window {
+            family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
+            ids,
+            item_bytes: head_total - before,
+            omitted_items: start_depth - 1,
+            omitted_turns: turn_seq - 1,
+        }))
+    }
+    /// Encoded items for a batch of window ids, in order, comma-separated.
+    pub fn items_by_ids(&self, ids: &[i64]) -> Result<Vec<u8>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut out = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            if index != 0 {
+                out.push(b',');
+            }
+            statement.query_row([id], |r| {
+                out.extend_from_slice(r.get_ref(0)?.as_blob()?);
+                Ok(())
+            })?;
+        }
+        Ok(out)
+    }
+    /// Bytes and items in the active turn alone. Older turns can be removed
+    /// from the context window; the current turn cannot. Walk metadata only.
+    pub fn turn_usage(&self, name: &str, turn: i64) -> Result<(Family, usize, usize)> {
+        let row: Option<(String, i64, i64)> = self
+            .conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,turn) AS (
+                SELECT n.id,n.parent,n.turn FROM bots b JOIN nodes n ON n.id=b.head
+                WHERE b.name=?1 AND b.running_turn=?2
+                UNION ALL SELECT n.id,n.parent,n.turn FROM nodes n JOIN chain c ON n.id=c.parent
+                WHERE c.turn IS NULL)
+             SELECT b.family,h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0)
+             FROM chain c JOIN bots b ON b.name=?1 JOIN nodes h ON h.id=b.head
+             LEFT JOIN nodes p ON p.id=c.parent WHERE c.turn=?2",
+            )?
+            .query_row(params![name, turn], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        let Some((family, bytes, items)) = row else {
+            return fail("stale_turn");
+        };
+        Ok((
+            Family::parse(&family).ok_or(Error::new("store_family_unsupported"))?,
+            bytes as usize,
+            items as usize,
+        ))
+    }
+
+    /// Page a reading view of provider items as JSONL by byte offset in that
+    /// view. Only reasoning.encrypted_content is omitted; stored items and
+    /// provider replay remain unchanged.
+    /// Pages end at UTF-8 boundaries and may split a JSON record. Concatenate
+    /// their text before decoding; no content is replaced with previews.
+    pub fn history_read(
+        &self,
+        name: &str,
+        turn_seq: i64,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Value> {
+        if !(4..=64 * 1024).contains(&limit) || offset > i64::MAX as u64 {
+            return fail("invalid_history_page");
+        }
+        let head: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT head FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("bot_not_found"))?;
+        // Walk only this bot's ancestry once. Crossing a turn start moves the
+        // end boundary to its parent; by the requested start, both boundaries
+        // are known, including for a fork cut midway through a turn.
+        let boundary: Option<(i64, i64)> = self
+            .conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,depth,turn_seq,end_id) AS (
+                SELECT id,parent,depth,turn_seq,id FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.turn_seq,
+                    CASE WHEN c.turn_seq IS NOT NULL THEN c.parent ELSE c.end_id END
+                FROM nodes n JOIN chain c ON n.id=c.parent
+                WHERE c.turn_seq IS NULL OR c.turn_seq>?2)
+             SELECT depth,end_id FROM chain WHERE turn_seq=?2 LIMIT 1",
+            )?
+            .query_row(params![head, turn_seq], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((depth, end)) = boundary else {
+            return fail("turn_not_in_history");
+        };
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth) AS (
+                SELECT id,parent,depth FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
+             SELECT id FROM chain ORDER BY depth",
+        )?;
+        let mut rows = statement.query(params![end, depth])?;
+        // Transform one item at a time, outside the ordered ancestry query:
+        // SQLite must not materialize a turn's projected bodies to sort them.
+        // Both length and slicing operate on BLOBs so offsets count UTF-8 bytes.
+        // Compact provider whitespace in this view only: each item must occupy
+        // one JSONL record even when its original response spans multiple lines.
+        // Already single-line items need no rewrite (escaped newlines are fine).
+        const READING_ITEM: &str = "CASE
+            WHEN json_extract(CAST(item AS TEXT),'$.type')='reasoning'
+             AND json_type(CAST(item AS TEXT),'$.encrypted_content') IS NOT NULL
+            THEN CAST(json_remove(CAST(item AS TEXT),'$.encrypted_content') AS BLOB)
+            WHEN instr(item,x'0a')=0 AND instr(item,x'0d')=0 THEN item
+            ELSE CAST(json(CAST(item AS TEXT)) AS BLOB) END";
+        let mut length = self.conn.prepare_cached(&format!(
+            "SELECT length({READING_ITEM}) FROM nodes WHERE id=?"
+        ))?;
+        let mut slice = self.conn.prepare_cached(&format!(
+            "SELECT substr({READING_ITEM},?,?) FROM nodes WHERE id=?"
+        ))?;
+        let mut text = String::new();
+        let mut position = 0_u64;
+        let mut items = 0;
+        let mut done = true;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let bytes = length.query_row([id], |r| r.get::<_, i64>(0))? as u64;
+            let end = position + bytes + 1; // Include the JSONL newline.
+            if offset >= end {
+                position = end;
+                continue;
+            }
+            if text.len() == limit {
+                done = false;
+                break;
+            }
+            let within = offset.saturating_sub(position);
+            if within < bytes {
+                let take = (bytes - within).min((limit - text.len()) as u64);
+                let chunk: Vec<u8> =
+                    slice.query_row(params![(within + 1) as i64, take as i64, id], |r| r.get(0))?;
+                let piece = match std::str::from_utf8(&chunk) {
+                    Ok(piece) => piece,
+                    Err(error) if error.error_len().is_none() => {
+                        std::str::from_utf8(&chunk[..error.valid_up_to()]).unwrap()
+                    }
+                    Err(_) => return fail("invalid_history_page"),
+                };
+                text.push_str(piece);
+                if within + (piece.len() as u64) < bytes {
+                    done = false;
+                    break;
+                }
+            }
+            if text.len() == limit {
+                done = false; // The record's newline remains unread.
+                break;
+            }
+            text.push('\n');
+            items += 1;
+            position = end;
+        }
+        if done && offset > position {
+            return fail("invalid_history_page");
+        }
+        let next = offset + text.len() as u64;
+        Ok(
+            json!({"turn":turn_seq,"format":"jsonl","offset":offset,"next_offset":next,
+            "items":items,"truncated":!done,"done":done,"text":text}),
+        )
+    }
+
     pub fn begin(
         &mut self,
         name: &str,
@@ -394,7 +672,7 @@ impl Database {
             params![name, request_id, prompt, options.workspace, options.model, epoch_ms()],
         )?;
         let turn = tx.last_insert_rowid();
-        let head = node(&tx, bot.head, &item)?;
+        let head = node_with_turn(&tx, bot.head, &item, Some(turn))?;
         tx.execute(
             "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
             params![head, turn, name],
@@ -907,7 +1185,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0)",
+            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL)",
             params![
                 name,
                 checkpoint,
@@ -1173,7 +1451,79 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
     )?;
     Ok(conn.last_insert_rowid())
 }
+/// Append an item. Stored history has no lifetime cap; the per-request
+/// context window is bounded separately. `turn` marks a turn's first item
+/// (its user prompt) and receives the next ordinal along the lineage.
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
+    node_with_turn(conn, parent, item, None)
+}
+/// Bring an older versioned store forward to the current schema inside the
+/// caller's transaction. Each step converts stored data once; the runtime has
+/// no other knowledge of earlier formats.
+fn migrate(conn: &Connection, from: i32) -> Result<()> {
+    if from < 6 {
+        return fail_with(
+            "store_schema_unsupported",
+            format!(
+                "store schema {from} has no migration to {}",
+                Database::SCHEMA
+            ),
+        );
+    }
+    if from < 7 {
+        // 6 -> 7: turn ordinals for context windows and history reads. A
+        // turn's first node is the one its `accepted` event named.
+        conn.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN turn INTEGER;
+             ALTER TABLE nodes ADD COLUMN turn_seq INTEGER;
+             ALTER TABLE bots ADD COLUMN context_start INTEGER REFERENCES nodes(id);",
+        )?;
+        let mut statement =
+            conn.prepare("SELECT turn,data FROM events WHERE kind='accepted' ORDER BY id")?;
+        // Accepted events and their first nodes commit together through one
+        // writer. Cursor order already places parents before descendants.
+        let mut rows = statement.query([])?;
+        let mut parent_query = conn.prepare("SELECT parent FROM nodes WHERE id=?")?;
+        let mut update = conn.prepare("UPDATE nodes SET turn=?,turn_seq=? WHERE id=?")?;
+        while let Some(row) = rows.next()? {
+            let turn: Option<i64> = row.get(0)?;
+            let data: Value = serde_json::from_str(&row.get::<_, String>(1)?)
+                .map_err(|_| Error::new("store_migration_invalid_event"))?;
+            let (Some(turn), Some(node)) = (turn, data["node"].as_i64()) else {
+                return fail("store_migration_invalid_event");
+            };
+            let parent: Option<i64> = parent_query.query_row([node], |r| r.get(0))?;
+            let seq = match parent {
+                None => 1,
+                Some(parent) => previous_turn_seq(conn, parent)?.unwrap_or(0) + 1,
+            };
+            update.execute(params![turn, seq, node])?;
+        }
+    }
+    Ok(())
+}
+
+/// The nearest turn ordinal at or above `node` along its lineage; the walk
+/// stops at the first numbered node.
+fn previous_turn_seq(conn: &Connection, node: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "WITH RECURSIVE chain(id,parent,turn_seq) AS (
+                SELECT id,parent,turn_seq FROM nodes WHERE id=?
+                UNION ALL SELECT n.id,n.parent,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
+                WHERE c.turn_seq IS NULL)
+             SELECT turn_seq FROM chain WHERE turn_seq IS NOT NULL LIMIT 1",
+        )?
+        .query_row([node], |r| r.get(0))
+        .optional()?)
+}
+
+fn node_with_turn(
+    conn: &Connection,
+    parent: Option<i64>,
+    item: &[u8],
+    turn: Option<i64>,
+) -> Result<i64> {
     let (bytes, depth): (i64, i64) = match parent {
         Some(id) => conn.query_row(
             "SELECT total_bytes,depth FROM nodes WHERE id=?",
@@ -1182,16 +1532,24 @@ fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
         )?,
         None => (0, 0),
     };
-    if bytes < 0
-        || depth < 0
-        || bytes + item.len() as i64 > MAX_HISTORY_BYTES as i64
-        || depth >= MAX_ITEMS as i64
-    {
-        return fail("history_limit");
+    if bytes < 0 || depth < 0 {
+        return fail("storage_error");
     }
+    let turn_seq = match (turn, parent) {
+        (None, _) => None,
+        (Some(_), None) => Some(1),
+        (Some(_), Some(parent)) => Some(previous_turn_seq(conn, parent)?.unwrap_or(0) + 1),
+    };
     conn.execute(
-        "INSERT INTO nodes(parent,item,total_bytes,depth) VALUES (?,?,?,?)",
-        params![parent, item, bytes + item.len() as i64, depth + 1],
+        "INSERT INTO nodes(parent,item,total_bytes,depth,turn,turn_seq) VALUES (?,?,?,?,?,?)",
+        params![
+            parent,
+            item,
+            bytes + item.len() as i64,
+            depth + 1,
+            turn,
+            turn_seq
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }

@@ -37,6 +37,7 @@ enum Tool {
     Write,
     Edit,
     Wait,
+    History,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -47,6 +48,7 @@ impl Tool {
             "write" => Tool::Write,
             "edit" => Tool::Edit,
             "wait" => Tool::Wait,
+            "history" => Tool::History,
             _ => return None,
         })
     }
@@ -58,6 +60,7 @@ impl Tool {
             Tool::Write => "write",
             Tool::Edit => "edit",
             Tool::Wait => "wait",
+            Tool::History => "history",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -90,6 +93,11 @@ impl Tool {
                 json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},
                 "new":{"type":"string"},"replace_all":{"type":"boolean"}},
                 "required":["path","old","new"],"additionalProperties":false}),
+            ),
+            Tool::History => (
+                "Read an omitted conversation turn (numbered from 1; see the context note). Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding.",
+                json!({"type":"object","properties":{"turn":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536}},
+                "required":["turn"],"additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait.",
@@ -124,6 +132,12 @@ pub enum Prepared {
         command: String,
         timeout_ms: u64,
         background: bool,
+    },
+    /// Resolved by the runtime, never by the registry.
+    History {
+        turn: i64,
+        offset: u64,
+        limit: usize,
     },
     /// Resolved by the runtime, never by the registry.
     Wait {
@@ -279,6 +293,14 @@ impl Registry {
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
+        struct HistoryArgs {
+            turn: i64,
+            #[serde(default)]
+            offset: u64,
+            limit: Option<usize>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Wait {
             handles: Vec<String>,
             timeout_ms: Option<u64>,
@@ -350,6 +372,18 @@ impl Registry {
                     background: args.background,
                 }
             }
+            Tool::History => {
+                let args: HistoryArgs = serde_json::from_str(args).map_err(invalid)?;
+                let limit = args.limit.unwrap_or(64 * 1024);
+                if args.turn < 1 || !(4..=64 * 1024).contains(&limit) {
+                    return fail("invalid_tool_arguments");
+                }
+                Prepared::History {
+                    turn: args.turn,
+                    offset: args.offset,
+                    limit,
+                }
+            }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;
                 if args.handles.is_empty()
@@ -419,6 +453,7 @@ impl Registry {
                 background: true, ..
             } => fail("background_requires_runtime"),
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
+            Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Shell {
                 command,
                 timeout_ms,

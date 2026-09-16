@@ -14,6 +14,27 @@ workflow builder, or remote execution service.
 Errand is separate. Do not modify it or implement its deferred local execution
 and continuation features from this project.
 
+## No compatibility branches
+
+This is an experiment with no users. Optimize for the current design,
+correctness, and performance; earlier Agent revisions impose no requirements.
+
+- Breaking protocols, CLI defaults, or configuration formats between revisions
+  is acceptable. Do not report those breaks as review findings.
+- The runtime has one behavior. Do not add or retain legacy modes, fallback
+  branches, or shims that keep earlier Agent behavior alive alongside the
+  current one. Delete them when found.
+- A one-way store migration is not a compatibility branch: it converts old data
+  once at open and the rest of the code knows only the current format. Keep
+  migrations small and tested; reject what cannot be converted clearly rather
+  than resetting it silently.
+- Update current callers, tests, and docs together.
+- Current-format durability, resumption, and fork correctness still matter.
+- Model/provider coverage is a product requirement, including older models.
+  Keep provider-specific wire formats, model capabilities, and required protocol
+  handling. This policy concerns Agent's own earlier versions; it is not a
+  reason to drop models or providers.
+
 ## Working rules
 
 - George explicitly selected a custom Rust core as a performance engineering

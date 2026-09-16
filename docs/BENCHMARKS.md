@@ -126,8 +126,17 @@ retain the separate caller-environment behavior described above.
 
 Provenance records Node version/hash, Pi versions/lock hash or Codex version/native
 binary hash, and a fingerprint of benchmark Python, adapter sources, and lockfiles.
-Rust records its version, release binary SHA-256, and Cargo.lock SHA-256. Its
-benchmark bypasses SQLite; durable-service measurements must be labeled separately.
+Rust records its version, release binary SHA-256, and Cargo.lock SHA-256. The
+Rust engine has no benchmark entry point: the runner starts `agent serve` on a
+fresh store bound to the synthetic provider and drives its stdio JSONL protocol
+from the observer (`bench/daemon_driver.py`), creating one bot per agent and
+submitting the workload's turns. Only the daemon is charged to the target; the
+observer translates its responses and `text_delta` events into the fixed-size
+chunk protocol. Rust captures therefore include SQLite FULL durability
+(`durability: sqlite_full` in the profile), so `compare` against the ephemeral
+Pi, Codex, and FX profiles is exploratory only. Rust captures before 2026-09-15
+used a removed `agent benchmark` subcommand that bypassed the protocol and
+SQLite; they are not comparable with later ones.
 Change the output directory for every run. The source audit revisions in RUNTIMES
 are separate evidence and must not be assumed identical to an installed binary.
 
@@ -195,6 +204,23 @@ environment and is never printed or stored.
 
 Results are `live_fleet_v1` records with the binary hash. See
 [LIVE_FLEET.md](LIVE_FLEET.md) for the recorded runs and their limits.
+
+## Long history probe
+
+`bench.long_history` seeds one bot with N stored items through a stdio daemon
+and a synthetic Responses provider, then measures what a caller pays as stored
+history grows while the context window stays fixed: daemon startup to readiness
+and the subsequent `resume` operation measured separately, one turn's request
+bytes, item count, and latency, a fork from the head and from the first checkpoint, a turn on the fork, a `history` read of
+turn 1, and daemon RSS sampled from outside. Seeding time is reported but is
+setup, not a claim. Results are `long_history_v2` records with the binary hash.
+`startup_ms` ends at readiness; `resume_op_ms` measures only the following request. Older v1 captures
+misnamed startup alone as `restart_and_resume_ms`; those historical numbers
+exclude resume.
+
+```sh
+.local/venv/bin/python -m bench.long_history --items 100000   --context-bytes 65536 --context-items 256 --out .local/bench/history-100k
+```
 
 ## What is measured
 

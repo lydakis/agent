@@ -3,6 +3,10 @@
 //! failing ends a turn early. A `wait` parks the turn: the task ends, the
 //! store holds the state (including any calls still to run), and a resumed
 //! task records the results and carries on.
+//!
+//! No transcript lives in memory. Each model call streams the bot's bounded
+//! context window from the store in batches; items appended during the turn
+//! are committed before the next call and read back like any other.
 use super::{
     handles::{Completion, Handle, Handles, Waiter, now_ms, wait_result},
     hub::Hub,
@@ -11,16 +15,19 @@ use agent_runtime::{
     Error, Result,
     codec::split_model,
     fail,
-    history::History,
-    provider::{Delta, Provider, Request as ModelRequest, ToolCall},
-    store::Store,
+    provider::{Delta, Items, Provider, Request as ModelRequest, ToolCall},
+    store::{Store, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use serde_json::json;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub const MAX_ROUNDS: usize = 200;
+/// Items fetched from the store per read-ahead batch while a body streams.
+const WINDOW_BATCH: usize = 64;
 
 pub struct Turn {
     pub bot: String,
@@ -31,6 +38,8 @@ pub struct Turn {
     pub hub: Hub,
     pub handles: Handles,
     pub background_failures: mpsc::UnboundedSender<Error>,
+    pub context_bytes: usize,
+    pub context_items: usize,
     /// Continue a parked turn: record its wait results, then keep going.
     pub resume: bool,
 }
@@ -82,6 +91,65 @@ impl Turn {
         Ok(())
     }
 
+    /// The bot's current context window as a streamed request body: a note
+    /// about omitted turns, then the window's items in store-read batches.
+    async fn items(&self) -> Result<Items> {
+        let (bot, bytes, count) = (self.bot.clone(), self.context_bytes, self.context_items);
+        let window = self
+            .store
+            .call(move |db| db.window(&bot, bytes as i64, count as i64))
+            .await?;
+        let Some(Window {
+            family,
+            ids,
+            item_bytes,
+            omitted_items,
+            omitted_turns,
+        }) = window
+        else {
+            return Ok(Items::empty());
+        };
+        let mut total = item_bytes as usize + ids.len().saturating_sub(1);
+        let mut head = Vec::new();
+        if omitted_items > 0 {
+            // Omission is explicit: the model is told what is missing and how
+            // to read it. This note is part of the request, never the store.
+            let note = format!(
+                "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown. \
+                 Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
+            );
+            head = family.user_item(&note)?;
+            if !ids.is_empty() {
+                head.push(b',');
+            }
+            total += head.len();
+        }
+        let store = self.store.clone();
+        let batches = ids
+            .chunks(WINDOW_BATCH)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let body = stream::iter([Ok(Bytes::from(head))]).chain(
+            stream::iter(batches.into_iter().enumerate()).then(move |(index, chunk)| {
+                let store = store.clone();
+                async move {
+                    let mut bytes = store
+                        .call(move |db| db.items_by_ids(&chunk))
+                        .await
+                        .map_err(|error| std::io::Error::other(error.code))?;
+                    if index != 0 {
+                        bytes.insert(0, b',');
+                    }
+                    Ok(Bytes::from(bytes))
+                }
+            }),
+        );
+        Ok(Items {
+            bytes: total,
+            stream: body.boxed(),
+        })
+    }
+
     async fn rounds(&self) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let record = self.store.call(move |db| db.inspect(&bot)).await?;
@@ -92,8 +160,6 @@ impl Turn {
             .get(provider)
             .ok_or(Error::with("provider_unavailable", provider))?;
         let workspace = PathBuf::from(&context.workspace);
-        let name = self.bot.clone();
-        let mut history = self.store.call(move |db| db.load(&name)).await?;
         if self.resume {
             let (waiting, entry) = match self.store.call(move |db| db.resume(turn)).await {
                 Ok(resumed) => resumed,
@@ -103,17 +169,13 @@ impl Turn {
             self.hub.durable(&self.bot, entry).await?;
             let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
             let id = waiting.call_id;
-            let (item, entry) = self
+            let (_, entry) = self
                 .store
                 .call(move |db| db.tool_finish(turn, &id, &outcome))
                 .await?;
             self.hub.durable(&self.bot, entry).await?;
-            history.append(item)?;
             // Calls that followed the wait in the same model response.
-            if self
-                .execute_calls(waiting.pending, &workspace, &mut history)
-                .await?
-            {
+            if self.execute_calls(waiting.pending, &workspace).await? {
                 return Ok(Round::Parked);
             }
         }
@@ -133,6 +195,7 @@ impl Turn {
                     ),
                 ));
             }
+            let items = self.items().await?;
             let mut reported_usage = None;
             let response = provider
                 .complete_accounted(
@@ -140,7 +203,7 @@ impl Turn {
                         model,
                         instructions: &record.instructions,
                         reasoning: record.reasoning.as_deref(),
-                        history: &history,
+                        items,
                     },
                     |delta| {
                         let (kind, text) = match delta {
@@ -167,7 +230,7 @@ impl Turn {
                     .saturating_add(usage.input_tokens)
                     .saturating_add(usage.output_tokens);
             }
-            let items = response.items.clone();
+            let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
             let entries = self
@@ -184,16 +247,10 @@ impl Turn {
             for entry in entries {
                 self.hub.durable(&self.bot, entry).await?;
             }
-            for item in response.items {
-                history.append(item)?;
-            }
             if response.calls.is_empty() {
                 return Ok(Round::Finished);
             }
-            if self
-                .execute_calls(response.calls, &workspace, &mut history)
-                .await?
-            {
+            if self.execute_calls(response.calls, &workspace).await? {
                 return Ok(Round::Parked);
             }
         }
@@ -218,7 +275,6 @@ impl Turn {
         &self,
         calls: Vec<ToolCall>,
         workspace: &std::path::Path,
-        history: &mut History,
     ) -> Result<bool> {
         let turn = self.turn;
         let mut calls = calls.into_iter();
@@ -274,6 +330,14 @@ impl Turn {
                         Err(error) => failure(error),
                     }
                 }
+                Ok(Prepared::History {
+                    turn: wanted,
+                    offset,
+                    limit,
+                }) => match Box::pin(self.history(&call.call_id, wanted, offset, limit)).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure(error),
+                },
                 Ok(prepared) => match self.registry.execute(prepared, workspace).await {
                     Ok(outcome) => annotate(outcome, turn, &call.call_id),
                     Err(error) if error.code == "tool_scheduler_closed" => return Err(error),
@@ -282,14 +346,68 @@ impl Turn {
                 Err(error) => failure(error),
             };
             let id = call.call_id;
-            let (item, entry) = self
+            let (_, entry) = self
                 .store
                 .call(move |db| db.tool_finish(turn, &id, &outcome))
                 .await?;
             self.hub.durable(&self.bot, entry).await?;
-            history.append(item)?;
         }
         Ok(false)
+    }
+
+    async fn history(
+        &self,
+        call_id: &str,
+        wanted: i64,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Outcome> {
+        let (bot, turn, bytes, items) = (
+            self.bot.clone(),
+            self.turn,
+            self.context_bytes,
+            self.context_items,
+        );
+        let (family, budget, mut page) = self
+            .store
+            .call(move |db| {
+                let (family, used, count) = db.turn_usage(&bot, turn)?;
+                // Reserve half the remaining bytes for subsequent model/tool work.
+                // Account against this turn only: older turns can leave the window.
+                let budget = bytes.saturating_sub(used) / 2;
+                if count >= items || budget < 256 {
+                    return fail("history_context_exhausted");
+                }
+                Ok((
+                    family,
+                    budget,
+                    db.history_read(&bot, wanted, offset, limit.min(budget))?,
+                ))
+            })
+            .await?;
+        loop {
+            let output = self.registry.redact_text(page.to_string());
+            // Page metadata, JSON escaping, redaction, and the provider's tool
+            // result envelope all count. Shrink in memory, without rereading
+            // history, until the actual encoded item fits the reserved budget.
+            if family.tool_result_item(call_id, &output)?.len() <= budget {
+                return Ok(Outcome::text(output));
+            }
+            let text = page["text"].as_str().unwrap();
+            let mut end = text.len() / 2;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == 0 {
+                return fail("history_context_exhausted");
+            }
+            let kept = text[..end].to_owned();
+            page["items"] = json!(kept.bytes().filter(|b| *b == b'\n').count());
+            page["text"] = json!(kept);
+            page["next_offset"] = json!(offset + end as u64);
+            page["truncated"] = json!(true);
+            page["done"] = json!(false);
+        }
     }
 
     /// Make the turn durable as waiting, then register its handles. Returns

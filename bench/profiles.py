@@ -7,7 +7,8 @@ def profile(engine):
               'provider': 'loopback_http1_responses_sse', 'retries': 0,
               'consumer': 'fast_normalized_text_events', 'isolation': 'caller_host_permissions'}
     footprints = {
-        'rust': ['native_core', 'one_scheduler', 'bounded_text_output', 'no_store_open', 'no_tools_registered'],
+        'rust': ['native_daemon', 'stdio_jsonl_protocol', 'sqlite_full_store', 'one_scheduler',
+                 'bounded_text_output', 'echo_tool_registered_not_called'],
         'pi': ['node_runtime', 'agent_core_and_pi_ai', 'no_coding_agent_session_manager',
                'steering_and_tool_loop_available', 'no_tools_registered'],
         'codex': ['node_rpc_adapter', 'native_app_server', 'native_session_services',
@@ -21,6 +22,8 @@ def profile(engine):
         raise ValueError('unknown benchmark profile')
     if engine == 'fixture':
         common = {'scenario': 'binary_transport_calibration_v1', 'durability': 'none'}
+    if engine == 'rust':
+        common = {**common, 'durability': 'sqlite_full', 'consumer': 'observer_driven_stdio_protocol'}
     if engine == 'fx':
         common = {**common, 'provider': 'loopback_http1_gateway_sse',
                   'retries': 'one_pre_output_transport_retry_available_but_rejected_by_fixture'}

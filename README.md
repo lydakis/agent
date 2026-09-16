@@ -28,7 +28,15 @@ and usage. Its protocol is experimental. The daemon has completed a bounded
 [live OpenAI run](docs/OPENAI_SMOKE.md#daemon-live-run) and a
 [live Anthropic run](docs/ANTHROPIC_SMOKE.md) covering file and shell tools,
 stored reasoning and thinking across turns, and delegation through detach and
-wait. Compaction, cross-provider handoff, and MCP are not implemented.
+wait. Stored history is unbounded; each request carries a bounded window of
+whole turns with an explicit note and a `history` tool for what it omits.
+Compaction with summaries, cross-provider handoff, and MCP are not implemented.
+
+This is an experiment with no users. Protocols, CLI defaults, and configuration
+may break between revisions, and the runtime carries no legacy modes or fallback
+branches for earlier Agent versions. Stores migrate forward one way at open.
+Supporting models and providers, including older models, remains a product
+requirement.
 
 ## What matters
 
@@ -82,6 +90,6 @@ Agent does not provide a sandbox.
 - [Initial measurements](docs/MEASUREMENTS.md): Pi/Codex resource costs through
   32 simultaneous streams and the provisional reuse decision.
 
-Next: run one bounded real-provider task on each family, then separate
-long-term history storage from bounded model context. Keep matched regression
+Next: a hundreds-of-bots live fleet now that per-turn memory no longer
+scales with history, then compaction with summaries. Keep matched regression
 workloads as tools and durable lifecycle behavior expand.

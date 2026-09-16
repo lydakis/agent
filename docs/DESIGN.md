@@ -276,8 +276,9 @@ Lifetime conversation size must be independent of active model-context size.
 Keep original history on disk; compaction creates a versioned context view rather
 than deleting history. Historical forks must use the context view valid at their
 checkpoint. Indexed resume/fork and bounded context construction are required
-performance cases. See [LONG_HISTORY.md](LONG_HISTORY.md). The current 8 MiB cap
-is a prototype limit and does not fulfill this requirement.
+performance cases. See [LONG_HISTORY.md](LONG_HISTORY.md). Stored history is
+unbounded and requests carry a bounded window of whole turns; compaction with
+summaries is not implemented.
 
 ## Remaining architectural choices
 

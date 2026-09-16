@@ -1,8 +1,7 @@
-mod benchmark;
 mod client;
 mod client_path;
 mod server;
-use agent_runtime::{Error, Result, fail_with, output::Output};
+use agent_runtime::{Error, Result, fail_with};
 
 // Machine-readable temporary startup conflict. The CLI waits for the owner
 // using this exit status, never by parsing a shared human-readable log.
@@ -20,8 +19,8 @@ const USAGE: &str = "usage:
   agent ls | agent shutdown
   agent serve --store PATH [--socket PATH] --provider SPEC... [--model P/M] [--tools LIST]
               [--max-processes N] [--max-active N] [--max-connecting N]   (0 = unbounded)
-              [--max-output-tokens N] [--idle-exit SECONDS]
-  agent benchmark | agent --version
+              [--max-output-tokens N] [--idle-exit SECONDS] [--context-bytes N] [--context-items N]
+  agent --version
 options: --store PATH --model PROVIDER/MODEL --provider SPEC --tools LIST --workspace DIR
          --bot NAME --instructions TEXT --instructions-file F --reasoning low|medium|high
          --request-id ID --new --detach (submit and return a turn handle) --pretty (human rendering instead of JSONL) --no-spawn
@@ -53,39 +52,6 @@ fn run() -> Result<i32> {
             runtime()?.block_on(server::run(config))?;
             Ok(0)
         }
-        Some("benchmark") => {
-            let runtime = runtime()?;
-            let (output, writer) = Output::stdout();
-            let result = runtime.block_on(async move {
-                let result = benchmark::run(output.clone()).await;
-                if let Err(error) = &result {
-                    let code = match error.code.as_str() {
-                        "provider_connection_timeout"
-                        | "provider_connection_failed"
-                        | "provider_stream_failed"
-                        | "missing_completion"
-                        | "output_closed" => error.code.clone(),
-                        code if code
-                            .strip_prefix("provider_connection_os_")
-                            .is_some_and(|n| n.parse::<i32>().is_ok()) =>
-                        {
-                            code.into()
-                        }
-                        _ => "benchmark_failed".into(),
-                    };
-                    let _ = output
-                        .send(serde_json::json!({"event":"diagnostic","stage":"benchmark","code":code}))
-                        .await;
-                }
-                result
-            });
-            drop(runtime); // Release aborted tasks and their output handles on failure.
-            // Drain accepted output before exit. Reader disconnection is a failure.
-            writer
-                .join()
-                .map_err(|_| Error::new("output_worker_failed"))??;
-            result.map(|_| 0)
-        }
         Some(
             "run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown" | "wait" | "turns"
             | "result",
@@ -112,6 +78,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_connecting = None;
     let mut max_output_tokens = None;
     let mut idle_exit = None;
+    let mut context_bytes = None;
+    let mut context_items = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -132,6 +100,17 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     "--max-processes" => max_processes = Some(parsed),
                     "--max-active" => max_active = Some(parsed),
                     _ => max_connecting = Some(parsed),
+                }
+            }
+            "--context-bytes" | "--context-items" => {
+                let parsed: usize = value.parse().ok().filter(|n| *n > 0).ok_or(Error::with(
+                    "usage",
+                    format!("{flag} needs a positive integer"),
+                ))?;
+                if flag == "--context-bytes" {
+                    context_bytes = Some(parsed);
+                } else {
+                    context_items = Some(parsed);
                 }
             }
             "--max-output-tokens" => {
@@ -163,5 +142,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_connecting,
         max_output_tokens,
         idle_exit,
+        context_bytes,
+        context_items,
     })
 }

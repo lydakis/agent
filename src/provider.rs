@@ -4,7 +4,6 @@ use crate::{
     Error, Result,
     codec::{Family, ToolSchema},
     fail,
-    history::History,
     sse::Decoder,
 };
 use bytes::Bytes;
@@ -85,11 +84,27 @@ pub struct ToolCall {
     pub call_id: String,
     pub arguments: String,
 }
+/// The conversation items of a request: a stream of pre-encoded,
+/// comma-separated items of known total length, so the body is never
+/// assembled in memory.
+pub struct Items {
+    /// Exact byte length the stream will yield.
+    pub bytes: usize,
+    pub stream: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
+}
+impl Items {
+    pub fn empty() -> Items {
+        Items {
+            bytes: 0,
+            stream: stream::empty().boxed(),
+        }
+    }
+}
 pub struct Request<'a> {
     pub model: &'a str,
     pub instructions: &'a str,
     pub reasoning: Option<&'a str>,
-    pub history: &'a History,
+    pub items: Items,
 }
 
 enum Parser {
@@ -204,7 +219,7 @@ impl Provider {
                     instructions: request.instructions,
                     stream: true,
                     store: false,
-                    // Explicit for compatibility with older Responses servers.
+                    // Request opaque reasoning for stateless continuation across endpoints.
                     include: ["reasoning.encrypted_content"],
                     max_output_tokens: self.max_output_tokens,
                     tools: &self.tools,
@@ -255,24 +270,14 @@ impl Provider {
         Ok(bytes)
     }
 
-    /// Body frames reference immutable history allocations. Content-Length avoids
-    /// requiring provider support for chunked uploads; no whole-body JSON copy.
-    fn body(&self, prefix: Vec<u8>, history: &History) -> (reqwest::Body, usize) {
-        let items = history.items();
-        let mut frames = Vec::with_capacity(2 * items.len() + 2);
-        frames.push(Bytes::from(prefix));
-        for (index, item) in items.into_iter().enumerate() {
-            if index != 0 {
-                frames.push(Bytes::from_static(b","));
-            }
-            frames.push(item);
-        }
-        frames.push(Bytes::from_static(b"]}"));
-        let len = frames.iter().map(Bytes::len).sum();
-        let body = reqwest::Body::wrap_stream(stream::iter(
-            frames.into_iter().map(Ok::<_, std::io::Error>),
-        ));
-        (body, len)
+    /// Content-Length avoids requiring provider support for chunked uploads;
+    /// the items stream through without a whole-body copy.
+    fn body(&self, prefix: Vec<u8>, items: Items) -> (reqwest::Body, usize) {
+        let len = prefix.len() + items.bytes + 2;
+        let framed = stream::iter([Ok(Bytes::from(prefix))])
+            .chain(items.stream)
+            .chain(stream::iter([Ok(Bytes::from_static(b"]}"))]));
+        (reqwest::Body::wrap_stream(framed), len)
     }
 
     pub async fn complete<F, Fut>(&self, request: Request<'_>, delta: F) -> Result<Completion>
@@ -319,7 +324,7 @@ impl Provider {
                 .map_err(|_| Error::new("provider_admission_timeout"))?
                 .map_err(|_| Error::new("provider_admission_closed"))?;
         let prefix = self.prefix(&request)?;
-        let (body, len) = self.body(prefix, request.history);
+        let (body, len) = self.body(prefix, request.items);
         let mut http = self
             .transport
             .client
@@ -518,13 +523,12 @@ mod tests {
             &[],
         )
         .unwrap();
-        let history = History::default();
         let prefix = provider
             .prefix(&Request {
                 model: "m",
                 instructions: "i",
                 reasoning: Some("low"),
-                history: &history,
+                items: Items::empty(),
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
@@ -532,30 +536,30 @@ mod tests {
         assert!(text.contains("\"type\":\"adaptive\""));
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
+        let legacy = provider
+            .prefix(&Request {
+                model: "claude-haiku-4-5-20251001",
+                instructions: "i",
+                reasoning: Some("low"),
+                items: Items::empty(),
+            })
+            .unwrap();
+        let legacy = String::from_utf8(legacy).unwrap();
+        assert!(legacy.contains("\"budget_tokens\":2048"));
+        assert!(!legacy.contains("output_config"));
         assert!(!text.contains("budget_tokens"));
         let mut empty_prefix = provider
             .prefix(&Request {
                 model: "m",
                 instructions: "",
                 reasoning: None,
-                history: &history,
+                items: Items::empty(),
             })
             .unwrap();
         empty_prefix.extend_from_slice(b"]}");
         let empty: Value = serde_json::from_slice(&empty_prefix).unwrap();
         assert!(empty.get("system").is_none());
         assert_eq!(empty["cache_control"], json!({"type":"ephemeral"}));
-        let legacy = provider
-            .prefix(&Request {
-                model: "claude-haiku-4-5-20251001",
-                instructions: "i",
-                reasoning: Some("low"),
-                history: &history,
-            })
-            .unwrap();
-        let legacy = String::from_utf8(legacy).unwrap();
-        assert!(legacy.contains("\"budget_tokens\":2048"));
-        assert!(!legacy.contains("output_config"));
         assert!(!text.contains("\"tools\""));
         assert_eq!(provider.url.path(), "/messages");
         let responses =
@@ -569,7 +573,7 @@ mod tests {
                 model: "m",
                 instructions: "i",
                 reasoning: None,
-                history: &history,
+                items: Items::empty(),
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -577,5 +581,25 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 2048);
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn body_length_counts_prefix_items_separators_and_close() {
+        let transport = Transport::new(64).unwrap();
+        let provider =
+            Provider::new(transport, Family::Responses, "http://h/v1/", None, &[]).unwrap();
+        let items: Vec<Bytes> = (0..3)
+            .map(|n| Bytes::from(Family::Responses.user_item(&format!("m{n}")).unwrap()))
+            .collect();
+        let joined = items.iter().map(Bytes::len).sum::<usize>() + items.len() - 1;
+        let prefix = b"{\"input\":[".to_vec();
+        let (_, len) = provider.body(
+            prefix.clone(),
+            Items {
+                bytes: joined,
+                stream: stream::empty().boxed(),
+            },
+        );
+        assert_eq!(len, prefix.len() + joined + 2);
     }
 }

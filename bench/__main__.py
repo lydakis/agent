@@ -63,6 +63,7 @@ def run(args):
         metadata['comparison_profile'] = profile('fixture')
     args.codex_executable = None
     args.protocol = "binary"
+    args.driver = "daemon" if args.engine == "rust" else None
     if args.engine != "fixture":
         if args.command or args.revision:
             raise ValueError("engine adapters resolve their own command and revision")

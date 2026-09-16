@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait";
+const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn startup_remaining(deadline: Instant) -> Result<Duration> {
@@ -123,7 +123,9 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-output-tokens"
-                    | "--idle-exit" => {
+                    | "--idle-exit"
+                    | "--context-bytes"
+                    | "--context-items" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;

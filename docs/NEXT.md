@@ -124,15 +124,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 1. Done: the [live fleet check](LIVE_FLEET.md) ran 32 and 96 concurrent bots
    on Sonnet 5 and 32 on gpt-5-mini through one daemon with no failures; the
    startup bound and idle timeout behaved as designed. Next at scale: a
-   hundreds-of-bots run once long history bounds per-turn memory, since each
-   active turn still loads its history.
-2. Separate long-term conversation storage from bounded model context. Implement
-   indexed history access and context selection before claiming long-history
-   support. Follow [LONG_HISTORY.md](LONG_HISTORY.md), including preserved fork
-   ancestry and versioned compaction with originals retained.
-   Add bounded model-facing history retrieval and branch-aware fact checks;
-   measure fixed active context against growing stored histories before adding
-   recursive context-processing machinery.
+   hundreds-of-bots run, now that a turn streams its context from the store
+   instead of loading its history.
+2. Done: stored history is unbounded; each request carries a
+   [context window](RUST_PROTOTYPE.md#long-history-and-context-windows) of
+   whole turns with a persisted, hysteretic start, an explicit omission note,
+   and a `history` tool that reads any earlier turn by ordinal along the
+   lineage. [Measured](DAEMON_MEASUREMENTS.md#long-history) at 1k, 10k, and
+   100k stored items with a fixed 64 KiB window. Remaining from
+   [LONG_HISTORY.md](LONG_HISTORY.md): compaction with summaries as versioned
+   context views, and checkpoint indexes so forks and reads of very old turns
+   stop walking node metadata.
 3. A measured slow-follower screen for the lag/drop policy, and a parked-agent
    screen on the lifecycle tool with retained versus live memory separated.
    Idle exit, schema versioning, budgets, turn listings, `result`, and

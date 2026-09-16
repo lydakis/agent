@@ -71,6 +71,29 @@ The [subsequent diagnosis and bounded-startup screen](LIFECYCLE_MEASUREMENTS.md)
 record the reset code, admission change, and new repeat results. These historical
 captures remain separate; do not select only their successful runs.
 
+## Through the daemon surface
+
+Observed 2026-09-15 on Darwin arm64 (10 logical CPUs, 32 GiB, external power),
+Rust 1.98.0, binary SHA-256
+`0c6f70d25a2df934ff3b637b289b8ef8fe05dc4bf264851d4c2244e9ee672441`. The
+`agent benchmark` subcommand and the in-memory history it used are gone; the
+runner now starts `agent serve` on a fresh SQLite store and drives its stdio
+protocol from the observer, so these numbers include FULL durability, one bot
+per agent, and the protocol round trips. Workload: three turns per agent,
+4 KiB of user text per turn, twenty 256-byte chunks 25 ms apart. Medians of
+three measured runs after one excluded warmup; every run achieved its configured
+provider concurrency with no quality warnings.
+
+| Configured agents | Sampled peak daemon RSS, MiB | Observed CPU seconds | Turn p95, ms |
+| --- | ---: | ---: | ---: |
+| 32 | 15.44 (15.28–15.58) | 0.192 | 574.3 |
+| 256 | 34.66 (34.64–34.91) | 1.024 | 642.6 |
+
+These are not comparable with the ephemeral rows above (different surface,
+durability, and history size) nor with the Pi, Codex, and FX captures, whose
+profiles remain ephemeral. Captures: ignored `.local/bench/surface-text-32/` and
+`surface-text-256/`.
+
 ## Provenance and limits
 
 - Release Rust 1.92.0, agent-runtime 0.1.0; Tokio 1.53.1, reqwest 0.13.4,

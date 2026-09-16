@@ -1,9 +1,13 @@
 # Long conversations with bounded working memory
 
 Requirement recorded 2026-09-07. Extremely long conversation histories are a
-first-class design target. This is future implementation work. The current
-8 MiB / 4,096-item history cap is a prototype limit, not an acceptable final
-maximum lifetime conversation length.
+first-class design target. Since 2026-09-15 stored history is unbounded and each
+request carries a bounded context window of whole turns with an explicit
+omission note and a `history` tool for retrieval; see
+[RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#long-history-and-context-windows) and the
+[measurements](DAEMON_MEASUREMENTS.md#long-history). Compaction with summaries,
+versioned context views, and checkpoint indexes for old-node lookups remain
+future work described below.
 
 ## Separate the lifetimes
 

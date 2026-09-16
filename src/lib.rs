@@ -1,5 +1,4 @@
 pub mod codec;
-pub mod history;
 pub mod output;
 pub mod provider;
 pub mod sse;

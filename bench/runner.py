@@ -7,10 +7,12 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import psutil
 
+from .daemon_driver import DaemonDriver
 from .events import Events
 from .processes import Tree, snapshot
 from .targets import clean_env
@@ -50,6 +52,8 @@ def stop(process, tree):
         if grace:
             time.sleep(grace)
     process.wait(timeout=3)
+    if process.stdin:
+        process.stdin.close()
     if process.stdout:
         process.stdout.close()
 
@@ -101,6 +105,23 @@ def run_once(command, config, options, directory, index):
     discovered = []
     next_discovery = 0
     protocol = getattr(options, "protocol", "binary")
+    # src/output.rs MAX_EVENT includes the newline; adapter events are smaller.
+    event_limit = 1024 * 1024 - 1 if getattr(options, "driver", None) == "daemon" else 65536
+    driver = writer = None
+    outgoing = None
+
+    def write_requests():
+        # The daemon reads stdin concurrently with writing stdout; a separate
+        # writer keeps the observer loop from blocking on a full pipe.
+        while True:
+            lines = outgoing.get()
+            if lines is None:
+                return
+            try:
+                target.stdin.write("".join(lines).encode())
+                target.stdin.flush()
+            except (OSError, ValueError):
+                return
 
     def sample(handle, force_discovery=False):
         nonlocal sample_count, target_sample_count, sample_wall, counters, observer_peak_rss
@@ -150,10 +171,21 @@ def run_once(command, config, options, directory, index):
                    "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
             if getattr(options, "codex_executable", None):
                 env["AGENT_BENCH_CODEX"] = options.codex_executable
+        if getattr(options, "driver", None) == "daemon":
+            # The real service surface: the daemon is the target, the observer
+            # drives its stdio protocol and translates its events.
+            driver = DaemonDriver(config, state / "workspace")
+            command = [*command, "--store", str(state / "state.sqlite"),
+                       "--provider", f"openai=responses,http://127.0.0.1:{port}/v1"]
         start = time.monotonic()
-        target = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+        target = subprocess.Popen(command, stdin=subprocess.PIPE if driver else subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                   env=env, start_new_session=True)
+        if driver:
+            import queue
+            outgoing = queue.Queue()
+            writer = threading.Thread(target=write_requests, daemon=True)
+            writer.start()
         target_tree = Tree(target.pid)
         buffer = b""
         eof = False
@@ -187,6 +219,8 @@ def run_once(command, config, options, directory, index):
                         status = "descendants_after_exit"
                     elif target_sample_count < 2:
                         status = "insufficient_samples"
+                    elif driver and driver.failed:
+                        status = "target_failed"
                     else:
                         event_summary = events.finish()
                         status = "ok"
@@ -201,11 +235,19 @@ def run_once(command, config, options, directory, index):
                     buffer += chunk
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
-                        if len(line) > 65536:
-                            raise ValueError("event line exceeds 64 KiB")
-                        events.add(json.loads(line), time.monotonic() - start)
-                    if len(buffer) > 65536:
-                        raise ValueError("event line exceeds 64 KiB")
+                        if len(line) > event_limit:
+                            raise ValueError("event line exceeds protocol limit")
+                        now = time.monotonic() - start
+                        if driver:
+                            for event in driver.handle(json.loads(line)):
+                                events.add(event, now)
+                            lines = driver.drain()
+                            if lines:
+                                outgoing.put(lines)
+                        else:
+                            events.add(json.loads(line), now)
+                    if len(buffer) > event_limit:
+                        raise ValueError("event line exceeds protocol limit")
         if elapsed is None:
             elapsed = time.monotonic() - start
     except KeyboardInterrupt:
@@ -218,6 +260,9 @@ def run_once(command, config, options, directory, index):
     finally:
         if start is not None and elapsed is None:
             elapsed = time.monotonic() - start
+        if writer is not None:
+            outgoing.put(None)
+            writer.join(timeout=1)
         for process, tree in ((target, target_tree), (provider, provider_tree)):
             try:
                 stop(process, tree)

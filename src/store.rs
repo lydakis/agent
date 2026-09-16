@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 mod db;
-pub use db::{Binding, Bot, Database, Started, TurnContext, TurnOptions, Waiting};
+pub use db::{Binding, Bot, Database, Started, TurnContext, TurnOptions, Waiting, Window};
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
 #[derive(Clone)]

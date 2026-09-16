@@ -61,7 +61,7 @@ and a restart with different values fails with `store_configuration_mismatch`.
 Providers are selected explicitly with `--provider`, or implied by which of the
 well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`)
 are set. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,read,write,edit`.
+daemon. Default tools are `shell,read,write,edit,wait,history`.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
 75 for a store/socket ownership conflict. Their clients continue polling for
@@ -130,13 +130,12 @@ produce handles, and one consumes them:
 - `agent run --detach` prints the peer turn's handle, `turn:BOT/N`, from the
   `submit` response.
 - `wait` takes up to 64 handles and an optional `timeout_ms`. It parks the turn:
-  the turn's task ends, its in-memory history is dropped, the store records
-  `waiting` with the handles, deadline, and any tool calls that followed the
-  wait in the same model response, and a small registry entry remains. Nothing
-  polls and no process or thread exists per waiter. When every handle resolves
-  (or the deadline passes), the daemon spawns a task that reloads the history,
-  records the wait result as the tool result, runs the remaining calls, and
-  continues the turn.
+  the turn's task ends, the store records `waiting` with the handles, deadline,
+  and any tool calls that followed the wait in the same model response, and a
+  small registry entry remains. Nothing polls and no process or thread exists
+  per waiter. When every handle resolves (or the deadline passes), the daemon
+  spawns a task that records the wait result as the tool result, runs the
+  remaining calls, and continues the turn.
 - Programs outside a tool use the same mechanism through the `wait` protocol
   op, or `agent wait HANDLE...` which prints the same result and exits 1 when
   anything is pending or errored. Inside a shell tool that command is refused,
@@ -236,11 +235,12 @@ bound; the operating system is then the only limit.
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. | 64 |
 | `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
+| `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
+| `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
 
 Parked agents cost a store row and a registry entry. An agent in a model call
-costs its loaded history and a connection; that, not these limits, bounds how
-many agents can be mid-call at once until request bodies stream from disk.
-Resolved waits queue until `--max-active` has capacity, including after restart.
+costs its request body read-ahead (64 items at a time), the parser buffers, and
+a connection; no transcript is held in memory. Resolved waits queue until `--max-active` has capacity, including after restart.
 Interrupting a queued turn cancels that turn without starting its continuation.
 The 200-provider-round budget belongs to the durable turn, so parking or
 restarting the daemon does not replenish it. The counter commits with each
@@ -331,8 +331,8 @@ or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 [Tokio](https://docs.rs/tokio/1.53.1/tokio/runtime/struct.Builder.html), and disk
 transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
 
-Current limits: 8 MiB / 4,096 items of loaded history per bot, 256 KiB input
-prompt, 64 KiB instructions, 512 KiB terminal provider output, 2 MiB SSE frame,
+Current limits: 8 MiB / 4,096 items of model context per request (stored
+history is unbounded), 256 KiB input prompt, 64 KiB instructions, 512 KiB terminal provider output, 2 MiB SSE frame,
 16 MiB response stream, 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission has a 60-second timeout. The permit is released before reading SSE. This
@@ -375,7 +375,7 @@ wants to observe.
 .local/target/release/agent serve \
   --store .local/runtime/state.sqlite --socket .local/runtime/state.sqlite.sock \
   --provider anthropic --provider openai --model anthropic/claude-sonnet-4-5 \
-  --tools shell,read,write,edit
+  --tools shell,read,write,edit,wait,history
 ```
 
 Requests include a string or nonnegative integer `id`. Responses carry the same
@@ -477,8 +477,10 @@ interrupted. Ownership uses the canonical database path with an appended
 files are rejected. Do not replace or rename the database or its lock while
 open. The schema version lives in SQLite's `user_version`; a store created
 before versioning is refused with `store_schema_unsupported`, one written by a
-newer binary with `store_schema_newer`, and an older versioned store will be
-migrated in order once a migration exists. The stored provider and tool
+newer binary with `store_schema_newer`, and an older versioned store is
+migrated forward one version at a time inside the opening transaction (a
+version-6 store gains turn ordinals rebuilt from its accepted events). The
+migration is the only code that knows an earlier format. The stored provider and tool
 configuration must still match at reopen, or `store_configuration_mismatch`
 is returned.
 
@@ -511,14 +513,77 @@ entries; an empty page means no later retained events. A single entry exceeding
 that budget returns `event_page_item_limit`. Responses exceeding the 1 MiB wire
 limit return a correlated `response_size_limit` error without stopping the service.
 
-Inactive bot histories stay on disk. Active requests currently load their bounded
-history into memory; fully disk-streamed context and a shared active-history cache
-are future optimizations. SQLite's configured cache is 2 MiB, not a total bound
-on storage-related or OS memory. Durable performance needs its own benchmark.
+Histories stay on disk whether or not the bot is active. A model request streams
+its context window from the store in batches of 64 items with an exact
+Content-Length; the daemon never holds a transcript. SQLite's configured cache is
+2 MiB, not a total bound on storage-related or OS memory. Durable performance
+needs its own benchmark.
+
+## Long history and context windows
+
+Stored history has no length limit. What a model sees per request is a
+context window: the newest whole turns of the bot's lineage that fit
+`--context-bytes` and `--context-items`. The window starts at a turn boundary
+(a user prompt), so a model never sees a tool call without its result or a
+reply without its prompt. Its start is persisted per bot (`context_start`) and
+only moves when the window overflows; it then jumps back to the oldest turn
+boundary within three quarters of both budgets, so the request prefix stays
+byte-identical across many turns and provider prompt caches keep hitting. A
+fork inherits the lineage, not the start; its first request computes its own
+window over the shared history.
+
+When turns are omitted, the request begins with one user item:
+`[context note] N earlier turn(s) with M messages are not shown. Use the
+history tool with a turn number from 1 to N to read any of them.` The note is
+part of the request, never stored. Turn numbers are ordinals along the lineage
+(`turn_seq`, stored on each turn's first item and indexed), so a fork's numbering
+continues its source's. The `history` tool returns one turn's prompt, replies,
+tool calls, and results as provider JSONL with only the top-level
+`encrypted_content` field removed from reasoning items. Reasoning records and
+readable summaries remain, as do Anthropic thinking and signatures. Stored
+items, raw `item` reads, forks, and provider replay remain unchanged. The reading
+view removes insignificant JSON whitespace from multiline provider items so
+each occupies one JSONL record. Single-line items need no whitespace rewrite;
+whitespace inside text strings remains intact. Pages
+contain at most 64 KiB of text. Optional `limit` (4–65,536 bytes) requests a
+smaller page.
+The runtime also limits the encoded tool result, including escaping and page
+metadata, to half the current turn's remaining byte budget. This leaves room
+for subsequent work; the current turn's overall item and byte limits still
+apply. If too little space remains, the tool returns `history_context_exhausted`.
+Start with `offset: 0`, then pass each `next_offset` until
+`done` is true. Offsets count UTF-8 bytes in that turn's filtered JSONL; pages end at
+character boundaries but may split a JSON record. Concatenate the text to decode
+complete records. `truncated` means more bytes remain, and `items` counts record
+newlines completed in this page. No entry is replaced by a preview. The store
+passes bounded blob slices into Rust rather than loading whole messages there.
+SQLite may parse and copy a whole item to filter it; items are transformed
+one at a time, outside the query that orders the turn.
+A number past the lineage returns `turn_not_in_history`; an offset past the end or inside a UTF-8
+character returns `invalid_history_page`. No summaries are made and nothing is
+deleted; compaction with summaries remains future work in [LONG_HISTORY.md](LONG_HISTORY.md).
+
+The window always contains the whole current turn. If that turn alone exceeds
+a budget, the turn fails with `context_limit` rather than sending a truncated
+request. Both limits are daemon flags forwarded by the client, reported in
+`ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
+the `context_window` capability. Stores are schema version 7; a version-6
+store is migrated at open. Store initialization and migration run in one
+transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
+one-way migrations but no legacy runtime behavior for earlier Agent versions.
+
+Each window request reads the head and saved-start accounting together, then
+walks the selected suffix once. Streaming batches copy item bytes directly from
+SQLite into the output buffer. History retrieval walks only the selected bot's
+ancestry to find both turn boundaries; unrelated bots do not add candidate
+walks. Very old reads still cost a walk from the selected head. The
+[measured costs](DAEMON_MEASUREMENTS.md#long-history) at fixed context and
+growing stored history are recorded separately.
 
 ## Tools and validation scope
 
-`--tools` names any subset of `echo`, `shell`, `read`, `write`, `edit`, and `wait`. The
+`--tools` names any subset of `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
+`history`. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, timeout, output
 overflow) returns an error result to the model and the turn continues. Only a
@@ -573,10 +638,12 @@ socket, and startup/reconnection with deeply nested store paths. Rust tests cove
 slow-consumer queue pressure, transactional tool outcomes, replay pagination,
 both stream parsers, file tools, and provider spec parsing.
 
-The ephemeral benchmark calls the same provider/history core but bypasses SQLite
-and registers no tools, matching the earlier Pi/Codex text workload. It must not
-be presented as durable-server, coding-tool, TLS, or real-provider performance.
+The streaming benchmark drives the daemon through its stdio protocol on a fresh
+store with the echo tool registered but never called; there is no benchmark-only
+entry point and no in-memory history path. It must not be presented as
+coding-tool, TLS, or real-provider performance.
 The [durable feature screen](LIFECYCLE_MEASUREMENTS.md) measures actual service
 execution, including shell descendants, independently of the text-core screen.
 Very long histories and compaction are specified in [LONG_HISTORY.md](LONG_HISTORY.md);
-the present whole-history cap has not yet been removed.
+stored history is now unbounded with a per-request context window, and
+compaction with summaries is not implemented.

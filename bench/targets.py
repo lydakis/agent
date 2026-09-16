@@ -26,12 +26,14 @@ def engine_target(engine, root, binary=None):
         executable = binary.resolve() if binary else root / ".local/target/release/agent"
         if not executable.exists():
             raise ValueError("build the Rust release target with cargo build --release --locked first")
-        metadata = {"engine": "rust", "comparison_profile": profile(engine), "durability": "ephemeral", "tools_exercised": False,
+        metadata = {"engine": "rust", "comparison_profile": profile(engine), "durability": "sqlite_full", "tools_exercised": False,
                     "binary_sha256": file_hash(executable),
                     "cargo_lock_sha256": None if binary else file_hash(root / "Cargo.lock"),
                     "version": subprocess.check_output([str(executable), "--version"],
                         env=clean_env(), text=True, timeout=5).strip()}
-        return [str(executable), "benchmark"], metadata, None
+        # The daemon itself; the runner appends the store path and provider
+        # endpoint once they exist and drives the stdio protocol.
+        return [str(executable), "serve", "--model", "openai/bench-model", "--tools", "echo"], metadata, None
     node = shutil.which("node")
     if not node:
         raise ValueError("Node.js is required for engine adapters")
