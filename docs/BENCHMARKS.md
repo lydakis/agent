@@ -179,6 +179,23 @@ build attestation for the downloaded npm artifact.
 
 See [FX measurements](FX_MEASUREMENTS.md) for observations and contribution ideas.
 
+## Live fleet check
+
+`bench.live_fleet` is a paid, explicitly invoked check against a real
+provider, never part of the test suite. It starts one daemon, submits N
+detached turns at once on fresh bots, waits on all handles, and reports
+achieved concurrency, per-turn latency, outcomes, tokens, and daemon RSS and
+threads sampled from outside. The provider key comes from the caller's
+environment and is never printed or stored.
+
+```sh
+.local/venv/bin/python -m bench.live_fleet --bots 32 --model anthropic/claude-sonnet-5 \
+  --max-connecting 64 --out .local/bench/fleet-sonnet-32
+```
+
+Results are `live_fleet_v1` records with the binary hash. See
+[LIVE_FLEET.md](LIVE_FLEET.md) for the recorded runs and their limits.
+
 ## What is measured
 
 | Field | Meaning and limits |

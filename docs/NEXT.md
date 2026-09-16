@@ -121,11 +121,11 @@ calls) and the three configurable daemon limits in place of fixed constants; see
 [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results). Still to measure:
 bytes per parked turn versus per live process, on the lifecycle screen.
 
-1. A bounded multi-agent run on either provider (tens of concurrent bots) to
-   observe the 64-request startup bound, header latency, and idle-timeout
-   adequacy for long thinking. Preserve failures. Anthropic prompt caching and
-   fork-from-any-message are implemented and verified live
-   ([ANTHROPIC_SMOKE.md](ANTHROPIC_SMOKE.md#caching-and-mid-turn-forks)).
+1. Done: the [live fleet check](LIVE_FLEET.md) ran 32 and 96 concurrent bots
+   on Sonnet 5 and 32 on gpt-5-mini through one daemon with no failures; the
+   startup bound and idle timeout behaved as designed. Next at scale: a
+   hundreds-of-bots run once long history bounds per-turn memory, since each
+   active turn still loads its history.
 2. Separate long-term conversation storage from bounded model context. Implement
    indexed history access and context selection before claiming long-history
    support. Follow [LONG_HISTORY.md](LONG_HISTORY.md), including preserved fork

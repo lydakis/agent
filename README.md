@@ -69,6 +69,7 @@ Agent does not provide a sandbox.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
 - [Rust measurements](docs/RUST_MEASUREMENTS.md): exploratory observations, with unequal feature footprints.
 - [Anthropic live run](docs/ANTHROPIC_SMOKE.md): the daemon against Sonnet 5, Opus 5, and Fable 5.1, with the adaptive-thinking fix it forced.
+- [Live fleet check](docs/LIVE_FLEET.md): 32 and 96 concurrent bots on real providers through one daemon.
 - [FX measurements](docs/FX_MEASUREMENTS.md): native embedded FX versus Rust with identical conversation content and explicit protocol differences.
 - [Comparison contract](docs/COMPARISON_CONTRACT.md): feature inventory and enforced comparison rules.
 - [Long histories](docs/LONG_HISTORY.md): full retained conversation versus bounded model context.
