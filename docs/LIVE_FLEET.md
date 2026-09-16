@@ -184,10 +184,249 @@ What the numbers say:
   idle read timeout, and no other turn was delayed by it.
 - **The store grows linearly** at about 2.8 KB per turn for this workload
   (items, events, turn rows, and tool intents), 25 MiB for five minutes at
-  30 turns per second. Retention is still unimplemented and this is the
-  number it will have to bound.
+  30 turns per second. This run predates retention and supplies the storage
+  baseline for the following screen.
 
 Not established: rate limits at higher token rates or on other tiers, hours
 of load, long contexts under sustained load (the window was fixed at eight
 items), or Anthropic beyond 16 bots. Captures: ignored
 `.local/bench/sustained-luna-64/` and `sustained-sonnet-16/`.
+
+## Retention under sustained load
+
+Observed 2026-09-16 America/New_York, same host and driver, binary with the
+retention primitives, `bench.sustained --retain-turns 8`: 64 bots on
+gpt-5.6-luna for two minutes, each bot pruned to its newest eight turns'
+records after every turn.
+
+| Run | Turns | Failed | Steady turns/s | p50 ms | Events rows at end | Main store file | Growth per turn |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sustained-luna-64 (no retention, above) | 9,050 | 4 | 30 | 1,907–2,014 | 73,270 | 21.3 MiB | 2.8 KB |
+| sustained-luna-64-retain | 3,914 | 4 | 31–33 | 1,777–1,877 | 4,212 | 5.6 MiB | 1.4 KB |
+
+With the policy on, the events table stops growing at 64 bots times eight
+turns, freed pages are reused, and what remains per turn is the transcript
+(about 870 bytes of items) plus turn and checkpoint rows. The runs have different
+durations and provider timings, so their throughput difference does not establish
+retention's performance effect. The remaining growth is the model's
+own history, which compaction has to address; a bot that is finished is
+freed entirely with `delete`. One provider call took 39.6 s at the very end,
+which is why the run's last window is a single turn. Captures: ignored
+`.local/bench/sustained-luna-64-retain/`.
+
+## Retention correctness and synthetic overhead
+
+Observed 2026-09-16 on Darwin arm64, release builds with Rust 1.98.0. Compared
+the initial retention binary `670048e1…` with the corrected binary `95656e92…`.
+The corrections preserve running background commands, allocate non-reusable
+turn IDs, report expired outcomes explicitly, and retire completed tasks before
+publishing their live terminal events. They also index the retention boundary,
+search retained records instead of all historical turns, and combine finish,
+prune, and outcome capture into one database-worker job.
+
+Matched workload: one bot over stdio, a loopback synthetic Responses provider,
+one `echo` call and two model requests per turn, eight context items, eight
+retained turns, SQLite FULL durability. Stores were seeded with 100 or 100,000
+complete four-item turns; the larger histories were populated offline from
+the same synthetic turn template. Both candidates opened and closed their
+store once before measurement, excluding migration from the steady-state
+process. Each run then warmed up for 16 turns and measured 400 turns. Three
+paired runs alternated candidate order. No tests or builds ran concurrently.
+
+Values below are medians of the three runs; RSS is the daemon alone, sampled
+every 10 ms, and excludes the controller and synthetic provider. Latency spans
+submit through receipt of `turn_finished`; CPU is daemon user plus system time.
+
+| Stored turns | Binary | Median turn ms | p95 turn ms | CPU ms/turn | Peak sampled RSS MiB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | Before | 2.96 | 3.85 | 2.40 | 11.91 |
+| 100 | Corrected | 2.96 | 6.31 | 2.34 | 12.09 |
+| 100,000 | Before | 53.17 | 57.17 | 52.20 | 15.00 |
+| 100,000 | Corrected | 2.50 | 3.24 | 1.99 | 14.06 |
+
+All measured turns completed. Each run made exactly 800 model requests;
+canonical request payload bytes matched between candidates at each history
+size: 1,441,330 and 1,448,000 respectively. SQL plans confirm the old retention
+boundary sorted historical turns, and its record deletions built historical
+turn lists. The corrected queries use the boundary index and retained records.
+
+The long-history improvement is clear on this workload. Short-history median
+latency is unchanged, while tail results are noisy: the first paired screen
+had p95 3.16 → 3.18 ms; the reopened screen above had 3.85 → 6.31 ms. This does
+not establish a short-history tail improvement or unchanged fleet-wide tails.
+A focused follow-up of seven alternating pairs at 100 stored turns produced
+median p50 2.69 → 2.63 ms, p95 3.32 → 3.22 ms, and CPU 2.18 → 2.04 ms/turn.
+Thus the earlier short-history p95 increase did not persist in the larger check.
+Short-history RSS increased by about 0.1–0.2 MiB. In the process that performed the
+100,000-turn migration, measured-turn RSS was 16.06 MiB versus 14.95 before;
+reopening the migrated store produced the lower steady-state value above.
+Startup latency, migration peak, many-bot contention, shell-process memory,
+and real-provider performance were not measured by this screen.
+
+Driver, seed stores, exact binary hashes, SQL plans, and captures remain in ignored
+`.local/retention-fixes/measure.py`, `query-plans.json`, `results.json`,
+`reopened/results.json`, and `short-tail-check/results.json`.
+
+### Checkpoint identity and retention follow-up
+
+Observed 2026-09-16, same synthetic contract and host as above. Compared
+`95656e92…` with `bc2478aa…`, which prevents checkpoint ID reuse, makes CLI
+retries fail explicitly when their result expired, and applies retention to
+parked-turn interruption. Node allocation uses the highest surviving ID and
+a floor saved atomically with deletion; it adds no per-message counter write.
+Node metadata reads and node, turn, and event insertions reuse prepared SQL
+statements. Normal CLI runs require no new RPC; a pruning notice triggers
+reconciliation of the selected turn.
+
+Seven alternating pairs at each history size, each with 16 warm-up turns and
+400 measured turns after opening and closing the store once. The controller,
+provider, context, retention, durability, and measurement boundaries match the
+preceding screen. Tests and builds did not run concurrently. All 11,200 measured
+turns completed; request counts and canonical payload bytes matched each pair.
+
+| Stored turns | Binary | Median turn ms | p95 turn ms | CPU ms/turn | Peak sampled RSS MiB |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | Before | 2.51 | 3.04 | 2.00 | 12.08 |
+| 100 | Corrected | 2.57 | 3.19 | 2.03 | 12.08 |
+| 100,000 | Before | 2.56 | 3.28 | 2.06 | 14.02 |
+| 100,000 | Corrected | 2.52 | 3.23 | 2.01 | 14.05 |
+
+These remain close to baseline: CPU changed +1.3% at 100 stored turns and
+−2.6% at 100,000, with effectively unchanged sampled memory. The short-history
+p95 increased by 0.15 ms. This is not evidence of an overall speedup; the large
+long-history improvement from the earlier retention-query fix is preserved.
+Startup, deletion latency, migration peak, and fleet-wide contention remain
+outside this screen. Earlier candidates that wrote the node counter on every
+message are retained as exploratory captures, not included in this table.
+
+Ignored evidence: `.local/retention-followup/measure-final.py`,
+`final/results.json`, and `measure-final.log`, with earlier candidates in
+`reopened/results.json` and `cached/results.json`.
+
+### Ordered completion and graceful shutdown
+
+Observed 2026-09-16, Darwin arm64, Rust 1.98.0. Compared `bc2478aa…`
+with `445f9af9…`. Completion now commits and publishes in the service loop,
+before another submission can overtake its terminal event. Shutdown uses the
+same path and drains socket writers concurrently under one five-second
+deadline. Moving the bot name through the completion job removes one string
+allocation per finished turn; the number of database jobs is unchanged.
+
+The single-bot screen uses the preceding matched contract: seven alternating
+pairs, 16 warm-up and 400 measured turns per run, eight context items and
+eight retained turns, reopened stores with 100 or 100,000 complete turns.
+The socket screen uses 32 bots, one warm-up turn each, then ten batches of
+32 turns per run, nine alternating pairs, default context limits and no
+retention. Both use two synthetic provider requests and one echo call per
+turn, SQLite FULL durability, and daemon-only CPU/RSS. The socket screen
+checks exact live/replay equality; it does not establish 32 simultaneous
+provider streams. No builds or tests ran alongside measurements.
+
+Medians across runs, before → after:
+
+| Workload | p50 ms | p95 ms | CPU ms/turn | Peak sampled RSS MiB |
+| --- | ---: | ---: | ---: | ---: |
+| 100 stored turns | 2.57 → 2.61 | 3.28 → 4.44 | 2.04 → 2.08 | 12.09 → 12.13 |
+| 100,000 stored turns | 2.64 → 2.47 | 3.46 → 3.09 | 2.05 → 1.96 | 14.08 → 14.09 |
+| 32 bots over sockets | 33.34 → 31.63 | 44.52 → 42.98 | 2.38 → 2.42 | 14.33 → 14.31 |
+
+The short-history tail increase triggered a separate seven-pair recheck on
+the same final binary and contract: p50 2.77 → 2.60 ms, p95 3.45 → 3.18 ms,
+CPU 2.21 → 2.07 ms/turn, and RSS 12.11 → 12.08 MiB. The increase did not
+repeat. These screens show essentially stable sampled memory and small,
+mixed CPU changes, not an established overall speedup or a consistent
+slowdown. Long-history CPU fell 4.4%; socket-fleet CPU rose 1.5%.
+
+All 22,560 measured turns completed across the final screens and recheck;
+request counts and canonical payload bytes matched within each workload.
+Shutdown delivery is covered by behavioral tests, not included in these
+steady-state timings. Startup, migration, real providers, and larger fleets
+remain outside the measurement boundary.
+
+Ignored captures: `.local/completion-fixes/measure.py`, `allocation/results.json`,
+`short-tail-check/results.json`, `fleet.py`, and `fleet-allocation-results.json`.
+Earlier candidates remain in `final/` and `verified/` as exploratory captures.
+
+### Retention scoped to one bot
+
+Observed 2026-09-16, Darwin arm64, Rust 1.98.0. Compared `445f9af9…`
+with `6e7707f4…`. Schema 11 indexes retention candidates in a separate
+`retained_turns` table, so a prune neither scans unrelated bots' operational
+records nor rewrites durable turn rows. Migration derives candidates from
+surviving records. Running background commands keep their candidate until a
+later prune can remove their completed results.
+
+Matched isolation probe: Alice owns 100, 10,000, or 100,000 retained tool rows;
+Bob has two turn rows and nothing to delete. Each candidate receives the same
+seed store. Migration and one initial prune run before closing and reopening
+the store. Five alternating pairs then measure 50 `prune Bob keep_turns=1`
+RPCs per run. Alice's tool rows are checked afterward. No provider calls are
+made; latency includes the stdio round trip. Medians across runs:
+
+| Alice's retained tool rows | Prune ms, before → after | Daemon CPU ms/prune, before → after |
+| ---: | ---: | ---: |
+| 100 | 0.084 → 0.061 | 0.077 → 0.065 |
+| 10,000 | 1.909 → 0.064 | 1.844 → 0.067 |
+| 100,000 | 23.491 → 0.077 | 23.267 → 0.147 |
+
+At 100,000 unrelated records this operation is about 300 times faster. The
+record deletion now looks up candidate turns using `(bot,turn)`, then seeks
+their records by turn ID. This ratio describes repeated pruning with nothing
+to delete, not whole-harness throughput. Sampled daemon RSS at that size was
+12.53 → 12.61 MiB.
+
+The ordinary-turn screen repeats the preceding single-bot synthetic contract:
+seven alternating pairs per history size, 16 warm-up and 400 measured turns,
+one echo and two requests per turn, eight context items and eight retained
+turns, FULL durability. All 11,200 measured turns completed, and request counts
+and canonical bytes matched. Median results, before → after:
+
+| Stored turns | p50 ms | p95 ms | CPU ms/turn | Peak sampled RSS MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 2.649 → 2.688 | 3.296 → 3.300 | 2.099 → 2.126 | 12.19 → 12.20 |
+| 100,000 | 2.604 → 2.553 | 3.280 → 3.277 | 2.052 → 2.041 | 14.14 → 14.11 |
+
+Ordinary-turn overhead stays close to baseline: CPU +1.3% at 100 turns and
+−0.6% at 100,000, with essentially unchanged memory and p95. Tests and builds
+did not run concurrently. Startup, migration peak, first-time pruning of a
+large retained history, and large live fleets remain outside these timings.
+
+Ignored evidence: `.local/retention-owner-fix/measure_scope.py`,
+`scope-final-results.json`, `measure.py`, `final/results.json`, and `summary.json`.
+The earlier turn-row-flag candidate in `steady/` increased long-history CPU
+and RSS and was discarded; it is not part of the final implementation.
+
+### Deleted-bot wake-ups
+
+Observed 2026-09-16, Darwin arm64, Rust 1.98.0. Compared `6e7707f4…`
+with `068225fe…`. A queued wake-up now checks only the bot name, parked
+status, and turn ID through a cached indexed query. It skips deleted or
+replaced turns, propagates database errors, and avoids loading the full bot
+record or cloning the bot name. No additional database job is needed.
+
+Matched synthetic screen: one bot over stdio, two Responses requests per
+turn, eight context items, eight retained turns, SQLite FULL durability,
+16 warm-up turns per run. Ordinary turns call `echo`; the resumption workload
+calls `wait` on an unknown process handle, parks and resumes immediately,
+and uses 64 KiB of synthetic instructions to exercise the previous metadata
+copy. CPU and RSS cover only the daemon; RSS is sampled every 10 ms. Latency
+spans submit through receipt of completion. Builds and tests ran beforehand.
+
+Five alternating pairs of 300 measured turns per candidate and workload:
+
+| Workload | p50 ms, before → after | p95 ms | CPU ms/turn | Peak sampled RSS MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary echo | 2.789 → 2.697 | 3.458 → 3.297 | 2.155 → 2.078 | 12.11 → 12.05 |
+| Wait/resume | 3.947 → 4.133 | 4.601 → 5.171 | 2.992 → 3.170 | 12.80 → 12.91 |
+
+The initial wait/resume increase prompted nine more alternating pairs of
+500 turns on the same binaries and contract: p50 3.915 → 3.887 ms,
+p95 4.600 → 4.754 ms, CPU 3.0461 → 3.0468 ms/turn, and RSS
+13.08 → 13.14 MiB. The CPU increase did not persist; the recheck's p95
+remained 0.15 ms higher. These results support roughly stable overhead on
+these workloads, not an overall speedup or unchanged fleet-wide tails.
+All 15,000 measured turns completed, with identical canonical provider payload
+hashes within each pair. Startup, long histories, large fleets, and real
+providers were not measured. Ignored evidence:
+`.local/deleted-wakeup-fix/measure.py`, `results.json`, `summary.json`, and
+`recheck/`.

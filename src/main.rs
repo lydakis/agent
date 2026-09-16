@@ -16,10 +16,13 @@ const USAGE: &str = "usage:
   agent turns --bot NAME [--after N]     list a bot's turns with status, tokens, and timing
   agent result --bot NAME --turn N       a turn's outcome without waiting
   agent wait [--timeout-ms N] HANDLE...  block until turn:BOT/N or proc:N handles resolve
+  agent rm --bot NAME                    delete an idle bot and everything only it owns
+  agent prune --bot NAME --keep-turns N  drop events, tool records, and artifacts of older turns
   agent ls | agent shutdown
   agent serve --store PATH [--socket PATH] --provider SPEC... [--model P/M] [--tools LIST]
               [--max-processes N] [--max-active N] [--max-connecting N]   (0 = unbounded)
               [--max-output-tokens N] [--idle-exit SECONDS] [--context-bytes N] [--context-items N]
+              [--retain-turns N]      (prune every bot to N turns' records after each turn)
   agent --version
 options: --store PATH --model PROVIDER/MODEL --provider SPEC --tools LIST --workspace DIR
          --bot NAME --instructions TEXT --instructions-file F --reasoning low|medium|high
@@ -54,7 +57,7 @@ fn run() -> Result<i32> {
         }
         Some(
             "run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown" | "wait" | "turns"
-            | "result",
+            | "result" | "rm" | "prune",
         ) => client::main(args),
         _ => fail_with("usage", USAGE),
     }
@@ -80,6 +83,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut idle_exit = None;
     let mut context_bytes = None;
     let mut context_items = None;
+    let mut retain_turns = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -118,6 +122,11 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     Error::with("usage", "--max-output-tokens needs a positive integer"),
                 )?)
             }
+            "--retain-turns" => {
+                retain_turns = Some(value.parse::<usize>().ok().filter(|n| *n > 0).ok_or(
+                    Error::with("usage", "--retain-turns needs a positive integer"),
+                )?)
+            }
             "--idle-exit" => {
                 let seconds: u64 = value
                     .parse()
@@ -144,5 +153,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         idle_exit,
         context_bytes,
         context_items,
+        retain_turns,
     })
 }

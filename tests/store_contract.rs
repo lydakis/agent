@@ -518,8 +518,11 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP INDEX nodes_turn_seq; ALTER TABLE nodes DROP COLUMN turn;
-             ALTER TABLE nodes DROP COLUMN turn_seq; ALTER TABLE bots DROP COLUMN context_start;",
+            "DROP TABLE retained_turns;
+             DROP TABLE node_sequence; DROP TABLE turn_sequence; DROP INDEX nodes_turn_seq; DROP INDEX nodes_parent; DROP INDEX bots_head;
+             DROP INDEX bots_context_start; ALTER TABLE bots DROP COLUMN pruned_cursor;
+             ALTER TABLE nodes DROP COLUMN turn; ALTER TABLE nodes DROP COLUMN turn_seq;
+             ALTER TABLE bots DROP COLUMN context_start;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 6).unwrap();
@@ -1099,5 +1102,313 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             assert_eq!(joined.lines().nth(1).unwrap(), item);
         }
         assert_eq!(db.items_by_ids(&window.ids).unwrap(), replay);
+    }
+}
+
+#[test]
+fn deleting_a_bot_frees_only_its_exclusive_history() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    db.fork("Bob", None, "branch", Some("/synthetic"), None)
+        .unwrap();
+    converse(&mut db, "branch", 4);
+    converse(&mut db, "Bob", 5);
+    let before: i64 = db
+        .window("Bob", i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap()
+        .ids
+        .len() as i64;
+    assert_eq!(before, 8);
+    // A running bot cannot be deleted.
+    let turn = db
+        .begin("Bob", "live", "p", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
+    db.append(turn, vec![assistant("r")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    // Deleting the source frees its suffix after the fork point (turn 5 and
+    // the live turn: four nodes) and keeps the six the branch still reaches.
+    let freed = db.delete_bot("Bob").unwrap();
+    assert_eq!(freed["nodes"], 4);
+    assert_eq!(freed["turns"], 5);
+    assert!(db.inspect("Bob").is_err());
+    assert_eq!(stored(&mut db, "branch").len(), 8);
+    assert!(
+        db.history_read("branch", 1, 0, 65536).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("p1")
+    );
+    // Deleting the last bot on a lineage frees everything.
+    let freed = db.delete_bot("branch").unwrap();
+    assert_eq!(freed["nodes"], 8);
+    let nodes: i64 = db.events("branch", 0, 8).map(|_| 0).unwrap_or_else(|_| 0);
+    assert_eq!(nodes, 0);
+    assert_eq!(db.delete_bot("branch").unwrap_err().code, "bot_not_found");
+}
+
+#[test]
+fn pruning_keeps_the_transcript_and_marks_the_replay_gap() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=5 {
+        converse(&mut db, "Bob", n);
+    }
+    assert_eq!(db.prune("Bob", 0).unwrap_err().code, "invalid_retention");
+    let full = db.events("Bob", 0, 256).unwrap();
+    let first_turn = full["events"][1]["turn"].as_i64().unwrap();
+    assert_eq!(
+        db.turn_outcome("Bob", first_turn).unwrap().unwrap()["text"],
+        "r1"
+    );
+    assert!(full.get("pruned_before").is_none());
+    let pruned = db.prune("Bob", 2).unwrap();
+    assert_eq!(
+        db.turn_outcome("Bob", first_turn).unwrap_err().code,
+        "turn_result_pruned"
+    );
+    // Turns 1 to 3: accepted, message, and turn_finished each (no usage here).
+    assert_eq!(pruned["events"], 9);
+    let cursor = pruned["pruned_cursor"].as_i64().unwrap();
+    let page = db.events("Bob", 0, 256).unwrap();
+    assert_eq!(page["pruned_before"], cursor);
+    let kinds: Vec<&str> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds[0], "created");
+    assert_eq!(page["events"].as_array().unwrap().len(), 1 + 2 * 3);
+    assert!(
+        db.events("Bob", cursor, 256)
+            .unwrap()
+            .get("pruned_before")
+            .is_none()
+    );
+    // The transcript is untouched: the window and history reads still see turn 1.
+    assert_eq!(stored(&mut db, "Bob").len(), 10);
+    assert!(
+        db.history_read("Bob", 1, 0, 65536).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("p1")
+    );
+    assert_eq!(
+        db.turns("Bob", 0, 64).unwrap()["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    // Pruning again with a wider window changes nothing; a narrower one moves the floor.
+    assert_eq!(db.prune("Bob", 3).unwrap()["events"], 0);
+    assert_eq!(db.prune("Bob", 1).unwrap()["events"], 3);
+}
+
+#[test]
+fn turn_identity_migrates_above_fork_retained_history() {
+    let path =
+        std::env::temp_dir().join(format!("agent-turn-identity-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let last;
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+        converse(&mut db, "Bob", 2);
+        last = db.turns("Bob", 0, 64).unwrap()["turns"][1]["turn"]
+            .as_i64()
+            .unwrap();
+        db.fork("Bob", None, "branch", Some("/synthetic"), None)
+            .unwrap();
+        db.delete_bot("Bob").unwrap();
+    }
+    {
+        // Version 8 has no surviving turn rows, but the branch retains their
+        // transcript markers. Migration must include those IDs in its floor.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE retained_turns;
+             DROP TABLE node_sequence; DROP TABLE turn_sequence; PRAGMA user_version=8;",
+        )
+        .unwrap();
+        let mut db = Database::initialize(conn, "test").unwrap();
+        let turn = db
+            .begin("branch", "next", "work", true, &TurnOptions::default())
+            .unwrap()
+            .turn;
+        assert!(turn > last);
+        db.finish(turn, None).unwrap();
+        assert!(
+            db.history_read("branch", 1, 0, 1024).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("p1")
+        );
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn checkpoint_identity_survives_migration_deletion_and_restart() {
+    let path =
+        std::env::temp_dir().join(format!("agent-node-identity-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let checkpoint;
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+        checkpoint = db.inspect("Bob").unwrap().head.unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE retained_turns;
+                            DROP TABLE IF EXISTS node_sequence; PRAGMA user_version=9;",
+        )
+        .unwrap();
+        let mut db = Database::initialize(conn, "test").unwrap();
+        assert_eq!(
+            db.item("Bob", checkpoint).unwrap()["content"][0]["text"],
+            "r1"
+        );
+        db.delete_bot("Bob").unwrap();
+    }
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 2);
+        assert!(db.inspect("Bob").unwrap().head.unwrap() > checkpoint);
+        assert_eq!(
+            db.item("Bob", checkpoint).unwrap_err().code,
+            "item_not_in_bot_history"
+        );
+        assert_eq!(
+            db.fork("Bob", Some(checkpoint), "stale", None, None)
+                .unwrap_err()
+                .code,
+            "node_not_in_source_history"
+        );
+        // Deleting the newest branch must also preserve its IDs while an
+        // older bot survives and appends more messages.
+        db.fork("Bob", None, "newer", Some("/synthetic"), None)
+            .unwrap();
+        converse(&mut db, "newer", 3);
+        let removed = db.inspect("newer").unwrap().head.unwrap();
+        db.delete_bot("newer").unwrap();
+        converse(&mut db, "Bob", 4);
+        assert!(db.inspect("Bob").unwrap().head.unwrap() > removed);
+        assert_eq!(
+            db.item("Bob", removed).unwrap_err().code,
+            "item_not_in_bot_history"
+        );
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn retention_keeps_running_processes_until_their_results_commit() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin("Bob", "bg", "work", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let process = db.process_start(turn, "bg").unwrap();
+    db.append(turn, vec![assistant("launched")], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
+    converse(&mut db, "Bob", 2);
+    db.prune("Bob", 1).unwrap();
+    assert_eq!(db.running_processes().unwrap(), 1);
+    db.process_finish(
+        process,
+        &json!({"stdout":"done"}),
+        &[("stdout", b"full output".to_vec())],
+    )
+    .unwrap();
+    assert_eq!(
+        db.process_result(process).unwrap().unwrap().1.unwrap()["stdout"],
+        "done"
+    );
+    // Late artifacts and completed process rows are removed on the next prune.
+    db.prune("Bob", 1).unwrap();
+    assert!(db.process_result(process).unwrap().is_none());
+    assert!(db.artifact_page("Bob", turn, "bg", "stdout", 0, 4).is_err());
+    db.delete_bot("Bob").unwrap();
+}
+
+#[test]
+fn retention_candidates_migrate_and_stay_scoped_to_their_bot() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-retention-index-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        for bot in ["Alice", "Bob"] {
+            db.create(bot, Some("/synthetic"), binding()).unwrap();
+            for n in 1..=3 {
+                converse(&mut db, bot, n);
+            }
+        }
+        db.prune("Bob", 2).unwrap();
+    }
+    let conn = Connection::open(&path).unwrap();
+    // Version 10 retains turn rows but has no operational-retention index.
+    conn.execute_batch(
+        "DROP TABLE retained_turns;
+                        PRAGMA user_version=10;",
+    )
+    .unwrap();
+    let mut db = Database::initialize(conn, "test").unwrap();
+    assert_eq!(
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM retained_turns WHERE bot='Bob'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2,
+    );
+    let alice = db.events("Alice", 0, 256).unwrap();
+    assert_eq!(db.prune("Bob", 1).unwrap()["events"], 3);
+    assert_eq!(db.prune("Bob", 1).unwrap()["events"], 0);
+    assert_eq!(db.events("Alice", 0, 256).unwrap(), alice);
+    assert_eq!(stored(&mut db, "Bob").len(), 6);
+    drop(db);
+    let conn = Connection::open(&path).unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .prepare("SELECT bot,count(*) FROM retained_turns GROUP BY bot ORDER BY bot")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, vec![("Alice".into(), 3), ("Bob".into(), 1)]);
+    // A restart and a wider retention request cannot restore expired records.
+    let mut db = Database::initialize(conn, "test").unwrap();
+    assert_eq!(db.prune("Bob", 3).unwrap()["events"], 0);
+    converse(&mut db, "Bob", 4);
+    assert_eq!(db.prune("Bob", 1).unwrap()["events"], 3);
+    assert_eq!(db.events("Alice", 0, 256).unwrap(), alice);
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }

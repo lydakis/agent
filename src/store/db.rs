@@ -95,7 +95,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 7;
+    pub const SCHEMA: i32 = 11;
 
     pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
         conn.execute_batch(
@@ -132,24 +132,39 @@ impl Database {
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+            INSERT OR IGNORE INTO node_sequence VALUES (1,0);
             CREATE TABLE IF NOT EXISTS bots(name TEXT PRIMARY KEY, head INTEGER REFERENCES nodes(id),
                 workspace TEXT, status TEXT NOT NULL, running_turn INTEGER,
                 provider TEXT NOT NULL, family TEXT NOT NULL, model TEXT NOT NULL,
                 instructions TEXT NOT NULL, reasoning TEXT,
                 budget_tokens INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0,
-                context_start INTEGER REFERENCES nodes(id));
+                context_start INTEGER REFERENCES nodes(id),
+                pruned_cursor INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
+            CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
+            CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
                 workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
                 UNIQUE(bot,request_id));
+            CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
+            CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+                bot TEXT NOT NULL REFERENCES bots(name));
+            CREATE INDEX IF NOT EXISTS retained_turns_bot ON retained_turns(bot,turn);
+            CREATE TABLE IF NOT EXISTS turn_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+            INSERT OR IGNORE INTO turn_sequence VALUES (1,0);
             CREATE TABLE IF NOT EXISTS checkpoints(bot TEXT NOT NULL REFERENCES bots(name), head INTEGER NOT NULL REFERENCES nodes(id),
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
+            CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 stream TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
@@ -270,7 +285,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL)",
+            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0)",
             params![
                 name,
                 workspace,
@@ -667,11 +682,19 @@ impl Database {
             .to_owned();
         let item = bot.family()?.user_item(prompt)?;
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO turns(bot,request_id,prompt,status,workspace,model,started_ms) VALUES (?,?,?,'running',?,?,?)",
-            params![name, request_id, prompt, options.workspace, options.model, epoch_ms()],
+        // A deleted bot must never make an old turn handle refer to new work.
+        let turn: i64 = tx
+            .prepare_cached(
+                "UPDATE turn_sequence SET last_id=last_id+1 WHERE singleton=1 RETURNING last_id",
+            )?
+            .query_row([], |r| r.get(0))?;
+        tx.prepare_cached(
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,started_ms) VALUES (?,?,?,?,'running',?,?,?)",
+        )?.execute(
+            params![turn, name, request_id, prompt, options.workspace, options.model, epoch_ms()],
         )?;
-        let turn = tx.last_insert_rowid();
+        tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
+            .execute(params![turn, name])?;
         let head = node_with_turn(&tx, bot.head, &item, Some(turn))?;
         tx.execute(
             "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
@@ -953,6 +976,18 @@ impl Database {
             .filter_map(|id| self.waiting(id).transpose())
             .collect()
     }
+    /// A queued wake-up is valid only for the bot's current parked turn.
+    /// Deleted bots and replaced turns are stale, not store failures.
+    pub fn can_resume(&self, name: &str, turn: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM bots
+                 WHERE name=? AND status='waiting' AND running_turn=?)",
+            )?
+            .query_row(params![name, turn], |r| r.get(0))?)
+    }
+
     /// Bring a parked turn back to running; the caller then records the wait result.
     pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value)> {
         let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
@@ -1002,7 +1037,7 @@ impl Database {
             .optional()?;
         let mut outcome: Value = match finished {
             Some(data) => serde_json::from_str(&data)?,
-            None => json!({"status":status}),
+            None => return fail("turn_result_pruned"),
         };
         let last: Option<i64> = self
             .conn
@@ -1185,7 +1220,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL)",
+            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0)",
             params![
                 name,
                 checkpoint,
@@ -1246,7 +1281,153 @@ impl Database {
             cursor = next;
             events.push(item);
         }
-        Ok(json!({"events":events,"next_cursor":cursor}))
+        let pruned: i64 =
+            self.conn
+                .query_row("SELECT pruned_cursor FROM bots WHERE name=?", [name], |r| {
+                    r.get(0)
+                })?;
+        let mut page = json!({"events":events,"next_cursor":cursor});
+        if after < pruned {
+            // The caller asked for events that retention removed; say so
+            // instead of replaying a silent gap.
+            page["pruned_before"] = json!(pruned);
+        }
+        Ok(page)
+    }
+    /// Remove an idle bot with everything only it owns: its turns, tool
+    /// intents, processes, artifacts, events, checkpoints, and the history
+    /// nodes no other bot's lineage reaches. Shared prefixes stay for forks.
+    pub fn delete_bot(&mut self, name: &str) -> Result<Value> {
+        let bot = self.inspect(name)?;
+        if bot.running_turn.is_some() {
+            return fail("bot_busy");
+        }
+        let running: bool = self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
+             WHERE t.bot=? AND p.status='running')",
+            )?
+            .query_row([name], |r| r.get(0))?;
+        if running {
+            return fail("bot_busy");
+        }
+        let tx = self.conn.transaction()?;
+        // Preserve identity before freeing the suffix, in the same transaction.
+        // The head is the largest ID on this append-only lineage. Together
+        // with surviving nodes, this floor covers every committed node ID.
+        if let Some(head) = bot.head {
+            tx.execute(
+                "UPDATE node_sequence SET last_id=MAX(last_id,?) WHERE singleton=1",
+                [head],
+            )?;
+        }
+        let mut deleted = json!({"turns":0,"events":0,"nodes":0});
+        for (table, key) in [
+            ("artifacts", "turn"),
+            ("processes", "turn"),
+            ("tools", "turn"),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {key} IN (SELECT id FROM turns WHERE bot=?)"),
+                [name],
+            )?;
+        }
+        deleted["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
+        tx.execute("DELETE FROM checkpoints WHERE bot=?", [name])?;
+        deleted["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
+        tx.execute("DELETE FROM bots WHERE name=?", [name])?;
+        // Walk back from the head, freeing nodes until one is still reached
+        // by another bot: as a head, a saved context start, or a parent of
+        // a surviving branch. A fork's own suffix is what it leaves behind.
+        let mut node = bot.head;
+        let mut freed = 0;
+        while let Some(id) = node {
+            let referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE head=?1 OR context_start=?1)
+                    OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if referenced {
+                break;
+            }
+            let parent: Option<i64> =
+                tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
+            tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
+            freed += 1;
+            node = parent;
+        }
+        deleted["nodes"] = json!(freed);
+        tx.commit()?;
+        Ok(deleted)
+    }
+    /// Keep the newest `keep_turns` turns' records and drop the rest of the
+    /// bot's events, tool intents, processes, and artifacts. The transcript
+    /// and the turn rows themselves stay: retention here bounds what replay
+    /// and tool retrieval keep, never what the model said.
+    pub fn prune(&mut self, name: &str, keep_turns: usize) -> Result<Value> {
+        self.inspect(name)?;
+        if keep_turns == 0 {
+            return fail("invalid_retention");
+        }
+        let floor: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM turns WHERE bot=? ORDER BY id DESC LIMIT 1 OFFSET ?",
+                params![name, (keep_turns - 1) as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(floor) = floor else {
+            return Ok(json!({"events":0,"pruned_cursor":Value::Null}));
+        };
+        let tx = self.conn.transaction()?;
+        for table in ["artifacts", "processes", "tools"] {
+            // The candidate index contains only this bot's unpruned turns, not
+            // its entire history or operational records owned by other bots.
+            // Background commands may outlive their launching turn; their
+            // running row is required when the result commits and waiters wake.
+            let finished = if table == "processes" {
+                "AND status!='running'"
+            } else {
+                ""
+            };
+            tx.prepare_cached(&format!(
+                "DELETE FROM {table} WHERE turn IN
+                 (SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2)
+                 {finished}"
+            ))?
+            .execute(params![name, floor])?;
+        }
+        let cursor: Option<i64> = tx.query_row(
+            "SELECT MAX(id) FROM events WHERE bot=? AND turn<?",
+            params![name, floor],
+            |r| r.get(0),
+        )?;
+        let events = tx.execute(
+            "DELETE FROM events WHERE bot=? AND turn<?",
+            params![name, floor],
+        )?;
+        // Keep pending background results discoverable by later prunes, even
+        // after their launching turn's events and tool records are gone.
+        tx.prepare_cached(
+            "DELETE FROM retained_turns WHERE bot=?1 AND turn<?2
+             AND NOT EXISTS(SELECT 1 FROM processes WHERE turn=retained_turns.turn AND status='running')",
+        )?
+        .execute(params![name, floor])?;
+        if let Some(cursor) = cursor {
+            tx.execute(
+                "UPDATE bots SET pruned_cursor=MAX(pruned_cursor,?) WHERE name=?",
+                params![cursor, name],
+            )?;
+        }
+        let pruned: i64 =
+            tx.query_row("SELECT pruned_cursor FROM bots WHERE name=?", [name], |r| {
+                r.get(0)
+            })?;
+        tx.commit()?;
+        Ok(json!({"events":events,"pruned_cursor":pruned}))
     }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
         let head = self.inspect(name)?.head;
@@ -1445,10 +1626,8 @@ fn epoch_ms() -> i64 {
 }
 
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO events(bot,turn,kind,data) VALUES (?,?,?,?)",
-        params![bot, turn, kind, data.to_string()],
-    )?;
+    conn.prepare_cached("INSERT INTO events(bot,turn,kind,data) VALUES (?,?,?,?)")?
+        .execute(params![bot, turn, kind, data.to_string()])?;
     Ok(conn.last_insert_rowid())
 }
 /// Append an item. Stored history has no lifetime cap; the per-request
@@ -1500,6 +1679,43 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             update.execute(params![turn, seq, node])?;
         }
     }
+    if from < 8 {
+        // 7 -> 8: retention. The indexes are in the shared DDL.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN pruned_cursor INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if from < 9 {
+        // A persistent high-water mark avoids rebuilding the referenced turns
+        // table. Include fork-retained node markers whose owner was deleted.
+        conn.execute_batch(
+            "CREATE TABLE turn_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+             INSERT INTO turn_sequence SELECT 1, MAX(
+                COALESCE((SELECT MAX(id) FROM turns),0),
+                COALESCE((SELECT MAX(turn) FROM nodes),0));",
+        )?;
+    }
+    if from < 10 {
+        // Persist an allocation floor without rebuilding the history table.
+        conn.execute_batch(
+            "CREATE TABLE node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+             INSERT INTO node_sequence SELECT 1, COALESCE(MAX(id),0) FROM nodes;",
+        )?;
+    }
+    if from < 11 {
+        // Index only turns that still own operational records, without
+        // rewriting durable turn rows or reviving already-pruned history.
+        conn.execute_batch(
+            "CREATE TABLE retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+                bot TEXT NOT NULL REFERENCES bots(name));
+             INSERT INTO retained_turns SELECT t.id,t.bot FROM turns t JOIN
+                (SELECT turn FROM tools UNION SELECT turn FROM artifacts
+                 UNION SELECT turn FROM processes
+                 UNION SELECT turn FROM events WHERE turn IS NOT NULL) r ON r.turn=t.id;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1525,11 +1741,9 @@ fn node_with_turn(
     turn: Option<i64>,
 ) -> Result<i64> {
     let (bytes, depth): (i64, i64) = match parent {
-        Some(id) => conn.query_row(
-            "SELECT total_bytes,depth FROM nodes WHERE id=?",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?,
+        Some(id) => conn
+            .prepare_cached("SELECT total_bytes,depth FROM nodes WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?,
         None => (0, 0),
     };
     if bytes < 0 || depth < 0 {
@@ -1540,16 +1754,21 @@ fn node_with_turn(
         (Some(_), None) => Some(1),
         (Some(_), Some(parent)) => Some(previous_turn_seq(conn, parent)?.unwrap_or(0) + 1),
     };
-    conn.execute(
-        "INSERT INTO nodes(parent,item,total_bytes,depth,turn,turn_seq) VALUES (?,?,?,?,?,?)",
-        params![
-            parent,
-            item,
-            bytes + item.len() as i64,
-            depth + 1,
-            turn,
-            turn_seq
-        ],
-    )?;
+    // Surviving nodes and the durable deletion floor jointly bound every ID
+    // ever committed. Allocate atomically in the insert, avoiding a separate
+    // counter write for every message. Callers already hold a transaction.
+    conn.prepare_cached(
+        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?
+         FROM node_sequence WHERE singleton=1",
+    )?
+    .execute(params![
+        parent,
+        item,
+        bytes + item.len() as i64,
+        depth + 1,
+        turn,
+        turn_seq
+    ])?;
     Ok(conn.last_insert_rowid())
 }

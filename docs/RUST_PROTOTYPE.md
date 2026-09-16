@@ -237,6 +237,7 @@ bound; the operating system is then the only limit.
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
+| `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by the 100 concurrent streams both providers allow per connection, 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 41 |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
@@ -406,6 +407,8 @@ Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":10,"op":"unfollow","bot":"Bob"}
 {"id":11,"op":"bots","after":null,"limit":64}
+{"id":14,"op":"prune","bot":"Bob","keep_turns":8}
+{"id":15,"op":"delete","bot":"Bob"}
 {"id":12,"op":"shutdown"}
 ```
 
@@ -430,7 +433,8 @@ service created. Do not replace ownership-lock files while a service runs.
 switch happens inside a storage job, so no committed event falls between the
 last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
-delivered only to live followers and carry `durable:false`. Durable event kinds
+delivered only to live followers and carry `durable:false`, as do the `pruned`
+and `deleted` retention notices. Durable event kinds
 are `created`, `forked`, `accepted`, `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview), `tool_completed` (with retained artifact
 names), `turn_waiting` and `turn_resumed` (a parked turn's handles and its
@@ -514,8 +518,7 @@ records; message/tool-result records reference stored nodes retrievable through
 `item`, avoiding another transcript copy in the event table. Cursors are store-wide
 monotonic IDs, and queries are filtered to the requested bot. History loads and
 lineage checks use recursive queries, so `item` and `fork` cost one query each
-instead of a walk per node. No retention pruning or replay-gap policy has been
-implemented yet.
+instead of a walk per node. Retention is explicit; see [Retention](#retention).
 
 Event pages stop at either the requested count or a 512 KiB encoded-entry budget.
 Continue from `next_cursor` even when a nonempty page has fewer than `limit`
@@ -577,7 +580,7 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 7; a version-6
+the `context_window` capability. Stores are schema version 11; a version-6
 store is migrated at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
@@ -589,6 +592,67 @@ ancestry to find both turn boundaries; unrelated bots do not add candidate
 walks. Very old reads still cost a walk from the selected head. The
 [measured costs](DAEMON_MEASUREMENTS.md#long-history) at fixed context and
 growing stored history are recorded separately.
+
+## Retention
+
+Nothing is dropped unless a caller asks. Two primitives cover what a fleet
+needs, and one optional policy composes them:
+
+- `delete {bot}` removes an idle bot and everything only it owns: its turns,
+  tool intents, processes, artifacts, events, checkpoints, and the history
+  nodes no other bot's lineage reaches. A fork keeps the shared prefix; the
+  deleted bot's own suffix is freed by walking back from its head until a
+  node is still some bot's head, saved context start, or the parent of a
+  surviving branch. A running or parked bot, or one with a background command
+  still running, answers `bot_busy`. Live
+  followers receive a non-durable `deleted` notification. `agent rm --bot`.
+  Queued wake-ups for interrupted or deleted turns are discarded when capacity
+  opens; reusing a bot name cannot resume its old turn. This internal check
+  does not change explicit `resume` requests: a missing bot returns `bot_not_found`.
+- `prune {bot, keep_turns}` keeps the newest `keep_turns` turns' records and
+  drops the older turns' events, tool intents, finished processes, and artifacts.
+  Running process rows survive so their results can commit; a later prune
+  removes those results after completion. The
+  transcript and the turn rows themselves stay, so the context window, the
+  `history` tool, `item`, forks, and accounting are unaffected; what shrinks
+  is replay and artifact retrieval. `result` and new `wait` calls for an expired
+  turn outcome return `turn_result_pruned`; they never report an empty success.
+  On a pruning notice, `agent run` and `agent follow` reconcile their selected
+  turn through `result`, so retries of expired turns exit with that error
+  instead of waiting for a terminal event that no longer exists.
+  Existing waiters can still receive the completion captured before pruning.
+  The bot remembers the highest pruned
+  cursor: an `events` page starting before it carries `pruned_before`, and a
+  `follow` from before it is preceded by a `pruned` notification, so no
+  consumer replays a silent gap. `agent prune --bot --keep-turns N`.
+- `--retain-turns N` on the daemon applies `prune` to a bot after each of
+  its turns finishes, including interruption while parked, before the terminal
+  event is delivered. Whoever sees `turn_finished` sees the store as retention
+  left it. The service commits completion and publishes its terminal event
+  before accepting another turn for that bot; the task is retired before
+  notifying followers and waiters. Shutdown drains completions through the
+  same path, including cancellation events and pending turn-wait results.
+
+Turn IDs come from a durable high-water mark. Node/checkpoint IDs use the
+highest surviving node ID and a durable floor saved atomically when deleting
+history. Neither can be reused across bot deletion, name reuse, or daemon
+restart. Stale handles and checkpoint references cannot identify new work. The
+version-8 to version-9 migration initializes the turn mark from surviving turns
+and fork-retained transcript markers. Version 10 initializes the node ID floor
+from the highest surviving node ID without rewriting transcript rows.
+Version 11 adds a small `retained_turns` table indexed by `(bot,turn)`.
+Pruning looks up only the selected bot's candidates, then removes them unless
+they still own running background commands. Late command results remain
+eligible for the next prune. Migration builds candidates from surviving
+operational records, without rewriting turn rows or reindexing expired history.
+A separate `(bot,id)` index locates the retention boundary without scanning
+older turns. The transcript, accounting, and idempotency rows remain intact.
+
+Freed pages are reused by later writes rather than returned to the
+filesystem, so a bounded fleet's store stops growing instead of shrinking.
+For a long-lived bot the transcript itself still grows with every turn (about
+850 bytes per turn on the sustained workload); bounding that is compaction,
+which is future work, or deleting the bot.
 
 ## Tools and validation scope
 

@@ -66,3 +66,66 @@ For compaction, measure summary calls/tokens/latency and additional storage, plu
 behavioral tests for preserved constraints, required facts, tool boundaries,
 recovery, and fork isolation. Cheap compaction that loses task-critical facts is
 not an improvement. No paid summarization runs are authorized by this roadmap.
+
+## Compaction plan
+
+Recorded 2026-09-16. The window drops whole old turns, says how many are
+missing, and offers the `history` tool: retrieval, not compaction. Compaction
+is what the model sees once a task outgrows the window, and it has to be
+efficient twice over: in tokens and cache hits per turn, and in preserving
+what the task needs to finish correctly. Those pull in different directions,
+so build it in layers, cheapest and most faithful first, and let the
+task-quality evaluation decide how far down the list to go.
+
+1. **Elide old tool results, keep everything else.** In a coding turn most
+   bytes are tool output, not the model's words. Once a turn is older than N,
+   the request carries each of its tool results as a one-line stub: the call,
+   the exit status, the size, and the artifact reference the `read` tool
+   already resolves. Prompts and replies stay verbatim. No model call,
+   deterministic, cache-friendly, and lossless because the original is one
+   tool call away. This should let the window hold several times as many
+   turns and composes with the window's hysteresis, artifacts, and the
+   history tool as they are.
+2. **A pinned, agent-owned note.** One durable item per bot, always first in
+   context, and a tool that rewrites it. The agent records what it knows it
+   will need: constraints, decisions, paths, what is left. The harness
+   guarantees the slot; the model decides the content, being the only party
+   that knows what matters for its task. Rewritten only when the agent
+   chooses, so the cached prefix holds. This is the preserve-the-right-things
+   mechanism, and it is a primitive, not a policy.
+3. **Model summaries as versioned views**, only for what the first two leave
+   uncovered. When turns leave the window, one bounded call summarizes only
+   the departing turns against the previous summary, so cost per turn is
+   constant rather than re-summarizing the transcript. The summary is a view
+   stored beside the history, never a replacement, and a fork binds to the
+   view valid at its checkpoint, as above. A structured shape (constraints,
+   decisions, open items, facts with their turn numbers) preserves more than
+   prose and lets the model fetch a source turn by ordinal. Concurrent forks
+   share completed summaries rather than each paying for the same prefix.
+
+Prior art to read before building, with what to take from each: Prime
+Agent's compaction (summary plus retained originals, rebuilding context from
+the summary; see [PRIME_INTELLECT.md](PRIME_INTELLECT.md)), Pi's context
+transformation hooks, Codex's native compaction, Claude Code's whole-transcript
+summarization with pinned memory files, and FX's in-memory conversations
+(see [RUNTIMES.md](RUNTIMES.md)). None of them is measured on cache hits under
+compaction, which is where a fleet's cost actually lands.
+
+Measure every layer on the same long conversation, live and synthetic:
+
+- tokens per turn as the conversation grows, and where the curve flattens;
+- cache-hit ratio per turn (item 13 of [NEXT.md](NEXT.md) makes it
+  observable), since a compaction that rewrites the prefix every turn can cost
+  more than the tokens it saves;
+- compaction cost itself: summary calls, tokens, latency, and storage;
+- quality on the task-level evaluation (item 15): a constraint appears early,
+  work pushes it out of the window, a later decision depends on it; measure
+  whether the agent retrieves it and acts on it, and record what each layer
+  lost when it fails;
+- fork isolation: a fork's context never contains later or sibling-branch
+  material.
+
+If layers 1 and 2 pass that evaluation on real tasks, layer 3 may not be
+worth its cost or its risk of summarizing away the wrong thing. No paid
+summarization runs are authorized by this plan; the evaluation is built
+first, then the layers, each measured against it.

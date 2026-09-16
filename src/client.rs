@@ -44,6 +44,7 @@ struct Options {
     timeout_ms: Option<u64>,
     budget_tokens: Option<u64>,
     turn: Option<i64>,
+    keep_turns: Option<usize>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
@@ -71,6 +72,7 @@ fn parse(args: &[String]) -> Result<Options> {
         timeout_ms: None,
         budget_tokens: None,
         turn: None,
+        keep_turns: None,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
     };
@@ -113,6 +115,11 @@ fn parse(args: &[String]) -> Result<Options> {
                             })?)
                     }
                     "--request-id" => options.request_id = Some(value),
+                    "--keep-turns" => {
+                        options.keep_turns = Some(value.parse().ok().filter(|n| *n > 0).ok_or(
+                            Error::with("usage", "--keep-turns needs a positive integer"),
+                        )?)
+                    }
                     "--timeout-ms" => {
                         options.timeout_ms =
                             Some(value.parse().map_err(|_| {
@@ -125,7 +132,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-output-tokens"
                     | "--idle-exit"
                     | "--context-bytes"
-                    | "--context-items" => {
+                    | "--context-items"
+                    | "--retain-turns" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -426,6 +434,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "wait" => wait(&options),
         "turns" => turns(&options),
         "result" => result(&options),
+        "rm" => remove(&options),
+        "prune" => prune(&options),
         "ls" => list(&options),
         "shutdown" => {
             let mut connection = Connection::connect(&options.socket)?;
@@ -560,6 +570,34 @@ fn interrupt(options: &Options) -> Result<i32> {
         return Ok(1);
     };
     connection.request("interrupt", json!({"bot":bot,"turn":turn}))?;
+    Ok(0)
+}
+
+/// Delete an idle bot; prints what was freed.
+fn remove(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "rm needs --bot"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    println!("{}", connection.request("delete", json!({"bot":bot}))?);
+    Ok(0)
+}
+
+/// Keep the newest --keep-turns turns' records of a bot and drop the rest.
+fn prune(options: &Options) -> Result<i32> {
+    let bot = options
+        .bot
+        .clone()
+        .ok_or(Error::with("usage", "prune needs --bot"))?;
+    let keep = options
+        .keep_turns
+        .ok_or(Error::with("usage", "prune needs --keep-turns N"))?;
+    let mut connection = ensure_existing_daemon(options)?;
+    println!(
+        "{}",
+        connection.request("prune", json!({"bot":bot,"keep_turns":keep}))?
+    );
     Ok(0)
 }
 
@@ -750,6 +788,14 @@ impl Renderer {
 
     /// Returns an exit code when the followed turn is finished.
     fn event(&mut self, connection: &mut Connection, event: &Value) -> Result<Option<i32>> {
+        if event["event"] == "pruned"
+            && let Some(turn) = self.turn
+        {
+            // A retried turn may have lost its terminal event to retention.
+            // Reconcile the selected turn, not merely the bot's newest state.
+            // Retained and running turns still finish through normal events.
+            connection.request("result", json!({"bot":event["bot"],"turn":turn}))?;
+        }
         let finished =
             event["event"] == "turn_finished" && self.turn.is_some_and(|t| event["turn"] == t);
         if !self.pretty {

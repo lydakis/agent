@@ -70,6 +70,16 @@ enum Command {
         workspace: Option<String>,
         budget_tokens: Option<u64>,
     },
+    /// Remove an idle bot and everything only it owns.
+    Delete {
+        bot: String,
+    },
+    /// Drop events, tool intents, processes, and artifacts of all but the
+    /// newest `keep_turns` turns; the transcript and turn rows stay.
+    Prune {
+        bot: String,
+        keep_turns: usize,
+    },
     /// A bot's turns with status, workspace, model, tokens, and timing.
     Turns {
         bot: String,
@@ -219,6 +229,9 @@ pub struct Configuration {
     /// history itself is unbounded. Defaults 8 MiB and 4,096 items.
     pub context_bytes: Option<usize>,
     pub context_items: Option<usize>,
+    /// Prune every bot to this many turns' records after each of its turns
+    /// finishes; none by default.
+    pub retain_turns: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -281,12 +294,13 @@ struct Service {
     handles: Handles,
     background_failures: mpsc::UnboundedSender<Error>,
     limits: Limits,
+    retain_turns: Option<usize>,
     limit_active: usize,
     /// Per bot: the running turn, the task owning it, and its cancel signal.
     /// A parked turn's task ends while a resumed task may already own the slot.
     active: HashMap<String, (i64, u64, watch::Sender<bool>)>,
     next_task: u64,
-    jobs: JoinSet<(String, i64, u64, Result<()>)>,
+    jobs: JoinSet<(String, i64, u64, turn::Exit)>,
     replays: JoinSet<()>,
 }
 
@@ -362,11 +376,12 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
-            "context_bytes":limits.context_bytes,"context_items":limits.context_items},
+            "context_bytes":limits.context_bytes,"context_items":limits.context_items,
+            "retain_turns":config.retain_turns},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":provider_names,"default_model":config.model,
         "durability":"sqlite_full","partial_text_durable":false});
@@ -440,6 +455,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         handles,
         background_failures: failure_sender,
         limits,
+        retain_turns: config.retain_turns,
         limit_active: limits.active,
         active: HashMap::new(),
         next_task: 0,
@@ -459,9 +475,8 @@ pub async fn run(config: Configuration) -> Result<()> {
             Some(error) = failures.recv() => return Err(error),
             _ = service.replays.join_next(), if !service.replays.is_empty() => {}
             joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
-                let (bot, _turn, task, result) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
-                if service.active.get(&bot).is_some_and(|(_, owner, _)| *owner == task) { service.active.remove(&bot); }
-                result?;
+                let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                service.complete(bot, turn, task, exit).await?;
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
@@ -529,11 +544,20 @@ pub async fn run(config: Configuration) -> Result<()> {
         let _ = cancel.send(true);
     }
     while let Some(result) = service.jobs.join_next().await {
-        result.map_err(|_| Error::new("turn_task_failed"))?.3?;
+        let (bot, turn, task, exit) = result.map_err(|_| Error::new("turn_task_failed"))?;
+        service.complete(bot, turn, task, exit).await?;
     }
     service.handles.shutdown();
     service.replays.abort_all();
     while service.replays.join_next().await.is_some() {}
+    // Socket writers need runtime time to flush terminal events and wait
+    // results. Drain concurrently under one deadline, so slow clients cannot
+    // multiply shutdown latency. Stdout also drains through its worker below.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        futures_util::future::join_all(sessions.values().map(Output::drain)),
+    )
+    .await;
     drop(sessions);
     // The stdio firehose owns another sender. Release it before waiting for
     // the output worker to drain and exit, including shutdown without EOF.
@@ -551,10 +575,13 @@ impl Service {
     }
 
     async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
-        let name = bot.clone();
-        let state = self.store.call(move |db| db.inspect(&name)).await?;
-        // The wake-up may have queued before an interrupt or a new turn.
-        if state.status == "waiting" && state.running_turn == Some(turn) {
+        // A wake-up can outlive an interrupt, deletion, or reuse of the name.
+        // Check only its identity and state, without loading the full bot.
+        let pending = self
+            .store
+            .call(move |db| Ok(db.can_resume(&bot, turn)?.then_some(bot)))
+            .await?;
+        if let Some(bot) = pending {
             self.spawn(bot, turn, true);
         }
         Ok(())
@@ -584,6 +611,40 @@ impl Service {
             let result = task.execute(cancelled).await;
             (bot, id, task_id, result)
         });
+    }
+
+    /// Commit and publish completion without dispatching another command in
+    /// between. The durable busy state prevents newer accepted events from
+    /// overtaking the terminal event while the task waits to be reaped.
+    async fn complete(
+        &mut self,
+        bot: String,
+        turn: i64,
+        task: u64,
+        exit: turn::Exit,
+    ) -> Result<()> {
+        if self
+            .active
+            .get(&bot)
+            .is_some_and(|(_, owner, _)| *owner == task)
+        {
+            self.active.remove(&bot);
+        }
+        if let turn::Exit::Finished(error) = exit {
+            let keep = self.retain_turns;
+            let (bot, finished) = self
+                .store
+                .call(move |db| {
+                    let finished = turn::Finished::record(db, &bot, turn, error.as_ref(), keep)?;
+                    Ok((bot, finished))
+                })
+                .await?;
+            for entry in finished.entries {
+                self.hub.durable(&bot, entry).await?;
+            }
+            self.handles.turn_finished(&bot, turn, finished.outcome);
+        }
+        Ok(())
     }
 
     async fn dispatch(
@@ -649,6 +710,21 @@ impl Service {
                 store
                     .call(move |db| db.turns(&bot, after, limit.unwrap_or(64)))
                     .await
+            }
+            Command::Delete { bot } => {
+                if self.active.contains_key(&bot) {
+                    return fail("bot_busy");
+                }
+                let name = bot.clone();
+                let deleted = store.call(move |db| db.delete_bot(&name)).await?;
+                // Followers learn the bot is gone; nothing durable remains to replay.
+                self.hub
+                    .live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))
+                    .await?;
+                Ok(deleted)
+            }
+            Command::Prune { bot, keep_turns } => {
+                store.call(move |db| db.prune(&bot, keep_turns)).await
             }
             Command::Result { bot, turn } => {
                 store
@@ -850,16 +926,23 @@ impl Service {
                     return fail("stale_turn");
                 }
                 self.handles.forget(Waiter::Turn(turn));
-                let entries = store
-                    .call(move |db| db.finish(turn, Some(&Error::new("cancelled"))))
+                let name = bot.clone();
+                let keep = self.retain_turns;
+                let finished = store
+                    .call(move |db| {
+                        turn::Finished::record(
+                            db,
+                            &name,
+                            turn,
+                            Some(&Error::new("cancelled")),
+                            keep,
+                        )
+                    })
                     .await?;
-                for entry in entries {
+                for entry in finished.entries {
                     self.hub.durable(&bot, entry).await?;
                 }
-                let name = bot.clone();
-                if let Some(outcome) = store.call(move |db| db.turn_outcome(&name, turn)).await? {
-                    self.handles.turn_finished(&bot, turn, outcome);
-                }
+                self.handles.turn_finished(&bot, turn, finished.outcome);
                 Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
             }
             Command::Shutdown => Ok(json!({"shutting_down":true})),
@@ -972,6 +1055,7 @@ mod tests {
                 context_bytes: 8 << 20,
                 context_items: 4096,
             },
+            retain_turns: None,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1,
             active: HashMap::from([("Bob".into(), (turn, 1, cancel))]),
@@ -981,7 +1065,7 @@ mod tests {
         };
         service.jobs.spawn(async move {
             drop(cancelled);
-            ("Bob".into(), turn, 1, Ok(()))
+            ("Bob".into(), turn, 1, turn::Exit::Parked)
         });
         service.active["Bob"].2.closed().await;
         let output = Output::writer(tokio::io::sink());
@@ -1092,6 +1176,7 @@ mod tests {
                 context_bytes: 8 << 20,
                 context_items: 4096,
             },
+            retain_turns: None,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
             active: (0..1024)

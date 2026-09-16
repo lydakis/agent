@@ -133,28 +133,212 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    A [sustained run](LIVE_FLEET.md#sustained-load) of 64 bots for five
    minutes (9,050 turns, 60 model calls per second) showed no drift in daemon
    memory, threads, or open files and no provider rate limit; the store grew
-   2.8 KB per turn, which retention will need to bound. Next at scale:
-   retention, then hours rather than minutes.
+   2.8 KB per turn. Retention is now explicit: `delete` frees a bot and its
+   exclusive history, `prune` keeps the newest N turns' records, and
+   `--retain-turns N` applies prune after every turn; see
+   [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#retention) and the measured growth in
+   [LIVE_FLEET.md](LIVE_FLEET.md#retention-under-sustained-load). What still
+   grows per turn is the transcript itself, which is compaction's job. Next at
+   scale: hours rather than minutes.
 2. Done: stored history is unbounded; each request carries a
    [context window](RUST_PROTOTYPE.md#long-history-and-context-windows) of
    whole turns with a persisted, hysteretic start, an explicit omission note,
    and a `history` tool that reads any earlier turn by ordinal along the
    lineage. [Measured](DAEMON_MEASUREMENTS.md#long-history) at 1k, 10k, and
-   100k stored items with a fixed 64 KiB window. Remaining from
-   [LONG_HISTORY.md](LONG_HISTORY.md): compaction with summaries as versioned
-   context views, and checkpoint indexes so forks and reads of very old turns
-   stop walking node metadata.
-3. A measured slow-follower screen for the lag/drop policy, and a parked-agent
-   screen on the lifecycle tool with retained versus live memory separated.
-   Idle exit, schema versioning, budgets, turn listings, `result`, and
-   model-facing artifact reads are implemented.
-4. Provider interface: decide whether cross-family handoff (thinking rendered
-   as text, tool history preserved) is worth a translation step, then freeze
-   the adapter contract.
-5. Extend measured tools and recovery semantics, slow-reader and sustained-load
-   tests. Profile CPU/allocations to explain regressions; compare matched revisions.
-6. Add equivalent lifecycle adapters for Pi/Codex only where native semantics can
-   satisfy the same contract. Unsupported guarantees remain an explicit gap.
+   100k stored items with a fixed 64 KiB window. Remaining: compaction, in
+   the layers of the [compaction plan](LONG_HISTORY.md#compaction-plan):
+   first elide old tool results into artifact stubs (no model call), then a
+   pinned agent-owned note the model rewrites with what it will need, and
+   only if the task-quality evaluation (item 15) still fails, incremental
+   model summaries as versioned context views that forks bind to. Read the
+   prior art named there first (Prime Agent, Pi, Codex, Claude Code, FX).
+   Every layer is measured on the same long conversation for tokens per
+   turn, cache-hit ratio (item 13), compaction cost, and task quality; a
+   compaction that rewrites the prefix every turn can cost more in cache
+   misses than it saves in tokens. Also remaining: checkpoint indexes so
+   forks and reads of very old turns stop walking node metadata.
+3. Store scale, in two steps. First, before compaction adds tables: an
+   `EXPLAIN QUERY PLAN` audit of every statement the daemon runs, fixing any
+   full scan. Startup recovery already scans `turns` and `processes` by an
+   unindexed `status`, which is invisible at thousands of rows and a
+   multi-second daemon start at millions, paid again on every idle-exit
+   restart. Second, after compaction: a store-scale screen that grows one
+   store with the synthetic provider to 1 GB and then 10 GB across thousands
+   of bots and, at each size, measures daemon start and recovery, submit to
+   finish latency, window construction, `bots` and `turns` paging, a fork, a
+   delete, and a migration, with RSS and WAL size sampled throughout. The
+   2 MiB page cache means the hot indexes eventually stop fitting; the screen
+   should find where that cliff is and how WAL checkpoints behave under hours
+   of writes. Seeding costs no provider spend, only background time.
+4. A 10,000-bot screen, the headline claim. Every run so far has 1,024 bots
+   in flight or 4,000 parked on a synthetic provider; the goal is an order of
+   magnitude more, and most of them exist and wait rather than sit mid-call.
+   One store, 10,000 bots created and submitted through the protocol (not
+   CLI processes), `--max-active` well below that, a real provider on the
+   cheap model: admission queueing under `--max-active`, memory per parked
+   and per active bot, submission rate, and a restart with thousands of
+   queued turns and its recovery time. A few dollars of spend. The same
+   shape, on the synthetic provider, is where the first heap profile
+   belongs: a dhat build behind a cargo feature, recording live bytes by
+   allocation site at peak, so the daemon's memory is attributed to
+   connections, per-turn buffers, store jobs, and parked state from
+   measurement rather than inference, and RSS minus live heap shows how much
+   is allocator retention and mapped code. The shaving list, and which knobs
+   trade memory for latency or throughput (read-ahead batch size, HTTP/2
+   windows, connection count, SQLite cache, allocator), comes out of that
+   profile; none of them should be turned before it exists. For a fleet the
+   order is memory per agent, then CPU per model call, then harness latency,
+   which is already milliseconds against the provider's seconds.
+5. Bound accepted background work, not only running processes. `--max-processes`
+   caps subprocesses that are running, but a background `shell` call spawns
+   its task immediately and that task waits for a process permit, with a
+   second task per command collecting the result, and the command's timeout
+   only starts once it has capacity. A controller can therefore finish turns
+   that enqueue background work faster than the pool drains it, and
+   `--max-active` does not bound what accumulates. Add a bounded pending
+   queue with explicit `queued` and `running` states and a `capacity_exhausted`
+   result when it is full; later, queued commands can be durable rows served
+   by one dispatcher instead of two resident tasks each. Regression: occupy
+   one process slot, enqueue background commands rapidly through the synthetic
+   provider, and assert pending work, memory, and control-request latency stay
+   bounded. In the same spirit, context read-ahead batches 64 items with no
+   byte ceiling; give it one so large items cannot make concurrent batches
+   expensive. Every queue needs an admission policy and every buffer a byte
+   bound.
+6. Fleet controller ergonomics. Listing (`bots`, `agent ls`) and attaching to
+   one bot (`follow`, `agent follow`) exist; a controller of thousands needs
+   three more, all small and composable: following every bot on one socket
+   session instead of one subscription each (stdio already gets the
+   firehose); a `wait` that resolves on the first finished handle, not only
+   on all of them, so a scheduler reacts as work completes and the 64-handle
+   chunking stops mattering; and a `stats` op reporting active and queued
+   turns, in-flight calls per connection, store and WAL size, so controllers
+   read the daemon instead of sampling its process with psutil as the bench
+   drivers do. `stats` should report the storage worker's queue wait time
+   separately from its execution time, since context reads, replay, and
+   writes share that one thread and that split decides whether more storage
+   concurrency is ever needed.
+7. Never silently ignore explicitly requested daemon configuration. Today the
+   first client's `--provider` and `--tools` bind the daemon, and a later
+   client's different values are ignored while it runs; only a restart with
+   changed values fails. A program that asks for one configuration and runs
+   against another has been misled. The client should compare every
+   daemon-scoped option it was given against the effective configuration the
+   daemon reports at attach and fail with the difference named; per-turn model
+   and workspace overrides stay as they are.
+8. Delivery modes on `submit`: the README promises steering and the protocol
+   answers `bot_busy`. One field with three values, all composable from what
+   exists. `reject` is today's behavior. `queue` accepts the submission now
+   and starts it when the bot is free: the turn is a durable row that waits
+   on the bot's current turn handle, queued turns chain on each other so
+   order holds, they survive restart like any parked turn, the handle is
+   returned immediately, and `wait`, `turns`, and `result` work unchanged;
+   the caller can fire and forget. `steer` delivers the message at the
+   running turn's next round boundary, after the current tool results are
+   recorded and before the next model call, so the model sees it inside the
+   turn without losing the round; on an idle bot it starts a new turn. Peers
+   get the same modes through `run --detach`, which is how bots talk to a
+   busy bot without racing on `bot_busy`. Interrupt stays the hard stop.
+9. An ACP bridge: a separate process speaking the Agent Client Protocol to an
+   editor or agent client on one side and the daemon's socket protocol on the
+   other, with no daemon changes. Create, submit, streamed text and thinking
+   deltas, tool events, interrupt, and resume are all already in the
+   protocol. This is the human way in; software keeps the protocol. Queued
+   here because it is wanted soon, not because it changes capacity.
+10. Provider failure policy and pacing, the flood-control slice. 503s and one
+   burst of transport failures each became a failed turn for the caller to
+   resubmit. The fundamental concept is per-provider pacing: a rate and an
+   in-flight cap per provider that every call, first attempt or retry, passes
+   through, so one scheduler spaces the fleet deterministically instead of
+   thousands of agents retrying in lockstep. On top of it: a model call that
+   fails before any tool ran has had no effect and is retried by construction
+   with exponential backoff bounded by attempts and total time; one that
+   fails after a tool ran is not, and stays a failed turn. A 429 with
+   `Retry-After` drops that provider's pace to zero until the time passes,
+   with queued turns waiting rather than failing; a 429 that signals an
+   exhausted quota rather than a rate, or one with no `Retry-After` that keeps
+   recurring past the backoff bound, fails the affected turns promptly instead
+   of pausing forever. A restart with thousands of resumable turns ramps
+   through the same pace instead of firing at once.
+   Jitter is only needed where daemons are the independent clients, several
+   hosts on one provider key, and a small random spread on retry and resume
+   delays covers that. No rate limit has been reached yet; the 10,000-bot
+   screen may find one, and that run should come first so the policy is
+   shaped by an observed limit. Retries happen at the model-call boundary,
+   never by replaying a turn, and are observable: attempt counts, provider
+   request ids, and retry delays in the turn record. Leaving retries off by
+   default is acceptable while the policy is new.
+11. Make `process_lost` unmistakably different from a stopped process. Shell
+   cleanup relies on a process-group guard and kill-on-drop, which cover normal
+   cleanup and cancellation but not a hard kill of the daemon; a child can
+   keep running and writing after its parent dies. The tools section says
+   so, but other recovery text and the store-initialization comment say
+   background commands "died with" the daemon while initialization only marks
+   their rows `process_lost`. Reconcile the contract to: supervision ended, the
+   command may still be running or may already have had effects, and a
+   controller must not read `process_lost` as permission to start conflicting
+   work in that workspace. Extend the restart test to observe a filesystem
+   write after killing only the daemon, not just the recovered handle's status.
+12. Retention correctness follow-ups. `prune` keeps turn rows, so submission
+   deduplication by `(bot, request_id)` survives pruning, and an expired event
+   cursor is answered with `pruned_before` and a `pruned` notice rather than an
+   empty page. Two intersections remain open: `delete` removes a bot's turn
+   rows with it, so a late retry of a deleted bot's request gets
+   `bot_not_found` rather than a duplicate (acceptable, but state it); and
+   `prune` drops a bot's old artifacts even though a fork reading through its
+   lineage could still ask for them, so either artifacts referenced by
+   surviving branches stay alive or the fork's read answers with an explicit
+   retention error. Retention and expensive historical reads should run in
+   bounded pieces on the storage thread once the queue-wait instrumentation
+   exists.
+13. Cache-hit accounting. The window's hysteresis exists to keep provider
+   prompt caches warm and the daemon already receives cached-token counts,
+   but records only cache-inclusive input tokens. Record and report the hit
+   ratio per turn and per bot; it decides whether the three-quarters rule is
+   right, with a live long-conversation run as the check.
+14. Mass interrupt. Interrupting one bot is tested; stopping a thousand at
+   once, how long until their processes are gone and their turns durable, is
+   not. Cancellation latency is on the unmeasured list and matters most for
+   fleets.
+15. Make context management accountable for task quality, not only cost. The
+   window, the omission note, and the `history` tool answer whether context is
+   cheap to build; they do not answer whether the agent finishes correctly
+   when what it needs has left the window. Build a small evaluation where a
+   constraint appears early, enough work follows to push it out of the window,
+   and a later decision depends on it; measure whether the agent retrieves it
+   and acts on it, not whether the bytes are reachable. Run it before and
+   after compaction lands, since compaction changes what the model sees.
+   Summaries stay versioned context views, never replacements of history, and
+   historical forks bind to the view valid at their checkpoint.
+16. A mixed-workload soak, replacing the single-purpose slow-follower and
+   parked-agent screens. Synthetic provider, no spend: large contexts, noisy
+   shell output that overflows into artifacts, background-command bursts,
+   parked parents waiting on children, slow socket followers, historical
+   forks, and injected provider failures, all at once for an hour. Measure
+   actual provider streams separately from active turns, storage-queue wait
+   and execution time, cancellation latency, pending background work, and
+   descendant-process resources, not only daemon RSS. Alongside it, a small
+   set of real repository tasks with objective tests on a controlled model
+   and starting state: completion, tokens, wall time, and recovery behavior,
+   so the results say something about the harness and not the model. Idle
+   exit, schema versioning, budgets, turn listings, `result`, and
+   model-facing artifact reads are implemented and belong in that soak.
+17. Provider interface: decide whether cross-family handoff (thinking rendered
+    as text, tool history preserved) is worth a translation step, then freeze
+    the adapter contract.
+   Separate runtime byte limits from model-context budgeting, and replace the
+   fixed Anthropic output ceiling and the `legacy_thinking` name-prefix match
+   with a small per-provider, per-model capability configuration. Preserve
+   native provider state; do not force every family into identical semantics.
+18. Extend measured tools and recovery semantics, slow-reader and
+    sustained-load tests. Profile CPU/allocations to explain regressions;
+    compare matched revisions.
+19. Add equivalent lifecycle adapters for Pi/Codex only where native semantics
+    can satisfy the same contract. Unsupported guarantees remain an explicit
+    gap.
+
+Kept out of the queue: process sandboxing, which is the host's job as the
+tools section says.
 
 ## Stop conditions
 

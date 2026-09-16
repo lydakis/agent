@@ -17,6 +17,25 @@ from tests.test_runtime import ModelFixture
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class WaitTests(ModelFixture):
+    def test_retention_applies_when_parked_turns_are_interrupted(self):
+        client = self.client('wait', extra=('--retain-turns', '1'))
+        for bot in ('Alice', 'Bob'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']['turn']
+        for n in range(3):
+            turn = client.request('submit', bot='Bob', request_id=str(n),
+                                  prompt=f'wait:turn:Alice/{alice}')['result']['turn']
+            client.receive(lambda e: e.get('event') == 'turn_waiting' and e.get('turn') == turn)
+            time.sleep(.03)  # Let the parked task retire; exercise the direct interrupt path.
+            interrupted = client.request('interrupt', bot='Bob', turn=turn)['result']
+            self.assertTrue(interrupted.get('parked'), interrupted)
+            self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        page = client.request('events', bot='Bob', after=0, limit=256)['result']
+        self.assertEqual([e['turn'] for e in page['events'] if e['event'] == 'turn_finished'], [turn])
+        self.assertIn('pruned_before', page)
+        self.assertEqual(client.request('result', bot='Bob', turn=turn)['result']['error'], 'cancelled')
+        client.request('interrupt', bot='Alice', turn=alice)
+
     def test_slow_stdio_wait_reader_gets_disconnect_without_stdin_eof(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -306,7 +325,7 @@ class WaitTests(ModelFixture):
         finally:
             client.close(kill=True)
 
-    def test_resumptions_obey_capacity_and_cancelled_queued_turns_are_skipped(self):
+    def test_resumptions_obey_capacity_and_stale_queued_turns_are_skipped(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = threading.Event()
         self.model.all_streaming.set()
@@ -339,10 +358,15 @@ class WaitTests(ModelFixture):
         cancelled = next(bot for bot in turns if bot not in live)
         client.request('interrupt', bot=cancelled, turn=turns[cancelled])
         self.assertEqual(client.finished(turns[cancelled])['data']['status'], 'interrupted')
+        deleted = next(bot for bot in turns if bot not in live and bot != cancelled)
+        client.request('interrupt', bot=deleted, turn=turns[deleted])
+        self.assertEqual(client.finished(turns[deleted])['data']['status'], 'interrupted')
+        self.assertIn('result', client.request('delete', bot=deleted))
         self.model.release_waiters.set()
         for bot, turn in turns.items():
-            if bot != cancelled:
+            if bot not in (cancelled, deleted):
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('resume', bot=deleted)['error'], 'bot_not_found')
         fresh = client.request('submit', bot=cancelled, request_id='fresh', prompt='hello')['result']['turn']
         self.assertEqual(client.finished(fresh)['data']['status'], 'completed')
 

@@ -21,7 +21,7 @@ use agent_runtime::{
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -50,8 +50,37 @@ enum Round {
     Parked,
 }
 
+pub enum Exit {
+    Finished(Option<Error>),
+    Parked,
+}
+
+pub struct Finished {
+    pub entries: Vec<Value>,
+    pub outcome: Value,
+}
+
+impl Finished {
+    pub fn record(
+        db: &mut agent_runtime::store::Database,
+        bot: &str,
+        turn: i64,
+        error: Option<&Error>,
+        keep: Option<usize>,
+    ) -> Result<Self> {
+        let entries = db.finish(turn, error)?;
+        if let Some(keep) = keep {
+            db.prune(bot, keep)?;
+        }
+        let outcome = db
+            .turn_outcome(bot, turn)?
+            .ok_or_else(|| Error::new("stale_turn"))?;
+        Ok(Self { entries, outcome })
+    }
+}
+
 impl Turn {
-    pub async fn execute(&self, mut cancelled: watch::Receiver<bool>) -> Result<()> {
+    pub async fn execute(&self, mut cancelled: watch::Receiver<bool>) -> Exit {
         // Only an explicit interrupt cancels. A dropped sender (the service
         // replacing this task's slot) must not end the turn.
         let interrupt = async {
@@ -65,30 +94,16 @@ impl Turn {
             result = self.rounds() => result,
         };
         let error = match result {
-            Ok(Round::Parked) => return Ok(()),
+            Ok(Round::Parked) => return Exit::Parked,
             Ok(Round::Finished) => None,
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
                 Some(error)
             }
         };
-        let turn = self.turn;
-        let entries = self
-            .store
-            .call(move |db| db.finish(turn, error.as_ref()))
-            .await?;
-        for entry in entries {
-            self.hub.durable(&self.bot, entry).await?;
-        }
-        let bot = self.bot.clone();
-        if let Some(outcome) = self
-            .store
-            .call(move |db| db.turn_outcome(&bot, turn))
-            .await?
-        {
-            self.handles.turn_finished(&self.bot, turn, outcome);
-        }
-        Ok(())
+        // Leave the bot durably busy until the service can commit completion
+        // and publish it before dispatching a subsequent submission.
+        Exit::Finished(error)
     }
 
     /// The bot's current context window as a streamed request body: a note

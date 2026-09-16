@@ -160,6 +160,15 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
             let s = sub.lock().unwrap();
             (s.session, s.output.clone(), s.last_cursor)
         };
+        if let Some(before) = page.get("pruned_before").and_then(Value::as_i64) {
+            // Retention removed events the follower asked for: say so once,
+            // ahead of what remains, rather than replaying a silent gap.
+            let notice = json!({"event":"pruned","bot":bot,"before":before,"durable":false});
+            if output.send(notice).await.is_err() {
+                hub.unsubscribe(&bot, session);
+                return Ok(());
+            }
+        }
         if events.is_empty() {
             // Marks the replay/live boundary for the follower.
             if output

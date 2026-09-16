@@ -315,10 +315,22 @@ class RuntimeTests(ModelFixture):
     def test_stdio_shutdown_exits_and_releases_store_without_stdin_eof(self):
         client = self.client()
         self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='shutdown', prompt='wait')['result']['turn']
+        self.model.requests.get(timeout=3)
+        handle = f'turn:Bob/{turn}'
+        client.process.stdin.write(json.dumps({'id': 'waiter', 'op': 'wait', 'handles': [handle]}) + '\n')
+        client.process.stdin.flush()
         self.assertTrue(client.request('shutdown')['result']['shutting_down'])
+        terminal = client.finished(turn)
+        self.assertEqual(terminal['data']['error'], 'cancelled')
+        waited = client.receive(lambda e: e.get('id') == 'waiter')['result']
+        self.assertEqual(waited['results'][handle]['error'], 'cancelled')
+        self.assertEqual(waited['pending'], [])
         self.assertEqual(client.process.wait(timeout=2), 0)
         restarted = self.client()
-        self.assertIn('result', restarted.request('bots'))
+        replay = restarted.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual(next(e for e in replay if e['event'] == 'turn_finished')['data'], terminal['data'])
 
     def test_request_startup_is_bounded_but_established_streams_are_not(self):
         self.model.release_headers = threading.Event()
@@ -673,6 +685,72 @@ class RuntimeTests(ModelFixture):
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
+
+    def test_retention_prunes_records_and_deletes_idle_bots(self):
+        client = self.client(extra=('--retain-turns', '2'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        for n in range(4):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'p{n}')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        page = client.request('events', bot='Bob', after=0, limit=256)['result']
+        # The policy pruned turns 1 and 2 after turn 4 finished; created plus two turns remain.
+        self.assertIn('pruned_before', page)
+        self.assertEqual([e['event'] for e in page['events']][:1], ['created'])
+        self.assertEqual(len(page['events']), 1 + 2 * 4)
+        self.assertNotIn('pruned_before', client.request('events', bot='Bob', after=page['pruned_before'], limit=256)['result'])
+        self.assertEqual(len(client.request('turns', bot='Bob')['result']['turns']), 4)
+        # Explicit prune goes further; the transcript still answers item reads.
+        self.assertEqual(client.request('prune', bot='Bob', keep_turns=1)['result']['events'], 4)
+        self.assertEqual(client.request('prune', bot='Bob', keep_turns=0)['error'], 'invalid_retention')
+        first = [e for e in page['events'] if e['event'] == 'message'][0]['data']['node']
+        self.assertEqual(client.request('item', bot='Bob', node=first)['result']['content'][0]['text'], 'reply:p2')
+        # A follower asking for pruned history is told so before the rest.
+        client.request('follow', bot='Bob', after=0)
+        self.assertEqual(client.receive(lambda m: m.get('event') == 'pruned')['bot'], 'Bob')
+        client.receive(lambda m: m.get('event') == 'follow_live')
+        # Delete refuses a busy bot, then frees an idle one; followers see it go.
+        turn = client.request('submit', bot='Bob', request_id='slow', prompt='wait')['result']['turn']
+        self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_busy')
+        client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout=10)
+        freed = client.request('delete', bot='Bob')['result']
+        self.assertEqual(freed['turns'], 5)
+        self.assertGreater(freed['nodes'], 0)
+        self.assertEqual(client.receive(lambda m: m.get('event') == 'deleted')['bot'], 'Bob')
+        self.assertEqual(client.request('resume', bot='Bob')['error'], 'bot_not_found')
+        self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_not_found')
+        self.assertEqual(client.request('bots')['result']['bots'], [])
+
+    def test_retention_preserves_background_completion_and_stale_turn_identity(self):
+        client = self.client(tools='shell,wait', extra=('--retain-turns', '1'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        old = client.request('submit', bot='Bob', request_id='bg',
+                             prompt='bg:while [ ! -f release ]; do sleep .01; done; printf done')['result']['turn']
+        client.finished(old)
+        text = client.request('result', bot='Bob', turn=old)['result']['text']
+        handle = json.loads(text.removeprefix('echo:'))['handle']
+        self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_busy')
+        later = client.request('submit', bot='Bob', request_id='next', prompt='next')['result']['turn']
+        client.finished(later)
+        self.assertEqual(client.request('result', bot='Bob', turn=old)['error'], 'turn_result_pruned')
+        waited = client.request('wait', handles=[f'turn:Bob/{old}'], timeout_ms=100)['result']['results']
+        self.assertEqual(waited[f'turn:Bob/{old}']['error'], 'turn_result_pruned')
+        (self.path / 'release').touch()
+        waited = client.request('wait', handles=[handle], timeout_ms=3000)['result']['results']
+        self.assertEqual(waited[handle]['stdout'], 'done')
+        self.assertIn('result', client.request('delete', bot='Bob'))
+        client.request('shutdown')
+        client.close()
+        client = self.client(tools='shell,wait', extra=('--retain-turns', '1'))
+        for index in range(10):
+            client.request('create', bot='Bob', workspace=str(self.path))
+            new = client.request('submit', bot='Bob', request_id='r', prompt='replacement')['result']['turn']
+            client.finished(new)
+            self.assertGreater(new, later)
+            result = client.request('wait', handles=[f'turn:Bob/{old}'], timeout_ms=100)['result']['results']
+            self.assertEqual(result[f'turn:Bob/{old}']['error'], 'turn_not_found')
+            # No retry or sleep after the terminal event should be necessary.
+            self.assertIn('result', client.request('delete', bot='Bob'))
+            later = new
 
     def test_premature_provider_eof_cannot_be_a_successful_checkpoint(self):
         client = self.client()

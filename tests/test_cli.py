@@ -94,6 +94,68 @@ class SocketAndCliTests(ModelFixture):
             time.sleep(.01)
         self.assertFalse(self.socket.exists())
 
+    def test_rm_and_prune_bound_a_bot_and_remove_it(self):
+        for n in range(3):
+            self.agent('run', *self.common, *(['--new'] if n == 0 else []), '--bot', 'Bob', f'p{n}')
+        pruned = json.loads(self.agent('prune', '--store', str(self.store), '--bot', 'Bob', '--keep-turns', '1').stdout)
+        self.assertGreater(pruned['events'], 0)
+        self.assertIn('usage', self.agent('prune', '--store', str(self.store), '--bot', 'Bob', check=False).stderr)
+        freed = json.loads(self.agent('rm', '--store', str(self.store), '--bot', 'Bob').stdout)
+        self.assertEqual(freed['turns'], 3)
+        self.assertNotIn('Bob', self.agent('ls', '--store', str(self.store), '--pretty').stdout)
+        self.assertIn('bot_not_found', self.agent('rm', '--store', str(self.store), '--bot', 'Bob', check=False).stderr)
+
+    def test_consecutive_submissions_preserve_live_completion_order(self):
+        client = SocketClient(self.binary, self.store, self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turns = []
+        for n in range(20):
+            deadline = time.monotonic() + 5
+            while True:
+                response = client.request('submit', bot='Bob', request_id=str(n), prompt='fast')
+                if 'result' in response:
+                    turns.append(response['result']['turn'])
+                    break
+                self.assertEqual(response['error'], 'bot_busy')
+                self.assertLess(time.monotonic(), deadline)
+        client.finished(turns[-1])
+        page = client.request('events', bot='Bob', after=0, limit=256)['result']
+        client.verify_followers({'Bob': page})
+        self.assertEqual([e['turn'] for e in page['events'] if e['event'] == 'turn_finished'], turns)
+
+    def test_socket_shutdown_delivers_completion_and_wait_result(self):
+        client = SocketClient(self.binary, self.store, self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='shutdown', prompt='wait')['result']['turn']
+        self.model.requests.get(timeout=3)
+        follower = client.followers['Bob']
+        handle = f'turn:Bob/{turn}'
+        follower.socket.sendall((json.dumps({'id': 'waiter', 'op': 'wait', 'handles': [handle]}) + '\n').encode())
+        # This acknowledgment ensures the wait is registered before shutdown
+        # arrives on the independent control connection.
+        follower.request('resume', bot='Bob')
+        client.request('shutdown')
+        self.assertEqual(client.finished(turn)['data']['error'], 'cancelled')
+        result = follower.receive(lambda e: e.get('id') == 'waiter')['result']
+        self.assertEqual(result['results'][handle]['error'], 'cancelled')
+        self.assertEqual(result['pending'], [])
+        self.assertEqual(client.process.wait(timeout=2), 0)
+
+    def test_retry_of_pruned_turn_exits_and_retained_retry_still_replays(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
+        retry = ['run', '--store', str(self.store), '--bot', 'Bob', '--request-id', 'old', 'first']
+        self.assertIn('turn_finished', self.agent(*retry, timeout=3).stdout)
+        self.agent('run', *self.common, '--bot', 'Bob', '--request-id', 'new', 'second')
+        self.agent('prune', '--store', str(self.store), '--bot', 'Bob', '--keep-turns', '1')
+        expired = self.agent(*retry, check=False, timeout=3)
+        self.assertEqual(expired.returncode, 1)
+        self.assertIn('turn_result_pruned', expired.stderr)
+        # A gap in earlier history must not reject a retained terminal event.
+        kept = self.agent('run', *self.common, '--bot', 'Bob', '--request-id', 'new', 'second', timeout=3)
+        self.assertIn('turn_finished', kept.stdout)
+
     def test_detached_peer_handle_is_collected_by_wait(self):
         common = [*self.common[:-2], '--tools', 'echo,shell,wait']
         nested = '"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- hello'
@@ -319,6 +381,7 @@ class CliTests(ModelFixture):
                                (f'old-{n}', directory, n))
                     db.execute("INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model) VALUES (?,?,'old','check','running',?,'openai/synthetic-model')",
                                (n, f'old-{n}', directory))
+                db.execute("UPDATE turn_sequence SET last_id=1024 WHERE singleton=1")
             barrier = threading.Barrier(16)
             common = ['--store', str(path), '--provider', 'openai=responses,'+self.url,
                       '--model', 'openai/synthetic-model', '--tools', 'echo', '--workspace', directory]
