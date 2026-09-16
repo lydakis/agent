@@ -12,7 +12,7 @@ const USAGE: &str = "usage:
   agent run [options] PROMPT...      run a turn and stream its events as JSONL (starts the daemon if needed)
                                      --bot NAME continues that bot; --new --bot NAME creates it; no --bot makes a fresh one
   agent follow --bot NAME [--after N] replay then stream a bot's events as JSONL
-  agent fork --source NAME --checkpoint N --bot NAME [--workspace DIR]
+  agent fork --source NAME --bot NAME [--checkpoint NODE] [--workspace DIR]   default: the source's current head
   agent interrupt --bot NAME
   agent turns --bot NAME [--after N]     list a bot's turns with status, tokens, and timing
   agent result --bot NAME --turn N       a turn's outcome without waiting

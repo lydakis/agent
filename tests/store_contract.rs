@@ -7,7 +7,7 @@ use agent_runtime::{
 };
 use bytes::Bytes;
 use rusqlite::Connection;
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn assistant(text: &str) -> Bytes {
     serde_json::to_vec(&json!({"type":"message","role":"assistant",
@@ -56,11 +56,14 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     db.append(second, vec![assistant("answer two")], &[], None)
         .unwrap();
     db.finish(second, None).unwrap();
-    db.fork("Bob", checkpoint, "Alternative", None, None)
+    db.fork("Bob", Some(checkpoint), "Alternative", None, None)
         .unwrap();
     assert_eq!(db.load("Alternative").unwrap().len(), 2);
     assert_eq!(db.load("Bob").unwrap().len(), 4);
-    assert!(db.fork("Bob", checkpoint - 1, "bad", None, None).is_err());
+    assert!(
+        db.fork("Bob", Some(checkpoint + 1000), "bad", None, None)
+            .is_err()
+    );
     // The fork carries no default directory; each of its turns names one.
     assert_eq!(
         db.begin(
@@ -491,4 +494,208 @@ fn stores_carry_a_schema_version_and_refuse_unversioned_or_newer_ones() {
         Database::SCHEMA
     };
     assert_eq!(version, Database::SCHEMA);
+}
+
+#[test]
+fn forks_start_at_any_answered_message_and_default_to_the_head() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin("Bob", "r1", "work", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let call = ToolCall {
+        name: "echo".into(),
+        call_id: "c1".into(),
+        arguments: "{}".into(),
+    };
+    let call_item: Bytes = serde_json::to_vec(&json!({"type":"function_call","name":"echo",
+        "call_id":"c1","arguments":"{}"}))
+    .unwrap()
+    .into();
+    let planned = db
+        .append(
+            turn,
+            vec![assistant("planning"), call_item],
+            std::slice::from_ref(&call),
+            None,
+        )
+        .unwrap();
+    let mid = planned[1]["data"]["node"].as_i64().unwrap();
+    // Between a planned call and its result there is an unanswered tool call.
+    assert_eq!(
+        db.fork("Bob", Some(mid), "early", None, None)
+            .unwrap_err()
+            .code,
+        "fork_point_has_open_tool_calls"
+    );
+    // While the turn runs, forking the moving head is refused; an explicit answered node is fine.
+    assert_eq!(
+        db.fork("Bob", None, "live", None, None).unwrap_err().code,
+        "bot_busy"
+    );
+    db.tool_start(turn, &call).unwrap();
+    let (_, entry) = db.tool_finish(turn, "c1", &result("hi")).unwrap();
+    let answered = entry["data"]["node"].as_i64().unwrap();
+    let branch = db
+        .fork("Bob", Some(answered), "branch", None, None)
+        .unwrap();
+    assert_eq!(branch.head, Some(answered));
+    assert_eq!(db.load("branch").unwrap().len(), 4);
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    let tip = db.fork("Bob", None, "tip", None, None).unwrap();
+    assert_eq!(tip.head, db.inspect("Bob").unwrap().head);
+    assert_eq!(db.load("tip").unwrap().len(), 5);
+    // Branches are independent of the source and of each other.
+    let b = db
+        .begin(
+            "branch",
+            "b",
+            "go",
+            true,
+            &TurnOptions {
+                workspace: Some("/synthetic/b".into()),
+                model: None,
+            },
+        )
+        .unwrap()
+        .turn;
+    db.append(b, vec![assistant("branch reply")], &[], None)
+        .unwrap();
+    db.finish(b, None).unwrap();
+    assert_eq!(db.load("branch").unwrap().len(), 6);
+    assert_eq!(db.load("Bob").unwrap().len(), 5);
+    assert_eq!(db.load("tip").unwrap().len(), 5);
+}
+
+#[test]
+fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin("Bob", "r", "work", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let reasoning: Bytes = serde_json::to_vec(&json!({"type":"reasoning",
+        "id":"rs_synthetic", "summary":[], "encrypted_content":"synthetic"}))
+    .unwrap()
+    .into();
+    let calls: Vec<ToolCall> = ["c1", "c2"]
+        .into_iter()
+        .map(|id| ToolCall {
+            name: "echo".into(),
+            call_id: id.into(),
+            arguments: "{}".into(),
+        })
+        .collect();
+    let mut items = vec![reasoning.clone()];
+    for call in &calls {
+        items.push(
+            serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+            "call_id":call.call_id,"arguments":call.arguments}))
+            .unwrap()
+            .into(),
+        );
+    }
+    let events = db.append(turn, items, &calls, None).unwrap();
+    let reasoning_node = events[0]["data"]["node"].as_i64().unwrap();
+    assert_eq!(
+        db.fork("Bob", Some(reasoning_node), "split", None, None)
+            .unwrap_err()
+            .code,
+        "fork_point_splits_reasoning"
+    );
+    assert!(db.inspect("split").is_err());
+    for (index, call) in calls.iter().enumerate() {
+        db.tool_start(turn, call).unwrap();
+        let (_, event) = db.tool_finish(turn, &call.call_id, &result("ok")).unwrap();
+        let node = event["data"]["node"].as_i64().unwrap();
+        if index == 0 {
+            assert_eq!(
+                db.fork("Bob", Some(node), "partial", None, None)
+                    .unwrap_err()
+                    .code,
+                "fork_point_has_open_tool_calls"
+            );
+        } else {
+            db.fork("Bob", Some(node), "answered", None, None).unwrap();
+            assert_eq!(db.load("answered").unwrap().items()[1], reasoning);
+            // A validated intermediate checkpoint is also safe for another branch.
+            db.fork("answered", None, "nested", None, None).unwrap();
+        }
+    }
+    // A checkpoint from an older binary is not proof that reasoning is paired.
+    // A reasoning-only completion must not bypass the boundary check either.
+    db.append(turn, vec![reasoning], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    assert_eq!(
+        db.fork("Bob", None, "unpaired_head", None, None)
+            .unwrap_err()
+            .code,
+        "fork_point_splits_reasoning"
+    );
+}
+
+#[test]
+fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
+    let mut db = db();
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            family: Family::Anthropic,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let first = db
+        .begin("Bob", "first", "hello", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let reply =
+        serde_json::to_vec(&json!({"role":"assistant", "content":[{"type":"text","text":"hi"}]}))
+            .unwrap()
+            .into();
+    db.append(first, vec![reply], &[], None).unwrap();
+    db.finish(first, None).unwrap();
+    let turn = db
+        .begin("Bob", "tools", "work", true, &TurnOptions::default())
+        .unwrap()
+        .turn;
+    let calls: Vec<ToolCall> = ["a", "b"]
+        .into_iter()
+        .map(|id| ToolCall {
+            name: "echo".into(),
+            call_id: id.into(),
+            arguments: "{}".into(),
+        })
+        .collect();
+    let blocks: Vec<Value> = calls
+        .iter()
+        .map(|call| {
+            json!({"type":"tool_use",
+        "id":call.call_id,"name":call.name,"input":{}})
+        })
+        .collect();
+    let item = serde_json::to_vec(&json!({"role":"assistant","content":blocks}))
+        .unwrap()
+        .into();
+    db.append(turn, vec![item], &calls, None).unwrap();
+    for (index, call) in calls.iter().enumerate() {
+        db.tool_start(turn, call).unwrap();
+        let (_, event) = db.tool_finish(turn, &call.call_id, &result("ok")).unwrap();
+        let node = event["data"]["node"].as_i64().unwrap();
+        if index == 0 {
+            assert_eq!(
+                db.fork("Bob", Some(node), "partial", None, None)
+                    .unwrap_err()
+                    .code,
+                "fork_point_has_open_tool_calls"
+            );
+        } else {
+            db.fork("Bob", Some(node), "answered", None, None).unwrap();
+            assert_eq!(db.load("answered").unwrap().len(), 6);
+        }
+    }
 }

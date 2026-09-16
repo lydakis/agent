@@ -184,8 +184,12 @@ impl Provider {
         struct Anthropic<'a> {
             model: &'a str,
             max_tokens: u32,
-            system: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            system: Option<Value>,
             stream: bool,
+            /// Automatic caching: the API places a breakpoint on the last
+            /// cacheable block and moves it forward as the history grows.
+            cache_control: Value,
             #[serde(skip_serializing_if = "Option::is_none")]
             tools: Option<&'a RawValue>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,8 +218,14 @@ impl Provider {
                 serde_json::to_vec(&Anthropic {
                     model: request.model,
                     max_tokens: ANTHROPIC_MAX_TOKENS,
-                    system: request.instructions,
+                    // An explicit breakpoint after the static prefix (tools
+                    // and instructions) guarantees a read point for it.
+                    system: (!request.instructions.is_empty()).then(|| {
+                        json!([{"type":"text","text":request.instructions,
+                            "cache_control":{"type":"ephemeral"}}])
+                    }),
                     stream: true,
+                    cache_control: json!({"type":"ephemeral"}),
                     tools: self.has_tools.then_some(&*self.tools),
                     // Current Claude models take adaptive thinking with an
                     // effort level and reject budgets; Haiku 4.5 and older
@@ -520,8 +530,21 @@ mod tests {
         let text = String::from_utf8(prefix).unwrap();
         assert!(text.ends_with(",\"messages\":["));
         assert!(text.contains("\"type\":\"adaptive\""));
+        assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
         assert!(!text.contains("budget_tokens"));
+        let mut empty_prefix = provider
+            .prefix(&Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                history: &history,
+            })
+            .unwrap();
+        empty_prefix.extend_from_slice(b"]}");
+        let empty: Value = serde_json::from_slice(&empty_prefix).unwrap();
+        assert!(empty.get("system").is_none());
+        assert_eq!(empty["cache_control"], json!({"type":"ephemeral"}));
         let legacy = provider
             .prefix(&Request {
                 model: "claude-haiku-4-5-20251001",

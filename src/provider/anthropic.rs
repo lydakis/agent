@@ -51,10 +51,15 @@ impl State {
         }
         match event["type"].as_str() {
             Some("message_start") => {
+                // Anthropic reports cache reads and cache writes outside
+                // input_tokens; count every processed input token, as the
+                // Responses family does, and keep cache reads separately.
                 let usage = &event["message"]["usage"];
-                self.usage.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
-                self.usage.cached_input_tokens =
-                    usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let created = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.usage.input_tokens =
+                    usage["input_tokens"].as_u64().unwrap_or(0) + read + created;
+                self.usage.cached_input_tokens = read;
                 self.saw_usage = true;
                 Ok(None)
             }
@@ -229,7 +234,7 @@ mod tests {
         let deltas = feed(
             &mut state,
             &[
-                r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3}}}"#,
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3,"cache_creation_input_tokens":5}}}"#,
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
@@ -252,7 +257,7 @@ mod tests {
         assert_eq!(
             completion.usage,
             Some(Usage {
-                input_tokens: 12,
+                input_tokens: 20,
                 output_tokens: 7,
                 cached_input_tokens: 3
             })

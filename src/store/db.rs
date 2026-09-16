@@ -149,7 +149,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
-            CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);")?;
+            CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
+            CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);")?;
         conn.pragma_update(None, "user_version", Self::SCHEMA)?;
         let saved: Option<String> = conn
             .query_row("SELECT value FROM configuration", [], |r| r.get(0))
@@ -815,29 +816,91 @@ impl Database {
             ))),
         }
     }
+    /// Check only the suffix after a known-valid checkpoint. Completed turns
+    /// and previously validated forks already establish a closed prefix. Walk
+    /// backward one item at a time: no transcript sorting or prefix loading.
+    /// Even old checkpoints must not end on an unpaired reasoning item.
+    fn validate_fork_point(&self, node: i64) -> Result<()> {
+        let reasoning: bool = self.conn.query_row(
+            "SELECT COALESCE(json_extract(item,'$.type')='reasoning',0) FROM nodes WHERE id=?",
+            [node],
+            |row| row.get(0),
+        )?;
+        if reasoning {
+            return fail("fork_point_splits_reasoning");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT parent, CASE WHEN EXISTS(SELECT 1 FROM checkpoints WHERE head=nodes.id)
+             THEN NULL ELSE item END FROM nodes WHERE id=?",
+        )?;
+        let mut next = Some(node);
+        let mut answered = std::collections::HashSet::new();
+        while let Some(id) = next {
+            let (parent, raw): (Option<i64>, Option<Vec<u8>>) =
+                statement.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            let Some(raw) = raw else {
+                return Ok(());
+            };
+            let item: Value = serde_json::from_slice(&raw)?;
+            match item["type"].as_str() {
+                Some("function_call") => {
+                    if !answered.remove(item["call_id"].as_str().unwrap_or("")) {
+                        return fail("fork_point_has_open_tool_calls");
+                    }
+                }
+                Some("function_call_output") => {
+                    answered.insert(item["call_id"].as_str().unwrap_or("").to_owned());
+                }
+                _ => {
+                    for block in item["content"].as_array().into_iter().flatten().rev() {
+                        match block["type"].as_str() {
+                            Some("tool_use") => {
+                                if !answered.remove(block["id"].as_str().unwrap_or("")) {
+                                    return fail("fork_point_has_open_tool_calls");
+                                }
+                            }
+                            Some("tool_result") => {
+                                answered
+                                    .insert(block["tool_use_id"].as_str().unwrap_or("").to_owned());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            next = parent;
+        }
+        Ok(())
+    }
+    /// Branch a new bot from any message in the source's history. Without a
+    /// node, the source's current head is used and the source must be idle,
+    /// since a live head is still moving. The point must leave no tool call
+    /// unanswered; the source itself is never changed.
     pub fn fork(
         &mut self,
         source: &str,
-        checkpoint: i64,
+        node: Option<i64>,
         name: &str,
         workspace: Option<&str>,
         budget_tokens: Option<u64>,
     ) -> Result<Bot> {
         let parent = self.inspect(source)?;
-        if self
-            .conn
-            .query_row(
-                "SELECT 1 FROM checkpoints WHERE head=? LIMIT 1",
-                [checkpoint],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_none()
-        {
-            return fail("invalid_checkpoint");
-        }
-        if !self.in_lineage(parent.head, checkpoint)? {
-            return fail("checkpoint_not_in_source_history");
+        let checkpoint = match node {
+            Some(node) => {
+                if !self.in_lineage(parent.head, node)? {
+                    return fail("node_not_in_source_history");
+                }
+                Some(node)
+            }
+            None => {
+                if parent.running_turn.is_some() {
+                    return fail("bot_busy");
+                }
+                parent.head
+            }
+        };
+        if let Some(node) = checkpoint {
+            self.validate_fork_point(node)?;
         }
         if self.exists(name)? {
             return fail("bot_exists");
@@ -857,16 +920,15 @@ impl Database {
                 budget_tokens.map(|b| b as i64)
             ],
         )?;
-        tx.execute(
-            "INSERT INTO checkpoints VALUES (?,?)",
-            params![name, checkpoint],
-        )?;
+        if let Some(node) = checkpoint {
+            tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
+        }
         event(
             &tx,
             name,
             None,
             "forked",
-            json!({"source":source,"checkpoint":checkpoint}),
+            json!({"source":source,"checkpoint":checkpoint,"node":checkpoint}),
         )?;
         tx.commit()?;
         self.inspect(name)

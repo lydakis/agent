@@ -64,7 +64,8 @@ enum Command {
     },
     Fork {
         source: String,
-        checkpoint: i64,
+        /// A node id from the source's history; defaults to its current head.
+        checkpoint: Option<i64>,
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
@@ -340,7 +341,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_completed_checkpoint","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
+        "capabilities":["create","resume","fork_any_node","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit},
         "schema":agent_runtime::store::Database::SCHEMA,

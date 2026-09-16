@@ -527,11 +527,13 @@ fn follow(options: &Options) -> Result<i32> {
 }
 
 fn fork(options: &Options) -> Result<i32> {
-    let (Some(source), Some(checkpoint), Some(bot)) =
-        (&options.source, options.checkpoint, &options.bot)
-    else {
-        return fail_with("usage", "fork needs --source, --checkpoint and --bot");
+    let (Some(source), Some(bot)) = (&options.source, &options.bot) else {
+        return fail_with(
+            "usage",
+            "fork needs --source and --bot; --checkpoint N picks a message, default is the current head",
+        );
     };
+    let checkpoint = options.checkpoint;
     let mut connection = Connection::connect(&options.socket)?;
     // A fork inherits only the conversation; its turns name their own workspace.
     let result = connection.request(

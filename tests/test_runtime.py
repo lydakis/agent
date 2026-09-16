@@ -160,7 +160,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
             assert request['model'] == 'synthetic-claude' and request['stream'] and request['max_tokens'] > 0
-            assert isinstance(request['system'], str)
+            for block in request.get('system', []):
+                assert block['text'] and block['cache_control'] == {'type': 'ephemeral'}
+            assert request['cache_control'] == {'type': 'ephemeral'}
             assert [t['name'] for t in request['tools']] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
@@ -235,7 +237,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(''.join(d['text'] for d in deltas if d['event'] == 'text_delta'), 'echo:shared')
         usage = [m for m in client.saved if m.get('event') == 'usage']
         self.assertEqual(len(usage), 2)
-        self.assertEqual(usage[0]['data'], {'input_tokens': 5, 'output_tokens': 7, 'cached_input_tokens': 2})
+        self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
         self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized'})
         self.assertEqual(first['output_config'], {'effort': 'low'})
@@ -258,9 +260,15 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client.request('create', bot='Capped', workspace=str(path), budget_tokens=10)
         capped = client.request('submit', bot='Capped', request_id='cap', prompt='incomplete')['result']['turn']
         self.assertEqual(client.finished(capped)['data']['error'], 'provider_incomplete')
-        self.assertEqual(client.request('resume', bot='Capped')['result']['tokens_used'], 12)
+        self.assertEqual(client.request('resume', bot='Capped')['result']['tokens_used'], 14)  # 5 + 2 cached in, 7 out
         self.assertEqual(client.request('submit', bot='Capped', request_id='retry', prompt='hello')['error'],
                          'budget_exhausted')
+        while not model.requests.empty():
+            model.requests.get_nowait()
+        client.request('create', bot='Empty', workspace=str(path), instructions='')
+        empty = client.request('submit', bot='Empty', request_id='e', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(empty)['data']['status'], 'completed')
+        self.assertNotIn('system', model.requests.get(timeout=1))
 
 
 class ModelFixture(unittest.TestCase):
@@ -345,6 +353,32 @@ class RuntimeTests(ModelFixture):
         self.assertNotIn('second', json.dumps(alt_history))
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
         self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
+
+    def test_fork_from_a_mid_turn_message_and_from_the_head(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='tool:shared')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        messages = [e['data']['node'] for e in events if e['event'] == 'message']
+        answered = next(e['data']['node'] for e in events if e['event'] == 'tool_completed')
+        # The assistant item that planned the call is unanswered at that point.
+        self.assertEqual(client.request('fork', source='Bob', checkpoint=messages[0], bot='early',
+                                        workspace=str(self.path))['error'], 'fork_point_has_open_tool_calls')
+        branch = client.request('fork', source='Bob', checkpoint=answered, bot='branch', workspace=str(self.path))['result']
+        self.assertEqual(branch['head'], answered)
+        tip = client.request('fork', source='Bob', bot='tip', workspace=str(self.path))['result']
+        self.assertEqual(tip['head'], client.request('resume', bot='Bob')['result']['head'])
+        # The branch continues from the tool result; the provider sees exactly that prefix.
+        t2 = client.request('submit', bot='branch', request_id='b', prompt='after the tool')['result']['turn']
+        self.assertEqual(client.finished(t2)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+        self.assertEqual(request['input'][-2]['type'], 'function_call_output')
+        self.assertEqual(request['input'][-1]['content'][0]['text'], 'after the tool')
+        self.assertEqual(len(request['input']), 4)
+        self.assertEqual(client.request('fork', source='Bob', checkpoint=99999, bot='nope',
+                                        workspace=str(self.path))['error'], 'node_not_in_source_history')
 
     def test_turn_overrides_workspace_and_model_within_the_family(self):
         client = self.client('echo,shell')
