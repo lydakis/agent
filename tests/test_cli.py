@@ -152,7 +152,8 @@ class SocketAndCliTests(ModelFixture):
         with sockets.socket(sockets.AF_UNIX) as sock:
             sock.connect(str(self.socket))
             ready = json.loads(sock.makefile('r').readline())
-        self.assertTrue({'processes', 'active', 'connecting', 'output_tokens', 'idle_exit_seconds'} <= set(ready['limits']))
+        self.assertTrue({'processes', 'active', 'connecting', 'connections', 'output_tokens', 'idle_exit_seconds'} <= set(ready['limits']))
+        self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 100))
         self.assertIn('wait', ready['capabilities'])
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):

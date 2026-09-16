@@ -324,7 +324,8 @@ class RuntimeTests(ModelFixture):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = threading.Barrier(70)
         self.addCleanup(self.model.release_headers.set)
-        client = self.client()
+        # The bound is off by default; this test asks for it explicitly.
+        client = self.client(extra=('--max-connecting', '64'))
         turns = []
         for index in range(70):
             bot = str(index)

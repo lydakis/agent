@@ -77,7 +77,7 @@ Agent does not provide a sandbox.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
 - [Rust measurements](docs/RUST_MEASUREMENTS.md): exploratory observations, with unequal feature footprints.
 - [Anthropic live run](docs/ANTHROPIC_SMOKE.md): the daemon against Sonnet 5, Opus 5, and Fable 5.1, with the adaptive-thinking fix it forced.
-- [Live fleet check](docs/LIVE_FLEET.md): 32 and 96 concurrent bots on real providers through one daemon.
+- [Live fleet check](docs/LIVE_FLEET.md): up to 1,024 concurrent bots on real providers through one daemon.
 - [FX measurements](docs/FX_MEASUREMENTS.md): native embedded FX versus Rust with identical conversation content and explicit protocol differences.
 - [Comparison contract](docs/COMPARISON_CONTRACT.md): feature inventory and enforced comparison rules.
 - [Long histories](docs/LONG_HISTORY.md): full retained conversation versus bounded model context.
@@ -90,6 +90,6 @@ Agent does not provide a sandbox.
 - [Initial measurements](docs/MEASUREMENTS.md): Pi/Codex resource costs through
   32 simultaneous streams and the provisional reuse decision.
 
-Next: a hundreds-of-bots live fleet now that per-turn memory no longer
-scales with history, then compaction with summaries. Keep matched regression
-workloads as tools and durable lifecycle behavior expand.
+Next: sustained live load over minutes rather than one burst, then
+compaction with summaries. Keep matched regression workloads as tools and
+durable lifecycle behavior expand.

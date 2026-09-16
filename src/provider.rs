@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
@@ -19,34 +20,84 @@ mod responses;
 pub const MAX_OUTPUT: usize = 512 * 1024;
 const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
 
-/// One HTTP client and startup-admission budget shared by every provider.
+/// Concurrent streams one HTTP/2 connection may carry, as both current
+/// providers advertise in SETTINGS_MAX_CONCURRENT_STREAMS. Requests beyond
+/// it on the same connection queue in the HTTP layer, so a fleet needs
+/// several connections per provider to actually run in parallel.
+pub const STREAMS_PER_CONNECTION: usize = 100;
+
+/// HTTP connections and the startup-admission budget shared by every
+/// provider. Each shard is its own client, so its own pooled HTTP/2
+/// connection per host; a request takes the least-loaded shard and holds it
+/// for the life of its stream.
 pub struct Transport {
-    client: reqwest::Client,
+    shards: Vec<Shard>,
     starting: Semaphore,
+}
+struct Shard {
+    client: reqwest::Client,
+    in_flight: AtomicUsize,
+}
+/// Holds a shard's in-flight count until the request, stream included, ends.
+struct Lease<'a>(&'a AtomicUsize);
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 impl Transport {
     /// `max_connecting` bounds requests awaiting response headers; zero means
-    /// no bound beyond the operating system.
-    pub fn new(max_connecting: usize) -> Result<Arc<Self>> {
-        // No total deadline: long generations are legitimate. Idle reads are
-        // bounded so a stalled stream cannot hold a turn forever.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(120))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .pool_max_idle_per_host(1024)
-            .build()
-            .map_err(|_| Error::new("http_client_init"))?;
+    /// no bound beyond the operating system. `connections` is the number of
+    /// shards, at least one.
+    pub fn new(max_connecting: usize, connections: usize) -> Result<Arc<Self>> {
+        let shards = (0..connections.max(1))
+            .map(|_| {
+                // No total deadline: long generations are legitimate. Idle
+                // reads are bounded so a stalled stream cannot hold a turn.
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(10))
+                    .read_timeout(Duration::from_secs(120))
+                    .pool_idle_timeout(Duration::from_secs(60))
+                    .pool_max_idle_per_host(1024)
+                    .build()
+                    .map_err(|_| Error::new("http_client_init"))?;
+                Ok(Shard {
+                    client,
+                    in_flight: AtomicUsize::new(0),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(Self {
-            client,
+            shards,
             starting: Semaphore::new(if max_connecting == 0 {
                 Semaphore::MAX_PERMITS
             } else {
                 max_connecting.min(Semaphore::MAX_PERMITS)
             }),
         }))
+    }
+    pub fn connections(&self) -> usize {
+        self.shards.len()
+    }
+    /// The least-loaded shard. The counts are advisory: a concurrent lease
+    /// may pick the same shard, which only costs balance, never correctness.
+    fn lease(&self) -> (&reqwest::Client, Lease<'_>) {
+        let shard = self
+            .shards
+            .iter()
+            .min_by_key(|shard| shard.in_flight.load(Ordering::Relaxed))
+            .expect("at least one shard");
+        shard.in_flight.fetch_add(1, Ordering::Relaxed);
+        (&shard.client, Lease(&shard.in_flight))
+    }
+    #[cfg(test)]
+    fn loads(&self) -> Vec<usize> {
+        self.shards
+            .iter()
+            .map(|shard| shard.in_flight.load(Ordering::Relaxed))
+            .collect()
     }
 }
 
@@ -325,9 +376,9 @@ impl Provider {
                 .map_err(|_| Error::new("provider_admission_closed"))?;
         let prefix = self.prefix(&request)?;
         let (body, len) = self.body(prefix, request.items);
-        let mut http = self
-            .transport
-            .client
+        // The lease lives until this function returns, stream included.
+        let (client, _lease) = self.transport.lease();
+        let mut http = client
             .post(self.url.clone())
             .header("content-type", "application/json")
             .header("content-length", len)
@@ -415,21 +466,30 @@ fn legacy_thinking(model: &str) -> bool {
 
 // Preserve only stage, timeout classification, and numeric OS code. Reqwest's
 // Display/debug strings can include URLs and must never become diagnostics.
+/// Classify a transport failure and keep its cause chain as the detail. The
+/// chain names the URL and the HTTP, TLS, or socket layer that failed, never a
+/// header, so it is safe once the caller's key redaction has run.
 fn connection_error(error: reqwest::Error) -> Error {
     if error.is_timeout() {
         return Error::new("provider_connection_timeout");
     }
+    let mut chain = error.to_string();
+    let mut os_code = None;
     let mut source = std::error::Error::source(&error);
     while let Some(cause) = source {
-        if let Some(code) = cause
-            .downcast_ref::<std::io::Error>()
-            .and_then(|e| e.raw_os_error())
-        {
-            return Error::new(&format!("provider_connection_os_{code}"));
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        if os_code.is_none() {
+            os_code = cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(|e| e.raw_os_error());
         }
         source = cause.source();
     }
-    Error::new("provider_connection_failed")
+    match os_code {
+        Some(code) => Error::with(&format!("provider_connection_os_{code}"), chain),
+        None => Error::with("provider_connection_failed", chain),
+    }
 }
 
 /// Capture only a complete, bounded error body. A partial body may end in a
@@ -514,7 +574,7 @@ mod tests {
 
     #[test]
     fn request_prefix_streams_history_after_family_specific_fields() {
-        let transport = Transport::new(64).unwrap();
+        let transport = Transport::new(64, 1).unwrap();
         let provider = Provider::new(
             transport.clone(),
             Family::Anthropic,
@@ -584,8 +644,26 @@ mod tests {
     }
 
     #[test]
+    fn leases_take_the_least_loaded_connection_and_release_on_drop() {
+        let transport = Transport::new(64, 3).unwrap();
+        assert_eq!(transport.connections(), 3);
+        let a = transport.lease().1;
+        let b = transport.lease().1;
+        let c = transport.lease().1;
+        assert_eq!(transport.loads(), vec![1, 1, 1]);
+        drop(b);
+        let d = transport.lease().1;
+        assert_eq!(transport.loads(), vec![1, 1, 1]);
+        drop(a);
+        drop(c);
+        drop(d);
+        assert_eq!(transport.loads(), vec![0, 0, 0]);
+        assert_eq!(Transport::new(0, 0).unwrap().connections(), 1);
+    }
+
+    #[test]
     fn body_length_counts_prefix_items_separators_and_close() {
-        let transport = Transport::new(64).unwrap();
+        let transport = Transport::new(64, 1).unwrap();
         let provider =
             Provider::new(transport, Family::Responses, "http://h/v1/", None, &[]).unwrap();
         let items: Vec<Bytes> = (0..3)

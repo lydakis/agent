@@ -232,11 +232,19 @@ bound; the operating system is then the only limit.
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
-| `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. | 64 |
+| `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
+| (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by the 100 concurrent streams both providers allow per connection, 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 41 |
+
+Provider requests multiplex over HTTP/2, and one connection carries at most
+the 100 streams the provider advertises; the HTTP layer queues the rest, so a
+single connection would serialize a fleet to 100 model calls at a time however
+many turns are active. The transport therefore keeps several connections per
+provider and gives each request the least-loaded one for the life of its
+stream. Each connection is one TLS session and a few kilobytes.
 
 Parked agents cost a store row and a registry entry. An agent in a model call
 costs its request body read-ahead (64 items at a time), the parser buffers, and
@@ -274,7 +282,9 @@ is currently no provider option to omit it and no automatic retry with a changed
 request. Preserve returned reasoning items verbatim for stateless continuation.
 
 HTTP and streamed provider failures retain stable error codes and useful detail.
-The selected provider's credential is redacted from decoded messages (and its
+Transport failures (`provider_connection_failed`, or `provider_connection_os_N`
+when an OS error code is known) carry the cause chain as detail: the URL and
+the HTTP, TLS, or socket layer that failed, never a header. The selected provider's credential is redacted from decoded messages (and its
 standard JSON-escaped representation) before the 512-character detail limit.
 HTTP error bodies are read only up to 4 KiB. Oversized, interrupted, malformed
 JSON, and unsupported JSON captures omit detail rather than publishing partial
@@ -335,11 +345,11 @@ Current limits: 8 MiB / 4,096 items of model context per request (stored
 history is unbounded), 256 KiB input prompt, 64 KiB instructions, 512 KiB terminal provider output, 2 MiB SSE frame,
 16 MiB response stream, 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
-admission has a 60-second timeout. The permit is released before reading SSE. This
-smooths connection bursts while allowing more established streams, but a
-provider that delays headers will limit admission; live-provider tuning remains
-open. The benchmark mode accepts up to 4,096 agents, subject to its additional
-fixture limits. There is no automatic compaction: exceeding a bound is an
+admission, when bounded, has a 60-second timeout and releases its permit when
+response headers arrive. Both live providers hold headers until the first
+token, so the permit covers the whole time to first token; the bound is off by
+default and the derived connection count is what keeps a fleet streaming in
+parallel. There is no automatic compaction: exceeding a bound is an
 explicit error. Opaque reasoning items count toward the same byte and item
 limits as text and tool history; reasoning-heavy conversations can reach the
 limits sooner. They are not discarded to make history appear smaller. Indexed

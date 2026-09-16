@@ -199,7 +199,7 @@ environment and is never printed or stored.
 
 ```sh
 .local/venv/bin/python -m bench.live_fleet --bots 32 --model anthropic/claude-sonnet-5 \
-  --max-connecting 64 --out .local/bench/fleet-sonnet-32
+  --out .local/bench/fleet-sonnet-32
 ```
 
 Results are `live_fleet_v1` records with the binary hash. See

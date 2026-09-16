@@ -6,7 +6,7 @@ outcomes, tokens, and daemon RSS/thread samples. The provider key comes from
 the caller's environment and is never printed or stored.
 
     .local/venv/bin/python -m bench.live_fleet --bots 32 --model anthropic/claude-sonnet-5 \
-        --max-connecting 64 --out .local/bench/fleet-sonnet-32
+        --out .local/bench/fleet-sonnet-32
 """
 import argparse
 import json
@@ -33,8 +33,8 @@ def run(agent, out, bots, model, max_connecting, reasoning):
     provider = model.split('/', 1)[0]
     env = os.environ.copy()
     common = ['--store', str(store), '--provider', provider, '--model', model, '--reasoning', reasoning,
-              '--tools', 'shell,read,write,edit,wait', '--max-connecting', str(max_connecting),
-              '--workspace', str(workspace)]
+              '--tools', 'shell,read,write,edit,wait', '--workspace', str(workspace),
+              *(['--max-connecting', str(max_connecting)] if max_connecting is not None else [])]
     # One detached turn starts the daemon so every fleet submission races a live one.
     subprocess.run([str(agent), 'run', *common, '--new', '--bot', 'warm', '--detach',
                     'reply with the single word ready'], check=True, capture_output=True, env=env)
@@ -122,7 +122,7 @@ def main():
     parser.add_argument('--binary', type=Path, default=Path('.local/target/release/agent'))
     parser.add_argument('--bots', type=int, default=32)
     parser.add_argument('--model', required=True)
-    parser.add_argument('--max-connecting', type=int, default=64)
+    parser.add_argument('--max-connecting', type=int, default=None, help='daemon default (unbounded) when omitted')
     parser.add_argument('--reasoning', default='low')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent

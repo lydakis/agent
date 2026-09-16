@@ -121,11 +121,17 @@ calls) and the three configurable daemon limits in place of fixed constants; see
 [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results). Still to measure:
 bytes per parked turn versus per live process, on the lifecycle screen.
 
-1. Done: the [live fleet check](LIVE_FLEET.md) ran 32 and 96 concurrent bots
-   on Sonnet 5 and 32 on gpt-5-mini through one daemon with no failures; the
-   startup bound and idle timeout behaved as designed. Next at scale: a
-   hundreds-of-bots run, now that a turn streams its context from the store
-   instead of loading its history.
+1. Done: the [live fleet check](LIVE_FLEET.md) submitted batches of up to
+   1,024 bots on gpt-5.6-luna and 256 on Sonnet 5 through one daemon. With
+   sharded HTTP/2 connections and no startup bound, the 1,024-bot luna batch
+   reached 805 overlapping turns, 1.924 s median turn latency, and 41.23 MiB
+   peak daemon RSS. The Sonnet batch reached 256 overlapping turns with
+   2.050 s median latency. These bursts do not establish those costs at
+   1,024 simultaneous provider streams. Failures included one 503 per
+   1,024-bot run and a burst of transport failures whose cause was not
+   captured; transport failures now retain their cause chain as detail.
+   Next at scale: sustained load over minutes to distinguish remaining
+   harness limits from provider limits.
 2. Done: stored history is unbounded; each request carries a
    [context window](RUST_PROTOTYPE.md#long-history-and-context-windows) of
    whole turns with a persisted, hysteretic start, an explicit omission note,

@@ -11,7 +11,7 @@ use agent_runtime::{
     codec::{Family, split_model},
     fail, fail_with,
     output::Output,
-    provider::{Provider, Transport},
+    provider::{Provider, STREAMS_PER_CONNECTION, Transport},
     store::{Binding, Store, TurnOptions},
     tools::Registry,
 };
@@ -206,7 +206,9 @@ pub struct Configuration {
     pub max_processes: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
     pub max_active: Option<usize>,
-    /// Provider requests awaiting response headers; default 64; zero unbounded.
+    /// Provider requests awaiting response headers; unbounded by default,
+    /// since providers hold headers until the first token and the bound
+    /// would cap throughput at permits per first-token latency.
     pub max_connecting: Option<usize>,
     /// Generated tokens per Responses call, including reasoning; none by default.
     pub max_output_tokens: Option<u32>,
@@ -224,16 +226,25 @@ pub struct Limits {
     pub processes: usize,
     pub active: usize,
     pub connecting: usize,
+    /// HTTP/2 connections per provider, enough for `active` turns to stream
+    /// at once at the providers' advertised streams per connection.
+    pub connections: usize,
     pub context_bytes: usize,
     pub context_items: usize,
 }
 impl Limits {
     pub fn resolve(config: &Configuration) -> Limits {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let active = config.max_active.unwrap_or(4096);
         Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
-            active: config.max_active.unwrap_or(4096),
-            connecting: config.max_connecting.unwrap_or(64),
+            active,
+            connecting: config.max_connecting.unwrap_or(0),
+            connections: if active == 0 {
+                64
+            } else {
+                active.div_ceil(STREAMS_PER_CONNECTION).clamp(1, 256)
+            },
             context_bytes: config.context_bytes.unwrap_or(8 * 1024 * 1024).max(1024),
             context_items: config.context_items.unwrap_or(4096).max(2),
         }
@@ -281,7 +292,7 @@ struct Service {
 
 pub async fn run(config: Configuration) -> Result<()> {
     let limits = Limits::resolve(&config);
-    let transport = Transport::new(limits.connecting)?;
+    let transport = Transport::new(limits.connecting, limits.connections)?;
     let registry = Registry::new(&config.tools)?;
     let schemas = registry.schemas();
     let mut providers = HashMap::new();
@@ -353,6 +364,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let ready = json!({"event":"ready","protocol":3,
         "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
+            "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
             "context_bytes":limits.context_bytes,"context_items":limits.context_items},
         "schema":agent_runtime::store::Database::SCHEMA,
@@ -956,6 +968,7 @@ mod tests {
                 processes: 16,
                 active: 1024,
                 connecting: 64,
+                connections: 11,
                 context_bytes: 8 << 20,
                 context_items: 4096,
             },
@@ -1055,7 +1068,7 @@ mod tests {
             .unwrap();
         let registry = Registry::new("echo").unwrap();
         let provider = Provider::new(
-            Transport::new(64).unwrap(),
+            Transport::new(64, 1).unwrap(),
             Family::Responses,
             "http://127.0.0.1:1/v1",
             None,
@@ -1075,6 +1088,7 @@ mod tests {
                 processes: 16,
                 active: 1024,
                 connecting: 64,
+                connections: 11,
                 context_bytes: 8 << 20,
                 context_items: 4096,
             },
