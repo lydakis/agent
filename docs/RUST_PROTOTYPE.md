@@ -580,7 +580,7 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 11; a version-6
+the `context_window` capability. Stores are schema version 12; a version-6
 store is migrated at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
@@ -640,6 +640,13 @@ restart. Stale handles and checkpoint references cannot identify new work. The
 version-8 to version-9 migration initializes the turn mark from surviving turns
 and fork-retained transcript markers. Version 10 initializes the node ID floor
 from the highest surviving node ID without rewriting transcript rows.
+Version 12 adds partial indexes on `turns` and `processes` for the
+`running` and `waiting` statuses, so startup recovery, parked-turn resumption,
+and the idle-exit check read only the active rows instead of scanning every
+turn a store has ever recorded; the indexes hold one entry per active row and
+cost nothing at rest. A query-plan audit of every store statement found no
+other full scan on a growing table (see
+[DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#query-plan-audit)).
 Version 11 adds a small `retained_turns` table indexed by `(bot,turn)`.
 Pruning looks up only the selected bot's candidates, then removes them unless
 they still own running background commands. Late command results remain

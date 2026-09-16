@@ -95,7 +95,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 11;
+    pub const SCHEMA: i32 = 12;
 
     pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
         conn.execute_batch(
@@ -171,7 +171,10 @@ impl Database {
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
-            CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);")?;
+            CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
+            CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
+            CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
+            CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }

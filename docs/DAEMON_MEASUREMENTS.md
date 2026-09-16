@@ -708,3 +708,48 @@ Final binary SHA-256:
 `5cc8f7b7a1195c0d7e194cd2fe5728513a423d5b57c1c36f2df00acf2877fa2b`.
 Final fixture SHA-256:
 `83e25315cf471339e3dd6645b03148e73eed01ed4f73297c18866ce64f04bdb8`.
+
+## Query plan audit
+
+The initial audit was recorded 2026-09-16 on the same Darwin arm64 host,
+SQLite 3.54, against a migrated copy of the five-minute sustained store.
+The corrected `bench.query_plans` expands 93 distinct runtime statements,
+including every table variant of deletion and pruning, and checks foreign-key
+plans. It rejects unindexed scans of growing tables; structural scan exemptions
+use exact names so `SCAN checkpoints` cannot be mistaken for recursive `SCAN c`.
+Flags were full table scans on growing tables and temporary B-trees; `SCAN
+CONSTANT ROW` from `EXISTS` subqueries, the recursive-CTE step scans that are
+bounded by the window or one turn, and per-turn `ORDER BY rowid` over a turn's
+few tool rows are structural and not counted.
+
+Four statements scanned a growing table by an unindexed `status`: startup
+recovery (`turns WHERE status='running'`, `processes ... status='running'` marked
+lost), parked-turn resumption at startup (`turns WHERE status='waiting'`), and
+the idle-exit check (`count(*) FROM processes WHERE status='running'`). One
+more, the schema 6 to 7 migration's read of accepted events, is a one-time
+scan by design. Partial indexes on the two active statuses fix the four; each
+holds one entry per active row.
+
+On a copy with 1,009,050 turn rows and 1,000,000 process rows (one million
+synthetic completed turns added to the sustained store), warm in the page
+cache:
+
+| Statement | Before | After |
+| --- | ---: | ---: |
+| `turns WHERE status='running'` | 76 ms, SCAN turns | 0.5 ms, COVERING INDEX turns_running |
+| `turns WHERE status='waiting' ORDER BY id` | 52 ms, SCAN turns | 0.02 ms, COVERING INDEX turns_waiting |
+| `count(*) FROM processes WHERE status='running'` | 44 ms, SCAN processes | 0.01 ms, COVERING INDEX processes_running |
+
+Warm figures understate the difference: a cold scan of a million-row table
+reads the whole table from disk, and the idle-exit check ran the process scan
+on every idle tick. After the indexes the re-run audit reports no full scan on
+a growing table. The store-scale screen in NEXT.md item 3 remains the place to
+measure these on a store that does not fit the cache.
+
+Validation of the corrected offline guard used Python SQLite 3.47.1: the
+current schema passed, while separate removal of `checkpoints_head`,
+`processes_turn`, `turns_running`, `turns_waiting`, or `processes_running`
+failed with a scan of the affected table. Its summary reports the actual
+SQLite version; plans can differ from the daemon's bundled version. The timing
+table above remains the initial observation, not a new runtime benchmark.
+These audit fixes change no daemon code or runtime work.

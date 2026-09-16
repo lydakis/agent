@@ -157,12 +157,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    compaction that rewrites the prefix every turn can cost more in cache
    misses than it saves in tokens. Also remaining: checkpoint indexes so
    forks and reads of very old turns stop walking node metadata.
-3. Store scale, in two steps. First, before compaction adds tables: an
-   `EXPLAIN QUERY PLAN` audit of every statement the daemon runs, fixing any
-   full scan. Startup recovery already scans `turns` and `processes` by an
-   unindexed `status`, which is invisible at thousands of rows and a
-   multi-second daemon start at millions, paid again on every idle-exit
-   restart. Second, after compaction: a store-scale screen that grows one
+3. Store scale, in two steps. First, done: the
+   [query-plan audit](DAEMON_MEASUREMENTS.md#query-plan-audit), now covering
+   93 runtime statement variants, found four full scans by unindexed `status` (startup
+   recovery, parked-turn resumption, the idle-exit check); schema 12 adds
+   partial indexes on the active statuses, taking each from tens of
+   milliseconds per million rows to microseconds. Second, after compaction: a
+   store-scale screen that grows one
    store with the synthetic provider to 1 GB and then 10 GB across thousands
    of bots and, at each size, measures daemon start and recovery, submit to
    finish latency, window construction, `bots` and `turns` paging, a fork, a

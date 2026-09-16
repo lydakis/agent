@@ -221,6 +221,21 @@ binary hash. See [LIVE_FLEET.md](LIVE_FLEET.md#sustained-load).
   --model openai/gpt-5.6-luna --out .local/bench/sustained-luna-64
 ```
 
+## Query plan audit
+
+`bench.query_plans STORE` runs `EXPLAIN QUERY PLAN` for runtime SQL extracted
+from `src/store/db.rs`, expanding both deletion templates for artifacts,
+processes, and tools with their actual predicates. It uses the source's column
+and history-view expressions and enables foreign-key checks as the daemon does.
+Against a store at the current schema, it exits nonzero when
+any statement scans a growing table without an index. Structural flags
+(`EXISTS` constant rows, named recursive walks, per-turn sorts, singleton
+configuration, and schema metadata) are counted separately; scan exemptions
+match exact plan steps. One-time migrations are excluded. The summary reports
+the Python interpreter's SQLite version, which can differ from the daemon's
+bundled SQLite. This is a plan check, not a runtime timing benchmark. Open a
+copy of a store once with the current binary to migrate it before auditing.
+
 ## Long history probe
 
 `bench.long_history` seeds one bot with N stored items through a stdio daemon
