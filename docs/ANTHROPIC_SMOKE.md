@@ -75,6 +75,25 @@ What this established for the Messages family through the daemon:
 - No admission wait, timeout, provider error after the fix, or lag. One or
   two concurrent requests say nothing about load.
 
+## Caching and mid-turn forks
+
+A later pass added a `cache_control` breakpoint after the instructions plus
+top-level automatic caching. Two more turns on the Sonnet bot (turns 11 and
+12, an `ls` task and a recall) then reported `cache_read_input_tokens` of
+2,633 and 2,741 on their second and following calls, after zero on every
+earlier call. Anthropic reports cache reads and cache writes outside
+`input_tokens`; the adapter now counts every processed input token in
+`input_tokens` and keeps reads in `cached_input_tokens`, so budgets and turn
+accounting see the same totals on both families.
+
+The same session forked the Sonnet bot at the tool result inside turn 1
+(node 5, before that turn's final answer) into a new bot, and one turn on the
+branch answered from that point ("the wc -l command showed that greek.txt
+contains 3 lines") with the cached prefix read. A fork without a node took
+the current head. Both are the store's fork-from-any-message rule exercised
+against the real API: the prefix ending at an answered tool call is a valid
+conversation for the Messages API.
+
 Not established: multi-agent load, long contexts, Haiku or older models with
 the budget form, a refusal path on Fable 5.1, or cost at scale. The
 store is under ignored `.local/live-anthropic/` with the daemon log.

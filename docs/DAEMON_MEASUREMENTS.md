@@ -274,3 +274,79 @@ host, transport and sampling settings. Binary SHA-256:
 
 - Before: `7dad3b893e7b3a77d10620c710fa9c33a716d860b55370d5e16f8536fe0e7afe`
 - After: `b20d0b20159e3aa64a1d5e860a56cf9f85215d8536d121a4128b89d56326358f`
+
+
+## Caching and fork slice regression check
+
+Observed 2026-09-15 on Darwin arm64, external power, Rust 1.98.0. The same
+32-agent socket echo workload as the accounting screen above, one excluded
+warmup and three measured runs, on the binary that adds Anthropic cache
+breakpoints, cache-inclusive input accounting, and fork-from-any-message
+(SHA-256 `362b1af4ddbcb1e1fc63056ff459e48cfc141988807108ed6a48c628d6d38fea`). All runs passed with 32 concurrent provider requests and
+no quality warnings.
+
+| Metric | Accounting screen "after" | This binary |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.00 (16.86–17.03) | 17.09 (16.92–17.19) |
+| Observed target CPU, seconds | 0.290 (0.280–0.313) | 0.299 |
+| Per-run p95 turn latency, ms | 594.4 (588.3–651.1) | 600.3 |
+
+Within the earlier ranges; no regression is indicated for this short-history
+workload. It does not constrain long-history fork cost (see below). The fork validation
+parses a lineage once per fork and this workload forks each bot once, so its
+cost is inside these numbers. Capture: ignored
+`.local/bench/slice-fork-cache-socket-32/`.
+
+## Fork validation fixes
+
+Observed 2026-09-15 on Darwin arm64, external power, Rust 1.98.0. Compare the
+caching/fork binary above with the fixed binary
+`d80773f0d9db9260deb4efc56a39386652b7dad02fcf20823a8c5f6641965b22`.
+The fixes reject forks ending on Responses reasoning, omit empty Anthropic
+system blocks, and replace the full-history fork scan with indexed checkpoint
+lookups and backward validation of only the uncheckpointed suffix. The selected
+item's type is checked even at an existing checkpoint; reasoning bytes are never
+rewritten. The added checkpoint index is compatible with existing version-6 stores.
+
+The long-history probe seeds identical synthetic 3,000-node, 6,186,000-byte
+histories and a completed head checkpoint. Each run starts a stdio daemon,
+performs one excluded warmup fork, then measures 24 independent forks at that
+same head. Three runs per binary alternate order. Seeding and daemon startup
+are outside the measured interval; the controller and fixture are excluded from
+daemon counters. RSS is sampled every 2 ms; CPU is the daemon's user plus system
+time over the 24 forks. Values are medians of run metrics, with ranges.
+
+| Long-history fork metric | Before | After |
+| --- | ---: | ---: |
+| Per-run median fork latency, ms | 31.28 (30.76–33.20) | 0.217 (0.193–0.229) |
+| Daemon CPU for 24 forks, seconds | 0.697 (0.680–0.708) | 0.0047 (0.0043–0.0050) |
+| Sampled peak daemon RSS, MiB | 16.03 (16.03–16.06) | 9.47 (9.44–9.52) |
+
+This establishes an improvement for known-checkpoint forks of this history.
+It does not establish constant-time arbitrary-node forks: a first fork inside
+a turn still validates the suffix since its nearest checkpoint, and ancestry
+checks still walk node metadata. These are sampled RSS measurements, not PSS
+or total physical memory. One before run had a 293 ms individual fork outlier;
+it remains in the raw capture and is not represented by the per-run medians.
+
+The existing 32-agent socket echo screen was also rerun with identical workload,
+observer, host, sampling, tools, and transport fields. One warmup and three
+measured runs per binary alternated order. All eight runs passed, each reaching
+32 simultaneous provider requests, completing 96 turns and 192 provider calls,
+and verifying follower/replay equality without quality warnings.
+
+| Socket lifecycle metric | Before | After |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.22 (17.19–17.22) | 17.11 (17.08–17.14) |
+| Observed target CPU, seconds | 0.265 (0.262–0.266) | 0.252 (0.252–0.258) |
+| Per-run p95 turn latency, ms | 591.3 (589.0–609.2) | 590.4 (584.2–603.5) |
+| Provider request body bytes per run | 3,254,232 | 3,254,232 |
+| Provider response body bytes per run | 2,948,154 | 2,948,154 |
+
+CPU and sampled memory improved slightly in this screen; latency ranges overlap
+and network traffic is unchanged. Host exclusivity was not established, so
+these small samples do not establish a general speedup or a worst-case bound.
+The substantial improvement is confined to the measured long-history fork path.
+Raw captures, immutable binaries, and the synthetic comparison driver are under
+ignored `.local/fable-slice-review/`; the matched results are in
+`performance-fixes/`. No live provider calls were used for these fixes.

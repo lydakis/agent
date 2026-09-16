@@ -294,6 +294,13 @@ A turn may override the model within the same family (`submit` with `model`, or
 conversation is not implemented; it would be an explicit lossy fork that
 discards provider-specific state such as thinking signatures.
 
+Anthropic requests carry a `cache_control` breakpoint after the instructions
+and top-level automatic caching for the growing history, so repeated prefixes
+are read from the provider cache once they exceed the model's minimum; the
+[live run](ANTHROPIC_SMOKE.md) records the effect. Responses caching needs no
+request change. Empty instructions omit the system block, since empty text
+cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
+
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`
@@ -433,9 +440,22 @@ within the 1 MiB response bound.
 
 Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
-within one store; rename/alias operations are not implemented. Fork validation
-requires a completed-turn checkpoint in the source's ancestry. It references
-existing stored nodes and creates no workspace or historical side effects.
+within one store; rename/alias operations are not implemented. A fork starts
+from any message in the source's history: `checkpoint` names a node id (every
+`message` and `tool_completed` event carries one), and without it the source's
+current head is used, which requires the source to be idle since a live head
+is still moving. The point must leave no tool call unanswered, or the fork
+fails with `fork_point_has_open_tool_calls`; a node outside the source's
+lineage fails with `node_not_in_source_history`. A Responses reasoning node
+cannot be separated from its following output item; selecting it fails with
+`fork_point_splits_reasoning`. Valid forks retain the opaque reasoning unchanged.
+Fork validation uses an index on checkpoint heads and inspects only the suffix
+after the nearest completed or previously validated checkpoint, one item at a
+time. After checking the selected item's type, a known checkpoint skips the
+history scan and copies no transcript into Rust. The first fork
+inside an uncheckpointed turn still scans its suffix; this is not constant-time
+validation for arbitrary nodes. Forking references existing stored nodes and
+creates no workspace or historical side effects.
 
 Submission is idempotent on `(bot, request_id)`. An identical retry returns the
 same turn without executing again, including after restart. Reusing that key

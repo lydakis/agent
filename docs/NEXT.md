@@ -121,13 +121,11 @@ calls) and the three configurable daemon limits in place of fixed constants; see
 [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#deferred-tool-results). Still to measure:
 bytes per parked turn versus per live process, on the lifecycle screen.
 
-1. Prompt caching on the Anthropic adapter: the [live run](ANTHROPIC_SMOKE.md)
-   showed zero cache reads because no `cache_control` breakpoints are sent.
-   Add breakpoints on the system prompt and the last history item, verify
-   `cache_read_input_tokens` on a continuation turn. Then a bounded
-   multi-agent run on either provider (tens of concurrent bots) to observe the
-   64-request startup bound, header latency, and idle-timeout adequacy for
-   long thinking. Preserve failures.
+1. A bounded multi-agent run on either provider (tens of concurrent bots) to
+   observe the 64-request startup bound, header latency, and idle-timeout
+   adequacy for long thinking. Preserve failures. Anthropic prompt caching and
+   fork-from-any-message are implemented and verified live
+   ([ANTHROPIC_SMOKE.md](ANTHROPIC_SMOKE.md#caching-and-mid-turn-forks)).
 2. Separate long-term conversation storage from bounded model context. Implement
    indexed history access and context selection before claiming long-history
    support. Follow [LONG_HISTORY.md](LONG_HISTORY.md), including preserved fork
