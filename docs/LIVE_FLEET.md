@@ -149,3 +149,45 @@ needed to distinguish remaining harness limits from provider limits. Captures: i
 `.local/bench/fleet-luna-1024-sharded/`, `fleet-luna-1024-sharded-c0/`,
 `fleet-sonnet-256-sharded/`, and `fleet-sonnet-256-sharded-c0/`; the
 connection counts were sampled with `lsof` on the daemon during the runs.
+
+## Sustained load
+
+Observed 2026-09-16 America/New_York on the same host, binary
+`7748a10c…` (sharded transport, startup bound off by default), with
+`bench.sustained`: N bots each resubmit the same shell-plus-answer turn the
+moment their previous turn finishes, for M minutes, through one stdio daemon
+with `--context-items 8` so requests stay the same size as histories grow.
+The driver samples the daemon every 10 s and buckets outcomes in 30 s
+windows. Spend: about 14 million input tokens on luna and 3.6 million on
+Sonnet 5.
+
+| Run | Model | Bots | Minutes | Turns | Failed | Steady turns/s | p50 ms | p95 ms | Slowest turn | Daemon RSS | Open files | Store growth |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| luna-64 | gpt-5.6-luna | 64 | 5 | 9,050 | 4 × `provider_http_503` | 30 (60 model calls/s) | 1,907–2,014 | 2,981–3,646 | 46.9 s | 27.0 → 23.3 MiB | 56 | 25 MiB (2.8 KB per turn) |
+| sonnet-16 | claude-sonnet-5 | 16 | 2 | 983 | none | 8 | 1,872–1,921 | 2,392–2,716 | 6.8 s | 17.7 → 19.7 MiB | 31 | 6 MiB |
+
+What the numbers say:
+
+- **Nothing drifts.** Over five minutes and 9,050 turns the luna daemon's
+  RSS stayed between 23 and 27 MiB (it fell mid-run when the allocator
+  returned pages), threads stayed at 5, and open files at 56 for the whole
+  run: 41 provider connections plus the store and stdio. Every 30 s window
+  completed 883 to 929 turns with p50 within 100 ms of the first window.
+  Sonnet showed the same shape at 16 bots.
+- **No provider rate limit appeared** at about 2.7 million input tokens per
+  minute and 60 requests per second on OpenAI, or at 1.8 million per minute
+  on Anthropic. OpenAI returned four 503s in 9,050 turns, all in the first
+  two and a half minutes; each became a failed turn and the bot's next
+  submission succeeded. That is the only provider-side limit observed so far.
+- **Tail latency is the provider's.** The slowest luna turn took 46.9 s
+  against a p95 of about 3 s; it completed normally, well inside the 120 s
+  idle read timeout, and no other turn was delayed by it.
+- **The store grows linearly** at about 2.8 KB per turn for this workload
+  (items, events, turn rows, and tool intents), 25 MiB for five minutes at
+  30 turns per second. Retention is still unimplemented and this is the
+  number it will have to bound.
+
+Not established: rate limits at higher token rates or on other tiers, hours
+of load, long contexts under sustained load (the window was fixed at eight
+items), or Anthropic beyond 16 bots. Captures: ignored
+`.local/bench/sustained-luna-64/` and `sustained-sonnet-16/`.

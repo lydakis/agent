@@ -130,8 +130,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    1,024 simultaneous provider streams. Failures included one 503 per
    1,024-bot run and a burst of transport failures whose cause was not
    captured; transport failures now retain their cause chain as detail.
-   Next at scale: sustained load over minutes to distinguish remaining
-   harness limits from provider limits.
+   A [sustained run](LIVE_FLEET.md#sustained-load) of 64 bots for five
+   minutes (9,050 turns, 60 model calls per second) showed no drift in daemon
+   memory, threads, or open files and no provider rate limit; the store grew
+   2.8 KB per turn, which retention will need to bound. Next at scale:
+   retention, then hours rather than minutes.
 2. Done: stored history is unbounded; each request carries a
    [context window](RUST_PROTOTYPE.md#long-history-and-context-windows) of
    whole turns with a persisted, hysteretic start, an explicit omission note,

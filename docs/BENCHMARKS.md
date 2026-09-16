@@ -205,6 +205,22 @@ environment and is never printed or stored.
 Results are `live_fleet_v1` records with the binary hash. See
 [LIVE_FLEET.md](LIVE_FLEET.md) for the recorded runs and their limits.
 
+## Sustained live load
+
+`bench.sustained` keeps N bots taking turns back to back for M minutes through
+one daemon against a real provider, resubmitting each bot as soon as its turn
+finishes whatever the outcome. It records completed and failed turns by error
+code per 30 s window with latency percentiles, daemon RSS, threads, and open
+files every 10 s, store growth, and token totals from the turn records.
+`--context-items` (default 8) keeps requests the same size as histories grow.
+Paid and explicitly invoked; results are `sustained_v1` records with the
+binary hash. See [LIVE_FLEET.md](LIVE_FLEET.md#sustained-load).
+
+```sh
+.local/venv/bin/python -m bench.sustained --bots 64 --minutes 5 \
+  --model openai/gpt-5.6-luna --out .local/bench/sustained-luna-64
+```
+
 ## Long history probe
 
 `bench.long_history` seeds one bot with N stored items through a stdio daemon
