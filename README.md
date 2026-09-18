@@ -7,13 +7,13 @@ that work, fork earlier conversation checkpoints to explore alternatives, and
 follow activity as an ordered stream of events. Programs are the consumers.
 Human-readable service logs are an optional view of that stream.
 
-The named agent is the single execution unit. In the intended design, an agent
-delegates by using the same CLI or protocol as any other program to create or
-fork another named agent. All named agents are peers; origin does not confer
-ownership, special permissions, or a different lifecycle. Models choose their tools and coordination strategies;
+A bot is a named agent and the single execution unit. In the intended design,
+a bot delegates by using the same CLI or protocol as any other program to create
+or fork another bot. All bots are peers; origin does not confer ownership,
+special permissions, or a different lifecycle. Models choose their tools and coordination strategies;
 the minimal core supplies durable lifecycle, provider access, and bounded execution.
 
-The reason to build this is efficient execution of many **active** agents. A
+The reason to build this is efficient execution of many **active** bots. A
 common command syntax around one full harness process per bot is not enough.
 The ambition is thousands of active conversations; no capacity claim has been
 established.
@@ -22,7 +22,7 @@ established.
 `agent` client, with Pi/Codex/FX comparison tooling.** The prototype supports
 named bots, restart/resume, historical checkpoints, cancellation, replay with
 live follow, shell/read/write/edit tools with retained artifacts, delegation to
-other named agents through the same client, and two provider families (OpenAI
+other bots through the same client, and two provider families (OpenAI
 Responses and compatible gateways, Anthropic Messages) with streamed thinking
 and usage. Its protocol is experimental. The daemon has completed a bounded
 [live OpenAI run](docs/OPENAI_SMOKE.md#daemon-live-run) and a
@@ -41,7 +41,7 @@ requirement.
 ## What matters
 
 - Performance first: minimal memory, CPU, network overhead, and tail latency
-  across many active agents, with bounded resources under load.
+  across many active bots, with bounded resources under load.
 - Fundamental behavior: named bots, explicit resumption, historical conversation
   forks, tool execution, and independent continuation of each branch.
 - Live activity and replay after reconnecting: messages, tool calls and results,
@@ -57,7 +57,7 @@ require measured equivalent work, including achieved active concurrency.
 
 ## Scope
 
-Agent owns agent identity, execution lifecycle, and observability. Callers
+Agent owns bot identity, execution lifecycle, and observability. Callers
 supply workspaces and decide where execution happens. Workspace provisioning,
 Git branching, diff application, and machine placement belong to callers or
 other tools.
@@ -77,7 +77,7 @@ Agent does not provide a sandbox.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
 - [Rust measurements](docs/RUST_MEASUREMENTS.md): exploratory observations, with unequal feature footprints.
 - [Anthropic live run](docs/ANTHROPIC_SMOKE.md): the daemon against Sonnet 5, Opus 5, and Fable 5.1, with the adaptive-thinking fix it forced.
-- [Live fleet check](docs/LIVE_FLEET.md): up to 1,024 concurrent bots on real providers through one daemon, and 64 bots sustained for five minutes with no drift. These are short-context turns; they establish a lightweight runtime, not coding-agent capacity.
+- [Live fleet check](docs/LIVE_FLEET.md): up to 1,024 concurrent bots on real providers through one daemon, 64 bots sustained for five minutes with no drift, and 10,000 bots through one key at the provider's own rate with no failures. These are short-context turns; they establish a lightweight runtime, not coding-agent capacity.
 - [FX measurements](docs/FX_MEASUREMENTS.md): native embedded FX versus Rust with identical conversation content and explicit protocol differences.
 - [Comparison contract](docs/COMPARISON_CONTRACT.md): feature inventory and enforced comparison rules.
 - [Long histories](docs/LONG_HISTORY.md): full retained conversation versus bounded model context.

@@ -171,25 +171,24 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    2 MiB page cache means the hot indexes eventually stop fitting; the screen
    should find where that cliff is and how WAL checkpoints behave under hours
    of writes. Seeding costs no provider spend, only background time.
-4. A 10,000-bot screen, the headline claim. Every run so far has 1,024 bots
-   in flight or 4,000 parked on a synthetic provider; the goal is an order of
-   magnitude more, and most of them exist and wait rather than sit mid-call.
-   One store, 10,000 bots created and submitted through the protocol (not
-   CLI processes), `--max-active` well below that, a real provider on the
-   cheap model: admission queueing under `--max-active`, memory per parked
-   and per active bot, submission rate, and a restart with thousands of
-   queued turns and its recovery time. A few dollars of spend. The same
-   shape, on the synthetic provider, is where the first heap profile
-   belongs: a dhat build behind a cargo feature, recording live bytes by
-   allocation site at peak, so the daemon's memory is attributed to
-   connections, per-turn buffers, store jobs, and parked state from
-   measurement rather than inference, and RSS minus live heap shows how much
-   is allocator retention and mapped code. The shaving list, and which knobs
-   trade memory for latency or throughput (read-ahead batch size, HTTP/2
-   windows, connection count, SQLite cache, allocator), comes out of that
-   profile; none of them should be turned before it exists. For a fleet the
-   order is memory per agent, then CPU per model call, then harness latency,
-   which is already milliseconds against the provider's seconds.
+4. Done: the [ten-thousand-bot screen](LIVE_FLEET.md#ten-thousand-bots)
+   through the protocol. Synthetic: 10,000 bots created in 1.5 s, all
+   submitted with 1,024 in flight throughout at 1,470 turns per second,
+   5,000 parked on one anchor for 0.8 KB each, a restart with 840 in flight
+   ready in 154 ms. The [heap profile](DAEMON_MEASUREMENTS.md#heap-profile-at-the-fleet-peak)
+   at that peak attributes 34 MiB live: three quarters is HTTP/1.1
+   per-connection state that real HTTP/2 providers do not incur, the
+   daemon's own per-active-turn cost is a 3.1 KB task future, and RSS
+   exceeds the live heap by about 25 MiB of allocator retention and mapped
+   code. Live on gpt-5.6-luna the burst spent this organization's
+   allowance, 5,000 requests and 4,000,000 tokens per minute, in five
+   seconds; 8,039 of 10,000 turns were refused, and the provider's edge
+   reset streams en masse, which the HTTP/2 client's flood protection turned
+   into whole-connection failures. In-stream rate limits are now
+   `provider_rate_limited`. The next fleet run should follow item 10, not
+   precede it. The shaving order, if a workload ever needs it: the turn
+   future's size, HTTP/1.1 buffers only for such a provider, then the
+   allocator.
 5. Bound accepted background work, not only running processes. `--max-processes`
    caps subprocesses that are running, but a background `shell` call spawns
    its task immediately and that task waits for a process permit, with a
@@ -246,7 +245,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    deltas, tool events, interrupt, and resume are all already in the
    protocol. This is the human way in; software keeps the protocol. Queued
    here because it is wanted soon, not because it changes capacity.
-10. Provider failure policy and pacing, the flood-control slice. 503s and one
+10. Done: [pacing and retries](RUST_PROTOTYPE.md#pacing-and-retries), the
+    flood-control slice. Per-provider, per-model pools learned from the
+    providers' own rate-limit headers, a fair FIFO gate at the model-call
+    boundary, estimate-then-correct token accounting, refusals that hold the
+    pool rather than fail the turn, bounded retries at the call boundary
+    with backoff and spread, `retries` and `paced_ms` per turn, and 64
+    streams per connection. The [matched follow-up](DAEMON_MEASUREMENTS.md#pacing-review-fixes)
+    records CPU, memory, latency, and measurement noise after the review fixes; the
+    live ten-thousand-bot rerun is recorded in
+    [LIVE_FLEET.md](LIVE_FLEET.md#ten-thousand-bots-paced). The original
+    design notes follow. Provider failure policy and pacing, the flood-control slice. 503s and one
    burst of transport failures each became a failed turn for the caller to
    resubmit. The fundamental concept is per-provider pacing: a rate and an
    in-flight cap per provider that every call, first attempt or retry, passes
@@ -265,7 +274,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    hosts on one provider key, and a small random spread on retry and resume
    delays covers that. No rate limit has been reached yet; the 10,000-bot
    screen may find one, and that run should come first so the policy is
-   shaped by an observed limit. Retries happen at the model-call boundary,
+   shaped by an observed limit: gpt-5.6-luna on this organization allows
+   5,000 requests and 4,000,000 tokens per minute, reported inside the
+   stream as `rate_limit_exceeded` with "please try again in N ms" in the
+   message and no header; the pace has to parse that. Retries happen at the model-call boundary,
    never by replaying a turn, and are observable: attempt counts, provider
    request ids, and retry delays in the turn record. Leaving retries off by
    default is acceptable while the policy is new.

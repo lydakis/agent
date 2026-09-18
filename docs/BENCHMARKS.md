@@ -205,6 +205,67 @@ environment and is never printed or stored.
 Results are `live_fleet_v1` records with the binary hash. See
 [LIVE_FLEET.md](LIVE_FLEET.md) for the recorded runs and their limits.
 
+## The 10,000-bot shape
+
+`bench.fleet_screen` runs the shape the goal is about: many bots exist, a
+bounded set is active, most wait. Everything goes through the daemon's stdio
+protocol, never CLI processes. Phases: create N bots; submit every bot once
+with `--max-active` bounding the live set, retrying the daemon's
+`active_agent_limit` refusals as turns finish; park P bots on one anchor turn
+the synthetic model holds open, then release it; submit a bounded wave held
+open by the provider, kill the daemon, confirm exit, and time recovery. Daemon
+RSS, threads, and open files are sampled from outside throughout. Synthetic by default with `--delay-ms` making replies
+slow enough that turns actually overlap at the bound; `--model` runs the burst
+against a real provider with the key from the environment. `--no-restart`
+keeps the daemon's exit clean for a heap profile. Synthetic parking requires
+`--max-active` of at least two, or zero for unbounded admission: the held
+anchor occupies one slot. A one-slot parking configuration is rejected before
+creating the workspace or starting the daemon.
+
+With `--max-active 0`, the driver submits up to the whole fleet before waiting
+for completions. Positive values cap outstanding submissions at that value.
+Earlier screens using zero incorrectly serialized submissions; discard those
+zero-limit runs as concurrency evidence. This is a driver correction.
+
+Results use `fleet_screen_v4`: `completed` counts only successful turns,
+`failed` counts all other terminal outcomes, and `finished` is their sum.
+`turns_per_second` measures successful work; `finished_per_second` includes
+failures. Latency runs from immediately before an accepted submission to the
+controller reader's receipt of its terminal event, including submission
+acknowledgment time and excluding later batch-processing delay. Percentiles
+include all finished outcomes. Earlier v1/v2 latency numbers used batch
+processing time and are not comparable to this boundary. The v4 restart phase
+holds `min(bots, max-active)` turns open (all bots when the limit is zero),
+waits for process exit before reopening the store, and verifies that every
+submitted bot recovered as interrupted. It works with a single bot and is
+independent of reply latency. Its controlled recovery workload differs from
+v1–v3, which tried to kill after half the fleet finished; do not compare their
+restart timings as matched work. Earlier v1 captures named all finished turns
+`completed`; their failure counts remain in `refusals` and must be subtracted when interpreting successful throughput.
+
+```sh
+.local/venv/bin/python -m bench.fleet_screen --bots 10000 --max-active 1024 \
+  --parked 5000 --delay-ms 500 --out .local/bench/fleet-screen-10k
+```
+
+`bench.heap_profile` reads the dhat JSON written by a daemon built with the
+`heap-profile` feature and `AGENT_HEAP_PROFILE=path`, and prints live bytes at
+the global peak by owning frame in this crate and by innermost allocation
+site. The profiling build keeps debug info and lives in its own target
+directory so the measured binary is untouched:
+
+```sh
+CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=1 \
+  cargo build --release --features heap-profile --target-dir .local/target-dhat
+AGENT_HEAP_PROFILE=$PWD/.local/bench/heap.json .local/venv/bin/python -m bench.fleet_screen \
+  --binary .local/target-dhat/release/agent --bots 10000 --max-active 1024 \
+  --parked 5000 --delay-ms 5000 --no-restart --out .local/bench/fleet-screen-heap
+.local/venv/bin/python -m bench.heap_profile .local/bench/heap.json
+```
+
+Allocation tracing slows the daemon by an order of magnitude, so the profiled
+run uses a long reply delay to reach the same overlap; its timings mean nothing.
+
 ## Sustained live load
 
 `bench.sustained` keeps N bots taking turns back to back for M minutes through

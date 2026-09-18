@@ -70,9 +70,25 @@ impl State {
                             .as_str()
                             .map(str::to_owned)
                     });
+                // A rate limit refused inside the stream is a distinct outcome
+                // from a response the model could not finish: it is the
+                // provider's pace, not the request, and a fleet must see it.
+                let rate_limited = (event.kind == "error"
+                    && value["code"].as_str() == Some("rate_limit_exceeded"))
+                    || [&value["error"], &value["response"]["error"]]
+                        .iter()
+                        .any(|error| error["code"].as_str() == Some("rate_limit_exceeded"))
+                    || detail
+                        .as_deref()
+                        .is_some_and(|d| d.starts_with("Rate limit reached"));
+                let code = if rate_limited {
+                    "provider_rate_limited"
+                } else {
+                    "provider_incomplete"
+                };
                 match detail {
-                    Some(detail) => fail_with("provider_incomplete", detail),
-                    None => fail("provider_incomplete"),
+                    Some(detail) => fail_with(code, detail),
+                    None => fail(code),
                 }
             }
             // Metadata and tool argument deltas are represented by the
@@ -212,5 +228,26 @@ mod tests {
             (failed.code.as_str(), failed.detail.as_deref()),
             ("provider_incomplete", Some("quota"))
         );
+        let limited = State::default()
+            .frame(br#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached for m on tokens per min (TPM): Limit 4000000"}}}"#)
+            .unwrap_err();
+        assert_eq!(limited.code, "provider_rate_limited");
+        assert!(limited.detail.unwrap().contains("TPM"));
+    }
+    #[test]
+    fn rate_limit_codes_do_not_depend_on_message_wording() {
+        for frame in [
+            r#"{"type":"error","code":"rate_limit_exceeded","message":"Please try again in 10ms.","param":null,"sequence_number":1}"#,
+            r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"Please try again in 10ms."}}"#,
+            r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Please try again in 10ms."}}}"#,
+        ] {
+            let error = State::default().frame(frame.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "provider_rate_limited", "{frame}");
+            assert_eq!(error.detail.as_deref(), Some("Please try again in 10ms."));
+        }
+        let error = State::default()
+            .frame(br#"{"type":"error","code":"invalid_request_error","message":"Invalid input."}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "provider_incomplete");
     }
 }

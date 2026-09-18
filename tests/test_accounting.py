@@ -13,6 +13,30 @@ from tests.test_runtime import ModelFixture
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AccountingTests(ModelFixture):
+    def test_failed_attempt_usage_limits_retries_and_later_tool_rounds(self):
+        client = self.client('echo')
+        # Each attempt reports 110 tokens. Check before the retry, after a
+        # successful tool call, and allow completion with sufficient budget.
+        for budget, calls, status in ((100, 1, 'failed'), (220, 2, 'failed'), (330, 3, 'completed')):
+            with self.subTest(budget=budget):
+                prior_calls = self.model.requests.qsize()
+                bot = f'Budget{budget}'
+                client.request('create', bot=bot, workspace=str(self.path), budget_tokens=budget)
+                turn = client.request('submit', bot=bot, request_id='run',
+                                      prompt=f'tool:billed-retry:{budget}')['result']['turn']
+                data = client.finished(turn)['data']
+                self.assertEqual(data['status'], status)
+                if status == 'failed':
+                    self.assertEqual(data['error'], 'budget_exhausted')
+                row = client.request('turns', bot=bot)['result']['turns'][0]
+                self.assertEqual((row['model_rounds'], row['input_tokens'], row['output_tokens']),
+                                 (calls, calls * 100, calls * 10))
+                self.assertEqual(row['retries'], int(calls > 1))
+                self.assertEqual(self.model.requests.qsize() - prior_calls, calls)
+                self.assertEqual(client.request('resume', bot=bot)['result']['tokens_used'], calls * 110)
+                page = client.request('events', bot=bot, after=0, limit=256)['result']['events']
+                self.assertEqual(sum(e['event'] == 'tool_completed' for e in page), int(calls > 1))
+
     def tool_output(self, client, bot, call_id):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         node = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]['data']['node']

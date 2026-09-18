@@ -15,7 +15,10 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 mod anthropic;
+pub mod pace;
 mod responses;
+
+pub use pace::Report;
 
 pub const MAX_OUTPUT: usize = 512 * 1024;
 const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
@@ -24,7 +27,9 @@ const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
 /// providers advertise in SETTINGS_MAX_CONCURRENT_STREAMS. Requests beyond
 /// it on the same connection queue in the HTTP layer, so a fleet needs
 /// several connections per provider to actually run in parallel.
-pub const STREAMS_PER_CONNECTION: usize = 100;
+/// Both providers advertise 100; using fewer per connection bounds how many
+/// turns one reset connection takes with it.
+pub const STREAMS_PER_CONNECTION: usize = 64;
 
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
@@ -104,6 +109,8 @@ impl Transport {
 #[derive(Clone)]
 pub struct Provider {
     transport: Arc<Transport>,
+    /// One pace per model behind this provider, shared by every clone.
+    pools: Arc<pace::Pools>,
     family: Family,
     url: reqwest::Url,
     key: Option<String>,
@@ -209,6 +216,7 @@ impl Provider {
         let encoded = serde_json::to_string(&family.tools(tools))?;
         Ok(Self {
             transport,
+            pools: Arc::new(pace::Pools::default()),
             family,
             url,
             key,
@@ -336,7 +344,8 @@ impl Provider {
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        self.complete_accounted(request, delta, &mut None).await
+        self.complete_accounted(request, delta, &mut Report::default())
+            .await
     }
 
     /// Also return provider-reported usage when a stream or completion fails.
@@ -345,14 +354,14 @@ impl Provider {
         &self,
         request: Request<'_>,
         delta: F,
-        usage: &mut Option<Usage>,
+        report: &mut Report,
     ) -> Result<Completion>
     where
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        *usage = None;
-        self.complete_inner(request, delta, usage)
+        *report = Report::default();
+        self.complete_inner(request, delta, report)
             .await
             .map_err(|error| sanitize_error(error, self.key.as_deref()))
     }
@@ -361,12 +370,22 @@ impl Provider {
         &self,
         request: Request<'_>,
         mut delta: F,
-        usage: &mut Option<Usage>,
+        report: &mut Report,
     ) -> Result<Completion>
     where
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
+        // Pace first: the provider's allowance is the scarce resource, and
+        // the estimate is what the request will bill at most, corrected by
+        // the usage the response reports.
+        let pace = self.pools.get(request.model);
+        let prefix = self.prefix(&request)?;
+        let estimate = ((prefix.len() + request.items.bytes) / 4) as u64
+            + u64::from(self.max_output_tokens.unwrap_or(512));
+        let mut reservation = pace
+            .acquire_reported(estimate, &mut report.paced_ms)
+            .await?;
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
         let admission =
@@ -374,7 +393,6 @@ impl Provider {
                 .await
                 .map_err(|_| Error::new("provider_admission_timeout"))?
                 .map_err(|_| Error::new("provider_admission_closed"))?;
-        let prefix = self.prefix(&request)?;
         let (body, len) = self.body(prefix, request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -394,13 +412,44 @@ impl Provider {
             }
             (Family::Responses, None) => http,
         };
-        let response = http.send().await.map_err(connection_error)?;
+        reservation.dispatch();
+        report.dispatched = true;
+        let response = match http.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                reservation.settle(0);
+                return Err(connection_error(error));
+            }
+        };
         drop(admission);
         if !response.status().is_success() {
-            let code = format!("provider_http_{}", response.status().as_u16());
-            let detail = error_detail(response).await;
-            return Err(Error { code, detail });
+            let status = response.status().as_u16();
+            let headers = response.headers().clone();
+            let body = error_body(response).await.unwrap_or_default();
+            let quota = status == 429 && body.quota;
+            if !quota {
+                reservation.learn(&headers, self.family);
+            }
+            if matches!(status, 429 | 529) && !quota {
+                let after = headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+                pace.limited(after);
+            }
+            reservation.settle(0);
+            let code = if quota {
+                "provider_quota_exhausted".to_owned()
+            } else {
+                format!("provider_http_{status}")
+            };
+            return Err(Error {
+                code,
+                detail: body.detail,
+            });
         }
+        reservation.learn(response.headers(), self.family);
         if response
             .headers()
             .get("content-type")
@@ -441,9 +490,23 @@ impl Provider {
             Ok(())
         }
         .await;
-        *usage = parser.usage();
+        report.usage = parser.usage();
+        let billed = report
+            .usage
+            .as_ref()
+            .map_or(estimate, |u| u.input_tokens.saturating_add(u.output_tokens));
+        reservation.settle(billed);
+        if let Err(error) = &result
+            && error.code == "provider_rate_limited"
+        {
+            pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+        }
         result?;
-        parser.finish()
+        parser.finish().inspect_err(|error| {
+            if error.code == "provider_rate_limited" {
+                pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+            }
+        })
     }
 }
 
@@ -494,7 +557,13 @@ fn connection_error(error: reqwest::Error) -> Error {
 
 /// Capture only a complete, bounded error body. A partial body may end in a
 /// credential, so never publish it as a fallback diagnostic.
-async fn error_detail(response: reqwest::Response) -> Option<String> {
+#[derive(Default)]
+struct ErrorBody {
+    detail: Option<String>,
+    quota: bool,
+}
+
+async fn error_body(response: reqwest::Response) -> Option<ErrorBody> {
     let expects_json = response
         .headers()
         .get("content-type")
@@ -522,16 +591,24 @@ async fn error_detail(response: reqwest::Response) -> Option<String> {
         return None;
     }
     match serde_json::from_str::<Value>(text) {
-        Ok(value) => value
-            .as_str()
-            .or_else(|| value["error"]["message"].as_str())
-            .or_else(|| value["error"].as_str())
-            .or_else(|| value["message"].as_str())
-            .map(str::to_owned),
+        Ok(value) => Some(ErrorBody {
+            quota: ["code", "type"]
+                .iter()
+                .any(|field| value["error"][field].as_str() == Some("insufficient_quota")),
+            detail: value
+                .as_str()
+                .or_else(|| value["error"]["message"].as_str())
+                .or_else(|| value["error"].as_str())
+                .or_else(|| value["message"].as_str())
+                .map(str::to_owned),
+        }),
         // Never fall back to a serialized JSON representation: alternate
         // escapes could conceal a credential from exact text redaction.
         Err(_) if expects_json || text.starts_with(['{', '[', '"']) => None,
-        Err(_) => Some(text.to_owned()),
+        Err(_) => Some(ErrorBody {
+            detail: Some(text.to_owned()),
+            quota: false,
+        }),
     }
 }
 

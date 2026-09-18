@@ -29,6 +29,25 @@ class Model(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/responses'
             assert request['model'] == 'synthetic-model'
             user = [i for i in request['input'] if i.get('role') == 'user'][-1]['content'][0]['text']
+            attempts = getattr(self.server, 'attempts', {})
+            attempt = attempts[user] = attempts.get(user, 0) + 1
+            self.server.attempts = attempts
+            if (user.startswith(('flaky:', 'limited:', 'waitretry:')) and attempt == 1) or user.startswith('limited-forever:'):
+                # Transport-level refusals: a 503 the next attempt clears, a
+                # 429 with Retry-After, or a 429 that never lifts.
+                body = json.dumps({'error': {'message': 'try later'}}).encode()
+                self.send_response(503 if user.startswith(('flaky:', 'waitretry:')) else 429)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                if not user.startswith(('flaky:', 'waitretry:')):
+                    delays = getattr(self.server, 'retry_delays', ['0.05'])
+                    self.send_header('Retry-After', delays[min(attempt - 1, len(delays) - 1)])
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if user == 'flaky:gate':
+                self.server.gate_entered.set()
+                self.server.release_headers.wait(timeout=5)
             if user == 'gate':
                 self.server.release_headers.wait(timeout=5)
             if user == 'wait':
@@ -81,10 +100,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'p' * self.server.history_prefill
                     output.insert(0, {'type': 'message', 'role': 'assistant',
                                       'content': [{'type': 'output_text', 'text': text}]})
-            elif user.startswith('wait:'):
+            elif user.startswith(('wait:', 'waitretry:')):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
-                           'arguments': json.dumps({'handles': user[5:].split(',')})}]
+                           'arguments': json.dumps({'handles': user.split(':', 1)[1].split(',')})}]
             elif user.startswith('waitgate:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
@@ -129,9 +148,25 @@ class Model(http.server.BaseHTTPRequestHandler):
                 events = [{'type': 'response.incomplete', 'response': {'status': 'incomplete',
                     'incomplete_details': {'reason': 'max_output_tokens'}, 'output': [],
                     'usage': {'input_tokens': 100, 'output_tokens': 10}}}]
+            if user.startswith('streamlimit:') and attempt == 1:
+                # A rate limit the provider reports inside the stream.
+                events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
+                    'code': 'rate_limit_exceeded', 'message': 'Rate limit reached. Please try again in 300ms.'}}}]
+            if user.startswith('streamlimit-flat:') and attempt == 1:
+                events = [{'type': 'error', 'code': 'rate_limit_exceeded',
+                           'message': 'Please try again in 300ms.', 'param': None, 'sequence_number': 1}]
+            if user.startswith('tool:billed-retry:') and attempt == 1:
+                events = [{'type': 'response.failed', 'response': {'status': 'failed',
+                    'usage': {'input_tokens': 100, 'output_tokens': 10}, 'error': {
+                    'code': 'rate_limit_exceeded', 'message': 'Please try again in 1ms.'}}}]
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Transfer-Encoding', 'chunked')
+            if user.startswith('paced:'):
+                # The allowance is spent; the daemon must hold the next call.
+                self.send_header('x-ratelimit-limit-tokens', '60000')
+                self.send_header('x-ratelimit-remaining-tokens', '0')
+                self.send_header('x-ratelimit-reset-tokens', '400ms')
             self.end_headers()
             if user == 'burst':
                 text = 'reply:burst'
@@ -751,6 +786,47 @@ class RuntimeTests(ModelFixture):
             # No retry or sleep after the terminal event should be necessary.
             self.assertIn('result', client.request('delete', bot='Bob'))
             later = new
+
+    def test_transient_failures_are_retried_and_rate_limits_pace_the_pool(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+
+        def run(prompt, timeout=15):
+            response = client.request('submit', bot='Bob', request_id=prompt.replace(':', '-'), prompt=prompt)
+            turn = response['result']['turn'] if 'result' in response else self.fail(response)
+            finished = client.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout=timeout)
+            retries = [m for m in client.saved if m.get('event') == 'retry' and m.get('turn') == turn]
+            client.saved.clear()
+            return finished['data'], retries
+
+        for prompt, code in (('flaky:1', 'provider_http_503'), ('limited:1', 'provider_http_429'),
+                             ('streamlimit:1', 'provider_rate_limited'),
+                             ('streamlimit-flat:1', 'provider_rate_limited')):
+            with self.subTest(prompt=prompt):
+                data, retries = run(prompt)
+                self.assertEqual(data['status'], 'completed', data)
+                self.assertEqual([(r['attempt'], r['error']) for r in retries], [(1, code)])
+        turns = client.request('turns', bot='Bob')['result']['turns']
+        self.assertEqual([t['retries'] for t in turns], [1, 1, 1, 1])
+        self.assertGreaterEqual(turns[1]['paced_ms'], 40)   # the retry waited for the pool's Retry-After
+        self.assertGreaterEqual(turns[2]['paced_ms'], 250)  # and for the delay named in the stream
+        self.assertGreaterEqual(turns[3]['paced_ms'], 250)  # top-level error uses the same pool delay
+        # Headers saying the allowance is spent pace the next call; nothing fails.
+        self.assertEqual(run('paced:1')[0]['status'], 'completed')
+        data, retries = run('hello')
+        self.assertEqual((data['status'], retries), ('completed', []))
+        held = client.request('turns', bot='Bob')['result']['turns'][-1]
+        self.assertEqual(held['retries'], 0)
+        self.assertGreaterEqual(held['paced_ms'], 300)
+        # A response the model could not finish is final, not retried.
+        data, retries = run('incomplete')
+        self.assertEqual((data['status'], data['error'], retries), ('failed', 'provider_incomplete', []))
+        # A refusal that never lifts is bounded: 64 paced attempts, each held
+        # for the provider's Retry-After, then the turn fails with the refusal.
+        data, retries = run('limited-forever:1', timeout=60)
+        self.assertEqual((data['status'], data['error']), ('failed', 'provider_http_429'))
+        self.assertEqual(len(retries), 63)
+        self.assertEqual(client.request('turns', bot='Bob')['result']['turns'][-1]['retries'], 63)
 
     def test_premature_provider_eof_cannot_be_a_successful_checkpoint(self):
         client = self.client()

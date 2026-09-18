@@ -95,7 +95,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 12;
+    pub const SCHEMA: i32 = 13;
 
     pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
         conn.execute_batch(
@@ -150,6 +150,7 @@ impl Database {
                 workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
+                retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
@@ -1444,6 +1445,15 @@ impl Database {
     }
     /// A bot's turns in id order, paged by `after`, with accounting a program
     /// needs without replaying events.
+    /// Flush an execution segment's retry and pacing accounting once when it
+    /// finishes, is interrupted, or parks; zero counters need no write.
+    pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE turns SET retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
+            params![retries as i64, paced_ms as i64, turn],
+        )?;
+        Ok(())
+    }
     pub fn turns(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
         if after < 0 || !(1..=256).contains(&limit) {
@@ -1452,7 +1462,8 @@ impl Database {
         let mut statement = self.conn.prepare(
             "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,b.provider||'/'||b.model),t.input_tokens,t.output_tokens,
-                    t.model_rounds,t.started_ms,t.finished_ms,substr(t.prompt,1,200),length(t.prompt)
+                    t.model_rounds,t.started_ms,t.finished_ms,substr(t.prompt,1,200),length(t.prompt),
+                    t.retries,t.paced_ms
              FROM turns t JOIN bots b ON b.name=t.bot WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
         let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
@@ -1470,7 +1481,8 @@ impl Database {
                 "model":r.get::<_, String>(4)?,"input_tokens":r.get::<_, i64>(5)?,
                 "output_tokens":r.get::<_, i64>(6)?,"model_rounds":r.get::<_, i64>(7)?,
                 "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
-                "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?}),
+                "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
+                "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?}),
             );
         }
         let next = more.then(|| {
@@ -1718,6 +1730,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                  UNION SELECT turn FROM processes
                  UNION SELECT turn FROM events WHERE turn IS NOT NULL) r ON r.turn=t.id;",
         )?;
+    }
+    if from < 13 {
+        // 12 -> 13: retries and pacing delay per turn. Added only when
+        // missing, so a store whose version was reset keeps working.
+        let present: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('turns')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for column in ["retries", "paced_ms"] {
+            if !present.iter().any(|c| c == column) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE turns ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
+        }
     }
     Ok(())
 }

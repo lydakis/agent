@@ -753,3 +753,408 @@ failed with a scan of the affected table. Its summary reports the actual
 SQLite version; plans can differ from the daemon's bundled version. The timing
 table above remains the initial observation, not a new runtime benchmark.
 These audit fixes change no daemon code or runtime work.
+
+## Heap profile at the fleet peak
+
+Observed 2026-09-16 on the same host with a dhat build of the daemon
+(`--features heap-profile`, debug info kept, own target directory) running the
+synthetic ten-thousand-bot shape: 10,000 bots, `--max-active 1024`, 5,000
+parked, replies held 5 s so the bound stayed full under the profiler's
+order-of-magnitude slowdown. The profile records every allocation's stack;
+`bench.heap_profile` attributes the bytes live at the global peak, which came
+73 s into a 156 s run with 1,024 turns in flight.
+
+Live at the peak: 34.22 MiB. Sampled RSS at the same phase was about 59 MiB,
+so roughly 25 MiB of the process is allocator retention, mapped code, thread
+stacks, and the SQLite cache rather than live data.
+
+| Bytes at peak | Share | What |
+| ---: | ---: | --- |
+| 8.78 MiB | 25.7% | hyper's per-connection request dispatch channel (a preallocated block per connection) |
+| 8.00 MiB | 23.4% | hyper's HTTP/1.1 read buffer, 8 KiB per connection |
+| 8.00 MiB | 23.4% | hyper's HTTP/1.1 write buffer, 8 KiB per connection |
+| 3.11 MiB | 9.1% | the boxed turn task: the turn loop's future, about 3.1 KB per active turn |
+| 1.06 MiB | 3.1% | reqwest's connection wrappers |
+| 1.02 MiB | 3.0% | byte copies (request and response bodies in flight) |
+| 0.93 MiB | 2.7% | bot records loaded for turns in flight |
+| 0.61 MiB | 1.8% | hyper's connection tasks |
+| 0.41 MiB | 1.2% | one cancellation channel per active turn |
+| under 0.1 MiB | | everything in this crate's own allocations |
+
+By crate: tokio 39%, hyper 25%, bytes 24%, reqwest 3%, this crate 0.3%.
+
+What it says: at 1,024 in flight about 25 MiB, three quarters of the live
+heap, is HTTP/1.1 per-connection state, because the synthetic provider speaks
+HTTP/1.1 and each in-flight request holds a connection. Real providers speak
+HTTP/2 over the 41 sharded connections, so that block does not scale with
+turns there, which is consistent with the 41 MiB peak at 1,024 live turns on
+OpenAI. The daemon's own cost per active turn is the 3.1 KB task future plus
+a few hundred bytes of channels; per parked turn it is under 1 KB; per bot
+that merely exists it is nothing resident. The shaving list this yields, in
+order of what it would buy: the turn future's size (boxing its large arms),
+which is the only per-turn term the daemon controls; hyper's HTTP/1.1 buffer
+sizes if an HTTP/1.1 provider ever matters; and allocator retention, which is
+the largest gap between live heap and RSS and would need a different
+allocator to test. None of these is worth taking before a workload needs it.
+Capture: ignored `.local/bench/fleet-screen-10k-heap.json` with the run's
+`fleet-screen-10k-heap/`.
+
+## Pacing slice regression check
+
+Observed 2026-09-16 on the same Darwin arm64 host, external power, Rust
+1.98.0. The 32-agent socket echo workload as before, one excluded warmup and
+three measured runs, on the pacing binary `58b839a5…` (per-model pools with a
+fair gate at every model call, header learning, retries, 64 streams per
+connection; the final binary `6f1b1429…` differs only in how a learned level
+is merged and how the retry budget is counted, neither on the hot path). All runs passed with 32 concurrent provider requests and no
+quality warnings. The synthetic provider sends no rate-limit headers, so the
+pools stay unbounded and every call pays the gate's lock and arithmetic and
+nothing else, which is the common path on a provider that has not refused.
+
+| Metric | Query-plan check | This binary |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.52 (17.52–17.69) | 17.59 (17.59–17.69) |
+| Observed target CPU, seconds | 0.289 (0.287–0.294) | 0.328 (0.322–0.335) |
+| Per-run p95 turn latency, ms | 602.2 (591.6–602.6) | 598.7 (596.0–604.4) |
+
+RSS and latency are unchanged. CPU is 39 ms higher over 192 calls, about
+0.2 ms per call, which is more than the gate should cost and within the
+spread this screen has shown between runs of the same binary before (0.289
+to 0.328 across earlier checks); it is recorded, not explained, and the
+next screen on an unchanged hot path will say whether it persists. Capture:
+ignored `.local/bench/slice-pacing-socket-32/`.
+
+## Pacing review fixes
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. The
+review fixes reject token estimates above a learned allowance instead of
+holding the model's queue forever, count failed-attempt usage before retries
+and later tool rounds, and separate successful work from failed terminal
+outcomes in `fleet_screen_v2`. Budget checks update the loaded bot record;
+they add no store reads or writes to successful model calls.
+
+The final matched screen compares the original pacing binary `6f1b1429…`
+with the fixed binary `f42ec74a…`. Seven before/after pairs alternate order;
+each run warms up for 16 turns and measures 1,000 turns on one bot, two model
+calls per turn, an eight-item context window, and eight retained turns.
+The local synthetic provider uses TCP_NODELAY. CPU is the daemon's user plus
+system time over the measured turns; peak RSS is sampled every 10 ms.
+All 14,000 measured turns completed. Each run sent 2,000 model requests with
+identical normalized payload hashes and 3,465,230 normalized request bytes.
+There were no credentials or paid calls.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms/turn | 1.854 | 1.902 |
+| Sampled peak daemon RSS, MiB | 13.078 | 13.125 |
+| Per-run p95 turn latency, ms | 3.048 | 3.017 |
+
+CPU was 2.6% higher, RSS 48 KiB higher, and p95 latency 1.0% lower. Treat
+this as roughly flat on this workload, not an established speedup or a claim
+about long-context fleet capacity. The deterministic improvements are removal
+of an indefinite queue stall and prevention of calls after reported usage
+exhausts a bot's budget.
+
+An earlier 32-bot socket comparison included the pre-pacing commit `608e11f`,
+the original pacing binary, and an initial fix candidate `32f6dfc2…`: one
+warmup and five measured runs each. Every run verified 192 model calls,
+96 tool results, 32 overlapping provider requests, replay/follower equality,
+and matching request/response byte counts. Five of the 15 measured runs
+triggered sampling-overhead warnings, and tail latency varied substantially;
+those results do not establish a speedup or explain the earlier 13% CPU
+difference. Shorter sequential screens also showed enough variation to
+motivate the longer, balanced final comparison above.
+
+Validation: 56 Rust tests, strict Clippy, the budget/retry integration
+regressions, mixed-outcome benchmark accounting, and a synthetic fleet
+creation/run/park/restart check passed. Captures and scripts are ignored under
+`.local/pacing-fix/`: the socket comparison at the root, exploratory sequential
+runs in `sustained/` and `recheck/`, and the final comparison in `final/`.
+
+## Allowance and retry accounting fixes
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. This
+follow-up compares `f42ec74a…` with `d87b5b04…` using the same sequential
+echo contract above: seven alternating before/after pairs, 16 warmup turns
+and 1,000 measured turns per run, two model calls per turn, an eight-item
+context window, and eight retained turns. All 14,000 turns completed;
+every run had the same normalized request hash and 3,465,230 request bytes.
+The provider is synthetic and local; no credentials or paid calls were used.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms/turn | 1.973 | 2.009 |
+| Sampled peak daemon RSS, MiB | 13.109 | 13.125 |
+| Per-run p95 turn latency, ms | 3.244 | 3.380 |
+
+CPU rose 1.8%, peak RSS 16 KiB, and p95 latency 4.2%. The per-run ranges
+overlap for all three metrics; this screen shows roughly flat cost, not a
+normal-path speedup or proof of exact performance equality. Reservation
+accounting uses a counter and notification per model pool and a stack guard
+per call; the turn-wide round check adds no database operations.
+
+A separate matched allowance probe ran three sequential calls on fresh bots,
+with a 1,000-token/minute limit, an 800-token output cap, and ten billed tokens
+per call. Headers reported 990, 980, then 970 tokens remaining. The third
+turn fell from 49,927 ms before the fix to 1.46 ms after it, with identical
+request-body hashes. This is one deterministic stall reproduction, not a
+general throughput ranking; its logs are in `allowance-results.json`.
+
+The behavioral improvements are removal of false allowance stalls, immediate
+failure for a recognized permanent quota error instead of 64 attempts, and
+enforcing 200 durable model rounds where the alternating billed-failure/tool
+fixture previously made 400 calls. Committed tool plans still execute at the
+limit. Cancellation releases reservations, settlement wakes waiting callers,
+and out-of-order high token balances cannot replenish spent allowance.
+
+Validation: all 58 Rust tests, strict Clippy with all features, and 13 focused
+Python integration tests passed, including error redaction, lifetime budgets,
+transient rate retries, and the round limit across parking and daemon restart.
+Captures, full binary hashes, and scripts are ignored under
+`.local/pacing-accounting-fix/`.
+
+## Streaming admission and benchmark timing fixes
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. Token
+headers now release their accounted reservation immediately, while the
+response may continue streaming. Reconciliation and release share one lock;
+completion or cancellation cannot refund it again. This removes a redundant
+completion-time lock on calls with token headers and adds no allocation or
+database operation.
+
+The matched normal-path screen compares `d87b5b04…` with `bcbc2516…` using
+the same seven alternating pairs described above: 16 warmup turns and 1,000
+measured turns per run, two model calls per turn, eight context items and
+eight retained turns. All 14,000 measured turns completed with identical
+normalized payload hashes and 3,465,230 request bytes per run.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms/turn | 1.854 | 1.852 |
+| Sampled peak daemon RSS, MiB | 13.125 | 13.188 |
+| Per-run p95 turn latency, ms | 2.859 | 2.869 |
+
+CPU fell 0.09%, p95 latency rose 0.33%, and sampled RSS rose 64 KiB. The
+per-run ranges overlap; this is effectively flat, not a normal-path speedup.
+
+A separate streaming probe used five alternating pairs. Each run submitted
+two identical requests on fresh bots with a 1,000-token/minute limit, an
+800-token output cap, ten billed tokens per call, and token-balance headers.
+The first stream stayed open for a controlled 300 ms after its first delta.
+Median submission-to-receipt latency for the second turn fell from 307.96 ms
+to 2.09 ms. It completed while the first stream was open in all five fixed
+runs and none of the baseline runs. Both binaries sent the same two request
+bodies in every run. This demonstrates removal of unnecessary serialization,
+not a general provider-throughput speedup.
+
+`fleet_screen_v3` separately corrects its latency boundary to submission
+through terminal-event receipt, excluding later observer batch delay. That
+measurement correction is not a runtime performance improvement. A regression
+with a one-second processing delay still reports the actual 20 ms turn time.
+One-slot parking is rejected before startup; an eight-bot, two-slot synthetic
+screen passed creation, completion, parking four turns, release, and restart.
+
+Validation: 58 Rust tests, 16 focused Python tests, strict all-feature Clippy,
+formatting, and diff checks passed. All provider traffic was synthetic and
+local, with no credentials or paid calls. Captures, scripts, and full binary
+hashes are ignored under `.local/streaming-pacing-fix/`.
+
+## Unsent reservation refunds and unbounded fleet submission
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. A pacing
+reservation now distinguishes waiting for an HTTP startup slot from dispatch.
+Cancellation or admission timeout before dispatch refunds its token estimate
+and any request allowance actually debited. After dispatch, existing header
+and usage accounting remains unchanged. This adds guard flags and arithmetic,
+with no new allocation, lock acquisition, or database operation.
+
+The normal-path screen compares `bcbc2516…` with `3f70009f…`: seven alternating
+pairs, 16 warmup turns and 1,000 measured turns per run, two synthetic model
+calls per turn, eight context items, and eight retained turns. All 14,000
+measured turns completed. Every run sent the same normalized payload hash and
+3,465,230 request bytes.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms/turn | 1.956 | 1.893 |
+| Sampled peak daemon RSS, MiB | 13.125 | 13.047 |
+| Per-run p95 turn latency, ms | 3.132 | 2.933 |
+
+CPU fell 3.2%, p95 latency 6.4%, and peak RSS 80 KiB. Per-run ranges overlap:
+CPU 1.879–2.012 versus 1.865–2.058 ms/turn; RSS 12.984–13.203 versus
+13.016–13.125 MiB; p95 2.877–3.187 versus 2.873–3.357 ms. This screen found
+no regression; it does not establish a statistically significant speedup.
+
+A separate cancellation probe warmed a 1,000-token/minute pool, occupied the
+single HTTP startup slot with another model, and interrupted a queued call
+with an 800-token output cap before it reached the provider. After releasing
+the slot, the next call remained blocked past the one-second observation
+window on the baseline; the fixed binary completed it in 1.98 ms. The provider
+confirmed that the cancelled request was never sent in either run. This is a
+bounded stall reproduction, not a general throughput comparison.
+
+The fleet-driver probe used the same current binary with eight bots,
+`--max-active 0`, and 100 ms synthetic replies. The old driver completed in
+0.85 s with one turn in flight; the corrected driver completed in 0.11 s with
+eight. This corrects the workload's concurrency, not runtime execution speed.
+
+Validation: 60 Rust tests, 18 focused Python tests, strict all-feature Clippy,
+formatting, and diff checks passed. Regression coverage includes cancellation,
+admission timeout, request limits learned while queued, and positive versus
+unbounded fleet submission. No credentials or paid providers were used.
+Scripts, captures, and full binary hashes are ignored under
+`.local/unsent-pacing-fix/`.
+
+## Request refunds and controlled restart recovery
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. Request
+allowance now uses reservation accounting alongside token allowance. A newer
+provider balance is reconciled net of pending requests before any cancellation
+refund, including requests acquired before a limit became known. Request
+reservations resolve at headers; absent request headers, the sent debit stays
+spent. The change adds one counter per model pool, with no new allocation,
+lock acquisition, or database operation.
+
+The matched screen compares `3f70009f…` with `67001acb…` in two modes: ordinary
+synthetic echo, and the same responses with request-limit headers (600,000 per
+minute, 100,000 remaining). Each mode has seven alternating before/after pairs,
+16 warmup turns and 1,000 measured turns per run, two calls per turn, eight
+context items, and eight retained turns. All 28,000 measured turns completed.
+Every run sent the same normalized payload hash and 3,465,230 request bytes.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Ordinary echo: daemon CPU, ms/turn | 1.896 | 1.897 |
+| Ordinary echo: sampled peak RSS, MiB | 13.094 | 13.094 |
+| Ordinary echo: per-run p95 latency, ms | 3.046 | 3.089 |
+| Request headers: daemon CPU, ms/turn | 1.865 | 1.867 |
+| Request headers: sampled peak RSS, MiB | 13.078 | 13.109 |
+| Request headers: per-run p95 latency, ms | 2.927 | 2.933 |
+
+CPU changed by +0.07% in both modes. P95 changed by +1.43% without request
+headers and +0.19% with them. Median sampled RSS was unchanged or up 32 KiB.
+Ranges overlap: ordinary CPU 1.851–2.178 versus 1.860–2.003 ms/turn, RSS
+13.016–13.156 versus 13.047–13.188 MiB, and p95 2.962–16.950 versus
+2.943–3.608 ms. With request headers, CPU was 1.859–1.900 versus 1.858–1.959,
+RSS 13.047–13.109 versus 13.094–13.141 MiB, and p95 2.902–3.167 versus
+2.902–3.594 ms. These screens show essentially flat overhead, not a speedup
+or proof of exact equality.
+
+The pacing regression uses a paused clock: after a fresh zero request balance
+and cancellation of an unsent call, the baseline admitted another request
+immediately. The fixed pool waits for the required one-second refill at
+60 requests/minute. Coverage also checks out-of-order reports and responses
+without request headers.
+
+`fleet_screen_v4` now submits a bounded wave of synthetic turns held open until
+the daemon is killed and its exit confirmed. It verifies that the expected
+number of bots recover as interrupted. This removes the half-completed-fleet
+race and works with a single bot. Restart timings have a new workload and
+must not be compared to v1–v3 as equivalent work. A full eight-bot, two-slot
+screen completed eight turns, parked four, drained five including the anchor,
+and recovered two interrupted bots. Separate restart regressions cover one
+bot, eight unbounded bots, and eight bots with a two-slot limit, followed by
+successful new work after recovery.
+
+Validation: 61 Rust tests, 19 focused Python tests, strict all-feature Clippy,
+formatting, and diff checks passed. All traffic was synthetic and local;
+no credentials or paid providers were used. Scripts, captures, and full binary
+hashes are ignored under `.local/request-restart-fix/`.
+
+## Retry accounting across interruption
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. Compare
+`67001acb…` with `64c2e927…`. Retry counters now outlive cancellation of a
+model-call future, include partially elapsed pacing waits, and flush once per
+execution segment on completion, failure, interruption, or parking. Unsent
+retries cancelled during backoff or admission do not count as dispatched
+attempts. An interrupt arriving during the flush is honored before retirement.
+Hard process termination can still lose the current segment's unflushed counters.
+
+The ordinary screen repeats the preceding section's contract: seven alternating
+pairs per mode, 16 warmup and 1,000 measured turns per run, two calls per turn,
+eight context items, and eight retained turns. All 28,000 measured turns
+completed. Each run sent the same normalized payload hash and 3,465,230 bytes.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Ordinary echo: daemon CPU, ms/turn | 1.622 | 1.626 |
+| Ordinary echo: sampled peak RSS, MiB | 13.094 | 13.141 |
+| Ordinary echo: per-run p95 latency, ms | 2.494 | 2.509 |
+| Request headers: daemon CPU, ms/turn | 1.599 | 1.608 |
+| Request headers: sampled peak RSS, MiB | 13.078 | 13.109 |
+| Request headers: per-run p95 latency, ms | 2.460 | 2.491 |
+
+CPU changed by +0.24% and +0.58%; p95 changed by +0.59% and +1.25%.
+Median sampled RSS increased by 48 KiB and 32 KiB. Run ranges overlap in
+all three metrics. This is effectively flat overhead within local variability,
+not proof of exact equality.
+
+A separate affected-path screen runs seven alternating pairs, one warmup and
+five measured turns per run, 256 context items, and eight retained turns. Each
+turn reaches the same `tool_round_limit` after 100 successful echo tool rounds
+and 100 billed retry failures. Both binaries record 100 retries, 200 model
+rounds, and 1,000 input plus 1,000 output tokens per turn. All 70 measured turns
+meet that contract; each run sends 1,000 requests, the same normalized payload
+hash, and 12,965,452 request bytes. Batching reduces accounting updates from
+100 to one per turn, while response, usage, and tool commits remain unchanged.
+
+| Retry-heavy screen, median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms/turn | 122.054 | 118.623 |
+| Per-run mean turn latency, ms | 179.159 | 175.454 |
+| Sampled peak RSS, MiB | 12.969 | 12.969 |
+
+CPU decreased 2.81%, improving in six of seven pairs. Mean turn latency
+decreased 2.07%, with substantial timing noise in two pairs. Memory was flat.
+This supports a modest CPU improvement for repeated retries across tool rounds;
+it is not a fleet-capacity or real-provider throughput claim.
+
+Validation: 61 Rust tests, 23 focused Python tests, strict all-feature Clippy,
+formatting, and diff checks passed. Three cancellation regressions fail against
+the saved baseline and pass after the fix. Coverage includes dispatched versus
+unsent retries, partial pacing waits, persistence after interrupt and restart,
+and parking/resumption without double-counting. All traffic was synthetic and
+local. Scripts, captures, and full hashes are ignored under
+`.local/retry-accounting-fix/`.
+
+## Top-level Responses rate-limit errors
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. The
+`64c2e927…` baseline is compared with `7663633c…`. The fix recognizes a
+Responses `error` event's top-level `code=rate_limit_exceeded` regardless of
+message wording. It adds a check only in the error branch, with no allocation,
+lock, database operation, or change to successful-response parsing.
+
+Seven alternating pairs use the preceding section's ordinary echo contract:
+16 warmup and 1,000 measured turns per run, two calls per turn, eight context
+items and eight retained turns. All 14,000 measured turns completed. Every run
+sent identical normalized payloads and 3,465,230 request bytes. A separate seven
+pairs use the preceding retry-heavy contract: one warmup and five measured
+turns per run, each with 100 billed failures and 100 successful tool rounds.
+All 70 measured turns reached the expected round limit with equal durable
+usage/retry totals; every run sent 1,000 requests and 12,965,452 normalized
+request bytes with matching payload hashes. This uses the existing nested
+error format so both binaries perform equivalent work; top-level errors fail
+prematurely on the baseline and therefore cannot form a throughput comparison.
+
+| Median across seven runs | Before | Fixed |
+| --- | ---: | ---: |
+| Ordinary echo: daemon CPU, ms/turn | 1.897 | 1.886 |
+| Ordinary echo: per-run p95 latency, ms | 2.969 | 2.921 |
+| Ordinary echo: sampled peak RSS, MiB | 13.172 | 13.141 |
+| Retry-heavy: daemon CPU, ms/turn | 132.835 | 133.610 |
+| Retry-heavy: per-run mean latency, ms | 190.813 | 191.681 |
+| Retry-heavy: sampled peak RSS, MiB | 12.906 | 12.922 |
+
+Ordinary CPU changed by -0.55% and p95 by -1.63%; retry-heavy CPU changed by
++0.58% and mean latency by +0.46%. Sampled memory changed by -32 KiB and
++16 KiB. These small variations indicate effectively flat overhead, not a
+speedup claim.
+
+Validation: 62 Rust tests, 18 focused runtime tests, strict all-feature Clippy,
+formatting, and diff checks passed. The new classification regression fails
+before the fix. Runtime coverage verifies that a top-level error with different
+message wording paces, retries, completes, and records one retry; non-rate-limit
+errors remain terminal. All provider traffic was synthetic and local. Scripts,
+captures, and full hashes are ignored under `.local/top-level-rate-fix/`.

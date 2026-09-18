@@ -200,6 +200,9 @@ any tool already planned has run, so the bot is never left uncertain. One
 call may overshoot the cap. Forks start at zero with their own optional cap.
 Reported usage from failed or incomplete calls is charged without accepting their
 output into history. Such calls count in `model_rounds` when usage is reported.
+Failed-attempt usage also counts before a retry and later tool rounds: a retry
+cannot start after that usage exhausts the budget. This check uses the running
+total without another store read.
 Cancellation and failures before a usage report is returned can leave usage
 unaccounted for; these totals are not a reconciliation of provider billing.
 Successful calls retain their single atomic transcript/usage commit; budget
@@ -238,7 +241,7 @@ bound; the operating system is then the only limit.
 | `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
 | `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
-| (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by the 100 concurrent streams both providers allow per connection, 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 41 |
+| (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -283,6 +286,14 @@ is currently no provider option to omit it and no automatic retry with a changed
 request. Preserve returned reasoning items verbatim for stateless continuation.
 
 HTTP and streamed provider failures retain stable error codes and useful detail.
+A rate limit the provider reports inside the stream (a Responses `error` or
+`response.failed` frame with code `rate_limit_exceeded`, including the top-level
+`code` on `error` events regardless of message wording) is
+`provider_rate_limited` with the provider's message as detail, distinct from
+`provider_incomplete`, which remains a response the model could not finish; a
+rate limit refused at the HTTP layer stays `provider_http_429`. A complete
+HTTP 429 body with `error.code` or `error.type` equal to `insufficient_quota`
+becomes `provider_quota_exhausted`, without retrying or pausing the shared pool.
 Transport failures (`provider_connection_failed`, or `provider_connection_os_N`
 when an OS error code is known) carry the cause chain as detail: the URL and
 the HTTP, TLS, or socket layer that failed, never a header. The selected provider's credential is redacted from decoded messages (and its
@@ -531,6 +542,76 @@ its context window from the store in batches of 64 items with an exact
 Content-Length; the daemon never holds a transcript. SQLite's configured cache is
 2 MiB, not a total bound on storage-related or OS memory. Durable performance
 needs its own benchmark.
+
+## Pacing and retries
+
+A provider's allowance is the scarce resource in a fleet, so every model call
+passes through one pace per provider and model: a fair FIFO gate holding two
+buckets, requests and tokens per minute. The pool is unbounded until the
+provider reports its limits in headers
+(`x-ratelimit-*` on OpenAI, `anthropic-ratelimit-*` on Anthropic); from then
+on a call is admitted only when both buckets can afford it, debited by an
+estimate (request bytes divided by four plus the output cap). Reported token
+balances are reduced by outstanding reservations before taking the minimum
+with the local balance, so stale high headers cannot replenish spent tokens.
+Token headers release their request's reservation immediately, in the same
+locked update, so other requests can start while that response streams.
+Completion cannot refund it again. Without token headers, final reported
+usage replaces the estimate. Request-only headers do not suppress that correction.
+Cancellation or admission timeout before HTTP dispatch refunds both token and
+request allowance. Both buckets reconcile server balances net of outstanding
+reservations, including calls admitted before limits were known. New lower
+request balances therefore survive cancellation refunds. Request reservations
+are resolved at response headers; without a request balance, their debit
+remains spent. After dispatch, cancelled streams retain an estimated token
+charge when no balance was reported.
+Releasing a reservation wakes the FIFO waiter immediately. This uses two
+counters per pool and a small guard per call, with no per-request allocation
+or additional database operation.
+
+Callers wait in arrival order and are released individually. Estimates and
+continuous refill are heuristics, not a guarantee of exact provider-limit
+utilization. A refusal for pace, a 429 with
+`Retry-After`, an Anthropic 529, or a rate limit named inside the stream
+(`provider_rate_limited`, with "try again in N" parsed from the message), holds
+the pool until that time; the turns behind it wait rather than fail. The gate
+adds a lock and a few arithmetic operations on an unpaced call. See the
+[matched follow-up](DAEMON_MEASUREMENTS.md#pacing-review-fixes) for CPU, memory,
+latency, and the measurement limits.
+
+An estimate above the learned per-minute token limit fails with
+`provider_pacing_limit`, without consuming allowance or blocking the next
+request. This is a local estimate limit, not a provider refusal; reduce the
+context or configured output cap before resubmitting. Unknown pools remain
+unbounded until headers teach them a limit.
+
+A model call has no side effects, so a failed one is retried by rebuilding
+the request from the store: within 5 minutes, up to 8 attempts for capacity
+(5xx) or transport failures and up to 64 for refusals for pace, which the pool
+spaces and which are not the request's fault; never for a response the model
+could not finish (`provider_incomplete`) or a client error. The providers'
+reset headers are only how long a full refill takes; the pool learns the level
+and refills continuously, so it never idles waiting for a reset. Rate limits wait on
+the pool; other transient failures back off from 250 ms doubling to 30 s with
+a deterministic spread of up to a fifth, which matters only when several
+daemons share one key. A tool is never rerun. Each retry is a non-durable
+`retry` notification (attempt, error, detail, delay) to live followers, and a
+turn's record carries `retries` and `paced_ms` in `turns`. `retries` counts
+additional attempts that entered HTTP dispatch; cancelling during backoff or
+pacing does not count an unsent retry. `paced_ms` includes a partially elapsed
+pool wait on interruption. Counters flush once per execution segment, on
+completion, failure, explicit interruption, or parking, and accumulate across
+resumption. A hard process kill can lose the current segment's unflushed
+counters. Retries are on by default because they cannot repeat an effect; what they can repeat is
+billing for a failed attempt, which is recorded as failed usage. Successful
+model responses and failures with reported usage share the durable limit of
+200 model rounds per turn, including across parking and restart. Reaching
+that limit stops the next model call; already committed tool plans still run.
+Unbilled failures remain bounded by the attempt and time limits above.
+
+The transport keeps 64 streams per HTTP/2 connection rather than the 100 the
+providers allow, so a connection the provider's edge resets takes fewer turns
+with it.
 
 ## Long history and context windows
 

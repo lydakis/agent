@@ -15,7 +15,7 @@ use agent_runtime::{
     Error, Result,
     codec::split_model,
     fail,
-    provider::{Delta, Items, Provider, Request as ModelRequest, ToolCall},
+    provider::{Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     store::{Store, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
@@ -26,6 +26,14 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub const MAX_ROUNDS: usize = 200;
+/// Attempts per model call before its failure is the turn's failure, and the
+/// wall-clock budget those attempts may span. A model call has no side
+/// effects, so retrying one is always safe; a tool is never rerun.
+const MAX_ATTEMPTS: u32 = 8;
+/// Refusals for pace are spaced by the pool and are not the request's fault,
+/// so they get many more attempts inside the same time budget.
+const MAX_PACED_ATTEMPTS: u32 = 64;
+const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 /// Items fetched from the store per read-ahead batch while a body streams.
 const WINDOW_BATCH: usize = 64;
 
@@ -42,6 +50,29 @@ pub struct Turn {
     pub context_items: usize,
     /// Continue a parked turn: record its wait results, then keep going.
     pub resume: bool,
+}
+
+/// Lives outside the cancellable rounds future. No allocation or per-attempt
+/// storage write: each execution segment flushes once, including when parked.
+#[derive(Default)]
+struct Accounting {
+    retries: u64,
+    paced_ms: u64,
+    retrying: bool,
+    report: Report,
+}
+impl Accounting {
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.retries + u64::from(self.retrying && self.report.dispatched),
+            self.paced_ms + self.report.paced_ms,
+        )
+    }
+    fn begin(&mut self, retrying: bool) {
+        (self.retries, self.paced_ms) = self.totals();
+        self.report = Report::default();
+        self.retrying = retrying;
+    }
 }
 
 enum Round {
@@ -88,11 +119,29 @@ impl Turn {
                 std::future::pending::<()>().await;
             }
         };
-        let result = tokio::select! {
+        let mut accounting = Accounting::default();
+        let mut result = tokio::select! {
             biased;
             _ = interrupt => fail("cancelled"),
-            result = self.rounds() => result,
+            result = self.rounds(&mut accounting) => result,
         };
+        // The rounds future is gone, so cancellation cannot discard this flush.
+        let (retries, paced_ms) = accounting.totals();
+        if retries > 0 || paced_ms > 0 {
+            let turn = self.turn;
+            if let Err(error) = self
+                .store
+                .call(move |db| db.note_pacing(turn, retries, paced_ms))
+                .await
+            {
+                result = Err(error);
+            }
+        }
+        // An interrupt may arrive while the non-cancellable flush is pending.
+        // Honor it before retiring a parked task whose receiver is still live.
+        if result.is_ok() && *cancelled.borrow() {
+            result = fail("cancelled");
+        }
         let error = match result {
             Ok(Round::Parked) => return Exit::Parked,
             Ok(Round::Finished) => None,
@@ -165,9 +214,9 @@ impl Turn {
         })
     }
 
-    async fn rounds(&self) -> Result<Round> {
+    async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
-        let record = self.store.call(move |db| db.inspect(&bot)).await?;
+        let mut record = self.store.call(move |db| db.inspect(&bot)).await?;
         let context = self.store.call(move |db| db.context(turn)).await?;
         let (provider, model) = split_model(&context.model)?;
         let provider = self
@@ -194,54 +243,26 @@ impl Turn {
                 return Ok(Round::Parked);
             }
         }
-        let mut tokens_used = record.tokens_used;
-        for _ in context.model_rounds..MAX_ROUNDS {
+        let mut model_rounds = context.model_rounds;
+        while model_rounds < MAX_ROUNDS {
             // The budget is checked before each call, so one call may overshoot.
-            if record
-                .budget_tokens
-                .is_some_and(|budget| tokens_used >= budget)
-            {
-                return Err(Error::with(
-                    "budget_exhausted",
-                    format!(
-                        "{} of {} tokens used",
-                        tokens_used,
-                        record.budget_tokens.unwrap_or(0)
-                    ),
-                ));
+            if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
+                return Err(error);
             }
-            let items = self.items().await?;
-            let mut reported_usage = None;
-            let response = provider
-                .complete_accounted(
-                    ModelRequest {
-                        model,
-                        instructions: &record.instructions,
-                        reasoning: record.reasoning.as_deref(),
-                        items,
-                    },
-                    |delta| {
-                        let (kind, text) = match delta {
-                            Delta::Text(text) => ("text_delta", text),
-                            Delta::Thinking(text) => ("thinking_delta", text),
-                        };
-                        self.hub.live(
-                            &self.bot,
-                            json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"text":text}),
-                        )
-                    },
-                    &mut reported_usage,
+            let response = self
+                .call(
+                    provider,
+                    model,
+                    &mut record,
+                    &mut model_rounds,
+                    turn,
+                    accounting,
                 )
-                .await;
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    self.failed_usage(reported_usage).await?;
-                    return Err(error);
-                }
-            };
+                .await?;
+            model_rounds += 1;
             if let Some(usage) = &response.usage {
-                tokens_used = tokens_used
+                record.tokens_used = record
+                    .tokens_used
                     .saturating_add(usage.input_tokens)
                     .saturating_add(usage.output_tokens);
             }
@@ -270,6 +291,106 @@ impl Turn {
             }
         }
         fail("tool_round_limit")
+    }
+
+    /// One model call with retries. Each attempt rebuilds the request from
+    /// the store, so nothing about the turn changes between attempts; a
+    /// refusal for pace holds the provider's pool rather than this turn.
+    async fn call(
+        &self,
+        provider: &Provider,
+        model: &str,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+    ) -> Result<agent_runtime::provider::Completion> {
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let paced_before = accounting.totals().1;
+        loop {
+            let items = self.items().await?;
+            accounting.begin(attempt > 0);
+            let result = provider
+                .complete_accounted(
+                    ModelRequest {
+                        model,
+                        instructions: &record.instructions,
+                        reasoning: record.reasoning.as_deref(),
+                        items,
+                    },
+                    |delta| {
+                        let (kind, text) = match delta {
+                            Delta::Text(text) => ("text_delta", text),
+                            Delta::Thinking(text) => ("thinking_delta", text),
+                        };
+                        self.hub.live(
+                            &self.bot,
+                            json!({"event":kind,"bot":self.bot,"turn":turn,"durable":false,"text":text}),
+                        )
+                    },
+                    &mut accounting.report,
+                )
+                .await;
+            let paced_ms = accounting.totals().1 - paced_before;
+            let error = match result {
+                Ok(completion) => return Ok(completion),
+                Err(error) => error,
+            };
+            // Whatever the provider billed for a failed attempt is still spent.
+            if let Some(usage) = &accounting.report.usage {
+                *model_rounds += 1;
+                record.tokens_used = record
+                    .tokens_used
+                    .saturating_add(usage.input_tokens)
+                    .saturating_add(usage.output_tokens);
+            }
+            self.failed_usage(accounting.report.usage.take()).await?;
+            // A retry is another billable call. Preserve final provider errors,
+            // but stop retrying once failed usage has spent the bot's budget.
+            let error = if retryable(&error.code) {
+                budget_error(record.budget_tokens, record.tokens_used)
+                    .or_else(|| {
+                        (*model_rounds >= MAX_ROUNDS).then(|| Error::new("tool_round_limit"))
+                    })
+                    .unwrap_or(error)
+            } else {
+                error
+            };
+            attempt += 1;
+            let paced = error.code == "provider_rate_limited" || error.code == "provider_http_429";
+            let cap = if paced {
+                MAX_PACED_ATTEMPTS
+            } else {
+                MAX_ATTEMPTS
+            };
+            // Time spent waiting fairly in the pool is the fleet's, not this
+            // call's; the budget counts only the attempts and their backoff.
+            let spent = started
+                .elapsed()
+                .saturating_sub(std::time::Duration::from_millis(paced_ms));
+            if !retryable(&error.code) || attempt >= cap || spent >= RETRY_BUDGET {
+                return Err(error);
+            }
+            // Rate limits already hold the pool; other transient failures
+            // back off exponentially with a little spread.
+            let delay = if paced {
+                std::time::Duration::ZERO
+            } else {
+                backoff(attempt, turn as u64)
+            };
+            self.hub
+                .live(
+                    &self.bot,
+                    json!({"event":"retry","bot":self.bot,"turn":turn,"durable":false,
+                        "attempt":attempt,"error":error.code,"detail":error.detail,
+                        "delay_ms":delay.as_millis() as u64}),
+                )
+                .await?;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
     }
 
     async fn failed_usage(&self, usage: Option<agent_runtime::provider::Usage>) -> Result<()> {
@@ -527,6 +648,45 @@ impl Turn {
             json!({"handle":format!("proc:{id}"),"background":true}).to_string(),
         ))
     }
+}
+
+fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {
+    budget
+        .filter(|&cap| used >= cap)
+        .map(|cap| Error::with("budget_exhausted", format!("{used} of {cap} tokens used")))
+}
+
+/// Failures of the provider's pace, capacity, or transport, none of which say
+/// anything about the request. Model-level outcomes (`provider_incomplete`)
+/// and client errors are final.
+fn retryable(code: &str) -> bool {
+    matches!(
+        code,
+        "provider_rate_limited"
+            | "provider_http_429"
+            | "provider_http_500"
+            | "provider_http_502"
+            | "provider_http_503"
+            | "provider_http_504"
+            | "provider_http_529"
+            | "provider_stream_failed"
+            | "truncated_sse_frame"
+            | "provider_admission_timeout"
+    ) || code.starts_with("provider_connection_")
+}
+
+/// 250 ms doubling to 30 s, spread by up to a fifth either way so several
+/// daemons on one key do not retry in step. Deterministic per turn and
+/// attempt, so it costs a few integer operations.
+fn backoff(attempt: u32, seed: u64) -> std::time::Duration {
+    let base = 250u64.saturating_mul(1u64 << (attempt.saturating_sub(1)).min(7));
+    let base = base.min(30_000);
+    let mut x = seed ^ (u64::from(attempt) << 32) ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    let spread = (x % 41) as i64 - 20; // -20..=20 percent
+    std::time::Duration::from_millis((base as i64 + base as i64 * spread / 100).max(1) as u64)
 }
 
 /// Name retained streams in the model-facing result so the model can read

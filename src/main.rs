@@ -29,8 +29,24 @@ options: --store PATH --model PROVIDER/MODEL --provider SPEC --tools LIST --work
          --request-id ID --new --detach (submit and return a turn handle) --pretty (human rendering instead of JSONL) --no-spawn
 provider SPEC: NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]; families: responses, anthropic";
 
+#[cfg(feature = "heap-profile")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() {
-    match run() {
+    // The profile is written when the profiler drops, so it must outlive
+    // `run` and be dropped before the process exits.
+    #[cfg(feature = "heap-profile")]
+    let profiler = std::env::var("AGENT_HEAP_PROFILE").ok().map(|path| {
+        dhat::Profiler::builder()
+            .file_name(path)
+            .trim_backtraces(Some(24))
+            .build()
+    });
+    let result = run();
+    #[cfg(feature = "heap-profile")]
+    drop(profiler);
+    match result {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("agent: {error}");

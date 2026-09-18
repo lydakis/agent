@@ -430,3 +430,95 @@ hashes within each pair. Startup, long histories, large fleets, and real
 providers were not measured. Ignored evidence:
 `.local/deleted-wakeup-fix/measure.py`, `results.json`, `summary.json`, and
 `recheck/`.
+
+## Ten thousand bots
+
+Observed 2026-09-16 America/New_York on the same host, binary `7d818255…`
+(schema 12 plus the heap-profile hook, compiled out), with `bench.fleet_screen`:
+one store, 10,000 bots, everything through the stdio protocol, `--max-active
+1024`, `--context-items 8`. Refusals at the bound (`active_agent_limit`) are
+retried by the driver as turns finish, which is today's contract; queueing on
+the daemon side is item 6 of NEXT.md.
+
+Latency percentiles in this section and the paced follow-up below use the
+driver's old batch-processing boundary. They include observer queue delay and
+exclude submission acknowledgment time. The corrected `fleet_screen_v3`
+measures submission to event receipt; its latency figures are not directly
+comparable to these historical captures.
+
+**Synthetic** (instant model holding each reply 500 ms so turns overlap):
+
+| Phase | Result | Daemon RSS | Open files | Store |
+| --- | --- | ---: | ---: | ---: |
+| create 10,000 bots | 1.5 s, 6,500 per second | 12.3 MiB | 13 | 15 MiB |
+| burst, all 10,000 submitted | 6.8 s, 1,470 turns/s, 1,024 in flight throughout, p50 570 ms against a 500 ms reply | 51 → 54 MiB | 1,037 | |
+| park 5,000 on one anchor | all parked in 8.1 s; released and drained through the bound in 3.1 s | 57.7 MiB | 1,037 | 31 MiB |
+| kill with 840 in flight, restart | ready in 154 ms on a store of 10,000 bots and 20,000 turns; 836 turns marked interrupted, 9,164 bots resumed idle | 12.2 MiB after | 13 | 42 MiB |
+
+The synthetic provider speaks HTTP/1.1, so each in-flight turn held its own
+connection (the 1,037 open files) and the burst's memory is dominated by
+that; see the [heap profile](DAEMON_MEASUREMENTS.md#heap-profile-at-the-fleet-peak)
+for the attribution. Parking 5,000 turns on top cost about 0.8 KB each.
+Creating a bot costs a store row and nothing resident.
+
+**Live** (gpt-5.6-luna, the shell-plus-answer prompt, same bound):
+
+| | |
+| --- | --- |
+| Turns | 10,000 submitted, 1,961 completed, 8,039 failed |
+| Time | 16.1 s at 1,024 in flight throughout; p50 854 ms, p95 3.7 s |
+| Failures | 7,862 rate limits inside the stream (6,945 tokens per minute, 339 requests per minute, 5 request too large against the remaining allowance); 175 transport failures (94 TLS `BadRecordMac` alerts, 81 HTTP/2 "detected excessive load"); 2 stream failures |
+| Daemon RSS | 60 → 71 MiB at 1,024 in flight with 41 connections |
+
+For the first five seconds every turn completed; from the sixth, this
+organization's allowance for the model, **5,000 requests and 4,000,000 tokens
+per minute**, was spent, and every request for the rest of the burst was
+refused before it ran. The daemon kept going at 620 turns per second, mostly
+refusals, because nothing tells it to slow down: that is item 10 of NEXT.md,
+now shaped by an observed limit. Two things were wrong on the harness side and
+one is fixed here: an in-stream rate limit was reported as
+`provider_incomplete`, hiding it behind the code for a response the model
+could not finish; it is now `provider_rate_limited` with the provider's
+message. The transport failures came from the provider's edge resetting
+streams en masse under the refusals, which trips the HTTP/2 client's
+flood protection on a whole connection and drops every stream on it; pacing
+would have prevented the refusals that caused them. Spend: about 2.5 million
+input tokens.
+
+Captures: ignored `.local/bench/fleet-screen-10k/`, `fleet-screen-luna-10k/`,
+and `fleet-screen-10k-heap/`.
+
+## Ten thousand bots, paced
+
+Observed 2026-09-16 America/New_York on the same host, same driver, prompt,
+bound, and model as the burst above, on the pacing binary `6f1b1429…`
+([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#pacing-and-retries)). Three runs tell
+the story; each spent about 13.6 million tokens.
+
+| Run | Completed | Failed | Retried attempts | Wall clock | Steady rate | Shape |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| unpaced (above) | 1,961 | 8,039 | none, no retries then | 16 s | 620 turns/s, mostly refusals | five seconds of work, then a closed door |
+| paced, first cut | 9,827 | 173 | 16,006 | 272 s | bursts of 2,000 then minute-long stalls | pool honored "remaining 0, resets in 60 s" as a hard block |
+| paced, final | 10,000 | 0 | 0 | 382 s | 26 turns/s, 1,024 in flight throughout | flat from first turn to last |
+
+What changed between the cuts, both learned from the live provider rather
+than guessed: the reset header is only how long a full refill takes, so the
+pool now learns the level and refills continuously instead of idling for a
+minute; and with 1,024 responses in flight the "remaining" headers arrive
+out of order, so a reported level may only lower the pool's own, never raise
+it, which turned 16,006 refused attempts into none. The retry budget also no
+longer counts time spent waiting fairly in the pool, which is what had made 8
+transport failures give up.
+
+The final run is the provider's allowance used steadily with nothing wasted:
+every turn completed, no request was refused, and the daemon held 1,024 turns
+in flight at 65 MiB for six minutes. The price is the queue: with 10,000
+turns and a fixed rate, the median turn waited 45 s for its slot, p95 46 s,
+the fair order at work. That is the honest shape of a fleet ten times larger
+than its allowance. The rate itself is the provider's, counted in its own
+accounting of in-flight requests, which reserves output tokens per request;
+`--max-output-tokens` lowers that reservation and is the knob for a workload
+that knows its replies are short.
+
+Captures: ignored `.local/bench/fleet-screen-luna-10k-paced/` (first cut)
+and `fleet-screen-luna-10k-paced2/` (final).
