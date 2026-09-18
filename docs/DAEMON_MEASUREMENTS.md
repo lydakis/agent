@@ -1324,3 +1324,29 @@ Validation: 65 Rust tests, 51 Python CLI/daemon/wait tests, strict all-feature
 Clippy, formatting, and diff checks passed. Regressions verify completed and
 pending CLI polls, mixed tool results, pending process handles, waiter cleanup,
 and a request whose pacing reservation ends while its stream remains active.
+
+## Background admission bound
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. The 32-agent socket echo workload as before, one excluded warmup and
+three measured runs, on binary `46c617f2…` (background admission refused with
+`capacity_exhausted` once as many jobs wait for a slot as can run, the
+`queued_processes` stats field, and request read-ahead batches capped at 256
+KiB as well as 64 items). The comparison binary `43b61a78…` is the tree at
+the previous commit. All runs passed with 32 concurrent provider requests and
+no quality warnings. On this path the slice adds one relaxed atomic load per
+background start and one atomic decrement when the job takes its slot; the
+read-ahead cap only sums per-item sizes the window query already returns.
+
+| Metric | Previous commit | This slice |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.69 (17.50–17.69) | 17.73 (17.56–18.44) |
+| Observed target CPU, seconds | 0.324 (0.322–0.329) | 0.299 (0.295–0.304) |
+| Per-run p95 turn latency, ms | 596.8 (595.0–600.4) | 591.7 (590.6–642.4) |
+
+Flat within this screen's noise; the echo workload starts no background
+processes, so the admission check is never reached, and its windows are far
+below the byte cap. The bound's behavior is covered by the wait-tool
+regressions (a refused third job under a budget of one, and eight jobs
+completing through a four-slot queue). Captures: ignored
+`.local/bench/slice-backlog-socket-32/` and `slice-astra-controller-socket-32/`.

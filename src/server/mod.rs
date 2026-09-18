@@ -774,6 +774,7 @@ impl Service {
                     "active_limit": self.limit_active,
                     "waiting_turns": waiting,
                     "running_processes": running,
+                    "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
                     "transport": {"in_flight_by_shard": self.transport.loads()},
                     "providers": providers,

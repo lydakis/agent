@@ -118,8 +118,22 @@ impl Tool {
 pub struct Registry {
     tools: Vec<Tool>,
     slots: Arc<Semaphore>,
+    /// The running bound, also the bound on background commands accepted but
+    /// not yet started; zero means neither is bounded.
+    budget: usize,
+    /// Background commands accepted and waiting for a slot. The operating
+    /// system never sees these, so only this count can bound them.
+    pending: Arc<std::sync::atomic::AtomicUsize>,
     credentials: Arc<Vec<Credential>>,
     environment: Arc<Vec<(String, String)>>,
+}
+/// One accepted background command's place in line, released when it starts
+/// or when it is dropped before starting.
+pub struct Queued(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 struct Credential {
     name: String,
@@ -225,6 +239,8 @@ impl Registry {
         Ok(Self {
             tools,
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
+            budget: DEFAULT_PROCESS_BUDGET,
+            pending: Arc::default(),
             credentials: Arc::new(Vec::new()),
             environment: Arc::new(Vec::new()),
         })
@@ -234,12 +250,28 @@ impl Registry {
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
     pub fn with_process_budget(mut self, budget: usize) -> Self {
+        self.budget = budget.min(Semaphore::MAX_PERMITS);
         self.slots = Arc::new(Semaphore::new(if budget == 0 {
             Semaphore::MAX_PERMITS
         } else {
-            budget.min(Semaphore::MAX_PERMITS)
+            self.budget
         }));
         self
+    }
+    /// Take a place in line for a background command, or refuse when as many
+    /// are already waiting as may run: a counter and a comparison, so a fleet
+    /// cannot accumulate an invisible backlog behind the process bound.
+    pub fn queue(&self) -> Result<Queued> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.budget != 0 && self.pending.load(Relaxed) >= self.budget {
+            return fail("capacity_exhausted");
+        }
+        self.pending.fetch_add(1, Relaxed);
+        Ok(Queued(self.pending.clone()))
+    }
+    /// Background commands accepted but not yet running, for `stats`.
+    pub fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Variables added to every shell child, such as the store and binary
     /// paths a bot needs to delegate through the same daemon.
@@ -573,21 +605,22 @@ impl Registry {
     /// acquired inside the task, so starting never blocks the caller; the
     /// result carries the same bounded preview and artifacts as a foreground
     /// command, or the error a foreground command would have returned.
+    /// `timeout_ms` bounds the command's running time; the place in line is
+    /// bounded by `queue`, not by the clock.
     pub fn background(
         &self,
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
+        queued: Queued,
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
             let result = async {
-                let _slot = registry
-                    .slots
-                    .acquire()
-                    .await
-                    .map_err(|_| Error::new("tool_scheduler_closed"))?;
+                let slot = registry.slots.acquire().await;
+                drop(queued);
+                let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
                 let (stdout, stderr, status) = shell(
                     &command,
                     &workspace,

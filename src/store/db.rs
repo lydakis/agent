@@ -73,6 +73,8 @@ pub struct Waiting {
 pub struct Window {
     pub family: Family,
     pub ids: Vec<i64>,
+    /// Each item's encoded length, so read-ahead can be bounded in bytes.
+    pub sizes: Vec<u32>,
     /// Sum of item lengths, without separators.
     pub item_bytes: i64,
     pub omitted_items: i64,
@@ -454,17 +456,27 @@ impl Database {
         };
         let (_, start_depth, before, turn_seq) = chosen;
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth) AS (
-                SELECT id,parent,depth FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
-             SELECT id FROM chain ORDER BY depth",
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes) AS (
+                SELECT id,parent,depth,total_bytes FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
+             SELECT id,total_bytes FROM chain ORDER BY depth",
         )?;
-        let ids: Vec<i64> = statement
-            .query_map(params![head, start_depth], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
+        // Sizes come from the cumulative byte column, no item is read here.
+        let mut ids = Vec::new();
+        let mut sizes = Vec::new();
+        let mut previous = before;
+        for row in statement.query_map(params![head, start_depth], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        })? {
+            let (id, total) = row?;
+            ids.push(id);
+            sizes.push((total - previous).clamp(0, u32::MAX as i64) as u32);
+            previous = total;
+        }
         Ok(Some(Window {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
             ids,
+            sizes,
             item_bytes: head_total - before,
             omitted_items: start_depth - 1,
             omitted_turns: turn_seq - 1,

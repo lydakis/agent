@@ -189,22 +189,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    precede it. The shaving order, if a workload ever needs it: the turn
    future's size, HTTP/1.1 buffers only for such a provider, then the
    allocator.
-5. Bound accepted background work, not only running processes. `--max-processes`
-   caps subprocesses that are running, but a background `shell` call spawns
-   its task immediately and that task waits for a process permit, with a
-   second task per command collecting the result, and the command's timeout
-   only starts once it has capacity. A controller can therefore finish turns
-   that enqueue background work faster than the pool drains it, and
-   `--max-active` does not bound what accumulates. Add a bounded pending
-   queue with explicit `queued` and `running` states and a `capacity_exhausted`
-   result when it is full; later, queued commands can be durable rows served
-   by one dispatcher instead of two resident tasks each. Regression: occupy
-   one process slot, enqueue background commands rapidly through the synthetic
-   provider, and assert pending work, memory, and control-request latency stay
-   bounded. In the same spirit, context read-ahead batches 64 items with no
-   byte ceiling; give it one so large items cannot make concurrent batches
-   expensive. Every queue needs an admission policy and every buffer a byte
-   bound.
+5. Done, and smaller than first written. Background commands accepted but
+   not started are bounded by the process bound itself: one counter and one
+   comparison, `capacity_exhausted` as the tool result beyond it, the count
+   in `stats`. The operating system bounds processes; it never sees this
+   line, which is the only reason the daemon has to. The durable dispatcher
+   is not built: nothing measured needs a backlog that survives restart, and
+   it would be a subsystem. `timeout_ms` stays a bound on running time, since
+   the line is now bounded by count rather than by the clock. Context
+   read-ahead batches are capped at 256 KiB as well as 64 items. Regression:
+   one process slot, a running command, one in line, the next refused, the
+   accepted ones resolving in order.
 6. Done: [fleet controller ergonomics](RUST_PROTOTYPE.md#fleet-controllers).
    `follow` with `bot: "*"` subscribes one socket session to every bot with
    replay from a store-wide cursor; `wait` with `any: true` answers on the

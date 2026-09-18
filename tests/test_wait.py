@@ -134,6 +134,35 @@ class WaitTests(ModelFixture):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         return [e['event'] for e in events if e.get('turn') == turn]
 
+    def test_background_admission_is_bounded_by_the_process_budget(self):
+        client = self.client('echo,shell,wait', extra=('--max-processes', '1'))
+        for bot in ('Run', 'Queue', 'Over', 'Later'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        # One command runs, one may wait behind it, the next is refused as a
+        # tool result the model can act on; the turn itself completes.
+        running = client.request('submit', bot='Run', request_id='r', prompt='bg:sleep 1.5')['result']['turn']
+        self.assertEqual(client.finished(running)['data']['status'], 'completed')
+        queued = client.request('submit', bot='Queue', request_id='q', prompt='bg:sleep .1')['result']['turn']
+        self.assertEqual(client.finished(queued)['data']['status'], 'completed')
+        # The store counts accepted, unfinished commands; the queue is the
+        # subset still waiting for a slot.
+        stats = client.request('stats')['result']
+        self.assertEqual((stats['running_processes'], stats['queued_processes'], stats['process_limit']), (2, 1, 1))
+        over = client.request('submit', bot='Over', request_id='o', prompt='bg:sleep .1')['result']['turn']
+        self.assertEqual(client.finished(over)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Over', 'bg-1')['error'], 'capacity_exhausted')
+        # No process record was made for the refusal; the accepted ones resolve in order.
+        handles = [self.tool_output(client, bot, 'bg-1')['handle'] for bot in ('Run', 'Queue')]
+        self.assertEqual(handles, ['proc:1', 'proc:2'])
+        done = client.request('wait', handles=handles, timeout_ms=10000)['result']
+        self.assertEqual(done['pending'], [])
+        self.assertEqual([done['results'][h]['exit_code'] for h in handles], [0, 0])
+        # The line is free again.
+        later = client.request('submit', bot='Later', request_id='l', prompt='bg:true')['result']['turn']
+        self.assertEqual(client.finished(later)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Later', 'bg-1')['handle'], 'proc:3')
+        self.assertEqual(client.request('stats')['result']['queued_processes'], 0)
+
     def test_background_command_is_collected_by_a_parked_turn(self):
         client = self.client('echo,shell,wait')
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -332,7 +361,9 @@ class WaitTests(ModelFixture):
         self.assertTrue(all(e['data']['cancelled'] for e in completed))
 
     def test_fan_out_with_a_tiny_process_budget_never_deadlocks(self):
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait', extra=('--max-processes', '2'))
+        # Eight jobs against four slots: four run, four queue behind them, and
+        # the queue is full, so nothing is refused and nothing waits forever.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait', extra=('--max-processes', '4'))
         self.addCleanup(client.close)
         turns = []
         for n in range(8):

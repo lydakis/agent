@@ -454,7 +454,8 @@ does not, and each is one op:
   pending without a timer, in both the protocol op and the wait tool.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
-  running processes against the process bound, daemon-wide in-flight
+  running processes against the process bound and how many of them are
+  still in line for a slot (`queued_processes`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),
   and every provider's model pools with their learned allowance and current
   level (`providers.NAME.pools`). Shard loads count requests, not physical
@@ -585,7 +586,9 @@ that budget returns `event_page_item_limit`. Responses exceeding the 1 MiB wire
 limit return a correlated `response_size_limit` error without stopping the service.
 
 Histories stay on disk whether or not the bot is active. A model request streams
-its context window from the store in batches of 64 items with an exact
+its context window from the store in batches of at most 64 items and 256 KiB
+(an item larger than that travels alone), so the memory an in-flight request
+holds is a number rather than a function of its items, with an exact
 Content-Length; the daemon never holds a transcript. SQLite's configured cache is
 2 MiB, not a total bound on storage-related or OS memory. Durable performance
 needs its own benchmark.
@@ -800,9 +803,18 @@ closed tool scheduler fails the turn. Allowed tools run without approval prompts
 A store remains bound to its tool set; changing it requires a new store.
 
 `shell` runs a noninteractive `/bin/sh` command in the bot workspace with
-`timeout_ms` (default 120 s, maximum 600 s). Commands are at most 16 KiB. At most
-`--max-processes` child processes run at once across the service, foreground or
-background; waiting never counts. stdout and stderr are each
+`timeout_ms` (default 120 s, maximum 600 s), which bounds the command's
+running time, not any time spent in line for a process slot. Commands are at
+most 16 KiB. At most `--max-processes` child processes run at once across the
+service, foreground or background; waiting never counts. Background commands
+the service has accepted but not started are bounded by the same number: when
+that many are already in line, a background `shell` call returns
+`capacity_exhausted` as its tool result and records no process, so a fleet
+cannot build an invisible backlog behind the process bound. The operating
+system counts processes; it never sees this line, which is why the daemon
+counts it (one counter, one comparison per accepted command). `stats` reports
+it as `queued_processes`, a subset of `running_processes`, which counts every
+accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Results include separate output, exit code, and

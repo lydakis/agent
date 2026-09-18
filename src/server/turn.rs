@@ -34,8 +34,30 @@ const MAX_ATTEMPTS: u32 = 8;
 /// so they get many more attempts inside the same time budget.
 const MAX_PACED_ATTEMPTS: u32 = 64;
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
-/// Items fetched from the store per read-ahead batch while a body streams.
+/// Read-ahead while a body streams: a batch stops at either bound, so the
+/// memory held per in-flight request is a number, not a function of item
+/// sizes. An item larger than the byte bound travels alone.
 const WINDOW_BATCH: usize = 64;
+const WINDOW_BATCH_BYTES: u64 = 256 * 1024;
+
+/// Split window items into read-ahead batches by count and by bytes.
+fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
+    let mut out: Vec<Vec<i64>> = Vec::with_capacity(ids.len().div_ceil(WINDOW_BATCH));
+    let mut bytes = 0u64;
+    for (index, id) in ids.iter().enumerate() {
+        let size = u64::from(sizes.get(index).copied().unwrap_or(0));
+        let full = out
+            .last()
+            .is_some_and(|b| b.len() >= WINDOW_BATCH || bytes + size > WINDOW_BATCH_BYTES);
+        if out.is_empty() || full {
+            out.push(Vec::new());
+            bytes = 0;
+        }
+        out.last_mut().unwrap().push(*id);
+        bytes += size;
+    }
+    out
+}
 
 pub struct Turn {
     pub bot: String,
@@ -166,6 +188,7 @@ impl Turn {
         let Some(Window {
             family,
             ids,
+            sizes,
             item_bytes,
             omitted_items,
             omitted_turns,
@@ -189,10 +212,7 @@ impl Turn {
             total += head.len();
         }
         let store = self.store.clone();
-        let batches = ids
-            .chunks(WINDOW_BATCH)
-            .map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
+        let batches = batches(&ids, &sizes);
         let body = stream::iter([Ok(Bytes::from(head))]).chain(
             stream::iter(batches.into_iter().enumerate()).then(move |(index, chunk)| {
                 let store = store.clone();
@@ -442,8 +462,16 @@ impl Turn {
                     timeout_ms,
                     background: true,
                 }) => {
-                    self.background(&call.call_id, command, workspace.to_path_buf(), timeout_ms)
-                        .await?
+                    // A full line behind the process bound is a tool result
+                    // the model acts on, not a runtime failure.
+                    match self
+                        .background(&call.call_id, command, workspace.to_path_buf(), timeout_ms)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) if error.code == "capacity_exhausted" => failure(error),
+                        Err(error) => return Err(error),
+                    }
                 }
                 Ok(Prepared::Read {
                     source:
@@ -603,6 +631,8 @@ impl Turn {
         workspace: PathBuf,
         timeout_ms: u64,
     ) -> Result<Outcome> {
+        // The place in line is taken before anything durable is written.
+        let queued = self.registry.queue()?;
         let (turn, started) = (self.turn, call_id.to_owned());
         let id = self
             .store
@@ -610,7 +640,7 @@ impl Turn {
             .await?;
         let (sender, receiver) = oneshot::channel();
         self.registry
-            .background(command, workspace, timeout_ms, sender);
+            .background(command, workspace, timeout_ms, queued, sender);
         let (store, handles, failures, call_id_for_refs) = (
             self.store.clone(),
             self.handles.clone(),
@@ -716,5 +746,26 @@ fn failure(error: Error) -> Outcome {
     Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_ahead_batches_stop_at_either_bound() {
+        let ids: Vec<i64> = (1..=200).collect();
+        let small = vec![10u32; 200];
+        let by_count = batches(&ids, &small);
+        assert_eq!(
+            by_count.iter().map(Vec::len).collect::<Vec<_>>(),
+            [64, 64, 64, 8]
+        );
+        // Three 100 KiB items fill a batch; a 1 MiB item travels alone.
+        let sizes = [100 << 10, 100 << 10, 100 << 10, 1 << 20, 10, 10];
+        let by_bytes = batches(&ids[..6], &sizes);
+        assert_eq!(by_bytes, [vec![1, 2], vec![3], vec![4], vec![5, 6]]);
+        assert!(batches(&[], &[]).is_empty());
     }
 }
