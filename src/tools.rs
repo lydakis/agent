@@ -100,9 +100,9 @@ impl Tool {
                 "required":["turn"],"additionalProperties":false}),
             ),
             Tool::Wait => (
-                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait.",
+                "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending.",
                 json!({"type":"object","properties":{"handles":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":64},
-                "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_WAIT_TIMEOUT_MS}},
+                "timeout_ms":{"type":"integer","minimum":0,"maximum":MAX_WAIT_TIMEOUT_MS},"any":{"type":"boolean"}},
                 "required":["handles"],"additionalProperties":false}),
             ),
         };
@@ -143,6 +143,7 @@ pub enum Prepared {
     Wait {
         handles: Vec<String>,
         timeout_ms: Option<u64>,
+        any: bool,
     },
     Read {
         source: ReadSource,
@@ -304,6 +305,8 @@ impl Registry {
         struct Wait {
             handles: Vec<String>,
             timeout_ms: Option<u64>,
+            #[serde(default)]
+            any: bool,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -389,15 +392,14 @@ impl Registry {
                 if args.handles.is_empty()
                     || args.handles.len() > 64
                     || args.handles.iter().any(|h| h.len() > 256)
-                    || args
-                        .timeout_ms
-                        .is_some_and(|t| !(1..=MAX_WAIT_TIMEOUT_MS).contains(&t))
+                    || args.timeout_ms.is_some_and(|t| t > MAX_WAIT_TIMEOUT_MS)
                 {
                     return fail("invalid_tool_arguments");
                 }
                 Prepared::Wait {
                     handles: args.handles,
                     timeout_ms: args.timeout_ms,
+                    any: args.any,
                 }
             }
             Tool::Read => {

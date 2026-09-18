@@ -79,6 +79,100 @@ class DaemonTests(ModelFixture):
                 model.server_close()
                 worker.join(timeout=2)
 
+    def test_one_socket_follows_every_bot_and_stats_report_the_fleet(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        for bot in ('Alice', 'Bob'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        first = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        client.finished(first)
+        # A controller follows `*` from a store-wide cursor: replay covers
+        # both bots in cursor order, then live events for any bot arrive.
+        everyone = Connection(client.socket_path)
+        self.addCleanup(everyone.close)
+        self.assertEqual(everyone.request('follow', bot='*', after=0)['result']['following'], '*')
+        live = everyone.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual([e['bot'] for e in everyone.durable if e['event'] == 'created'], ['Alice', 'Bob'])
+        self.assertTrue(any(e['event'] == 'turn_finished' and e['bot'] == 'Alice' for e in everyone.durable))
+        self.assertEqual(live['bot'], '*')
+        second = client.request('submit', bot='Bob', request_id='b', prompt='hi')['result']['turn']
+        finished = everyone.receive(lambda e: e.get('event') == 'turn_finished' and e.get('turn') == second)
+        self.assertEqual(finished['bot'], 'Bob')
+        # Cursors are store-wide, so a reconnect resumes from the last one seen.
+        again = Connection(client.socket_path)
+        self.addCleanup(again.close)
+        again.request('follow', bot='*', after=finished['cursor'])
+        again.receive(lambda e: e.get('event') == 'follow_live')
+        self.assertEqual(again.durable, [])
+        # Identities created after the replay/live boundary must also arrive.
+        client.control.request('create', bot='New')
+        created = everyone.receive(lambda e: e.get('event') == 'created' and e.get('bot') == 'New')
+        client.control.request('fork', source='Alice', bot='Branch')
+        forked = everyone.receive(lambda e: e.get('event') == 'forked' and e.get('bot') == 'Branch')
+        for event in (created, forked):
+            replay = client.control.request('events', bot=event['bot'], after=0, limit=1)['result']['events']
+            self.assertEqual(replay, [event])
+        stats = client.request('stats')['result']
+        # control, one follower per bot, and the two `*` followers
+        self.assertEqual(stats['sessions'], 5)
+        self.assertEqual((stats['active_turns'], stats['waiting_turns'], stats['running_processes']), (0, 0, 0))
+        provider = stats['providers']['openai']
+        loads = stats['transport']['in_flight_by_shard']
+        self.assertEqual(loads, [0] * len(loads))
+        self.assertEqual(provider['pools'], {'synthetic-model': provider['pools']['synthetic-model']})
+        self.assertIsNone(provider['pools']['synthetic-model']['tokens_per_minute'])
+        self.assertGreater(stats['store']['jobs'], 0)
+        self.assertGreater(stats['store']['bytes'], 0)
+        self.assertEqual(stats['handles'], {'waiters': 0, 'retained': 0})
+
+    def test_stats_count_shared_transport_once_across_providers(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = threading.Barrier(2)
+        self.addCleanup(self.model.release_headers.set)
+        client = self.client(extra=('--provider', f'other=responses,{self.url}'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='one', prompt='gate')['result']['turn']
+        self.model.requests.get(timeout=3)
+        stats = client.request('stats')['result']
+        self.assertEqual(sum(stats['transport']['in_flight_by_shard']), 1)
+        self.assertEqual(stats['sessions'], 1)
+        self.assertEqual(stats['providers']['other'], {'pools': {}})
+        self.assertEqual(set(stats['providers']['openai']), {'pools'})
+        self.assertIn('synthetic-model', stats['providers']['openai']['pools'])
+        self.assertEqual(stats['providers']['openai']['pools']['synthetic-model']['reserved_requests'], 1)
+        self.model.release_headers.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            stats = client.request('stats')['result']
+            if stats['providers']['openai']['pools']['synthetic-model']['reserved_requests'] == 0:
+                break
+            time.sleep(.01)
+        pool = stats['providers']['openai']['pools']['synthetic-model']
+        self.assertEqual(pool['reserved_requests'], 0)
+        self.assertNotIn('in_flight', pool)
+        self.assertEqual(sum(stats['transport']['in_flight_by_shard']), 1)
+        self.model.all_streaming.wait(timeout=3)
+        client.finished(turn)
+        self.assertEqual(sum(client.request('stats')['result']['transport']['in_flight_by_shard']), 0)
+
+    def test_stats_use_the_opened_database_path_after_alias_changes(self):
+        path = self.path/'real.sqlite'
+        seed = Client(self.binary, path, self.url, 'echo')
+        seed.close()
+        alias = self.path/'alias.sqlite'
+        alias.symlink_to(path)
+        client = Client(self.binary, alias, self.url, 'echo')
+        self.addCleanup(client.close)
+        client.request('create', bot='Bob')
+        wal = Path(str(path)+'-wal')
+        self.assertGreater(wal.stat().st_size, 0)
+        for remove_alias in (False, True):
+            if remove_alias:
+                alias.unlink()
+            stats = client.request('stats')['result']['store']
+            self.assertEqual(stats['bytes'], path.stat().st_size)
+            self.assertEqual(stats['wal_bytes'], wal.stat().st_size)
+
     def test_slow_rpc_reader_does_not_delay_other_clients(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
         self.addCleanup(client.close)

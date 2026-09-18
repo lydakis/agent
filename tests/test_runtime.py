@@ -100,6 +100,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = 'p' * self.server.history_prefill
                     output.insert(0, {'type': 'message', 'role': 'assistant',
                                       'content': [{'type': 'output_text', 'text': text}]})
+            elif user.startswith('waitany:'):
+                text = ''
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': user[8:].split(','), 'any': True})}]
             elif user.startswith(('wait:', 'waitretry:')):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',

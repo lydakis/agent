@@ -205,19 +205,16 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    byte ceiling; give it one so large items cannot make concurrent batches
    expensive. Every queue needs an admission policy and every buffer a byte
    bound.
-6. Fleet controller ergonomics. Listing (`bots`, `agent ls`) and attaching to
-   one bot (`follow`, `agent follow`) exist; a controller of thousands needs
-   three more, all small and composable: following every bot on one socket
-   session instead of one subscription each (stdio already gets the
-   firehose); a `wait` that resolves on the first finished handle, not only
-   on all of them, so a scheduler reacts as work completes and the 64-handle
-   chunking stops mattering; and a `stats` op reporting active and queued
-   turns, in-flight calls per connection, store and WAL size, so controllers
-   read the daemon instead of sampling its process with psutil as the bench
-   drivers do. `stats` should report the storage worker's queue wait time
-   separately from its execution time, since context reads, replay, and
-   writes share that one thread and that split decides whether more storage
-   concurrency is ever needed.
+6. Done: [fleet controller ergonomics](RUST_PROTOTYPE.md#fleet-controllers).
+   `follow` with `bot: "*"` subscribes one socket session to every bot with
+   replay from a store-wide cursor; `wait` with `any: true` answers on the
+   first resolved handle and leaves the rest valid, in the op, the tool, and
+   across restart; `stats` reports sessions, turns against their bounds,
+   daemon-wide in-flight requests per shared client shard, every pool's
+   learned allowance and level, store and WAL size, the storage worker's queued versus running
+   time, and the handle registry. CLI: `follow --all`, `wait --any`, `stats`.
+   The bench drivers can now read the daemon instead of sampling it; moving
+   them over is a follow-up when one is next touched.
 7. Never silently ignore explicitly requested daemon configuration. Today the
    first client's `--provider` and `--tools` bind the daemon, and a later
    client's different values are ignored while it runs; only a restart with

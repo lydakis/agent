@@ -1,3 +1,4 @@
+mod cli;
 mod client;
 mod client_path;
 mod server;
@@ -6,28 +7,6 @@ use agent_runtime::{Error, Result, fail_with};
 // Machine-readable temporary startup conflict. The CLI waits for the owner
 // using this exit status, never by parsing a shared human-readable log.
 const DAEMON_OWNERSHIP_CONFLICT: i32 = 75;
-
-const USAGE: &str = "usage:
-  agent run [options] PROMPT...      run a turn and stream its events as JSONL (starts the daemon if needed)
-                                     --bot NAME continues that bot; --new --bot NAME creates it; no --bot makes a fresh one
-  agent follow --bot NAME [--after N] replay then stream a bot's events as JSONL
-  agent fork --source NAME --bot NAME [--checkpoint NODE] [--workspace DIR]   default: the source's current head
-  agent interrupt --bot NAME
-  agent turns --bot NAME [--after N]     list a bot's turns with status, tokens, and timing
-  agent result --bot NAME --turn N       a turn's outcome without waiting
-  agent wait [--timeout-ms N] HANDLE...  block until turn:BOT/N or proc:N handles resolve
-  agent rm --bot NAME                    delete an idle bot and everything only it owns
-  agent prune --bot NAME --keep-turns N  drop events, tool records, and artifacts of older turns
-  agent ls | agent shutdown
-  agent serve --store PATH [--socket PATH] --provider SPEC... [--model P/M] [--tools LIST]
-              [--max-processes N] [--max-active N] [--max-connecting N]   (0 = unbounded)
-              [--max-output-tokens N] [--idle-exit SECONDS] [--context-bytes N] [--context-items N]
-              [--retain-turns N]      (prune every bot to N turns' records after each turn)
-  agent --version
-options: --store PATH --model PROVIDER/MODEL --provider SPEC --tools LIST --workspace DIR
-         --bot NAME --instructions TEXT --instructions-file F --reasoning low|medium|high
-         --request-id ID --new --detach (submit and return a turn handle) --pretty (human rendering instead of JSONL) --no-spawn
-provider SPEC: NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]; families: responses, anthropic";
 
 #[cfg(feature = "heap-profile")]
 #[global_allocator]
@@ -62,20 +41,30 @@ fn main() {
 fn run() -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("--version") => {
+        Some("--version") if args.len() == 1 => {
             println!("agent-runtime {}", env!("CARGO_PKG_VERSION"));
-            Ok(0)
+            return Ok(0);
         }
-        Some("serve") => {
-            let config = configuration(&args[1..])?;
-            runtime()?.block_on(server::run(config))?;
-            Ok(0)
+        Some("--help" | "-h") if args.len() == 1 => {
+            cli::help(None)?;
+            return Ok(0);
         }
-        Some(
-            "run" | "follow" | "fork" | "interrupt" | "ls" | "shutdown" | "wait" | "turns"
-            | "result" | "rm" | "prune",
-        ) => client::main(args),
-        _ => fail_with("usage", USAGE),
+        Some("help") if args.len() <= 2 => {
+            cli::help(args.get(1).map(String::as_str))?;
+            return Ok(0);
+        }
+        None => return fail_with("usage", "a command is required; use agent --help"),
+        _ => {}
+    }
+    let Some(args) = cli::prepare(args)? else {
+        return Ok(0);
+    };
+    if args[0] == "serve" {
+        let config = configuration(&args[1..])?;
+        runtime()?.block_on(server::run(config))?;
+        Ok(0)
+    } else {
+        client::main(args)
     }
 }
 
@@ -112,6 +101,12 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--model" => model = Some(value.clone()),
             "--tools" => tools = Some(value.clone()),
             "--instructions" => instructions = Some(value.clone()),
+            "--instructions-file" => {
+                instructions = Some(
+                    std::fs::read_to_string(value)
+                        .map_err(|_| Error::with("usage", format!("cannot read {value}")))?,
+                )
+            }
             "--max-processes" | "--max-active" | "--max-connecting" => {
                 let parsed: usize = value
                     .parse()
@@ -149,7 +144,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     .map_err(|_| Error::with("usage", "--idle-exit needs seconds (0 disables)"))?;
                 idle_exit = (seconds > 0).then_some(seconds);
             }
-            _ => return fail_with("usage", USAGE),
+            _ => return fail_with("usage", format!("unknown option {flag}")),
         }
     }
     if providers.is_empty() {

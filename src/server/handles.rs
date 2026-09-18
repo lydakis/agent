@@ -79,6 +79,9 @@ pub enum Waiter {
 
 struct Waiting {
     generation: u64,
+    /// Complete on the first resolved handle; the rest are reported pending
+    /// and stay valid for a later wait.
+    any: bool,
     remaining: BTreeSet<String>,
     results: BTreeMap<String, Arc<Value>>,
     completion: Completion,
@@ -189,6 +192,19 @@ impl Handles {
         waiting.results.insert(handle.to_owned(), result);
         if waiting.remaining.is_empty() {
             Self::complete_locked(inner, resume, waiter);
+        } else if waiting.any {
+            // First one wins; the others are reported pending, exactly as a
+            // timeout would report them, and stay valid for a later wait.
+            Self::pend_remaining(waiting);
+            Self::complete_locked(inner, resume, waiter);
+        }
+    }
+
+    fn pend_remaining(waiting: &mut Waiting) {
+        for handle in std::mem::take(&mut waiting.remaining) {
+            waiting
+                .results
+                .insert(handle, Arc::new(json!({"pending":true})));
         }
     }
 
@@ -231,6 +247,7 @@ impl Handles {
         waiter: Waiter,
         handles: &[String],
         deadline_ms: Option<u64>,
+        any: bool,
         completion: Completion,
     ) {
         let parsed: Vec<Result<Handle>> = handles.iter().map(|h| Handle::parse(h)).collect();
@@ -255,6 +272,7 @@ impl Handles {
                 waiter,
                 Waiting {
                     generation,
+                    any,
                     remaining,
                     results: BTreeMap::new(),
                     completion,
@@ -316,6 +334,13 @@ impl Handles {
             }
         }
         if let Some(deadline) = deadline_ms {
+            let delay = Duration::from_millis(deadline.saturating_sub(now_ms()));
+            if delay.is_zero() {
+                // Polls inspect every handle above, then return pending results
+                // without allocating a timer task or waiting for a timer tick.
+                self.expire(waiter, generation);
+                return;
+            }
             let mut inner = self.inner.lock().unwrap();
             let Some(waiting) = inner.waiters.get_mut(&waiter) else {
                 return;
@@ -323,7 +348,6 @@ impl Handles {
             if waiting.generation != generation || waiting.remaining.is_empty() {
                 return;
             }
-            let delay = Duration::from_millis(deadline.saturating_sub(now_ms()));
             let handles = self.clone();
             waiting.timer = Some(
                 tokio::spawn(async move {
@@ -351,12 +375,14 @@ impl Handles {
         if waiting.generation != generation || waiting.remaining.is_empty() {
             return;
         }
-        for handle in std::mem::take(&mut waiting.remaining) {
-            waiting
-                .results
-                .insert(handle, Arc::new(json!({"pending":true})));
-        }
+        Self::pend_remaining(waiting);
         Self::complete_locked(&mut inner, &self.resume, waiter);
+    }
+
+    /// Registry size for `stats`: live waiters and retained outcomes.
+    pub fn stats(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (inner.waiters.len(), inner.retained.len())
     }
 
     /// Consume a parked turn's results when it resumes.
@@ -450,6 +476,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn any_mode_completes_on_the_first_result_and_pends_the_rest() {
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let (output, _worker) = Output::stdout();
+        {
+            let mut inner = handles.inner.lock().unwrap();
+            inner.waiters.insert(
+                Waiter::Request(1),
+                Waiting {
+                    generation: 1,
+                    any: true,
+                    remaining: ["proc:1".into(), "proc:2".into()].into(),
+                    results: BTreeMap::new(),
+                    completion: Completion::Respond {
+                        session: 7,
+                        output,
+                        request: json!(1),
+                    },
+                    timer: None,
+                },
+            );
+            inner.by_process.insert(2, vec![Waiter::Request(1)]);
+            inner.by_process.insert(1, vec![Waiter::Request(1)]);
+        }
+        handles.process_finished(2, json!({"exit_code":0}));
+        let inner = handles.inner.lock().unwrap();
+        // Consumed by its response, with nothing left registered.
+        assert!(inner.waiters.is_empty());
+        assert!(inner.by_process.is_empty());
+    }
+
+    #[test]
     fn shared_results_are_released_when_waiters_leave() {
         let handles = Handles::new(mpsc::unbounded_channel().0);
         {
@@ -460,6 +517,7 @@ mod tests {
                     waiter,
                     Waiting {
                         generation: turn as u64,
+                        any: false,
                         remaining: ["proc:1".into(), "proc:2".into()].into(),
                         results: BTreeMap::new(),
                         completion: Completion::Resume {

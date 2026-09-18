@@ -86,6 +86,10 @@ impl Transport {
     pub fn connections(&self) -> usize {
         self.shards.len()
     }
+    /// Startup permits still available; none when the bound is off.
+    pub fn starting_permits(&self) -> usize {
+        self.starting.available_permits()
+    }
     /// The least-loaded shard. The counts are advisory: a concurrent lease
     /// may pick the same shard, which only costs balance, never correctness.
     fn lease(&self) -> (&reqwest::Client, Lease<'_>) {
@@ -97,8 +101,8 @@ impl Transport {
         shard.in_flight.fetch_add(1, Ordering::Relaxed);
         (&shard.client, Lease(&shard.in_flight))
     }
-    #[cfg(test)]
-    fn loads(&self) -> Vec<usize> {
+    /// In-flight requests per shared client shard across all providers, for `stats`.
+    pub fn loads(&self) -> Vec<usize> {
         self.shards
             .iter()
             .map(|shard| shard.in_flight.load(Ordering::Relaxed))
@@ -223,6 +227,12 @@ impl Provider {
             tools: Arc::from(RawValue::from_string(encoded)?),
             has_tools: !tools.is_empty(),
             max_output_tokens: None,
+        })
+    }
+    /// Model pool levels behind this provider, for `stats`.
+    pub fn status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pools": self.pools.status(),
         })
     }
     pub fn family(&self) -> Family {

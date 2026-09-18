@@ -427,9 +427,10 @@ impl Turn {
                 Ok(Prepared::Wait {
                     handles,
                     timeout_ms,
+                    any,
                 }) => {
                     match self
-                        .park(&call.call_id, handles, timeout_ms, &mut calls)
+                        .park(&call.call_id, handles, timeout_ms, any, &mut calls)
                         .await?
                     {
                         Some(outcome) => outcome,
@@ -553,6 +554,7 @@ impl Turn {
         call_id: &str,
         handles: Vec<String>,
         timeout_ms: Option<u64>,
+        any: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
     ) -> Result<Option<Outcome>> {
         for text in &handles {
@@ -573,7 +575,7 @@ impl Turn {
         let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
         let entry = self
             .store
-            .call(move |db| db.suspend(turn, &id, &list, deadline_ms, &pending))
+            .call(move |db| db.suspend(turn, &id, &list, deadline_ms, any, &pending))
             .await?;
         self.hub.durable(&self.bot, entry).await?;
         self.handles
@@ -582,6 +584,7 @@ impl Turn {
                 Waiter::Turn(self.turn),
                 &handles,
                 deadline_ms,
+                any,
                 Completion::Resume {
                     bot: self.bot.clone(),
                     turn: self.turn,

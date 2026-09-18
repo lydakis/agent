@@ -94,6 +94,77 @@ class SocketAndCliTests(ModelFixture):
             time.sleep(.01)
         self.assertFalse(self.socket.exists())
 
+    def test_stats_and_wait_any_from_the_cli(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)
+        self.assertEqual(stats['active_turns'], 0)
+        self.assertIn('store', stats)
+        slow = json.loads(self.agent('run', '--store', str(self.store), '--new', '--bot', 'Slow', '--detach', 'wait').stdout)['handle']
+        quick = json.loads(self.agent('run', '--store', str(self.store), '--new', '--bot', 'Quick', '--detach', 'hi').stdout)['handle']
+        first = json.loads(self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '5000', slow, quick).stdout)
+        self.assertEqual(first['pending'], [slow])
+        self.assertEqual(first['results'][quick]['text'], 'reply:hi')
+        timed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '0', slow, check=False)
+        self.assertEqual(timed.returncode, 1)
+        self.assertEqual(json.loads(timed.stdout), {'pending': [slow], 'results': {slow: {'pending': True}}})
+        self.assertEqual(timed.stderr, '')
+        done = self.agent('wait', '--store', str(self.store), '--timeout-ms=0', quick)
+        self.assertEqual(json.loads(done.stdout)['results'][quick]['text'], 'reply:hi')
+        mixed = self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms=0', slow, quick)
+        self.assertEqual(json.loads(mixed.stdout)['pending'], [slow])
+        self.agent('interrupt', '--store', str(self.store), '--bot', 'Slow')
+        failed = self.agent('wait', '--store', str(self.store), '--any', slow, check=False)
+        self.assertEqual(failed.returncode, 1)
+
+    def test_help_and_invalid_flags_do_not_start_a_daemon(self):
+        for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'stats', 'shutdown', 'serve')]:
+            with self.subTest(args=args):
+                result = self.agent(*args)
+                self.assertIn('Usage:', result.stdout)
+                self.assertEqual(result.stderr, '')
+        invalid = [
+            ('follow', '--all', '--bot', 'Bob'),
+            ('stats', '--any'), ('ls', 'ignored'), ('ls', '-x'),
+            ('wait', '--all', 'proc:1'),
+            ('run', '--bot', 'Bob', '--reasoning', 'low', 'hi'),
+            ('run', '--new', '--instructions', 'one', '--instructions-file', 'missing', 'hi'),
+            ('wait', '--any=true', 'proc:1'),
+            ('run', '--bot', 'Bob', '--bot', 'Alice', 'hi'),
+            ('run', '--max-output-tokens', '0', 'hi'),
+            ('serve', '--context-items', '0'),
+            ('follow', '--after=-1', '--all'),
+        ]
+        for args in invalid:
+            with self.subTest(args=args):
+                result = self.agent(args[0], '--store', str(self.store), *args[1:], check=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, '')
+        self.assertFalse(self.store.exists())
+        self.assertFalse(self.socket.exists())
+
+    def test_equals_delimiter_and_json_output_conventions(self):
+        run = self.agent('run', *self.common, '--new', '--bot=Bob', '--', '--help')
+        self.assertIn('turn_finished', run.stdout)
+        # Help after -- is literal prompt text, and = keeps flag-like values literal.
+        self.assertEqual(self.model.requests.get(timeout=2)['input'][-1]['content'][0]['text'], '--help')
+        first = self.agent('fork', '--store='+str(self.store), '--source=Bob', '--bot=Branch')
+        self.assertEqual(len(first.stdout.splitlines()), 1)
+        pretty = self.agent('fork', '--store='+str(self.store), '--source=Bob', '--bot=Pretty', '--pretty')
+        self.assertGreater(len(pretty.stdout.splitlines()), 1)
+        self.assertEqual(json.loads(first.stdout)['head'], json.loads(pretty.stdout)['head'])
+        detached = self.agent('run', '--store='+str(self.store), '--bot=Bob', '--detach', '--pretty', 'hi')
+        self.assertGreater(len(detached.stdout.splitlines()), 1)
+        self.agent('wait', '--store='+str(self.store), json.loads(detached.stdout)['handle'])
+        # The daemon parser shares the same value syntax and file option.
+        instructions = self.path / 'instructions.txt'
+        instructions.write_text('synthetic instructions')
+        stdio = Client(self.binary, self.path/'stdio.sqlite', self.url, 'echo',
+                       extra=('--instructions-file='+str(instructions),))
+        self.addCleanup(stdio.close)
+        state = stdio.request('create', bot='Standalone')['result']
+        self.assertEqual(state['instructions'], 'synthetic instructions')
+
     def test_rm_and_prune_bound_a_bot_and_remove_it(self):
         for n in range(3):
             self.agent('run', *self.common, *(['--new'] if n == 0 else []), '--bot', 'Bob', f'p{n}')
@@ -482,7 +553,7 @@ class CliTests(ModelFixture):
         self.addCleanup(client.close)
         client.control.request('create', bot='first')
         env = {**clean_env(), 'AGENT_SOCKET':str(client.socket_path)}
-        base = [str(self.binary), 'ls', '--store', str(self.path/'other.db'), '--no-spawn']
+        base = [str(self.binary), 'ls', '--store', str(self.path/'other.db')]
         result = subprocess.run(base, env=env, capture_output=True, text=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('daemon_unavailable', result.stderr)
@@ -497,16 +568,16 @@ class CliTests(ModelFixture):
         def cli(*args):
             return subprocess.run([str(self.binary), *args, *common], env=env,
                                   capture_output=True, text=True, timeout=12)
-        self.addCleanup(lambda: cli('shutdown', '--no-spawn'))
+        self.addCleanup(lambda: cli('shutdown'))
         result = cli('run', '--detach', '--new', '--bot', 'deep', '--provider',
                      'openai=responses,'+self.url, '--tools', 'echo',
                      '--model', 'openai/synthetic-model', 'hello')
         self.assertEqual(result.returncode, 0, result.stderr)
-        result = cli('ls', '--no-spawn')
+        result = cli('ls')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)[0]['name'], 'deep')
         self.assertTrue(store.exists())
-        self.assertEqual(cli('shutdown', '--no-spawn').returncode, 0)
+        self.assertEqual(cli('shutdown').returncode, 0)
 
     def test_listing_pages_metadata_and_cli_lists_every_bot(self):
         client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo,shell')

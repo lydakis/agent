@@ -29,6 +29,15 @@ pub struct Report {
 #[derive(Default)]
 pub struct Pools(Mutex<HashMap<String, Arc<Pace>>>);
 impl Pools {
+    /// Every pool's learned allowance and level, for `stats`.
+    pub fn status(&self) -> serde_json::Value {
+        let pools = self.0.lock().unwrap();
+        let mut out = serde_json::Map::new();
+        for (model, pace) in pools.iter() {
+            out.insert(model.clone(), pace.status());
+        }
+        serde_json::Value::Object(out)
+    }
     pub fn get(&self, model: &str) -> Arc<Pace> {
         let mut pools = self.0.lock().unwrap();
         if let Some(pace) = pools.get(model) {
@@ -312,6 +321,24 @@ impl Pace {
             self.changed.notify_one();
         }
         token_reported
+    }
+    pub fn status(&self) -> serde_json::Value {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        state.requests.refill(now);
+        state.tokens.refill(now);
+        let blocked_ms = state
+            .blocked_until
+            .map_or(0, |u| u.saturating_duration_since(now).as_millis() as u64);
+        serde_json::json!({
+            "requests_per_minute": state.requests.per_minute,
+            "requests_available": state.requests.per_minute.map(|_| state.requests.available.floor()),
+            "tokens_per_minute": state.tokens.per_minute,
+            "tokens_available": state.tokens.per_minute.map(|_| state.tokens.available.floor()),
+            "reserved_tokens": state.reserved,
+            "reserved_requests": state.reserved_requests,
+            "blocked_ms": blocked_ms,
+        })
     }
     #[cfg(test)]
     pub fn snapshot(&self) -> (Option<f64>, f64, Option<f64>, f64, bool) {

@@ -1,5 +1,7 @@
 //! Live event fan-out. The stdio owner receives everything with backpressure;
 //! socket followers receive their bots' events and are dropped when they lag.
+//! A follower of `*` receives every bot's events on one connection, replayed
+//! from a store-wide cursor, so a fleet controller needs one subscription.
 use agent_runtime::{Result, fail, output::Output, store::Store};
 use serde_json::{Value, json};
 use std::{
@@ -34,6 +36,8 @@ impl Subscription {
     }
 }
 pub type Sub = Arc<Mutex<Subscription>>;
+/// The subscription name that means every bot.
+pub const ALL: &str = "*";
 #[derive(Clone, Default)]
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
@@ -90,14 +94,14 @@ impl Hub {
     }
     /// Deliver to followers; `cursor` orders durable entries after replay.
     fn fan_out(&self, bot: &str, event: &Value, cursor: Option<i64>) {
-        let subs: Vec<Sub> = self
-            .inner
-            .lock()
-            .unwrap()
-            .subs
-            .get(bot)
-            .map(|s| s.to_vec())
-            .unwrap_or_default();
+        let subs: Vec<Sub> = {
+            let inner = self.inner.lock().unwrap();
+            let mut subs = inner.subs.get(bot).map(|s| s.to_vec()).unwrap_or_default();
+            if let Some(all) = inner.subs.get(ALL) {
+                subs.extend(all.iter().cloned());
+            }
+            subs
+        };
         for sub in subs {
             let (session, output) = {
                 let mut s = sub.lock().unwrap();
@@ -144,7 +148,11 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
                 if s.cancelled {
                     return Ok(json!({"events":[]}));
                 }
-                let page = db.events(&page_bot, s.last_cursor, 256)?;
+                let page = if page_bot == ALL {
+                    db.events_after(s.last_cursor, 256)?
+                } else {
+                    db.events(&page_bot, s.last_cursor, 256)?
+                };
                 if page["events"].as_array().is_some_and(Vec::is_empty) {
                     s.live = true;
                 } else if let Some(next) = page["next_cursor"].as_i64() {

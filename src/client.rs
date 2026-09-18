@@ -45,6 +45,10 @@ struct Options {
     budget_tokens: Option<u64>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
+    /// `follow --all`: every bot on one connection.
+    all: bool,
+    /// `wait --any`: return on the first resolved handle.
+    any: bool,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
@@ -73,6 +77,8 @@ fn parse(args: &[String]) -> Result<Options> {
         budget_tokens: None,
         turn: None,
         keep_turns: None,
+        all: false,
+        any: false,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
     };
@@ -85,6 +91,8 @@ fn parse(args: &[String]) -> Result<Options> {
             "--no-spawn" => options.no_spawn = true,
             "--new" => options.new = true,
             "--detach" => options.detach = true,
+            "--all" => options.all = true,
+            "--any" => options.any = true,
             "--" => options.positional.extend(iter.by_ref().cloned()),
             flag if flag.starts_with("--") => {
                 let value = iter
@@ -436,6 +444,12 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "result" => result(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
+        "stats" => {
+            let mut connection = ensure_existing_daemon(&options)?;
+            let stats = connection.request("stats", json!({}))?;
+            print_json(&stats, options.pretty)?;
+            Ok(0)
+        }
         "ls" => list(&options),
         "shutdown" => {
             let mut connection = Connection::connect(&options.socket)?;
@@ -444,6 +458,15 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         }
         _ => fail("usage"),
     }
+}
+
+fn print_json(value: &Value, pretty: bool) -> Result<()> {
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        println!("{value}");
+    }
+    Ok(())
 }
 
 fn workspace(options: &Options) -> Result<String> {
@@ -488,7 +511,7 @@ fn run(options: &Options) -> Result<i32> {
             "model":if created { Value::Null } else { json!(options.model) }}),
     )?;
     if options.detach {
-        println!("{submitted}");
+        print_json(&submitted, options.pretty)?;
         return Ok(0);
     }
     let turn = submitted["turn"]
@@ -512,10 +535,21 @@ fn run(options: &Options) -> Result<i32> {
 }
 
 fn follow(options: &Options) -> Result<i32> {
+    if options.all {
+        // Every bot's events from a store-wide cursor, then live, until the
+        // connection ends: the fleet controller's view.
+        let mut connection = Connection::connect(&options.socket)?;
+        connection.request("follow", json!({"bot":"*","after":options.after}))?;
+        let mut renderer = Renderer::new(options.pretty, None);
+        loop {
+            let event = connection.next_event()?;
+            renderer.event(&mut connection, &event)?;
+        }
+    }
     let bot = options
         .bot
         .clone()
-        .ok_or(Error::with("usage", "follow needs --bot"))?;
+        .ok_or(Error::with("usage", "follow needs --bot or --all"))?;
     let mut connection = Connection::connect(&options.socket)?;
     // Choose the turn before subscribing. If it finishes during attachment,
     // replay still delivers its terminal event; a later idle snapshot cannot
@@ -554,7 +588,7 @@ fn fork(options: &Options) -> Result<i32> {
             "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
             "budget_tokens":options.budget_tokens}),
     )?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    print_json(&result, options.pretty)?;
     Ok(0)
 }
 
@@ -580,7 +614,10 @@ fn remove(options: &Options) -> Result<i32> {
         .clone()
         .ok_or(Error::with("usage", "rm needs --bot"))?;
     let mut connection = ensure_existing_daemon(options)?;
-    println!("{}", connection.request("delete", json!({"bot":bot}))?);
+    print_json(
+        &connection.request("delete", json!({"bot":bot}))?,
+        options.pretty,
+    )?;
     Ok(0)
 }
 
@@ -594,15 +631,15 @@ fn prune(options: &Options) -> Result<i32> {
         .keep_turns
         .ok_or(Error::with("usage", "prune needs --keep-turns N"))?;
     let mut connection = ensure_existing_daemon(options)?;
-    println!(
-        "{}",
-        connection.request("prune", json!({"bot":bot,"keep_turns":keep}))?
-    );
+    print_json(
+        &connection.request("prune", json!({"bot":bot,"keep_turns":keep}))?,
+        options.pretty,
+    )?;
     Ok(0)
 }
 
-/// Block until every handle resolves, then print the same result the wait
-/// tool would receive. Exit 1 if any handle is still pending or errored.
+/// Wait for all handles, or the first with --any. Pending peers are expected
+/// in any mode; timeout without a result and resolved errors still exit 1.
 fn wait(options: &Options) -> Result<i32> {
     if options.positional.is_empty() {
         return fail_with("usage", "wait needs at least one handle");
@@ -610,14 +647,19 @@ fn wait(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     let result = connection.request(
         "wait",
-        json!({"handles":options.positional,"timeout_ms":options.timeout_ms}),
+        json!({"handles":options.positional,"timeout_ms":options.timeout_ms,"any":options.any}),
     )?;
-    println!("{result}");
-    let clean = result["pending"].as_array().is_some_and(Vec::is_empty)
-        && result["results"].as_object().is_some_and(|r| {
-            r.values()
-                .all(|v| v.get("error").is_none_or(Value::is_null))
-        });
+    print_json(&result, options.pretty)?;
+    let clean = result["results"].as_object().is_some_and(|results| {
+        let resolved = |v: &&Value| v.get("pending") != Some(&Value::Bool(true));
+        let mut completed = results.values().filter(resolved).peekable();
+        let enough = if options.any {
+            completed.peek().is_some()
+        } else {
+            result["pending"].as_array().is_some_and(Vec::is_empty)
+        };
+        enough && completed.all(|v| v.get("error").is_none_or(Value::is_null))
+    });
     Ok(if clean { 0 } else { 1 })
 }
 
@@ -684,7 +726,7 @@ fn result(options: &Options) -> Result<i32> {
     };
     let mut connection = ensure_existing_daemon(options)?;
     let outcome = connection.request("result", json!({"bot":bot,"turn":turn}))?;
-    println!("{outcome}");
+    print_json(&outcome, options.pretty)?;
     Ok(if outcome["status"] == "completed" {
         0
     } else {

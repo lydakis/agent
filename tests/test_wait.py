@@ -17,6 +17,22 @@ from tests.test_runtime import ModelFixture
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class WaitTests(ModelFixture):
+    def test_zero_timeout_tool_returns_ready_and_pending_handles(self):
+        client = self.client('echo,wait')
+        for bot in ('Alice', 'Bob', 'Carol'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        slow = client.request('submit', bot='Alice', request_id='slow', prompt='wait')['result']
+        quick = client.request('submit', bot='Carol', request_id='quick', prompt='hi')['result']
+        client.finished(quick['turn'])
+        turn = client.request('submit', bot='Bob', request_id='poll',
+                              prompt=f"waitt:0:{slow['handle']},{quick['handle']}")['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        outcome = self.tool_output(client, 'Bob', 'wait-1')
+        self.assertEqual(outcome['pending'], [slow['handle']])
+        self.assertEqual(outcome['results'][quick['handle']]['text'], 'reply:hi')
+        self.assertEqual(client.request('stats')['result']['handles'], {'waiters': 0, 'retained': 0})
+        client.request('interrupt', bot='Alice', turn=slow['turn'])
+
     def test_retention_applies_when_parked_turns_are_interrupted(self):
         client = self.client('wait', extra=('--retain-turns', '1'))
         for bot in ('Alice', 'Bob'):
@@ -89,7 +105,7 @@ class WaitTests(ModelFixture):
             # Copying the 128 KiB output into each waiter costs 16 MiB per phase.
             # Allow ample allocator noise while rejecting that linear growth.
             self.assertLess(process.memory_info().rss - baseline, 8 * 1024 * 1024, phase)
-        self.assertEqual(client.request('wait', handles=[pending], timeout_ms=1)['result']['pending'], [pending])
+        self.assertEqual(client.request('wait', handles=[pending], timeout_ms=0)['result']['pending'], [pending])
 
     def test_old_turn_outcomes_use_indexed_event_lookups(self):
         client = self.client()
@@ -243,6 +259,27 @@ class WaitTests(ModelFixture):
         self.assertEqual(timed['pending'], [again['handle']])
         client.request('interrupt', bot='Alice', turn=again['turn'])
         client.finished(again['turn'])
+
+    def test_any_mode_returns_the_first_result_and_keeps_the_rest_valid(self):
+        client = self.client('echo,shell,wait')
+        for bot in ('Bob', 'Alice', 'Carol'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        slow = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
+        quick = client.request('submit', bot='Carol', request_id='c', prompt='hi')['result']
+        # The protocol op answers as soon as one handle resolves.
+        first = client.request('wait', handles=[slow['handle'], quick['handle']], any=True, timeout_ms=5000)['result']
+        self.assertEqual(first['results'][quick['handle']]['text'], 'reply:hi')
+        self.assertEqual(first['pending'], [slow['handle']])
+        # The tool does the same and the turn continues with what it got.
+        bob = client.request('submit', bot='Bob', request_id='b',
+                             prompt=f"waitany:{slow['handle']},{quick['handle']}")['result']['turn']
+        self.assertEqual(client.finished(bob)['data']['status'], 'completed')
+        outcome = self.tool_output(client, 'Bob', 'wait-1')
+        self.assertEqual(outcome['pending'], [slow['handle']])
+        self.assertEqual(outcome['results'][quick['handle']]['text'], 'reply:hi')
+        # The pending handle stays valid: an all-mode wait still gets it.
+        later = client.request('wait', handles=[slow['handle']], timeout_ms=10000)['result']
+        self.assertEqual((later['pending'], later['results'][slow['handle']]['text']), ([], 'reply:wait'))
 
     def test_rejected_wait_preserves_the_rest_of_the_tool_batch(self):
         client = self.client('echo,wait')

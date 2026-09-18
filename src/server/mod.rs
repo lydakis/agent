@@ -134,7 +134,13 @@ enum Command {
     Wait {
         handles: Vec<String>,
         timeout_ms: Option<u64>,
+        /// Answer on the first resolved handle; the rest are reported pending.
+        #[serde(default)]
+        any: bool,
     },
+    /// The daemon's live state for a fleet controller: sessions, turns,
+    /// connections, pools, storage worker, and handle registry.
+    Stats,
     Bots {
         after: Option<String>,
         limit: Option<usize>,
@@ -286,6 +292,7 @@ fn workspace(path: &str) -> Result<String> {
 }
 struct Service {
     store: Store,
+    transport: Arc<Transport>,
     providers: Arc<HashMap<String, Provider>>,
     registry: Registry,
     hub: Hub,
@@ -295,6 +302,8 @@ struct Service {
     background_failures: mpsc::UnboundedSender<Error>,
     limits: Limits,
     retain_turns: Option<usize>,
+    /// Open client sessions, kept by the run loop for `stats`.
+    sessions: usize,
     limit_active: usize,
     /// Per bot: the running turn, the task owning it, and its cancel signal.
     /// A parked turn's task ends while a resumed task may already own the slot.
@@ -376,7 +385,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","bots","wait","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
@@ -435,6 +444,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 Waiter::Turn(waiting.turn),
                 &waiting.handles,
                 waiting.deadline_ms,
+                waiting.any,
                 Completion::Resume {
                     bot: waiting.bot.clone(),
                     turn: waiting.turn,
@@ -444,6 +454,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     let mut service = Service {
         store,
+        transport,
         providers: Arc::new(providers),
         registry,
         hub,
@@ -456,6 +467,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         background_failures: failure_sender,
         limits,
         retain_turns: config.retain_turns,
+        sessions: sessions.len(),
         limit_active: limits.active,
         active: HashMap::new(),
         next_task: 0,
@@ -500,9 +512,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     Inbound::Open(id, output) => {
                         let _ = output.try_send(ready.clone());
                         sessions.insert(id, output);
+                        service.sessions = sessions.len();
                     }
                     Inbound::Closed(id) => {
                         sessions.remove(&id);
+                        service.sessions = sessions.len();
                         service.hub.close_session(id);
                         service.handles.close_session(id);
                         if id == 0 && stdio_owner { break; }
@@ -525,6 +539,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                             }
                         } else if output.try_respond(request_id, result).is_err() {
                             sessions.remove(&id);
+                            service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
                             output.close();
@@ -689,9 +704,9 @@ impl Service {
                     return fail("instructions_limit");
                 }
                 let (provider, model) = (provider.to_owned(), model.to_owned());
-                store
+                let (created, event) = store
                     .call(move |db| {
-                        Ok(serde_json::to_value(db.create(
+                        db.create(
                             &bot,
                             path.as_deref(),
                             Binding {
@@ -702,9 +717,11 @@ impl Service {
                                 reasoning: reasoning.as_deref(),
                                 budget_tokens,
                             },
-                        )?)?)
+                        )
                     })
-                    .await
+                    .await?;
+                self.hub.durable(&created.name, event).await?;
+                Ok(serde_json::to_value(created)?)
             }
             Command::Turns { bot, after, limit } => {
                 store
@@ -743,14 +760,36 @@ impl Service {
                     .call(move |db| Ok(serde_json::to_value(db.inspect(&bot)?)?))
                     .await
             }
+            Command::Stats => {
+                let (waiting, running) = store.call(|db| db.counts()).await?;
+                let (waiters, retained) = self.handles.stats();
+                let providers: serde_json::Map<String, Value> = self
+                    .providers
+                    .iter()
+                    .map(|(name, provider)| (name.clone(), provider.status()))
+                    .collect();
+                Ok(json!({
+                    "sessions": self.sessions,
+                    "active_turns": self.active.len(),
+                    "active_limit": self.limit_active,
+                    "waiting_turns": waiting,
+                    "running_processes": running,
+                    "process_limit": self.limits.processes,
+                    "transport": {"in_flight_by_shard": self.transport.loads()},
+                    "providers": providers,
+                    "store": store.stats(),
+                    "handles": {"waiters": waiters, "retained": retained},
+                }))
+            }
             Command::Wait {
                 handles,
                 timeout_ms,
+                any,
             } => {
                 if handles.is_empty() || handles.len() > 64 {
                     return fail("invalid_handles");
                 }
-                if timeout_ms.is_some_and(|t| t == 0 || t > 86_400_000) {
+                if timeout_ms.is_some_and(|t| t > 86_400_000) {
                     return fail("invalid_timeout");
                 }
                 for handle in &handles {
@@ -764,6 +803,7 @@ impl Service {
                         waiter,
                         &handles,
                         deadline,
+                        any,
                         Completion::Respond {
                             session,
                             output: output.clone(),
@@ -791,17 +831,13 @@ impl Service {
                 }
                 name(&bot)?;
                 let path = path.as_deref().map(workspace).transpose()?;
-                store
+                let (created, event) = store
                     .call(move |db| {
-                        Ok(serde_json::to_value(db.fork(
-                            &source,
-                            checkpoint,
-                            &bot,
-                            path.as_deref(),
-                            budget_tokens,
-                        )?)?)
+                        db.fork(&source, checkpoint, &bot, path.as_deref(), budget_tokens)
                     })
-                    .await
+                    .await?;
+                self.hub.durable(&created.name, event).await?;
+                Ok(serde_json::to_value(created)?)
             }
             Command::Events { bot, after, limit } => {
                 store.call(move |db| db.events(&bot, after, limit)).await
@@ -834,8 +870,11 @@ impl Service {
                 if after < 0 {
                     return fail("invalid_event_page");
                 }
-                let check = bot.clone();
-                store.call(move |db| db.inspect(&check)).await?;
+                // `*` follows every bot from a store-wide cursor.
+                if bot != hub::ALL {
+                    let check = bot.clone();
+                    store.call(move |db| db.inspect(&check)).await?;
+                }
                 let sub = self.hub.subscribe(&bot, session, output.clone(), after);
                 let (store, hub, replay_bot, output) =
                     (store.clone(), self.hub.clone(), bot.clone(), output.clone());
@@ -1033,7 +1072,7 @@ mod tests {
                 .into();
                 db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
                 db.tool_start(turn, &call)?;
-                db.suspend(turn, &call.call_id, &["proc:1".into()], None, &[])?;
+                db.suspend(turn, &call.call_id, &["proc:1".into()], None, false, &[])?;
                 Ok(turn)
             })
             .await
@@ -1041,6 +1080,7 @@ mod tests {
         let (cancel, cancelled) = watch::channel(false);
         let mut service = Service {
             store: store.clone(),
+            transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
@@ -1056,6 +1096,7 @@ mod tests {
                 context_items: 4096,
             },
             retain_turns: None,
+            sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1,
             active: HashMap::from([("Bob".into(), (turn, 1, cancel))]),
@@ -1151,8 +1192,9 @@ mod tests {
             .await
             .unwrap();
         let registry = Registry::new("echo").unwrap();
+        let transport = Transport::new(64, 1).unwrap();
         let provider = Provider::new(
-            Transport::new(64, 1).unwrap(),
+            transport.clone(),
             Family::Responses,
             "http://127.0.0.1:1/v1",
             None,
@@ -1162,6 +1204,7 @@ mod tests {
         let (output, writer) = Output::stdout();
         let mut service = Service {
             store: store.clone(),
+            transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
             registry,
             hub: Hub::default(),
@@ -1177,6 +1220,7 @@ mod tests {
                 context_items: 4096,
             },
             retain_turns: None,
+            sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
             active: (0..1024)

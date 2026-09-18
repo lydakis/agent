@@ -420,8 +420,55 @@ Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":15,"op":"delete","bot":"Bob"}
+{"id":16,"op":"follow","bot":"*","after":0}
+{"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
+{"id":18,"op":"stats"}
 {"id":12,"op":"shutdown"}
 ```
+
+## Fleet controllers
+
+A program driving thousands of bots needs three things a single-bot client
+does not, and each is one op:
+
+- `follow` with `bot: "*"` subscribes one socket session to every bot's
+  events. Replay comes from a store-wide cursor (event ids are store-wide and
+  monotonic), so a controller reconnecting after a crash resumes from the last
+  cursor it saw with one request, not one per bot; `follow_live` then marks
+  the switch to live delivery, and a retention gap anywhere is announced as a
+  `pruned` notice first. Live delivery has the socket follower's contract:
+  a lagging session is disconnected rather than allowed to hold the daemon.
+  `agent follow --all [--after N]`. New identities publish their `created` or
+  `forked` entry to live followers. A store-level watermark records gaps from
+  pruning and deletion even after the owning bot is removed; reading this
+  watermark does not scan the fleet. Schema 14 seeds it once from surviving
+  retention marks and missing event IDs when opening an older store.
+- `wait` with `any: true` answers on the first handle that resolves; the rest
+  are reported `pending`, exactly as a timeout reports them, and stay valid
+  for a later wait. A scheduler reacts as work completes instead of chunking
+  handles into groups of 64 and waiting for whole groups. The `wait` tool
+  accepts the same field, and a parked turn's mode survives a restart.
+  `agent wait --any HANDLE...` exits 0 when a successful handle resolves,
+  even with peers pending; an error or timeout without a result exits 1.
+  `timeout_ms: 0` polls current outcomes and returns unresolved handles as
+  pending without a timer, in both the protocol op and the wait tool.
+- `stats` returns the daemon's live state without sampling its process from
+  outside: open sessions, active turns against the bound, parked turns,
+  running processes against the process bound, daemon-wide in-flight
+  requests per shared HTTP client shard (`transport.in_flight_by_shard`),
+  and every provider's model pools with their learned allowance and current
+  level (`providers.NAME.pools`). Shard loads count requests, not physical
+  connections, and appear once even when multiple providers share transport.
+  A pool's `reserved_requests` counts pacing reservations awaiting response
+  headers, including admitted requests not yet dispatched; it is not the
+  number of streaming requests. Receiving headers releases the reservation
+  while the shared transport load continues through stream completion.
+  Stats also reports the store's on-disk and WAL sizes with the storage worker's
+  job count and its time queued versus time running (whether the worker or
+  the disk is the bottleneck), and the handle registry's size. `agent stats
+  [--pretty]`. Store sizes use the canonical database path established at
+  open, including when the caller used a symlink. The counters cost three
+  clock reads per storage job.
 
 Protocol version 3 changes `bots` to return `{bots, next_after}`. It pages by
 name, with a default limit of 64, maximum 256, and a 512 KiB encoded metadata
@@ -661,7 +708,7 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 12; a version-6
+the `context_window` capability. Stores are schema version 14; a version-6
 store is migrated at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
@@ -809,3 +856,5 @@ execution, including shell descendants, independently of the text-core screen.
 Very long histories and compaction are specified in [LONG_HISTORY.md](LONG_HISTORY.md);
 stored history is now unbounded with a per-request context window, and
 compaction with summaries is not implemented.
+
+CLI syntax, option scope, output, and exit conventions: [CLI.md](CLI.md).

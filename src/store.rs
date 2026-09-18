@@ -11,9 +11,20 @@ mod db;
 pub use db::{Binding, Bot, Database, Started, TurnContext, TurnOptions, Waiting, Window};
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
+/// Storage worker counters: how long jobs queued for the worker versus how
+/// long they ran on it. The split says whether the worker or the disk is the
+/// bottleneck; three clock reads per job.
+#[derive(Default)]
+pub struct Counters {
+    pub jobs: std::sync::atomic::AtomicU64,
+    pub queued_ns: std::sync::atomic::AtomicU64,
+    pub ran_ns: std::sync::atomic::AtomicU64,
+}
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Job>,
+    path: std::sync::Arc<std::path::PathBuf>,
+    counters: std::sync::Arc<Counters>,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -30,7 +41,7 @@ impl Store {
         std::thread::Builder::new()
             .name("agent-storage".into())
             .spawn(move || {
-                let opened: Result<(Database, File)> = (|| {
+                let opened: Result<(Database, File, std::path::PathBuf)> = (|| {
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
@@ -76,11 +87,11 @@ impl Store {
                         Err(error) => return Err(error.into()),
                     }
                     let db = Database::initialize(Connection::open(&path)?, &configuration)?;
-                    Ok((db, lock))
+                    Ok((db, lock, path))
                 })();
                 match opened {
-                    Ok((mut db, _lock)) => {
-                        let _ = ready.send(Ok(()));
+                    Ok((mut db, _lock, path)) => {
+                        let _ = ready.send(Ok(path));
                         while let Some(job) = receiver.blocking_recv() {
                             job(&mut db);
                         }
@@ -90,20 +101,52 @@ impl Store {
                     }
                 }
             })?;
-        opened
+        let store_path = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            path: std::sync::Arc::new(store_path),
+            counters: std::sync::Arc::default(),
+        })
+    }
+
+    /// Worker counters and on-disk size, for `stats`.
+    pub fn stats(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = |suffix: &str| {
+            let mut name = self.path.as_os_str().to_owned();
+            name.push(suffix);
+            std::fs::metadata(name).map(|m| m.len()).unwrap_or(0)
+        };
+        serde_json::json!({
+            "bytes": size(""),
+            "wal_bytes": size("-wal"),
+            "jobs": self.counters.jobs.load(Relaxed),
+            "queued_ms": self.counters.queued_ns.load(Relaxed) / 1_000_000,
+            "ran_ms": self.counters.ran_ns.load(Relaxed) / 1_000_000,
+        })
     }
 
     pub async fn call<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        use std::sync::atomic::Ordering::Relaxed;
         let (sender, receiver) = oneshot::channel();
+        let counters = self.counters.clone();
+        let queued = std::time::Instant::now();
         self.sender
             .send(Box::new(move |db| {
+                let started = std::time::Instant::now();
+                counters
+                    .queued_ns
+                    .fetch_add((started - queued).as_nanos() as u64, Relaxed);
                 let _ = sender.send(operation(db));
+                counters
+                    .ran_ns
+                    .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+                counters.jobs.fetch_add(1, Relaxed);
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;

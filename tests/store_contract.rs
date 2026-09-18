@@ -384,7 +384,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
 #[test]
 fn a_bot_without_a_default_workspace_needs_one_per_submission() {
     let mut db = db();
-    let bot = db.create("Nomad", None, binding()).unwrap();
+    let (bot, _) = db.create("Nomad", None, binding()).unwrap();
     assert!(bot.workspace.is_none());
     assert_eq!(
         db.begin("Nomad", "r1", "work", true, &TurnOptions::default())
@@ -635,14 +635,14 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
     db.tool_start(turn, &call).unwrap();
     let (_, entry) = db.tool_finish(turn, "c1", &result("hi")).unwrap();
     let answered = entry["data"]["node"].as_i64().unwrap();
-    let branch = db
+    let (branch, _) = db
         .fork("Bob", Some(answered), "branch", None, None)
         .unwrap();
     assert_eq!(branch.head, Some(answered));
     assert_eq!(stored(&mut db, "branch").len(), 4);
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
-    let tip = db.fork("Bob", None, "tip", None, None).unwrap();
+    let (tip, _) = db.fork("Bob", None, "tip", None, None).unwrap();
     assert_eq!(tip.head, db.inspect("Bob").unwrap().head);
     assert_eq!(stored(&mut db, "tip").len(), 5);
     // Branches are independent of the source and of each other.
@@ -1411,4 +1411,79 @@ fn retention_candidates_migrate_and_stay_scoped_to_their_bot() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+#[test]
+fn global_replay_gap_survives_deletion_restart_and_migration() {
+    let path = std::env::temp_dir().join(format!("agent-global-gap-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let high;
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+        converse(&mut db, "Bob", 2);
+        db.prune("Bob", 1).unwrap();
+        let gap = db.events("Bob", 0, 256).unwrap()["pruned_before"].clone();
+        assert_eq!(db.events_after(0, 256).unwrap()["pruned_before"], gap);
+        high = db.events_after(0, 256).unwrap()["next_cursor"]
+            .as_i64()
+            .unwrap();
+        db.delete_bot("Bob").unwrap();
+        let empty = db.events_after(0, 256).unwrap();
+        assert_eq!(empty["events"], json!([]));
+        assert_eq!(empty["pruned_before"], high);
+    }
+    for migrate in [false, true] {
+        if migrate {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE event_retention; PRAGMA user_version=13;")
+                .unwrap();
+        }
+        let db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        assert_eq!(db.events_after(0, 256).unwrap()["pruned_before"], high);
+        assert!(
+            db.events_after(high, 256)
+                .unwrap()
+                .get("pruned_before")
+                .is_none()
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
+    let path =
+        std::env::temp_dir().join(format!("agent-interior-gap-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let deleted;
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let (_, first) = db.create("First", None, binding()).unwrap();
+        let (_, second) = db.create("Second", None, binding()).unwrap();
+        let (_, third) = db.create("Third", None, binding()).unwrap();
+        assert!(first["cursor"].as_i64().unwrap() < second["cursor"].as_i64().unwrap());
+        deleted = second["cursor"].as_i64().unwrap();
+        assert_eq!(third["cursor"], deleted + 1);
+    }
+    for remove in [false, true] {
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+            if remove {
+                db.delete_bot("Second").unwrap();
+            }
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE event_retention; PRAGMA user_version=13;")
+            .unwrap();
+        let db = Database::initialize(conn, "test").unwrap();
+        let page = db.events_after(0, 256).unwrap();
+        if remove {
+            assert_eq!(page["pruned_before"], deleted);
+        } else {
+            assert!(page.get("pruned_before").is_none());
+        }
+    }
+    std::fs::remove_file(path).unwrap();
 }

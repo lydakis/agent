@@ -1158,3 +1158,169 @@ before the fix. Runtime coverage verifies that a top-level error with different
 message wording paces, retries, completes, and records one retry; non-rate-limit
 errors remain terminal. All provider traffic was synthetic and local. Scripts,
 captures, and full hashes are ignored under `.local/top-level-rate-fix/`.
+
+## Fleet controller slice regression check
+
+Observed 2026-09-17 on the same Darwin arm64 host, external power, Rust
+1.98.0. The 32-agent socket echo workload as before, two series of one
+excluded warmup and three measured runs, on binary `f3001f7f…` (follow-all,
+any-mode waits, the `stats` op, and storage-worker counters). All runs passed
+with 32 concurrent provider requests and no quality warnings. On this path the
+slice adds three clock reads and three relaxed atomic adds per storage job, and
+one hash lookup per fan-out for `*` followers.
+
+| Metric | Pacing tree (Astra's review) | Series 1 | Series 2 |
+| --- | ---: | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.52 (17.25–17.94) | 17.58 (17.52–17.73) | 17.78 (17.66–17.92) |
+| Observed target CPU, seconds | 0.294 (0.294–0.311) | 0.315 (0.312–0.335) | 0.326 (0.296–0.351) |
+| Per-run p95 turn latency, ms | 594.9 (593.6–600.6) | 617.2 (607.6–618.4) | 606.1 (595.4–624.8) |
+
+The two series disagree with each other by as much as they disagree with the
+baseline, and the second's ranges (0.296 to 0.351 s, 595 to 625 ms) span every
+earlier reading of this screen. The host was not quiet: during the screens
+the window server, a media analysis daemon, and a system predictor were each
+using a third to a half of a core. Nothing added here runs per byte or per
+message; the recorded cost is within this screen's own noise on this host,
+and the sequential 1,000-turn screen Astra used for the pacing fixes is the
+better instrument if a difference needs to be established. Captures:
+ignored `.local/bench/slice-controller-socket-32/` and `-32b/`.
+
+## Controller fixes and CLI consistency
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. The
+uncommitted controller baseline `f3001f7f…` is compared with final binary
+`80941699…`. The fixes publish creation/fork events, preserve global replay
+gaps after deletion, and correct `wait --any` exit status. CLI validation,
+help, and JSON formatting now follow [one documented contract](CLI.md),
+without a new dependency. Retention checks only whether a bot exists instead
+of copying its full configuration. A single persistent watermark replaces
+the fleet scan on each global replay page.
+
+Seven rotating rounds compare the original, correctness-only (`5fab5e5e…`),
+and final builds. Each run excludes 16 warmup turns and measures 1,000 turns,
+two model calls per turn, eight context items, and eight retained turns.
+All 21,000 measured turns completed; every run sent 2,000 requests with equal
+normalized payload hashes and 3,697,230 normalized request-body bytes.
+Provider and observer costs are outside daemon CPU/RSS. RSS is sampled every
+10 ms; latency runs from submission through receipt of the terminal event.
+
+| Median across seven runs | Original | Final |
+| --- | ---: | ---: |
+| Ordinary echo: daemon CPU, ms/turn | 2.023 | 1.983 |
+| Ordinary echo: per-run p95 latency, ms | 3.607 | 3.512 |
+| Ordinary echo: sampled peak RSS, MiB | 13.203 | 13.203 |
+| Global replay: daemon CPU, ms/operation | 2.201 | 0.067 |
+| Global replay: per-run p95 latency, ms | 2.973 | 0.236 |
+| Global replay: ending RSS, MiB | 13.094 | 10.609 |
+
+Ordinary CPU changed by -1.98%, p95 by -2.65%, and median peak RSS was
+unchanged. These are effectively flat results, not a throughput speedup
+claim: ordinary CPU ranges overlap (1.871–2.198 versus 1.892–2.047 ms/turn),
+and one final run had a 9.646 ms p95. The correctness-only build's CPU median
+was 1.995 ms/turn with the same median RSS; the small existence-check change
+does not establish an independent speedup.
+
+The separate global replay screen uses 10,000 **stored, idle** bots, with
+16 warmups and 500 measured operations per run, seven alternating pairs.
+Each operation subscribes from the latest cursor, receives `follow_live`,
+and unsubscribes on the same socket; it verifies that no durable events are
+replayed. Neither build calls a provider. CPU fell 96.97%, p95 fell 92.06%,
+and ending RSS fell 2.484 MiB. This measures cursor catch-up across fleet
+metadata, not active-agent capacity or full-transcript replay throughput.
+The final query reads one watermark row instead of scanning every bot.
+
+An experiment caching five additional retention statements was rejected:
+in its seven-round comparison, CPU increased from 1.919 to 2.172 ms/turn
+and median peak RSS from 13.219 to 13.453 MiB. Those extra cached statements
+are not in the final implementation. The schema-14 migration scans existing
+event IDs once to reconstruct older gaps; migration time is outside these
+steady-state measurements.
+
+All traffic is synthetic and local. Scripts, full hashes, raw measurements,
+and rejected-experiment evidence are ignored under `.local/controller-fixes/`.
+Validation on the final implementation: 65 Rust tests, 74 focused Python
+integration tests, strict all-feature Clippy, formatting, and diff checks passed.
+
+## Stats accounting fixes
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. The
+preceding binary `80941699…` is compared with `b6bc4ac2…`. Stats now reports
+the shared transport's request loads once, retains provider-scoped model
+pools, counts the stdio session, and reads database/WAL sizes using the
+canonical path already resolved at open. No model-request counters, locks,
+or path lookups were added. Transport load vectors fall from one per provider
+to one per stats response.
+
+Both screens use seven alternating before/after pairs, run sequentially.
+Stats polling registers eight providers sharing 64 HTTP client shards,
+excludes 32 warmup requests, then measures 4,000 stats requests per run.
+All providers and pools remain idle; it verifies the same zero-load state
+through each build's response shape. No provider calls occur. Ordinary echo
+uses the preceding screen's 16 warmups, 1,000 measured turns per run, eight
+context items, and eight retained turns. All 14,000 measured turns completed;
+each run made 2,000 requests with equal normalized payload hashes and
+3,697,230 normalized request-body bytes. Observer and synthetic provider
+CPU/RSS are excluded.
+
+| Median across seven runs | Before | After |
+| --- | ---: | ---: |
+| Stats: daemon CPU, ms/operation | 0.0485 | 0.0388 |
+| Stats: per-run p95 latency, ms | 0.141 | 0.103 |
+| Stats: ending RSS, MiB | 10.875 | 11.000 |
+| Stats: encoded transport/provider fields, bytes | 1,315 | 328 |
+| Ordinary echo: daemon CPU, ms/turn | 1.925 | 1.949 |
+| Ordinary echo: per-run p95 latency, ms | 3.123 | 3.273 |
+| Ordinary echo: sampled peak RSS, MiB | 13.203 | 13.219 |
+
+Stats polling uses 20.0% less CPU, its p95 falls 27.3%, and its
+transport/provider fields shrink 75.1%. Those bytes exclude the rest of the
+response and its changing counters. Ending stats RSS rises 128 KiB, so this
+is a CPU and response-size improvement, not a demonstrated memory saving.
+Ordinary echo CPU rises 1.2%, p95 rises 4.8%, and peak RSS rises 16 KiB.
+The ordinary CPU ranges overlap (1.853–2.008 versus 1.857–2.055 ms/turn),
+as do p95 ranges (3.000–4.094 versus 3.009–3.548 ms). This screen does not
+establish a meaningful ordinary-turn performance change or an active-fleet
+capacity improvement. RSS is sampled every 10 ms for echo and once after
+polling for stats; it is not a live-heap measurement.
+
+Captures and scripts: ignored `.local/stats-fixes/`. Regression tests cover
+an active request shared by two providers and WAL reporting through an alias,
+including after that alias is removed. Validation: 65 Rust tests, 49 Python
+CLI/daemon/runtime tests, strict all-feature Clippy, formatting, and diff
+checks passed.
+
+## Reservation labels and zero-timeout polling
+
+Observed 2026-09-17 on Darwin arm64, external power, Rust 1.98.0. Baseline
+`b6bc4ac2…` is compared with `43b61a78…`. Stats labels the existing pacing
+counter `reserved_requests`; it adds no request-path bookkeeping. Zero-timeout
+waits now return ready outcomes and pending handles in the CLI, protocol, and
+tool. After checking outcomes, an expired deadline completes directly without
+allocating a timer task or waiting for a timer tick.
+
+Seven alternating before/after pairs each exclude 16 warmup turns and measure
+1,000 synthetic echo-tool turns, with eight context items and eight retained
+turns. Only `echo` is registered in both builds so the changed wait-tool
+description/schema does not change the comparison's requests. All 14,000
+measured turns completed; every run sent 2,000 requests with equal normalized
+payload hashes and 2,097,230 normalized request-body bytes. CPU/RSS cover the
+daemon only, with RSS sampled every 10 ms; latency runs from submission to
+receipt of the terminal event. This is an ordinary-turn regression screen,
+not a measurement of the new polling operation versus the old validation error.
+
+| Median across seven runs | Before | After |
+| --- | ---: | ---: |
+| Daemon CPU, ms/turn | 1.8160 | 1.8169 |
+| Per-run p95 latency, ms | 2.925 | 2.935 |
+| Sampled peak RSS, MiB | 13.203 | 13.109 |
+
+CPU changed by +0.05%, p95 by +0.36%, and median peak RSS fell 96 KiB.
+Treat this as effectively flat ordinary-turn performance, not a speedup:
+CPU ranges overlap (1.783–1.843 versus 1.813–1.854 ms/turn), as do p95
+ranges (2.859–3.247 versus 2.876–3.101 ms). Captures and scripts are in
+ignored `.local/poll-fixes/`.
+
+Validation: 65 Rust tests, 51 Python CLI/daemon/wait tests, strict all-feature
+Clippy, formatting, and diff checks passed. Regressions verify completed and
+pending CLI polls, mixed tool results, pending process handles, waiter cleanup,
+and a request whose pacing reservation ends while its stream remains active.

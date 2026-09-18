@@ -70,6 +70,7 @@ Agent does not provide a sandbox.
 
 ## Start here
 
+- [CLI contract](docs/CLI.md): command structure, flags, output, and exit status.
 - [Design brief](docs/DESIGN.md): the proposed contract and open choices.
 - [Runtime investigation](docs/RUNTIMES.md): evidence, alternatives, and gaps.
 - [Prime Intellect investigation](docs/PRIME_INTELLECT.md): Prime Agent, long-history design, and evaluation-tool reuse.

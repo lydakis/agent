@@ -62,6 +62,9 @@ pub struct Waiting {
     pub call_id: String,
     pub handles: Vec<String>,
     pub deadline_ms: Option<u64>,
+    /// Resume on the first resolved handle rather than all of them.
+    #[serde(default)]
+    pub any: bool,
     /// Tool calls from the same model response that follow the wait.
     pub pending: Vec<ToolCall>,
 }
@@ -95,7 +98,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 13;
+    pub const SCHEMA: i32 = 14;
 
     pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
         conn.execute_batch(
@@ -170,6 +173,9 @@ impl Database {
                 stream TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                pruned_cursor INTEGER NOT NULL);
+            INSERT OR IGNORE INTO event_retention VALUES (1,0);
             CREATE INDEX IF NOT EXISTS events_bot_cursor ON events(bot,id);
             CREATE INDEX IF NOT EXISTS events_turn_kind_cursor ON events(turn,kind,id);
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
@@ -283,7 +289,7 @@ impl Database {
         name: &str,
         workspace: Option<&str>,
         binding: Binding<'_>,
-    ) -> Result<Bot> {
+    ) -> Result<(Bot, Value)> {
         if self.exists(name)? {
             return fail("bot_exists");
         }
@@ -301,15 +307,13 @@ impl Database {
                 binding.budget_tokens.map(|b| b as i64)
             ],
         )?;
-        event(
-            &tx,
-            name,
-            None,
-            "created",
-            json!({"model":format!("{}/{}", binding.provider, binding.model)}),
-        )?;
+        let data = json!({"model":format!("{}/{}", binding.provider, binding.model)});
+        let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
-        self.inspect(name)
+        Ok((
+            self.inspect(name)?,
+            entry(cursor, name, None, "created", data),
+        ))
     }
     /// Is `node` on the path from `head` back to the root?
     fn in_lineage(&self, head: Option<i64>, node: i64) -> Result<bool> {
@@ -938,6 +942,7 @@ impl Database {
         call_id: &str,
         handles: &[String],
         deadline_ms: Option<u64>,
+        any: bool,
         pending: &[ToolCall],
     ) -> Result<Value> {
         let bot = self.active(turn)?;
@@ -955,6 +960,7 @@ impl Database {
             call_id: call_id.into(),
             handles: handles.to_vec(),
             deadline_ms,
+            any,
             pending: pending.to_vec(),
         };
         let tx = self.conn.transaction()?;
@@ -963,7 +969,7 @@ impl Database {
             params![serde_json::to_string(&waiting)?, turn],
         )?;
         tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
-        let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms});
+        let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,"any":any});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_waiting", data.clone())?;
         tx.commit()?;
         Ok(entry(cursor, &bot.name, Some(turn), "turn_waiting", data))
@@ -1200,7 +1206,7 @@ impl Database {
         name: &str,
         workspace: Option<&str>,
         budget_tokens: Option<u64>,
-    ) -> Result<Bot> {
+    ) -> Result<(Bot, Value)> {
         let parent = self.inspect(source)?;
         let checkpoint = match node {
             Some(node) => {
@@ -1240,24 +1246,31 @@ impl Database {
         if let Some(node) = checkpoint {
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
         }
-        event(
-            &tx,
-            name,
-            None,
-            "forked",
-            json!({"source":source,"checkpoint":checkpoint,"node":checkpoint}),
-        )?;
+        let data = json!({"source":source,"checkpoint":checkpoint,"node":checkpoint});
+        let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
-        self.inspect(name)
+        Ok((
+            self.inspect(name)?,
+            entry(cursor, name, None, "forked", data),
+        ))
     }
     pub fn events(&self, name: &str, after: i64, limit: usize) -> Result<Value> {
         self.inspect(name)?;
+        self.event_page(Some(name), after, limit)
+    }
+    /// Every bot's durable events after a store-wide cursor: what a fleet
+    /// controller replays on one connection instead of one per bot.
+    pub fn events_after(&self, after: i64, limit: usize) -> Result<Value> {
+        self.event_page(None, after, limit)
+    }
+    fn event_page(&self, name: Option<&str>, after: i64, limit: usize) -> Result<Value> {
         if after < 0 || !(1..=256).contains(&limit) {
             return fail("invalid_event_page");
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT id,turn,kind,data FROM events WHERE bot=? AND id>? ORDER BY id LIMIT ?",
-        )?;
+        let mut stmt = self.conn.prepare_cached(match name {
+            Some(_) => "SELECT id,turn,kind,data,bot FROM events WHERE bot=?1 AND id>?2 ORDER BY id LIMIT ?3",
+            None => "SELECT id,turn,kind,data,bot FROM events WHERE ?1 IS NULL AND id>?2 ORDER BY id LIMIT ?3",
+        })?;
         let mut rows = stmt.query(params![name, after, limit as i64])?;
         let mut events = Vec::new();
         let mut cursor = after;
@@ -1267,9 +1280,10 @@ impl Database {
         while let Some(row) = rows.next()? {
             let next: i64 = row.get(0)?;
             let data: String = row.get(3)?;
+            let bot: String = row.get(4)?;
             let item = entry(
                 next,
-                name,
+                &bot,
                 row.get::<_, Option<i64>>(1)?,
                 &row.get::<_, String>(2)?,
                 serde_json::from_str::<Value>(&data)?,
@@ -1285,11 +1299,20 @@ impl Database {
             cursor = next;
             events.push(item);
         }
-        let pruned: i64 =
-            self.conn
-                .query_row("SELECT pruned_cursor FROM bots WHERE name=?", [name], |r| {
-                    r.get(0)
-                })?;
+        let pruned: i64 = match name {
+            Some(name) => {
+                self.conn
+                    .query_row("SELECT pruned_cursor FROM bots WHERE name=?", [name], |r| {
+                        r.get(0)
+                    })?
+            }
+            // Any bot's retention gap is a gap in the store-wide stream.
+            None => self.conn.query_row(
+                "SELECT pruned_cursor FROM event_retention WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?,
+        };
         let mut page = json!({"events":events,"next_cursor":cursor});
         if after < pruned {
             // The caller asked for events that retention removed; say so
@@ -1337,6 +1360,11 @@ impl Database {
                 [name],
             )?;
         }
+        tx.execute(
+            "UPDATE event_retention SET pruned_cursor=MAX(pruned_cursor,
+                COALESCE((SELECT MAX(id) FROM events WHERE bot=?),0)) WHERE singleton=1",
+            [name],
+        )?;
         deleted["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
         tx.execute("DELETE FROM checkpoints WHERE bot=?", [name])?;
         deleted["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
@@ -1371,7 +1399,10 @@ impl Database {
     /// and the turn rows themselves stay: retention here bounds what replay
     /// and tool retrieval keep, never what the model said.
     pub fn prune(&mut self, name: &str, keep_turns: usize) -> Result<Value> {
-        self.inspect(name)?;
+        // Retention only needs identity, not a copy of instructions and binding.
+        if !self.exists(name)? {
+            return fail("bot_not_found");
+        }
         if keep_turns == 0 {
             return fail("invalid_retention");
         }
@@ -1421,6 +1452,10 @@ impl Database {
         )?
         .execute(params![name, floor])?;
         if let Some(cursor) = cursor {
+            tx.prepare_cached(
+                "UPDATE event_retention SET pruned_cursor=? WHERE singleton=1 AND pruned_cursor<?",
+            )?
+            .execute(params![cursor, cursor])?;
             tx.execute(
                 "UPDATE bots SET pruned_cursor=MAX(pruned_cursor,?) WHERE name=?",
                 params![cursor, name],
@@ -1447,6 +1482,16 @@ impl Database {
     /// needs without replaying events.
     /// Flush an execution segment's retry and pacing accounting once when it
     /// finishes, is interrupted, or parks; zero counters need no write.
+    /// Counts a controller reads instead of scanning: parked turns and
+    /// running background commands, both from the active-status indexes.
+    pub fn counts(&self) -> Result<(i64, i64)> {
+        let waiting: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE status='waiting'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((waiting, self.running_processes()?))
+    }
     pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE turns SET retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
@@ -1745,6 +1790,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 ))?;
             }
         }
+    }
+    if from < 14 {
+        // Seed a durable global watermark, including holes left by deleted
+        // bots. This indexed scan runs once during migration, never on replay.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                pruned_cursor INTEGER NOT NULL);
+             INSERT OR IGNORE INTO event_retention SELECT 1, MAX(
+                COALESCE((SELECT MAX(pruned_cursor) FROM bots),0),
+                COALESCE((SELECT MAX(e.id-1) FROM events e WHERE e.id>1
+                    AND NOT EXISTS(SELECT 1 FROM events p WHERE p.id=e.id-1)),0),
+                CASE WHEN COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'),0)
+                    > COALESCE((SELECT MAX(id) FROM events),0)
+                    THEN (SELECT seq FROM sqlite_sequence WHERE name='events') ELSE 0 END);",
+        )?;
     }
     Ok(())
 }
