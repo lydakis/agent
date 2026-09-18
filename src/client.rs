@@ -49,6 +49,8 @@ struct Options {
     all: bool,
     /// `wait --any`: return on the first resolved handle.
     any: bool,
+    /// `run --delivery`: what to do when the bot is busy.
+    delivery: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
@@ -79,6 +81,7 @@ fn parse(args: &[String]) -> Result<Options> {
         keep_turns: None,
         all: false,
         any: false,
+        delivery: std::env::var("AGENT_DELIVERY").ok(),
         daemon_flags: Vec::new(),
         positional: Vec::new(),
     };
@@ -105,6 +108,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--provider" => options.providers.push(value),
                     "--tools" => options.tools = value,
                     "--model" => options.model = Some(value),
+                    "--delivery" => options.delivery = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
                         options.instructions =
@@ -508,7 +512,8 @@ fn run(options: &Options) -> Result<i32> {
     let submitted = connection.request(
         "submit",
         json!({"bot":bot,"request_id":request_id,"prompt":prompt,"workspace":workspace,
-            "model":if created { Value::Null } else { json!(options.model) }}),
+            "model":if created { Value::Null } else { json!(options.model) },
+            "delivery":options.delivery}),
     )?;
     if options.detach {
         print_json(&submitted, options.pretty)?;
@@ -905,6 +910,7 @@ impl Renderer {
                 };
                 match status {
                     "completed" => eprintln!("agent: ✔ completed{tokens}"),
+                    "steered" => eprintln!("agent: ✔ steered into turn {}", data["into"]),
                     _ => eprintln!(
                         "agent: ✘ {status}{}{}{tokens}",
                         data["error"]
@@ -927,7 +933,12 @@ impl Renderer {
 }
 
 fn exit_code(data: &Value) -> i32 {
-    if data["status"] == "completed" { 0 } else { 1 }
+    // A steer delivered into the running turn did what was asked.
+    if data["status"] == "completed" || data["status"] == "steered" {
+        0
+    } else {
+        1
+    }
 }
 
 /// A bounded, readable slice of a tool result for the terminal.

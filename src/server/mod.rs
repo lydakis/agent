@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Binding, Store, TurnOptions},
+    store::{Binding, Delivery, Store, TurnOptions},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter};
@@ -98,6 +98,8 @@ enum Command {
         prompt: String,
         workspace: Option<String>,
         model: Option<String>,
+        /// `reject` (default), `queue`, or `steer`.
+        delivery: Option<String>,
     },
     Interrupt {
         bot: String,
@@ -311,6 +313,10 @@ struct Service {
     next_task: u64,
     jobs: JoinSet<(String, i64, u64, turn::Exit)>,
     replays: JoinSet<()>,
+    /// A turn may be ready to start: set whenever a slot opens or a turn
+    /// is queued, cleared when the store has none. Keeps the idle loop free
+    /// of a store read per iteration.
+    ready_hint: bool,
 }
 
 pub async fn run(config: Configuration) -> Result<()> {
@@ -385,7 +391,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut provider_names: Vec<&String> = providers.keys().collect();
     provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
@@ -473,6 +479,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         next_task: 0,
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
+        // Queued turns that survived a restart start as capacity allows.
+        ready_hint: true,
     };
     let idle_exit = config
         .idle_exit
@@ -504,6 +512,12 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
                 service.resume(bot, turn).await?;
+            }
+            // One queued turn per iteration, so requests interleave with a
+            // long backlog; resumes hold no slot and are not starved because
+            // the branch choice is fair.
+            _ = std::future::ready(()), if service.ready_hint && service.has_capacity() => {
+                service.dispatch_ready().await?;
             }
             message = inbound.recv() => {
                 let Some(message) = message else { break };
@@ -602,6 +616,47 @@ impl Service {
         Ok(())
     }
 
+    /// Start the oldest turn waiting for a slot, or learn there is none.
+    /// A turn that cannot start (its bot's outcome uncertain, budget spent)
+    /// ends with that error; the bot's next queued turn takes its place.
+    async fn dispatch_ready(&mut self) -> Result<()> {
+        let Some((bot, turn)) = self.store.call(|db| db.next_ready()).await? else {
+            self.ready_hint = false;
+            return Ok(());
+        };
+        match self.store.call(move |db| db.start(turn)).await {
+            Ok(entry) => {
+                self.hub.durable(&bot, entry).await?;
+                self.spawn(bot, turn, false);
+            }
+            Err(error) if error.code == "stale_turn" || error.code == "bot_busy" => {}
+            Err(error) => self.end_queued(bot, turn, error).await?,
+        }
+        Ok(())
+    }
+
+    /// End a turn that never started and answer its waiters.
+    async fn end_queued(&mut self, bot: String, turn: i64, error: Error) -> Result<()> {
+        let keep = self.retain_turns;
+        let owner = bot.clone();
+        let (entries, outcome) = self
+            .store
+            .call(move |db| {
+                let finished = db.end_queued(turn, &error)?;
+                if let Some(keep) = keep {
+                    db.prune(&owner, keep)?;
+                }
+                Ok(finished)
+            })
+            .await?;
+        for entry in entries {
+            self.hub.durable(&bot, entry).await?;
+        }
+        self.handles.turn_finished(&bot, turn, outcome);
+        self.ready_hint = true;
+        Ok(())
+    }
+
     /// Run a turn as a task: fresh after submission, or resuming a parked one.
     fn spawn(&mut self, bot: String, turn: i64, resume: bool) {
         let (cancel, cancelled) = watch::channel(false);
@@ -644,6 +699,8 @@ impl Service {
             .is_some_and(|(_, owner, _)| *owner == task)
         {
             self.active.remove(&bot);
+            // A slot opened, and a finish may promote the bot's next turn.
+            self.ready_hint = true;
         }
         if let turn::Exit::Finished(error) = exit {
             let keep = self.retain_turns;
@@ -654,6 +711,9 @@ impl Service {
                     Ok((bot, finished))
                 })
                 .await?;
+            // Interrupt may already have released the task's active slot.
+            // Finishing still promotes queued work in that case.
+            self.ready_hint = true;
             for entry in finished.entries {
                 self.hub.durable(&bot, entry).await?;
             }
@@ -748,8 +808,7 @@ impl Service {
                     .call(move |db| match db.turn_outcome(&bot, turn)? {
                         Some(outcome) => Ok(outcome),
                         None => {
-                            let context = db.context(turn)?;
-                            let status = db.inspect(&context.bot)?.status;
+                            let status = db.turn_status(&bot, turn)?;
                             Ok(json!({"turn":turn,"status":status,"finished":false}))
                         }
                     })
@@ -761,7 +820,7 @@ impl Service {
                     .await
             }
             Command::Stats => {
-                let (waiting, running) = store.call(|db| db.counts()).await?;
+                let (waiting, running, queued) = store.call(|db| db.counts()).await?;
                 let (waiters, retained) = self.handles.stats();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
@@ -773,6 +832,7 @@ impl Service {
                     "active_turns": self.active.len(),
                     "active_limit": self.limit_active,
                     "waiting_turns": waiting,
+                    "queued_turns": queued,
                     "running_processes": running,
                     "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
@@ -898,11 +958,17 @@ impl Service {
                 prompt,
                 workspace: path,
                 model,
+                delivery,
             } => {
                 name(&request_id)?;
                 if prompt.len() > 256 * 1024 {
                     return fail("prompt_limit");
                 }
+                let delivery = match delivery.as_deref() {
+                    None => Delivery::Reject,
+                    Some(mode) => Delivery::parse(mode)
+                        .ok_or_else(|| Error::with("invalid_delivery", mode))?,
+                };
                 // A turn may run in another checkout or on another model of
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
@@ -924,6 +990,7 @@ impl Service {
                         }
                         None => None,
                     },
+                    delivery,
                 };
                 let capacity = self.has_capacity();
                 let (b, r) = (bot.clone(), request_id.clone());
@@ -935,26 +1002,44 @@ impl Service {
                     cursor = entry["cursor"].as_i64();
                     self.hub.durable(&bot, entry).await?;
                 }
-                if started.fresh {
+                if started.fresh && started.status == "running" {
                     self.spawn(bot.clone(), started.turn, false);
+                }
+                if started.status == "ready" {
+                    self.ready_hint = true;
                 }
                 Ok(
                     json!({"bot":bot,"turn":started.turn,"request_id":request_id,
-                    "duplicate":!started.fresh,"cursor":cursor,
+                    "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
                     "handle":format!("turn:{bot}/{}", started.turn)}),
                 )
             }
             Command::Interrupt { bot, turn } => {
-                if let Some((running, _, cancel)) = self.active.get(&bot) {
-                    if *running != turn {
-                        return fail("stale_turn");
-                    }
+                if let Some((_, _, cancel)) = self
+                    .active
+                    .get(&bot)
+                    .filter(|(running, _, _)| *running == turn)
+                {
                     if cancel.send(true).is_ok() {
                         return Ok(json!({"interrupt_requested":true,"turn":turn}));
                     }
                     // The task exited but its JoinSet result has not been reaped.
                     // Release its slot; the result still gets checked by the loop.
                     self.active.remove(&bot);
+                }
+                // A queued turn has no task either; end it where it stands.
+                // An unknown id is judged below against the bot's state.
+                let check = bot.clone();
+                let status = store
+                    .call(move |db| db.turn_status(&check, turn))
+                    .await
+                    .unwrap_or_default();
+                if matches!(status.as_str(), "queued" | "ready") {
+                    self.end_queued(bot, turn, Error::new("cancelled")).await?;
+                    return Ok(json!({"interrupt_requested":true,"turn":turn,"queued":true}));
+                }
+                if self.active.contains_key(&bot) {
+                    return fail("stale_turn");
                 }
                 // A parked turn has no task; confirm durable state and end it.
                 let check = bot.clone();
@@ -979,6 +1064,7 @@ impl Service {
                         )
                     })
                     .await?;
+                self.ready_hint = true;
                 for entry in finished.entries {
                     self.hub.durable(&bot, entry).await?;
                 }
@@ -1104,6 +1190,7 @@ mod tests {
             next_task: 1,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
+            ready_hint: false,
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -1139,7 +1226,7 @@ mod tests {
         assert_eq!(reply["parked"], true);
         assert!(service.has_capacity());
         assert_eq!(service.jobs.join_next().await.unwrap().unwrap().1, turn);
-        store
+        let next = store
             .call(move |db| {
                 let state = db.inspect("Bob")?;
                 assert_eq!(state.status, "interrupted");
@@ -1158,11 +1245,32 @@ mod tests {
                     .find(|e| e["event"] == "tool_completed")
                     .unwrap();
                 assert_eq!(completed["data"]["cancelled"], true);
-                db.begin("Bob", "second", "continue", true, &TurnOptions::default())?;
-                Ok(())
+                let next = db
+                    .begin("Bob", "second", "continue", true, &TurnOptions::default())?
+                    .turn;
+                db.begin(
+                    "Bob",
+                    "third",
+                    "queued",
+                    true,
+                    &TurnOptions {
+                        delivery: Delivery::Queue,
+                        ..TurnOptions::default()
+                    },
+                )?;
+                Ok(next)
             })
             .await
             .unwrap();
+        // A finished task can likewise be reaped after interrupt released
+        // its active slot. Its successor must still wake the dispatcher.
+        service.ready_hint = false;
+        service
+            .complete("Bob".into(), next, 2, turn::Exit::Finished(None))
+            .await
+            .unwrap();
+        assert!(service.ready_hint);
+        assert!(store.call(|db| db.next_ready()).await.unwrap().is_some());
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1230,6 +1338,7 @@ mod tests {
             next_task: 0,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
+            ready_hint: false,
         };
         let duplicate = service
             .dispatch(
@@ -1239,6 +1348,7 @@ mod tests {
                     prompt: "work".into(),
                     workspace: None,
                     model: None,
+                    delivery: None,
                 },
                 0,
                 &output,
@@ -1256,6 +1366,7 @@ mod tests {
                     prompt: "work".into(),
                     workspace: None,
                     model: None,
+                    delivery: None,
                 },
                 0,
                 &output,

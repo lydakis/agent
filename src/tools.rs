@@ -127,12 +127,18 @@ pub struct Registry {
     credentials: Arc<Vec<Credential>>,
     environment: Arc<Vec<(String, String)>>,
 }
-/// One accepted background command's place in line, released when it starts
-/// or when it is dropped before starting.
-pub struct Queued(Arc<std::sync::atomic::AtomicUsize>);
+/// A background command's admission: a slot taken at once when one was
+/// free, otherwise a counted place in line released when it gets a slot
+/// or is dropped before starting.
+pub struct Queued {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pending: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
 impl Drop for Queued {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(pending) = &self.pending {
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 struct Credential {
@@ -263,11 +269,23 @@ impl Registry {
     /// cannot accumulate an invisible backlog behind the process bound.
     pub fn queue(&self) -> Result<Queued> {
         use std::sync::atomic::Ordering::Relaxed;
+        // A free slot is taken here, not in the task, so the line counts
+        // only commands that truly wait; the semaphore is fair, so this
+        // never overtakes a waiter.
+        if let Ok(permit) = self.slots.clone().try_acquire_owned() {
+            return Ok(Queued {
+                permit: Some(permit),
+                pending: None,
+            });
+        }
         if self.budget != 0 && self.pending.load(Relaxed) >= self.budget {
             return fail("capacity_exhausted");
         }
         self.pending.fetch_add(1, Relaxed);
-        Ok(Queued(self.pending.clone()))
+        Ok(Queued {
+            permit: None,
+            pending: Some(self.pending.clone()),
+        })
     }
     /// Background commands accepted but not yet running, for `stats`.
     pub fn pending(&self) -> usize {
@@ -616,9 +634,13 @@ impl Registry {
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
     ) {
         let registry = self.clone();
+        let mut queued = queued;
         tokio::spawn(async move {
             let result = async {
-                let slot = registry.slots.acquire().await;
+                let slot = match queued.permit.take() {
+                    Some(permit) => Ok(permit),
+                    None => registry.slots.clone().acquire_owned().await,
+                };
                 drop(queued);
                 let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
                 let (stdout, stderr, status) = shell(

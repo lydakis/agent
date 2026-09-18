@@ -218,19 +218,16 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    daemon-scoped option it was given against the effective configuration the
    daemon reports at attach and fail with the difference named; per-turn model
    and workspace overrides stay as they are.
-8. Delivery modes on `submit`: the README promises steering and the protocol
-   answers `bot_busy`. One field with three values, all composable from what
-   exists. `reject` is today's behavior. `queue` accepts the submission now
-   and starts it when the bot is free: the turn is a durable row that waits
-   on the bot's current turn handle, queued turns chain on each other so
-   order holds, they survive restart like any parked turn, the handle is
-   returned immediately, and `wait`, `turns`, and `result` work unchanged;
-   the caller can fire and forget. `steer` delivers the message at the
-   running turn's next round boundary, after the current tool results are
-   recorded and before the next model call, so the model sees it inside the
-   turn without losing the round; on an idle bot it starts a new turn. Peers
-   get the same modes through `run --detach`, which is how bots talk to a
-   busy bot without racing on `bot_busy`. Interrupt stays the hard stop.
+8. Done: [delivery modes](RUST_PROTOTYPE.md#delivery-modes) on `submit`.
+   `reject` is the old behavior. `queue` is a durable turn row in `queued`
+   or `ready` state, started by the service when the bot and a slot are
+   free; the line is per bot in submission order, one ready head per bot,
+   and ready heads start oldest first. `steer` is a queued row the running
+   turn absorbs at its round boundary as a user item, finishing the steer as
+   `steered` with `into`; a steer that misses the last boundary starts as a
+   turn. Both survive restart. Not built: a way to flush a bot's whole line
+   in one call, and a per-bot cap on queued work; `turns` lists the line
+   and `interrupt` ends one entry at a time.
 9. An ACP bridge: a separate process speaking the Agent Client Protocol to an
    editor or agent client on one side and the daemon's socket protocol on the
    other, with no daemon changes. Create, submit, streamed text and thinking

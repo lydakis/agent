@@ -1350,3 +1350,224 @@ below the byte cap. The bound's behavior is covered by the wait-tool
 regressions (a refused third job under a budget of one, and eight jobs
 completing through a four-slot queue). Captures: ignored
 `.local/bench/slice-backlog-socket-32/` and `slice-astra-controller-socket-32/`.
+
+## Delivery modes
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. The 32-agent socket echo workload as before, one excluded warmup and
+four measured runs. Three binaries, screened back to back within a few
+minutes: the previous commit `fd8ad1d8…` rebuilt from a worktree, the slice
+with a storage round trip at every round boundary (`b29bb992…`), and the
+slice as committed (`e4e7bccc…`), where the store keeps an exact count of
+queued steers and a boundary with nothing to absorb costs one atomic load.
+The workload queues nothing and steers nothing, so this is the cost the
+mechanism adds to ordinary turns: three boundary checks per two-round turn,
+plus one indexed `UPDATE` that finds no queued turn at each finish.
+
+| Metric | Previous commit | Round trip per boundary | As committed |
+| --- | ---: | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.59 (17.52–17.72) | 17.76 (17.72–17.81) | 17.79 (17.77–17.81) |
+| Observed target CPU, seconds | 0.337 (0.331–0.357) | 0.337 (0.323–0.350) | 0.323 (0.316–0.333) |
+| Per-run p95 turn latency, ms | 628.6 (618.2–646.0) | 619.5 (613.4–627.0) | 619.5 (616.7–640.6) |
+
+The host was busier than for the admission-bound screen a few hours earlier
+(the same previous-commit tree then read 0.299 s and 592 ms), which is why
+the three are compared against each other and not against that section. As
+committed, CPU and p95 are level with the previous commit within the
+screen's noise; RSS is up about 200 KiB, inside the range this screen has
+shown for one binary. Captures: ignored `.local/bench/slice-prev-socket-32/`,
+`slice-delivery-socket-32/`, and `slice-delivery-b-socket-32/`.
+
+Validation: 68 Rust tests including two store contracts for the line (queue,
+steer, ready, promotion at finish, ending a queued turn, the exact steer
+count) and 131 Python tests including five daemon-level delivery tests
+(ordering, steer at a shell boundary, a steer during the final call, ready
+turns under `--max-active 1` with interrupt and delete, restart) and one CLI
+test for `run --delivery`.
+
+### Delivery review fixes
+
+Observed 2026-09-18 on Darwin arm64, external power, Rust 1.98.0. The saved
+pre-fix binary is `1a432379…`; the final candidate is `796e1c41…`. The fixes
+preserve queued cancellation while a bot runs, wake queued successors after
+parked interruption or retirement of an already-released task, preserve FIFO
+admission when capacity opens, and preserve one ready head on restart.
+Retention protects unfinished work and its preceding retained turns. Completion
+is captured before pruning so a later steer's row cannot erase a current
+waiter's answer.
+
+Admission uses one cached, indexed ready-head lookup on an idle bot. The
+retention boundary uses existing active/queued/ready indexes and a cached
+statement, with no new index or schema. The query-plan audit planned 113 runtime
+statement variants with no growing-table scans (Python SQLite 3.47.1).
+
+Three matched synthetic screens, each with one excluded warmup and three
+measured runs per binary. Values below are medians; these small screens do not
+establish a general speedup or a tail-latency guarantee.
+
+| Workload | CPU seconds, before → after | Peak RSS MiB, before → after | Per-run p95 ms, before → after |
+| --- | ---: | ---: | ---: |
+| 32-bot socket echo lifecycle | 0.330 → 0.289 | 17.828 → 17.859 | 590.9 → 590.4 |
+| 16 bots, 128 submissions, 112 queued | 0.175 → 0.174 | 13.203 → 13.078 | 104.1 → 105.1 |
+| 16 bots, 128 turns, retention 1 | 0.183 → 0.187 | 12.750 → 12.891 | 13.9 → 12.9 |
+
+The socket screen uses the existing lifecycle boundary and observer. Every run
+completed 96 turns with 32 simultaneous provider requests and no invalid
+requests. Its candidate p95 ranged from 585.7 to 682.5 ms, versus 589.9–590.9 ms
+for the baseline; one slower candidate run remains visible despite similar
+medians. Candidate RSS ranged from 17.797 to 18.281 MiB. Earlier alternating
+screens also varied in CPU and latency, so the lower final CPU median is not
+attributed to an optimization of ordinary turns.
+
+The two additional screens alternate binaries against a local synthetic
+Responses fixture, with FULL SQLite durability and default limits. They measure
+daemon CPU and sample daemon RSS every 10 ms, excluding fixture/controller
+resources and daemon startup. The queue screen gates each bot's first request
+until all 128 submissions are accepted, verifies exactly 112 queued admissions,
+and checks all 128 final answers. Timing spans submission through completion;
+answer verification follows the timed interval. The retention screen drains and
+checks each 16-turn round before the next, including result reads in its timed
+interval. It exercises retention without the pre-fix queue crash. Queue plus
+retention, steering, and cancellation are covered by regressions, not ranked
+against the failing baseline.
+
+An initial retention screen showed extra CPU. In the subsequent three-way
+comparison, CPU medians were 0.183 s for baseline, 0.192 s for the uncached
+candidate (`6d4b3274…`), and 0.187 s for the final cached candidate. Baseline
+CPU ranged from 0.180 to 0.194 s; the final candidate ranged from 0.186 to
+0.187 s. Caching avoids repeated SQL preparation, but the small samples do
+not establish a broader throughput improvement. Final queued-work CPU and
+latency ranges overlap the baseline; retention's median RSS increase is
+144 KiB, and the socket median increase is 32 KiB.
+
+Validation: 71 Rust tests, strict Clippy, and 72 focused Python tests across
+delivery, CLI, wait, and runtime behavior, with affected tests rerun after the
+final changes. Regression coverage includes queued and steer cancellation,
+parked and released-slot completion wake-ups, retention of live tool intents,
+completion under queued/steered retention, FIFO admission, and ready-head
+recovery. Captures and bounded probe scripts are in ignored
+`.local/delivery-fix/`: `baseline-cached-screen/`, `candidate-cached-screen/`,
+`queue-cached-results.json`, `retention-cached-results.json`, and
+`queue_bench.py`. Earlier diagnostic screens are retained there too.
+
+### Bounded steering absorption and explicit overrides
+
+Observed 2026-09-18 on Darwin arm64, Rust 1.98.0. The saved pre-fix release
+binary is `796e1c41…`; the final candidate is `d14b6879…`. Incompatible explicit
+workspace/model overrides now leave a steer queued to run separately, without
+letting later steers overtake it. Each round boundary drains a finite snapshot
+through storage batches capped at 32 steers and 256 KiB of raw UTF-8 prompts.
+Each batch is released before the next is loaded. A partial queued-steer index
+keeps these reads independent of ordinary queued work; the query-plan audit
+planned 114 statement variants with no growing-table scans (SQLite 3.47.1).
+
+The matched release-daemon screen gates the first request for each of 16 bots,
+then queues seven steers per bot before releasing the gate. Both binaries
+completed 16 original turns, absorbed 112 steers, returned the expected final
+answers, and made exactly 32 provider requests. The fixture also checked the
+request histories: 16 contained one user item and 16 contained eight. Batching
+does not add provider calls; a separate 70-steer regression verifies this across
+multiple storage batches.
+
+One warmup per binary was excluded, followed by three measured runs per binary
+in alternating order. Values are medians (ranges). The stdio daemon uses FULL
+SQLite durability and default limits against a synthetic Responses fixture.
+Daemon CPU is measured after bot creation through completion, RSS is sampled
+every 5 ms, and latency runs from submission to receipt of the original turn's
+terminal event. Startup, bot creation, and controller/fixture resources are
+excluded.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Daemon CPU, seconds | 0.0605 (0.0588–0.0668) | 0.0633 (0.0567–0.0672) |
+| Sampled peak daemon RSS, MiB | 13.063 (13.047–13.063) | 13.063 (13.047–13.109) |
+| Per-run p95 turn latency, ms | 65.7 (62.7–67.1) | 65.9 (60.7–71.7) |
+
+Memory and latency medians are similar. The CPU median increased by 2.8 ms,
+with overlapping ranges; this short screen establishes neither a CPU speedup
+nor a general performance non-regression guarantee.
+
+A separate debug-build storage probe drains the entire backlog of 128 prompts,
+each 256 KiB, in both versions. Seeding is excluded. Both use a file-backed
+store with a 2 MiB SQLite cache; the baseline absorbs everything in one call,
+while the candidate releases each bounded result before continuing. This
+changes one large transaction into 128 bounded transactions. Three runs per
+binary alternate order; RSS is sampled every 2 ms after seeding through exit.
+
+| Storage probe metric | Before | After |
+| --- | ---: | ---: |
+| Sampled peak RSS, MiB | 47.188 (47.031–47.906) | 15.156 (15.078–15.156) |
+| Absorption CPU, seconds | 1.238 (1.229–1.245) | 1.184 (1.184–1.188) |
+
+The same full-backlog storage work uses about 68% less peak RSS. These are
+debug storage-probe measurements, not daemon capacity or model-context results.
+A one-prompt control measured median peak RSS of 11.109 → 11.453 MiB and CPU
+of 0.0131 → 0.0132 seconds, with overlapping ranges. Captures and bounded probe
+scripts are in ignored `.local/steer-fix/`: `bench.py`, `memory.rs`,
+`runtime-results.json`, and `memory-results.json`. Full release-binary hashes
+are recorded in the runtime capture.
+
+Validation: 73 Rust tests, strict Clippy, and 74 focused Python tests across
+delivery, CLI, wait, and runtime behavior. The affected ten-test delivery suite
+was rerun after the final snapshot refinement. New regressions cover explicit
+workspace/model overrides, deferred-steer ordering, byte and item limits,
+late-arrival exclusion from the current snapshot, and exact provider-call
+counts across multiple batches.
+
+### Cancellation-safe steering completion and queued retention
+
+Observed 2026-09-18 on Darwin arm64, AC power, Rust 1.98.0. Saved pre-fix
+release binary: `d14b6879…`; candidate: `f4fe934b…`. Interrupting an absorbing
+turn now finishes its in-flight bounded batch, including event publication and
+waiter notifications, then stops before another batch. Two inline atomic flags
+coordinate the execution future with its cancellation branch; there is no
+additional task, allocation, store query, or provider call on ordinary turns.
+Cancelled and failed queued work now applies configured retention in the same
+storage job as completion, after capturing the outcome for existing waiters.
+
+The deterministic cancellation regression blocks event output after the first
+32 steers commit, interrupts the absorbing turn, then releases output. All 32
+terminal events and steer events arrive, all registered waiters resolve, and
+the next batch stays queued. It failed before the fix. The original daemon
+probe also found no stranded steered outcomes in six candidate runs. With
+`--retain-turns 1`, cancelling eight queued turns now leaves only the newest
+turn's terminal event; an existing waiter for the oldest still receives its
+captured result even when that completion prunes itself.
+
+The two matched release screens use 16 bots and 128 submissions against a
+synthetic Responses fixture, FULL SQLite durability, and default limits.
+The steering screen above verifies 112 steered outcomes, 16 completed turns,
+32 provider calls, and exact request history counts. The queue screen verifies
+112 queued admissions and 128 completed turns with their expected final text.
+It gates the first request per bot until all submissions are accepted. Daemon
+CPU excludes startup and bot creation; daemon RSS is sampled every 5 ms for
+steering and 10 ms for queueing. Latency spans submission through terminal-event
+receipt. Controller and fixture resources are excluded. Retention is disabled
+in both performance screens; the formerly incorrect cancellation/retention
+path is validated for behavior, not ranked as equivalent work.
+
+An initial five-run alternating screen, after one excluded warmup per binary,
+showed median CPU of 0.0581 → 0.0623 s for steering and 0.1618 → 0.1768 s for
+queueing. Queue p95 increased from 100.8 to 108.9 ms. This prompted a second
+alternating screen of ten measured runs per binary, again excluding one warmup.
+Repeat-screen values below are medians (ranges):
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Steering CPU, seconds | 0.0632 (0.0578–0.0687) | 0.0620 (0.0544–0.0658) |
+| Steering peak RSS, MiB | 13.125 (12.953–13.141) | 13.070 (12.969–13.125) |
+| Steering per-run p95, ms | 65.2 (61.5–78.8) | 64.7 (55.4–111.0) |
+| Queue CPU, seconds | 0.1738 (0.1581–0.1839) | 0.1790 (0.1634–0.1873) |
+| Queue peak RSS, MiB | 13.211 (13.078–13.250) | 13.234 (13.078–13.281) |
+| Queue per-run p95, ms | 107.3 (97.4–113.6) | 109.3 (102.1–114.9) |
+
+The larger initial CPU difference did not repeat. Memory is similar; the
+repeat queue CPU median is about 3% higher, with overlapping ranges. One
+candidate steering run has a 111 ms p95 outlier. These observations establish
+neither a general speedup nor a tail-latency non-regression guarantee.
+
+Validation: 74 Rust tests, strict Clippy, 75 focused Python tests across
+delivery, CLI, wait, and runtime behavior, formatting and diff checks. Captures,
+full binary hashes, and probe scripts are in ignored `.local/completion-fix/`:
+`steering-results.json`, `queue-results.json`, `steering-repeat-results.json`,
+`queue-repeat-results.json`, and `interrupt-probe.log`.

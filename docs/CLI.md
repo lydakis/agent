@@ -23,6 +23,16 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--bot NAME`; a fork uses `--source NAME` and `--bot DESTINATION`.
 - `--all` selects all bots for `follow`; `--any` selects first-completion
   behavior for `wait`. `follow --all --bot NAME` is an error.
+- `run --delivery MODE` is `reject`, `queue`, or `steer`: what the
+  submission does when the bot is busy. Without the flag, `AGENT_DELIVERY`
+  applies, then `reject`. The daemon has no default of its own: the client
+  always sends the mode it resolved, so one person's preference never
+  changes what a program's submission means. A blocking `run` with `queue`
+  follows the turn from its queued state to its end; with `steer` it ends
+  with exit 0 when the message is absorbed (`steered`, naming the turn it
+  joined) or when the turn it started completes.
+  A steer with an explicit workspace or model that differs from the running
+  turn stays queued and runs separately with those choices.
 - Unknown flags, flags belonging to another command, unexpected operands,
   and repeated singleton flags are usage errors. `--provider` is repeatable.
 - `--instructions` and `--instructions-file` are mutually exclusive.

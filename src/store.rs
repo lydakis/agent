@@ -8,7 +8,9 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 mod db;
-pub use db::{Binding, Bot, Database, Started, TurnContext, TurnOptions, Waiting, Window};
+pub use db::{
+    Absorbed, Binding, Bot, Database, Delivery, Started, TurnContext, TurnOptions, Waiting, Window,
+};
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
 /// Storage worker counters: how long jobs queued for the worker versus how
@@ -25,6 +27,7 @@ pub struct Store {
     sender: mpsc::Sender<Job>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
+    queued_steers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -34,6 +37,12 @@ impl From<rusqlite::Error> for Error {
 }
 
 impl Store {
+    /// Whether any bot has a steer queued, without a storage round trip.
+    pub fn steers_queued(&self) -> bool {
+        self.queued_steers
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
     pub async fn open(path: &Path, configuration: String) -> Result<Self> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Job>(32);
@@ -91,7 +100,7 @@ impl Store {
                 })();
                 match opened {
                     Ok((mut db, _lock, path)) => {
-                        let _ = ready.send(Ok(path));
+                        let _ = ready.send(Ok((path, db.queued_steers())));
                         while let Some(job) = receiver.blocking_recv() {
                             job(&mut db);
                         }
@@ -101,10 +110,11 @@ impl Store {
                     }
                 }
             })?;
-        let store_path = opened
+        let (store_path, queued_steers) = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
         Ok(Self {
+            queued_steers,
             sender,
             path: std::sync::Arc::new(store_path),
             counters: std::sync::Arc::default(),

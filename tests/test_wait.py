@@ -361,8 +361,8 @@ class WaitTests(ModelFixture):
         self.assertTrue(all(e['data']['cancelled'] for e in completed))
 
     def test_fan_out_with_a_tiny_process_budget_never_deadlocks(self):
-        # Eight jobs against four slots: four run, four queue behind them, and
-        # the queue is full, so nothing is refused and nothing waits forever.
+        # Eight jobs against four slots: four take slots at admission, four
+        # fill the line exactly, so nothing is refused and nothing waits forever.
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait', extra=('--max-processes', '4'))
         self.addCleanup(client.close)
         turns = []

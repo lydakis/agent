@@ -9,6 +9,13 @@ use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering::Relaxed},
+};
+
+const STEER_BATCH_ITEMS: usize = 32;
+const STEER_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
@@ -45,7 +52,9 @@ pub struct Binding<'a> {
 pub struct Started {
     pub turn: i64,
     pub fresh: bool,
-    /// The durable `accepted` entry, present only for fresh submissions.
+    /// `running`, `queued` behind the bot's own work, or `ready` for a slot.
+    pub status: &'static str,
+    /// The durable `accepted` or `queued` entry, present only for fresh submissions.
     pub entry: Option<Value>,
 }
 /// Per-turn overrides of the bot's defaults, recorded with the turn.
@@ -53,6 +62,45 @@ pub struct Started {
 pub struct TurnOptions {
     pub workspace: Option<String>,
     pub model: Option<String>,
+    pub delivery: Delivery,
+}
+/// What a submission does when the bot is busy or the daemon is full.
+/// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
+/// turn and starts it when the bot and a slot are free. `Steer` is a queued
+/// turn the bot's running turn may absorb at its next round boundary.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    #[default]
+    Reject,
+    Queue,
+    Steer,
+}
+impl Delivery {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "reject" => Some(Self::Reject),
+            "queue" => Some(Self::Queue),
+            "steer" => Some(Self::Steer),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+        }
+    }
+}
+/// Steers a running turn absorbed at a round boundary: their user items are
+/// on the lineage and their rows are finished as `steered`.
+#[derive(Default)]
+pub struct Absorbed {
+    pub entries: Vec<Value>,
+    /// Each steered turn with its outcome, for its waiters.
+    pub outcomes: Vec<(i64, Value)>,
+    /// Continue this boundary's finite snapshot in another bounded call.
+    pub next_through: Option<i64>,
 }
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -89,6 +137,10 @@ pub struct TurnContext {
 }
 pub struct Database {
     conn: Connection,
+    /// Exact count of queued steer rows, kept by every function that
+    /// changes one, so a running turn's boundary costs one atomic load
+    /// when there is nothing to absorb.
+    queued_steers: Arc<AtomicUsize>,
 }
 
 /// Durable events and their live copies share one shape.
@@ -100,7 +152,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 14;
+    pub const SCHEMA: i32 = 15;
 
     pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
         conn.execute_batch(
@@ -156,6 +208,7 @@ impl Database {
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
+                delivery TEXT NOT NULL DEFAULT 'reject',
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
@@ -183,6 +236,10 @@ impl Database {
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
             CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
+            CREATE INDEX IF NOT EXISTS turns_queued ON turns(bot,id) WHERE status='queued';
+            CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
+            CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
+            CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
@@ -204,7 +261,10 @@ impl Database {
             "UPDATE processes SET status='lost',result=? WHERE status='running'",
             [json!({"error":"process_lost"}).to_string()],
         )?;
-        let mut db = Self { conn };
+        let mut db = Self {
+            conn,
+            queued_steers: Arc::default(),
+        };
         // A committed tool intent without a result is never automatically
         // retried. Turns parked on handles keep their state and resume.
         let pending: Vec<i64> = db
@@ -215,7 +275,27 @@ impl Database {
         for turn in pending {
             db.finish(turn, Some(&Error::new("process_interrupted")))?;
         }
+        // Queued turns outlive a restart. The oldest one of each idle bot
+        // waits only for a slot; those behind a parked turn stay queued.
+        db.conn.execute(
+            "UPDATE turns SET status='ready' WHERE id IN (
+                SELECT MIN(t.id) FROM turns t JOIN bots b ON b.name=t.bot
+                WHERE t.status='queued' AND b.running_turn IS NULL
+                  AND NOT EXISTS(SELECT 1 FROM turns r WHERE r.bot=t.bot AND r.status='ready')
+                GROUP BY t.bot)",
+            [],
+        )?;
+        let steers: usize = db.conn.query_row(
+            "SELECT COUNT(*) FROM turns WHERE status='queued' AND delivery='steer'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n.max(0) as usize),
+        )?;
+        db.queued_steers.store(steers, Relaxed);
         Ok(db)
+    }
+    /// Shared with the runtime; see `queued_steers` on the struct.
+    pub fn queued_steers(&self) -> Arc<AtomicUsize> {
+        self.queued_steers.clone()
     }
 
     fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
@@ -653,39 +733,45 @@ impl Database {
         capacity: bool,
         options: &TurnOptions,
     ) -> Result<Started> {
-        let prior: Option<(i64, String, TurnOptions)> = self
+        let prior: Option<(i64, String, String, TurnOptions)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,workspace,model FROM turns WHERE bot=? AND request_id=?",
+                "SELECT id,prompt,status,workspace,model,delivery FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
+                        r.get(2)?,
                         TurnOptions {
-                            workspace: r.get(2)?,
-                            model: r.get(3)?,
+                            workspace: r.get(3)?,
+                            model: r.get(4)?,
+                            delivery: Delivery::parse(&r.get::<_, String>(5)?)
+                                .unwrap_or_default(),
                         },
                     ))
                 },
             )
             .optional()?;
-        if let Some((turn, saved, saved_options)) = prior {
+        if let Some((turn, saved, status, saved_options)) = prior {
             if saved != prompt || saved_options != *options {
                 return fail("idempotency_conflict");
             }
             return Ok(Started {
                 turn,
                 fresh: false,
+                status: turn_status_name(&status),
                 entry: None,
             });
         }
+        let reject = options.delivery == Delivery::Reject;
         // Admission applies only to new work, before any durable mutation.
-        if !capacity {
+        if !capacity && reject {
             return fail("active_agent_limit");
         }
         let bot = self.inspect(name)?;
-        if bot.running_turn.is_some() {
+        let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
+        if busy && reject {
             return fail("bot_busy");
         }
         if bot.status == "uncertain" {
@@ -700,7 +786,14 @@ impl Database {
             .or(bot.workspace.as_deref())
             .ok_or(Error::new("workspace_required"))?
             .to_owned();
-        let item = bot.family()?.user_item(prompt)?;
+        // Only the head of a bot's line is ready; the rest wait behind it.
+        let status = if busy {
+            "queued"
+        } else if capacity {
+            "running"
+        } else {
+            "ready"
+        };
         let tx = self.conn.transaction()?;
         // A deleted bot must never make an old turn handle refer to new work.
         let turn: i64 = tx
@@ -709,27 +802,261 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,started_ms) VALUES (?,?,?,?,'running',?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery) VALUES (?,?,?,?,?,?,?,?)",
         )?.execute(
-            params![turn, name, request_id, prompt, options.workspace, options.model, epoch_ms()],
+            params![turn, name, request_id, prompt, status, options.workspace, options.model, options.delivery.name()],
         )?;
         tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
             .execute(params![turn, name])?;
-        let head = node_with_turn(&tx, bot.head, &item, Some(turn))?;
-        tx.execute(
-            "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
-            params![head, turn, name],
-        )?;
-        let data = json!({"request_id":request_id,"node":head,
-            "workspace":workspace,
-            "model":options.model.clone().unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model))});
-        let cursor = event(&tx, name, Some(turn), "accepted", data.clone())?;
+        let model = options
+            .model
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
+        let (kind, data) = if status == "running" {
+            let head = start_locked(&tx, &bot, turn, prompt)?;
+            (
+                "accepted",
+                json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model}),
+            )
+        } else {
+            (
+                "queued",
+                json!({"request_id":request_id,"status":status,"delivery":options.delivery.name(),
+                    "workspace":workspace,"model":model}),
+            )
+        };
+        let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
         tx.commit()?;
+        if status == "queued" && options.delivery == Delivery::Steer {
+            self.queued_steers.fetch_add(1, Relaxed);
+        }
         Ok(Started {
             turn,
             fresh: true,
-            entry: Some(entry(cursor, name, Some(turn), "accepted", data)),
+            status,
+            entry: Some(entry(cursor, name, Some(turn), kind, data)),
         })
+    }
+    /// Start a queued or ready turn on an idle bot: its user item joins the
+    /// lineage and the bot becomes busy. Returns the durable `accepted` entry.
+    pub fn start(&mut self, turn: i64) -> Result<Value> {
+        let (name, request_id, prompt, status, workspace, model, delivery): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = self
+            .conn
+            .query_row(
+                "SELECT bot,request_id,prompt,status,workspace,model,delivery FROM turns WHERE id=?",
+                [turn],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(Error::new("turn_not_found"))?;
+        if !matches!(status.as_str(), "queued" | "ready") {
+            return fail("stale_turn");
+        }
+        let bot = self.inspect(&name)?;
+        if bot.running_turn.is_some() {
+            // Back in line behind the bot's work, so the dispatcher never
+            // picks the same ready row twice.
+            self.conn
+                .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
+            if delivery == "steer" {
+                self.queued_steers.fetch_add(1, Relaxed);
+            }
+            return fail("bot_busy");
+        }
+        if bot.status == "uncertain" {
+            return fail("tool_outcome_uncertain");
+        }
+        if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
+            return fail("budget_exhausted");
+        }
+        let workspace = workspace
+            .or(bot.workspace.clone())
+            .ok_or(Error::new("workspace_required"))?;
+        let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
+        let tx = self.conn.transaction()?;
+        let head = start_locked(&tx, &bot, turn, &prompt)?;
+        let data = json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
+        let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
+        tx.commit()?;
+        if status == "queued" && delivery == "steer" {
+            self.queued_steers.fetch_sub(1, Relaxed);
+        }
+        Ok(entry(cursor, &name, Some(turn), "accepted", data))
+    }
+    /// An idle bot's line has exactly one ready head, including after recovery.
+    /// Only inspect that head; running/parked bots are checked by the caller.
+    fn has_ready_turn(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='ready')")?
+            .query_row([name], |r| r.get(0))?)
+    }
+    /// The oldest turn waiting only for an active slot.
+    pub fn next_ready(&self) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT bot,id FROM turns WHERE status='ready' ORDER BY id LIMIT 1")?
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+    /// A turn's own status, for a caller that names the bot.
+    pub fn turn_status(&self, name: &str, turn: i64) -> Result<String> {
+        self.conn
+            .prepare_cached("SELECT status FROM turns WHERE id=? AND bot=?")?
+            .query_row(params![turn, name], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::new("turn_not_found"))
+    }
+    /// End a turn that never started. A ready turn's place goes to the bot's
+    /// next queued one.
+    pub fn end_queued(&mut self, turn: i64, error: &Error) -> Result<(Vec<Value>, Value)> {
+        let (name, status, delivery): (String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT bot,status,delivery FROM turns WHERE id=?",
+                [turn],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(Error::new("turn_not_found"))?;
+        if !matches!(status.as_str(), "queued" | "ready") {
+            return fail("stale_turn");
+        }
+        let ended = if error.code == "cancelled" {
+            "interrupted"
+        } else {
+            "failed"
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
+            params![ended, epoch_ms(), turn],
+        )?;
+        let promoted_steer = status == "ready" && promote(&tx, &name)?;
+        let data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
+        let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
+        tx.commit()?;
+        let left =
+            usize::from(status == "queued" && delivery == "steer") + usize::from(promoted_steer);
+        if left > 0 {
+            self.queued_steers.fetch_sub(left, Relaxed);
+        }
+        let outcome = self
+            .turn_outcome(&name, turn)?
+            .ok_or_else(|| Error::new("stale_turn"))?;
+        Ok((
+            vec![entry(cursor, &name, Some(turn), "turn_finished", data)],
+            outcome,
+        ))
+    }
+    /// Deliver a bounded prefix of queued steers into the running turn.
+    /// Stop at an incompatible explicit override; it and later steers stay
+    /// queued, so a later message cannot overtake the deferred steer.
+    pub fn absorb(&mut self, turn: i64, through: Option<i64>) -> Result<Absorbed> {
+        let bot = self.active(turn)?;
+        let through = match through {
+            Some(id) => Some(id),
+            None => self.conn.prepare_cached(
+                "SELECT MAX(id) FROM turns WHERE bot=? AND status='queued' AND delivery='steer'",
+            )?.query_row([&bot.name], |r| r.get::<_, Option<i64>>(0))?,
+        };
+        let Some(through) = through else {
+            return Ok(Absorbed::default());
+        };
+        let mut steers: Vec<(i64, String)> = Vec::new();
+        let mut more = false;
+        {
+            // The partial index skips ordinary queued work. Read at most one
+            // candidate beyond the byte budget, without copying its prompt.
+            let mut statement = self.conn.prepare_cached(
+                "SELECT s.id,s.prompt,length(CAST(s.prompt AS BLOB)),
+                    (s.workspace IS NULL OR s.workspace=COALESCE(t.workspace,b.workspace))
+                    AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
+                 FROM turns s JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
+                 WHERE s.bot=?1 AND s.status='queued' AND s.delivery='steer' AND s.id<=?4
+                 ORDER BY s.id LIMIT ?3",
+            )?;
+            let mut rows =
+                statement.query(params![bot.name, turn, STEER_BATCH_ITEMS as i64, through])?;
+            let mut bytes = 0;
+            while let Some(row) = rows.next()? {
+                let size = row.get::<_, i64>(2)? as usize;
+                if !row.get::<_, bool>(3)? {
+                    break;
+                }
+                if size > STEER_BATCH_BYTES - bytes {
+                    // An oversized store-level prompt must not spin forever.
+                    // Protocol prompts are already capped at this same limit.
+                    more = !steers.is_empty();
+                    break;
+                }
+                bytes += size;
+                steers.push((row.get(0)?, row.get(1)?));
+            }
+        }
+        let mut absorbed = Absorbed::default();
+        if steers.is_empty() {
+            return Ok(absorbed);
+        }
+        if more || steers.len() == STEER_BATCH_ITEMS {
+            absorbed.next_through = Some(through);
+        }
+        let family = bot.family()?;
+        let tx = self.conn.transaction()?;
+        let mut head = bot.head;
+        let mut steered = Vec::with_capacity(steers.len());
+        for (steer, prompt) in steers {
+            let item = family.user_item(&prompt)?;
+            let id = node(&tx, head, &item)?;
+            head = Some(id);
+            tx.execute(
+                "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
+                params![epoch_ms(), steer],
+            )?;
+            let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
+                "error":Value::Null,"detail":Value::Null});
+            let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
+            absorbed
+                .entries
+                .push(entry(cursor, &bot.name, Some(steer), "turn_finished", data));
+            let data = json!({"from":steer,"node":id});
+            let cursor = event(&tx, &bot.name, Some(turn), "steered", data.clone())?;
+            absorbed
+                .entries
+                .push(entry(cursor, &bot.name, Some(turn), "steered", data));
+            steered.push(steer);
+        }
+        tx.execute(
+            "UPDATE bots SET head=? WHERE name=?",
+            params![head, bot.name],
+        )?;
+        tx.commit()?;
+        self.queued_steers.fetch_sub(steered.len(), Relaxed);
+        for steer in steered {
+            let outcome = self
+                .turn_outcome(&bot.name, steer)?
+                .ok_or_else(|| Error::new("stale_turn"))?;
+            absorbed.outcomes.push((steer, outcome));
+        }
+        Ok(absorbed)
     }
     pub fn append(
         &mut self,
@@ -919,6 +1246,7 @@ impl Database {
             "UPDATE bots SET head=?,running_turn=NULL,status=? WHERE name=?",
             params![head, status, bot.name],
         )?;
+        let promoted_steer = promote(&tx, &bot.name)?;
         if status == "completed" {
             tx.execute(
                 "INSERT INTO checkpoints VALUES (?,?)",
@@ -929,6 +1257,9 @@ impl Database {
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
+        if promoted_steer {
+            self.queued_steers.fetch_sub(1, Relaxed);
+        }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
         Ok(entries)
     }
@@ -1046,7 +1377,7 @@ impl Database {
         if owner != name {
             return fail("turn_not_found");
         }
-        if status == "running" || status == "waiting" {
+        if matches!(status.as_str(), "running" | "waiting" | "queued" | "ready") {
             return Ok(None);
         }
         let finished: Option<String> = self
@@ -1345,9 +1676,10 @@ impl Database {
             .conn
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
-             WHERE t.bot=? AND p.status='running')",
+             WHERE t.bot=? AND p.status='running')
+             OR EXISTS(SELECT 1 FROM turns WHERE bot=? AND status IN ('queued','ready'))",
             )?
-            .query_row([name], |r| r.get(0))?;
+            .query_row([name, name], |r| r.get(0))?;
         if running {
             return fail("bot_busy");
         }
@@ -1406,7 +1738,8 @@ impl Database {
         tx.commit()?;
         Ok(deleted)
     }
-    /// Keep the newest `keep_turns` turns' records and drop the rest of the
+    /// Keep unfinished work and the preceding `keep_turns` turns' records.
+    /// With no unfinished work, keep the newest `keep_turns`. Drop the rest of the
     /// bot's events, tool intents, processes, and artifacts. The transcript
     /// and the turn rows themselves stay: retention here bounds what replay
     /// and tool retrieval keep, never what the model said.
@@ -1420,11 +1753,19 @@ impl Database {
         }
         let floor: Option<i64> = self
             .conn
-            .query_row(
-                "SELECT id FROM turns WHERE bot=? ORDER BY id DESC LIMIT 1 OFFSET ?",
-                params![name, (keep_turns - 1) as i64],
-                |r| r.get(0),
-            )
+            .prepare_cached(
+                // Find the unfinished suffix through the active-status indexes,
+                // then seek backwards in turns_bot_id. A large queued backlog
+                // neither moves the retention boundary nor needs to be scanned.
+                "SELECT id FROM turns WHERE bot=?1 AND id < COALESCE(
+                    (SELECT MIN(id) FROM (
+                        SELECT running_turn AS id FROM bots WHERE name=?1
+                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='queued'
+                        UNION ALL SELECT MIN(id) FROM turns WHERE bot=?1 AND status='ready'
+                    )), 9223372036854775807)
+                 ORDER BY id DESC LIMIT 1 OFFSET ?2",
+            )?
+            .query_row(params![name, (keep_turns - 1) as i64], |r| r.get(0))
             .optional()?;
         let Some(floor) = floor else {
             return Ok(json!({"events":0,"pruned_cursor":Value::Null}));
@@ -1496,13 +1837,20 @@ impl Database {
     /// finishes, is interrupted, or parks; zero counters need no write.
     /// Counts a controller reads instead of scanning: parked turns and
     /// running background commands, both from the active-status indexes.
-    pub fn counts(&self) -> Result<(i64, i64)> {
+    /// Waiting turns, running processes, and turns queued or ready to start.
+    pub fn counts(&self) -> Result<(i64, i64, i64)> {
         let waiting: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM turns WHERE status='waiting'",
             [],
             |r| r.get(0),
         )?;
-        Ok((waiting, self.running_processes()?))
+        let queued: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM turns WHERE status='queued')
+                  + (SELECT COUNT(*) FROM turns WHERE status='ready')",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((waiting, self.running_processes()?, queued))
     }
     pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {
         self.conn.execute(
@@ -1520,7 +1868,7 @@ impl Database {
             "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,b.provider||'/'||b.model),t.input_tokens,t.output_tokens,
                     t.model_rounds,t.started_ms,t.finished_ms,substr(t.prompt,1,200),length(t.prompt),
-                    t.retries,t.paced_ms
+                    t.retries,t.paced_ms,t.delivery
              FROM turns t JOIN bots b ON b.name=t.bot WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
         let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
@@ -1539,7 +1887,8 @@ impl Database {
                 "output_tokens":r.get::<_, i64>(6)?,"model_rounds":r.get::<_, i64>(7)?,
                 "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
                 "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
-                "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?}),
+                "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?,
+                "delivery":r.get::<_, String>(14)?}),
             );
         }
         let next = more.then(|| {
@@ -1705,6 +2054,41 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 /// Append an item. Stored history has no lifetime cap; the per-request
 /// context window is bounded separately. `turn` marks a turn's first item
 /// (its user prompt) and receives the next ordinal along the lineage.
+/// Put a turn's user item on the lineage and mark the bot busy with it.
+fn start_locked(tx: &Connection, bot: &Bot, turn: i64, prompt: &str) -> Result<Option<i64>> {
+    let item = bot.family()?.user_item(prompt)?;
+    let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
+    tx.execute(
+        "UPDATE turns SET status='running',started_ms=? WHERE id=?",
+        params![epoch_ms(), turn],
+    )?;
+    tx.execute(
+        "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
+        params![head, turn, bot.name],
+    )?;
+    Ok(Some(head))
+}
+/// The bot's oldest queued turn now waits only for a slot. True when that
+/// turn was a steer, for the queued-steer count.
+fn promote(tx: &Connection, bot: &str) -> Result<bool> {
+    let delivery: Option<String> = tx
+        .prepare_cached(
+            "UPDATE turns SET status='ready' WHERE id=(
+                SELECT MIN(id) FROM turns WHERE bot=? AND status='queued') RETURNING delivery",
+        )?
+        .query_row([bot], |r| r.get(0))
+        .optional()?;
+    Ok(delivery.as_deref() == Some("steer"))
+}
+fn turn_status_name(status: &str) -> &'static str {
+    match status {
+        "queued" => "queued",
+        "ready" => "ready",
+        "waiting" => "waiting",
+        "running" => "running",
+        _ => "finished",
+    }
+}
 fn node(conn: &Connection, parent: Option<i64>, item: &[u8]) -> Result<i64> {
     node_with_turn(conn, parent, item, None)
 }
@@ -1801,6 +2185,19 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     "ALTER TABLE turns ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
                 ))?;
             }
+        }
+    }
+    if from < 15 {
+        // 14 -> 15: delivery mode per turn. Added only when missing.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='delivery')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(
+                "ALTER TABLE turns ADD COLUMN delivery TEXT NOT NULL DEFAULT 'reject';",
+            )?;
         }
     }
     if from < 14 {

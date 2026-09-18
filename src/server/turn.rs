@@ -22,7 +22,14 @@ use agent_runtime::{
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
+};
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub const MAX_ROUNDS: usize = 200;
@@ -97,6 +104,14 @@ impl Accounting {
     }
 }
 
+/// Shared only by an execution future and its cancellation branch. Atomics
+/// keep the borrowed state Send across awaits; no allocation or extra task.
+#[derive(Default)]
+struct Steering {
+    committing: AtomicBool,
+    interrupted: AtomicBool,
+}
+
 enum Round {
     Finished,
     /// The turn is parked or was ended elsewhere; nothing to finish here.
@@ -122,12 +137,14 @@ impl Finished {
         keep: Option<usize>,
     ) -> Result<Self> {
         let entries = db.finish(turn, error)?;
-        if let Some(keep) = keep {
-            db.prune(bot, keep)?;
-        }
         let outcome = db
             .turn_outcome(bot, turn)?
             .ok_or_else(|| Error::new("stale_turn"))?;
+        // A later steer may already be terminal, placing this completion
+        // outside retention. Capture it for current waiters before pruning.
+        if let Some(keep) = keep {
+            db.prune(bot, keep)?;
+        }
         Ok(Self { entries, outcome })
     }
 }
@@ -142,10 +159,25 @@ impl Turn {
             }
         };
         let mut accounting = Accounting::default();
-        let mut result = tokio::select! {
-            biased;
-            _ = interrupt => fail("cancelled"),
-            result = self.rounds(&mut accounting) => result,
+        let steering = Steering::default();
+        let mut result = {
+            let rounds = self.rounds(&mut accounting, &steering);
+            tokio::pin!(rounds);
+            tokio::select! {
+                biased;
+                _ = interrupt => {
+                    steering.interrupted.store(true, Relaxed);
+                    if steering.committing.load(Relaxed) {
+                        // Store jobs keep running if their receiver is dropped.
+                        // Finish this bounded batch and its notifications before
+                        // acknowledging cancellation; absorb then stops itself.
+                        rounds.await
+                    } else {
+                        fail("cancelled")
+                    }
+                }
+                result = &mut rounds => result,
+            }
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
         let (retries, paced_ms) = accounting.totals();
@@ -234,7 +266,7 @@ impl Turn {
         })
     }
 
-    async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {
+    async fn rounds(&self, accounting: &mut Accounting, steering: &Steering) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.call(move |db| db.inspect(&bot)).await?;
         let context = self.store.call(move |db| db.context(turn)).await?;
@@ -264,6 +296,8 @@ impl Turn {
             }
         }
         let mut model_rounds = context.model_rounds;
+        // Steers submitted since the last boundary go in before this call.
+        self.absorb(steering).await?;
         while model_rounds < MAX_ROUNDS {
             // The budget is checked before each call, so one call may overshoot.
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
@@ -304,13 +338,52 @@ impl Turn {
                 self.hub.durable(&self.bot, entry).await?;
             }
             if response.calls.is_empty() {
+                // A steer that arrived during the final call keeps the turn
+                // going for one more round rather than ending it unheard.
+                if self.absorb(steering).await? {
+                    continue;
+                }
                 return Ok(Round::Finished);
             }
             if self.execute_calls(response.calls, &workspace).await? {
                 return Ok(Round::Parked);
             }
+            self.absorb(steering).await?;
         }
         fail("tool_round_limit")
+    }
+
+    /// The round boundary: queued steers become user items after everything
+    /// recorded so far, and their waiters learn where they went.
+    async fn absorb(&self, steering: &Steering) -> Result<bool> {
+        if !self.store.steers_queued() {
+            return Ok(false);
+        }
+        let turn = self.turn;
+        let mut through = None;
+        let mut steered = false;
+        loop {
+            steering.committing.store(true, Relaxed);
+            let absorbed = self.store.call(move |db| db.absorb(turn, through)).await?;
+            through = absorbed.next_through;
+            steered |= !absorbed.outcomes.is_empty();
+            for entry in absorbed.entries {
+                self.hub.durable(&self.bot, entry).await?;
+            }
+            for (steer, outcome) in absorbed.outcomes {
+                self.handles.turn_finished(&self.bot, steer, outcome);
+            }
+            steering.committing.store(false, Relaxed);
+            if steering.interrupted.load(Relaxed) {
+                return fail("cancelled");
+            }
+            // Release the batch before loading another; new arrivals beyond
+            // the initial snapshot wait for the next model-round boundary.
+            if through.is_none() {
+                break;
+            }
+        }
+        Ok(steered)
     }
 
     /// One model call with retries. Each attempt rebuilds the request from
@@ -752,6 +825,171 @@ fn failure(error: Error) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interrupt_finishes_a_committed_steer_batch_and_wakes_waiters() {
+        use agent_runtime::{
+            codec::Family,
+            output::Output,
+            provider::Transport,
+            store::{Binding, Delivery, TurnOptions},
+        };
+        use tokio::io::AsyncReadExt;
+        let dir =
+            std::env::temp_dir().join(format!("agent-steer-interrupt-{}", std::process::id()));
+        let store = Store::open(&dir.join("state.sqlite"), "test".into())
+            .await
+            .unwrap();
+        let (turn, steers) = store
+            .call(|db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                    },
+                )?;
+                let turn = db
+                    .begin("Bob", "first", "work", true, &TurnOptions::default())?
+                    .turn;
+                let options = TurnOptions {
+                    delivery: Delivery::Steer,
+                    ..TurnOptions::default()
+                };
+                let steers = (0..64)
+                    .map(|n| {
+                        db.begin("Bob", &n.to_string(), "steer", true, &options)
+                            .map(|s| s.turn)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((turn, steers))
+            })
+            .await
+            .unwrap();
+        // Hold the firehose full so interruption is guaranteed to land after
+        // the first batch commits and before its completion notifications.
+        let (writer, mut reader) = tokio::io::duplex(1);
+        let output = Output::writer(writer);
+        for _ in 0..65 {
+            output.send(json!({"filler":true})).await.unwrap();
+        }
+        let hub = Hub::default();
+        hub.add_firehose(0, output.clone());
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let (reply_writer, mut reply_reader) = tokio::io::duplex(65536);
+        handles
+            .attach(
+                &store,
+                handles.request_waiter(),
+                &steers[..32]
+                    .iter()
+                    .map(|id| format!("turn:Bob/{id}"))
+                    .collect::<Vec<_>>(),
+                None,
+                false,
+                Completion::Respond {
+                    session: 1,
+                    output: Output::writer(reply_writer),
+                    request: json!(1),
+                },
+            )
+            .await;
+        let (cancel, cancelled) = watch::channel(false);
+        let task = Turn {
+            bot: "Bob".into(),
+            turn,
+            store: store.clone(),
+            providers: Arc::new(HashMap::from([(
+                "openai".into(),
+                Provider::new(
+                    Transport::new(1, 1).unwrap(),
+                    Family::Responses,
+                    "http://127.0.0.1:9/v1",
+                    None,
+                    &[],
+                )
+                .unwrap(),
+            )])),
+            registry: Registry::new("echo").unwrap(),
+            hub,
+            handles: handles.clone(),
+            background_failures: mpsc::unbounded_channel().0,
+            context_bytes: 8 << 20,
+            context_items: 4096,
+            resume: false,
+        };
+        let running = tokio::spawn(async move { task.execute(cancelled).await });
+        let last = steers[31];
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store
+                .call(move |db| db.turn_status("Bob", last))
+                .await
+                .unwrap()
+                != "steered"
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.send(true).unwrap();
+        drop(output);
+        let drain = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == "cancelled"));
+        assert_eq!(
+            handles.stats(),
+            (0, 0),
+            "committed steer waiters must resolve before cancellation finishes"
+        );
+        let mut reply = Vec::new();
+        reply_reader.read_to_end(&mut reply).await.unwrap();
+        let reply: Value = serde_json::from_slice(&reply).unwrap();
+        assert_eq!(reply["result"]["results"].as_object().unwrap().len(), 32);
+        for outcome in reply["result"]["results"].as_object().unwrap().values() {
+            assert_eq!(outcome["status"], "steered");
+            assert_eq!(outcome["into"], turn);
+        }
+        let bytes = drain.await.unwrap();
+        let events: Vec<Value> = bytes
+            .split(|b| *b == b'\n')
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::from_slice(s).unwrap())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["event"] == "turn_finished")
+                .count(),
+            32
+        );
+        assert_eq!(
+            events.iter().filter(|e| e["event"] == "steered").count(),
+            32
+        );
+        let next = steers[32];
+        assert_eq!(
+            store
+                .call(move |db| db.turn_status("Bob", next))
+                .await
+                .unwrap(),
+            "queued"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn read_ahead_batches_stop_at_either_bound() {

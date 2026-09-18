@@ -116,6 +116,36 @@ class SocketAndCliTests(ModelFixture):
         failed = self.agent('wait', '--store', str(self.store), '--any', slow, check=False)
         self.assertEqual(failed.returncode, 1)
 
+    def test_run_delivery_modes_from_the_cli(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
+        self.assertEqual(busy['status'], 'running')
+        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('bot_busy', refused.stderr + refused.stdout)
+        queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
+                                       '--delivery', 'queue', 'second').stdout)
+        self.assertEqual(queued['status'], 'queued')
+        steered = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery=steer', '--pretty', 'late')
+        self.assertRegex(steered.stderr, r'steered into turn|completed')
+        done = json.loads(self.agent('wait', '--store', str(self.store), queued['handle']).stdout)
+        self.assertEqual(done['results'][queued['handle']]['text'], 'reply:second')
+        usage = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery', 'later', 'x', check=False)
+        self.assertEqual(usage.returncode, 1)
+        self.assertIn('invalid_delivery', usage.stderr + usage.stdout)
+        # The environment supplies a per-user default; the flag still wins.
+        env = dict(clean_env(), AGENT_DELIVERY='queue')
+        slow = json.loads(subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow'],
+                                         env=env, capture_output=True, text=True, cwd=self.path).stdout)
+        queued = json.loads(subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'from-env'],
+                                           env=env, capture_output=True, text=True, cwd=self.path).stdout)
+        self.assertEqual((slow['status'], queued['status']), ('running', 'queued'))
+        overridden = subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob', '--detach',
+                                     '--delivery', 'reject', 'flag-wins'], env=env, capture_output=True, text=True, cwd=self.path)
+        self.assertEqual(overridden.returncode, 1)
+        self.assertIn('bot_busy', overridden.stderr + overridden.stdout)
+        self.agent('wait', '--store', str(self.store), queued['handle'])
+
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
                 ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'stats', 'shutdown', 'serve')]:

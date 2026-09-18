@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -137,6 +137,10 @@ fn print_flags(flags: &str) {
             "--turn" => ("ID", "Select a turn"),
             "--new" => ("", "Create a new bot instead of continuing a named bot"),
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
+            "--delivery" => (
+                "MODE",
+                "If the bot is busy: reject, queue, or steer; default AGENT_DELIVERY or reject",
+            ),
             "--all" => ("", "Follow every bot on one connection"),
             "--any" => ("", "Return when the first handle resolves"),
             "--timeout-ms" => ("N", "Wait at most N milliseconds; 0 polls immediately"),

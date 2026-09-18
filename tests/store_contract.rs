@@ -2,12 +2,13 @@ use agent_runtime::{
     Error,
     codec::Family,
     provider::ToolCall,
-    store::{Binding, Database, TurnOptions},
+    store::{Binding, Database, Delivery, TurnOptions},
     tools::Outcome,
 };
 use bytes::Bytes;
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 
 fn assistant(text: &str) -> Bytes {
     serde_json::to_vec(&json!({"type":"message","role":"assistant",
@@ -88,6 +89,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     let branch = TurnOptions {
         workspace: Some("/synthetic/alternative".into()),
         model: None,
+        delivery: Delivery::Reject,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch)
@@ -353,6 +355,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
     let options = TurnOptions {
         workspace: Some("/synthetic/elsewhere".into()),
         model: Some("openai/other-model".into()),
+        delivery: Delivery::Reject,
     };
     let started = db.begin("Bob", "r1", "work", true, &options).unwrap();
     let accepted = started.entry.unwrap();
@@ -395,6 +398,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
     let options = TurnOptions {
         workspace: Some("/synthetic/today".into()),
         model: None,
+        delivery: Delivery::Reject,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options)
@@ -655,6 +659,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
             &TurnOptions {
                 workspace: Some("/synthetic/b".into()),
                 model: None,
+                delivery: Delivery::Reject,
             },
         )
         .unwrap()
@@ -1486,4 +1491,380 @@ fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
         }
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let first = db
+        .begin("Bob", "r1", "first", true, &TurnOptions::default())
+        .unwrap();
+    assert_eq!(first.status, "running");
+    let second = db.begin("Bob", "r2", "second", true, &queue).unwrap();
+    assert_eq!(second.status, "queued");
+    assert_eq!(second.entry.as_ref().unwrap()["event"], "queued");
+    let third = db.begin("Bob", "r3", "third", true, &steer).unwrap();
+    assert_eq!(third.status, "queued");
+    let steers = db.queued_steers();
+    assert_eq!(steers.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        db.begin("Bob", "r4", "fourth", true, &TurnOptions::default())
+            .unwrap_err()
+            .code,
+        "bot_busy"
+    );
+    // A retry of a queued submission is a duplicate, not a second row.
+    assert!(!db.begin("Bob", "r2", "second", true, &queue).unwrap().fresh);
+    assert!(db.turn_outcome("Bob", second.turn).unwrap().is_none());
+
+    // The boundary takes the steer, not the queued turn, and answers its waiters.
+    let absorbed = db.absorb(first.turn, None).unwrap();
+    assert_eq!(absorbed.outcomes.len(), 1);
+    let (steered, outcome) = &absorbed.outcomes[0];
+    assert_eq!(*steered, third.turn);
+    assert_eq!(outcome["status"], "steered");
+    assert_eq!(outcome["into"], first.turn);
+    let kinds: Vec<&str> = absorbed
+        .entries
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["turn_finished", "steered"]);
+    assert_eq!(steers.load(Ordering::Relaxed), 0);
+    let items = stored(&mut db, "Bob");
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1]["content"][0]["text"], "third");
+    assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "queued");
+    assert!(db.absorb(first.turn, None).unwrap().outcomes.is_empty());
+
+    // Finishing promotes the bot's oldest queued turn to ready; starting it
+    // puts its prompt after the whole first turn.
+    db.append(first.turn, vec![assistant("done")], &[], None)
+        .unwrap();
+    db.finish(first.turn, None).unwrap();
+    assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "ready");
+    assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), second.turn)));
+    assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
+    let accepted = db.start(second.turn).unwrap();
+    assert_eq!(accepted["event"], "accepted");
+    assert_eq!(db.inspect("Bob").unwrap().running_turn, Some(second.turn));
+    assert_eq!(db.next_ready().unwrap(), None);
+    let items = stored(&mut db, "Bob");
+    assert_eq!(items[3]["content"][0]["text"], "second");
+    assert_eq!(db.start(second.turn).unwrap_err().code, "stale_turn");
+
+    // A queued turn can be ended where it stands; a ready one hands its
+    // place to the next in line.
+    let fourth = db.begin("Bob", "r4", "fourth", false, &steer).unwrap();
+    let fifth = db.begin("Bob", "r5", "fifth", false, &queue).unwrap();
+    assert_eq!((fourth.status, fifth.status), ("queued", "queued"));
+    assert_eq!(steers.load(Ordering::Relaxed), 1);
+    db.append(second.turn, vec![assistant("done")], &[], None)
+        .unwrap();
+    db.finish(second.turn, None).unwrap();
+    // The steer at the head of the line is promoted, so it is no longer
+    // absorbable and leaves the count.
+    assert_eq!(db.turn_status("Bob", fourth.turn).unwrap(), "ready");
+    assert_eq!(steers.load(Ordering::Relaxed), 0);
+    let (entries, outcome) = db
+        .end_queued(fourth.turn, &Error::new("cancelled"))
+        .unwrap();
+    assert_eq!(entries[0]["data"]["status"], "interrupted");
+    assert_eq!(outcome["status"], "interrupted");
+    assert_eq!(db.turn_status("Bob", fifth.turn).unwrap(), "ready");
+    db.end_queued(fifth.turn, &Error::new("cancelled")).unwrap();
+    assert_eq!(
+        db.end_queued(fifth.turn, &Error::new("cancelled"))
+            .unwrap_err()
+            .code,
+        "stale_turn"
+    );
+    assert_eq!(db.counts().unwrap().2, 0);
+    db.delete_bot("Bob").unwrap();
+}
+
+#[test]
+fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
+    let mut db = db();
+    db.create("Alice", Some("/synthetic"), binding()).unwrap();
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    assert_eq!(
+        db.begin("Alice", "r0", "work", false, &TurnOptions::default())
+            .unwrap_err()
+            .code,
+        "active_agent_limit"
+    );
+    let waiting = db.begin("Alice", "r1", "work", false, &queue).unwrap();
+    assert_eq!(waiting.status, "ready");
+    assert_eq!(waiting.entry.as_ref().unwrap()["data"]["status"], "ready");
+    assert_eq!(db.counts().unwrap().2, 1);
+    assert_eq!(
+        db.next_ready().unwrap(),
+        Some(("Alice".into(), waiting.turn))
+    );
+    db.start(waiting.turn).unwrap();
+
+    // A turn queued behind one that ends uncertain cannot start; it fails
+    // with that reason and its waiters hear it.
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin("Carol", "c1", "work", true, &TurnOptions::default())
+        .unwrap();
+    let second = db.begin("Carol", "c2", "more", true, &queue).unwrap();
+    let call = ToolCall {
+        name: "echo".into(),
+        call_id: "call-1".into(),
+        arguments: "{}".into(),
+    };
+    db.append(first.turn, vec![assistant("calling")], &[call], None)
+        .unwrap();
+    db.finish(first.turn, Some(&Error::new("process_interrupted")))
+        .unwrap();
+    assert_eq!(db.inspect("Carol").unwrap().status, "uncertain");
+    assert_eq!(db.turn_status("Carol", second.turn).unwrap(), "ready");
+    let error = db.start(second.turn).unwrap_err();
+    assert_eq!(error.code, "tool_outcome_uncertain");
+    let (_, outcome) = db.end_queued(second.turn, &error).unwrap();
+    assert_eq!(outcome["status"], "failed");
+    assert_eq!(outcome["error"], "tool_outcome_uncertain");
+    assert_eq!(
+        db.begin("Carol", "c3", "again", true, &queue)
+            .unwrap_err()
+            .code,
+        "tool_outcome_uncertain"
+    );
+}
+
+#[test]
+fn ready_work_cannot_be_overtaken_when_capacity_opens() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let first = db.begin("Bob", "a", "first", false, &queue).unwrap();
+    assert_eq!(
+        db.begin("Bob", "reject", "no", true, &TurnOptions::default())
+            .unwrap_err()
+            .code,
+        "bot_busy"
+    );
+    let next = db.begin("Bob", "b", "next", true, &queue).unwrap();
+    assert_eq!((first.status, next.status), ("ready", "queued"));
+    db.start(first.turn).unwrap();
+    db.finish(first.turn, None).unwrap();
+    let last = db.begin("Bob", "c", "last", true, &queue).unwrap();
+    assert_eq!(last.status, "queued");
+    assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), next.turn)));
+}
+
+#[test]
+fn restart_keeps_one_ready_head_per_bot() {
+    let path = std::env::temp_dir().join(format!("agent-ready-head-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let (first, next);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        first = db.begin("Bob", "a", "first", false, &queue).unwrap().turn;
+        next = db.begin("Bob", "b", "next", false, &queue).unwrap().turn;
+    }
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        assert_eq!(db.turn_status("Bob", next).unwrap(), "queued");
+        db.start(first).unwrap();
+        assert_eq!(db.next_ready().unwrap(), None);
+        db.finish(first, None).unwrap();
+        assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), next)));
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let first = db
+        .begin("Bob", "a", "active", true, &TurnOptions::default())
+        .unwrap();
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let next = db.begin("Bob", "b", "next", true, &queue).unwrap();
+    let cancelled = db.begin("Bob", "c", "cancelled", true, &queue).unwrap();
+    db.end_queued(cancelled.turn, &Error::new("cancelled"))
+        .unwrap();
+    // A newer terminal row must not move retention past live tool intents.
+    let call = ToolCall {
+        name: "echo".into(),
+        call_id: "live".into(),
+        arguments: "{}".into(),
+    };
+    db.append(first.turn, vec![], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.tool_start(first.turn, &call).unwrap();
+    assert_eq!(db.prune("Bob", 1).unwrap()["events"], 0);
+    db.tool_finish(first.turn, "live", &result("done")).unwrap();
+    db.finish(first.turn, None).unwrap();
+    db.prune("Bob", 1).unwrap();
+    assert_eq!(
+        db.turn_outcome("Bob", first.turn).unwrap().unwrap()["status"],
+        "completed"
+    );
+    assert_eq!(db.turn_status("Bob", next.turn).unwrap(), "ready");
+    db.start(next.turn).unwrap();
+    db.finish(next.turn, None).unwrap();
+    assert!(db.prune("Bob", 1).unwrap()["events"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
+    let mut db = db();
+    db.create("Bob", Some("/default"), binding()).unwrap();
+    let active = TurnOptions {
+        workspace: Some("/active".into()),
+        model: Some("openai/active".into()),
+        ..TurnOptions::default()
+    };
+    let first = db
+        .begin("Bob", "first", "work", true, &active)
+        .unwrap()
+        .turn;
+    let matching = TurnOptions {
+        delivery: Delivery::Steer,
+        ..active.clone()
+    };
+    let matched = db
+        .begin("Bob", "match", "match", true, &matching)
+        .unwrap()
+        .turn;
+    let moved = db
+        .begin(
+            "Bob",
+            "move",
+            "move",
+            true,
+            &TurnOptions {
+                workspace: Some("/elsewhere".into()),
+                ..matching.clone()
+            },
+        )
+        .unwrap()
+        .turn;
+    let changed = db
+        .begin(
+            "Bob",
+            "model",
+            "model",
+            true,
+            &TurnOptions {
+                model: Some("openai/other".into()),
+                ..matching
+            },
+        )
+        .unwrap()
+        .turn;
+    let inherited = db
+        .begin(
+            "Bob",
+            "inherit",
+            "inherit",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            },
+        )
+        .unwrap()
+        .turn;
+    let result = db.absorb(first, None).unwrap();
+    assert_eq!(
+        result
+            .outcomes
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        [matched]
+    );
+    assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
+    assert_eq!(db.queued_steers().load(Ordering::Relaxed), 3);
+    db.finish(first, None).unwrap();
+    db.start(moved).unwrap();
+    assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
+    assert!(db.absorb(moved, None).unwrap().outcomes.is_empty());
+    db.finish(moved, None).unwrap();
+    db.start(changed).unwrap();
+    assert_eq!(db.context(changed).unwrap().model, "openai/other");
+    assert_eq!(db.absorb(changed, None).unwrap().outcomes[0].0, inherited);
+    assert_eq!(db.queued_steers().load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
+    for (prompt, count, batch) in [("small".into(), 70, 32), ("é".repeat(128 * 1024), 3, 1)] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let first = db
+            .begin("Bob", "first", "work", true, &TurnOptions::default())
+            .unwrap()
+            .turn;
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            ..TurnOptions::default()
+        };
+        let mut submitted = Vec::new();
+        for n in 0..count {
+            submitted.push(
+                db.begin("Bob", &n.to_string(), &prompt, true, &options)
+                    .unwrap()
+                    .turn,
+            );
+        }
+        let mut seen = Vec::new();
+        let mut through = None;
+        let mut late = None;
+        while seen.len() < count {
+            let absorbed = db.absorb(first, through).unwrap();
+            through = absorbed.next_through;
+            assert_eq!(absorbed.outcomes.len(), batch.min(count - seen.len()));
+            seen.extend(absorbed.outcomes.into_iter().map(|(id, _)| id));
+            if late.is_none() {
+                late = Some(
+                    db.begin("Bob", "late", "late", true, &options)
+                        .unwrap()
+                        .turn,
+                );
+            }
+            assert_eq!(
+                db.queued_steers().load(Ordering::Relaxed),
+                count - seen.len() + 1
+            );
+        }
+        assert!(through.is_none());
+        assert_eq!(seen, submitted);
+        assert_eq!(db.turn_status("Bob", late.unwrap()).unwrap(), "queued");
+        assert_eq!(db.absorb(first, None).unwrap().outcomes[0].0, late.unwrap());
+        assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
+    }
 }

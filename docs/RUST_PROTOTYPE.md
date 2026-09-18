@@ -106,8 +106,9 @@ ownership, special permissions, or coupled lifetime. The same create, submit,
 resume, fork, inspect, and interrupt operations apply to all agents.
 
 `agent run --detach` commits a submission and prints its bot, turn, request ID,
-and durable cursor, then exits. Completion is independent of the submitting
-client. A controller can inspect metadata through `ls` or observe events through
+status, and durable cursor, then exits. Completion is independent of the
+submitting client. `--delivery queue` or `steer` hands a busy bot the work
+instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
 Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`, and
@@ -408,6 +409,7 @@ Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 ```json
 {"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low"}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-4-1"}
+{"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"resume","bot":"Bob"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
@@ -455,7 +457,8 @@ does not, and each is one op:
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
-  still in line for a slot (`queued_processes`), daemon-wide in-flight
+  still in line for a slot (`queued_processes`), turns queued or ready to
+  start (`queued_turns`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),
   and every provider's model pools with their learned allowance and current
   level (`providers.NAME.pools`). Shard loads count requests, not physical
@@ -494,11 +497,14 @@ last replayed page and the first live delivery, and replayed cursors are never
 repeated live. Non-durable `text_delta` and `thinking_delta` notifications are
 delivered only to live followers and carry `durable:false`, as do the `pruned`
 and `deleted` retention notices. Durable event kinds
-are `created`, `forked`, `accepted`, `message`, `usage`, `tool_started`
+are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
+(a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview), `tool_completed` (with retained artifact
 names), `turn_waiting` and `turn_resumed` (a parked turn's handles and its
-wake-up), and `turn_finished` (with status, checkpoint, error code, and detail).
-A `submit` response includes the turn's `handle`, `turn:BOT/N`.
+wake-up), `steered` (a steer's item joining the running turn), and
+`turn_finished` (with status, checkpoint, error code, and detail; a steered
+turn's carries `into` and `node`). A `submit` response includes the turn's
+`handle`, `turn:BOT/N`, and its `status`.
 
 For bounded artifact retrieval, specify a `stream` from `tool_completed`, a
 UTF-8 byte `offset` (default 0), and a byte `limit` (4 through 65,536, default
@@ -538,6 +544,59 @@ event records the values actually used. Duplicate reconciliation still works whe
 turn slots are occupied; capacity rejection never writes a fresh submission.
 A bot permits one running turn. Interrupt requires its exact current turn ID.
 A missing bot never creates a replacement implicitly.
+
+### Delivery modes
+
+`delivery` on `submit` says what happens when the bot is busy or the daemon
+is at `--max-active`. It is one field with three values; every mode returns
+the turn's id and handle at once, and `wait`, `result`, `turns`, and
+`interrupt` work on the turn unchanged.
+
+- `reject` (default): `bot_busy` while a turn runs or is parked,
+  `active_agent_limit` when no slot is free. Nothing is written.
+- `queue`: the turn is a durable row that starts when the bot is free and a
+  slot is open. The response reports `status`: `running` when it started at
+  once, `queued` behind the bot's own work, or `ready` when only a slot is
+  missing. A bot's line runs in submission order; only its head is `ready`,
+  and ready turns across bots start oldest first, one per loop iteration so
+  requests interleave with a long backlog. A `queued` event records the
+  submission; the `accepted` event comes when the turn actually starts, with
+  the node its prompt became. Queued turns survive restart: recovery ends
+  the interrupted running turn and the line moves at once.
+- `steer`: a queued turn the bot's running turn may absorb. At the running
+  turn's next round boundary, after its tool results are recorded and before
+  the next model call, a snapshot of queued steers joins the lineage as
+  user items, in submission order, and each delivered steer finishes as `steered`
+  with `into` naming the turn that took it and `node` its item; the absorbing
+  turn records a `steered` event. A steer that arrives while the final model
+  call is in flight keeps that turn going for one more round rather than
+  going unheard; one that arrives after the last boundary starts as an
+  ordinary turn when its place in the line comes, as does a steer on an idle
+  bot. Waiting on a steer's handle resolves at absorption; wait on `into`
+  for the answer. Rounds spent on steers count toward the turn's round limit.
+  An explicit workspace or model must match the running turn's effective
+  value; omitted overrides inherit that running turn for absorption. A
+  mismatching steer stays queued for its own turn with its requested values,
+  and later steers cannot overtake it. The snapshot is drained in batches of
+  at most 32 steers and 256 KiB of UTF-8 prompt bytes, releasing each batch
+  before another storage call. Batching adds no model calls; arrivals beyond
+  the snapshot wait for the next boundary. An interrupt completes any in-flight
+  batch's commit, event publication, and waiter notifications before stopping;
+  it does not drain further batches. Unabsorbed work stays durable.
+  A partial queued-steer index keeps ordinary queued work out of the scan.
+  The store keeps an exact count of queued steers, so a boundary with
+  nothing to absorb costs one atomic load and no storage round trip.
+
+A queued or ready turn that cannot start when its place comes (the bot's last
+outcome is `uncertain`, its budget is spent) finishes as `failed` with that
+error, and the next in line takes its place. `interrupt` on a queued or ready
+turn ends it as `interrupted` and answers `queued: true`; interrupting the
+running turn does not touch the line behind it. `delete` refuses a bot with
+queued work as `bot_busy`. `stats` reports queued and ready turns together
+as `queued_turns`. `agent run --delivery MODE` sets the field, defaulting
+to `AGENT_DELIVERY` in the client's environment, never in the daemon; with
+`--detach` a peer can hand a busy bot work or a mid-turn message without
+racing on `bot_busy`.
 
 ## Durable state and recovery
 
@@ -740,8 +799,12 @@ needs, and one optional policy composes them:
   Queued wake-ups for interrupted or deleted turns are discarded when capacity
   opens; reusing a bot name cannot resume its old turn. This internal check
   does not change explicit `resume` requests: a missing bot returns `bot_not_found`.
-- `prune {bot, keep_turns}` keeps the newest `keep_turns` turns' records and
-  drops the older turns' events, tool intents, finished processes, and artifacts.
+- `prune {bot, keep_turns}` protects the unfinished suffix (running, parked,
+  ready, and queued work) and keeps the `keep_turns` finished turns preceding
+  it. With no unfinished work it keeps the newest `keep_turns` turns by
+  submission ID. It drops older events, tool intents, finished processes, and artifacts.
+  Queuing new work or cancelling a later queued turn cannot prune a live
+  turn's tool intents or move retention past work that has not finished.
   Running process rows survive so their results can commit; a later prune
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the
@@ -757,7 +820,8 @@ needs, and one optional policy composes them:
   `follow` from before it is preceded by a `pruned` notification, so no
   consumer replays a silent gap. `agent prune --bot --keep-turns N`.
 - `--retain-turns N` on the daemon applies `prune` to a bot after each of
-  its turns finishes, including interruption while parked, before the terminal
+  its turns finishes, including cancelled or failed queued work and interruption
+  while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention
   left it. The service commits completion and publishes its terminal event
   before accepting another turn for that bot; the task is retired before
@@ -784,7 +848,9 @@ they still own running background commands. Late command results remain
 eligible for the next prune. Migration builds candidates from surviving
 operational records, without rewriting turn rows or reindexing expired history.
 A separate `(bot,id)` index locates the retention boundary without scanning
-older turns. The transcript, accounting, and idempotency rows remain intact.
+older turns; the bot's active turn and existing queued/ready indexes locate
+the unfinished suffix without scanning its backlog. The transcript, accounting,
+and idempotency rows remain intact.
 
 Freed pages are reused by later writes rather than returned to the
 filesystem, so a bounded fleet's store stops growing instead of shrinking.
