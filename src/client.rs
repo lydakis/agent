@@ -24,9 +24,16 @@ fn startup_remaining(deadline: Instant) -> Result<Duration> {
 }
 
 struct Options {
+    /// The command being run; `run` treats `--model` as the turn's model.
+    command: String,
     store: PathBuf,
     socket: PathBuf,
     providers: Vec<String>,
+    /// Daemon-scoped values the caller stated, checked against a running
+    /// daemon at attach. Defaults and environment-implied values never conflict.
+    providers_explicit: bool,
+    tools_explicit: bool,
+    model_explicit: bool,
     tools: String,
     model: Option<String>,
     instructions: Option<String>,
@@ -58,9 +65,13 @@ struct Options {
 
 fn parse(args: &[String]) -> Result<Options> {
     let mut options = Options {
+        command: String::new(),
         socket: PathBuf::new(),
         store: PathBuf::new(),
         providers: Vec::new(),
+        providers_explicit: false,
+        tools_explicit: false,
+        model_explicit: false,
         tools: DEFAULT_TOOLS.into(),
         model: std::env::var("AGENT_MODEL").ok(),
         instructions: None,
@@ -105,9 +116,18 @@ fn parse(args: &[String]) -> Result<Options> {
                 match flag {
                     "--store" => store = Some(PathBuf::from(value)),
                     "--socket" => socket = Some(PathBuf::from(value)),
-                    "--provider" => options.providers.push(value),
-                    "--tools" => options.tools = value,
-                    "--model" => options.model = Some(value),
+                    "--provider" => {
+                        options.providers.push(value);
+                        options.providers_explicit = true;
+                    }
+                    "--tools" => {
+                        options.tools = value;
+                        options.tools_explicit = true;
+                    }
+                    "--model" => {
+                        options.model = Some(value);
+                        options.model_explicit = true;
+                    }
                     "--delivery" => options.delivery = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
@@ -336,10 +356,110 @@ fn ensure_existing_daemon(options: &Options) -> Result<Connection> {
     ensure_daemon(options)
 }
 
+/// A running daemon serves whatever configuration started it. Every
+/// daemon-scoped value this client stated must match what the daemon
+/// announces, or the client fails here naming each difference, before any
+/// work is submitted under a configuration nobody asked for.
+fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
+    let mut differences = Vec::new();
+    if options.providers_explicit {
+        for spec in &options.providers {
+            let requested = crate::server::ProviderSpec::parse(spec)?;
+            let running = &ready["providers"][&requested.name];
+            if running.is_null() {
+                differences.push(format!("--provider {}: not registered", requested.name));
+            } else if running["family"] != requested.family.name()
+                || running["url"] != requested.url
+            {
+                differences.push(format!(
+                    "--provider {}: requested {},{} but daemon has {},{}",
+                    requested.name,
+                    requested.family.name(),
+                    requested.url,
+                    running["family"].as_str().unwrap_or(""),
+                    running["url"].as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+    if options.tools_explicit {
+        let mut requested: Vec<&str> = options.tools.split(',').filter(|t| !t.is_empty()).collect();
+        requested.sort_unstable();
+        requested.dedup();
+        let mut running: Vec<&str> = ready["tools"]
+            .as_array()
+            .map(|tools| tools.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        running.sort_unstable();
+        if requested != running {
+            differences.push(format!(
+                "--tools: requested {} but daemon has {}",
+                requested.join(","),
+                running.join(",")
+            ));
+        }
+    }
+    for (flag, value) in &options.daemon_flags {
+        let key = match flag.as_str() {
+            "--max-processes" => "processes",
+            "--max-active" => "active",
+            "--max-connecting" => "connecting",
+            "--max-output-tokens" => "output_tokens",
+            "--idle-exit" => "idle_exit_seconds",
+            "--context-bytes" => "context_bytes",
+            "--context-items" => "context_items",
+            "--retain-turns" => "retain_turns",
+            _ => continue,
+        };
+        let running = &ready["limits"][key];
+        let requested = value
+            .parse::<u64>()
+            .ok()
+            .map(|value| match flag.as_str() {
+                "--context-bytes" if value > 0 => {
+                    value.max(crate::server::MIN_CONTEXT_BYTES as u64)
+                }
+                "--context-items" if value > 0 => {
+                    value.max(crate::server::MIN_CONTEXT_ITEMS as u64)
+                }
+                _ => value,
+            })
+            .filter(|value| flag != "--idle-exit" || *value != 0);
+        if running.as_u64() != requested {
+            differences.push(format!(
+                "{flag}: requested {value} but daemon has {}",
+                if running.is_null() {
+                    "no value".to_owned()
+                } else {
+                    running.to_string()
+                }
+            ));
+        }
+    }
+    if options.model_explicit
+        && options.command != "run"
+        && let Some(model) = &options.model
+        && ready["default_model"] != model.as_str()
+    {
+        differences.push(format!(
+            "--model: requested {model} but daemon defaults to {}",
+            ready["default_model"].as_str().unwrap_or("none")
+        ));
+    }
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        fail_with("daemon_configuration_mismatch", differences.join("; "))
+    }
+}
+
 fn ensure_daemon(options: &Options) -> Result<Connection> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let connect = || match Connection::connect_until(&options.socket, deadline) {
-        Ok(connection) => Ok(Some(connection)),
+        Ok(connection) => {
+            check_daemon(options, &connection.ready)?;
+            Ok(Some(connection))
+        }
         Err(error) if error.code == "daemon_start_timeout" => Err(error),
         Err(_) => Ok(None),
     };
@@ -429,7 +549,8 @@ fn unique(prefix: &str) -> String {
 
 pub fn main(args: Vec<String>) -> Result<i32> {
     let command = args[0].as_str();
-    let options = parse(&args[1..])?;
+    let mut options = parse(&args[1..])?;
+    options.command = command.to_owned();
     if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
         && (command == "follow" || command == "wait" || (command == "run" && !options.detach))
     {

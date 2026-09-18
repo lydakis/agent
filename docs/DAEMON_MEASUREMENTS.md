@@ -1571,3 +1571,129 @@ delivery, CLI, wait, and runtime behavior, formatting and diff checks. Captures,
 full binary hashes, and probe scripts are in ignored `.local/completion-fix/`:
 `steering-results.json`, `queue-results.json`, `steering-repeat-results.json`,
 `queue-repeat-results.json`, and `interrupt-probe.log`.
+
+## Explicit configuration
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. The 32-agent socket echo workload as before, one excluded warmup and
+four measured runs. The store no longer binds a provider set or toolset at
+open; a turn compares its provider's family with the bot's at start, and the
+client compares its stated daemon flags with `ready` at attach. Neither runs
+per byte or per message. A first screen of the slice (`fad51e30…`, CPU
+0.374 s) read well above the delivery slice's 0.323 s, so the committed tree
+`e1ebc942…` was rebuilt from a worktree and screened back to back with the
+slice binary.
+
+| Metric | Committed tree | This slice |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.80 (17.66–17.89) | 17.96 (17.91–18.00) |
+| Observed target CPU, seconds | 0.365 (0.335–0.371) | 0.373 (0.362–0.379) |
+| Per-run p95 turn latency, ms | 618.3 (612.1–626.9) | 620.9 (615.4–625.0) |
+
+The committed tree itself moved from 0.323 s to 0.365 s between the two
+sessions, so the first reading was the host, not the slice. Side by side, CPU
+and p95 are level within the screen's noise; RSS is up about 160 KiB, which
+this screen has shown between runs of one binary before. Captures: ignored
+`.local/bench/slice-prev2-socket-32/`, `slice-config-socket-32/`, and
+`slice-config-b-socket-32/`.
+
+Validation: 74 Rust tests, strict Clippy, formatting, and 139 Python tests,
+including one runtime test that reopens a store without a bot's provider,
+with the same provider name under another family, and with the provider back,
+and one CLI test that attaches with unstated, restated, and mismatched
+providers, tools, limits, and model.
+
+
+## Configuration admission fixes
+
+Observed 2026-09-18 on Darwin arm64, external power. Compared the pre-fix
+working-tree binary `7b6fd12b…` with `33dcd025…`. Provider validation now runs
+inside the existing admission/start storage job, before transcript mutation;
+explicit model overrides no longer need a separate bot-inspection job. Duplicate
+requests reconcile before validation. Client limit checks compare normalized
+values and share the daemon's context minimums.
+
+Four measured 32-agent socket echo runs per binary, each preceded by an excluded
+warmup, alternating before/after order. Same workload, tools, observer, full
+SQLite durability, follower/replay equality, resume and fork checks. All runs
+completed 96 turns with no invalid provider requests. Values are medians of
+per-run metrics, with ranges in parentheses.
+
+| Metric | Before fix | After fix |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.766 (17.656–17.875) | 17.625 (17.562–17.641) |
+| Observed target CPU, seconds | 0.3307 (0.3237–0.3309) | 0.3198 (0.3119–0.3269) |
+| Per-run p95 turn latency, ms | 595.2 (591.0–597.6) | 591.1 (589.1–592.6) |
+
+A separate warm-daemon CLI attachment screen ran `stats` with explicit matching
+provider, model, tool and context flags. Each of four groups per binary excluded
+five warmups and measured 40 invocations. Wall time includes process startup,
+configuration validation, the stats request and JSON output. CPU and peak RSS
+are per-client `wait4` measurements, excluding the already-running daemon and
+Python controller. The table reports medians of each group's medians.
+
+| CLI metric | Before fix | After fix |
+| --- | ---: | ---: |
+| Wall time, ms | 8.799 | 8.663 |
+| CPU, ms | 5.530 | 5.437 |
+| Peak RSS, MiB | 6.703 | 6.734 |
+
+This screen shows no material slowdown; daemon CPU and RSS are modestly lower.
+CPU and latency ranges overlap, so this is not a general speedup claim. The
+client's temporary peak RSS rose by about 32 KiB. Network work and completed
+lifecycle contracts match. These short synthetic conversations do not establish
+long-history or large-fleet capacity.
+
+Validation: 74 Rust tests, strict Clippy, 57 Python tests covering CLI, runtime,
+and delivery, formatting and diff checks. Regression coverage includes disabled
+idle exit and clamped limits, unchanged history on provider rejection, queued
+work after a provider change, and idempotent replies after configuration changes.
+Captures, binary hashes, measurement script and summaries are in ignored
+`.local/config-fixes/` (`results.json`, `summary.json`, `measure.py`).
+
+
+## Inherited-steer provider validation
+
+Observed 2026-09-18, Darwin arm64 on external power, Rust 1.98.0. Compared
+`33dcd025…` before the fix with retained candidate `40f6e761…`. An omitted
+steer model can inherit the active override when the default provider is
+unavailable or incompatible. The existing admission job performs one cached
+primary-key lookup only after default validation fails; ordinary submissions
+and steers with valid defaults gain no query, storage round trip, or retained
+per-agent state. A steer that starts separately still validates its default
+before appending its prompt.
+
+The matched screen uses 16 active bots, seven steers per bot (112 total),
+full SQLite durability, and a gated synthetic provider. Every run verifies 16
+completed turns, 112 absorbed steers, exactly 32 provider requests, and the
+expected input history and final answers. Daemon CPU spans submission through
+completion; RSS is sampled every 5 ms. Latency spans initial submission through
+completion, including the gate and steer submissions. It uses stdio, not CLI
+processes or socket followers.
+
+An initial four-pair screen suggested higher CPU. Ten alternating measured
+runs per binary, after one excluded warmup each, did not repeat that result:
+CPU medians were 0.05826 to 0.05739 seconds, p95 medians 61.26 to 61.62 ms.
+A further ten-run comparison included an experimental cold helper (`1f3596e…`)
+that reduced RSS but increased CPU relative to the inline fix; it was discarded.
+The final comparison's per-run medians and ranges are:
+
+| Metric | Before | Retained fix |
+| --- | ---: | ---: |
+| Daemon CPU, seconds | 0.05950 (0.05724–0.08639) | 0.05839 (0.05435–0.06286) |
+| Sampled peak RSS, MiB | 13.109 (12.984–13.188) | 13.172 (13.047–13.250) |
+| Per-run p95, ms | 63.14 (57.24–128.68) | 62.43 (60.21–96.98) |
+
+CPU and latency overlap the baseline; there is no demonstrated general speedup.
+Sampled RSS increased by about 64–120 KiB across the repeated screens. The newly
+working missing-default case has regression coverage but no valid pre-fix
+performance baseline. These measurements cover the equivalent valid-default
+steering path, not long histories or fleet capacity.
+
+Validation: 74 Rust tests, strict Clippy, 33 runtime/delivery tests plus two
+query-plan tests. The focused inheritance regression also covers an incompatible
+default, explicit matching and mismatching workspaces, an explicitly invalid
+model, an idle bot, and cancellation that forces separate execution without
+history mutation. Captures and scripts are in ignored `.local/inherited-steer-fix/`:
+`runtime-results.json`, `repeat-results.json`, `cold-results.json`, and their
+measurement scripts; the `inline` series in the final comparison is retained.

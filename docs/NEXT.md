@@ -210,14 +210,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    time, and the handle registry. CLI: `follow --all`, `wait --any`, `stats`.
    The bench drivers can now read the daemon instead of sampling it; moving
    them over is a follow-up when one is next touched.
-7. Never silently ignore explicitly requested daemon configuration. Today the
-   first client's `--provider` and `--tools` bind the daemon, and a later
-   client's different values are ignored while it runs; only a restart with
-   changed values fails. A program that asks for one configuration and runs
-   against another has been misled. The client should compare every
-   daemon-scoped option it was given against the effective configuration the
-   daemon reports at attach and fail with the difference named; per-turn model
-   and workspace overrides stay as they are.
+7. Done: a running daemon is never silently different from what a client
+   asked for. The client compares every daemon-scoped value it stated with
+   the daemon's `ready` and fails with `daemon_configuration_mismatch`
+   naming each difference. The store no longer binds a provider set or
+   toolset at all: providers come and go between runs, and a bot's provider
+   is checked by family before admission and again before queued work starts.
 8. Done: [delivery modes](RUST_PROTOTYPE.md#delivery-modes) on `submit`.
    `reject` is the old behavior. `queue` is a durable turn row in `queued`
    or `ready` state, started by the service when the bot and a slot are
@@ -338,6 +336,28 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 19. Add equivalent lifecycle adapters for Pi/Codex only where native semantics
     can satisfy the same contract. Unsupported guarantees remain an explicit
     gap.
+20. The daemon holds no defaults. Next after items 7 and 8, ahead of 13. The
+    split that pays is mechanism in the daemon and policy in the client:
+    anything that must be true for every client at once (durable truth,
+    shared pacing, processes, the per-turn invariants) stays in the daemon;
+    anything that is an opinion belongs to whoever is asking. Rendering,
+    the delivery default (`AGENT_DELIVERY`), and configuration judgment
+    (item 7) already live in the client. Three opinions remain in the
+    daemon, and each is also a configuration axis that can mismatch:
+    default instructions filled in when `create` names none; the default
+    model, which `create` should always name (the CLI keeps the user's in
+    `AGENT_MODEL`); and tools chosen per daemon, where the daemon should
+    register the universe of tools at start and each bot select its set at
+    `create`, which heterogeneous fleets need anyway and which retires the
+    toolset mismatch check. Afterwards daemon configuration is store,
+    socket, providers, and limits; everything else is stated per bot or per
+    turn. Two cautions bound this: client-side work is paid per invocation,
+    and every bot's shell tool that runs `agent run` is a client, so shared
+    mechanisms such as pacing must not move; and the regression screen, not
+    the principle, decides whether a move was free. The delivery boundary
+    check was made one atomic load on the per-turn path, and the client-side
+    configuration check moved nothing on it; both were confirmed by the
+    screen, not assumed.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

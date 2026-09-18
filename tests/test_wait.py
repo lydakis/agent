@@ -306,8 +306,13 @@ class WaitTests(ModelFixture):
         outcome = self.tool_output(client, 'Bob', 'wait-1')
         self.assertEqual(outcome['pending'], [slow['handle']])
         self.assertEqual(outcome['results'][quick['handle']]['text'], 'reply:hi')
-        # The pending handle stays valid: an all-mode wait still gets it.
-        later = client.request('wait', handles=[slow['handle']], timeout_ms=10000)['result']
+        # The pending handle stays valid: an all-mode wait still gets it. The
+        # fixture holds this turn for five seconds, so read past the helper's
+        # default deadline.
+        client.process.stdin.write(json.dumps({'id': 'later', 'op': 'wait', 'handles': [slow['handle']],
+                                               'timeout_ms': 10000}) + '\n')
+        client.process.stdin.flush()
+        later = client.receive(lambda m: m.get('id') == 'later', timeout=15)['result']
         self.assertEqual((later['pending'], later['results'][slow['handle']]['text']), ([], 'reply:wait'))
 
     def test_rejected_wait_preserves_the_rest_of_the_tool_batch(self):

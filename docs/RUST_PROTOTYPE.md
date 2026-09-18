@@ -54,10 +54,27 @@ none is running. If the canonical store path is too long for a Unix socket,
 the CLI uses a stable hash of that path in a private `/tmp/agent-<uid>` directory.
 This also works before a new store exists. `--socket` explicitly selects an
 endpoint; otherwise `AGENT_SOCKET` applies only when `--store` was not supplied.
-Explicit socket paths are used as given and must fit the OS address limit. The daemon inherits the providers, tools, and default model of
-the client that started it and binds them to the store; later clients that pass
-different `--provider` or `--tools` values are ignored while that daemon runs,
-and a restart with different values fails with `store_configuration_mismatch`.
+Explicit socket paths are used as given and must fit the OS address limit.
+The daemon runs the providers, tools, default model, and limits of the client
+that started it, and announces them in `ready`. The store binds none of that:
+it opens under any provider set, so providers can be added, removed, and
+brought back between runs. New submissions validate the effective provider,
+including the bot's default, before accepting work or changing history.
+An eligible steer with no model override can inherit the active turn's provider
+when its own default is unavailable or incompatible. Validation errors are:
+`provider_unavailable` if it is absent, `provider_family_mismatch` if its
+encoding differs. Previously accepted requests still reconcile by request ID.
+Queued turns recheck before starting after a restart; an invalid provider ends
+the queued turn with that error without appending its prompt. Parked turns have
+already changed history; a provider failure ends them through normal turn cleanup. Whether a running daemon is acceptable is the client's call: every
+daemon-scoped value a client states (`--provider`, `--tools`, the limits, and
+`--model` outside `run`, where it is the turn's model) is compared with `ready`
+at attach, and a difference fails with `daemon_configuration_mismatch` naming
+each one, before anything is submitted. Defaults and providers implied by
+environment keys never conflict; a stated provider must be registered with the
+same family and URL, and a stated toolset must match as a set. Limit comparisons
+use effective values: `--idle-exit 0` disables idle exit, and positive context
+limits below 1,024 bytes or two items are raised to those minimums.
 Providers are selected explicitly with `--provider`, or implied by which of the
 well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`)
 are set. No other credential discovery happens. `--no-spawn` refuses to start a
@@ -612,9 +629,9 @@ before versioning is refused with `store_schema_unsupported`, one written by a
 newer binary with `store_schema_newer`, and an older versioned store is
 migrated forward one version at a time inside the opening transaction (a
 version-6 store gains turn ordinals rebuilt from its accepted events). The
-migration is the only code that knows an earlier format. The stored provider and tool
-configuration must still match at reopen, or `store_configuration_mismatch`
-is returned.
+migration is the only code that knows an earlier format. The store records no
+provider set or toolset; a bot's provider is checked by family when its turn
+starts.
 
 Accepted user input is committed before the submission response. Provider output,
 usage, and tool plans are committed before tool dispatch. Tool intent is

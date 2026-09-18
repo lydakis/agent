@@ -1,14 +1,19 @@
 use agent_runtime::{
-    Error,
+    Error, Result,
     codec::Family,
     provider::ToolCall,
-    store::{Binding, Database, Delivery, TurnOptions},
+    store::{Binding, Bot, Database, Delivery, TurnOptions},
     tools::Outcome,
 };
 use bytes::Bytes;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
+
+// These tests isolate store contracts; runtime tests cover provider admission.
+fn allow_provider(_: &Bot, _: Option<&str>) -> Result<()> {
+    Ok(())
+}
 
 fn assistant(text: &str) -> Bytes {
     serde_json::to_vec(&json!({"type":"message","role":"assistant",
@@ -17,7 +22,7 @@ fn assistant(text: &str) -> Bytes {
     .into()
 }
 fn db() -> Database {
-    Database::initialize(Connection::open_in_memory().unwrap(), "test").unwrap()
+    Database::initialize(Connection::open_in_memory().unwrap()).unwrap()
 }
 fn binding() -> Binding<'static> {
     Binding {
@@ -50,7 +55,14 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     assert!(db.inspect("missing").is_err());
     db.create("Bob", Some("/synthetic/bob"), binding()).unwrap();
     let first = db
-        .begin("Bob", "r1", "first", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r1",
+            "first",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     db.append(first, vec![assistant("answer one")], &[], None)
@@ -59,7 +71,14 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         .as_i64()
         .unwrap();
     let second = db
-        .begin("Bob", "r2", "second", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r2",
+            "second",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     db.append(second, vec![assistant("answer two")], &[], None)
@@ -80,7 +99,8 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
             "r1",
             "different",
             true,
-            &TurnOptions::default()
+            &TurnOptions::default(),
+            allow_provider
         )
         .unwrap_err()
         .code,
@@ -92,7 +112,9 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         delivery: Delivery::Reject,
     };
     let alt = db
-        .begin("Alternative", "r1", "different", true, &branch)
+        .begin("Alternative", "r1", "different", true, &branch, |_, _| {
+            Ok(())
+        })
         .unwrap()
         .turn;
     db.append(alt, vec![assistant("another direction")], &[], None)
@@ -120,29 +142,64 @@ fn submission_is_idempotent_and_conflicting_or_overlapping_work_is_rejected() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let started = db
-        .begin("Bob", "same", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "same",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
     assert!(started.fresh);
     let retry = db
-        .begin("Bob", "same", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "same",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
     assert!(!retry.fresh);
     assert_eq!(started.turn, retry.turn);
     assert!(
-        db.begin("Bob", "same", "different", true, &TurnOptions::default())
-            .is_err()
+        db.begin(
+            "Bob",
+            "same",
+            "different",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .is_err()
     );
     assert!(
-        db.begin("Bob", "other", "work", true, &TurnOptions::default())
-            .is_err()
+        db.begin(
+            "Bob",
+            "other",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .is_err()
     );
     db.append(started.turn, vec![assistant("done")], &[], None)
         .unwrap();
     db.finish(started.turn, None).unwrap();
     assert!(
-        !db.begin("Bob", "same", "work", true, &TurnOptions::default())
-            .unwrap()
-            .fresh
+        !db.begin(
+            "Bob",
+            "same",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap()
+        .fresh
     );
     assert_eq!(stored(&mut db, "Bob").len(), 2);
     assert!(
@@ -157,26 +214,54 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     db.create("Other", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "same", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "same",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let retry = db
-        .begin("Bob", "same", "work", false, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "same",
+            "work",
+            false,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
     assert!(!retry.fresh);
     assert_eq!(retry.turn, turn);
     assert_eq!(
-        db.begin("Bob", "same", "changed", false, &TurnOptions::default())
-            .err()
-            .unwrap()
-            .code,
+        db.begin(
+            "Bob",
+            "same",
+            "changed",
+            false,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .err()
+        .unwrap()
+        .code,
         "idempotency_conflict"
     );
     assert_eq!(
-        db.begin("Other", "fresh", "work", false, &TurnOptions::default())
-            .err()
-            .unwrap()
-            .code,
+        db.begin(
+            "Other",
+            "fresh",
+            "work",
+            false,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .err()
+        .unwrap()
+        .code,
         "active_agent_limit"
     );
     assert!(db.inspect("Other").unwrap().head.is_none());
@@ -189,9 +274,16 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
         1
     );
     assert!(
-        db.begin("Other", "fresh", "work", true, &TurnOptions::default())
-            .unwrap()
-            .fresh
+        db.begin(
+            "Other",
+            "fresh",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap()
+        .fresh
     );
 }
 
@@ -200,7 +292,14 @@ fn unrecorded_tool_outcomes_block_automatic_reexecution() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "request", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let call = ToolCall {
@@ -219,8 +318,15 @@ fn unrecorded_tool_outcomes_block_automatic_reexecution() {
         "uncertain"
     );
     assert!(
-        db.begin("Bob", "retry", "work", true, &TurnOptions::default())
-            .is_err()
+        db.begin(
+            "Bob",
+            "retry",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .is_err()
     );
     assert_eq!(db.inspect("Bob").unwrap().status, "uncertain");
 }
@@ -230,7 +336,14 @@ fn tool_results_and_cursor_events_commit_together() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "request", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let call = ToolCall {
@@ -265,7 +378,14 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "request", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let call = ToolCall {
@@ -357,7 +477,9 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         model: Some("openai/other-model".into()),
         delivery: Delivery::Reject,
     };
-    let started = db.begin("Bob", "r1", "work", true, &options).unwrap();
+    let started = db
+        .begin("Bob", "r1", "work", true, &options, allow_provider)
+        .unwrap();
     let accepted = started.entry.unwrap();
     assert_eq!(accepted["data"]["workspace"], "/synthetic/elsewhere");
     assert_eq!(accepted["data"]["model"], "openai/other-model");
@@ -366,16 +488,34 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         (context.workspace.as_str(), context.model.as_str()),
         ("/synthetic/elsewhere", "openai/other-model")
     );
-    assert!(!db.begin("Bob", "r1", "work", true, &options).unwrap().fresh);
+    assert!(
+        !db.begin("Bob", "r1", "work", true, &options, allow_provider)
+            .unwrap()
+            .fresh
+    );
     assert_eq!(
-        db.begin("Bob", "r1", "work", true, &TurnOptions::default())
-            .unwrap_err()
-            .code,
+        db.begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap_err()
+        .code,
         "idempotency_conflict"
     );
     db.finish(started.turn, None).unwrap();
     let plain = db
-        .begin("Bob", "r2", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r2",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
     let context = db.context(plain.turn).unwrap();
     assert_eq!(
@@ -390,9 +530,16 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
     let (bot, _) = db.create("Nomad", None, binding()).unwrap();
     assert!(bot.workspace.is_none());
     assert_eq!(
-        db.begin("Nomad", "r1", "work", true, &TurnOptions::default())
-            .unwrap_err()
-            .code,
+        db.begin(
+            "Nomad",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap_err()
+        .code,
         "workspace_required"
     );
     let options = TurnOptions {
@@ -401,7 +548,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         delivery: Delivery::Reject,
     };
     let turn = db
-        .begin("Nomad", "r1", "work", true, &options)
+        .begin("Nomad", "r1", "work", true, &options, allow_provider)
         .unwrap()
         .turn;
     assert_eq!(db.context(turn).unwrap().workspace, "/synthetic/today");
@@ -437,7 +584,14 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
     capped.budget_tokens = Some(150);
     db.create("Bob", Some("/synthetic"), capped).unwrap();
     let turn = db
-        .begin("Bob", "r1", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let usage = Usage {
@@ -451,16 +605,30 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
     db.finish(turn, None).unwrap();
     // Below the cap, a second turn is admitted; its own call pushes past it.
     let second = db
-        .begin("Bob", "r2", "more", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r2",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     db.append(second, vec![assistant("two")], &[], Some(&usage))
         .unwrap();
     db.finish(second, None).unwrap();
     assert_eq!(
-        db.begin("Bob", "r3", "again", true, &TurnOptions::default())
-            .unwrap_err()
-            .code,
+        db.begin(
+            "Bob",
+            "r3",
+            "again",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap_err()
+        .code,
         "budget_exhausted"
     );
     let page = db.turns("Bob", 0, 1).unwrap();
@@ -487,19 +655,19 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     conn.execute_batch("CREATE TABLE bots(name TEXT PRIMARY KEY)")
         .unwrap();
     assert_eq!(
-        Database::initialize(conn, "test").err().unwrap().code,
+        Database::initialize(conn).err().unwrap().code,
         "store_schema_unsupported"
     );
     let conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "user_version", Database::SCHEMA + 1)
         .unwrap();
     assert_eq!(
-        Database::initialize(conn, "test").err().unwrap().code,
+        Database::initialize(conn).err().unwrap().code,
         "store_schema_newer"
     );
     let conn = Connection::open_in_memory().unwrap();
     let version: i32 = {
-        let _db = Database::initialize(conn, "test").unwrap();
+        let _db = Database::initialize(conn).unwrap();
         Database::SCHEMA
     };
     assert_eq!(version, Database::SCHEMA);
@@ -509,7 +677,7 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     let path = std::env::temp_dir().join(format!("agent-migrate-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         for n in 1..=3 {
             converse(&mut db, "Bob", n);
@@ -544,7 +712,7 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     conn.execute("UPDATE events SET data='{}' WHERE id=?", [event])
         .unwrap();
     assert_eq!(
-        Database::initialize(conn, "test").err().unwrap().code,
+        Database::initialize(conn).err().unwrap().code,
         "store_migration_invalid_event"
     );
     let conn = Connection::open(&path).unwrap();
@@ -568,7 +736,7 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
     )
     .unwrap();
     drop(conn);
-    let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert!(
         db.history_read("Bob", 3, 0, 1024).unwrap()["text"]
             .as_str()
@@ -603,7 +771,14 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "r1", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let call = ToolCall {
@@ -661,6 +836,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 model: None,
                 delivery: Delivery::Reject,
             },
+            allow_provider,
         )
         .unwrap()
         .turn;
@@ -703,7 +879,9 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "r", "work", true, &TurnOptions::default())
+        .begin("Bob", "r", "work", true, &TurnOptions::default(), |_, _| {
+            Ok(())
+        })
         .unwrap()
         .turn;
     let reasoning: Bytes = serde_json::to_vec(&json!({"type":"reasoning",
@@ -781,7 +959,14 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
     )
     .unwrap();
     let first = db
-        .begin("Bob", "first", "hello", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "first",
+            "hello",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let reply =
@@ -791,7 +976,14 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
     db.append(first, vec![reply], &[], None).unwrap();
     db.finish(first, None).unwrap();
     let turn = db
-        .begin("Bob", "tools", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "tools",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let calls: Vec<ToolCall> = ["a", "b"]
@@ -843,6 +1035,7 @@ fn converse(db: &mut Database, bot: &str, n: usize) {
             &format!("p{n}"),
             true,
             &TurnOptions::default(),
+            allow_provider,
         )
         .unwrap()
         .turn;
@@ -896,7 +1089,14 @@ fn context_windows_start_at_turn_boundaries_and_move_with_hysteresis() {
     );
     // A running turn's own items are always part of its window.
     let turn = db
-        .begin("Bob", "live", "p13", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "live",
+            "p13",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     db.append(turn, vec![assistant("partial"), user("more")], &[], None)
@@ -968,7 +1168,14 @@ fn history_preserves_content_beyond_the_preview() {
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let prompt = format!("{} final fact", "é🦀".repeat(1000));
     let turn = db
-        .begin("Bob", "long", &prompt, true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "long",
+            &prompt,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let reasoning: Bytes = serde_json::to_vec(&json!({"type":"reasoning","id":"rs_1",
@@ -1073,7 +1280,14 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
         )
         .unwrap();
         let turn = db
-            .begin(name, "r1", "prompt", true, &TurnOptions::default())
+            .begin(
+                name,
+                "r1",
+                "prompt",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
             .unwrap()
             .turn;
         db.append(turn, vec![Bytes::from_static(item.as_bytes())], &[], None)
@@ -1130,7 +1344,9 @@ fn deleting_a_bot_frees_only_its_exclusive_history() {
     assert_eq!(before, 8);
     // A running bot cannot be deleted.
     let turn = db
-        .begin("Bob", "live", "p", true, &TurnOptions::default())
+        .begin("Bob", "live", "p", true, &TurnOptions::default(), |_, _| {
+            Ok(())
+        })
         .unwrap()
         .turn;
     assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
@@ -1223,7 +1439,7 @@ fn turn_identity_migrates_above_fork_retained_history() {
     let _ = std::fs::remove_file(&path);
     let last;
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
         converse(&mut db, "Bob", 2);
@@ -1243,9 +1459,16 @@ fn turn_identity_migrates_above_fork_retained_history() {
              DROP TABLE node_sequence; DROP TABLE turn_sequence; PRAGMA user_version=8;",
         )
         .unwrap();
-        let mut db = Database::initialize(conn, "test").unwrap();
+        let mut db = Database::initialize(conn).unwrap();
         let turn = db
-            .begin("branch", "next", "work", true, &TurnOptions::default())
+            .begin(
+                "branch",
+                "next",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
             .unwrap()
             .turn;
         assert!(turn > last);
@@ -1269,7 +1492,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
     let _ = std::fs::remove_file(&path);
     let checkpoint;
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
         checkpoint = db.inspect("Bob").unwrap().head.unwrap();
@@ -1281,7 +1504,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
                             DROP TABLE IF EXISTS node_sequence; PRAGMA user_version=9;",
         )
         .unwrap();
-        let mut db = Database::initialize(conn, "test").unwrap();
+        let mut db = Database::initialize(conn).unwrap();
         assert_eq!(
             db.item("Bob", checkpoint).unwrap()["content"][0]["text"],
             "r1"
@@ -1289,7 +1512,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
         db.delete_bot("Bob").unwrap();
     }
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 2);
         assert!(db.inspect("Bob").unwrap().head.unwrap() > checkpoint);
@@ -1327,7 +1550,14 @@ fn retention_keeps_running_processes_until_their_results_commit() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     let turn = db
-        .begin("Bob", "bg", "work", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "bg",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap()
         .turn;
     let process = db.process_start(turn, "bg").unwrap();
@@ -1363,7 +1593,7 @@ fn retention_candidates_migrate_and_stay_scoped_to_their_bot() {
     ));
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         for bot in ["Alice", "Bob"] {
             db.create(bot, Some("/synthetic"), binding()).unwrap();
             for n in 1..=3 {
@@ -1379,7 +1609,7 @@ fn retention_candidates_migrate_and_stay_scoped_to_their_bot() {
                         PRAGMA user_version=10;",
     )
     .unwrap();
-    let mut db = Database::initialize(conn, "test").unwrap();
+    let mut db = Database::initialize(conn).unwrap();
     assert_eq!(
         Connection::open(&path)
             .unwrap()
@@ -1407,7 +1637,7 @@ fn retention_candidates_migrate_and_stay_scoped_to_their_bot() {
         .unwrap();
     assert_eq!(rows, vec![("Alice".into(), 3), ("Bob".into(), 1)]);
     // A restart and a wider retention request cannot restore expired records.
-    let mut db = Database::initialize(conn, "test").unwrap();
+    let mut db = Database::initialize(conn).unwrap();
     assert_eq!(db.prune("Bob", 3).unwrap()["events"], 0);
     converse(&mut db, "Bob", 4);
     assert_eq!(db.prune("Bob", 1).unwrap()["events"], 3);
@@ -1424,7 +1654,7 @@ fn global_replay_gap_survives_deletion_restart_and_migration() {
     let _ = std::fs::remove_file(&path);
     let high;
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
         converse(&mut db, "Bob", 2);
@@ -1445,7 +1675,7 @@ fn global_replay_gap_survives_deletion_restart_and_migration() {
             conn.execute_batch("DROP TABLE event_retention; PRAGMA user_version=13;")
                 .unwrap();
         }
-        let db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.events_after(0, 256).unwrap()["pruned_before"], high);
         assert!(
             db.events_after(high, 256)
@@ -1464,7 +1694,7 @@ fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
     let _ = std::fs::remove_file(&path);
     let deleted;
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let (_, first) = db.create("First", None, binding()).unwrap();
         let (_, second) = db.create("Second", None, binding()).unwrap();
         let (_, third) = db.create("Third", None, binding()).unwrap();
@@ -1474,7 +1704,7 @@ fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
     }
     for remove in [false, true] {
         {
-            let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
             if remove {
                 db.delete_bot("Second").unwrap();
             }
@@ -1482,7 +1712,7 @@ fn global_gap_migration_finds_interior_holes_but_not_contiguous_events() {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("DROP TABLE event_retention; PRAGMA user_version=13;")
             .unwrap();
-        let db = Database::initialize(conn, "test").unwrap();
+        let db = Database::initialize(conn).unwrap();
         let page = db.events_after(0, 256).unwrap();
         if remove {
             assert_eq!(page["pruned_before"], deleted);
@@ -1506,24 +1736,46 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
         ..TurnOptions::default()
     };
     let first = db
-        .begin("Bob", "r1", "first", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "r1",
+            "first",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
     assert_eq!(first.status, "running");
-    let second = db.begin("Bob", "r2", "second", true, &queue).unwrap();
+    let second = db
+        .begin("Bob", "r2", "second", true, &queue, allow_provider)
+        .unwrap();
     assert_eq!(second.status, "queued");
     assert_eq!(second.entry.as_ref().unwrap()["event"], "queued");
-    let third = db.begin("Bob", "r3", "third", true, &steer).unwrap();
+    let third = db
+        .begin("Bob", "r3", "third", true, &steer, allow_provider)
+        .unwrap();
     assert_eq!(third.status, "queued");
     let steers = db.queued_steers();
     assert_eq!(steers.load(Ordering::Relaxed), 1);
     assert_eq!(
-        db.begin("Bob", "r4", "fourth", true, &TurnOptions::default())
-            .unwrap_err()
-            .code,
+        db.begin(
+            "Bob",
+            "r4",
+            "fourth",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap_err()
+        .code,
         "bot_busy"
     );
     // A retry of a queued submission is a duplicate, not a second row.
-    assert!(!db.begin("Bob", "r2", "second", true, &queue).unwrap().fresh);
+    assert!(
+        !db.begin("Bob", "r2", "second", true, &queue, allow_provider)
+            .unwrap()
+            .fresh
+    );
     assert!(db.turn_outcome("Bob", second.turn).unwrap().is_none());
 
     // The boundary takes the steer, not the queued turn, and answers its waiters.
@@ -1554,18 +1806,25 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "ready");
     assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), second.turn)));
     assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
-    let accepted = db.start(second.turn).unwrap();
+    let accepted = db.start(second.turn, allow_provider).unwrap();
     assert_eq!(accepted["event"], "accepted");
     assert_eq!(db.inspect("Bob").unwrap().running_turn, Some(second.turn));
     assert_eq!(db.next_ready().unwrap(), None);
     let items = stored(&mut db, "Bob");
     assert_eq!(items[3]["content"][0]["text"], "second");
-    assert_eq!(db.start(second.turn).unwrap_err().code, "stale_turn");
+    assert_eq!(
+        db.start(second.turn, allow_provider).unwrap_err().code,
+        "stale_turn"
+    );
 
     // A queued turn can be ended where it stands; a ready one hands its
     // place to the next in line.
-    let fourth = db.begin("Bob", "r4", "fourth", false, &steer).unwrap();
-    let fifth = db.begin("Bob", "r5", "fifth", false, &queue).unwrap();
+    let fourth = db
+        .begin("Bob", "r4", "fourth", false, &steer, allow_provider)
+        .unwrap();
+    let fifth = db
+        .begin("Bob", "r5", "fifth", false, &queue, allow_provider)
+        .unwrap();
     assert_eq!((fourth.status, fifth.status), ("queued", "queued"));
     assert_eq!(steers.load(Ordering::Relaxed), 1);
     db.append(second.turn, vec![assistant("done")], &[], None)
@@ -1601,12 +1860,21 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
         ..TurnOptions::default()
     };
     assert_eq!(
-        db.begin("Alice", "r0", "work", false, &TurnOptions::default())
-            .unwrap_err()
-            .code,
+        db.begin(
+            "Alice",
+            "r0",
+            "work",
+            false,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap_err()
+        .code,
         "active_agent_limit"
     );
-    let waiting = db.begin("Alice", "r1", "work", false, &queue).unwrap();
+    let waiting = db
+        .begin("Alice", "r1", "work", false, &queue, allow_provider)
+        .unwrap();
     assert_eq!(waiting.status, "ready");
     assert_eq!(waiting.entry.as_ref().unwrap()["data"]["status"], "ready");
     assert_eq!(db.counts().unwrap().2, 1);
@@ -1614,15 +1882,24 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
         db.next_ready().unwrap(),
         Some(("Alice".into(), waiting.turn))
     );
-    db.start(waiting.turn).unwrap();
+    db.start(waiting.turn, allow_provider).unwrap();
 
     // A turn queued behind one that ends uncertain cannot start; it fails
     // with that reason and its waiters hear it.
     db.create("Carol", Some("/synthetic"), binding()).unwrap();
     let first = db
-        .begin("Carol", "c1", "work", true, &TurnOptions::default())
+        .begin(
+            "Carol",
+            "c1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
-    let second = db.begin("Carol", "c2", "more", true, &queue).unwrap();
+    let second = db
+        .begin("Carol", "c2", "more", true, &queue, allow_provider)
+        .unwrap();
     let call = ToolCall {
         name: "echo".into(),
         call_id: "call-1".into(),
@@ -1634,13 +1911,13 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
         .unwrap();
     assert_eq!(db.inspect("Carol").unwrap().status, "uncertain");
     assert_eq!(db.turn_status("Carol", second.turn).unwrap(), "ready");
-    let error = db.start(second.turn).unwrap_err();
+    let error = db.start(second.turn, allow_provider).unwrap_err();
     assert_eq!(error.code, "tool_outcome_uncertain");
     let (_, outcome) = db.end_queued(second.turn, &error).unwrap();
     assert_eq!(outcome["status"], "failed");
     assert_eq!(outcome["error"], "tool_outcome_uncertain");
     assert_eq!(
-        db.begin("Carol", "c3", "again", true, &queue)
+        db.begin("Carol", "c3", "again", true, &queue, allow_provider)
             .unwrap_err()
             .code,
         "tool_outcome_uncertain"
@@ -1655,18 +1932,31 @@ fn ready_work_cannot_be_overtaken_when_capacity_opens() {
         delivery: Delivery::Queue,
         ..TurnOptions::default()
     };
-    let first = db.begin("Bob", "a", "first", false, &queue).unwrap();
+    let first = db
+        .begin("Bob", "a", "first", false, &queue, allow_provider)
+        .unwrap();
     assert_eq!(
-        db.begin("Bob", "reject", "no", true, &TurnOptions::default())
-            .unwrap_err()
-            .code,
+        db.begin(
+            "Bob",
+            "reject",
+            "no",
+            true,
+            &TurnOptions::default(),
+            allow_provider
+        )
+        .unwrap_err()
+        .code,
         "bot_busy"
     );
-    let next = db.begin("Bob", "b", "next", true, &queue).unwrap();
+    let next = db
+        .begin("Bob", "b", "next", true, &queue, allow_provider)
+        .unwrap();
     assert_eq!((first.status, next.status), ("ready", "queued"));
-    db.start(first.turn).unwrap();
+    db.start(first.turn, allow_provider).unwrap();
     db.finish(first.turn, None).unwrap();
-    let last = db.begin("Bob", "c", "last", true, &queue).unwrap();
+    let last = db
+        .begin("Bob", "c", "last", true, &queue, allow_provider)
+        .unwrap();
     assert_eq!(last.status, "queued");
     assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), next.turn)));
 }
@@ -1681,15 +1971,21 @@ fn restart_keeps_one_ready_head_per_bot() {
     };
     let (first, next);
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
-        first = db.begin("Bob", "a", "first", false, &queue).unwrap().turn;
-        next = db.begin("Bob", "b", "next", false, &queue).unwrap().turn;
+        first = db
+            .begin("Bob", "a", "first", false, &queue, allow_provider)
+            .unwrap()
+            .turn;
+        next = db
+            .begin("Bob", "b", "next", false, &queue, allow_provider)
+            .unwrap()
+            .turn;
     }
     {
-        let mut db = Database::initialize(Connection::open(&path).unwrap(), "test").unwrap();
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         assert_eq!(db.turn_status("Bob", next).unwrap(), "queued");
-        db.start(first).unwrap();
+        db.start(first, allow_provider).unwrap();
         assert_eq!(db.next_ready().unwrap(), None);
         db.finish(first, None).unwrap();
         assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), next)));
@@ -1705,14 +2001,25 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     converse(&mut db, "Bob", 1);
     let first = db
-        .begin("Bob", "a", "active", true, &TurnOptions::default())
+        .begin(
+            "Bob",
+            "a",
+            "active",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
         .unwrap();
     let queue = TurnOptions {
         delivery: Delivery::Queue,
         ..TurnOptions::default()
     };
-    let next = db.begin("Bob", "b", "next", true, &queue).unwrap();
-    let cancelled = db.begin("Bob", "c", "cancelled", true, &queue).unwrap();
+    let next = db
+        .begin("Bob", "b", "next", true, &queue, allow_provider)
+        .unwrap();
+    let cancelled = db
+        .begin("Bob", "c", "cancelled", true, &queue, allow_provider)
+        .unwrap();
     db.end_queued(cancelled.turn, &Error::new("cancelled"))
         .unwrap();
     // A newer terminal row must not move retention past live tool intents.
@@ -1733,7 +2040,7 @@ fn retention_preserves_unfinished_turns_and_their_completed_prefix() {
         "completed"
     );
     assert_eq!(db.turn_status("Bob", next.turn).unwrap(), "ready");
-    db.start(next.turn).unwrap();
+    db.start(next.turn, allow_provider).unwrap();
     db.finish(next.turn, None).unwrap();
     assert!(db.prune("Bob", 1).unwrap()["events"].as_u64().unwrap() > 0);
 }
@@ -1748,7 +2055,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         ..TurnOptions::default()
     };
     let first = db
-        .begin("Bob", "first", "work", true, &active)
+        .begin("Bob", "first", "work", true, &active, allow_provider)
         .unwrap()
         .turn;
     let matching = TurnOptions {
@@ -1756,7 +2063,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         ..active.clone()
     };
     let matched = db
-        .begin("Bob", "match", "match", true, &matching)
+        .begin("Bob", "match", "match", true, &matching, allow_provider)
         .unwrap()
         .turn;
     let moved = db
@@ -1769,6 +2076,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
                 workspace: Some("/elsewhere".into()),
                 ..matching.clone()
             },
+            allow_provider,
         )
         .unwrap()
         .turn;
@@ -1782,6 +2090,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
                 model: Some("openai/other".into()),
                 ..matching
             },
+            allow_provider,
         )
         .unwrap()
         .turn;
@@ -1795,6 +2104,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
                 delivery: Delivery::Steer,
                 ..TurnOptions::default()
             },
+            allow_provider,
         )
         .unwrap()
         .turn;
@@ -1810,11 +2120,11 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
     assert_eq!(db.queued_steers().load(Ordering::Relaxed), 3);
     db.finish(first, None).unwrap();
-    db.start(moved).unwrap();
+    db.start(moved, allow_provider).unwrap();
     assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
     assert!(db.absorb(moved, None).unwrap().outcomes.is_empty());
     db.finish(moved, None).unwrap();
-    db.start(changed).unwrap();
+    db.start(changed, allow_provider).unwrap();
     assert_eq!(db.context(changed).unwrap().model, "openai/other");
     assert_eq!(db.absorb(changed, None).unwrap().outcomes[0].0, inherited);
     assert_eq!(db.queued_steers().load(Ordering::Relaxed), 0);
@@ -1826,7 +2136,14 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let first = db
-            .begin("Bob", "first", "work", true, &TurnOptions::default())
+            .begin(
+                "Bob",
+                "first",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
             .unwrap()
             .turn;
         let options = TurnOptions {
@@ -1836,9 +2153,16 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         let mut submitted = Vec::new();
         for n in 0..count {
             submitted.push(
-                db.begin("Bob", &n.to_string(), &prompt, true, &options)
-                    .unwrap()
-                    .turn,
+                db.begin(
+                    "Bob",
+                    &n.to_string(),
+                    &prompt,
+                    true,
+                    &options,
+                    allow_provider,
+                )
+                .unwrap()
+                .turn,
             );
         }
         let mut seen = Vec::new();
@@ -1851,7 +2175,7 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
             seen.extend(absorbed.outcomes.into_iter().map(|(id, _)| id));
             if late.is_none() {
                 late = Some(
-                    db.begin("Bob", "late", "late", true, &options)
+                    db.begin("Bob", "late", "late", true, &options, allow_provider)
                         .unwrap()
                         .turn,
                 );

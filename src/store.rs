@@ -43,7 +43,7 @@ impl Store {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
     }
-    pub async fn open(path: &Path, configuration: String) -> Result<Self> {
+    pub async fn open(path: &Path) -> Result<Self> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Job>(32);
         let (ready, opened) = oneshot::channel();
@@ -95,7 +95,7 @@ impl Store {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error.into()),
                     }
-                    let db = Database::initialize(Connection::open(&path)?, &configuration)?;
+                    let db = Database::initialize(Connection::open(&path)?)?;
                     Ok((db, lock, path))
                 })();
                 match opened {

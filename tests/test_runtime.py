@@ -420,6 +420,41 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
         self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
 
+    def test_stores_open_under_any_provider_set_and_turns_check_the_family(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        first = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(first)['data']['status'], 'completed')
+        before = client.request('resume', bot='Bob')['result']
+        client.close()
+        # A daemon without Bob's provider opens the store; Bob's turns fail by name.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, provider='other')
+        self.addCleanup(client.close)
+        client.request('create', bot='Alice', workspace=str(self.path), model='other/synthetic-model')
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(alice)['data']['status'], 'completed')
+        for delivery in ('reject', 'queue', 'steer'):
+            missing = client.request('submit', bot='Bob', request_id='2', prompt='again', delivery=delivery)
+            self.assertEqual(missing['error'], 'provider_unavailable')
+        self.assertEqual(client.request('resume', bot='Bob')['result'], before)
+        duplicate = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['turn'], first)
+        client.close()
+        # The same name with another encoding is refused; the transcript is untouched.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, family='anthropic')
+        self.addCleanup(client.close)
+        for model in (None, 'openai/synthetic-model'):
+            wrong = client.request('submit', bot='Bob', request_id='3', prompt='again', model=model)
+            self.assertEqual(wrong['error'], 'provider_family_mismatch')
+        self.assertEqual(client.request('resume', bot='Bob')['result'], before)
+        client.close()
+        # Back with the provider, the conversation continues where it was.
+        client = self.client()
+        later = client.request('submit', bot='Bob', request_id='2', prompt='back')['result']['turn']
+        self.assertEqual(client.finished(later)['data']['status'], 'completed')
+        self.assertEqual(client.request('result', bot='Bob', turn=later)['result']['text'], 'reply:back')
+
     def test_fork_from_a_mid_turn_message_and_from_the_head(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))

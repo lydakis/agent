@@ -146,6 +146,40 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_busy', overridden.stderr + overridden.stdout)
         self.agent('wait', '--store', str(self.store), queued['handle'])
 
+    def test_attach_refuses_a_running_daemon_with_a_different_configuration(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        def attempt(*flags):
+            return self.agent('run', '--store', str(self.store), *flags, '--bot', 'Bob', '--detach', 'hi', check=False)
+        # Nothing stated, or the same thing stated differently, attaches.
+        self.assertEqual(attempt().returncode, 0)
+        self.assertEqual(attempt('--tools', 'shell,echo').returncode, 0)
+        self.assertEqual(attempt('--provider', f'openai=responses,{self.url}').returncode, 0)
+        # A stated value the daemon does not serve fails before any submission.
+        for flags, named in ((('--tools', 'echo'), '--tools'),
+                             (('--provider', 'openai=responses,http://127.0.0.1:1/v1'), '--provider openai'),
+                             (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
+                             (('--max-processes', '3'), '--max-processes'),
+                             (('--retain-turns', '2'), '--retain-turns')):
+            refused = attempt(*flags)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn('daemon_configuration_mismatch', refused.stderr)
+            self.assertIn(named, refused.stderr)
+        # Outside run, --model is a daemon default and is checked; in run it is the turn's.
+        stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
+        self.assertIn('--model', stats.stderr)
+        self.assertEqual(attempt('--model', 'openai/synthetic-model').returncode, 0)
+        self.assertEqual(json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)[0]['status'],
+                         'completed')
+
+    def test_normalized_daemon_limits_match_on_startup_and_attach(self):
+        flags = ['--idle-exit', '0', '--context-bytes', '512', '--context-items', '1']
+        self.agent('run', *self.common, *flags, '--new', '--bot', 'Bob', 'hi')
+        self.agent('run', *self.common, *flags, '--bot', 'Bob', 'again')
+        self.agent('run', *self.common, '--context-bytes', '1024', '--context-items', '2',
+                   '--bot', 'Bob', 'effective')
+        refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
+        self.assertIn('daemon_configuration_mismatch', refused.stderr)
+
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
                 ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'stats', 'shutdown', 'serve')]:

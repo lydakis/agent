@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Binding, Delivery, Store, TurnOptions},
+    store::{Binding, Bot, Delivery, Store, TurnOptions},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter};
@@ -253,6 +253,9 @@ pub struct Limits {
     pub context_bytes: usize,
     pub context_items: usize,
 }
+pub const MIN_CONTEXT_BYTES: usize = 1024;
+pub const MIN_CONTEXT_ITEMS: usize = 2;
+
 impl Limits {
     pub fn resolve(config: &Configuration) -> Limits {
         let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -266,8 +269,11 @@ impl Limits {
             } else {
                 active.div_ceil(STREAMS_PER_CONNECTION).clamp(1, 256)
             },
-            context_bytes: config.context_bytes.unwrap_or(8 * 1024 * 1024).max(1024),
-            context_items: config.context_items.unwrap_or(4096).max(2),
+            context_bytes: config
+                .context_bytes
+                .unwrap_or(8 * 1024 * 1024)
+                .max(MIN_CONTEXT_BYTES),
+            context_items: config.context_items.unwrap_or(4096).max(MIN_CONTEXT_ITEMS),
         }
     }
 }
@@ -326,7 +332,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let schemas = registry.schemas();
     let mut providers = HashMap::new();
     let mut credentials = Vec::new();
-    let mut binding = serde_json::Map::new();
+    let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
         let key = spec
             .key_env
@@ -348,7 +354,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
-        binding.insert(
+        bindings.insert(
             spec.name.clone(),
             json!({"family":spec.family.name(),"url":spec.url}),
         );
@@ -362,8 +368,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             return fail_with("provider_unavailable", provider);
         }
     }
-    let binding = json!({"providers":binding,"tools":registry.names()}).to_string();
-    let store = Store::open(&config.store, binding).await?;
+    let store = Store::open(&config.store).await?;
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
@@ -388,8 +393,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_process_budget(limits.processes);
     let hub = Hub::default();
-    let mut provider_names: Vec<&String> = providers.keys().collect();
-    provider_names.sort();
     let ready = json!({"event":"ready","protocol":3,
         "capabilities":["create","resume","fork_any_node","context_window","submit","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
@@ -398,7 +401,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "retain_turns":config.retain_turns},
         "schema":agent_runtime::store::Database::SCHEMA,
-        "tools":registry.names(),"providers":provider_names,"default_model":config.model,
+        "tools":registry.names(),"providers":bindings,"default_model":config.model,
         "durability":"sqlite_full","partial_text_durable":false});
     let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
     let mut sessions: HashMap<u64, Output> = HashMap::new();
@@ -598,6 +601,31 @@ pub async fn run(config: Configuration) -> Result<()> {
     Ok(())
 }
 
+// Runs on the storage worker using the bot already read for admission. No
+// extra query or channel round trip; defaults do not allocate a model string.
+fn validate_provider(
+    providers: &HashMap<String, Provider>,
+    bot: &Bot,
+    model: Option<&str>,
+) -> Result<()> {
+    let name = match model {
+        Some(model) => split_model(model)?.0,
+        None => &bot.provider,
+    };
+    let provider = providers
+        .get(name)
+        .ok_or_else(|| Error::with("provider_unavailable", name))?;
+    if provider.family() != bot.family()? {
+        return fail_with(
+            "provider_family_mismatch",
+            model
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
+        );
+    }
+    Ok(())
+}
+
 impl Service {
     fn has_capacity(&self) -> bool {
         self.limit_active == 0 || self.active.len() < self.limit_active
@@ -624,7 +652,12 @@ impl Service {
             self.ready_hint = false;
             return Ok(());
         };
-        match self.store.call(move |db| db.start(turn)).await {
+        let providers = self.providers.clone();
+        match self
+            .store
+            .call(move |db| db.start(turn, |bot, model| validate_provider(&providers, bot, model)))
+            .await
+        {
             Ok(entry) => {
                 self.hub.durable(&bot, entry).await?;
                 self.spawn(bot, turn, false);
@@ -973,29 +1006,18 @@ impl Service {
                 // the same family; the conversation encoding never changes.
                 let options = TurnOptions {
                     workspace: path.as_deref().map(workspace).transpose()?,
-                    model: match model {
-                        Some(reference) => {
-                            let (provider, _) = split_model(&reference)?;
-                            let family = self
-                                .providers
-                                .get(provider)
-                                .ok_or(Error::with("provider_unavailable", provider))?
-                                .family();
-                            let check = bot.clone();
-                            let current = store.call(move |db| db.inspect(&check)).await?;
-                            if current.family()? != family {
-                                return fail_with("provider_family_mismatch", reference);
-                            }
-                            Some(reference)
-                        }
-                        None => None,
-                    },
+                    model,
                     delivery,
                 };
                 let capacity = self.has_capacity();
                 let (b, r) = (bot.clone(), request_id.clone());
+                let providers = self.providers.clone();
                 let started = store
-                    .call(move |db| db.begin(&b, &r, &prompt, capacity, &options))
+                    .call(move |db| {
+                        db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
+                            validate_provider(&providers, bot, model)
+                        })
+                    })
                     .await?;
                 let mut cursor = None;
                 if let Some(entry) = started.entry {
@@ -1129,9 +1151,7 @@ mod tests {
             "agent-parked-interrupt-test-{}",
             std::process::id()
         ));
-        let store = Store::open(&dir.join("state.sqlite"), "test".into())
-            .await
-            .unwrap();
+        let store = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let turn = store
             .call(|db| {
                 db.create(
@@ -1147,7 +1167,14 @@ mod tests {
                     },
                 )?;
                 let turn = db
-                    .begin("Bob", "first", "work", true, &TurnOptions::default())?
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
                     .turn;
                 let call = agent_runtime::provider::ToolCall {
                     name: "wait".into(),
@@ -1246,7 +1273,14 @@ mod tests {
                     .unwrap();
                 assert_eq!(completed["data"]["cancelled"], true);
                 let next = db
-                    .begin("Bob", "second", "continue", true, &TurnOptions::default())?
+                    .begin(
+                        "Bob",
+                        "second",
+                        "continue",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
                     .turn;
                 db.begin(
                     "Bob",
@@ -1257,6 +1291,7 @@ mod tests {
                         delivery: Delivery::Queue,
                         ..TurnOptions::default()
                     },
+                    |_, _| Ok(()),
                 )?;
                 Ok(next)
             })
@@ -1279,9 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn saturated_dispatch_reconciles_duplicates_but_rejects_new_work() {
         let dir = std::env::temp_dir().join(format!("agent-admission-test-{}", std::process::id()));
-        let store = Store::open(&dir.join("state.sqlite"), "test".into())
-            .await
-            .unwrap();
+        let store = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let binding = || Binding {
             provider: "openai",
             family: Family::Responses,
@@ -1295,7 +1328,14 @@ mod tests {
                 db.create("Bob", Some("/synthetic"), binding())?;
                 db.create("Other", Some("/synthetic"), binding())?;
                 Ok(db
-                    .begin("Bob", "same", "work", true, &TurnOptions::default())?
+                    .begin(
+                        "Bob",
+                        "same",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
                     .turn)
             })
             .await

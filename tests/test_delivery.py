@@ -5,6 +5,7 @@ import time
 import unittest
 
 from tests.test_runtime import ModelFixture
+from bench.runtime_client import Client
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -60,6 +61,49 @@ class DeliveryTests(ModelFixture):
         handle = json.loads(text.removeprefix('echo:'))['handle']
         output = client.request('wait', handles=[handle])['result']['results'][handle]['stdout']
         self.assertEqual(output.strip(), str(requested))
+
+    def test_inherited_steers_validate_the_active_model_and_recheck_before_start(self):
+        import threading
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = threading.Event()
+        self.model.all_streaming.set()
+        self.addCleanup(self.model.release_headers.set)
+        elsewhere = self.path / 'elsewhere'
+        elsewhere.mkdir()
+        client = self.client(extra=('--provider', f'changed=responses,{self.url}'))
+        for bot in ('Bob', 'Changed', 'Cancelled', 'Idle'):
+            client.request('create', bot=bot, workspace=str(self.path),
+                           model=('changed' if bot == 'Changed' else 'openai') + '/synthetic-model')
+        client.close()
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, provider='other',
+                        extra=('--provider', f'changed=anthropic,{self.url}'))
+        self.addCleanup(client.close)
+        active = {}
+        for bot in ('Bob', 'Changed', 'Cancelled'):
+            active[bot] = client.request('submit', bot=bot, request_id='active', prompt='gate',
+                                         model='other/synthetic-model')['result']['turn']
+            self.model.requests.get(timeout=3)
+        # Inheritance applies only to steers eligible for the running turn.
+        for bot, overrides in [('Idle', {}), ('Bob', {'workspace': str(elsewhere)}),
+                               ('Bob', {'model': 'openai/synthetic-model'})]:
+            refused = client.request('submit', bot=bot, request_id='refused', prompt='no',
+                                     delivery='steer', **overrides)
+            self.assertEqual(refused['error'], 'provider_unavailable')
+        steers = {}
+        for bot in active:
+            steers[bot] = client.request('submit', bot=bot, request_id='steer', prompt='continue',
+                                         delivery='steer', workspace=str(self.path) if bot == 'Bob' else None)['result']['turn']
+        # Cancellation makes this steer start alone, where the default is invalid.
+        head = client.request('resume', bot='Cancelled')['result']['head']
+        client.request('interrupt', bot='Cancelled', turn=active['Cancelled'])
+        self.assertEqual(client.finished(active['Cancelled'])['data']['status'], 'interrupted')
+        self.assertEqual(client.finished(steers['Cancelled'])['data']['error'], 'provider_unavailable')
+        self.assertEqual(client.request('resume', bot='Cancelled')['result']['head'], head)
+        self.model.release_headers.set()
+        for bot in ('Bob', 'Changed'):
+            self.assertEqual(client.finished(steers[bot])['data']['status'], 'steered')
+            self.assertEqual(client.finished(active[bot])['data']['status'], 'completed')
+            self.assertEqual(client.request('result', bot=bot, turn=active[bot])['result']['text'], 'reply:continue')
 
     def test_multiple_steer_batches_are_delivered_in_order(self):
         import threading
@@ -218,6 +262,29 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(after['turn'])['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
         self.assertEqual(client.request('delete', bot='Bob')['result']['turns'], 3)
+
+    def test_restart_rejects_queued_provider_changes_before_history_mutation(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        client.request('submit', bot='Bob', request_id='1', prompt='wait')
+        default = client.request('submit', bot='Bob', request_id='2', prompt='default',
+                                 delivery='queue')['result']['turn']
+        override = client.request('submit', bot='Bob', request_id='3', prompt='override',
+                                  delivery='queue', model='openai/synthetic-model')['result']['turn']
+        head = client.request('resume', bot='Bob')['result']['head']
+        client.close(kill=True)
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, family='anthropic')
+        self.addCleanup(client.close)
+        for turn in (default, override):
+            self.assertEqual(client.finished(turn)['data']['error'], 'provider_family_mismatch')
+        self.assertEqual(client.request('resume', bot='Bob')['result']['head'], head)
+        events = self.events(client, 'Bob')
+        self.assertFalse(any(e['event'] == 'accepted' and e['turn'] in (default, override) for e in events))
+        # An accepted request remains reconcilable even if its provider changed.
+        duplicate = client.request('submit', bot='Bob', request_id='3', prompt='override',
+                                   delivery='queue', model='openai/synthetic-model')['result']
+        self.assertTrue(duplicate['duplicate'])
+        self.assertEqual(duplicate['turn'], override)
 
     def test_queued_turns_survive_a_restart(self):
         client = self.client()

@@ -152,9 +152,9 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 15;
+    pub const SCHEMA: i32 = 16;
 
-    pub fn initialize(conn: Connection, configuration: &str) -> Result<Self> {
+    pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048;",
@@ -184,7 +184,6 @@ impl Database {
             _ => {}
         }
         tx.execute_batch("
-            CREATE TABLE IF NOT EXISTS configuration(value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER);
@@ -243,16 +242,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
-        }
-        let saved: Option<String> = tx
-            .query_row("SELECT value FROM configuration", [], |r| r.get(0))
-            .optional()?;
-        match saved {
-            None => {
-                tx.execute("INSERT INTO configuration VALUES (?)", [configuration])?;
-            }
-            Some(saved) if saved != configuration => return fail("store_configuration_mismatch"),
-            _ => {}
         }
         tx.commit()?;
         // Background commands died with the previous daemon; their handles
@@ -725,6 +714,8 @@ impl Database {
         )
     }
 
+    /// Reconcile duplicates first, then validate the effective provider using
+    /// the bot already loaded for admission, before any durable mutation.
     pub fn begin(
         &mut self,
         name: &str,
@@ -732,6 +723,7 @@ impl Database {
         prompt: &str,
         capacity: bool,
         options: &TurnOptions,
+        validate: impl Fn(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<Started> {
         let prior: Option<(i64, String, String, TurnOptions)> = self
             .conn
@@ -770,6 +762,33 @@ impl Database {
             return fail("active_agent_limit");
         }
         let bot = self.inspect(name)?;
+        if let Err(error) = validate(&bot, options.model.as_deref()) {
+            // An omitted steer model inherits the active turn for absorption.
+            // Only look it up when the default fails validation: ordinary
+            // submissions and steers with valid defaults pay no extra query.
+            let inherited: Option<String> = if options.delivery == Delivery::Steer
+                && options.model.is_none()
+                && let Some(turn) = bot.running_turn
+            {
+                self.conn
+                    .prepare_cached(
+                        "SELECT model FROM turns WHERE id=?1 AND model IS NOT NULL
+                     AND (?2 IS NULL OR ?2=COALESCE(workspace,?3))",
+                    )?
+                    .query_row(params![turn, options.workspace, bot.workspace], |r| {
+                        r.get(0)
+                    })
+                    .optional()?
+            } else {
+                None
+            };
+            match inherited {
+                Some(model) => validate(&bot, Some(&model))?,
+                None => return Err(error),
+            }
+            // Keep the submitted model unset. If it misses absorption, start()
+            // must validate its own default rather than pinning this override.
+        }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
             return fail("bot_busy");
@@ -839,7 +858,11 @@ impl Database {
     }
     /// Start a queued or ready turn on an idle bot: its user item joins the
     /// lineage and the bot becomes busy. Returns the durable `accepted` entry.
-    pub fn start(&mut self, turn: i64) -> Result<Value> {
+    pub fn start(
+        &mut self,
+        turn: i64,
+        validate: impl FnOnce(&Bot, Option<&str>) -> Result<()>,
+    ) -> Result<Value> {
         let (name, request_id, prompt, status, workspace, model, delivery): (
             String,
             String,
@@ -887,6 +910,7 @@ impl Database {
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
         }
+        validate(&bot, model.as_deref())?;
         let workspace = workspace
             .or(bot.workspace.clone())
             .ok_or(Error::new("workspace_required"))?;
@@ -2186,6 +2210,11 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 ))?;
             }
         }
+    }
+    if from < 16 {
+        // 15 -> 16: the store no longer binds a provider set or toolset.
+        // A bot's provider is checked by family when a turn starts.
+        conn.execute_batch("DROP TABLE IF EXISTS configuration;")?;
     }
     if from < 15 {
         // 14 -> 15: delivery mode per turn. Added only when missing.

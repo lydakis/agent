@@ -275,6 +275,14 @@ impl Turn {
             .providers
             .get(provider)
             .ok_or(Error::with("provider_unavailable", provider))?;
+        // The daemon runs whatever provider set started it; the one thing a
+        // conversation needs is that its provider speaks the bot's encoding.
+        if provider.family() != record.family()? {
+            return Err(Error::with(
+                "provider_family_mismatch",
+                context.model.as_str(),
+            ));
+        }
         let workspace = PathBuf::from(&context.workspace);
         if self.resume {
             let (waiting, entry) = match self.store.call(move |db| db.resume(turn)).await {
@@ -837,40 +845,49 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let dir =
             std::env::temp_dir().join(format!("agent-steer-interrupt-{}", std::process::id()));
-        let store = Store::open(&dir.join("state.sqlite"), "test".into())
-            .await
-            .unwrap();
-        let (turn, steers) = store
-            .call(|db| {
-                db.create(
-                    "Bob",
-                    Some("/synthetic"),
-                    Binding {
-                        provider: "openai",
-                        family: Family::Responses,
-                        model: "synthetic",
-                        instructions: "",
-                        reasoning: None,
-                        budget_tokens: None,
-                    },
-                )?;
-                let turn = db
-                    .begin("Bob", "first", "work", true, &TurnOptions::default())?
-                    .turn;
-                let options = TurnOptions {
-                    delivery: Delivery::Steer,
-                    ..TurnOptions::default()
-                };
-                let steers = (0..64)
-                    .map(|n| {
-                        db.begin("Bob", &n.to_string(), "steer", true, &options)
-                            .map(|s| s.turn)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((turn, steers))
-            })
-            .await
-            .unwrap();
+        let store = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let (turn, steers) =
+            store
+                .call(|db| {
+                    db.create(
+                        "Bob",
+                        Some("/synthetic"),
+                        Binding {
+                            provider: "openai",
+                            family: Family::Responses,
+                            model: "synthetic",
+                            instructions: "",
+                            reasoning: None,
+                            budget_tokens: None,
+                        },
+                    )?;
+                    let turn = db
+                        .begin(
+                            "Bob",
+                            "first",
+                            "work",
+                            true,
+                            &TurnOptions::default(),
+                            |_, _| Ok(()),
+                        )?
+                        .turn;
+                    let options = TurnOptions {
+                        delivery: Delivery::Steer,
+                        ..TurnOptions::default()
+                    };
+                    let steers =
+                        (0..64)
+                            .map(|n| {
+                                db.begin("Bob", &n.to_string(), "steer", true, &options, |_, _| {
+                                    Ok(())
+                                })
+                                .map(|s| s.turn)
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                    Ok((turn, steers))
+                })
+                .await
+                .unwrap();
         // Hold the firehose full so interruption is guaranteed to land after
         // the first batch commits and before its completion notifications.
         let (writer, mut reader) = tokio::io::duplex(1);
