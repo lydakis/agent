@@ -448,6 +448,30 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
         self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
 
+    def test_a_bot_is_created_with_what_its_client_states_and_keeps_it(self):
+        client = self.client()
+        raw = lambda **params: client.request('create', bot='Bob', workspace=str(self.path), **params)
+        client.next_id += 1
+        client.process.stdin.write(json.dumps({'id': client.next_id, 'op': 'create', 'bot': 'Bob',
+                                               'workspace': str(self.path), 'instructions': 'x'}) + '\n')
+        client.process.stdin.flush()
+        self.assertEqual(client.receive(lambda m: m.get('id') == client.next_id)['error'], 'model_required')
+        client.next_id += 1
+        client.process.stdin.write(json.dumps({'id': client.next_id, 'op': 'create', 'bot': 'Bob',
+                                               'workspace': str(self.path), 'model': 'openai/synthetic-model'}) + '\n')
+        client.process.stdin.flush()
+        self.assertEqual(client.receive(lambda m: m.get('id') == client.next_id)['error'], 'instructions_required')
+        created = raw(model='openai/synthetic-model', instructions='Be brief.')['result']
+        self.assertEqual((created['model'], created['instructions']), ('synthetic-model', 'Be brief.'))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
+        client.finished(turn)
+        self.assertEqual(self.model.requests.get(timeout=3)['instructions'], 'Be brief.')
+        # Another client with other ideas changes nothing about Bob.
+        client.close()
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, model='other-model')
+        self.addCleanup(client.close)
+        self.assertEqual(client.request('resume', bot='Bob')['result']['instructions'], 'Be brief.')
+
     def test_stores_open_under_any_provider_set_and_turns_check_the_family(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))

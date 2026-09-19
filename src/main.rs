@@ -78,9 +78,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut store = None;
     let mut socket = None;
     let mut providers = Vec::new();
-    let mut model = None;
     let mut tools = None;
-    let mut instructions = None;
     let mut max_processes = None;
     let mut max_active = None;
     let mut max_connecting = None;
@@ -98,15 +96,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--store" => store = Some(value.into()),
             "--socket" => socket = Some(value.into()),
             "--provider" => providers.push(server::ProviderSpec::parse(value)?),
-            "--model" => model = Some(value.clone()),
             "--tools" => tools = Some(value.clone()),
-            "--instructions" => instructions = Some(value.clone()),
-            "--instructions-file" => {
-                instructions = Some(
-                    std::fs::read_to_string(value)
-                        .map_err(|_| Error::with("usage", format!("cannot read {value}")))?,
-                )
-            }
             "--max-processes" | "--max-active" | "--max-connecting" => {
                 let parsed: usize = value
                     .parse()
@@ -154,8 +144,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         store: store.ok_or(Error::with("usage", "serve needs --store"))?,
         socket,
         providers,
-        model,
-        instructions,
         tools: tools.unwrap_or_else(|| "echo".into()),
         max_processes,
         max_active,

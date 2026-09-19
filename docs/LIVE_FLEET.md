@@ -16,6 +16,9 @@ and threads are sampled every 200 ms by the driver, which runs outside the
 daemon. Reproduce with `bench.live_fleet`; captures are under ignored
 `.local/fleet-*/` and `.local/bench/fleet-*/`.
 
+The driver passes its selected `--model` to every new bot, including the
+warmup. An ambient `AGENT_MODEL` does not select the measured fleet's model.
+
 | Run | Model | Bots | Connecting bound | Overlapping turns | Total s | p50 ms | p95 ms | Input tokens | Daemon RSS peak | Threads |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | sonnet-c8 | claude-sonnet-5 | 32 | 8 | 32 | 5.55 | 4,513 | 5,413 | 108,480 | 15.6 MiB | 11 |

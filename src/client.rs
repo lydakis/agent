@@ -14,6 +14,18 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
+/// What a new bot is told when the caller gives no instructions. The
+/// daemon has no such text; the bot keeps whatever it was created with.
+const DEFAULT_INSTRUCTIONS: &str = "You are a software engineering agent working in the current workspace. \
+Complete the requested task using the available tools, verify your work, and finish with a short summary. \
+To delegate a subtask to another agent with its own conversation, run \
+\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
+Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
+Collect results with the wait tool on that handle; it returns the peer's status and final text. \
+Long commands can run with shell background=true and be collected the same way. \
+Blocking run/follow inside a shell tool is rejected. \
+Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an earlier checkpoint.";
+
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn startup_remaining(deadline: Instant) -> Result<Duration> {
@@ -33,7 +45,6 @@ struct Options {
     /// daemon at attach. Defaults and environment-implied values never conflict.
     providers_explicit: bool,
     tools_explicit: bool,
-    model_explicit: bool,
     tools: String,
     model: Option<String>,
     instructions: Option<String>,
@@ -71,9 +82,8 @@ fn parse(args: &[String]) -> Result<Options> {
         providers: Vec::new(),
         providers_explicit: false,
         tools_explicit: false,
-        model_explicit: false,
         tools: DEFAULT_TOOLS.into(),
-        model: std::env::var("AGENT_MODEL").ok(),
+        model: None,
         instructions: None,
         reasoning: None,
         workspace: None,
@@ -124,10 +134,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.tools = value;
                         options.tools_explicit = true;
                     }
-                    "--model" => {
-                        options.model = Some(value);
-                        options.model_explicit = true;
-                    }
+                    "--model" => options.model = Some(value),
                     "--delivery" => options.delivery = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
@@ -436,16 +443,6 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             ));
         }
     }
-    if options.model_explicit
-        && options.command != "run"
-        && let Some(model) = &options.model
-        && ready["default_model"] != model.as_str()
-    {
-        differences.push(format!(
-            "--model: requested {model} but daemon defaults to {}",
-            ready["default_model"].as_str().unwrap_or("none")
-        ));
-    }
     if differences.is_empty() {
         Ok(())
     } else {
@@ -499,9 +496,6 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
     for (flag, value) in &options.daemon_flags {
         command.arg(flag).arg(value);
-    }
-    if let Some(model) = &options.model {
-        command.arg("--model").arg(model);
     }
     {
         use std::os::unix::process::CommandExt;
@@ -621,15 +615,30 @@ fn run(options: &Options) -> Result<i32> {
     let created = options.new || options.bot.is_none();
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
     if created {
+        // The client chooses; the bot retains. Nothing about a bot comes
+        // from the daemon or from whichever client connects later.
+        let model = options
+            .model
+            .clone()
+            .or_else(|| std::env::var("AGENT_MODEL").ok())
+            .ok_or(Error::with(
+                "usage",
+                "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
+            ))?;
+        let instructions = options
+            .instructions
+            .clone()
+            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned());
         connection.request(
             "create",
-            json!({"bot":bot,"workspace":workspace,"model":options.model,
-                "instructions":options.instructions,"reasoning":options.reasoning,
+            json!({"bot":bot,"workspace":workspace,"model":model,
+                "instructions":instructions,"reasoning":options.reasoning,
                 "budget_tokens":options.budget_tokens}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
-    // Each turn runs where the command was invoked, on the requested model.
+    // Existing bots keep their model unless --model explicitly overrides it.
+    // AGENT_MODEL is only a creation default, including inside a peer's shell.
     let submitted = connection.request(
         "submit",
         json!({"bot":bot,"request_id":request_id,"prompt":prompt,"workspace":workspace,

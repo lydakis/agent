@@ -55,8 +55,12 @@ the CLI uses a stable hash of that path in a private `/tmp/agent-<uid>` director
 This also works before a new store exists. `--socket` explicitly selects an
 endpoint; otherwise `AGENT_SOCKET` applies only when `--store` was not supplied.
 Explicit socket paths are used as given and must fit the OS address limit.
-The daemon runs the providers, tools, default model, and limits of the client
-that started it, and announces them in `ready`. The store binds none of that:
+The daemon runs the providers, tools, and limits of the client that started
+it, and announces them in `ready`. It supplies no agent behavior: `create`
+names the bot's model and instructions, the bot keeps both, and a later
+client's environment changes nothing about an existing bot. The CLI resolves
+`--model` or `AGENT_MODEL` and `--instructions` or its built-in text before
+it asks. The store binds none of that:
 it opens under any provider set, so providers can be added, removed, and
 brought back between runs. New submissions validate the effective provider,
 including the bot's default, before accepting work or changing history.
@@ -67,8 +71,8 @@ encoding differs. Previously accepted requests still reconcile by request ID.
 Queued turns recheck before starting after a restart; an invalid provider ends
 the queued turn with that error without appending its prompt. Parked turns have
 already changed history; a provider failure ends them through normal turn cleanup. Whether a running daemon is acceptable is the client's call: every
-daemon-scoped value a client states (`--provider`, `--tools`, the limits, and
-`--model` outside `run`, where it is the turn's model) is compared with `ready`
+daemon-scoped value a client states (`--provider`, `--tools`, and the limits;
+`--model` belongs to `run` alone) is compared with `ready`
 at attach, and a difference fails with `daemon_configuration_mismatch` naming
 each one, before anything is submitted. Defaults and providers implied by
 environment keys never conflict; a stated provider must be registered with the
@@ -128,8 +132,11 @@ submitting client. `--delivery queue` or `steer` hands a busy bot the work
 instead of getting `bot_busy` ([delivery modes](#delivery-modes)). A controller can inspect metadata through `ls` or observe events through
 `follow` from outside a shell tool. Full records remain available via the protocol.
 
-Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`, and
-`AGENT_SOCKET` when a socket is configured. Default instructions use
+Shell tool processes receive `AGENT_BIN`, an absolute `AGENT_STORE`,
+`AGENT_SOCKET` when a socket is configured, and `AGENT_MODEL`, the running
+turn's effective model, so newly created peers default to its model.
+Continuing an existing peer keeps that peer's stored model unless `--model`
+explicitly overrides it for the turn. The client's built-in instructions use
 `"$AGENT_BIN" run --detach --new --bot NAME -- TASK` to submit peer work and the
 `wait` tool to collect it. `AGENT_SHELL_CONTEXT=1` tells the CLI to reject
 blocking `run` and `follow` inside a shell tool: a blocked client would hold a
@@ -421,7 +428,7 @@ remain available through replay if the drain deadline is reached.
 ```sh
 .local/target/release/agent serve \
   --store .local/runtime/state.sqlite --socket .local/runtime/state.sqlite.sock \
-  --provider anthropic --provider openai --model anthropic/claude-sonnet-4-5 \
+  --provider anthropic --provider openai \
   --tools shell,read,write,edit,wait,history
 ```
 

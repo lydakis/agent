@@ -54,7 +54,8 @@ class DaemonDriver:
         kind = message.get('event')
         if kind == 'ready':
             for agent in range(self.config['concurrency']):
-                self.request('create', agent, bot=f'b{agent}', workspace=self.workspace)
+                self.request('create', agent, bot=f'b{agent}', workspace=self.workspace,
+                             model='openai/bench-model', instructions='Benchmark agent.')
             return []
         bot = message.get('bot')
         if not isinstance(bot, str) or not bot.startswith('b') or not bot[1:].isdigit():

@@ -50,6 +50,10 @@ class Connection:
             raise
 
     def request(self, op, **params):
+        if op == 'create':
+            # This client's choice for a new bot; the daemon supplies none.
+            params.setdefault('model', 'openai/synthetic-model')
+            params.setdefault('instructions', 'Test agent.')
         self.next_id += 1
         self.socket.sendall((json.dumps(dict(id=self.next_id, op=op, **params)) + '\n').encode())
         return self.receive(lambda e: e.get('id') == self.next_id)

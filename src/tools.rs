@@ -498,7 +498,14 @@ impl Registry {
         })
     }
 
-    pub async fn execute(&self, tool: Prepared, workspace: &Path) -> Result<Outcome> {
+    /// `environment` is what the running turn adds for its children, such
+    /// as its own model for peers it delegates to.
+    pub async fn execute(
+        &self,
+        tool: Prepared,
+        workspace: &Path,
+        environment: &[(String, String)],
+    ) -> Result<Outcome> {
         match tool {
             Prepared::Echo(text) => Ok(Outcome::text(self.redact(text))),
             Prepared::Shell {
@@ -516,8 +523,14 @@ impl Registry {
                     .acquire()
                     .await
                     .map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let (stdout, stderr, status) =
-                    shell(&command, workspace, Duration::from_millis(timeout_ms), self).await?;
+                let (stdout, stderr, status) = shell(
+                    &command,
+                    workspace,
+                    Duration::from_millis(timeout_ms),
+                    self,
+                    environment,
+                )
+                .await?;
                 Ok(self.shell_outcome(stdout, stderr, status))
             }
             Prepared::Read {
@@ -630,6 +643,7 @@ impl Registry {
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
+        environment: Vec<(String, String)>,
         queued: Queued,
         done: tokio::sync::oneshot::Sender<Result<Outcome>>,
     ) {
@@ -648,6 +662,7 @@ impl Registry {
                     &workspace,
                     Duration::from_millis(timeout_ms),
                     &registry,
+                    &environment,
                 )
                 .await?;
                 Ok(registry.shell_outcome(stdout, stderr, status))
@@ -750,6 +765,7 @@ async fn shell(
     workspace: &Path,
     timeout: Duration,
     registry: &Registry,
+    environment: &[(String, String)],
 ) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
     use std::process::Stdio;
     use tokio::process::{Child, Command};
@@ -772,7 +788,7 @@ async fn shell(
     for credential in registry.credentials.iter() {
         process.env_remove(&credential.name);
     }
-    for (name, value) in registry.environment.iter() {
+    for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
     }
     let child = process
@@ -820,6 +836,7 @@ async fn shell(
     _: &Path,
     _: Duration,
     _: &Registry,
+    _: &[(String, String)],
 ) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
     fail("shell_platform_unsupported")
 }

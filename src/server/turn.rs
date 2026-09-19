@@ -269,6 +269,9 @@ impl Turn {
             ));
         }
         let workspace = PathBuf::from(&context.workspace);
+        // What this turn's children inherit: the CLI a bot runs to delegate
+        // needs a model for the peer, and the natural default is its own.
+        let environment = vec![("AGENT_MODEL".to_owned(), context.model.clone())];
         if self.resume {
             let (waiting, _, steers) = match self.store.call(move |db| db.resume(turn)).await {
                 Ok(resumed) => resumed,
@@ -285,7 +288,10 @@ impl Turn {
                 .call(move |db| db.tool_finish(turn, &id, &outcome))
                 .await?;
             // Calls that followed the wait in the same model response.
-            if self.execute_calls(waiting.pending, &workspace).await? {
+            if self
+                .execute_calls(waiting.pending, &workspace, &environment)
+                .await?
+            {
                 return Ok(Round::Parked);
             }
         }
@@ -333,7 +339,10 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            if self.execute_calls(response.calls, &workspace).await? {
+            if self
+                .execute_calls(response.calls, &workspace, &environment)
+                .await?
+            {
                 return Ok(Round::Parked);
             }
             self.absorb().await?;
@@ -481,6 +490,7 @@ impl Turn {
         &self,
         calls: Vec<ToolCall>,
         workspace: &std::path::Path,
+        environment: &[(String, String)],
     ) -> Result<bool> {
         let turn = self.turn;
         let mut calls = calls.into_iter();
@@ -513,7 +523,13 @@ impl Turn {
                     // A full line behind the process bound is a tool result
                     // the model acts on, not a runtime failure.
                     match self
-                        .background(&call.call_id, command, workspace.to_path_buf(), timeout_ms)
+                        .background(
+                            &call.call_id,
+                            command,
+                            workspace.to_path_buf(),
+                            timeout_ms,
+                            environment.to_vec(),
+                        )
                         .await
                     {
                         Ok(outcome) => outcome,
@@ -551,7 +567,11 @@ impl Turn {
                     Ok(outcome) => outcome,
                     Err(error) => failure(error),
                 },
-                Ok(prepared) => match self.registry.execute(prepared, workspace).await {
+                Ok(prepared) => match self
+                    .registry
+                    .execute(prepared, workspace, environment)
+                    .await
+                {
                     Ok(outcome) => annotate(outcome, turn, &call.call_id),
                     Err(error) if error.code == "tool_scheduler_closed" => return Err(error),
                     Err(error) => failure(error),
@@ -674,6 +694,7 @@ impl Turn {
         command: String,
         workspace: PathBuf,
         timeout_ms: u64,
+        environment: Vec<(String, String)>,
     ) -> Result<Outcome> {
         // The place in line is taken before anything durable is written.
         let queued = self.registry.queue()?;
@@ -684,7 +705,7 @@ impl Turn {
             .await?;
         let (sender, receiver) = oneshot::channel();
         self.registry
-            .background(command, workspace, timeout_ms, queued, sender);
+            .background(command, workspace, timeout_ms, environment, queued, sender);
         let (store, handles, failures, call_id_for_refs) = (
             self.store.clone(),
             self.handles.clone(),

@@ -10,8 +10,7 @@ def serve_args(path, url, tools="echo", model="synthetic-model", key_env=None,
                provider="openai", family="responses", extra=()):
     """Arguments for a stdio service bound to one synthetic provider endpoint."""
     spec = f'{provider}={family},{url}' + (f',{key_env}' if key_env else '')
-    return ['serve', '--store', str(path), '--provider', spec, '--model', f'{provider}/{model}',
-            '--tools', tools, *extra]
+    return ['serve', '--store', str(path), '--provider', spec, '--tools', tools, *extra]
 
 
 class Client:
@@ -24,6 +23,10 @@ class Client:
         self.queue = queue.Queue()
         self.saved = []
         self.next_id = 0
+        # What this client tells a new bot when the caller says nothing; the
+        # daemon supplies no agent behavior.
+        self.model = f'{provider}/{model}'
+        self.instructions = 'Test agent.'
         def read():
             for line in self.process.stdout:
                 message = json.loads(line)
@@ -53,6 +56,9 @@ class Client:
             self.saved.append(message)
 
     def request(self, op, **params):
+        if op == 'create':
+            params.setdefault('model', self.model)
+            params.setdefault('instructions', self.instructions)
         self.next_id += 1
         self.process.stdin.write(json.dumps({'id': self.next_id, 'op': op, **params}) + '\n')
         self.process.stdin.flush()

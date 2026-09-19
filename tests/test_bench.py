@@ -9,6 +9,8 @@ from bench.events import Events
 from bench.processes import Process, Tree
 from bench.report import compare
 from bench.profiles import profile
+from bench.targets import clean_env
+from tests.test_runtime import ModelFixture
 
 
 class ProcessTests(unittest.TestCase):
@@ -200,10 +202,49 @@ class DaemonRunnerTests(unittest.TestCase):
                 config = dict(version=1, concurrency=1, turns=2, chunks=3,
                               chunk_bytes=chunk_bytes, chunk_delay_ms=100, history_bytes=32)
                 (directory / 'workload.json').write_text(json.dumps(config))
-                result = run_once([str(binary), 'serve', '--model', 'openai/bench-model', '--tools', 'echo'],
+                result = run_once([str(binary), 'serve', '--tools', 'echo'],
                                   config, options, directory, 0)
                 self.assertEqual(result['status'], 'ok', result)
                 self.assertEqual(result['events']['stream_payload_bytes'], 6 * chunk_bytes)
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1',
+                     'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class LiveFleetTests(ModelFixture):
+    def test_selected_model_reaches_every_bot_without_environment_dependence(self):
+        import subprocess
+        from bench import live_fleet
+
+        original_run = subprocess.run
+
+        def local_run(command, **kwargs):
+            # Redirect only provider transport. All CLI parsing, submission,
+            # model selection, tool execution and reporting remain real.
+            command = list(command)
+            if '--provider' in command:
+                command[command.index('--provider') + 1] = f'openai=responses,{self.url}'
+            return original_run(command, **kwargs)
+
+        for label, defaults in (('unset', {}), ('conflicting', {'AGENT_MODEL': 'unregistered/wrong-model'})):
+            with self.subTest(environment=label):
+                out = self.path / label
+                with patch.dict(os.environ, dict(clean_env(), **defaults), clear=True), \
+                     patch.object(live_fleet.subprocess, 'run', side_effect=local_run), \
+                     patch.object(live_fleet, 'PROMPT', 'shell:wc -l notes.txt'):
+                    try:
+                        result = live_fleet.run(self.binary, out, 2, 'openai/synthetic-model', None, 'low')
+                    finally:
+                        original_run([str(self.binary), 'shutdown', '--store', str(out / 'state.sqlite')],
+                                     env=clean_env(), capture_output=True, timeout=5)
+                self.assertEqual(result['submitted'], 2)
+                self.assertEqual(result['submit_failures'], [])
+                self.assertEqual(result['statuses'], {'completed': 2})
+                self.assertEqual(result['errors'], {})
+                self.assertEqual(result['model'], 'openai/synthetic-model')
+                # One warmup plus a shell call and final answer for each bot.
+                requests = [self.model.requests.get(timeout=3) for _ in range(5)]
+                self.assertEqual({r['model'] for r in requests}, {'synthetic-model'})
+                self.assertTrue(self.model.requests.empty())
 
 
 if __name__ == "__main__":

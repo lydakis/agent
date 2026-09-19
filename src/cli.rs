@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --model --tools --max-processes --max-active --max-connecting --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
+const STARTUP: &str = "--provider --tools --max-processes --max-active --max-connecting --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -87,7 +87,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "serve",
         usage: "serve --store PATH --provider SPEC... [OPTIONS]",
-        flags: "--instructions --instructions-file",
+        flags: "",
         startup: true,
     },
 ];
@@ -148,8 +148,11 @@ fn print_flags(flags: &str) {
             "--any" => ("", "Return when the first handle resolves"),
             "--timeout-ms" => ("N", "Wait at most N milliseconds; 0 polls immediately"),
             "--workspace" => ("DIR", "Select the working directory"),
-            "--instructions" => ("TEXT", "Set model instructions"),
-            "--instructions-file" => ("FILE", "Read model instructions from a file"),
+            "--instructions" => (
+                "TEXT",
+                "A new bot's instructions; default: the built-in text",
+            ),
+            "--instructions-file" => ("FILE", "Read a new bot's instructions from a file"),
             "--reasoning" => ("LEVEL", "low, medium, high, xhigh, or max"),
             "--request-id" => ("ID", "Idempotency key for this submission"),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
@@ -159,7 +162,7 @@ fn print_flags(flags: &str) {
             "--provider" => ("SPEC", "Register a provider; repeat for multiple providers"),
             "--model" => (
                 "PROVIDER/MODEL",
-                "Default model; run also selects the turn's model",
+                "Set the model; new bots default to AGENT_MODEL, existing bots keep theirs",
             ),
             "--tools" => ("LIST", "Comma-separated enabled tools"),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),

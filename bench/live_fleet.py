@@ -56,7 +56,8 @@ def run(agent, out, bots, model, max_connecting, reasoning):
 
     def submit(i):
         r = subprocess.run([str(agent), 'run', '--store', str(store), '--workspace', str(workspace), '--new',
-                            '--bot', f'f{i}', '--detach', PROMPT], capture_output=True, text=True, env=env)
+                            '--model', model, '--bot', f'f{i}', '--detach', PROMPT],
+                           capture_output=True, text=True, env=env)
         with lock:
             if r.returncode == 0:
                 handles.append(json.loads(r.stdout)['handle'])

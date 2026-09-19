@@ -99,8 +99,10 @@ class SocketAndCliTests(ModelFixture):
         stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)
         self.assertEqual(stats['active_turns'], 0)
         self.assertIn('store', stats)
-        slow = json.loads(self.agent('run', '--store', str(self.store), '--new', '--bot', 'Slow', '--detach', 'wait').stdout)['handle']
-        quick = json.loads(self.agent('run', '--store', str(self.store), '--new', '--bot', 'Quick', '--detach', 'hi').stdout)['handle']
+        slow = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
+                                     '--new', '--bot', 'Slow', '--detach', 'wait').stdout)['handle']
+        quick = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
+                                      '--new', '--bot', 'Quick', '--detach', 'hi').stdout)['handle']
         first = json.loads(self.agent('wait', '--store', str(self.store), '--any', '--timeout-ms', '5000', slow, quick).stdout)
         self.assertEqual(first['pending'], [slow])
         self.assertEqual(first['results'][quick]['text'], 'reply:hi')
@@ -155,6 +157,41 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_busy', overridden.stderr + overridden.stdout)
         self.agent('wait', '--store', str(self.store), queued['handle'])
 
+    def test_a_new_bot_needs_a_model_from_the_client(self):
+        without = self.agent('run', '--store', str(self.store), '--provider', f'openai=responses,{self.url}',
+                             '--tools', 'echo', '--new', '--bot', 'Nobody', 'hello', check=False)
+        self.assertEqual(without.returncode, 2, without.stderr)
+        self.assertIn('AGENT_MODEL', without.stderr)
+        env = dict(clean_env(), AGENT_MODEL='openai/synthetic-model')
+        with_env = subprocess.run([*self.base, 'run', '--store', str(self.store), '--provider',
+                                   f'openai=responses,{self.url}', '--tools', 'echo', '--new', '--bot', 'Env',
+                                   '--detach', 'hello'], env=env, capture_output=True, text=True, cwd=self.path)
+        self.assertEqual(with_env.returncode, 0, with_env.stderr)
+        listed = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
+        self.assertEqual([b['model'] for b in listed if b['name'] == 'Env'], ['synthetic-model'])
+
+    def test_peer_creation_inherits_a_model_but_continuation_keeps_its_own(self):
+        self.agent('run', *self.common, '--provider', f'peer=responses,{self.url}',
+                   '--new', '--bot', 'Bob', 'hello')
+        self.agent('run', '--store', str(self.store), '--model', 'peer/synthetic-model',
+                   '--new', '--bot', 'Alice', 'hello')
+        for flags, bot, provider in (
+            ('--new --bot Inherited', 'Inherited', 'peer'),
+            ('--bot Bob', 'Bob', 'openai'),
+            ('--bot Inherited --model openai/synthetic-model', 'Inherited', 'openai'),
+        ):
+            with self.subTest(flags=flags):
+                self.agent('run', '--store', str(self.store), '--bot', 'Alice',
+                           f'shell:"$AGENT_BIN" run --detach {flags} -- hello')
+                turns = json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
+                turn = turns[-1]
+                self.agent('wait', '--store', str(self.store), f'turn:{bot}/{turn["turn"]}')
+                self.assertEqual(turn['model'], f'{provider}/synthetic-model')
+        # A one-turn override does not replace the bot's durable choice.
+        listed = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
+        providers = {b['name']: b['provider'] for b in listed}
+        self.assertEqual((providers['Bob'], providers['Inherited']), ('openai', 'peer'))
+
     def test_attach_refuses_a_running_daemon_with_a_different_configuration(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         def attempt(*flags):
@@ -173,9 +210,10 @@ class SocketAndCliTests(ModelFixture):
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertIn('daemon_configuration_mismatch', refused.stderr)
             self.assertIn(named, refused.stderr)
-        # Outside run, --model is a daemon default and is checked; in run it is the turn's.
+        # The daemon has no model of its own: --model belongs to run alone.
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
-        self.assertIn('--model', stats.stderr)
+        self.assertEqual(stats.returncode, 2)
+        self.assertIn('does not accept --model', stats.stderr)
         self.assertEqual(attempt('--model', 'openai/synthetic-model').returncode, 0)
         self.assertEqual(json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)[0]['status'],
                          'completed')
@@ -229,14 +267,15 @@ class SocketAndCliTests(ModelFixture):
         detached = self.agent('run', '--store='+str(self.store), '--bot=Bob', '--detach', '--pretty', 'hi')
         self.assertGreater(len(detached.stdout.splitlines()), 1)
         self.agent('wait', '--store='+str(self.store), json.loads(detached.stdout)['handle'])
-        # The daemon parser shares the same value syntax and file option.
+        # The file option uses the same value syntax, and the daemon never
+        # sees it: the client resolves a new bot's instructions before asking.
         instructions = self.path / 'instructions.txt'
         instructions.write_text('synthetic instructions')
-        stdio = Client(self.binary, self.path/'stdio.sqlite', self.url, 'echo',
-                       extra=('--instructions-file='+str(instructions),))
-        self.addCleanup(stdio.close)
-        state = stdio.request('create', bot='Standalone')['result']
-        self.assertEqual(state['instructions'], 'synthetic instructions')
+        self.agent('run', *self.common, '--new', '--bot=Told', '--instructions-file='+str(instructions), 'hi')
+        seen = []
+        while not seen or seen[-1]['instructions'] != 'synthetic instructions':
+            seen.append(self.model.requests.get(timeout=2))
+        self.assertEqual(seen[-1]['input'][-1]['content'][0]['text'], 'hi')
 
     def test_rm_and_prune_bound_a_bot_and_remove_it(self):
         for n in range(3):

@@ -32,15 +32,6 @@ use tokio::{
     task::JoinSet,
 };
 use turn::Turn;
-const DEFAULT_INSTRUCTIONS: &str = "You are a software engineering agent working in the current workspace. \
-Complete the requested task using the available tools, verify your work, and finish with a short summary. \
-To delegate a subtask to another agent with its own conversation, run \
-\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
-Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
-Collect results with the wait tool on that handle; it returns the peer's status and final text. \
-Long commands can run with shell background=true and be collected the same way. \
-Blocking run/follow inside a shell tool is rejected. \
-Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an earlier checkpoint.";
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -219,8 +210,6 @@ pub struct Configuration {
     pub store: PathBuf,
     pub socket: Option<PathBuf>,
     pub providers: Vec<ProviderSpec>,
-    pub model: Option<String>,
-    pub instructions: Option<String>,
     pub tools: String,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
@@ -306,8 +295,6 @@ struct Service {
     providers: Arc<HashMap<String, Provider>>,
     registry: Registry,
     hub: Hub,
-    default_model: Option<String>,
-    default_instructions: String,
     handles: Handles,
     background_failures: mpsc::UnboundedSender<Error>,
     limits: Limits,
@@ -397,12 +384,6 @@ pub async fn run(config: Configuration) -> Result<()> {
     if providers.is_empty() {
         return fail("no_providers");
     }
-    if let Some(model) = &config.model {
-        let (provider, _) = split_model(model)?;
-        if !providers.contains_key(provider) {
-            return fail_with("provider_unavailable", provider);
-        }
-    }
     let (store, publications) = Store::open(&config.store).await?;
     let mut environment = vec![
         (
@@ -436,7 +417,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "retain_turns":config.retain_turns},
         "schema":agent_runtime::store::Database::SCHEMA,
-        "tools":registry.names(),"providers":bindings,"default_model":config.model,
+        "tools":registry.names(),"providers":bindings,
         "durability":"sqlite_full","partial_text_durable":false});
     let (sender, mut inbound) = mpsc::channel::<Inbound>(64);
     let mut sessions: HashMap<u64, Output> = HashMap::new();
@@ -503,11 +484,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         providers: Arc::new(providers),
         registry,
         hub,
-        default_model: config.model.clone(),
-        default_instructions: config
-            .instructions
-            .clone()
-            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned()),
         handles,
         background_failures: failure_sender,
         limits,
@@ -842,9 +818,9 @@ impl Service {
                 }
                 name(&bot)?;
                 let path = path.as_deref().map(workspace).transpose()?;
-                let reference = model
-                    .or_else(|| self.default_model.clone())
-                    .ok_or(Error::new("model_required"))?;
+                // The daemon supplies no agent behavior: who creates a bot
+                // says what it runs and what it is told, and the bot keeps both.
+                let reference = model.ok_or(Error::new("model_required"))?;
                 let (provider, model) = split_model(&reference)?;
                 let family = self
                     .providers
@@ -856,8 +832,7 @@ impl Service {
                 {
                     return fail("invalid_reasoning_level");
                 }
-                let instructions =
-                    instructions.unwrap_or_else(|| self.default_instructions.clone());
+                let instructions = instructions.ok_or(Error::new("instructions_required"))?;
                 if instructions.len() > 64 * 1024 {
                     return fail("instructions_limit");
                 }
@@ -1265,8 +1240,6 @@ mod tests {
             providers: Arc::new(HashMap::new()),
             registry: Registry::new("wait").unwrap(),
             hub: Hub::default(),
-            default_model: None,
-            default_instructions: "test".into(),
             handles: Handles::new(mpsc::unbounded_channel().0),
             limits: Limits {
                 processes: 16,
@@ -1432,8 +1405,6 @@ mod tests {
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
             registry,
             hub: Hub::default(),
-            default_model: None,
-            default_instructions: "test".into(),
             handles: Handles::new(mpsc::unbounded_channel().0),
             limits: Limits {
                 processes: 16,

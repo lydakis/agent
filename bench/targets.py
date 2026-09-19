@@ -33,7 +33,7 @@ def engine_target(engine, root, binary=None):
                         env=clean_env(), text=True, timeout=5).strip()}
         # The daemon itself; the runner appends the store path and provider
         # endpoint once they exist and drives the stdio protocol.
-        return [str(executable), "serve", "--model", "openai/bench-model", "--tools", "echo"], metadata, None
+        return [str(executable), "serve", "--tools", "echo"], metadata, None
     node = shutil.which("node")
     if not node:
         raise ValueError("Node.js is required for engine adapters")

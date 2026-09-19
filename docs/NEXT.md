@@ -369,7 +369,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     the principle, decides whether a move was free. Removing a default
     string saves little; the benefit is heterogeneous bots sharing one
     runtime and its connections, with any performance change demonstrated,
-    not assumed. (Refined with Astra's review of the item.)
+    not assumed. (Refined with Astra's review of the item.) First slice
+    done: `serve` takes no model or instructions, `create` requires both,
+    the CLI resolves them from `--model`/`AGENT_MODEL` and
+    `--instructions`/its built-in text, and `--model` is `run`'s alone.
+    Remaining: durable per-bot tool selection.
 21. Done: durable events are published by the storage worker in commit
     order, through one publisher, with turn outcomes for waiters behind
     the events that end them. Tasks and the service no longer publish or

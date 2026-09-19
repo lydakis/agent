@@ -1828,3 +1828,77 @@ the original turn and the model's subsequent input and answer. Both workspace
 and model variants failed on the baseline and pass with the fix. Validation:
 76 Rust tests, 19 focused Python tests, strict Clippy, formatting, and diff
 checks passed.
+
+## Explicit model and instructions
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. Compared the committed tree `2580e39a…` (rebuilt from a worktree)
+with the slice binary `cd07f38f…`, back to back. `serve` no longer takes a
+model or instructions; `create` requires both; the CLI resolves them from
+`--model` or `AGENT_MODEL` and from `--instructions` or its built-in text;
+shell tool children receive `AGENT_MODEL`, the running turn's effective
+model, so a bot's peers default to its own. On ordinary turns the only new
+work is one environment variable per shell child.
+
+The 32-agent socket echo workload as before, one excluded warmup and four
+measured runs per binary:
+
+| Metric | Committed tree | This slice |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.70 (17.59–17.80) | 17.77 (17.73–17.91) |
+| Observed target CPU, seconds | 0.336 (0.334–0.339) | 0.342 (0.333–0.347) |
+| Per-run p95 turn latency, ms | 619.3 (615.0–622.8) | 621.6 (619.9–622.5) |
+
+Level within the screen's noise on every metric, as expected for a change
+that moves a string from the daemon to the client. Captures: ignored
+`.local/bench/slice-prev4-socket-32/` and `slice-defaults-socket-32/`.
+
+Validation: 76 Rust tests, strict Clippy, formatting, and 148 Python tests.
+New regressions: `create` without a model or without instructions is
+refused by name; a bot created with stated values keeps them across a
+daemon restarted by a client with other ideas; the CLI refuses a new bot
+without `--model` or `AGENT_MODEL` and accepts the environment default;
+`stats --model` is a usage error; `--instructions-file` resolves in the
+client. The test helpers now state a model and instructions on `create`,
+as any client must.
+
+### Existing-peer model fix
+
+Observed 2026-09-18 on Darwin arm64, external power, Rust 1.98.0.
+Compared the pre-fix working tree binary `7850585e…` with `ab2e6f78…`.
+The client now reads `AGENT_MODEL` only on creation; continuing a peer
+keeps its stored model unless `--model` explicitly overrides that turn.
+This removes an environment lookup and string allocation from continuation
+and inspection commands, with no extra RPC or storage work.
+
+Two synthetic local screens, each with one excluded warmup per binary and
+four measured runs, alternating binary order:
+
+- Peer screen: 16 callers each submit four detached turns through shell/CLI
+  to 16 existing peers. All 128 turns complete, with 192 provider requests.
+  Whole-tree CPU uses waited-child resource accounting, including the daemon,
+  shells and CLI processes; provider/controller work is excluded.
+- CLI screen: 32 sequential detached continuations, with completion checked
+  after each. Each binary sends exactly 113,248 provider-request bytes.
+  macOS `time -l` records each CLI's actual peak RSS. CPU includes the
+  daemon, CLI processes and the identical timing wrappers.
+
+| Metric, median across measured runs | Before | After |
+| --- | ---: | ---: |
+| Peer screen CPU, seconds | 0.678 | 0.679 |
+| Peer screen p95 parent-turn latency, ms | 45.6 | 42.9 |
+| CLI screen median per-process peak RSS, MiB | 6.67 | 6.62 |
+| CLI screen CPU, seconds | 0.248 | 0.256 |
+| CLI screen median invocation time, ms | 8.90 | 9.05 |
+
+Peer CPU is level; CLI peak memory is slightly lower in this screen.
+CPU and latency ranges overlap, so these short screens establish no speedup.
+Whole-tree RSS sampling misses short-lived CLI processes and varied widely;
+it does not establish a peak-memory comparison. The per-CLI measurements
+above use actual process high-water marks instead. Captures and probe scripts:
+ignored `.local/model-default-fix/` (`performance.json`, `cli-peaks.json`).
+
+The peer regression fails before the fix and passes after it. It covers new
+peer inheritance, continuation with a different stored provider/model, explicit
+turn overrides, and preservation of the stored choice. Validation: 76 Rust
+tests, 28 focused Python tests, strict Clippy, formatting, and diff checks.
