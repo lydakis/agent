@@ -5,3 +5,6 @@
 !.env.example
 __pycache__/
 node_modules/
+
+# Tauri regenerates these on every build
+app/src-tauri/gen/
