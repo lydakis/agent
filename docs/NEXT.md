@@ -268,29 +268,23 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    never by replaying a turn, and are observable: attempt counts, provider
    request ids, and retry delays in the turn record. Leaving retries off by
    default is acceptable while the policy is new.
-11. Make `process_lost` unmistakably different from a stopped process. Shell
-   cleanup relies on a process-group guard and kill-on-drop, which cover normal
-   cleanup and cancellation but not a hard kill of the daemon; a child can
-   keep running and writing after its parent dies. The tools section says
-   so, but other recovery text and the store-initialization comment say
-   background commands "died with" the daemon while initialization only marks
-   their rows `process_lost`. Reconcile the contract to: supervision ended, the
-   command may still be running or may already have had effects, and a
-   controller must not read `process_lost` as permission to start conflicting
-   work in that workspace. Extend the restart test to observe a filesystem
-   write after killing only the daemon, not just the recovered handle's status.
-12. Retention correctness follow-ups. `prune` keeps turn rows, so submission
-   deduplication by `(bot, request_id)` survives pruning, and an expired event
-   cursor is answered with `pruned_before` and a `pruned` notice rather than an
-   empty page. Two intersections remain open: `delete` removes a bot's turn
-   rows with it, so a late retry of a deleted bot's request gets
-   `bot_not_found` rather than a duplicate (acceptable, but state it); and
-   `prune` drops a bot's old artifacts even though a fork reading through its
-   lineage could still ask for them, so either artifacts referenced by
-   surviving branches stay alive or the fork's read answers with an explicit
-   retention error. Retention and expensive historical reads should run in
-   bounded pieces on the storage thread once the queue-wait instrumentation
-   exists.
+11. Done: `process_lost` means supervision ended. The recovery text now
+    says the daemon no longer owns the process and never records its result,
+    that a hard kill of the daemon leaves children running, and that a
+    controller must not read the code as permission to start conflicting work
+    in that workspace. The restart test kills only the daemon and observes the
+    background command's write landing afterwards, not just the recovered
+    handle's status.
+12. Done: retention intersections. A late retry of a deleted bot's request
+    answers `bot_not_found`, stated in the retention section. An artifact
+    read for a turn retention has emptied answers `artifact_pruned` for the
+    producing bot and for a fork whose transcript holds the output node,
+    through the protocol operation and the model's `read`; the transcript
+    nodes that retention keeps decide it, so `artifact_not_found` and
+    `turn_not_found` keep their meanings. Deleting the producer after a fork
+    inherited its output answers the same way. Still open from the item:
+    retention and expensive historical reads in bounded pieces on the storage
+    thread; the operation histograms from item 27 show where they wait.
 13. Done: [cache-hit accounting](DAEMON_MEASUREMENTS.md#cache-hit-accounting).
    `cached_input_tokens` and `cache_hit` per turn and per bot, and
    daemon-lifetime totals in `stats`. The live check on luna and Sonnet
@@ -430,6 +424,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     histograms come from one consistent snapshot, formatted outside the lock. The
     store-scale screen (item 3) reads them. (From the second Astra Pro
     review.)
+28. Done: bot identities. A bot has a store-wide integer `id`, allocated
+    from a sequence and never reused after delete; `create`, `fork`,
+    `resume`, `bots`, and `submit` report it and the `created` and `forked`
+    events carry it. `submit` accepts `bot_id`, and `run --bot-id N`: a retry
+    pinned to an identity the name no longer holds answers `bot_not_found`
+    with the current identity in `detail`, so a recycled name cannot absorb
+    a stale retry as fresh work. A fork is its own identity with an empty
+    request namespace. One primary-key lookup per submission. (From the
+    item 12 discussion.)
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

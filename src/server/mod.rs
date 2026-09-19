@@ -87,6 +87,9 @@ enum Command {
     },
     Submit {
         bot: String,
+        /// The identity `bot` had when this request was first made; a retry
+        /// carrying it is refused if the name has since changed hands.
+        bot_id: Option<i64>,
         request_id: String,
         prompt: String,
         workspace: Option<String>,
@@ -415,7 +418,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_process_budget(limits.processes);
     let hub = Hub::default();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
@@ -1092,6 +1095,7 @@ impl Service {
             }
             Command::Submit {
                 bot,
+                bot_id,
                 request_id,
                 prompt,
                 workspace: path,
@@ -1122,11 +1126,14 @@ impl Service {
                 let capacity = self.has_capacity();
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
-                let started = store
+                let (identity, started) = store
                     .op("begin", move |db| {
-                        db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
-                            validate_provider(&providers, bot, model)
-                        })
+                        let identity = db.identity(&b, bot_id)?;
+                        let started =
+                            db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
+                                validate_provider(&providers, bot, model)
+                            })?;
+                        Ok((identity, started))
                     })
                     .await?;
                 let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
@@ -1146,7 +1153,7 @@ impl Service {
                     self.ready_hint = true;
                 }
                 Ok(
-                    json!({"bot":bot,"turn":started.turn,"request_id":request_id,
+                    json!({"bot":bot,"bot_id":identity,"turn":started.turn,"request_id":request_id,
                     "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
                     "handle":format!("turn:{bot}/{}", started.turn)}),
                 )
@@ -1518,6 +1525,7 @@ mod tests {
             .dispatch(
                 Command::Submit {
                     bot: "Bob".into(),
+                    bot_id: None,
                     request_id: "same".into(),
                     prompt: "work".into(),
                     workspace: None,
@@ -1537,6 +1545,7 @@ mod tests {
             .dispatch(
                 Command::Submit {
                     bot: "Other".into(),
+                    bot_id: None,
                     request_id: "new".into(),
                     prompt: "work".into(),
                     workspace: None,

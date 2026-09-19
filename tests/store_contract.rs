@@ -630,6 +630,56 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     assert!(db.item("Bob", node).is_ok());
     assert!(db.item("Other", node).is_err());
     assert!(db.item("Bob", node + 1000).is_err());
+    // Retention empties the turn: the owner and a fork holding the output
+    // node learn that, an unrelated bot and an unanswered call still do not.
+    let checkpoint = db.finish(turn, None).unwrap().last().unwrap()["data"]["checkpoint"]
+        .as_i64()
+        .unwrap();
+    db.fork("Bob", Some(checkpoint), "Fork", None, None)
+        .unwrap();
+    let later = db
+        .begin(
+            "Bob",
+            "later",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(later, None).unwrap();
+    db.prune("Bob", 1).unwrap();
+    for reader in ["Bob", "Fork"] {
+        assert_eq!(
+            db.artifact(reader, turn, "c1").unwrap_err().code,
+            "artifact_pruned"
+        );
+        assert_eq!(
+            db.artifact_page(reader, turn, "c1", "stdout", 0, 4)
+                .unwrap_err()
+                .code,
+            "artifact_pruned"
+        );
+        assert_eq!(
+            db.artifact_lines(reader, turn, "c1", "stdout", 1, 5)
+                .unwrap_err()
+                .code,
+            "artifact_pruned"
+        );
+    }
+    assert_eq!(
+        db.artifact("Other", turn, "c1").unwrap_err().code,
+        "turn_not_found"
+    );
+    assert_eq!(
+        db.artifact("Fork", turn, "c9").unwrap_err().code,
+        "turn_not_found"
+    );
+    assert_eq!(
+        db.artifact("Bob", later, "c1").unwrap_err().code,
+        "artifact_not_found"
+    );
 }
 
 #[test]
@@ -2820,6 +2870,120 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
             drop(db);
             let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
             assert_eq!(db.inspect("Bob").unwrap().cache_hit, 0.56);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
+    let path = std::env::temp_dir().join(format!("agent-identity-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let (bob, event) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        assert_eq!((bob.id, event["data"]["id"].as_i64()), (1, Some(1)));
+        converse(&mut db, "Bob", 1);
+        let (fork, event) = db
+            .fork("Bob", None, "Fork", Some("/synthetic"), None)
+            .unwrap();
+        assert_eq!((fork.id, event["data"]["id"].as_i64()), (2, Some(2)));
+        assert_eq!(db.identity("Bob", Some(1)).unwrap(), 1);
+        let stale = db.identity("Fork", Some(1)).unwrap_err();
+        assert_eq!(stale.code, "bot_not_found");
+        assert!(stale.detail.unwrap().contains("identity 2"));
+        assert_eq!(
+            db.identity("Nobody", None).unwrap_err().code,
+            "bot_not_found"
+        );
+        db.delete_bot("Fork").unwrap();
+        assert_eq!(
+            db.create("Fork", Some("/synthetic"), binding())
+                .unwrap()
+                .0
+                .id,
+            3
+        );
+    }
+    // A schema-20 store numbers its bots in creation order once; a reset
+    // version keeps the identities it already has.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;
+             PRAGMA user_version=20;",
+        )
+        .unwrap();
+    }
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.inspect("Bob").unwrap().id, 1);
+        assert_eq!(db.inspect("Fork").unwrap().id, 2);
+        assert_eq!(
+            db.create("New", Some("/synthetic"), binding())
+                .unwrap()
+                .0
+                .id,
+            3
+        );
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 20).unwrap();
+    }
+    {
+        let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.inspect("New").unwrap().id, 3);
+        assert_eq!(db.list(None, 8).unwrap()["bots"][0]["id"], 1);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn identity_migration_seeds_allocation_after_sparse_and_empty_stores() {
+    for empty in [false, true] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-identity-gaps-{}-{empty}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            if !empty {
+                for name in ["First", "Deleted", "Last"] {
+                    db.create(name, Some("/synthetic"), binding()).unwrap();
+                }
+                db.delete_bot("Deleted").unwrap();
+            }
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;
+                 PRAGMA user_version=20;",
+            )
+            .unwrap();
+        }
+        let last;
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let maximum = if empty {
+                0
+            } else {
+                let first = db.inspect("First").unwrap().id;
+                let last = db.inspect("Last").unwrap().id;
+                assert!(first > 0 && last > first);
+                last
+            };
+            let created = db.create("New", Some("/synthetic"), binding()).unwrap().0;
+            assert!(created.id > maximum);
+            last = db.fork("New", None, "Fork", None, None).unwrap().0.id;
+            assert!(last > created.id);
+            db.delete_bot("Fork").unwrap();
+        }
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            assert!(db.create("AfterRestart", None, binding()).unwrap().0.id > last);
         }
         std::fs::remove_file(path).unwrap();
     }

@@ -189,6 +189,22 @@ class SocketAndCliTests(ModelFixture):
         listed = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
         self.assertEqual([b['model'] for b in listed if b['name'] == 'Env'], ['synthetic-model'])
 
+    def test_run_refuses_a_stale_bot_identity(self):
+        env = dict(clean_env(), AGENT_MODEL='openai/synthetic-model')
+        created = subprocess.run([*self.base, 'run', '--store', str(self.store), '--provider',
+                                  f'openai=responses,{self.url}', '--tools', 'echo', '--new', '--bot', 'Ident',
+                                  '--detach', 'hello'], env=env, capture_output=True, text=True, cwd=self.path)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        identity = json.loads(created.stdout)['bot_id']
+        stale = self.agent('run', '--store', str(self.store), '--bot', 'Ident', '--bot-id', str(identity + 1),
+                           '--detach', 'again', check=False)
+        self.assertEqual(stale.returncode, 1, stale.stdout)
+        self.assertIn('bot_not_found', stale.stderr + stale.stdout)
+        exact = self.agent('run', '--store', str(self.store), '--bot', 'Ident', '--bot-id', str(identity),
+                           '--detach', 'again')
+        self.assertEqual(json.loads(exact.stdout)['bot_id'], identity)
+        self.assertEqual(self.agent('run', '--bot-id', 'x', 'hello', check=False).returncode, 2)
+
     def test_peer_creation_inherits_a_model_but_continuation_keeps_its_own(self):
         self.agent('run', *self.common, '--provider', f'peer=responses,{self.url}',
                    '--new', '--bot', 'Bob', 'hello')
@@ -581,12 +597,13 @@ class CliTests(ModelFixture):
             bootstrap.close()
             with sqlite3.connect(path) as db:
                 for n in range(1, 1025):
-                    db.execute("INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning)"
-                               " VALUES (?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
-                               (f'old-{n}', directory, n))
+                    db.execute("INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning)"
+                               " VALUES (?,?,NULL,?,'running',?,'openai','responses','synthetic-model','',NULL)",
+                               (f'old-{n}', n, directory, n))
                     db.execute("INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model) VALUES (?,?,'old','check','running',?,'openai/synthetic-model')",
                                (n, f'old-{n}', directory))
                 db.execute("UPDATE turn_sequence SET last_id=1024 WHERE singleton=1")
+                db.execute("UPDATE bot_sequence SET last_id=1024 WHERE singleton=1")
             barrier = threading.Barrier(16)
             common = ['--store', str(path), '--provider', 'openai=responses,'+self.url,
                       '--model', 'openai/synthetic-model', '--tools', 'echo', '--workspace', directory]

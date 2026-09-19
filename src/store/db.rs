@@ -16,6 +16,9 @@ const STEER_BATCH_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
+    /// Store-wide identity, never reused after deletion. A name can be
+    /// recycled; a retry that carries the id cannot land on the new holder.
+    pub id: i64,
     pub head: Option<i64>,
     /// Lifetime cap on input plus output tokens; checked before each model call.
     pub budget_tokens: Option<u64>,
@@ -202,7 +205,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 20;
+    pub const SCHEMA: i32 = 21;
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -242,6 +245,7 @@ impl Database {
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO node_sequence VALUES (1,0);
             CREATE TABLE IF NOT EXISTS bots(name TEXT PRIMARY KEY, head INTEGER REFERENCES nodes(id),
+                id INTEGER NOT NULL,
                 workspace TEXT, status TEXT NOT NULL, running_turn INTEGER,
                 provider TEXT NOT NULL, family TEXT NOT NULL, model TEXT NOT NULL,
                 instructions TEXT NOT NULL, reasoning TEXT,
@@ -251,6 +255,10 @@ impl Database {
                 tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history',
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0);
+            CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
+            CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+            INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
@@ -415,9 +423,10 @@ impl Database {
             input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
+            id: r.get(15)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id";
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -435,7 +444,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens
+                    input_tokens,cached_input_tokens,id
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -443,7 +452,8 @@ impl Database {
         let mut bytes = 0;
         let mut more = false;
         while let Some(r) = rows.next()? {
-            let bot = json!({"name":r.get::<_, String>(0)?,"head":r.get::<_, Option<i64>>(1)?,
+            let bot = json!({"name":r.get::<_, String>(0)?,"id":r.get::<_, i64>(14)?,
+                "head":r.get::<_, Option<i64>>(1)?,
                 "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
                 "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
@@ -483,10 +493,12 @@ impl Database {
             return fail("bot_exists");
         }
         let tx = self.conn.transaction()?;
+        let id = identity(&tx)?;
         tx.execute(
-            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
             params![
                 name,
+                id,
                 workspace,
                 binding.provider,
                 binding.family.name(),
@@ -497,7 +509,7 @@ impl Database {
                 binding.tools.join(",")
             ],
         )?;
-        let data = json!({"model":format!("{}/{}", binding.provider, binding.model)});
+        let data = json!({"id":id,"model":format!("{}/{}", binding.provider, binding.model)});
         let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
         Ok((
@@ -835,6 +847,26 @@ impl Database {
 
     /// Reconcile duplicates first, then validate the effective provider using
     /// the bot already loaded for admission, before any durable mutation.
+    /// The identity currently holding `name`. A submission that carries the
+    /// identity it was first made against is refused once the name belongs to
+    /// another bot, so a late retry never becomes fresh work on a namesake.
+    pub fn identity(&self, name: &str, expected: Option<i64>) -> Result<i64> {
+        let id: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT id FROM bots WHERE name=?")?
+            .query_row([name], |r| r.get(0))
+            .optional()?;
+        let Some(id) = id else {
+            return fail("bot_not_found");
+        };
+        match expected {
+            Some(expected) if expected != id => fail_with(
+                "bot_not_found",
+                format!("{name} is identity {id}; identity {expected} no longer exists"),
+            ),
+            _ => Ok(id),
+        }
+    }
     pub fn begin(
         &mut self,
         name: &str,
@@ -1771,10 +1803,12 @@ impl Database {
             return fail("bot_exists");
         }
         let tx = self.conn.transaction()?;
+        let id = identity(&tx)?;
         tx.execute(
-            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
             params![
                 name,
+                id,
                 checkpoint,
                 workspace,
                 parent.provider,
@@ -1789,7 +1823,7 @@ impl Database {
         if let Some(node) = checkpoint {
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
         }
-        let data = json!({"source":source,"checkpoint":checkpoint,"node":checkpoint});
+        let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint});
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
         Ok((
@@ -2141,7 +2175,55 @@ impl Database {
         {
             return Ok(());
         }
+        // Retention removed the turn's events with its artifacts, but the
+        // transcript keeps the nodes: a branch that inherited the output is
+        // told the artifact is gone, not that the turn is somebody else's.
+        if let (Some(Some(head)), None) = (head, node)
+            && self.pruned(turn)?
+            && self.lineage_holds_output(head, turn, call_id)?
+        {
+            return fail("artifact_pruned");
+        }
         fail("turn_not_found")
+    }
+    /// An existing turn keeps at least its start event until retention
+    /// removes them together with its artifacts.
+    fn pruned(&self, turn: i64) -> Result<bool> {
+        Ok(!self
+            .conn
+            .prepare_cached("SELECT 1 FROM events WHERE turn=? LIMIT 1")?
+            .exists([turn])?)
+    }
+    /// Whether the tool result of `call_id` in `turn` is on the chain ending
+    /// at `head`. Only a turn's prompt node records its turn, and ids grow
+    /// along a chain, so the turn's nodes are those between its prompt and
+    /// the next prompt; the walk stops at the turn's own prompt.
+    fn lineage_holds_output(&self, head: i64, turn: i64, call_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,turn) AS (
+                    SELECT id,parent,turn FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,n.turn FROM nodes n JOIN chain c ON n.id=c.parent
+                    WHERE c.turn IS NULL OR c.turn>?2)
+                 SELECT 1 FROM chain c JOIN nodes n ON n.id=c.id
+                 WHERE c.id>(SELECT id FROM chain WHERE turn=?2)
+                   AND c.id<COALESCE((SELECT MIN(id) FROM chain WHERE turn>?2),9223372036854775807)
+                   AND ((json_extract(CAST(n.item AS TEXT),'$.type')='function_call_output'
+                         AND json_extract(CAST(n.item AS TEXT),'$.call_id')=?3)
+                     OR EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content')
+                        WHERE json_extract(value,'$.type')='tool_result'
+                        AND json_extract(value,'$.tool_use_id')=?3)) LIMIT 1",
+            )?
+            .exists(params![head, turn, call_id])?)
+    }
+    /// The turn is the caller's to read, and no stream is stored for the call.
+    fn missing_artifact<T>(&self, turn: i64) -> Result<T> {
+        if self.pruned(turn)? {
+            fail("artifact_pruned")
+        } else {
+            fail("artifact_not_found")
+        }
     }
     /// A retained stream as text, for the model's own `read`.
     pub fn artifact_lines(
@@ -2165,7 +2247,9 @@ impl Database {
                 |r| r.get(0),
             )
             .optional()?;
-        let data = data.ok_or(Error::new("artifact_not_found"))?;
+        let Some(data) = data else {
+            return self.missing_artifact(turn);
+        };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
     }
     pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
@@ -2183,7 +2267,7 @@ impl Database {
             );
         }
         if streams.is_empty() {
-            return fail("artifact_not_found");
+            return self.missing_artifact(turn);
         }
         Ok(Value::Object(streams))
     }
@@ -2207,7 +2291,9 @@ impl Database {
             "SELECT length(data),substr(data,?,?) FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
             params![offset as i64 + 1, limit as i64, turn, call_id, stream],
             |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let (total, bytes) = row.ok_or(Error::new("artifact_not_found"))?;
+        let Some((total, bytes)) = row else {
+            return self.missing_artifact(turn);
+        };
         let total = u64::try_from(total).map_err(|_| Error::new("storage_error"))?;
         if offset > total {
             return fail("invalid_artifact_page");
@@ -2527,8 +2613,37 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             conn.execute("UPDATE turns SET status='running' WHERE id=?", [turn])?;
         }
     }
+    if from < 21 {
+        // 20 -> 21: bots gain a store-wide identity that is never reused.
+        // Existing positive rowids give creation order without counting each
+        // prefix again. Preserve gaps left by deletion and seed the sequence
+        // above the largest assigned id, not the number of surviving bots.
+        // Added only when missing, so a reset version keeps its identities.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='id')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(
+                "ALTER TABLE bots ADD COLUMN id INTEGER;
+                 UPDATE bots SET id=rowid;
+                 CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    last_id INTEGER NOT NULL CHECK(last_id>=0));
+                 INSERT OR REPLACE INTO bot_sequence SELECT 1,COALESCE(MAX(id),0) FROM bots;",
+            )?;
+        }
+    }
 
     Ok(())
+}
+/// Allocate the next bot identity inside the caller's transaction.
+fn identity(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "UPDATE bot_sequence SET last_id=last_id+1 WHERE singleton=1 RETURNING last_id",
+        )?
+        .query_row([], |r| r.get(0))?)
 }
 
 /// Operational tool records can have been pruned after a blocked turn's

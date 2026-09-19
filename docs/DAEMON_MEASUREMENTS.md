@@ -2504,3 +2504,81 @@ strict Clippy, formatting, and diff checks. Coverage includes cancellation,
 crash during a shell call followed by successful use of the same bot, queued
 continuation, both provider result formats, pruned-record migration, and
 idempotent reopening without duplicate tool results.
+
+## Lost processes and pruned artifacts
+
+2026-09-19. Two contract slices, no scheduler or storage-path change on the
+ordinary turn. `process_lost` now means supervision ended: the daemon no
+longer owns the command and never records its result, and a hard kill of the
+daemon leaves the child running. The restart test kills only the daemon while
+a background `sleep 1; printf written > survived` is parked on, confirms the
+file is absent at the kill, recovers the handle as `process_lost`, and then
+observes the write landing about a second later. An artifact read for a turn
+retention has emptied answers `artifact_pruned` for the producer and for a
+fork whose transcript holds the output node; the check runs only on the miss
+path, walks the reader's lineage back to the turn's own prompt node, and
+tests the turn's nodes for the call's result.
+
+The 32-agent socket echo screen, committed tree `c971efbe…` (rebuilt from a
+worktree) against the slice binary `a17d4b18…`, one excluded warmup and four
+measured runs each, run back to back on external power: RSS 17.91
+(17.77–18.02) versus 17.77 (17.66–17.81) MiB, CPU 0.323 (0.319–0.335) versus
+0.326 (0.310–0.360) s, p95 618.1 (615.1–620.8) versus 624.7 (618.6–630.1) ms.
+Level within noise, as expected for a change confined to artifact misses.
+Captures: ignored `.local/bench/slice-prev11-socket-32/` and
+`slice-retention-socket-32/`.
+
+Validation: 85 Rust tests, strict Clippy, formatting, the query-plan audit,
+and 161 Python tests.
+
+## Bot identities
+
+2026-09-19. Bots gained a store-wide integer identity that is never reused
+after delete, and `submit` accepts `bot_id` so a retry pinned to an identity
+the name no longer holds is refused rather than started as fresh work on the
+namesake. The cost on the ordinary path is one primary-key lookup per
+submission, on the storage thread inside the same job as `begin`.
+
+The 32-agent socket echo screen, committed tree `c971efbe…` (rebuilt from a
+worktree) against the slice binary `e378e056…`, one excluded warmup and four
+measured runs each, run back to back on external power: RSS 18.00
+(17.77–18.64) versus 18.22 (18.11–18.25) MiB, CPU 0.313 (0.303–0.318) versus
+0.313 (0.301–0.321) s, p95 590.3 (588.8–620.0) versus 590.5 (585.8–654.8) ms.
+Level within noise. The slice binary also carries the items 11 and 12 changes
+screened above. Captures: ignored `.local/bench/slice-prev12-socket-32/` and
+`slice-identity-socket-32/`.
+
+Validation: 86 Rust tests, strict Clippy, formatting, the query-plan audit,
+and 163 Python tests.
+
+### Identity migration at fleet scale
+
+2026-09-19 follow-up. The first schema-21 backfill counted every preceding bot
+for every row, making startup quadratic. It now copies each existing row ID
+once and seeds allocation from `MAX(id)`, preserving deletion gaps. Empty
+stores start at zero. This changes only migration; ordinary turn execution and
+already-migrated stores take the same paths as before.
+
+Two runs per binary in ABBA order, using fresh copies of the same schema-20
+store with 40,000 idle bots, empty instructions, and no turns. Pre-fix binary
+`e378e056…`, candidate `ad6cff8f…`, Darwin arm64, Rust 1.98.0. No warmups excluded.
+Readiness measures process spawn through the stdio `ready` event. CPU and peak
+RSS use `/usr/bin/time -l` through clean shutdown; CPU has 0.01-second reporting
+resolution. No provider requests occur. Every migrated store was checked for
+40,000 distinct positive IDs and a sequence matching the maximum assigned ID.
+
+| Metric | Before, two runs | After, two runs |
+| --- | ---: | ---: |
+| Ready | 18.766 / 18.721 s | 0.346 / 0.054 s |
+| CPU | 18.28 / 18.29 s | 0.04 / 0.03 s |
+| Peak RSS | 14.39 / 14.41 MiB | 14.33 / 14.30 MiB |
+
+The CLI's automatic migration/startup path on another identical copy completed
+`turns --bot b0` in 0.063 s, below its 10-second deadline. These are migration
+measurements, not active-agent throughput claims. Captures and comparison
+script: ignored `.local/review-identities/`.
+
+Validation: 41 store-contract tests, strict Clippy, formatting, diff checks,
+and the real CLI startup probe. Regression coverage includes sparse and empty
+stores, allocation and forking after migration, and non-reuse after deleting
+the highest identity and restarting.

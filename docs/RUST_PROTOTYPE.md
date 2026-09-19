@@ -114,7 +114,8 @@ A blocking `run` exits 0 when it observes the turn completed, 1 when it fails,
 is interrupted or loses its connection, and
 2 for usage errors. A connection error means the outcome was not observed;
 it does not assert that execution failed or cancel the turn. `--request-id` makes a
-submission idempotent across retries.
+submission idempotent across retries; `--bot-id N` pins the retry to the bot
+identity it was first made against (see below).
 
 The `follow` CLI snapshots the running turn before subscribing and waits for
 that turn's `turn_finished` event, whether delivered during replay or live.
@@ -126,7 +127,10 @@ A bot is an identity with a retained conversation: every turn appends to it.
 `--bot NAME` continues that bot and fails with `bot_not_found` if it does not
 exist; `--new --bot NAME` creates it and fails with `bot_exists` if the name is
 taken; no `--bot` creates a fresh generated identity. A typo can therefore never
-silently start an empty conversation under a familiar name.
+silently start an empty conversation under a familiar name. Names are the
+address; the identity is a store-wide integer `id` that `create`, `fork`,
+`resume`, `bots`, and every `submit` answer report, and that is never reused
+after a delete. A fork is a new identity with an empty request namespace.
 
 A bot is not bound to a directory. Each turn runs in the directory `run` was
 invoked from (or `--workspace`), so the same conversation can continue in a new
@@ -202,8 +206,14 @@ can be waited on more than once, and daemon memory holds only in-flight
 commands. Completion commits the result and its overflow artifacts in one
 transaction before waking waiters. A persistence failure stops the daemon with
 an error and disconnects clients. After storage is repaired, restart marks an
-unrecorded completion as `process_lost`; it never reruns the command, whose
-external effects may already have happened.
+unrecorded completion as `process_lost`. The code means supervision ended: the
+daemon no longer owns the process and its result will never be recorded. It is
+not evidence that the OS process stopped or that its effects did not happen. The
+process-group kill runs only when the daemon itself drops the command, so a hard
+kill of the daemon leaves its children running, possibly still writing to the
+workspace. The daemon never reruns the command, and a controller must not read
+`process_lost` as permission to start conflicting work in that workspace;
+inspect the workspace first.
 Waiters share immutable completed outcomes, including when they register after
 completion. The last waiter releases the shared outcome; the daemon does not
 cache past results indefinitely. Turn outcome queries use an index on turn,
@@ -211,7 +221,8 @@ event kind, and cursor rather than scanning unrelated agents' events.
 Parked turns survive a daemon restart: they are re-registered at
 startup, peer handles resolve from durable state (a peer interrupted by the
 restart reports `interrupted`), and commands that were still running resolve
-to `process_lost` because they died with the daemon. Interrupting a parked
+to `process_lost`: their supervision ended with the daemon, whether or not the
+OS process did. Interrupting a parked
 turn ends it as `interrupted`: the wait and any planned calls behind it get a
 `cancelled` tool result in the same transaction, so the conversation stays
 valid and the bot is not left uncertain. A bot whose turn is parked reports
@@ -267,6 +278,9 @@ example `["12/call_abc/stdout"]`, and the model can page through one with
 `read` by passing `artifact` instead of `path`. Artifact reads allow the producing
 bot or a branch containing the original tool-result node. Historical forks can
 read inherited outputs, but cannot read later source turns or unrelated branches.
+A stream the call never retained answers `artifact_not_found`, a turn outside
+the reader's lineage `turn_not_found`, and a turn whose records retention has
+removed `artifact_pruned` (see Retention).
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
@@ -607,7 +621,11 @@ creates no workspace or historical side effects.
 
 Submission is idempotent on `(bot, request_id)`. An identical retry returns the
 same turn without executing again, including after restart. Reusing that key
-with a different prompt, workspace, or model fails. `workspace` and `model` on
+with a different prompt, workspace, or model fails. A retry may carry `bot_id`,
+the identity the name had when the request was first made: if the name has
+since been deleted and recreated, the retry answers `bot_not_found` with the
+current identity in `detail`, instead of starting fresh work on the namesake.
+Without `bot_id` a submission addresses whoever holds the name now. `workspace` and `model` on
 `submit` are optional per-turn overrides of the bot's defaults; the `accepted`
 event records the values actually used. Duplicate reconciliation still works when all active
 turn slots are occupied; capacity rejection never writes a fresh submission.
@@ -699,7 +717,10 @@ retained usage events, checking them against durable turn and bot totals. If
 pruning or invalid records make those totals unrecoverable, opening fails with
 `store_migration_usage_unavailable` and leaves data and schema intact; keep
 that store and use a new store path. Usage events are streamed through their
-turn index, without loading the transcript. The migration is the only code that
+turn index, without loading the transcript. Schema 21 copies existing bot row IDs
+in one pass, preserving creation order and gaps from deletion, and starts the
+identity sequence above the highest assigned ID (zero for an empty store).
+The migration is the only code that
 knows an earlier format. The store records no daemon-wide provider set or
 toolset; each bot retains its tools, and its provider is checked by family
 when its turn starts.
@@ -925,10 +946,22 @@ needs, and one optional policy composes them:
   Queued wake-ups for interrupted or deleted turns are discarded when capacity
   opens; reusing a bot name cannot resume its old turn. This internal check
   does not change explicit `resume` requests: a missing bot returns `bot_not_found`.
+  The bot's turn rows go with it, so a late retry of one of its requests (the
+  same `bot` and `request_id`) answers `bot_not_found`, never the old outcome
+  or a duplicate turn. If the name was recreated meanwhile, a retry carrying
+  the old `bot_id` is still refused; one without it is fresh work on the new
+  identity.
 - `prune {bot, keep_turns}` protects the unfinished suffix (running, parked,
   ready, and queued work) and keeps the `keep_turns` finished turns preceding
   it. With no unfinished work it keeps the newest `keep_turns` turns by
   submission ID. It drops older events, tool intents, finished processes, and artifacts.
+  An artifact read for a turn retention has emptied answers `artifact_pruned`,
+  whether the reader is the producing bot or a fork that inherited the output,
+  through the protocol `artifact` operation or the model's `read`. The answer
+  comes from the transcript nodes retention keeps, so it stays distinct from
+  `artifact_not_found` (the call retained no such stream) and `turn_not_found`
+  (the turn is outside the reader's lineage). Deleting the producing bot after
+  a fork inherited its output answers the same way.
   Queuing new work or cancelling a later queued turn cannot prune a live
   turn's tool intents or move retention past work that has not finished.
   A completion's own retention pass never removes that turn's records:
