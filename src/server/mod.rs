@@ -470,7 +470,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
     let mut paced_at_start = Vec::new();
-    for waiting in store.call(|db| db.waiting_turns()).await? {
+    for waiting in store.op("waiting_turns", |db| db.waiting_turns()).await? {
         if waiting.paced_since_ms.is_some() {
             paced_at_start.push((waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn));
             continue;
@@ -536,7 +536,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
                 // Idle means no client, no live turn, and no running command.
                 // Parked turns are durable and resume on the next start.
-                let running = service.store.call(|db| db.running_processes()).await?;
+                let running = service.store.op("running_processes", |db| db.running_processes()).await?;
                 if sessions.is_empty() && service.active.is_empty() && running == 0 {
                     if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                 } else {
@@ -697,7 +697,9 @@ impl Service {
         // Check only its identity and state, without loading the full bot.
         let pending = self
             .store
-            .call(move |db| Ok(db.can_resume(&bot, turn)?.then_some(bot)))
+            .op("can_resume", move |db| {
+                Ok(db.can_resume(&bot, turn)?.then_some(bot))
+            })
             .await?;
         if let Some(bot) = pending {
             self.spawn(bot, turn, true, false);
@@ -709,14 +711,16 @@ impl Service {
     /// A turn that cannot start (its bot's outcome uncertain, budget spent)
     /// ends with that error; the bot's next queued turn takes its place.
     async fn dispatch_ready(&mut self) -> Result<()> {
-        let Some((bot, turn)) = self.store.call(|db| db.next_ready()).await? else {
+        let Some((bot, turn)) = self.store.op("next_ready", |db| db.next_ready()).await? else {
             self.ready_hint = false;
             return Ok(());
         };
         let providers = self.providers.clone();
         match self
             .store
-            .call(move |db| db.start(turn, |bot, model| validate_provider(&providers, bot, model)))
+            .op("start", move |db| {
+                db.start(turn, |bot, model| validate_provider(&providers, bot, model))
+            })
             .await
         {
             Ok((_, steers)) => self.spawn(bot, turn, false, steers),
@@ -728,7 +732,7 @@ impl Service {
                 let check = bot.clone();
                 if matches!(
                     self.store
-                        .call(move |db| db.turn_status(&check, turn))
+                        .op("turn_status", move |db| db.turn_status(&check, turn))
                         .await
                         .as_deref(),
                     Ok("queued" | "ready")
@@ -746,7 +750,7 @@ impl Service {
         let keep = self.retain_turns;
         let steers = self.active.get(&bot).map(|active| active.steers.clone());
         self.store
-            .call(move |db| {
+            .op("end_queued", move |db| {
                 db.end_queued(turn, &error)?;
                 // Removing an incompatible head can expose eligible steers.
                 // Re-arm this bot inside the committing job, before another
@@ -822,7 +826,9 @@ impl Service {
             turn::Exit::Finished(error) => {
                 let keep = self.retain_turns;
                 self.store
-                    .call(move |db| turn::Finished::record(db, &bot, turn, error.as_ref(), keep))
+                    .op("finish", move |db| {
+                        turn::Finished::record(db, &bot, turn, error.as_ref(), keep)
+                    })
                     .await?;
                 // Interrupt may already have released the task's active slot.
                 // Finishing still promotes queued work in that case.
@@ -879,7 +885,7 @@ impl Service {
                 self.registry.validate(&tools)?;
                 let (provider, model) = (provider.to_owned(), model.to_owned());
                 let (created, event) = store
-                    .call(move |db| {
+                    .op("create", move |db| {
                         db.create(
                             &bot,
                             path.as_deref(),
@@ -900,7 +906,9 @@ impl Service {
             }
             Command::Turns { bot, after, limit } => {
                 store
-                    .call(move |db| db.turns(&bot, after, limit.unwrap_or(64)))
+                    .op("turns", move |db| {
+                        db.turns(&bot, after, limit.unwrap_or(64))
+                    })
                     .await
             }
             Command::Delete { bot } => {
@@ -908,7 +916,9 @@ impl Service {
                     return fail("bot_busy");
                 }
                 let name = bot.clone();
-                let deleted = store.call(move |db| db.delete_bot(&name)).await?;
+                let deleted = store
+                    .op("delete_bot", move |db| db.delete_bot(&name))
+                    .await?;
                 // Followers learn the bot is gone; nothing durable remains to replay.
                 self.hub
                     .live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))
@@ -916,26 +926,33 @@ impl Service {
                 Ok(deleted)
             }
             Command::Prune { bot, keep_turns } => {
-                store.call(move |db| db.prune(&bot, keep_turns)).await
+                store
+                    .op("prune", move |db| db.prune(&bot, keep_turns))
+                    .await
             }
             Command::Result { bot, turn } => {
                 store
-                    .call(move |db| match db.turn_outcome(&bot, turn)? {
-                        Some(outcome) => Ok(outcome),
-                        None => {
-                            let status = db.turn_status(&bot, turn)?;
-                            Ok(json!({"turn":turn,"status":status,"finished":false}))
+                    .op("turn_outcome", move |db| {
+                        match db.turn_outcome(&bot, turn)? {
+                            Some(outcome) => Ok(outcome),
+                            None => {
+                                let status = db.turn_status(&bot, turn)?;
+                                Ok(json!({"turn":turn,"status":status,"finished":false}))
+                            }
                         }
                     })
                     .await
             }
             Command::Resume { bot } => {
                 store
-                    .call(move |db| Ok(serde_json::to_value(db.inspect(&bot)?)?))
+                    .op("inspect", move |db| {
+                        Ok(serde_json::to_value(db.inspect(&bot)?)?)
+                    })
                     .await
             }
             Command::Stats => {
-                let (waiting, running, queued, paced) = store.call(|db| db.counts()).await?;
+                let (waiting, running, queued, paced) =
+                    store.op("counts", |db| db.counts()).await?;
                 let (waiters, retained) = self.handles.stats();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
@@ -994,7 +1011,9 @@ impl Service {
             }
             Command::Bots { after, limit } => {
                 store
-                    .call(move |db| db.list(after.as_deref(), limit.unwrap_or(64)))
+                    .op("list", move |db| {
+                        db.list(after.as_deref(), limit.unwrap_or(64))
+                    })
                     .await
             }
             Command::Fork {
@@ -1010,7 +1029,7 @@ impl Service {
                 name(&bot)?;
                 let path = path.as_deref().map(workspace).transpose()?;
                 let (created, event) = store
-                    .call(move |db| {
+                    .op("fork", move |db| {
                         db.fork(&source, checkpoint, &bot, path.as_deref(), budget_tokens)
                     })
                     .await?;
@@ -1018,9 +1037,11 @@ impl Service {
                 Ok(serde_json::to_value(created)?)
             }
             Command::Events { bot, after, limit } => {
-                store.call(move |db| db.events(&bot, after, limit)).await
+                store
+                    .op("events", move |db| db.events(&bot, after, limit))
+                    .await
             }
-            Command::Item { bot, node } => store.call(move |db| db.item(&bot, node)).await,
+            Command::Item { bot, node } => store.op("item", move |db| db.item(&bot, node)).await,
             Command::Artifact {
                 bot,
                 turn,
@@ -1030,7 +1051,7 @@ impl Service {
                 limit,
             } => {
                 store
-                    .call(move |db| match stream {
+                    .op("artifact_page", move |db| match stream {
                         Some(stream) => db.artifact_page(
                             &bot,
                             turn,
@@ -1051,7 +1072,7 @@ impl Service {
                 // `*` follows every bot from a store-wide cursor.
                 if bot != hub::ALL {
                     let check = bot.clone();
-                    store.call(move |db| db.inspect(&check)).await?;
+                    store.op("inspect", move |db| db.inspect(&check)).await?;
                 }
                 let sub = self.hub.subscribe(&bot, session, output.clone(), after);
                 let (store, hub, replay_bot, output) =
@@ -1102,7 +1123,7 @@ impl Service {
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
                 let started = store
-                    .call(move |db| {
+                    .op("begin", move |db| {
                         db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
                             validate_provider(&providers, bot, model)
                         })
@@ -1143,7 +1164,7 @@ impl Service {
                 // An unknown id is judged below against the bot's state.
                 let check = bot.clone();
                 let status = store
-                    .call(move |db| db.turn_status(&check, turn))
+                    .op("turn_status", move |db| db.turn_status(&check, turn))
                     .await
                     .unwrap_or_default();
                 if matches!(status.as_str(), "queued" | "ready") {
@@ -1155,7 +1176,7 @@ impl Service {
                 }
                 // A parked turn has no task; confirm durable state and end it.
                 let check = bot.clone();
-                let state = store.call(move |db| db.inspect(&check)).await?;
+                let state = store.op("inspect", move |db| db.inspect(&check)).await?;
                 if state.running_turn.is_none() {
                     return fail("no_active_turn");
                 }
@@ -1168,7 +1189,7 @@ impl Service {
                 let name = bot.clone();
                 let keep = self.retain_turns;
                 store
-                    .call(move |db| {
+                    .op("finish", move |db| {
                         turn::Finished::record(
                             db,
                             &name,
@@ -1241,7 +1262,7 @@ mod tests {
         ));
         let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let turn = store
-            .call(|db| {
+            .op("create", |db| {
                 db.create(
                     "Bob",
                     Some("/synthetic"),
@@ -1351,7 +1372,7 @@ mod tests {
         assert!(service.has_capacity());
         assert_eq!(service.jobs.join_next().await.unwrap().unwrap().1, turn);
         let next = store
-            .call(move |db| {
+            .op("inspect", move |db| {
                 let state = db.inspect("Bob")?;
                 assert_eq!(state.status, "interrupted");
                 assert_eq!(state.running_turn, None);
@@ -1402,7 +1423,13 @@ mod tests {
             .await
             .unwrap();
         assert!(service.ready_hint);
-        assert!(store.call(|db| db.next_ready()).await.unwrap().is_some());
+        assert!(
+            store
+                .op("next_ready", |db| db.next_ready())
+                .await
+                .unwrap()
+                .is_some()
+        );
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1422,7 +1449,7 @@ mod tests {
             tools: &[],
         };
         let turn = store
-            .call(move |db| {
+            .op("create", move |db| {
                 db.create("Bob", Some("/synthetic"), binding())?;
                 db.create("Other", Some("/synthetic"), binding())?;
                 Ok(db
@@ -1527,7 +1554,7 @@ mod tests {
         assert!(service.jobs.is_empty());
         assert!(
             store
-                .call(|db| Ok(db.inspect("Other")?.head.is_none()))
+                .op("inspect", |db| Ok(db.inspect("Other")?.head.is_none()))
                 .await
                 .unwrap()
         );

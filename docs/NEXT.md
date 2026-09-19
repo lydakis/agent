@@ -340,8 +340,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 19. Add equivalent lifecycle adapters for Pi/Codex only where native semantics
     can satisfy the same contract. Unsupported guarantees remain an explicit
     gap.
-20. The daemon supplies no implicit agent behavior. Next after item 23,
-    ahead of 13. The split that pays is mechanism in the daemon and policy
+20. Done: the daemon supplies no implicit agent behavior. The split that pays is mechanism in the daemon and policy
     in the client: anything that must be true for every client at once
     (durable truth, shared pacing and pooling, processes, cancellation, the
     model and tool loop, the per-turn invariants, resource limits and
@@ -416,14 +415,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     what the next request carries; the same is true of any turn whose own
     items outgrow the window. Budget the boundary against encoded context,
     leaving excess steers queued, as part of the compaction work.
-27. Storage counters by operation. `stats` reports the worker's cumulative
-    jobs, queued time, and ran time, which cannot show whether a few long
-    retention or history jobs dominate the tail, or separate database CPU
-    from disk wait. Label each job by operation and keep a small latency
-    histogram per label (fixed log-spaced buckets, no allocation per job),
-    so a fleet controller can see which operations are slow and how often.
-    Pays for itself in the store-scale screen (item 3). (From the second
-    Astra Pro review.)
+27. Done: storage counters by operation. Every store job is labeled by
+    the method it performs, and `stats` reports per operation the count,
+    queued and ran totals, the slowest run, and two fourteen-bucket
+    log-spaced latency histograms, at one short lock per job. Totals and
+    histograms come from one consistent snapshot, formatted outside the lock. The
+    store-scale screen (item 3) reads them. (From the second Astra Pro
+    review.)
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

@@ -208,14 +208,16 @@ impl Turn {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
             // Commit the park and its accounting together, outside cancellation.
             self.store
-                .call(move |db| {
+                .op("suspend_paced", move |db| {
                     db.suspend_paced(turn, at, attempts, spent, retries, paced_ms)
                         .map(|_| ())
                 })
                 .await
         } else if retries > 0 || paced_ms > 0 {
             self.store
-                .call(move |db| db.note_pacing(turn, retries, paced_ms))
+                .op("note_pacing", move |db| {
+                    db.note_pacing(turn, retries, paced_ms)
+                })
                 .await
         } else {
             Ok(())
@@ -248,7 +250,9 @@ impl Turn {
         let (bot, bytes, count) = (self.bot.clone(), self.context_bytes, self.context_items);
         let window = self
             .store
-            .call(move |db| db.window(&bot, bytes as i64, count as i64))
+            .op("window", move |db| {
+                db.window(&bot, bytes as i64, count as i64)
+            })
             .await?;
         let Some(Window {
             family,
@@ -283,7 +287,7 @@ impl Turn {
                 let store = store.clone();
                 async move {
                     let mut bytes = store
-                        .call(move |db| db.items_by_ids(&chunk))
+                        .op("items_by_ids", move |db| db.items_by_ids(&chunk))
                         .await
                         .map_err(|error| std::io::Error::other(error.code))?;
                     if index != 0 {
@@ -301,8 +305,8 @@ impl Turn {
 
     async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
-        let mut record = self.store.call(move |db| db.inspect(&bot)).await?;
-        let context = self.store.call(move |db| db.context(turn)).await?;
+        let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
+        let context = self.store.op("context", move |db| db.context(turn)).await?;
         let (provider, model) = split_model(&context.model)?;
         let provider = self
             .providers
@@ -321,11 +325,12 @@ impl Turn {
         // needs a model for the peer, and the natural default is its own.
         let environment = vec![("AGENT_MODEL".to_owned(), context.model.clone())];
         if self.resume {
-            let (waiting, _, steers) = match self.store.call(move |db| db.resume(turn)).await {
-                Ok(resumed) => resumed,
-                Err(error) if error.code == "turn_not_waiting" => return Ok(Round::Parked),
-                Err(error) => return Err(error),
-            };
+            let (waiting, _, steers) =
+                match self.store.op("resume", move |db| db.resume(turn)).await {
+                    Ok(resumed) => resumed,
+                    Err(error) if error.code == "turn_not_waiting" => return Ok(Round::Parked),
+                    Err(error) => return Err(error),
+                };
             if steers {
                 // Queued while parked: absorbed at the first boundary below.
                 self.steers.store(true, Relaxed);
@@ -338,7 +343,7 @@ impl Turn {
                 let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
                 let id = waiting.call_id;
                 self.store
-                    .call(move |db| db.tool_finish(turn, &id, &outcome))
+                    .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                     .await?;
                 // Calls that followed the wait in the same model response.
                 if self
@@ -385,7 +390,9 @@ impl Turn {
             let usage = response.usage.clone();
             if let Err(error) = self
                 .store
-                .call(move |db| db.append(turn, items, &calls, usage.as_ref()))
+                .op("append", move |db| {
+                    db.append(turn, items, &calls, usage.as_ref())
+                })
                 .await
             {
                 self.failed_usage(response.usage.clone()).await?;
@@ -422,7 +429,10 @@ impl Turn {
         let mut through = None;
         let mut steered = false;
         loop {
-            let absorbed = self.store.call(move |db| db.absorb(turn, through)).await?;
+            let absorbed = self
+                .store
+                .op("absorb", move |db| db.absorb(turn, through))
+                .await?;
             through = absorbed.next_through;
             steered |= !absorbed.outcomes.is_empty();
             // Release the batch before loading another; new arrivals beyond
@@ -573,7 +583,7 @@ impl Turn {
         if let Some(usage) = usage {
             let turn = self.turn;
             self.store
-                .call(move |db| db.failed_usage(turn, &usage))
+                .op("failed_usage", move |db| db.failed_usage(turn, &usage))
                 .await?;
         }
         Ok(())
@@ -593,7 +603,7 @@ impl Turn {
         while let Some(call) = calls.next() {
             let started = call.clone();
             self.store
-                .call(move |db| db.tool_start(turn, &started))
+                .op("tool_start", move |db| db.tool_start(turn, &started))
                 .await?;
             // A tool failure is a result the model can act on. Only the
             // scheduler closing is a runtime failure. The bot's selection is
@@ -652,7 +662,7 @@ impl Turn {
                     let bot = self.bot.clone();
                     let text = self
                         .store
-                        .call(move |db| {
+                        .op("artifact_lines", move |db| {
                             db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
                         })
                         .await;
@@ -682,7 +692,7 @@ impl Turn {
             };
             let id = call.call_id;
             self.store
-                .call(move |db| db.tool_finish(turn, &id, &outcome))
+                .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                 .await?;
         }
         Ok(false)
@@ -703,7 +713,7 @@ impl Turn {
         );
         let (family, budget, mut page) = self
             .store
-            .call(move |db| {
+            .op("turn_usage", move |db| {
                 let (family, used, count) = db.turn_usage(&bot, turn)?;
                 // Reserve half the remaining bytes for subsequent model/tool work.
                 // Account against this turn only: older turns can leave the window.
@@ -770,7 +780,9 @@ impl Turn {
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
         let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
         self.store
-            .call(move |db| db.suspend(turn, &id, &list, deadline_ms, any, &pending))
+            .op("suspend", move |db| {
+                db.suspend(turn, &id, &list, deadline_ms, any, &pending)
+            })
             .await?;
         self.handles
             .attach(
@@ -803,7 +815,7 @@ impl Turn {
         let (turn, started) = (self.turn, call_id.to_owned());
         let id = self
             .store
-            .call(move |db| db.process_start(turn, &started))
+            .op("process_start", move |db| db.process_start(turn, &started))
             .await?;
         let (sender, receiver) = oneshot::channel();
         self.registry
@@ -834,7 +846,9 @@ impl Turn {
             // Report storage failures to the service instead of stranding waiters.
             let recorded = value.clone();
             match store
-                .call(move |db| db.process_finish(id, &recorded, &artifacts))
+                .op("process_finish", move |db| {
+                    db.process_finish(id, &recorded, &artifacts)
+                })
                 .await
             {
                 Ok(()) => handles.process_finished(id, value),
@@ -935,7 +949,7 @@ mod tests {
         let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
         let (turn, steers) =
             store
-                .call(|db| {
+                .op("create", |db| {
                     db.create(
                         "Bob",
                         Some("/synthetic"),
@@ -1035,7 +1049,7 @@ mod tests {
         let last = steers[31];
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while store
-                .call(move |db| db.turn_status("Bob", last))
+                .op("turn_status", move |db| db.turn_status("Bob", last))
                 .await
                 .unwrap()
                 != "steered"

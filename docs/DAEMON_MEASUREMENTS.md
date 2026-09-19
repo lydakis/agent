@@ -2338,3 +2338,79 @@ Clippy, formatting, and diff checks passed. The new burst regression failed
 with the cap and now admits 128 requests without waiting for any headers.
 The caller-selected startup-bound test again starts cold, without a warmup;
 pacing, retry, interruption, and restart tests continue to pass.
+
+## Storage counters by operation
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0. Every
+store job now carries the name of the store method it performs, and the
+worker keeps per label a count, queued and ran totals, the slowest run, and
+two fourteen-bucket log-spaced latency histograms (bounds in `buckets_us`,
+100 µs to 1 s), reported by `stats` under `store.operations`. Per job that
+is one uncontended lock and a few adds after the three clock reads it
+already paid; the map allocates once per distinct operation.
+
+A sample from sixteen bots running four two-round `shell` turns each
+against the instant synthetic model, the eight busiest operations by time
+run (percentiles read from the histograms):
+
+| Operation | Jobs | Ran, ms | Slowest, ms | Ran p50 | Ran p99 | Queued p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `append` | 128 | 28 | 0 | <250us | <500us | <2500us |
+| `begin` | 64 | 17 | 0 | <500us | <1000us | <2500us |
+| `finish` | 64 | 17 | 0 | <250us | <1000us | <2500us |
+| `tool_finish` | 64 | 12 | 0 | <250us | <500us | <2500us |
+| `tool_start` | 64 | 10 | 0 | <250us | <500us | <2500us |
+| `window` | 128 | 5 | 0 | <100us | <500us | <2500us |
+| `create` | 16 | 2 | 0 | <250us | <250us | <100us |
+| `items_by_ids` | 128 | 2 | 0 | <100us | <100us | <2500us |
+
+The screen the item was written for is the store-scale one (item 3); this
+sample shows the shape a controller sees: which operations are slow, how
+often, and whether the wait was in the queue or on the disk.
+
+The 32-agent socket echo screen, committed tree `ad739fa2…` (rebuilt from a
+worktree) against the slice binary `c47c1be0…`, one excluded warmup and four
+measured runs each: RSS 17.77 (17.73–17.81) versus 17.92 (17.83–17.95) MiB,
+CPU 0.309 (0.290–0.322) versus 0.315 (0.304–0.326) s, p95 593.4
+(591.6–644.0) versus 593.0 (589.8–597.8) ms. Level within noise; RSS is up
+about 150 KiB, inside this screen's own spread. Captures: ignored
+`.local/bench/slice-prev9-socket-32/` and `slice-counters-socket-32/`.
+
+Validation: 83 Rust tests, strict Clippy, formatting, and 159 Python tests.
+The fleet stats test now checks that every job is counted under its method,
+that each histogram's buckets sum to that method's count, and that the
+per-operation counts sum to the worker's job count.
+
+### Consistent counter snapshots
+
+Review follow-up, 2026-09-19: aggregate atomics and operation counters could
+describe different instants. A concurrent regression failed before the fix
+with 382 total jobs and 495 in the operation breakdown. Stats now copies the
+operation records under one short lock, then derives totals and formats JSON
+outside it. This removes three atomic updates per job. Totals sum nanoseconds
+before rounding; independently rounded operation times can still differ from
+the rounded total by less than one millisecond per operation.
+
+The release probe performed 10,000 storage jobs while repeatedly reading
+stats: the original run found 620 inconsistent snapshots in 61,099 reads;
+the fixed run found none in 61,880. Read counts depend on scheduling; this
+probe establishes reconciliation, not relative throughput.
+
+Matched 32-agent socket echo screen on Darwin arm64, external power,
+Rust 1.98.0: pre-fix binary `c47c1be0…` versus fixed `561c7be0…`, in
+before/after/after/before batches. Each batch excluded one warmup and measured
+two runs, for four measured runs per binary. Identical three-turn workloads
+completed with the lifecycle and follower/replay checks intact. Median
+(minimum–maximum):
+
+| Metric | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms | 282.9 (279.0–290.7) | 284.9 (280.2–300.0) |
+| Sampled peak RSS, MiB | 17.89 (17.88–17.94) | 17.95 (17.84–18.00) |
+| Per-run p95 turn latency, ms | 588.16 (586.11–589.61) | 588.22 (586.64–589.64) |
+
+The ranges overlap; this screen establishes neither a regression nor a
+speedup. It does not measure sustained high-frequency stats polling. Captures,
+binary hashes, and probes are in ignored `.local/review-store-counters/`.
+Validation: 84 Rust tests, two focused daemon stats tests, strict Clippy,
+formatting, and diff checks passed.

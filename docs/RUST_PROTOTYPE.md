@@ -527,10 +527,18 @@ does not, and each is one op:
   while the shared transport load continues through stream completion.
   Stats also reports the store's on-disk and WAL sizes with the storage worker's
   job count and its time queued versus time running (whether the worker or
-  the disk is the bottleneck), and the handle registry's size. `agent stats
+  the disk is the bottleneck), the same per operation under `operations`
+  (each store method's count, queued and ran totals, slowest run, and two
+  fourteen-bucket latency histograms, `ran` and `queued`, over the
+  log-spaced bounds in `buckets_us`, so a controller can see which jobs
+  make the tail and how often), and the handle registry's size. `agent stats
   [--pretty]`. Store sizes use the canonical database path established at
   open, including when the caller used a symlink. The counters cost three
-  clock reads per storage job.
+  clock reads and one short lock per storage job, and allocate only the
+  first time an operation is seen. Stats copies the operation records under
+  that lock, then derives totals and builds JSON outside it. The totals and
+  histograms describe the same snapshot; time totals are summed before
+  rounding to milliseconds.
 
 Protocol version 3 changes `bots` to return `{bots, next_after}`. It pages by
 name, with a default limit of 64, maximum 256, and a 512 KiB encoded metadata
