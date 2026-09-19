@@ -312,6 +312,8 @@ struct Service {
     next_task: u64,
     jobs: JoinSet<(String, i64, u64, turn::Exit)>,
     replays: JoinSet<()>,
+    /// Retention tasks own outputs and must release them before stdout joins.
+    retention: JoinSet<()>,
     /// A turn may be ready to start: set whenever a slot opens or a turn
     /// is queued, cleared when the store has none. Keeps the idle loop free
     /// of a store read per iteration.
@@ -508,6 +510,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         next_task: 0,
         jobs: JoinSet::new(),
         replays: JoinSet::new(),
+        retention: JoinSet::new(),
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
@@ -530,6 +533,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
             Some(error) = failures.recv() => return Err(error),
             _ = service.replays.join_next(), if !service.replays.is_empty() => {}
+            _ = service.retention.join_next(), if !service.retention.is_empty() => {}
             joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
                 let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
                 service.complete(bot, turn, task, exit).await?;
@@ -612,6 +616,10 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
         }
     }
+    // Committed pieces survive cancellation. Deletion resumes at next open;
+    // explicit pruning can be reissued. Await drops before joining stdout.
+    service.retention.abort_all();
+    while service.retention.join_next().await.is_some() {}
     for active in service.active.values() {
         let _ = active.cancel.send(true);
     }
@@ -918,20 +926,90 @@ impl Service {
                 if self.active.contains_key(&bot) {
                     return fail("bot_busy");
                 }
+                // One bounded piece per job, on a task of its own, so other
+                // bots' requests and commits interleave with a large deletion
+                // instead of waiting behind this loop; the bot refuses work
+                // from the first piece. The response is sent when it is done.
                 let name = bot.clone();
-                let deleted = store
-                    .op("delete_bot", move |db| db.delete_bot(&name))
+                // Capture identity before spawning, but leave artifact deletion
+                // off the dispatch path so other clients are not held behind it.
+                let bot_id = store
+                    .op("inspect", move |db| Ok(db.inspect(&name)?.id))
                     .await?;
-                // Followers learn the bot is gone; nothing durable remains to replay.
-                self.hub
-                    .live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))
-                    .await?;
-                Ok(deleted)
+                let (store, hub, output) = (store.clone(), self.hub.clone(), output.clone());
+                self.retention.spawn(async move {
+                    let result = async {
+                        let mut deleted = json!({"turns":0,"events":0,"nodes":0});
+                        loop {
+                            let name = bot.clone();
+                            let piece = store
+                                .op("delete_bot", move |db| {
+                                    db.delete_bot_piece(
+                                        &name,
+                                        bot_id,
+                                        agent_runtime::store::Database::RETENTION_PIECE,
+                                    )
+                                })
+                                .await?;
+                            for key in ["turns", "events", "nodes"] {
+                                deleted[key] = json!(
+                                    deleted[key].as_i64().unwrap_or(0)
+                                        + piece[key].as_i64().unwrap_or(0)
+                                );
+                            }
+                            if piece["done"] == true {
+                                break;
+                            }
+                        }
+                        // Followers learn the bot is gone; nothing durable remains to replay.
+                        hub.live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))
+                            .await?;
+                        Ok(deleted)
+                    }
+                    .await;
+                    retention_reply(session, &output, request_id, result).await;
+                });
+                Err(Error::new("deferred"))
             }
             Command::Prune { bot, keep_turns } => {
-                store
-                    .op("prune", move |db| db.prune(&bot, keep_turns))
-                    .await
+                // Pieces of turns, oldest first, each its own job, on a task
+                // of its own for the same reason as deletion.
+                let name = bot.clone();
+                let bot_id = store
+                    .op("identity", move |db| db.identity(&name, None))
+                    .await?;
+                let (store, output) = (store.clone(), output.clone());
+                self.retention.spawn(async move {
+                    let result = async {
+                        let mut after = 0;
+                        let mut events = 0;
+                        loop {
+                            let name = bot.clone();
+                            let piece = store
+                                .op("prune", move |db| {
+                                    db.prune_piece(
+                                        &name,
+                                        bot_id,
+                                        keep_turns,
+                                        after,
+                                        agent_runtime::store::Database::RETENTION_PIECE,
+                                    )
+                                })
+                                .await?;
+                            events += piece["events"].as_i64().unwrap_or(0);
+                            match piece["next_after"].as_i64() {
+                                Some(next) => after = next,
+                                None => {
+                                    return Ok(json!({"events":events,
+                                        "pruned_cursor":piece["pruned_cursor"]}));
+                                }
+                            }
+                        }
+                    }
+                    .await;
+                    retention_reply(session, &output, request_id, result).await;
+                });
+                Err(Error::new("deferred"))
             }
             Command::Result { bot, turn } => {
                 store
@@ -1214,9 +1292,79 @@ impl Service {
     }
 }
 
+/// Match ordinary replies: the stdio owner (session zero) gets bounded
+/// backpressure; socket clients cannot hold up a reply task when they lag.
+async fn retention_reply(session: u64, output: &Output, id: Value, result: Result<Value>) {
+    let sent = if session == 0 {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), output.respond(id, result)).await,
+            Ok(Ok(()))
+        )
+    } else {
+        output.try_respond(id, result).is_ok()
+    };
+    if !sent {
+        output.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retention_replies_backpressure_stdio_but_evict_lagged_sockets() {
+        use tokio::io::AsyncBufReadExt;
+        for session in [0, 1] {
+            let (writer, reader) = tokio::io::duplex(1);
+            let output = Output::writer(writer);
+            let closed = output.subscribe_closed();
+            output.send(json!({"first":true})).await.unwrap();
+            // Block the writer on its first packet, then fill the queue.
+            tokio::task::yield_now().await;
+            while output.try_send(json!({"filler":true})).is_ok() {}
+            let response = output.clone();
+            let mut task = tokio::spawn(async move {
+                retention_reply(
+                    session,
+                    &response,
+                    json!("retention"),
+                    Ok(json!({"done":true})),
+                )
+                .await;
+            });
+            if session == 0 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), &mut task)
+                        .await
+                        .is_err()
+                );
+                assert!(!*closed.borrow());
+                let mut lines = BufReader::new(reader).lines();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let line = lines.next_line().await.unwrap().unwrap();
+                        let value: Value = serde_json::from_str(&line).unwrap();
+                        if value["id"] == "retention" {
+                            assert_eq!(value["result"]["done"], true);
+                            break;
+                        }
+                    }
+                    task.await.unwrap();
+                })
+                .await
+                .unwrap();
+                assert!(!*closed.borrow());
+            } else {
+                tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(*closed.borrow());
+            }
+            output.close();
+        }
+    }
 
     fn spec(spec: &str) -> (String, &'static str, String, Option<String>) {
         let parsed = ProviderSpec::parse(spec).unwrap();
@@ -1340,6 +1488,7 @@ mod tests {
             next_task: 1,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
+            retention: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
@@ -1517,6 +1666,7 @@ mod tests {
             next_task: 0,
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
+            retention: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),

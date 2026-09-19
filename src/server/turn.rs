@@ -287,7 +287,7 @@ impl Turn {
                 let store = store.clone();
                 async move {
                     let mut bytes = store
-                        .op("items_by_ids", move |db| db.items_by_ids(&chunk))
+                        .read("items_by_ids", move |db| db.items_by_ids(&chunk))
                         .await
                         .map_err(|error| std::io::Error::other(error.code))?;
                     if index != 0 {

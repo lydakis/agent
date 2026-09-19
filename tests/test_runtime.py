@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -374,6 +375,50 @@ class ModelFixture(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
+    def test_shutdown_cancels_pending_retention_without_stdin_eof(self):
+        client = self.client()
+        client.request('create', bot='Big')
+        client.request('shutdown')
+        client.close()
+        store = self.path / 'state.sqlite'
+        # Synthetic cancelled queued turns need no transcript. Enough small
+        # records to keep retention pending beyond shutdown's drain deadline,
+        # without allocating large artifacts or making provider calls.
+        with sqlite3.connect(store) as db:
+            db.execute("""WITH RECURSIVE n(x) AS (
+                VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000)
+                INSERT INTO turns(id,bot,request_id,prompt,status)
+                SELECT x,'Big',CAST(x AS TEXT),'p','cancelled' FROM n""")
+            db.execute('INSERT INTO retained_turns SELECT id,bot FROM turns')
+            db.execute('UPDATE turn_sequence SET last_id=1000000')
+        for operation in ('prune', 'delete'):
+            with self.subTest(operation=operation):
+                client = self.client()
+                try:
+                    client.next_id += 1
+                    request = {'id': client.next_id, 'op': operation, 'bot': 'Big'}
+                    if operation == 'prune':
+                        request['keep_turns'] = 1
+                    client.process.stdin.write(json.dumps(request) + '\n')
+                    client.process.stdin.flush()
+                    # Ensure at least one piece committed before asking to stop.
+                    label = 'delete_bot' if operation == 'delete' else 'prune'
+                    deadline = time.monotonic() + 5
+                    while True:
+                        ops = client.request('stats')['result']['store']['operations']
+                        if ops.get(label, {}).get('count', 0):
+                            break
+                        self.assertLess(time.monotonic(), deadline)
+                    self.assertTrue(client.request('shutdown')['result']['shutting_down'])
+                    self.assertFalse(client.process.stdin.closed)
+                    self.assertEqual(client.process.wait(timeout=3), 0)
+                    with sqlite3.connect(store) as db:
+                        self.assertGreater(db.execute('SELECT count(*) FROM retained_turns').fetchone()[0], 0)
+                        status = db.execute("SELECT status FROM bots WHERE name='Big'").fetchone()[0]
+                        self.assertEqual(status, 'deleting' if operation == 'delete' else 'idle')
+                finally:
+                    client.close(kill=True)
+
     def test_stdio_shutdown_with_background_work_releases_publisher_and_store(self):
         self.model.background_timeout_ms = 30000
         client = self.client('shell')
@@ -964,6 +1009,23 @@ class RuntimeTests(ModelFixture):
             # No retry or sleep after the terminal event should be necessary.
             self.assertIn('result', client.request('delete', bot='Bob'))
             later = new
+
+    def test_large_deletions_run_in_pieces_and_refuse_work_meanwhile(self):
+        client = self.client('echo,shell')
+        for bot in ('Big', 'Other'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        for n in range(40):
+            turn = client.request('submit', bot='Big', request_id=str(n), prompt='shell:printf big')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        before = client.request('stats')['result']['store']['operations'].get('delete_bot', {}).get('count', 0)
+        freed = client.request('delete', bot='Big')['result']
+        self.assertEqual(freed['turns'], 40)
+        after = client.request('stats')['result']['store']['operations']['delete_bot']['count']
+        # 40 turns of records in pieces of 16, then the turn rows, then nodes, then the bot.
+        self.assertGreaterEqual(after - before, 5)
+        self.assertEqual(client.request('resume', bot='Big')['error'], 'bot_not_found')
+        turn = client.request('submit', bot='Other', request_id='o', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
 
     def test_bot_identities_outlive_names_and_refuse_stale_retries(self):
         client = self.client()

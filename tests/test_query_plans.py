@@ -16,12 +16,16 @@ class QueryPlanTests(unittest.TestCase):
         queries = set(statements(source))
         for table in ('artifacts', 'processes', 'tools'):
             with self.subTest(table=table):
-                self.assertIn(f'DELETE FROM {table} WHERE turn IN (SELECT id FROM turns WHERE bot=?)', queries)
-                prune = (f'DELETE FROM {table} WHERE turn IN '
-                         '(SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)')
-                self.assertIn(prune + (" AND status!='running'" if table == 'processes' else ''), queries)
-        self.assertNotIn('DELETE FROM processes WHERE turn IN '
-                         '(SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)', queries)
+                self.assertIn(f'DELETE FROM {table} WHERE turn=?', queries)
+        self.assertIn("DELETE FROM processes WHERE turn=? AND status!='running'", queries)
+        # A prune never drops a running process; a deletion refuses a bot
+        # that still has one instead of filtering.
+        prune = source.split('fn prune_records(', 1)[1].split('\n    pub fn ', 1)[0]
+        self.assertNotIn('DELETE FROM processes WHERE turn=?")', prune)
+        self.assertIn("status!='running'", prune)
+        delete = source.split('fn delete_bot_piece_for(', 1)[1].split('\n    pub fn ', 1)[0]
+        self.assertIn("p.status='running'", delete)
+        self.assertNotIn("status!='running'", delete)
 
     def test_current_schema_passes_and_missing_indexes_fail(self):
         root = Path(__file__).resolve().parent.parent

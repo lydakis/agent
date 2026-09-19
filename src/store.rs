@@ -1,4 +1,5 @@
-//! One database worker for all agents. Durable writes never block the I/O runtime.
+//! One database worker for all agents, plus one reader for bulk context
+//! reads. Durable writes never block the I/O runtime.
 use crate::{Error, Result};
 use rusqlite::Connection;
 use std::{
@@ -14,6 +15,7 @@ pub use db::{
 };
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
+type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 /// Storage worker counters: how long jobs queued for the worker versus how
 /// long they ran on it, in total and per operation. The split says whether
 /// the worker or the disk is the bottleneck; the per-operation histograms
@@ -86,6 +88,7 @@ impl Counters {
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Job>,
+    reader: mpsc::Sender<ReadJob>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
 }
@@ -184,9 +187,39 @@ impl Store {
         let store_path = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
+        // A second connection on its own thread for reads that carry bytes
+        // rather than decide anything: streaming a context window out of
+        // the store must not hold every other bot's commit behind it. It
+        // opens after the worker, so the file, its WAL, and the current
+        // schema exist, and it sees each job's commit once that job is done.
+        let (reader, mut reads) = mpsc::channel::<ReadJob>(32);
+        let (ready, opened) = oneshot::channel();
+        let reader_path = store_path.clone();
+        std::thread::Builder::new()
+            .name("agent-storage-reader".into())
+            .spawn(move || {
+                let db = Connection::open(&reader_path)
+                    .map_err(Error::from)
+                    .and_then(Database::reader);
+                match db {
+                    Ok(db) => {
+                        let _ = ready.send(Ok(()));
+                        while let Some(job) = reads.blocking_recv() {
+                            job(&db);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            })?;
+        opened
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))??;
         Ok((
             Self {
                 sender,
+                reader,
                 path: std::sync::Arc::new(store_path),
                 counters: std::sync::Arc::default(),
             },
@@ -233,6 +266,33 @@ impl Store {
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?
     }
+    /// Run a read on the reader connection, counted like any job. Only for
+    /// reads whose result is bytes for a caller, never for decisions that
+    /// must see the write the caller is about to make.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (sender, receiver) = oneshot::channel();
+        let counters = self.counters.clone();
+        let queued = std::time::Instant::now();
+        self.reader
+            .send(Box::new(move |db| {
+                let started = std::time::Instant::now();
+                let _ = sender.send(operation(db));
+                counters.record(
+                    label,
+                    (started - queued).as_nanos() as u64,
+                    started.elapsed().as_nanos() as u64,
+                );
+            }))
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))?;
+        receiver
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))?
+    }
     /// A job without a named operation, counted as `other`.
     pub async fn call<T: Send + 'static>(
         &self,
@@ -250,8 +310,10 @@ mod tests {
     #[test]
     fn live_counter_snapshots_reconcile_totals_and_histograms() {
         let (sender, _receiver) = mpsc::channel(1);
+        let (reader, _reads) = mpsc::channel(1);
         let store = Store {
             sender,
+            reader,
             path: Arc::new(std::path::PathBuf::new()),
             counters: Arc::default(),
         };

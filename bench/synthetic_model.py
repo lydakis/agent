@@ -23,8 +23,8 @@ class Model(http.server.BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # includes the next keep-alive read after a deliberate kill
+        except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError):
+            pass  # includes the next keep-alive read, or a body cut short, after a deliberate kill
 
     def do_POST(self):
         self.reply()

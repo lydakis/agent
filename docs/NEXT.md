@@ -157,20 +157,19 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    compaction that rewrites the prefix every turn can cost more in cache
    misses than it saves in tokens. Also remaining: checkpoint indexes so
    forks and reads of very old turns stop walking node metadata.
-3. Store scale, in two steps. First, done: the
-   [query-plan audit](DAEMON_MEASUREMENTS.md#query-plan-audit), now covering
-   93 runtime statement variants, found four full scans by unindexed `status` (startup
-   recovery, parked-turn resumption, the idle-exit check); schema 12 adds
-   partial indexes on the active statuses, taking each from tens of
-   milliseconds per million rows to microseconds. Second, after compaction: a
-   store-scale screen that grows one
-   store with the synthetic provider to 1 GB and then 10 GB across thousands
-   of bots and, at each size, measures daemon start and recovery, submit to
-   finish latency, window construction, `bots` and `turns` paging, a fork, a
-   delete, and a migration, with RSS and WAL size sampled throughout. The
-   2 MiB page cache means the hot indexes eventually stop fitting; the screen
-   should find where that cliff is and how WAL checkpoints behave under hours
-   of writes. Seeding costs no provider spend, only background time.
+3. Done: store scale, in two steps. First, the
+   [query-plan audit](DAEMON_MEASUREMENTS.md#query-plan-audit), covering
+   93 runtime statement variants, found four full scans by unindexed `status`;
+   schema 12 added partial indexes on the active statuses. Second, the
+   [store-scale screen](DAEMON_MEASUREMENTS.md#store-scale): one store grown
+   to 1 GB and 10 GB across 4,104 bots. In the corrected mixed workload,
+   startup, recovery, and bounded paging took tens of milliseconds; sampled
+   daemon RSS peaked at 55.7 MiB. A heavy text turn averaged 8 ms of storage
+   work with a 7.24 MiB request body, at at most eight concurrent heavy turns.
+   Deleting a bot with 596 turns and 298 shell outputs blocked the storage
+   worker for 693 ms. Cache state was uncontrolled; this is not a cold-cache
+   or capacity claim. Both stalls are addressed by items 29 and 30. Still
+   open: the WAL under hours of writes (item 16).
 4. Done: the [ten-thousand-bot screen](LIVE_FLEET.md#ten-thousand-bots)
    through the protocol. Synthetic: 10,000 bots created in 1.5 s, all
    submitted with 1,024 in flight throughout at 1,470 turns per second,
@@ -433,6 +432,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     a stale retry as fresh work. A fork is its own identity with an empty
     request namespace. One primary-key lookup per submission. (From the
     item 12 discussion.)
+29. Done: [retention in bounded pieces](DAEMON_MEASUREMENTS.md#retention-in-pieces-and-the-storage-reader).
+    `delete` and explicit `prune` run as series of storage jobs of four
+    turns each, so other bots' commits interleave with a large deletion; the
+    bot is marked `deleting` from the first piece and refuses work, and an
+    interrupted deletion finishes at the next open. Closes the item 12
+    leftover.
+30. Done: a [storage reader](DAEMON_MEASUREMENTS.md#retention-in-pieces-and-the-storage-reader)
+    connection on its own thread streams context items into model requests,
+    so a long history's window is no longer read on the thread every other
+    bot's commit waits for. Only byte-returning reads move; decisions stay
+    on the worker.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

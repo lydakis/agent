@@ -401,8 +401,14 @@ tests; see [NEXT.md](NEXT.md).
 One process uses a Tokio I/O runtime with one scheduler thread, one shared reqwest
 client, and asynchronous agent tasks. Each client session drains its output
 independently (a thread for stdio, a task per socket). Durable mode adds one
-storage worker for all bots and one reader per session. These are threads and
-tasks, not one process per bot.
+storage worker for all bots, one storage reader, and one reader per session.
+These are threads and tasks, not one process per bot. The storage reader is a
+second SQLite connection in query-only mode on its own thread; it serves
+reads whose result is bytes for a caller, today the batches of context items
+that stream into a model request, so a long history's 8 MiB window is not
+read on the thread every other bot's commit waits for. It sees each job's
+commit once that job is done; anything that decides against the store's
+current state stays on the worker.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
@@ -433,8 +439,12 @@ follower whose queue is full has its entire session closed, including blocked
 writes. This is deliberate: one session multiplexes replies and events, so
 keeping its control channel open would not provide reliable delivery. Socket
 RPC replies also use nonblocking enqueue and close a saturated session without
-waiting in the shared command loop. The CLI exits with a connection error;
-clients reconnect and re-follow from their last received durable cursor, or
+waiting in the shared command loop.
+Deferred deletion and pruning replies preserve this distinction: stdio waits
+up to five seconds for capacity, matching ordinary replies, while sockets
+close immediately on saturation. The wait runs in the retention task.
+The CLI exits with a connection error; clients reconnect and re-follow from
+their last received durable cursor, or
 inspect the bot and turn through the protocol. The submitted turn continues
 independently. This signal does not depend on free queue capacity.
 The input channel holds at most 64 bounded
@@ -541,7 +551,8 @@ does not, and each is one op:
   while the shared transport load continues through stream completion.
   Stats also reports the store's on-disk and WAL sizes with the storage worker's
   job count and its time queued versus time running (whether the worker or
-  the disk is the bottleneck), the same per operation under `operations`
+  the disk is the bottleneck; jobs on the storage reader are counted the
+  same way under their operation), the same per operation under `operations`
   (each store method's count, queued and ran totals, slowest run, and two
   fourteen-bucket latency histograms, `ran` and `queued`, over the
   log-spaced bounds in `buckets_us`, so a controller can see which jobs
@@ -941,8 +952,23 @@ needs, and one optional policy composes them:
   deleted bot's own suffix is freed by walking back from its head until a
   node is still some bot's head, saved context start, or the parent of a
   surviving branch. A running or parked bot, or one with a background command
-  still running, answers `bot_busy`. Live
+  still running, answers `bot_busy`. A deletion runs as a series of bounded
+  storage jobs, four turns of records at a time, then the turn rows, then
+  the exclusive nodes in larger pieces with the head moved back as they go, so
+  other bots' work interleaves with a large deletion. The first piece marks
+  the bot `deleting`: from then on `submit` and `fork` answer
+  `bot_not_found`, `create` under the name still answers `bot_exists`, and
+  `resume` reports the status. Shutdown cancels and awaits pending retention
+  tasks before closing outputs; committed pieces remain. Whether shutdown
+  or a crash interrupts deletion, the next open finishes it before readiness. Live
   followers receive a non-durable `deleted` notification. `agent rm --bot`.
+  The first piece marks the bot's original event range as a possible replay
+  gap for both bot and global followers. Reads between pieces therefore
+  report `pruned_before` even before every event in that range is removed.
+  Admission captures the bot's identity before spawning the deletion task;
+  each piece checks that identity against the record it already reads.
+  If concurrent deletion removes the original, an old task returns
+  `bot_not_found` rather than deleting a replacement with the same name.
   Queued wake-ups for interrupted or deleted turns are discarded when capacity
   opens; reusing a bot name cannot resume its old turn. This internal check
   does not change explicit `resume` requests: a missing bot returns `bot_not_found`.
@@ -955,6 +981,14 @@ needs, and one optional policy composes them:
   ready, and queued work) and keeps the `keep_turns` finished turns preceding
   it. With no unfinished work it keeps the newest `keep_turns` turns by
   submission ID. It drops older events, tool intents, finished processes, and artifacts.
+  An explicit `prune` runs as pieces of four turns, oldest first, each
+  its own storage job; the prune a completion applies is one job, so whoever
+  sees `turn_finished` sees the store as retention left it. An explicit prune
+  interrupted by shutdown can be reissued to finish the remaining work.
+  Admission captures the bot ID; every piece checks it before pruning, so a
+  delayed request cannot remove records from a replacement with the same name.
+  This check replaces the piece's existing existence read. Automatic retention
+  still runs within its completion job, with no extra admission read.
   An artifact read for a turn retention has emptied answers `artifact_pruned`,
   whether the reader is the producing bot or a fork that inherited the output,
   through the protocol `artifact` operation or the model's `read`. The answer

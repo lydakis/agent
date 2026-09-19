@@ -206,6 +206,22 @@ impl Database {
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
     pub const SCHEMA: i32 = 21;
+    /// Turns per retention piece: a delete or explicit prune of a large bot
+    /// runs as a series of jobs this size, so other bots' work interleaves.
+    /// Small, because every job of a turn in flight can land behind one
+    /// piece; a piece of four turns' records runs in about two milliseconds.
+    pub const RETENTION_PIECE: usize = 4;
+
+    /// A second connection that only reads. The writer owns the file, its
+    /// lock, migration, and recovery; this one sees each job's commit once
+    /// it is done and never takes the write lock.
+    pub fn reader(conn: Connection) -> Result<Self> {
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-2048;")?;
+        Ok(Self {
+            conn,
+            outcomes: Vec::new(),
+        })
+    }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -302,7 +318,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
-            CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';")?;
+            CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
+            CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
@@ -317,6 +334,16 @@ impl Database {
             conn,
             outcomes: Vec::new(),
         };
+        // A deletion interrupted between pieces finishes now: the bot was
+        // already refusing work, and nothing else may see it half gone.
+        let deleting: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM bots WHERE status='deleting'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for name in deleting {
+            db.delete_bot(&name)?;
+        }
         // A committed tool intent without a result is never automatically
         // retried. Turns parked on handles keep their state and resume.
         let pending: Vec<i64> = db
@@ -851,14 +878,17 @@ impl Database {
     /// identity it was first made against is refused once the name belongs to
     /// another bot, so a late retry never becomes fresh work on a namesake.
     pub fn identity(&self, name: &str, expected: Option<i64>) -> Result<i64> {
-        let id: Option<i64> = self
+        let row: Option<(i64, String)> = self
             .conn
-            .prepare_cached("SELECT id FROM bots WHERE name=?")?
-            .query_row([name], |r| r.get(0))
+            .prepare_cached("SELECT id,status FROM bots WHERE name=?")?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        let Some(id) = id else {
+        let Some((id, status)) = row else {
             return fail("bot_not_found");
         };
+        if status == "deleting" {
+            return fail_with("bot_not_found", format!("{name} is being deleted"));
+        }
         match expected {
             Some(expected) if expected != id => fail_with(
                 "bot_not_found",
@@ -876,6 +906,15 @@ impl Database {
         options: &TurnOptions,
         validate: impl Fn(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<Started> {
+        // A bot being deleted refuses work before its turn rows are gone,
+        // so a retry cannot be answered from records about to vanish.
+        let deleting: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM bots WHERE name=? AND status='deleting')")?
+            .query_row([name], |r| r.get(0))?;
+        if deleting {
+            return fail_with("bot_not_found", format!("{name} is being deleted"));
+        }
         let prior: Option<(i64, String, String, TurnOptions)> = self
             .conn
             .query_row(
@@ -1802,6 +1841,9 @@ impl Database {
         if self.exists(name)? {
             return fail("bot_exists");
         }
+        if parent.status == "deleting" {
+            return fail_with("bot_not_found", format!("{source} is being deleted"));
+        }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
         tx.execute(
@@ -1901,62 +1943,141 @@ impl Database {
     /// Remove an idle bot with everything only it owns: its turns, tool
     /// intents, processes, artifacts, events, checkpoints, and the history
     /// nodes no other bot's lineage reaches. Shared prefixes stay for forks.
+    /// Remove a bot and everything only it owns, running every piece to
+    /// completion on this thread. Services run the pieces as separate jobs.
     pub fn delete_bot(&mut self, name: &str) -> Result<Value> {
+        let (id, mut piece) = self.start_delete_bot(name, Self::RETENTION_PIECE)?;
+        let mut totals = json!({"turns":0,"events":0,"nodes":0});
+        loop {
+            for key in ["turns", "events", "nodes"] {
+                totals[key] =
+                    json!(totals[key].as_i64().unwrap_or(0) + piece[key].as_i64().unwrap_or(0));
+            }
+            if piece["done"] == true {
+                return Ok(totals);
+            }
+            piece = self.delete_bot_piece(name, id, Self::RETENTION_PIECE)?;
+        }
+    }
+    /// Bind a synchronous deletion to the current identity and commit its
+    /// first piece using the same loaded record.
+    pub fn start_delete_bot(&mut self, name: &str, piece: usize) -> Result<(i64, Value)> {
         let bot = self.inspect(name)?;
-        if bot.running_turn.is_some() {
-            return fail("bot_busy");
+        let id = bot.id;
+        Ok((id, self.delete_bot_piece_for(name, bot, piece)?))
+    }
+    /// One bounded piece of a deletion. The first piece checks the bot is
+    /// idle and marks it `deleting`, after which it refuses new work; each
+    /// later piece drops the records of up to `piece` turns, then the turn
+    /// rows, then up to `piece` nodes of the exclusive suffix with `head`
+    /// moved back as they go, so an interruption resumes exactly. The last
+    /// piece removes the bot row and answers `done`.
+    pub fn delete_bot_piece(
+        &mut self,
+        name: &str,
+        expected_id: i64,
+        piece: usize,
+    ) -> Result<Value> {
+        let bot = self.inspect(name)?;
+        if bot.id != expected_id {
+            return fail("bot_not_found");
         }
-        let running: bool = self
-            .conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
-             WHERE t.bot=? AND p.status='running')
-             OR EXISTS(SELECT 1 FROM turns WHERE bot=? AND status IN ('queued','ready'))",
-            )?
-            .query_row([name, name], |r| r.get(0))?;
-        if running {
-            return fail("bot_busy");
-        }
+        self.delete_bot_piece_for(name, bot, piece)
+    }
+    fn delete_bot_piece_for(&mut self, name: &str, bot: Bot, piece: usize) -> Result<Value> {
+        let piece = piece.max(1) as i64;
         let tx = self.conn.transaction()?;
-        // Preserve identity before freeing the suffix, in the same transaction.
-        // The head is the largest ID on this append-only lineage. Together
-        // with surviving nodes, this floor covers every committed node ID.
-        if let Some(head) = bot.head {
-            tx.execute(
-                "UPDATE node_sequence SET last_id=MAX(last_id,?) WHERE singleton=1",
-                [head],
-            )?;
-        }
-        let mut deleted = json!({"turns":0,"events":0,"nodes":0});
-        for (table, key) in [
-            ("artifacts", "turn"),
-            ("processes", "turn"),
-            ("tools", "turn"),
-        ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE {key} IN (SELECT id FROM turns WHERE bot=?)"),
+        let mut out = json!({"turns":0,"events":0,"nodes":0,"done":false});
+        if bot.status != "deleting" {
+            if bot.running_turn.is_some() {
+                return fail("bot_busy");
+            }
+            let running: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
+                 WHERE t.bot=? AND p.status='running')
+                 OR EXISTS(SELECT 1 FROM turns WHERE bot=? AND status IN ('queued','ready'))",
+                )?
+                .query_row([name, name], |r| r.get(0))?;
+            if running {
+                return fail("bot_busy");
+            }
+            // Preserve identity before freeing the suffix, in the same transaction.
+            // The head is the largest ID on this append-only lineage. Together
+            // with surviving nodes, this floor covers every committed node ID.
+            if let Some(head) = bot.head {
+                tx.execute(
+                    "UPDATE node_sequence SET last_id=MAX(last_id,?) WHERE singleton=1",
+                    [head],
+                )?;
+            }
+            // Reserve the deletion's event range for both replay scopes before
+            // any piece commits. RETURNING shares the existing indexed lookup
+            // with the global watermark, without another query per piece.
+            let pruned: i64 = tx.query_row(
+                "UPDATE bots SET status='deleting',context_start=NULL,
+                    pruned_cursor=MAX(pruned_cursor,
+                        COALESCE((SELECT MAX(id) FROM events WHERE bot=?1),0))
+                 WHERE name=?1 RETURNING pruned_cursor",
                 [name],
+                |r| r.get(0),
             )?;
+            tx.execute(
+                "UPDATE event_retention SET pruned_cursor=MAX(pruned_cursor,?) WHERE singleton=1",
+                [pruned],
+            )?;
+            // Its checkpoints reference nodes the walk below will free.
+            tx.execute("DELETE FROM checkpoints WHERE bot=?", [name])?;
         }
-        tx.execute(
-            "UPDATE event_retention SET pruned_cursor=MAX(pruned_cursor,
-                COALESCE((SELECT MAX(id) FROM events WHERE bot=?),0)) WHERE singleton=1",
-            [name],
-        )?;
-        deleted["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
-        tx.execute("DELETE FROM checkpoints WHERE bot=?", [name])?;
-        deleted["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
-        tx.execute("DELETE FROM bots WHERE name=?", [name])?;
+        // Operational records, a piece of turns at a time.
+        let turns: Vec<i64> = tx
+            .prepare_cached("SELECT turn FROM retained_turns WHERE bot=? ORDER BY turn LIMIT ?")?
+            .query_map(params![name, piece], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !turns.is_empty() {
+            let mut events = 0;
+            for turn in &turns {
+                for table in ["artifacts", "processes", "tools"] {
+                    tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
+                        .execute([turn])?;
+                }
+                events += tx
+                    .prepare_cached("DELETE FROM events WHERE turn=?")?
+                    .execute([turn])?;
+                tx.prepare_cached("DELETE FROM retained_turns WHERE turn=?")?
+                    .execute([turn])?;
+            }
+            out["events"] = json!(events);
+            tx.commit()?;
+            return Ok(out);
+        }
+        // Then the turn rows and what remains keyed by the bot alone.
+        let has_turns: bool = tx
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE bot=?)")?
+            .query_row([name], |r| r.get(0))?;
+        if has_turns {
+            out["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
+            out["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
+            tx.commit()?;
+            return Ok(out);
+        }
         // Walk back from the head, freeing nodes until one is still reached
         // by another bot: as a head, a saved context start, or a parent of
         // a surviving branch. A fork's own suffix is what it leaves behind.
+        // Nodes are small rows; a piece of them is a multiple of the turn piece.
         let mut node = bot.head;
         let mut freed = 0;
         while let Some(id) = node {
+            if freed == piece * 32 {
+                tx.execute("UPDATE bots SET head=? WHERE name=?", params![id, name])?;
+                out["nodes"] = json!(freed);
+                tx.commit()?;
+                return Ok(out);
+            }
             let referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bots WHERE head=?1 OR context_start=?1)
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1))
                     OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)",
-                [id],
+                params![id, name],
                 |r| r.get(0),
             )?;
             if referenced {
@@ -1964,13 +2085,17 @@ impl Database {
             }
             let parent: Option<i64> =
                 tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
+            tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
         }
-        deleted["nodes"] = json!(freed);
+        tx.execute("DELETE FROM events WHERE bot=?", [name])?;
+        tx.execute("DELETE FROM bots WHERE name=?", [name])?;
+        out["nodes"] = json!(freed);
+        out["done"] = json!(true);
         tx.commit()?;
-        Ok(deleted)
+        Ok(out)
     }
     /// Keep unfinished work and the preceding `keep_turns` turns' records.
     /// With no unfinished work, keep the newest `keep_turns`. Drop the rest of the
@@ -1989,10 +2114,42 @@ impl Database {
         keep_turns: usize,
         protect: Option<i64>,
     ) -> Result<Value> {
-        // Retention only needs identity, not a copy of instructions and binding.
         if !self.exists(name)? {
             return fail("bot_not_found");
         }
+        self.prune_records(name, keep_turns, protect, 0, None)
+    }
+    /// One identity-bound piece: the records of up to `limit` prunable turns
+    /// after `after`, oldest first. `next_after` names where the next piece
+    /// starts, or is null when this one reached the retention boundary.
+    pub fn prune_piece(
+        &mut self,
+        name: &str,
+        expected_id: i64,
+        keep_turns: usize,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
+        // Replace the existing existence read with an identity check. The
+        // worker cannot interleave another mutation inside this storage job.
+        let matches: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM bots WHERE name=? AND id=?)")?
+            .query_row(params![name, expected_id], |r| r.get(0))?;
+        if !matches {
+            return fail("bot_not_found");
+        }
+        self.prune_records(name, keep_turns, None, after, Some(limit))
+    }
+    /// Without a limit the whole prune is one piece, as completion needs.
+    fn prune_records(
+        &mut self,
+        name: &str,
+        keep_turns: usize,
+        protect: Option<i64>,
+        after: i64,
+        limit: Option<usize>,
+    ) -> Result<Value> {
         if keep_turns == 0 {
             return fail("invalid_retention");
         }
@@ -2013,42 +2170,47 @@ impl Database {
             .query_row(params![name, (keep_turns - 1) as i64], |r| r.get(0))
             .optional()?;
         let Some(floor) = floor else {
-            return Ok(json!({"events":0,"pruned_cursor":Value::Null}));
+            return Ok(json!({"events":0,"pruned_cursor":Value::Null,"next_after":Value::Null}));
         };
         let tx = self.conn.transaction()?;
-        for table in ["artifacts", "processes", "tools"] {
-            // The candidate index contains only this bot's unpruned turns, not
-            // its entire history or operational records owned by other bots.
+        // The candidate index contains only this bot's unpruned turns, not
+        // its entire history or operational records owned by other bots.
+        let turns: Vec<i64> = tx
+            .prepare_cached(
+                "SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
+                 ORDER BY turn LIMIT ?5",
+            )?
+            .query_map(
+                params![name, floor, protect, after, limit.map(|l| l as i64).unwrap_or(-1)],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut events = 0;
+        let mut cursor: Option<i64> = None;
+        for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
-            let finished = if table == "processes" {
-                "AND status!='running'"
-            } else {
-                ""
-            };
-            tx.prepare_cached(&format!(
-                "DELETE FROM {table} WHERE turn IN
-                 (SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)
-                 {finished}"
-            ))?
-            .execute(params![name, floor, protect])?;
+            tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
+                .execute([turn])?;
+            tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
+                .execute([turn])?;
+            tx.prepare_cached("DELETE FROM tools WHERE turn=?")?
+                .execute([turn])?;
+            let last: Option<i64> = tx
+                .prepare_cached("SELECT MAX(id) FROM events WHERE turn=?")?
+                .query_row([turn], |r| r.get(0))?;
+            cursor = cursor.max(last);
+            events += tx
+                .prepare_cached("DELETE FROM events WHERE turn=?")?
+                .execute([turn])?;
+            // Keep pending background results discoverable by later prunes, even
+            // after their launching turn's events and tool records are gone.
+            tx.prepare_cached(
+                "DELETE FROM retained_turns WHERE turn=?1
+                 AND NOT EXISTS(SELECT 1 FROM processes WHERE turn=?1 AND status='running')",
+            )?
+            .execute([turn])?;
         }
-        let cursor: Option<i64> = tx.query_row(
-            "SELECT MAX(id) FROM events WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3",
-            params![name, floor, protect],
-            |r| r.get(0),
-        )?;
-        let events = tx.execute(
-            "DELETE FROM events WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3",
-            params![name, floor, protect],
-        )?;
-        // Keep pending background results discoverable by later prunes, even
-        // after their launching turn's events and tool records are gone.
-        tx.prepare_cached(
-            "DELETE FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3
-             AND NOT EXISTS(SELECT 1 FROM processes WHERE turn=retained_turns.turn AND status='running')",
-        )?
-        .execute(params![name, floor, protect])?;
         if let Some(cursor) = cursor {
             tx.prepare_cached(
                 "UPDATE event_retention SET pruned_cursor=? WHERE singleton=1 AND pruned_cursor<?",
@@ -2064,7 +2226,11 @@ impl Database {
                 r.get(0)
             })?;
         tx.commit()?;
-        Ok(json!({"events":events,"pruned_cursor":pruned}))
+        let next_after = match limit {
+            Some(limit) if turns.len() == limit => turns.last().copied(),
+            _ => None,
+        };
+        Ok(json!({"events":events,"pruned_cursor":pruned,"next_after":next_after}))
     }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
         let head = self.inspect(name)?.head;

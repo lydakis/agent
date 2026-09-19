@@ -2988,3 +2988,237 @@ fn identity_migration_seeds_allocation_after_sparse_and_empty_stores() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn deletion_runs_in_pieces_refuses_work_and_resumes_after_interruption() {
+    let path =
+        std::env::temp_dir().join(format!("agent-delete-pieces-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=40 {
+            converse(&mut db, "Bob", n);
+        }
+        db.fork("Bob", None, "branch", Some("/synthetic"), None)
+            .unwrap();
+        for n in 41..=44 {
+            converse(&mut db, "Bob", n);
+        }
+        // Pieces of 16 turns: records, then turn rows, then nodes, then the bot.
+        let (id, first) = db.start_delete_bot("Bob", 16).unwrap();
+        assert_eq!(
+            (
+                first["done"].as_bool(),
+                first["events"].as_i64().unwrap() > 0
+            ),
+            (Some(false), true)
+        );
+        assert_eq!(db.inspect("Bob").unwrap().status, "deleting");
+        assert_eq!(db.identity("Bob", None).unwrap_err().code, "bot_not_found");
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "late",
+                "p",
+                true,
+                &TurnOptions::default(),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "bot_not_found"
+        );
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "r1",
+                "p1",
+                true,
+                &TurnOptions::default(),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "bot_not_found"
+        );
+        assert_eq!(
+            db.fork("Bob", None, "late", None, None).unwrap_err().code,
+            "bot_not_found"
+        );
+        assert_eq!(
+            db.create("Bob", None, binding()).unwrap_err().code,
+            "bot_exists"
+        );
+        assert_eq!(db.delete_bot_piece("Bob", id, 16).unwrap()["done"], false);
+    }
+    // Reopening finishes the deletion; the branch keeps the shared prefix.
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.inspect("Bob").unwrap_err().code, "bot_not_found");
+        assert_eq!(stored(&mut db, "branch").len(), 80);
+        assert!(
+            db.history_read("branch", 40, 0, 65536).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("p40")
+        );
+    }
+    let conn = Connection::open(&path).unwrap();
+    for (table, column) in [
+        ("turns", "bot"),
+        ("events", "bot"),
+        ("retained_turns", "bot"),
+        ("checkpoints", "bot"),
+    ] {
+        let left: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column}='Bob'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "{table}");
+    }
+    // The branch's 80 nodes are all that survive: Bob's suffix of 8 is gone.
+    let nodes: i64 = conn
+        .query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(nodes, 80);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn explicit_prune_pieces_cover_the_same_records_as_one_pass() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=40 {
+        converse(&mut db, "Bob", n);
+    }
+    let id = db.inspect("Bob").unwrap().id;
+    let mut after = 0;
+    let mut events = 0;
+    let mut pieces = 0;
+    loop {
+        let piece = db.prune_piece("Bob", id, 2, after, 16).unwrap();
+        events += piece["events"].as_i64().unwrap();
+        pieces += 1;
+        match piece["next_after"].as_i64() {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    // 38 turns of three events each, in three pieces of at most 16 turns.
+    assert_eq!((events, pieces), (38 * 3, 3));
+    assert_eq!(db.prune("Bob", 2).unwrap()["events"], 0);
+    let page = db.events("Bob", 0, 256).unwrap();
+    assert!(page["pruned_before"].as_i64().unwrap() > 0);
+    assert_eq!(page["events"].as_array().unwrap().len(), 1 + 2 * 3);
+}
+
+#[test]
+fn stale_deletion_piece_cannot_remove_a_replacement_bot() {
+    let mut db = db();
+    let original = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    converse(&mut db, "Bob", 1);
+    converse(&mut db, "Bob", 2);
+    let (id, first) = db.start_delete_bot("Bob", 1).unwrap();
+    assert_eq!(id, original);
+    assert_eq!(first["done"], false);
+    // Another deletion finishes while the first caller is between pieces.
+    db.delete_bot("Bob").unwrap();
+    let replacement = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    assert_ne!(original, replacement);
+    converse(&mut db, "Bob", 3);
+    let history = stored(&mut db, "Bob");
+    assert_eq!(
+        db.delete_bot_piece("Bob", original, 1).unwrap_err().code,
+        "bot_not_found"
+    );
+    assert_eq!(db.inspect("Bob").unwrap().id, replacement);
+    assert_eq!(db.inspect("Bob").unwrap().status, "completed");
+    assert_eq!(stored(&mut db, "Bob"), history);
+    assert!(db.delete_bot("Bob").is_ok());
+}
+
+#[test]
+fn deletion_pieces_report_replay_gaps_until_the_bot_is_gone() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=10 {
+        converse(&mut db, "Bob", n);
+    }
+    let original = db.events("Bob", 0, 256).unwrap();
+    let first_cursor = original["events"][0]["cursor"].as_i64().unwrap();
+    let last_cursor = original["next_cursor"].as_i64().unwrap();
+    db.create("Other", None, binding()).unwrap();
+    let other = db.events("Other", 0, 256).unwrap();
+    let (id, mut piece) = db.start_delete_bot("Bob", 4).unwrap();
+    while piece["done"] != true {
+        let page = db.events("Bob", first_cursor, 256).unwrap();
+        // Deletion reserves its whole event range as a conservative gap,
+        // including the later piece that removes all remaining bot events.
+        assert_eq!(page["pruned_before"], last_cursor);
+        assert_eq!(
+            db.events_after(first_cursor, 256).unwrap()["pruned_before"],
+            last_cursor
+        );
+        assert!(
+            db.events("Bob", last_cursor, 256)
+                .unwrap()
+                .get("pruned_before")
+                .is_none()
+        );
+        assert_eq!(db.events("Other", 0, 256).unwrap(), other);
+        piece = db.delete_bot_piece("Bob", id, 4).unwrap();
+    }
+    assert_eq!(db.events("Bob", 0, 256).unwrap_err().code, "bot_not_found");
+}
+
+#[test]
+fn stale_prune_piece_preserves_replacement_records() {
+    let mut db = db();
+    let original = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    for n in 1..=10 {
+        converse(&mut db, "Bob", n);
+    }
+    let first = db.prune_piece("Bob", original, 1, 0, 4).unwrap();
+    let after = first["next_after"].as_i64().unwrap();
+    db.delete_bot("Bob").unwrap();
+    let replacement = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    assert_ne!(original, replacement);
+    for n in 11..=12 {
+        converse(&mut db, "Bob", n);
+    }
+    let events = db.events("Bob", 0, 256).unwrap();
+    let history = stored(&mut db, "Bob");
+    // Both a delayed first piece and a continuation must reject name reuse.
+    for cursor in [0, after] {
+        assert_eq!(
+            db.prune_piece("Bob", original, 1, cursor, 4)
+                .unwrap_err()
+                .code,
+            "bot_not_found"
+        );
+        assert_eq!(db.events("Bob", 0, 256).unwrap(), events);
+        assert_eq!(stored(&mut db, "Bob"), history);
+    }
+    assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
+}
