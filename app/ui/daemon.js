@@ -16,6 +16,7 @@ window.Daemon = (() => {
       setup: () => invoke('setup'),
       policy: () => invoke('policy'),
       attach: (after) => invoke('attach', { after }),
+      stream: () => invoke('stream'),
       request: (op, params = {}) => invoke('request', { op, params }),
       onEvent: (cb) => listen('daemon', (e) => cb(e.payload)),
       close: () => tauri.window.getCurrentWindow().close(),

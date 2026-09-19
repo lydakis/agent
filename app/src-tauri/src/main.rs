@@ -22,9 +22,19 @@ struct Shared {
     /// Counts attachments; every forwarded event carries its session so the
     /// page can ignore the tail of one it has already left behind.
     session: std::sync::atomic::AtomicU64,
+    /// An attachment whose events have not started flowing: the page asks
+    /// for them once it has applied the snapshot, so nothing the replay
+    /// says is overwritten by an older record.
+    pending: Mutex<Option<Pending>>,
 }
 
-/// Socket selection matches the CLI and the TUI: --socket, then AGENT_SOCKET,
+struct Pending {
+    session: u64,
+    events: tokio::sync::mpsc::Receiver<Value>,
+    backlog: Vec<Value>,
+}
+
+/// Socket selection matches the CLI: --socket, then AGENT_SOCKET,
 /// then the socket adjacent to --store, AGENT_STORE, or ~/.agent/state.sqlite.
 fn config() -> Result<Config, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -36,10 +46,15 @@ fn config() -> Result<Config, String> {
             None => (arg.as_str(), None),
         };
         let mut value = || {
-            inline
+            let value = inline
                 .clone()
                 .or_else(|| iter.next().cloned())
-                .ok_or_else(|| format!("{flag} needs a value"))
+                .ok_or_else(|| format!("{flag} needs a value"))?;
+            // A flag-looking value must use '=' to be unambiguous, as in the CLI.
+            if inline.is_none() && value.starts_with("--") {
+                return Err(format!("{flag} needs a value; use {flag}=VALUE"));
+            }
+            Ok(value)
         };
         match flag {
             "--socket" => socket = Some(PathBuf::from(value()?)),
@@ -120,11 +135,11 @@ fn policy(state: State<'_, Shared>) -> Value {
     }
 }
 
-/// Connect, list every bot, follow `*` from the page's cursor, and forward
-/// every notification to the window as a `daemon` event. A closed session
-/// is reported the same way, as `{"event":"closed"}`.
+/// Connect, follow `*` from the page's cursor, and list every bot. The
+/// replay gathered meanwhile waits for `stream`: the page applies the
+/// snapshot first, then asks for the events, which are all newer than it.
 #[tauri::command]
-async fn attach(app: AppHandle, state: State<'_, Shared>, after: i64) -> Result<Value, String> {
+async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
     let (client, mut events) = Client::connect(&state.config.socket)
         .await
         .map_err(|e| e.to_string())?;
@@ -172,25 +187,42 @@ async fn attach(app: AppHandle, state: State<'_, Shared>, after: i64) -> Result<
         }
     };
     *state.client.lock().await = Some(client);
-    let window = app.clone();
+    *state.pending.lock().await = Some(Pending {
+        session,
+        events,
+        backlog,
+    });
+    Ok(json!({"bots": bots, "session": session}))
+}
+
+/// Forward the attached session's events to the window as `daemon` events:
+/// the replay gathered during `attach`, then live. A closed session is
+/// reported the same way, as `{"event":"closed"}`.
+#[tauri::command]
+async fn stream(app: AppHandle, state: State<'_, Shared>) -> Result<(), String> {
+    let Pending {
+        session,
+        mut events,
+        backlog,
+    } = state.pending.lock().await.take().ok_or("not attached")?;
     tauri::async_runtime::spawn(async move {
         let stamp = |mut event: Value| {
             event["session"] = json!(session);
             event
         };
         for event in backlog {
-            if window.emit("daemon", stamp(event)).is_err() {
+            if app.emit("daemon", stamp(event)).is_err() {
                 return;
             }
         }
         while let Some(event) = events.recv().await {
-            if window.emit("daemon", stamp(event)).is_err() {
+            if app.emit("daemon", stamp(event)).is_err() {
                 break;
             }
         }
-        let _ = window.emit("daemon", json!({"event": "closed", "session": session}));
+        let _ = app.emit("daemon", json!({"event": "closed", "session": session}));
     });
-    Ok(json!({"bots": bots, "session": session}))
+    Ok(())
 }
 
 /// Page diagnostics land on stderr, where a terminal can see them.
@@ -219,9 +251,10 @@ fn main() {
             config,
             client: Mutex::new(None),
             session: std::sync::atomic::AtomicU64::new(0),
+            pending: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
-            setup, policy, attach, request, log
+            setup, policy, attach, stream, request, log
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");

@@ -44,7 +44,7 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--agents` composes the shared client policy instead: the harness preamble,
   every AGENTS.md from the workspace up to the root plus `~/.agent/AGENTS.md`,
   and an index of `.agent/skills/*.md` files ([CLIENT.md](CLIENT.md)). It is
-  opt-in on the CLI, the default in the TUI and the app, and exclusive with
+  opt-in on the CLI, the default in the app, and exclusive with
   `--instructions`.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.

@@ -76,9 +76,8 @@ Agent does not provide a sandbox.
 - [Prime Intellect investigation](docs/PRIME_INTELLECT.md): Prime Agent, long-history design, and evaluation-tool reuse.
 - [Next decisions](docs/NEXT.md): remaining implementation and measurement work.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
-- [Client policy](docs/CLIENT.md): what human-facing clients tell a new bot, the preamble, AGENTS.md discovery and skills, shared by the CLI (`--agents`), the TUI and the app.
-- [Desktop client](docs/APP.md): `agent-app`, the Thread design in a Tauri window over the same socket protocol, with a demo mode for design work.
-- [Terminal client](docs/TUI.md): `agent-tui`, a socket-protocol client for watching and steering many bots, with an offline playground, and why ACP and a binary framing were not adopted for the client path.
+- [Client policy](docs/CLIENT.md): what human-facing clients tell a new bot, the preamble, AGENTS.md discovery and skills, shared by the CLI (`--agents`) and the app.
+- [Desktop client](docs/APP.md): `agent-app`, the Thread design in a Tauri window over the daemon's socket protocol, with a demo mode for design work and an offline playground, and why ACP and a binary framing were not adopted for the client path.
 - [Rust measurements](docs/RUST_MEASUREMENTS.md): exploratory observations, with unequal feature footprints.
 - [Anthropic live run](docs/ANTHROPIC_SMOKE.md): the daemon against Sonnet 5, Opus 5, and Fable 5.1, with the adaptive-thinking fix it forced.
 - [Live fleet check](docs/LIVE_FLEET.md): up to 1,024 concurrent bots on real providers through one daemon, 64 bots sustained for five minutes with no drift, and 10,000 bots through one key at the provider's own rate with no failures. These are short-context turns; they establish a lightweight runtime, not coding-agent capacity.

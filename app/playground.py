@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Offline playground for agent-tui: a synthetic streaming Responses model
+"""Offline playground for agent-app: a synthetic streaming Responses model
 plus a daemon bound to it, so bots, delegation, forks, waits, interrupts, and
 attach/detach can be exercised with no provider credentials.
 
-    python3 tui/playground.py [--root DIR] [--agent PATH] [--no-tui]
+    python3 app/playground.py [--root DIR] [--agent PATH] [--no-app]
 
-By default it opens agent-tui in this terminal once the daemon is ready and
-stops the daemon when the TUI exits (^d). Rerunning resumes the same bot. With --no-tui it stays in the foreground and prints the attach
-command for another terminal.
+By default it opens agent-app once the daemon is ready and stops the daemon
+when the window closes. Rerunning resumes the same bots. With --no-app it
+stays in the foreground and prints the attach command for another terminal.
 
 The model streams a reply word by word. Prompt prefixes drive behavior:
 
@@ -19,7 +19,7 @@ The model streams a reply word by word. Prompt prefixes drive behavior:
     slow: TEXT        stream the reply slowly (a long turn to interrupt)
     md:               a reply with a code fence, bold and inline code
     hold:             keep the model call open until the server is released
-                      (Enter in --no-tui mode, `kill -USR1 PID`, or 30 seconds)
+                      (Enter in --no-app mode, `kill -USR1 PID`, or 30 seconds)
     limited:          always 429 with Retry-After 1 (turn_paced)
     anything else     a short streamed reply that echoes the prompt
 
@@ -167,13 +167,13 @@ def main():
     parser.add_argument('--root', default='.local/playground', help='store and socket directory')
     parser.add_argument('--agent', default='.local/target/release/agent', help='agent binary')
     parser.add_argument('--max-active', type=int, default=64)
-    parser.add_argument('--no-tui', action='store_true', help='do not launch agent-tui; print the attach command')
-    parser.add_argument('--tui', default=None, help='agent-tui binary (default: release, then debug build)')
+    parser.add_argument('--no-app', action='store_true', help='do not launch agent-app; print the attach command')
+    parser.add_argument('--app', default=None, help='agent-app binary (default: release, then debug build)')
     args = parser.parse_args()
-    tui = args.tui or next((p for p in ('.local/target/release/agent-tui', '.local/target/debug/agent-tui')
+    app = args.app or next((p for p in ('.local/target/release/agent-app', '.local/target/debug/agent-app')
                             if Path(p).exists()), None)
-    if not args.no_tui and tui is None:
-        print('no agent-tui binary; run `cargo build --release -p agent-tui` or pass --no-tui', file=sys.stderr)
+    if not args.no_app and app is None:
+        print('no agent-app binary; run `cargo build --release -p agent-app` or pass --no-app', file=sys.stderr)
         return 2
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -218,12 +218,12 @@ def main():
         server.release = threading.Event()
 
     try:
-        return run(args, tui, root, socket, env, daemon, server, url, stop, release)
+        return run(args, app, root, socket, env, daemon, server, url, stop, release)
     finally:
         stop()
 
 
-def run(args, tui, root, socket, env, daemon, server, url, stop, release):
+def run(args, app, root, socket, env, daemon, server, url, stop, release):
     ready = daemon.stdout.readline().strip()
     try:
         banner = json.loads(ready)
@@ -236,7 +236,7 @@ def run(args, tui, root, socket, env, daemon, server, url, stop, release):
               'or pass a different --root', file=sys.stderr)
         return 1
     workspace = root / 'workspace'
-    attach = f'AGENT_MODEL=openai/play {tui or ".local/target/release/agent-tui"} --socket {socket} --workspace {workspace}'
+    attach = f'AGENT_MODEL=openai/play {app or ".local/target/release/agent-app"} --socket {socket} --workspace {workspace}'
     print(f'model   {url}')
     print(f'daemon  pid {daemon.pid}  protocol {banner.get("protocol")}  socket {socket}')
     print(f'attach  {attach}')
@@ -246,7 +246,7 @@ def run(args, tui, root, socket, env, daemon, server, url, stop, release):
     def interrupted(*_):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
-    if args.no_tui:
+    if args.no_app:
         print('Ctrl-C stops the daemon; the store persists for the next run. Enter releases hold: prompts.')
         while daemon.poll() is None:
             line = sys.stdin.readline()
@@ -256,18 +256,17 @@ def run(args, tui, root, socket, env, daemon, server, url, stop, release):
             release()
             print('released held prompts')
     else:
-        print('opening agent-tui; ^d detaches and stops the playground daemon. Store persists for the next run.')
+        print('opening agent-app; closing the window stops the playground daemon. Store persists for the next run.')
         time.sleep(0.5)
-        child = subprocess.Popen([tui, '--socket', str(socket), '--workspace', str(workspace)],
+        child = subprocess.Popen([app, '--socket', str(socket), '--workspace', str(workspace)],
                                  env=dict(env, AGENT_MODEL='openai/play'))
-        # Ctrl-C inside the TUI is the TUI's to handle.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             code = child.wait()
-        finally:
-            signal.signal(signal.SIGINT, signal.default_int_handler)
+        except KeyboardInterrupt:
+            child.terminate()
+            raise
         if code != 0:
-            print(f'agent-tui exited with status {code}', file=sys.stderr)
+            print(f'agent-app exited with status {code}', file=sys.stderr)
     if daemon.poll() is not None:
         print(f'daemon exited with status {daemon.returncode}', file=sys.stderr)
         return 1

@@ -1,7 +1,7 @@
 //! What a human-facing client tells a new bot. The daemon stores whatever
 //! text it is given and never composes any; this is where clients agree on
-//! the composition, so a bot created from the app, the TUI, or the CLI with
-//! `--agents` reads the same way.
+//! the composition, so a bot created from the app or the CLI with `--agents`
+//! reads the same way.
 //!
 //! Three layers, in this order: the harness preamble (how to delegate and
 //! collect results through this runtime), every AGENTS.md from the

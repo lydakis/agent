@@ -3,9 +3,8 @@
 The daemon composes no text. A bot's instructions are whatever the creating
 client sent, stored once, immutable for the bot's life. `agent-client`
 (`client/`) is where the human-facing clients agree on what that text is, so a
-bot created from the app, the TUI, or the CLI with `--agents` reads the same
-way. The crate also holds the socket protocol client both the TUI and the app
-use.
+bot created from the app or the CLI with `--agents` reads the same way. The
+crate also holds the socket protocol client the app uses.
 
 Implemented 2026-09-19.
 
@@ -29,7 +28,7 @@ The text is a stable prefix on purpose: after the first turn it rides the
 provider's prompt cache, and it changes only when a file changes. The whole
 composition is bounded at 60 KiB, under the daemon's 64 KiB limit. A workspace
 whose files exceed it fails to compose rather than being silently cut; the
-TUI and the app then fall back to the preamble and say so in the create
+app then falls back to the preamble and says so in the create
 notice, the CLI reports `instructions_limit` with the file that tipped it.
 
 ## Who uses it
@@ -37,8 +36,7 @@ notice, the CLI reports `instructions_limit` with the file that tipped it.
 - **CLI**: plumbing by default, the preamble alone. `--agents` on `run` and
   `fork` composes the policy for the workspace; exclusive with
   `--instructions`.
-- **TUI** and **app**: the policy is the default for `/new`. The create
-  notice says what went in, for example `preamble + 2 AGENTS.md + 1 skills`.
+- **app**: the policy is the default for `/new`. The create notice says what went in, for example `preamble + 2 AGENTS.md + 1 skills`.
 - A **fork** with `--agents` or `--instructions` gets new text; its source is
   untouched. That is how an edited AGENTS.md reaches a fresh bot while every
   existing bot stays immutable.

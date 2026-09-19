@@ -12,6 +12,9 @@ const WINDOW = 3 * LAZY_ITEMS;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
+  // Bumped whenever a bot is added, removed or changes status, so the rail and the activity check
+  // rebuild once per change instead of scanning the fleet on every event.
+  botsGen: 0,
   config: null, ui: { rail: false, peek: null, picker: false, pickerSel: 0, help: false, thoughts: false, output: false, toast: null },
 };
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
@@ -37,7 +40,8 @@ function takeAt(t, at) { const [it] = t.items.splice(at, 1); if (it) count(t, it
 // Fold decoded bodies outside the window back into their nodes. Whole nodes only: a run split by the
 // boundary folds entirely, so a later decode cannot sit next to its own remainder.
 function evict(t) {
-  const len = t.items.length; if (len <= WINDOW) return;
+  // Hysteresis: a fold costs a pass over the items, so it runs once per batch of growth, not per item.
+  const len = t.items.length; if (len <= WINDOW + LAZY_ITEMS) return;
   let outside;
   if (t.anchor === 'end') { const limit = len - WINDOW; outside = (i) => i < limit; }
   else { const first = t.items.findIndex((it) => it.kind !== 'node'); if (first < 0) return; const limit = first + WINDOW; outside = (i) => i > limit; }
@@ -68,6 +72,7 @@ function upsert(record) {
   if (known && known.id != null && record.id != null && known.id !== record.id) { S.bots.delete(record.name); S.transcripts.delete(record.name); }
   const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
   if (record.id != null) b.id = record.id;
+  S.botsGen += 1;
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
@@ -123,6 +128,7 @@ function callSummary(name, args) {
 }
 
 // ---------- events ----------
+const FLEET_EVENTS = new Set(['created', 'forked', 'accepted', 'queued', 'turn_waiting', 'turn_paced', 'turn_resumed', 'turn_finished', 'deleted']);
 async function onEvent(ev) {
   const kind = ev.event, name = ev.bot ?? '', turn = ev.turn ?? null, data = ev.data ?? {};
   if (typeof ev.cursor === 'number') S.cursor = Math.max(S.cursor, ev.cursor);
@@ -178,8 +184,9 @@ async function onEvent(ev) {
     }
     case 'tool_completed': {
       const t = transcript(name);
-      const call = [...t.items].reverse().find((i) => i.kind === 'tool' && i.callId === data.call_id);
-      if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; }
+      let call = null;
+      for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if (it.kind === 'tool' && it.callId === data.call_id) { call = it; break; } }
+      if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchItem(name, `[data-call="${cssEsc(call.callId)}"]`, call); }
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -234,6 +241,7 @@ function applyWaitOrProc(name, item, call) {
       if (result.pending) continue;
       for (const it of t.items) if (it.kind === 'proc' && it.handle === handle) {
         const out = result.stdout ?? result.output ?? '';
+        queueMicrotask(() => patchItem(name, `[data-proc="${cssEsc(handle)}"]`, it));
         // A process can end without an exit status: a spawn failure, a timeout, an output limit. Say which.
         if (result.error) it.done = result.detail ? `${result.error}: ${result.detail}` : String(result.error);
         else if (typeof result.exit_code === 'number' && result.exit_code !== 0) it.done = `exit ${result.exit_code}`;
@@ -318,6 +326,7 @@ async function attach() {
       // one being attached forwards its replay before its number is installed, so only older is stale.
       if (ev.session !== undefined && S.session !== undefined && ev.session < S.session) return;
       const terminal = await onEvent(ev);
+      if (FLEET_EVENTS.has(ev.event)) S.botsGen += 1;
       if (ev.session !== undefined && ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = ev.session;
       // During replay nothing is fetched: a load per node-producing event would serialize a long history
       // into one request each. The first load runs once follow_live arrives.
@@ -335,6 +344,9 @@ async function attach() {
     restore();
     // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
     if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
+    S.botsGen += 1;
+    // Only now do the session's events flow: every one of them is newer than the snapshot just applied.
+    if (Daemon.stream) await Daemon.stream();
     await enqueue(loadVisible);
     $('detached').classList.remove('on');
     render();
@@ -377,8 +389,37 @@ function markdown(text) {
   if (fence) out.push(`<pre class="code">${fence.lang ? `<span class="lang">${esc(fence.lang)}</span>` : ''}${esc(fence.body.join('\n'))}</pre>`);
   return out.join('');
 }
-function cardHTML({ attr, status, name, last, elapsed, sel, body }) {
-  return `<div class="peer${sel ? ' sel' : ''}" ${attr} role="button" tabindex="0"><span class="glyph ${status}">${glyphOf(status)}</span><span class="pn">${esc(name)}</span><span class="el">${elapsed ?? ''}</span><span class="pl">${esc(last)}</span>${body ?? ''}</div>`;
+function cardInner({ status, name, last, elapsed, body }) {
+  return `<span class="glyph ${status}">${glyphOf(status)}</span><span class="pn">${esc(name)}</span><span class="el">${elapsed ?? ''}</span><span class="pl">${esc(last)}</span>${body ?? ''}`;
+}
+function cardHTML(card) {
+  return `<div class="peer${card.sel ? ' sel' : ''}" ${card.attr} role="button" tabindex="0">${cardInner(card)}</div>`;
+}
+const cssEsc = (s) => String(s).replace(/["\\]/g, '\\$&');
+function peerCard(who) {
+  const p = bot(who); if (!p) return null;
+  const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '';
+  return { attr: `data-peek="${esc(p.name)}"`, status: p.status, name: p.name, last: lastLine(transcript(who)), elapsed: el, sel: S.ui.peek === who };
+}
+// Replace one rendered item in place, in whichever pane shows that bot, so a tool finishing or a
+// process ending costs the size of its own line, not a rebuild of the window.
+function patchItem(name, selector, it) {
+  for (const [id, shown] of [['log', S.selected], ['peek', S.ui.peek]]) {
+    if (shown !== name) continue;
+    const old = $(id).querySelector(selector);
+    if (old) old.outerHTML = itemHTML(it);
+  }
+}
+// What changes with time, refreshed in place: peer cards (their peer's status and last line), and
+// running tools' elapsed. Cheap: a pane holds a few cards and fewer running tools.
+function refreshLive(el) {
+  for (const card of el.querySelectorAll('.peer[data-peek]')) {
+    const c = peerCard(card.dataset.peek); if (!c) continue;
+    card.classList.toggle('sel', c.sel); card.innerHTML = cardInner(c);
+  }
+  for (const line of el.querySelectorAll('.tool[data-started]')) {
+    const span = line.querySelector('.el'); if (span) span.textContent = fmt(Date.now() - Number(line.dataset.started));
+  }
 }
 // A card's one line: the last non-empty line of the newest text, bounded, so a long reply costs the
 // parent's render nothing.
@@ -393,18 +434,20 @@ function itemHTML(it) {
     case 'user': return `<div class="line user">› ${esc(it.text)}</div>`;
     case 'text': return markdown(it.text);
     case 'thought': return S.ui.thoughts ? `<div class="line think">${esc(it.text)}</div>` : `<div class="line think folded">thought ${fmt((it.secs || 0) * 1000)}</div>`;
-    case 'tool': { const el = it.started ? `<span class="el">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool">▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
+    case 'tool': { const el = it.started ? `<span class="el">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}"${it.started ? ` data-started="${it.started}"` : ''}>▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
     case 'out': { const rows = it.text.split('\n').filter((l) => l.trim()); const shown = !S.ui.output && rows.length > 2 ? rows.slice(0, 2) : rows; return `<div class="line out">${esc(shown.join('\n'))}${shown.length < rows.length ? ` <span class="more">+${rows.length - shown.length} lines</span>` : ''}</div>`; }
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
-    case 'peer': { const p = bot(it.who); if (!p) return ''; const t = transcript(it.who); const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : ''; return cardHTML({ attr: `data-peek="${esc(p.name)}"`, status: p.status, name: p.name, last: lastLine(t), elapsed: el, sel: S.ui.peek === it.who }); }
+    case 'peer': { const c = peerCard(it.who); return c ? cardHTML(c) : ''; }
     case 'proc': { const status = it.done === null ? 'running' : 'idle'; const last = it.done === null ? it.handle : (it.done || 'done'); return cardHTML({ attr: `data-proc="${esc(it.handle)}"`, status, name: `$ ${it.cmd}`, last, elapsed: '', sel: false }); }
     case 'node': return `<div class="line pending">…</div>`;
     default: return '';
   }
 }
-function itemsHTML(t) {
+// The items from `from` on; a blank line separates turns, judged against the nearest earlier item with one.
+function itemsHTML(t, from = 0) {
   let h = ''; let lastTurn = null;
-  for (const it of t.items) { if (it.turn != null && it.turn !== lastTurn) { if (h) h += '<div class="line"></div>'; lastTurn = it.turn; } h += itemHTML(it); }
+  for (let i = from - 1; i >= 0; i--) if (t.items[i].turn != null) { lastTurn = t.items[i].turn; break; }
+  for (let i = from; i < t.items.length; i++) { const it = t.items[i]; if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += '<div class="line"></div>'; lastTurn = it.turn; } h += itemHTML(it); }
   return h;
 }
 function tailHTML(name, t) {
@@ -416,21 +459,28 @@ function tailHTML(name, t) {
 // A streamed delta touches only the tail. The items rebuild when their
 // count or a fold changes, when a load replaced nodes (gen), or on the
 // slow tick that refreshes elapsed counters and cards.
-let forceRebuild = false;
 function renderTranscript(el, name) {
   const t = S.transcripts.get(name);
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   const before = el.scrollHeight;
-  if (!t) { el.innerHTML = ''; return; }
-  const key = `${name}|${t.items.length}|${t.gen ?? 0}|${S.ui.thoughts}|${S.ui.output}|${S.ui.peek}`;
+  if (!t) { el.innerHTML = ''; el.dataset.key = ''; return; }
+  // A structural change (a load, a fold, another bot) rebuilds the window; items appended since the
+  // last render are added on their own; everything else changes in place. A streamed delta touches
+  // only the tail.
+  const key = `${name}|${t.gen}|${S.ui.thoughts}|${S.ui.output}`;
+  const rendered = el.dataset.key === key ? Number(el.dataset.len) : -1;
   let tail = el.lastElementChild;
-  if (forceRebuild || el.dataset.key !== key || !tail || !tail.classList.contains('tail')) {
+  if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
     el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
     el.dataset.key = key;
     tail = el.lastElementChild;
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
+  } else if (rendered < t.items.length) {
+    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, rendered));
   }
+  el.dataset.len = String(t.items.length);
+  refreshLive(el);
   tail.innerHTML = tailHTML(name, t);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
@@ -471,30 +521,35 @@ function render() {
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('peek', !!S.ui.peek && S.bots.has(S.ui.peek));
   $('title').innerHTML = b ? titleHTML(b) : '<span>no bots · /new NAME creates one</span>';
   if (b) renderTranscript($('log'), b.name); else $('log').innerHTML = '';
-  if (S.ui.rail) $('bots').innerHTML = tree().map((n) => botRowHTML(n, n.b.name === S.selected)).join('');
+  if (S.ui.rail) { const key = `${S.botsGen}|${S.selected}`; if ($('bots').dataset.key !== key) { $('bots').innerHTML = tree().map((n) => botRowHTML(n, n.b.name === S.selected)).join(''); $('bots').dataset.key = key; } }
   if (S.ui.peek && bot(S.ui.peek)) { $('peektitle').innerHTML = titleHTML(bot(S.ui.peek), true); renderTranscript($('peek'), S.ui.peek); }
-  forceRebuild = false;
   $('who').textContent = b ? `${b.name} ›` : '›';
   $('input').placeholder = b ? (b.status === 'idle' ? '' : `${b.name} is ${labelOf(b.status)}; your message queues`) : '/new NAME [PROVIDER/MODEL]';
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
 }
-setInterval(() => { if (S.attached && [...S.bots.values()].some((b) => isActive(b.status))) { forceRebuild = true; render(); } }, 1000);
+// Once a second, while anything runs: the clocks on cards and tool lines, in place. The activity
+// check is cached per fleet change, so a quiet fleet of any size costs nothing here.
+let activeAt = -1, active = false;
+function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; active = [...S.bots.values()].some((b) => isActive(b.status)); } return active; }
+setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.peek) refreshLive($('peek')); const b = bot(S.selected); if (b) $('title').innerHTML = titleHTML(b); } }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
   return tree().map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
+const PICKER_ROWS = 200;
 function renderPicker() {
-  const q = $('pickerq').value.trim(); const rows = pickerRows();
+  const q = $('pickerq').value.trim(); const all = pickerRows(); const rows = all.slice(0, PICKER_ROWS);
   S.ui.pickerSel = Math.min(S.ui.pickerSel, Math.max(0, rows.length - 1));
-  $('pickerlist').innerHTML = rows.length ? rows.map((r, idx) => {
+  const more = all.length > rows.length ? `<div class="empty">${all.length - rows.length} more; type to narrow</div>` : '';
+  $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
     const state = r.b.status === 'idle' ? '' : labelOf(r.b.status);
     const hint = q ? [r.b.parent ? `↳ ${r.b.parent}` : '', state].filter(Boolean).join(' · ') : state;
     return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
-  }).join('') : '<div class="empty">no bot matches</div>';
+  }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
 function openPicker() { S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
 function closePicker() { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $('input').focus(); }

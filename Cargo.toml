@@ -38,4 +38,4 @@ heap-profile = ["dep:dhat"]
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
 
 [workspace]
-members = ["client", "tui", "app/src-tauri"]
+members = ["client", "app/src-tauri"]
