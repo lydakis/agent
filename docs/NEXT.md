@@ -403,14 +403,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     retries stay separate and count only dispatched retries. No second scheduler.
     Still open from the item: pending submissions want their own count and
     byte bound, separate from the active-turn bound.
-25. Pacing inputs per provider. The request estimate's output term is an
-    estimate, not a billing ceiling (fix the comment now). Quota identity
-    is not always model identity: some providers share limits across
-    model families and separate request, input-token, and output-token
-    limits, so put the pool key and the cost dimensions behind the
-    provider adapter without building a model registry. Unknown pools
-    admit freely until headers arrive; a small bootstrap allowance would
-    keep a cold daemon from rediscovering the limit with its first burst.
+25. Done: pacing inputs per provider. The pool key is the family's
+    (dated snapshots share their alias's pool); the estimate is a cost with
+    input and output shares, paced per dimension the provider publishes
+    (Anthropic's input and output token limits alongside the total).
+    Unknown pools admit freely within caller-selected local resource limits;
+    reported limits and 429s supply pacing feedback. No hidden cold-start cap.
+    No model registry: a shared quota the provider does not name is still
+    corrected by every response's headers.
 26. Absorption against context capacity. A boundary drains the whole
     steer snapshot in storage batches, so the absorbed total can exceed
     what the next request carries; the same is true of any turn whose own

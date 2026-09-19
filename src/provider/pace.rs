@@ -1,8 +1,10 @@
 //! Per-provider pacing. A fleet must use a provider's allowance fully and
 //! fairly without ever overshooting it, so every model call passes through
-//! one gate per provider and model: a fair FIFO lock holding two token
-//! buckets, requests and tokens per minute, learned from the provider's own
-//! rate-limit headers and corrected by every response. A refusal blocks the
+//! one gate per provider and pool: a fair FIFO lock holding buckets for
+//! requests and for each token dimension the provider limits (total, and
+//! input and output where it publishes them), learned from the provider's
+//! own rate-limit headers and corrected by every response. Unknown limits
+//! impose no admission cap. A refusal blocks the
 //! pool until the time the provider names; callers queue in arrival order
 //! and are released one at a time, so nothing retries in lockstep. The gate
 //! is an uncontended lock and a few arithmetic operations per call.
@@ -54,6 +56,24 @@ impl Pools {
     }
 }
 
+/// What one call costs the pool, in the dimensions a provider may limit
+/// separately: total tokens, and the input and output shares of that total.
+/// Responses providers publish only the total; Anthropic publishes all three.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cost {
+    pub input: u64,
+    pub output: u64,
+}
+impl Cost {
+    fn dims(self) -> [u64; DIMS] {
+        [self.input + self.output, self.input, self.output]
+    }
+}
+const DIMS: usize = 3;
+const TOTAL: usize = 0;
+const INPUT: usize = 1;
+const OUTPUT: usize = 2;
+
 #[derive(Default)]
 pub struct Pace {
     /// Fair: tokio's mutex hands the lock to waiters in arrival order.
@@ -61,12 +81,18 @@ pub struct Pace {
     state: Mutex<State>,
     changed: tokio::sync::Notify,
 }
+/// One limited quantity: its learned allowance and the estimates reserved
+/// against it by calls that have not yet been accounted for by headers.
+#[derive(Default)]
+struct Dim {
+    bucket: Bucket,
+    reserved: u64,
+}
 #[derive(Default)]
 struct State {
     requests: Bucket,
-    tokens: Bucket,
+    tokens: [Dim; DIMS],
     blocked_until: Option<Instant>,
-    reserved: u64,
     reserved_requests: u64,
 }
 
@@ -74,9 +100,9 @@ struct State {
 /// conservatively charges the estimate until headers or usage account for it.
 pub struct Reservation<'a> {
     pace: &'a Pace,
-    estimated: u64,
-    actual: u64,
-    reported: bool,
+    estimated: [u64; DIMS],
+    actual: [u64; DIMS],
+    reported: [bool; DIMS],
     dispatched: bool,
     request_reported: bool,
     pub waited: Duration,
@@ -89,22 +115,32 @@ impl Reservation<'_> {
         self.actual = self.estimated;
     }
     pub fn learn(&mut self, headers: &reqwest::header::HeaderMap, family: super::Family) {
-        debug_assert!(self.dispatched && !self.reported);
+        debug_assert!(self.dispatched && !self.reported[TOTAL]);
         self.reported = self.pace.learn(headers, family, self.estimated, 1);
         self.request_reported = true;
     }
-    pub fn settle(mut self, actual: u64) {
+    /// Final accounting by total tokens; the split is taken as input.
+    pub fn settle(self, actual: u64) {
+        self.settle_cost(Cost {
+            input: actual,
+            output: 0,
+        });
+    }
+    /// Final accounting by what the provider reported billing.
+    pub fn settle_usage(self, usage: Option<&Usage>, estimate: Cost) {
+        self.settle_cost(usage.map_or(estimate, |u| Cost {
+            input: u.input_tokens,
+            output: u.output_tokens,
+        }));
+    }
+    fn settle_cost(mut self, actual: Cost) {
         debug_assert!(self.dispatched);
-        self.actual = actual;
+        self.actual = actual.dims();
     }
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        if self.reported {
-            return;
-        }
         let mut state = self.pace.state.lock().unwrap();
-        state.reserved -= self.estimated;
         if !self.request_reported {
             state.reserved_requests -= 1;
             if !self.dispatched
@@ -113,9 +149,19 @@ impl Drop for Reservation<'_> {
                 state.requests.available = (state.requests.available + 1.0).min(limit);
             }
         }
-        if let Some(limit) = state.tokens.per_minute {
-            state.tokens.available =
-                (state.tokens.available + self.estimated as f64 - self.actual as f64).min(limit);
+        // Every dimension the headers did not account for returns its
+        // unspent estimate, or charges the actual overrun.
+        for index in 0..DIMS {
+            if self.reported[index] {
+                continue;
+            }
+            let dim = &mut state.tokens[index];
+            dim.reserved -= self.estimated[index];
+            if let Some(limit) = dim.bucket.per_minute {
+                dim.bucket.available = (dim.bucket.available + self.estimated[index] as f64
+                    - self.actual[index] as f64)
+                    .min(limit);
+            }
         }
         drop(state);
         self.pace.changed.notify_one();
@@ -181,38 +227,56 @@ impl Drop for WaitTime<'_> {
 impl Pace {
     pub(super) async fn acquire_reported(
         &self,
-        tokens: u64,
+        cost: Cost,
         report: &mut Report,
     ) -> crate::Result<Reservation<'_>> {
         let _time = WaitTime {
             elapsed_ms: &mut report.paced_ms,
             started: Instant::now(),
         };
-        self.acquire(tokens, &mut report.park_for).await
+        self.acquire_cost(cost, &mut report.park_for).await
     }
     /// Hold the caller until the pool can afford one request of `tokens`,
-    /// then reserve it until headers, final usage, or cancellation account for it.
+    /// then reserve it until headers, final usage, or cancellation account
+    /// for it. The tokens count as input.
     pub async fn acquire<'a>(
         &'a self,
         tokens: u64,
         park_for: &mut Option<Duration>,
     ) -> crate::Result<Reservation<'a>> {
+        self.acquire_cost(
+            Cost {
+                input: tokens,
+                output: 0,
+            },
+            park_for,
+        )
+        .await
+    }
+    pub async fn acquire_cost<'a>(
+        &'a self,
+        cost: Cost,
+        park_for: &mut Option<Duration>,
+    ) -> crate::Result<Reservation<'a>> {
         let started = Instant::now();
+        let costs = cost.dims();
         let _turn = self.gate.lock().await;
         loop {
             let changed = self.changed.notified();
             let wait = {
                 let mut state = self.state.lock().unwrap();
                 let now = Instant::now();
-                if let Some(limit) = state.tokens.per_minute
-                    && tokens as f64 > limit
-                {
-                    return Err(crate::Error::with(
-                        "provider_pacing_limit",
-                        format!(
-                            "estimated {tokens} tokens exceeds learned limit {limit} per minute"
-                        ),
-                    ));
+                for (dim, cost) in state.tokens.iter().zip(costs) {
+                    if let Some(limit) = dim.bucket.per_minute
+                        && cost as f64 > limit
+                    {
+                        return Err(crate::Error::with(
+                            "provider_pacing_limit",
+                            format!(
+                                "estimated {cost} tokens exceeds learned limit {limit} per minute"
+                            ),
+                        ));
+                    }
                 }
                 match state.blocked_until {
                     Some(until) if until > now => {
@@ -226,21 +290,23 @@ impl Pace {
                     _ => {
                         state.blocked_until = None;
                         state.requests.refill(now);
-                        state.tokens.refill(now);
-                        let wait = state
-                            .requests
-                            .shortfall(1.0)
-                            .max(state.tokens.shortfall(tokens as f64));
+                        let mut wait = state.requests.shortfall(1.0);
+                        for (dim, cost) in state.tokens.iter_mut().zip(costs) {
+                            dim.bucket.refill(now);
+                            wait = wait.max(dim.bucket.shortfall(cost as f64));
+                        }
                         if wait.is_zero() {
                             state.requests.take(1.0);
-                            state.tokens.take(tokens as f64);
-                            state.reserved += tokens;
+                            for (dim, cost) in state.tokens.iter_mut().zip(costs) {
+                                dim.bucket.take(cost as f64);
+                                dim.reserved += cost;
+                            }
                             state.reserved_requests += 1;
                             return Ok(Reservation {
                                 pace: self,
-                                estimated: tokens,
-                                actual: 0,
-                                reported: false,
+                                estimated: costs,
+                                actual: [0; DIMS],
+                                reported: [false; DIMS],
                                 dispatched: false,
                                 request_reported: false,
                                 waited: started.elapsed(),
@@ -274,96 +340,117 @@ impl Pace {
         // It parks and releases the gate; queued callers then observe the block.
         self.changed.notify_one();
     }
-    /// Learn the allowance from a response's rate-limit headers. Returns
-    /// whether token headers accounted for and released this estimate. Request
-    /// reservations are always resolved at headers; their debit is retained
-    /// unless a request balance accounts for it. The
-    /// conservative minimum and release share a lock so no other admission can
-    /// spend an intermediate balance. Stream completion must not settle it again.
+    /// Learn the allowance from a response's rate-limit headers, per
+    /// dimension the provider publishes. Returns which token dimensions
+    /// accounted for and released this estimate. Request reservations are
+    /// always resolved at headers; their debit is retained unless a request
+    /// balance accounts for it. The conservative minimum and release share a
+    /// lock so no other admission can spend an intermediate balance. Stream
+    /// completion must not settle a reported dimension again.
     fn learn(
         &self,
         headers: &reqwest::header::HeaderMap,
         family: super::Family,
-        estimate: u64,
+        estimate: [u64; DIMS],
         request_count: u64,
-    ) -> bool {
+    ) -> [bool; DIMS] {
         let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let number = |name: &str| get(name).and_then(|v| v.trim().parse::<f64>().ok());
+        let pair = |limit: &str, remaining: &str| match (number(limit), number(remaining)) {
+            (Some(limit), Some(remaining)) => Some((limit, remaining)),
+            _ => None,
+        };
         // The allowance refills continuously, so the reset header is only
         // how long a full refill takes; the level itself is what to learn.
         // Blocking until a reset would idle the pool for a minute while the
         // provider was already accepting again.
-        let (requests, tokens) = match family {
+        let (requests, tokens): (_, [Option<(f64, f64)>; DIMS]) = match family {
             super::Family::Responses => (
-                (
-                    number("x-ratelimit-limit-requests"),
-                    number("x-ratelimit-remaining-requests"),
+                pair(
+                    "x-ratelimit-limit-requests",
+                    "x-ratelimit-remaining-requests",
                 ),
-                (
-                    number("x-ratelimit-limit-tokens"),
-                    number("x-ratelimit-remaining-tokens"),
-                ),
+                [
+                    pair("x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens"),
+                    None,
+                    None,
+                ],
             ),
             super::Family::Anthropic => (
-                (
-                    number("anthropic-ratelimit-requests-limit"),
-                    number("anthropic-ratelimit-requests-remaining"),
+                pair(
+                    "anthropic-ratelimit-requests-limit",
+                    "anthropic-ratelimit-requests-remaining",
                 ),
-                (
-                    number("anthropic-ratelimit-tokens-limit"),
-                    number("anthropic-ratelimit-tokens-remaining"),
-                ),
+                [
+                    pair(
+                        "anthropic-ratelimit-tokens-limit",
+                        "anthropic-ratelimit-tokens-remaining",
+                    ),
+                    pair(
+                        "anthropic-ratelimit-input-tokens-limit",
+                        "anthropic-ratelimit-input-tokens-remaining",
+                    ),
+                    pair(
+                        "anthropic-ratelimit-output-tokens-limit",
+                        "anthropic-ratelimit-output-tokens-remaining",
+                    ),
+                ],
             ),
         };
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        let State {
-            requests: request_bucket,
-            tokens: token_bucket,
-            reserved,
-            reserved_requests,
-            ..
-        } = &mut *state;
-        if let (Some(limit), Some(remaining)) = requests {
+        if let Some((limit, remaining)) = requests {
             // Keep server balances net of every outstanding reservation,
             // including calls acquired before the limit became known.
-            request_bucket.learn(limit, remaining - *reserved_requests as f64, now);
-            request_bucket.available = (request_bucket.available + request_count as f64).min(limit);
+            let reserved = state.reserved_requests as f64;
+            state.requests.learn(limit, remaining - reserved, now);
+            state.requests.available = (state.requests.available + request_count as f64).min(limit);
         }
         // Receiving headers proves this request was sent. Without request
         // headers its debit stays spent, but it is no longer a reservation.
-        *reserved_requests -= request_count;
-        let token_reported = if let (Some(limit), Some(remaining)) = tokens {
+        state.reserved_requests -= request_count;
+        let mut reported = [false; DIMS];
+        for index in 0..DIMS {
+            let Some((limit, remaining)) = tokens[index] else {
+                continue;
+            };
             // Header balances exclude reservations, our bucket includes them.
             // Put both on the same basis before taking the conservative minimum.
             // Every reservation is returned exactly once, even on cancellation.
-            token_bucket.learn(limit, remaining - *reserved as f64, now);
-            *reserved -= estimate;
-            token_bucket.available = (token_bucket.available + estimate as f64).min(limit);
-            true
-        } else {
-            false
-        };
+            let dim = &mut state.tokens[index];
+            dim.bucket
+                .learn(limit, remaining - dim.reserved as f64, now);
+            dim.reserved -= estimate[index];
+            dim.bucket.available = (dim.bucket.available + estimate[index] as f64).min(limit);
+            reported[index] = true;
+        }
         drop(state);
-        if token_reported || matches!(requests, (Some(_), Some(_))) {
+        if reported.iter().any(|r| *r) || requests.is_some() {
             self.changed.notify_one();
         }
-        token_reported
+        reported
     }
     pub fn status(&self) -> serde_json::Value {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         state.requests.refill(now);
-        state.tokens.refill(now);
+        for dim in state.tokens.iter_mut() {
+            dim.bucket.refill(now);
+        }
         let blocked_ms = state
             .blocked_until
             .map_or(0, |u| u.saturating_duration_since(now).as_millis() as u64);
+        let level = |dim: &Dim| dim.bucket.per_minute.map(|_| dim.bucket.available.floor());
         serde_json::json!({
             "requests_per_minute": state.requests.per_minute,
             "requests_available": state.requests.per_minute.map(|_| state.requests.available.floor()),
-            "tokens_per_minute": state.tokens.per_minute,
-            "tokens_available": state.tokens.per_minute.map(|_| state.tokens.available.floor()),
-            "reserved_tokens": state.reserved,
+            "tokens_per_minute": state.tokens[TOTAL].bucket.per_minute,
+            "tokens_available": level(&state.tokens[TOTAL]),
+            "input_tokens_per_minute": state.tokens[INPUT].bucket.per_minute,
+            "input_tokens_available": level(&state.tokens[INPUT]),
+            "output_tokens_per_minute": state.tokens[OUTPUT].bucket.per_minute,
+            "output_tokens_available": level(&state.tokens[OUTPUT]),
+            "reserved_tokens": state.tokens[TOTAL].reserved,
             "reserved_requests": state.reserved_requests,
             "blocked_ms": blocked_ms,
         })
@@ -374,10 +461,20 @@ impl Pace {
         (
             state.requests.per_minute,
             state.requests.available,
-            state.tokens.per_minute,
-            state.tokens.available,
+            state.tokens[TOTAL].bucket.per_minute,
+            state.tokens[TOTAL].bucket.available,
             state.blocked_until.is_some_and(|u| u > Instant::now()),
         )
+    }
+    #[cfg(test)]
+    pub fn split_snapshot(&self) -> [(Option<f64>, f64); DIMS] {
+        let state = self.state.lock().unwrap();
+        std::array::from_fn(|i| {
+            (
+                state.tokens[i].bucket.per_minute,
+                state.tokens[i].bucket.available,
+            )
+        })
     }
 }
 
@@ -486,6 +583,88 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn unknown_pool_admits_a_burst_without_waiting_for_headers() {
+        let pace = Pace::default();
+        let held = tokio::time::timeout(Duration::from_millis(1), async {
+            let mut held = Vec::new();
+            for _ in 0..128 {
+                held.push(sent(&pace, 10).await.unwrap());
+            }
+            held
+        })
+        .await
+        .expect("unknown capacity must not impose an admission cap");
+        assert!(held.iter().all(|r| r.waited.is_zero()));
+        assert_eq!(pace.state.lock().unwrap().reserved_requests, 128);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn anthropic_input_and_output_limits_pace_their_own_dimensions() {
+        let pace = Arc::new(Pace::default());
+        // Total is ample; output alone is tight. An output-heavy call waits
+        // on the output bucket while an input-heavy one goes through.
+        pace.learn(
+            &headers(&[
+                ("anthropic-ratelimit-tokens-limit", "100000"),
+                ("anthropic-ratelimit-tokens-remaining", "100000"),
+                ("anthropic-ratelimit-input-tokens-limit", "80000"),
+                ("anthropic-ratelimit-input-tokens-remaining", "80000"),
+                ("anthropic-ratelimit-output-tokens-limit", "1200"),
+                ("anthropic-ratelimit-output-tokens-remaining", "600"),
+            ]),
+            crate::codec::Family::Anthropic,
+            [0; DIMS],
+            0,
+        );
+        let [total, input, output] = pace.split_snapshot();
+        assert_eq!(
+            (total.0, input.0, output.0),
+            (Some(100000.0), Some(80000.0), Some(1200.0))
+        );
+        let light = pace
+            .acquire_cost(
+                Cost {
+                    input: 5000,
+                    output: 500,
+                },
+                &mut None,
+            )
+            .await
+            .unwrap();
+        assert!(light.waited < Duration::from_millis(10));
+        assert_eq!(pace.split_snapshot()[OUTPUT].1, 100.0);
+        let heavy = pace
+            .acquire_cost(
+                Cost {
+                    input: 100,
+                    output: 500,
+                },
+                &mut None,
+            )
+            .await
+            .unwrap();
+        // 400 more output tokens at 1,200 per minute is twenty seconds.
+        assert!(
+            heavy.waited >= Duration::from_secs(19),
+            "{:?}",
+            heavy.waited
+        );
+        // A dimension the headers never mention constrains nothing.
+        drop((light, heavy));
+        let responses = Pace::default();
+        responses.learn(
+            &headers(&[
+                ("x-ratelimit-limit-tokens", "1000"),
+                ("x-ratelimit-remaining-tokens", "1000"),
+            ]),
+            crate::codec::Family::Responses,
+            [0; DIMS],
+            0,
+        );
+        assert_eq!(responses.split_snapshot()[OUTPUT].0, None);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn closing_pool_releases_existing_fifo_waiters_without_reserving() {
         let pace = Arc::new(Pace::default());
         pace.learn(
@@ -494,7 +673,7 @@ mod tests {
                 ("x-ratelimit-remaining-requests", "0"),
             ]),
             crate::codec::Family::Responses,
-            0,
+            [0; DIMS],
             0,
         );
         let mut tasks = Vec::new();
@@ -503,7 +682,13 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 let mut report = Report::default();
                 let code = pace
-                    .acquire_reported(1, &mut report)
+                    .acquire_reported(
+                        Cost {
+                            input: 1,
+                            output: 0,
+                        },
+                        &mut report,
+                    )
                     .await
                     .err()
                     .unwrap()
@@ -524,7 +709,7 @@ mod tests {
             assert!(!dispatched);
         }
         let state = pace.state.lock().unwrap();
-        assert_eq!(state.reserved, 0);
+        assert_eq!(state.tokens[TOTAL].reserved, 0);
         assert_eq!(state.reserved_requests, 0);
     }
 
@@ -539,7 +724,7 @@ mod tests {
                 ("x-ratelimit-remaining-tokens", "900"),
             ]),
             crate::codec::Family::Responses,
-            0,
+            [0; DIMS],
             0,
         );
         let held = pace.acquire(800, &mut None).await.unwrap();
@@ -551,7 +736,7 @@ mod tests {
         let next = next.unwrap();
         assert!(next.waited < Duration::from_millis(20));
         drop(next);
-        assert_eq!(pace.state.lock().unwrap().reserved, 0);
+        assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 0);
         // The timeout drops the reservation just like the production admission
         // timeout's early return, without ever marking the request dispatched.
         let semaphore = tokio::sync::Semaphore::new(0);
@@ -564,7 +749,7 @@ mod tests {
         let (_, requests, _, tokens, _) = pace.snapshot();
         assert!((1.0..1.1).contains(&requests), "{requests}");
         assert!((900.0..901.0).contains(&tokens), "{tokens}");
-        assert_eq!(pace.state.lock().unwrap().reserved, 0);
+        assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -587,7 +772,7 @@ mod tests {
         assert_eq!(pace.snapshot().3, 990.0);
         drop(reporting);
         assert_eq!(pace.snapshot().3, 990.0);
-        assert_eq!(pace.state.lock().unwrap().reserved, 0);
+        assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -656,7 +841,7 @@ mod tests {
                 ("x-ratelimit-remaining-tokens", "600"),
             ]),
             crate::codec::Family::Responses,
-            0,
+            [0; DIMS],
             0,
         );
         let (oversized, small) = tokio::join!(
@@ -689,7 +874,7 @@ mod tests {
                 ("x-ratelimit-reset-tokens", "1s"),
             ]),
             crate::codec::Family::Responses,
-            0,
+            [0; DIMS],
             0,
         );
         let call = sent(&pace, 50).await.unwrap();
@@ -717,7 +902,7 @@ mod tests {
                 ("x-ratelimit-remaining-tokens", "500"),
             ]),
             crate::codec::Family::Responses,
-            0,
+            [0; DIMS],
             0,
         );
         assert!(pace.snapshot().3 < 31.0, "{}", pace.snapshot().3);
@@ -727,7 +912,7 @@ mod tests {
                 ("x-ratelimit-remaining-tokens", "10"),
             ]),
             crate::codec::Family::Responses,
-            0,
+            [0; DIMS],
             0,
         );
         assert!(pace.snapshot().3 <= 10.0, "{}", pace.snapshot().3);
@@ -735,11 +920,17 @@ mod tests {
         pace.limited(Some(Duration::from_secs(3)));
         let mut report = Report::default();
         assert_eq!(
-            pace.acquire_reported(1, &mut report)
-                .await
-                .err()
-                .unwrap()
-                .code,
+            pace.acquire_reported(
+                Cost {
+                    input: 1,
+                    output: 0
+                },
+                &mut report
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
             "provider_paced"
         );
         assert_eq!(report.park_for, Some(Duration::from_secs(3)));
@@ -753,7 +944,7 @@ mod tests {
                 ("anthropic-ratelimit-requests-reset", "2999-01-01T00:00:00Z"),
             ]),
             crate::codec::Family::Anthropic,
-            0,
+            [0; DIMS],
             0,
         );
         assert!(!pace.snapshot().4);
@@ -815,7 +1006,7 @@ mod tests {
                 ("x-ratelimit-remaining-tokens", "1000"),
             ]),
             family,
-            0,
+            [0; DIMS],
             0,
         );
         let mut first = sent(&pace, 800).await.unwrap();
@@ -834,17 +1025,17 @@ mod tests {
         let follower = follower.unwrap();
         assert!(follower.waited < Duration::from_millis(20));
         assert_eq!(pace.snapshot().3, 190.0);
-        assert_eq!(pace.state.lock().unwrap().reserved, 800);
+        assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 800);
         // Cancelling the accounted stream cannot credit its estimate again.
         drop(first);
         assert_eq!(pace.snapshot().3, 190.0);
         follower.settle(10);
-        assert_eq!(pace.state.lock().unwrap().reserved, 0);
+        assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 0);
         assert_eq!(pace.snapshot().3, 980.0);
         // Cancelling an unreported request retains its estimated charge.
         let unreported = sent(&pace, 800).await.unwrap();
         drop(unreported);
-        assert_eq!(pace.state.lock().unwrap().reserved, 0);
+        assert_eq!(pace.state.lock().unwrap().tokens[TOTAL].reserved, 0);
         assert_eq!(pace.snapshot().3, 180.0);
     }
 }

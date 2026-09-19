@@ -2215,3 +2215,126 @@ are in ignored `.local/paced-elapsed-fix/`.
 Validation: 80 Rust tests, 31 relevant Python tests, strict Clippy, formatting,
 and diff checks. The interruption and late-restart regressions failed before
 the fix. Only synthetic providers were used.
+
+## Pacing inputs per provider
+
+The following screen records the initial implementation, including its
+experimental sixteen-request cold-start cap. That cap was subsequently
+removed: unknown pools now admit freely, with reported limits and refusals
+providing feedback. These results do not describe the current cold-start
+policy; the comparison below records the removal separately.
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0. Compared
+the committed tree `8ba85986…` (rebuilt from a worktree) with the slice
+binary `e3ee0cde…`. Three changes to the pacing gate: pools are keyed by the
+family's idea of a quota, so a dated snapshot shares its alias's pool; the
+estimate is a cost with input and output shares, paced per dimension the
+provider publishes, which for Anthropic adds the input-token and
+output-token limits beside the total; and a cold pool lets sixteen requests
+out and holds the rest until any response's headers have arrived. On a
+warm pool the gate does what it did, over three buckets instead of one;
+the bootstrap branch is one flag test per admission.
+
+The cold-burst screen (ignored `.local/bootstrap/bench.py`): 96 bots submit
+one turn each at once to a daemon that has never seen the provider. The
+fixture keeps a continuously refilling allowance of 60 requests per minute,
+publishes the Responses rate-limit headers on every reply, answers 429 with
+a one-second Retry-After when empty, and holds every reply's headers for
+500 ms, as a real provider holds them until the first token. Two runs per
+binary:
+
+| | Committed tree | This slice |
+| --- | ---: | ---: |
+| Provider calls for 96 turns | 132 | 96 |
+| Refused with 429 | 36 | 0 |
+| Turns that retried | 36 | 0 |
+| Wall to finish all 96, s | 37.8 | 37.2 |
+
+Before, the whole burst went out before any headers came back, the 36
+calls beyond the allowance were refused, and each of those turns retried.
+After, sixteen went out, their headers taught the limit half a second
+later, and the rest were paced into the allowance; the wall is the
+allowance's own 36 seconds either way. With the fixture answering
+instantly instead, neither binary is refused: the store spaces turn starts
+by a few milliseconds and the first headers arrive within that, which is
+why the screen holds headers.
+
+The 32-agent socket echo screen, committed tree against the slice binary,
+one excluded warmup and four measured runs each: RSS 17.80 (17.66–18.03)
+versus 17.79 (17.69–17.91) MiB, CPU 0.323 (0.308–0.327) versus 0.322
+(0.310–0.345) s, p95 592.3 (590.5–593.9) versus 590.8 (584.5–643.1) ms.
+Level on every median; one slice run carried a 643 ms p95 outlier. Captures:
+ignored `.local/bootstrap/{before,after}.json`,
+`.local/bench/slice-prev8-socket-32/`, and `slice-pacing-socket-32/`.
+
+Validation: 83 Rust tests, strict Clippy, formatting, and 159 Python tests.
+New unit tests: a cold pool caps at sixteen until headers arrive and never
+again after; Anthropic's output limit paces an output-heavy call while an
+input-heavy one proceeds, and a dimension the provider never publishes
+constrains nothing; dated snapshots map to their alias's pool and version
+numbers do not. The startup-bound test warms its pool with one answered
+turn first, since it is about `--max-connecting`, not cold pools.
+
+Review follow-up: the first response now wakes bootstrap waiters even when
+it carries no rate-limit headers. The same paused-clock probe, with sixteen
+initial streams kept open, measured admission delay after those headers at
+50 ms before and 0 ms after the fix. This isolates an unnecessary timer
+wait; it is not a wall-clock throughput or CPU measurement. The existing
+bootstrap test now requires admission within 10 ms of virtual time and
+failed before the fix. An informed pool gains no extra notifications, and
+the change adds no allocations, locks, or database work. All 83 Rust tests,
+strict Clippy, formatting, and diff checks pass after this correction.
+
+### Removing the cold-start cap
+
+Decision and observation, 2026-09-19: unknown provider capacity does not
+justify an inferred concurrency limit. The sixteen-request cap, its
+`informed` flag, polling branch, and special notification were removed.
+Reported limits still teach the shared buckets, and rate-limit refusals
+still pause and park affected turns. Caller-selected local resource bounds
+remain independent. Initial refusals are an accepted discovery cost.
+
+Compared the capped binary `4b0ef97e…` with uncapped `10bbd5cf…` on Darwin
+arm64, external power, Rust 1.98.0. Each run started a fresh daemon and
+submitted 32 short synthetic turns. Every case used baseline/candidate/
+candidate/baseline order, with two cold runs per binary and no warmup.
+Fast fixtures returned headers immediately; slow fixtures delayed them by
+200 ms. Ample fixtures allowed 100,000 requests/minute; the constrained
+fixture allowed 30, continuously refilled, and returned a one-second
+Retry-After with each refusal. Header-less fixtures omitted limit headers.
+Builds and tests finished before measurement. All turns completed.
+
+| Fixture | Batch wall ms, capped → uncapped | Per-run p95 ms, capped → uncapped | Refusals per run, capped → uncapped |
+| --- | ---: | ---: | ---: |
+| Ample, fast | 36.4 → 38.5 | 7.2 → 7.8 | 0 → 0 |
+| Ample, slow | 424.8 → 224.5 | 411.2 → 213.0 | 0 → 0 |
+| No limit headers, fast | 32.7 → 36.9 | 6.4 → 7.7 | 0 → 0 |
+| No limit headers, slow | 425.4 → 228.7 | 409.0 → 217.7 | 0 → 0 |
+| Constrained, slow | 4,836.0 → 4,643.4 | 2,609.1 → 2,417.7 | 0 → 2 |
+
+Values are medians of two runs. Slow ample and header-less fixtures finish
+about 46–47% sooner because admission no longer waits for the first replies.
+The constrained fixture makes 34 provider calls instead of 32, with two
+successful retries; slightly lower completion time here does not establish
+a general improvement under rate limits.
+
+Initial fast header-less CPU readings increased from 33.9 to 38.3 ms, so
+that case received six further cold runs per binary in alternating ABBA
+batches. Median CPU was then 37.9 (31.3–38.5) versus 35.8 (30.7–39.8) ms;
+batch wall time 32.5 (26.7–32.7) versus 30.3 (26.0–33.9) ms; sampled peak
+RSS 12.38 (12.30–12.41) versus 12.37 (12.23–12.44) MiB. These overlapping
+ranges establish no fast-provider speedup or regression. Across the initial
+matrix, median RSS changes stayed within 0.11 MiB. This is a short cold-start
+screen, not sustained-load or active-capacity evidence.
+
+CPU is the daemon's process CPU between submissions and observed completion;
+RSS is sampled every 5 ms through bot creation, turns, and result inspection.
+The Python controller and provider are excluded; these turns execute no
+tools. Latencies use controller receive timestamps. Captures, full ranges,
+binary hashes, and the driver are in ignored `.local/unrestricted-pacing/`.
+
+Validation: all 83 Rust tests, 10 targeted Python runtime tests, strict
+Clippy, formatting, and diff checks passed. The new burst regression failed
+with the cap and now admits 128 requests without waiting for any headers.
+The caller-selected startup-bound test again starts cold, without a warmup;
+pacing, retry, interruption, and restart tests continue to pass.

@@ -735,12 +735,24 @@ needs its own benchmark.
 ## Pacing and retries
 
 A provider's allowance is the scarce resource in a fleet, so every model call
-passes through one pace per provider and model: a fair FIFO gate holding two
-buckets, requests and tokens per minute. The pool is unbounded until the
-provider reports its limits in headers
-(`x-ratelimit-*` on OpenAI, `anthropic-ratelimit-*` on Anthropic); from then
-on a call is admitted only when both buckets can afford it, debited by an
-estimate (request bytes divided by four plus the output cap). Reported token
+passes through one pace per provider and pool: a fair FIFO gate holding a
+bucket for requests per minute and one for each token dimension the provider
+limits. The pool key is the family's idea of a quota, not the model string:
+a dated snapshot shares its alias's pool (`gpt-5.6-luna-2026-05-01` with
+`gpt-5.6-luna`, `claude-sonnet-5-20260401` with `claude-sonnet-5`), and
+`stats` lists pools by that key. A shared quota the provider does not name is
+still corrected by every response's headers, bounded by what is in flight.
+The pool is unbounded until the provider reports its limits in headers
+(`x-ratelimit-*` on OpenAI, `anthropic-ratelimit-*` on Anthropic).
+There is no extra cold-start cap: caller-selected local resource limits
+still apply, and a 429 is feedback to the shared pool. A first burst may
+therefore need retries. Once limits are known, a call is admitted only when
+every learned bucket can afford it, debited by an estimate
+(request bytes divided by four as input, plus the output cap as output).
+OpenAI publishes one token limit and the estimate's total is paced against
+it; Anthropic also publishes input-token and output-token limits, and each
+share of the estimate is paced against its own, so an output-heavy call
+waits on the output bucket while input-heavy work proceeds. Reported token
 balances are reduced by outstanding reservations before taking the minimum
 with the local balance, so stale high headers cannot replenish spent tokens.
 Token headers release their request's reservation immediately, in the same
@@ -789,7 +801,9 @@ An estimate above the learned per-minute token limit fails with
 `provider_pacing_limit`, without consuming allowance or blocking the next
 request. This is a local estimate limit, not a provider refusal; reduce the
 context or configured output cap before resubmitting. Unknown pools remain
-unbounded until headers teach them a limit.
+unbounded until headers teach them a limit. A provider that publishes no
+limits imposes no inferred rate bound, though explicit rate-limit refusals
+still pause its pool.
 
 A model call has no side effects, so a failed one is retried by rebuilding
 the request from the store: within 5 minutes, up to 8 attempts for capacity
