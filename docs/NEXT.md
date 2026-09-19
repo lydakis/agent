@@ -413,6 +413,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     what the next request carries; the same is true of any turn whose own
     items outgrow the window. Budget the boundary against encoded context,
     leaving excess steers queued, as part of the compaction work.
+27. Storage counters by operation. `stats` reports the worker's cumulative
+    jobs, queued time, and ran time, which cannot show whether a few long
+    retention or history jobs dominate the tail, or separate database CPU
+    from disk wait. Label each job by operation and keep a small latency
+    histogram per label (fixed log-spaced buckets, no allocation per job),
+    so a fleet controller can see which operations are slow and how often.
+    Pays for itself in the store-scale screen (item 3). (From the second
+    Astra Pro review.)
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
