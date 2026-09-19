@@ -462,18 +462,35 @@ fn transcript_rows(
     rows
 }
 
+/// A card's one line: the last non-empty line of the newest text, bounded,
+/// so a long reply costs the parent's draw nothing.
 fn last_line(t: &Transcript) -> String {
+    fn tail(s: &str) -> String {
+        s.rsplit('\n')
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect()
+    }
     if !t.text.is_empty() {
-        return t.text.clone();
+        return tail(&t.text);
     }
     if !t.thinking.is_empty() {
-        return t.thinking.rsplit(". ").next().unwrap_or("").to_owned();
+        return t
+            .thinking
+            .rsplit(". ")
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
     }
     t.items
         .iter()
         .rev()
         .find_map(|(_, i)| match i {
-            Item::Text(s) => Some(s.clone()),
+            Item::Text(s) => Some(tail(s)),
             Item::Tool { name, summary, .. } => Some(format!("▸ {name} {summary}")),
             _ => None,
         })
@@ -686,18 +703,10 @@ fn band(frame: &mut Frame, area: Rect, app: &App, pulse: bool) {
         }
         keys_list.push(("^b", "bots"));
         let t = app.transcripts.get(&app.selected);
-        if t.is_some_and(|t| {
-            t.items
-                .iter()
-                .any(|(_, i)| matches!(i, Item::Thought { .. }))
-        }) {
+        if t.is_some_and(|t| t.thoughts > 0) {
             keys_list.push(("^t", if app.ui.thoughts { "fold" } else { "thoughts" }));
         }
-        if t.is_some_and(|t| {
-            t.items
-                .iter()
-                .any(|(_, i)| matches!(i, Item::Output(s) if s.lines().count() > 2))
-        }) {
+        if t.is_some_and(|t| t.long_outputs > 0) {
             keys_list.push(("^o", if app.ui.output { "fold" } else { "output" }));
         }
         if busy {

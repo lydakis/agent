@@ -11,6 +11,11 @@ use std::{
 };
 
 const LAZY_ITEMS: usize = 400;
+/// Decoded items kept around the end of a transcript read live; bodies
+/// beyond it fold back into their nodes and a scroll up loads them again.
+const WINDOW: usize = 3 * LAZY_ITEMS;
+/// Notifications applied per loop pass before input and drawing get a turn.
+pub const DRAIN: usize = 256;
 pub const TOAST: Duration = Duration::from_millis(2200);
 
 #[derive(Debug, Default, Clone)]
@@ -71,13 +76,97 @@ pub enum Item {
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub items: Vec<(Option<i64>, Item)>,
+    /// Parallel to `items`: the history node an item was decoded from and
+    /// that node's call id, `None` for items built from live events. A
+    /// decoded body folds back into its node when it leaves the window.
+    origin: Vec<Option<(i64, Option<String>)>>,
     /// How many items are still bare nodes; loads skip a transcript at zero
     /// instead of scanning it on every event.
     pub nodes: usize,
+    /// Kept in step with `items`, so the key bar never scans the history.
+    pub thoughts: usize,
+    pub long_outputs: usize,
+    /// Peers whose cards are on this transcript, in card order.
+    pub peers: Vec<String>,
     pub text: String,
     pub thinking: String,
     pub thinking_since: Option<Instant>,
     pub streaming_turn: Option<i64>,
+}
+
+impl Transcript {
+    /// Append an item built from a live event.
+    pub fn add(&mut self, turn: Option<i64>, item: Item) {
+        self.count(&item, 1);
+        self.items.push((turn, item));
+        self.origin.push(None);
+    }
+    /// Replace the bare node at `at` with what it decoded to.
+    fn decode(&mut self, at: usize, entries: Vec<(Option<i64>, Item)>) {
+        let Item::Node { node, call_id } = &self.items[at].1 else {
+            return;
+        };
+        let from = Some((*node, call_id.clone()));
+        let (_, bare) = self.items.remove(at);
+        self.origin.remove(at);
+        self.count(&bare, -1);
+        for item in &entries {
+            self.count(&item.1, 1);
+        }
+        let n = entries.len();
+        self.items.splice(at..at, entries);
+        self.origin.splice(at..at, std::iter::repeat_n(from, n));
+    }
+    /// Remove the item at `at`.
+    pub fn take(&mut self, at: usize) -> (Option<i64>, Item) {
+        let entry = self.items.remove(at);
+        self.origin.remove(at);
+        self.count(&entry.1, -1);
+        entry
+    }
+    /// Fold decoded bodies older than the newest `keep` items back into their
+    /// nodes. Whole nodes only: a run split by the boundary folds entirely,
+    /// so a later decode cannot sit next to its own remainder.
+    pub fn evict(&mut self, keep: usize) {
+        let len = self.items.len();
+        if len <= keep {
+            return;
+        }
+        let limit = len - keep;
+        let items = std::mem::take(&mut self.items);
+        let origin = std::mem::take(&mut self.origin);
+        let mut folding: Option<i64> = None;
+        for (i, ((turn, item), from)) in items.into_iter().zip(origin).enumerate() {
+            match from {
+                Some((node, _)) if folding == Some(node) => self.count(&item, -1),
+                Some((node, call_id)) if i < limit => {
+                    folding = Some(node);
+                    self.count(&item, -1);
+                    let bare = Item::Node { node, call_id };
+                    self.count(&bare, 1);
+                    self.items.push((turn, bare));
+                    self.origin.push(None);
+                }
+                _ => {
+                    folding = None;
+                    self.items.push((turn, item));
+                    self.origin.push(from);
+                }
+            }
+        }
+    }
+    fn count(&mut self, item: &Item, delta: isize) {
+        let bump = |n: &mut usize| *n = (*n as isize + delta).max(0) as usize;
+        match item {
+            Item::Node { .. } => bump(&mut self.nodes),
+            Item::Thought { .. } => bump(&mut self.thoughts),
+            Item::Output(s) if s.lines().take(3).count() > 2 => bump(&mut self.long_outputs),
+            Item::Peer(who) if delta > 0 && !self.peers.contains(who) => {
+                self.peers.push(who.clone());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A width moving from one value to another over a short time.
@@ -496,11 +585,10 @@ impl App {
     }
 
     fn push(&mut self, bot: &str, turn: Option<i64>, item: Item) {
-        let t = self.transcripts.entry(bot.to_owned()).or_default();
-        if matches!(item, Item::Node { .. }) {
-            t.nodes += 1;
-        }
-        t.items.push((turn, item));
+        self.transcripts
+            .entry(bot.to_owned())
+            .or_default()
+            .add(turn, item);
     }
 
     /// Apply one notification from the daemon.
@@ -617,7 +705,7 @@ impl App {
                         let secs = t.thinking_since.map(|s| s.elapsed().as_secs()).unwrap_or(0);
                         let text = std::mem::take(&mut t.thinking);
                         t.thinking_since = None;
-                        t.items.push((turn, Item::Thought { text, secs }));
+                        t.add(turn, Item::Thought { text, secs });
                     }
                     t.text.clear();
                 }
@@ -693,7 +781,7 @@ impl App {
                         },
                     );
                     if let Some(tool) = eager {
-                        self.load_wait_or_proc(&bot, node, &tool).await;
+                        self.load_wait_or_proc(&bot, node, &tool, &call_id).await;
                     }
                 }
             }
@@ -760,7 +848,7 @@ impl App {
                 {
                     if !t.text.is_empty() {
                         let text = std::mem::take(&mut t.text);
-                        t.items.push((turn, Item::Text(text)));
+                        t.add(turn, Item::Text(text));
                     }
                     t.thinking.clear();
                     t.thinking_since = None;
@@ -807,15 +895,16 @@ impl App {
 
     /// A background shell's result names its proc handle; a wait's result
     /// names which handles resolved. Both are read eagerly, they are rare.
-    async fn load_wait_or_proc(&mut self, bot: &str, node: i64, tool: &str) {
+    async fn load_wait_or_proc(&mut self, bot: &str, node: i64, tool: &str, call_id: &str) {
         let Ok(client) = self.client() else { return };
+        // A failed fetch keeps the node: the next attach loads it lazily.
         let Ok(item) = client
             .request("item", json!({"bot": bot, "node": node}))
             .await
         else {
             return;
         };
-        self.apply_wait_or_proc(bot, &item, tool);
+        self.apply_wait_or_proc(bot, &item, tool, call_id);
         // The node is spent: its output is what the cards now show, and a
         // later lazy load must not decode it a second time.
         if let Some(t) = self.transcripts.get_mut(bot)
@@ -824,13 +913,12 @@ impl App {
                 .iter()
                 .rposition(|(_, i)| matches!(i, Item::Node { node: n, .. } if *n == node))
         {
-            t.items.remove(pos);
-            t.nodes = t.nodes.saturating_sub(1);
+            t.take(pos);
         }
     }
     /// Decode a background start (a proc handle) or a wait result (which
     /// handles resolved) into the cards; also reached by a retried load.
-    fn apply_wait_or_proc(&mut self, bot: &str, item: &Value, tool: &str) {
+    fn apply_wait_or_proc(&mut self, bot: &str, item: &Value, tool: &str, call_id: &str) {
         let output = item["output"]
             .as_str()
             .or_else(|| item["content"][0]["content"].as_str())
@@ -841,16 +929,29 @@ impl App {
         let turn = self.bots.get(bot).and_then(|b| b.running_turn);
         if tool == "shell" {
             if let Some(handle) = value["handle"].as_str() {
-                let cmd = self
-                    .transcripts
-                    .get(bot)
-                    .and_then(|t| {
-                        t.items.iter().rev().find_map(|(_, i)| match i {
-                            Item::Tool { name, summary, .. } if name == "shell" => {
-                                Some(summary.clone())
-                            }
-                            _ => None,
-                        })
+                // The card names the call that started the process, not the
+                // newest shell call; a decode seen twice adds no second card.
+                let Some(t) = self.transcripts.get(bot) else {
+                    return;
+                };
+                if t.items
+                    .iter()
+                    .rev()
+                    .any(|(_, i)| matches!(i, Item::Proc { handle: h, .. } if h == handle))
+                {
+                    return;
+                }
+                let cmd = t
+                    .items
+                    .iter()
+                    .rev()
+                    .find_map(|(_, i)| match i {
+                        Item::Tool {
+                            call_id: id,
+                            summary,
+                            ..
+                        } if id == call_id => Some(summary.clone()),
+                        _ => None,
                     })
                     .unwrap_or_default();
                 self.push(
@@ -931,11 +1032,31 @@ impl App {
     async fn load(&mut self, name: &str) {
         // One batch of the newest bare nodes: what the screen can show.
         // Scrolling up asks for the next batch, so a long history is
-        // materialized only as far as someone reads.
-        self.load_batch(name).await;
+        // materialized only as far as someone reads. A pane at its end
+        // keeps only the window: older bodies fold back into their nodes
+        // and are not fetched again until someone scrolls up to them.
+        let at_end = if name == self.selected {
+            self.ui.scroll == 0
+        } else if self.ui.peek.as_deref() == Some(name) {
+            self.ui.peek_scroll == 0
+        } else {
+            true
+        };
+        let floor = if at_end {
+            self.transcripts
+                .get(name)
+                .map_or(0, |t| t.items.len().saturating_sub(WINDOW))
+        } else {
+            0
+        };
+        self.load_batch(name, floor).await;
+        if at_end && let Some(t) = self.transcripts.get_mut(name) {
+            t.evict(WINDOW);
+        }
     }
-    /// One batch; `false` when there was nothing left to fetch.
-    async fn load_batch(&mut self, name: &str) -> bool {
+    /// One batch of bare nodes at or after `floor`; `false` when there was
+    /// nothing left to fetch.
+    async fn load_batch(&mut self, name: &str, floor: usize) -> bool {
         let Ok(client) = self.client() else {
             return false;
         };
@@ -949,6 +1070,7 @@ impl App {
                 t.items
                     .iter()
                     .enumerate()
+                    .skip(floor)
                     .rev()
                     .filter_map(|(i, (_, item))| match item {
                         Item::Node { node, .. } => Some((i, *node)),
@@ -978,7 +1100,7 @@ impl App {
         let mut progressed = false;
         // Background starts and wait results decoded after the borrow ends:
         // a load retried after a lost session must still build its card.
-        let mut deferred: Vec<(String, Value)> = Vec::new();
+        let mut deferred: Vec<(String, String, Value)> = Vec::new();
         for ((index, node), result) in pending.into_iter().zip(fetched) {
             let turn = t.items[index].0;
             if let Ok(item) = &result
@@ -998,7 +1120,7 @@ impl App {
                     _ => None,
                 })
             {
-                deferred.push((tool, item.clone()));
+                deferred.push((tool, id.clone(), item.clone()));
             }
             let mut entries = match result {
                 Ok(item) => items::entries(&item),
@@ -1015,7 +1137,6 @@ impl App {
                 Err(error) => vec![Entry::Note(format!("node {node}: {error}"))],
             };
             progressed = true;
-            t.nodes = t.nodes.saturating_sub(1);
             // A delegate call's result is the handle JSON the peer cards already
             // show, a background start's result is its proc card, and a wait's
             // result is what those cards became. None of it is shown twice.
@@ -1042,10 +1163,10 @@ impl App {
                 };
                 replacement.push((turn, item));
             }
-            t.items.splice(index..index + 1, replacement);
+            t.decode(index, replacement);
         }
-        for (tool, item) in deferred {
-            self.apply_wait_or_proc(name, &item, &tool);
+        for (tool, call_id, item) in deferred {
+            self.apply_wait_or_proc(name, &item, &tool, &call_id);
         }
         progressed
     }
@@ -1099,12 +1220,10 @@ impl App {
         self.transcripts
             .get(&self.selected)
             .map(|t| {
-                t.items
+                t.peers
                     .iter()
-                    .filter_map(|(_, i)| match i {
-                        Item::Peer(n) if self.bots.contains_key(n) => Some(n.clone()),
-                        _ => None,
-                    })
+                    .filter(|n| self.bots.contains_key(*n))
+                    .cloned()
                     .collect()
             })
             .unwrap_or_default()
@@ -1122,10 +1241,13 @@ impl App {
             .and_then(|b| b.workspace.clone())
             .unwrap_or_else(|| self.default_workspace.clone());
         let busy = self.bots.get(&name).is_some_and(|b| b.status != "idle");
+        // The identity on screen, so a name that changed hands in between
+        // is refused rather than handed the prompt.
+        let bot_id = self.bots.get(&name).and_then(|b| b.id);
         client
             .request(
                 "submit",
-                json!({"bot": name, "request_id": format!("tui-{}", now_ms()), "prompt": prompt,
+                json!({"bot": name, "bot_id": bot_id, "request_id": format!("tui-{}", now_ms()), "prompt": prompt,
                 "workspace": workspace, "delivery": if busy { "queue" } else { "reject" }}),
             )
             .await?;
@@ -1181,24 +1303,22 @@ pub fn is_active(status: &str) -> bool {
 pub fn spawns_peer(command: &str) -> bool {
     // Each shell segment on its own: the executable must be the agent CLI,
     // its first argument `run`, and `--detach` among the rest before `--`.
-    command
-        .split([';', '|', '&', '\n'])
-        .any(|segment| {
-            let mut tokens = segment
-                .split_whitespace()
-                .map(|t| t.trim_matches(|c| c == '"' || c == '\''));
-            let Some(exe) = tokens.next() else {
-                return false;
-            };
-            let is_agent = exe == "$AGENT_BIN"
-                || exe == "${AGENT_BIN}"
-                || exe == "agent"
-                || exe.ends_with("/agent");
-            if !is_agent || tokens.next() != Some("run") {
-                return false;
-            }
-            tokens.take_while(|t| *t != "--").any(|t| t == "--detach")
-        })
+    command.split([';', '|', '&', '\n']).any(|segment| {
+        let mut tokens = segment
+            .split_whitespace()
+            .map(|t| t.trim_matches(|c| c == '"' || c == '\''));
+        let Some(exe) = tokens.next() else {
+            return false;
+        };
+        let is_agent = exe == "$AGENT_BIN"
+            || exe == "${AGENT_BIN}"
+            || exe == "agent"
+            || exe.ends_with("/agent");
+        if !is_agent || tokens.next() != Some("run") {
+            return false;
+        }
+        tokens.take_while(|t| *t != "--").any(|t| t == "--detach")
+    })
 }
 
 pub fn now_ms() -> u128 {
@@ -1283,14 +1403,73 @@ mod tests {
     }
 
     #[test]
+    fn bodies_beyond_the_window_fold_back_into_whole_nodes() {
+        let mut t = Transcript::default();
+        t.add(Some(1), Item::User("hi".into()));
+        for node in 1..=4 {
+            t.add(
+                Some(1),
+                Item::Node {
+                    node,
+                    call_id: None,
+                },
+            );
+        }
+        t.add(Some(2), Item::Peer("kid".into()));
+        // Node 2 decodes to a thought and a long output; node 3 to text.
+        t.decode(
+            2,
+            vec![
+                (
+                    Some(1),
+                    Item::Thought {
+                        text: "t".into(),
+                        secs: 0,
+                    },
+                ),
+                (Some(1), Item::Output("a\nb\nc".into())),
+            ],
+        );
+        t.decode(4, vec![(Some(1), Item::Text("three".into()))]);
+        assert_eq!((t.nodes, t.thoughts, t.long_outputs), (2, 1, 1));
+        assert_eq!(t.peers, vec!["kid".to_owned()]);
+        // Keep the newest four items: the boundary falls inside node 2's run.
+        t.evict(4);
+        let kinds: Vec<String> = t
+            .items
+            .iter()
+            .map(|(_, i)| match i {
+                Item::User(_) => "user".into(),
+                Item::Node { node, .. } => format!("node{node}"),
+                Item::Text(_) => "text".into(),
+                Item::Peer(_) => "peer".into(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "node1", "node2", "text", "node4", "peer"]);
+        assert_eq!((t.nodes, t.thoughts, t.long_outputs), (3, 0, 0));
+        assert_eq!(t.items.len(), t.origin.len());
+        assert!(
+            t.origin[3].is_some(),
+            "the surviving body still knows its node"
+        );
+    }
+
+    #[test]
     fn a_recreated_name_is_a_new_bot_with_nothing_of_the_old_one() {
         let mut app = app_with(&[("Bob", Some("Alice"))]);
         app.transcripts.entry("Bob".into()).or_default().text = "old".into();
         app.upsert(&serde_json::json!({"name": "Bob", "id": 7, "status": "idle"}));
-        assert_eq!(app.transcripts["Bob"].text, "old", "same identity keeps its history");
+        assert_eq!(
+            app.transcripts["Bob"].text, "old",
+            "same identity keeps its history"
+        );
         app.upsert(&serde_json::json!({"name": "Bob", "id": 8, "status": "idle"}));
         assert_eq!(app.bots["Bob"].id, Some(8));
         assert_eq!(app.bots["Bob"].parent, None, "the old lineage is gone");
-        assert!(!app.transcripts.contains_key("Bob"), "the old transcript is gone");
+        assert!(
+            !app.transcripts.contains_key("Bob"),
+            "the old transcript is gone"
+        );
     }
 }

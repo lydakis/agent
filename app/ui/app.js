@@ -3,9 +3,12 @@
 (() => {
 'use strict';
 const $ = (id) => document.getElementById(id);
-const GLYPH = { running: '●', waiting: '◐', paced: '◔', failed: '✘', idle: '○', queued: '◌', interrupted: '✘' };
-const LABEL = { running: 'working', waiting: 'waiting', paced: 'rate limited', failed: 'failed', idle: 'idle', queued: 'queued', interrupted: 'interrupted' };
+const GLYPH = { running: '●', waiting: '◐', paced: '◔', failed: '✘', idle: '○', queued: '◌', ready: '◌', interrupted: '✘' };
+const LABEL = { running: 'working', waiting: 'waiting', paced: 'rate limited', failed: 'failed', idle: 'idle', queued: 'queued', ready: 'queued', interrupted: 'interrupted' };
 const LAZY_ITEMS = 400;
+// Decoded items kept around the reader's end of a transcript; bodies beyond it fold back into their
+// nodes and a scroll toward them loads them again.
+const WINDOW = 3 * LAZY_ITEMS;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
@@ -13,9 +16,44 @@ const S = {
 };
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
-const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null }); return S.transcripts.get(name); };
+const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null }); return S.transcripts.get(name); };
+// Counters kept in step with the items, so the key bar never scans the history.
+function count(t, it, d) {
+  if (it.kind === 'node') t.nodes = Math.max(0, t.nodes + d);
+  else if (it.kind === 'thought') t.thoughts = Math.max(0, t.thoughts + d);
+  else if (it.kind === 'out' && it.text.split('\n', 3).length > 2) t.longOut = Math.max(0, t.longOut + d);
+  else if (it.kind === 'peer' && d > 0 && !t.peers.includes(it.who)) t.peers.push(it.who);
+}
+const addItem = (t, it) => { count(t, it, 1); t.items.push(it); };
+// Replace the bare node at `at` with what it decoded to; each entry remembers its node.
+function decodeAt(t, at, entries) {
+  const bare = t.items[at]; if (bare.kind !== 'node') return;
+  count(t, bare, -1);
+  for (const e of entries) { e.from = bare.node; e.fromCall = bare.callId; count(t, e, 1); }
+  t.items.splice(at, 1, ...entries);
+  t.gen += 1;
+}
+function takeAt(t, at) { const [it] = t.items.splice(at, 1); if (it) count(t, it, -1); t.gen += 1; }
+// Fold decoded bodies outside the window back into their nodes. Whole nodes only: a run split by the
+// boundary folds entirely, so a later decode cannot sit next to its own remainder.
+function evict(t) {
+  const len = t.items.length; if (len <= WINDOW) return;
+  let outside;
+  if (t.anchor === 'end') { const limit = len - WINDOW; outside = (i) => i < limit; }
+  else { const first = t.items.findIndex((it) => it.kind !== 'node'); if (first < 0) return; const limit = first + WINDOW; outside = (i) => i > limit; }
+  const items = t.items; t.items = []; let folding = null; let changed = false;
+  items.forEach((it, i) => {
+    if (it.from !== undefined && folding === it.from) { count(t, it, -1); changed = true; return; }
+    if (it.from !== undefined && outside(i)) {
+      folding = it.from; count(t, it, -1); changed = true;
+      const bare = { kind: 'node', node: it.from, callId: it.fromCall, turn: it.turn }; count(t, bare, 1); t.items.push(bare); return;
+    }
+    folding = null; t.items.push(it);
+  });
+  if (changed) t.gen += 1;
+}
 // Every bare node goes through here so the count stays right; loads skip a transcript at zero.
-const pushNode = (t, item) => { t.nodes += 1; t.items.push(item); };
+const pushNode = addItem;
 const glyphOf = (status) => GLYPH[status] || '✘';
 const labelOf = (status) => LABEL[status] || 'failed';
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
@@ -106,8 +144,8 @@ async function onEvent(ev) {
       if (kind === 'created') {
         // Lineage comes from the daemon's record or the event, never from guessing at shell text.
         const parent = bot(name)?.parent;
-        if (parent && bot(name) && S.bots.has(parent)) { bot(name).parent = parent; transcript(parent).items.push({ kind: 'peer', who: name, turn: bot(parent)?.runningTurn ?? null }); }
-      } else transcript(name).items.push({ kind: 'note', text: `forked from ${data.source ?? '?'}`, turn: null });
+        if (parent && bot(name) && S.bots.has(parent)) { bot(name).parent = parent; addItem(transcript(parent), { kind: 'peer', who: name, turn: bot(parent)?.runningTurn ?? null }); }
+      } else addItem(transcript(name), { kind: 'note', text: `forked from ${data.source ?? '?'}`, turn: null });
       break;
     }
     case 'accepted': {
@@ -119,13 +157,13 @@ async function onEvent(ev) {
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
       if (b && !behindOwn) b.status = data.status ?? 'queued';
-      transcript(name).items.push({ kind: 'note', text: behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
+      addItem(transcript(name), { kind: 'note', text: behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
       break;
     }
     case 'message': {
       const t = transcript(name);
       if (t.streamingTurn === turn) {
-        if (t.thinking) { t.items.push({ kind: 'thought', text: t.thinking, secs: t.thinkingSince ? Math.round((Date.now() - t.thinkingSince) / 1000) : 0, turn }); t.thinking = ''; t.thinkingSince = 0; }
+        if (t.thinking) { addItem(t, { kind: 'thought', text: t.thinking, secs: t.thinkingSince ? Math.round((Date.now() - t.thinkingSince) / 1000) : 0, turn }); t.thinking = ''; t.thinkingSince = 0; }
         t.text = '';
       }
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn });
@@ -135,7 +173,7 @@ async function onEvent(ev) {
       const args = data.arguments ?? '';
       let parsed = {}; try { parsed = JSON.parse(args); } catch (_) {}
       const tname = data.name ?? 'tool';
-      transcript(name).items.push({ kind: 'tool', callId: data.call_id, name: tname, summary: callSummary(tname, args), args, background: tname === 'shell' && parsed.background === true, spawns: tname === 'shell' && spawnsPeer(String(parsed.command ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn });
+      addItem(transcript(name), { kind: 'tool', callId: data.call_id, name: tname, summary: callSummary(tname, args), args, background: tname === 'shell' && parsed.background === true, spawns: tname === 'shell' && spawnsPeer(String(parsed.command ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn });
       break;
     }
     case 'tool_completed': {
@@ -144,11 +182,11 @@ async function onEvent(ev) {
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; }
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
-        if (call && (call.background || call.name === 'wait')) {
-          await loadWaitOrProc(name, data.node, call);
+        if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
           // The node is spent: the cards show its result, and a later lazy load must not decode it again.
+          // A failed fetch keeps it for the next session's lazy load instead.
           const pos = t.items.findLastIndex((it) => it.kind === 'node' && it.node === data.node);
-          if (pos >= 0) { t.items.splice(pos, 1); t.nodes = Math.max(0, t.nodes - 1); t.gen = (t.gen ?? 0) + 1; }
+          if (pos >= 0) takeAt(t, pos);
         }
       }
       break;
@@ -156,15 +194,15 @@ async function onEvent(ev) {
     case 'turn_waiting': { const b = bot(name); if (b) { b.status = 'waiting'; b.waitingOn = data.handles ?? []; } break; }
     case 'turn_paced': { const b = bot(name); if (b) b.status = 'paced'; break; }
     case 'turn_resumed': { const b = bot(name); if (b) { b.status = 'running'; b.waitingOn = []; } break; }
-    case 'steered': transcript(name).items.push({ kind: 'note', text: 'steered into the running turn', turn }); break;
+    case 'steered': addItem(transcript(name), { kind: 'note', text: 'steered into the running turn', turn }); break;
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
-      if (t.streamingTurn === turn) { if (t.text) t.items.push({ kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; }
-      if (status !== 'completed' && status !== 'steered') t.items.push({ kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
+      if (t.streamingTurn === turn) { if (t.text) addItem(t, { kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; }
+      if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
@@ -172,15 +210,16 @@ async function onEvent(ev) {
     case 'pruned': {
       // A `follow *` replay reports a retention gap with bot "*": a notice about the store, not a transcript.
       if (name === '*') toast(`events before cursor ${ev.before ?? 0} were pruned; older history is gone`, 5000);
-      else transcript(name).items.push({ kind: 'note', text: 'earlier history pruned', turn: null });
+      else addItem(transcript(name), { kind: 'note', text: 'earlier history pruned', turn: null });
       break;
     }
     default: break;
   }
 }
 async function loadWaitOrProc(name, node, call) {
-  let item; try { item = await Daemon.request('item', { bot: name, node }); } catch (_) { return; }
+  let item; try { item = await Daemon.request('item', { bot: name, node }); } catch (_) { return false; }
   applyWaitOrProc(name, item, call);
+  return true;
 }
 // Decode a background start (a proc handle) or a wait result into the cards; also reached by a retried load.
 function applyWaitOrProc(name, item, call) {
@@ -188,7 +227,8 @@ function applyWaitOrProc(name, item, call) {
   let value; try { value = JSON.parse(output); } catch (_) { return; }
   const t = transcript(name);
   if (call.background) {
-    if (typeof value.handle === 'string') t.items.push({ kind: 'proc', handle: value.handle, cmd: call.summary, done: null, open: false, turn: bot(name)?.runningTurn ?? null });
+    // A decode seen twice adds no second card.
+    if (typeof value.handle === 'string' && !t.items.some((it) => it.kind === 'proc' && it.handle === value.handle)) addItem(t, { kind: 'proc', handle: value.handle, cmd: call.summary, done: null, open: false, turn: bot(name)?.runningTurn ?? null });
   } else if (value.results) {
     for (const [handle, result] of Object.entries(value.results)) {
       if (result.pending) continue;
@@ -225,15 +265,21 @@ async function load(name) {
 }
 async function loadBatch(name) {
   const t = S.transcripts.get(name); if (!t || !t.nodes) return false;
-  const pending = t.items.map((it, i) => [i, it]).filter(([, it]) => it.kind === 'node').slice(-LAZY_ITEMS).reverse();
-  if (!pending.length) { t.nodes = 0; return false; }
+  // At the end: the newest bare nodes inside the window. At the top: the newest bare nodes above the
+  // oldest decoded item, so the reader's next screen fills and nothing folded at the far end is fetched.
+  let lo = 0, hi = t.items.length;
+  if (t.anchor === 'end') lo = Math.max(0, hi - WINDOW);
+  else { const first = t.items.findIndex((it) => it.kind !== 'node'); if (first > 0) hi = first; }
+  const pending = [];
+  for (let i = hi - 1; i >= lo && pending.length < LAZY_ITEMS; i--) if (t.items[i].kind === 'node') pending.push([i, t.items[i]]);
+  if (!pending.length) return false;
   const fetched = await Promise.all(pending.map(([, it]) => Daemon.request('item', { bot: name, node: it.node }).then((v) => ({ ok: v }), (e) => ({ err: String(e?.message ?? e) }))));
   let progressed = false; const deferred = [];
   pending.forEach(([index, it], k) => {
     const r = fetched[k];
     // A lost session is not the item's fault: the node stays and the next attach fetches it. Anything else is final.
     if (r.err && /daemon_disconnected|detached|^io\b/.test(r.err)) return;
-    progressed = true; t.nodes = Math.max(0, t.nodes - 1);
+    progressed = true;
     let es = r.ok ? entries(r.ok) : [{ kind: 'note', text: `node ${it.node}: ${r.err}` }];
     const call = it.callId ? t.items.slice(0, index).reverse().find((x) => x.kind === 'tool' && x.callId === it.callId) : null;
     if (call && r.ok && (call.background || call.name === 'wait')) deferred.push([call, r.ok]);
@@ -243,10 +289,10 @@ async function loadBatch(name) {
       if (e.kind === 'thought') { const prev = t.items[index - 1]; if (prev && prev.kind === 'thought' && prev.turn === it.turn && rep.length === 0) { prev.text = e.text; continue; } }
       rep.push({ ...e, turn: it.turn });
     }
-    t.items.splice(index, 1, ...rep);
-    t.gen = (t.gen ?? 0) + 1;
+    decodeAt(t, index, rep);
   });
   for (const [call, item] of deferred) applyWaitOrProc(name, item, call);
+  evict(t);
   return progressed;
 }
 async function loadVisible() {
@@ -268,9 +314,11 @@ async function attach() {
   try {
     if (!S.config) S.config = await Daemon.setup();
     if (!unlisten) unlisten = await Daemon.onEvent((ev) => enqueue(async () => {
-      // An event from a session this page already left behind is noise.
-      if (ev.session !== undefined && S.session !== undefined && ev.session !== S.session) return;
+      // An event from a session this page already left behind is noise. Sessions count up, and the
+      // one being attached forwards its replay before its number is installed, so only older is stale.
+      if (ev.session !== undefined && S.session !== undefined && ev.session < S.session) return;
       const terminal = await onEvent(ev);
+      if (ev.session !== undefined && ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = ev.session;
       // During replay nothing is fetched: a load per node-producing event would serialize a long history
       // into one request each. The first load runs once follow_live arrives.
       if (!terminal) { if (S.live) await loadVisible(); render(); }
@@ -281,9 +329,12 @@ async function attach() {
     // its live-only `deleted` notice cannot be replayed; anything newer arrives on the subscription.
     const listed = new Set((result.bots ?? []).map((r) => r.name));
     for (const record of result.bots ?? []) upsert(record);
-    for (const name of [...S.bots.keys()]) if (!listed.has(name)) { S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null; }
+    // A bot this session's own events already mentioned was born after the listing, not deleted.
+    for (const [name, b] of [...S.bots]) if (!listed.has(name) && !(b.touched >= result.session)) { S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null; }
     S.attached = true;
     restore();
+    // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
+    if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
     await enqueue(loadVisible);
     $('detached').classList.remove('on');
     render();
@@ -329,9 +380,12 @@ function markdown(text) {
 function cardHTML({ attr, status, name, last, elapsed, sel, body }) {
   return `<div class="peer${sel ? ' sel' : ''}" ${attr} role="button" tabindex="0"><span class="glyph ${status}">${glyphOf(status)}</span><span class="pn">${esc(name)}</span><span class="el">${elapsed ?? ''}</span><span class="pl">${esc(last)}</span>${body ?? ''}</div>`;
 }
+// A card's one line: the last non-empty line of the newest text, bounded, so a long reply costs the
+// parent's render nothing.
+function tailOf(s) { const at = s.trimEnd().lastIndexOf('\n'); return s.slice(at + 1).trim().slice(0, 200); }
 function lastLine(t) {
-  if (t.text) return t.text; if (t.thinking) return t.thinking.split('. ').pop();
-  for (const it of [...t.items].reverse()) { if (it.kind === 'text') return it.text; if (it.kind === 'tool') return `▸ ${it.name} ${it.summary}`; }
+  if (t.text) return tailOf(t.text); if (t.thinking) return t.thinking.split('. ').pop().slice(0, 200);
+  for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if (it.kind === 'text') return tailOf(it.text); if (it.kind === 'tool') return `▸ ${it.name} ${it.summary}`; }
   return '';
 }
 function itemHTML(it) {
@@ -382,8 +436,11 @@ function renderTranscript(el, name) {
 }
 for (const [id, who] of [['log', () => S.selected], ['peek', () => S.ui.peek]]) {
   $(id).addEventListener('scroll', () => {
-    const el = $(id); const name = who();
-    if (el.scrollTop < 200 && name && (S.transcripts.get(name)?.nodes ?? 0) > 0) enqueue(async () => { await load(name); render(); });
+    const el = $(id); const name = who(); const t = name && S.transcripts.get(name); if (!t) return;
+    const nearTop = el.scrollTop < 200, nearEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
+    // The window follows the reader: the edge they reach is where bodies stay decoded.
+    if (nearTop && !nearEnd) t.anchor = 'top'; else if (nearEnd) t.anchor = 'end';
+    if ((nearTop || nearEnd) && t.nodes > 0) enqueue(async () => { await load(name); render(); });
   });
 }
 function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><b>${esc(b.name)}</b><span>${labelOf(b.status)}</span>${closable ? '<span class="x">Esc closes</span>' : ''}`; }
@@ -392,7 +449,7 @@ function botRowHTML(n, sel) {
   const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => h.replace(/^turn:/, '').split('/')[0]).join(' ')}</div>` : '';
   return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="n">${esc(b.name)}</span></div>${w}`;
 }
-function peers() { return (S.transcripts.get(S.selected)?.items ?? []).filter((i) => i.kind === 'peer' && S.bots.has(i.who)).map((i) => i.who); }
+function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
 function keybarHTML(b) {
   const busy = b && isActive(b.status);
   const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : busy ? labelOf(b.status) : 'live'}</span>`;
@@ -402,8 +459,8 @@ function keybarHTML(b) {
   else {
     keys.push('<kbd>^k</kbd> switch'); if (peers().length) keys.push('<kbd>^p</kbd> peek'); keys.push('<kbd>^b</kbd> bots');
     const t = S.transcripts.get(S.selected);
-    if (t?.items.some((i) => i.kind === 'thought')) keys.push(`<kbd>^t</kbd> ${S.ui.thoughts ? 'fold' : 'thoughts'}`);
-    if (t?.items.some((i) => i.kind === 'out' && i.text.split('\n').length > 2)) keys.push(`<kbd>^o</kbd> ${S.ui.output ? 'fold' : 'output'}`);
+    if (t?.thoughts > 0) keys.push(`<kbd>^t</kbd> ${S.ui.thoughts ? 'fold' : 'thoughts'}`);
+    if (t?.longOut > 0) keys.push(`<kbd>^o</kbd> ${S.ui.output ? 'fold' : 'output'}`);
     if (busy) keys.push('<kbd>Esc</kbd> interrupt');
     keys.push('<kbd>^d</kbd> detach');
   }
@@ -458,7 +515,8 @@ async function submit(text) {
   }
   if (text === '/help' || text === '?') { showHelp(); return; }
   const b = bot(S.selected); if (!b) throw new Error('no bot selected; /new NAME creates one');
-  await Daemon.request('submit', { bot: b.name, request_id: `app-${Date.now()}`, prompt: text, workspace: b.workspace ?? S.config.workspace, delivery: b.status === 'idle' ? 'reject' : 'queue' });
+  // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
+  await Daemon.request('submit', { bot: b.name, bot_id: b.id ?? undefined, request_id: `app-${Date.now()}`, prompt: text, workspace: b.workspace ?? S.config.workspace, delivery: b.status === 'idle' ? 'reject' : 'queue' });
 }
 async function interrupt() { const b = bot(S.selected); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
 function detach() { save(); Daemon.close(); }

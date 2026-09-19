@@ -228,7 +228,14 @@ async fn main() {
                 match event {
                     Some(event) => {
                         app.event(event).await;
-                        while let Ok(event) = events.try_recv() { app.event(event).await; }
+                        // A bounded batch: a fleet that never stops talking
+                        // still leaves input and drawing their turn.
+                        for _ in 1..app::DRAIN {
+                            match events.try_recv() {
+                                Ok(event) => app.event(event).await,
+                                Err(_) => break,
+                            }
+                        }
                         if app.reattach {
                             app.reattach = false;
                             match app.attach().await {

@@ -84,6 +84,40 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// The first `limit + 1` bytes at most: enough to know whether a file
+/// fits in `limit`. Nothing beyond that is ever read, so a runaway file
+/// fails before it fills memory.
+fn read_head(path: &Path, limit: usize) -> Result<Vec<u8>, Failure> {
+    use std::io::Read;
+    let unreadable = |error: std::io::Error| Failure::Unreadable {
+        path: path.to_path_buf(),
+        reason: error.to_string(),
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    Ok(bytes)
+}
+
+/// A whole file of at most `limit` bytes, or `None` when it holds more.
+fn read_bounded(path: &Path, limit: usize) -> Result<Option<String>, Failure> {
+    let bytes = read_head(path, limit)?;
+    if bytes.len() > limit {
+        return Ok(None);
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|e| Failure::Unreadable {
+            path: path.to_path_buf(),
+            reason: e.utf8_error().to_string(),
+        })
+}
+
+/// The first line of a skill: at most this much is read to find it.
+const SKILL_HEAD: usize = 4096;
+
 /// AGENTS.md files that apply to `workspace`: the global one first, then
 /// from the filesystem root down to the workspace, so the nearest file is
 /// read last and wins where they disagree.
@@ -132,10 +166,23 @@ pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
                 continue;
             };
-            let text = std::fs::read_to_string(&path).map_err(|error| Failure::Unreadable {
-                path: path.clone(),
-                reason: error.to_string(),
-            })?;
+            // Only the head is read; a character cut at its end is not an
+            // error, bytes that are not text anywhere before it are.
+            let mut bytes = read_head(&path, SKILL_HEAD)?;
+            bytes.truncate(SKILL_HEAD);
+            let text = match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) if error.utf8_error().error_len().is_none() => {
+                    let valid = error.utf8_error().valid_up_to();
+                    String::from_utf8_lossy(&error.into_bytes()[..valid]).into_owned()
+                }
+                Err(error) => {
+                    return Err(Failure::Unreadable {
+                        path,
+                        reason: error.utf8_error().to_string(),
+                    });
+                }
+            };
             let summary = text
                 .lines()
                 .map(|l| l.trim().trim_start_matches('#').trim())
@@ -163,15 +210,22 @@ pub fn instructions(workspace: &Path) -> Result<Instructions, Failure> {
     let mut text = String::from(PREAMBLE);
     let mut sources = Vec::new();
     for path in agents_files(workspace) {
-        let body = std::fs::read_to_string(&path).map_err(|error| Failure::Unreadable {
-            path: path.clone(),
-            reason: error.to_string(),
-        })?;
+        // Read no more than what could still fit; a file past the budget
+        // fails on its size, not after being copied into memory.
+        let header = format!("\n\n# Instructions from {}\n\n", path.display());
+        let room = MAX_INSTRUCTIONS.saturating_sub(text.len() + header.len());
+        let Some(body) = read_bounded(&path, room)? else {
+            let size = std::fs::metadata(&path).map_or(room + 1, |m| m.len() as usize);
+            return Err(Failure::TooLong {
+                path,
+                total: text.len() + header.len() + size,
+            });
+        };
         let body = body.trim();
         if body.is_empty() {
             continue;
         }
-        let block = format!("\n\n# Instructions from {}\n\n{body}", path.display());
+        let block = format!("{header}{body}");
         if text.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
                 path,
@@ -267,6 +321,28 @@ mod tests {
         assert!(
             matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > MAX_INSTRUCTIONS)
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_runaway_file_fails_on_its_size_without_being_read_whole() {
+        let root = temp("runaway");
+        // Sparse: the file is huge on disk, cheap to create, and reading
+        // it whole would allocate it all.
+        let file = std::fs::File::create(root.join("AGENTS.md")).unwrap();
+        file.set_len(512 * 1024 * 1024).unwrap();
+        drop(file);
+        let error = instructions(&root).unwrap_err();
+        assert!(
+            matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > 512 * 1024 * 1024)
+        );
+        std::fs::create_dir_all(root.join(".agent/skills")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "rule").unwrap();
+        let mut long = String::from("# Big skill\n\n");
+        long.push_str(&"x".repeat(SKILL_HEAD * 4));
+        std::fs::write(root.join(".agent/skills/big.md"), long).unwrap();
+        let composed = instructions(&root).unwrap();
+        assert_eq!(composed.skills[0].summary, "Big skill");
         let _ = std::fs::remove_dir_all(&root);
     }
 

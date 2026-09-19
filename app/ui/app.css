@@ -46,7 +46,7 @@ pre.code .lang{position:absolute;right:10px;top:4px;color:var(--t-faint);font-si
 .glyph{display:inline-block;width:1ch;text-align:center}
 .glyph.running{color:var(--run);animation:pulse 1.4s ease-in-out infinite}
 .glyph.waiting{color:var(--wait);animation:breathe 2.2s ease-in-out infinite}
-.glyph.paced{color:var(--pace)}.glyph.failed{color:var(--fail)}.glyph.idle{color:var(--idle)}.glyph.queued{color:#7aa2f7}
+.glyph.paced{color:var(--pace)}.glyph.failed{color:var(--fail)}.glyph.idle{color:var(--idle)}.glyph.queued,.glyph.ready{color:#7aa2f7}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(.7)}}
 .botrow{padding:2px 10px;cursor:pointer;display:flex;gap:1ch;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-left:2px solid transparent}
