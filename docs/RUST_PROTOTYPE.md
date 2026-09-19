@@ -55,12 +55,17 @@ the CLI uses a stable hash of that path in a private `/tmp/agent-<uid>` director
 This also works before a new store exists. `--socket` explicitly selects an
 endpoint; otherwise `AGENT_SOCKET` applies only when `--store` was not supplied.
 Explicit socket paths are used as given and must fit the OS address limit.
-The daemon runs the providers, tools, and limits of the client that started
-it, and announces them in `ready`. It supplies no agent behavior: `create`
-names the bot's model and instructions, the bot keeps both, and a later
+The daemon runs the providers and limits of the client that started it,
+registers every tool this build knows, and announces all of it in `ready`.
+It supplies no agent behavior: `create` names the bot's model, instructions,
+and tools, the bot keeps all three, a fork inherits them, and a later
 client's environment changes nothing about an existing bot. The CLI resolves
-`--model` or `AGENT_MODEL` and `--instructions` or its built-in text before
-it asks. The store binds none of that:
+`--model` or `AGENT_MODEL`, `--instructions` or its built-in text, and
+`--tools` or `shell,read,write,edit,wait,history` before it asks. A bot's
+tools are what the model is shown and what dispatch allows: a call to any
+other tool is answered with a `tool_not_available` result, whatever the
+model was told. Tool definitions live once in the daemon and their request
+encodings once per distinct selection, shared by every bot that made it. The store binds none of that:
 it opens under any provider set, so providers can be added, removed, and
 brought back between runs. New submissions validate the effective provider,
 including the bot's default, before accepting work or changing history.
@@ -71,12 +76,12 @@ encoding differs. Previously accepted requests still reconcile by request ID.
 Queued turns recheck before starting after a restart; an invalid provider ends
 the queued turn with that error without appending its prompt. Parked turns have
 already changed history; a provider failure ends them through normal turn cleanup. Whether a running daemon is acceptable is the client's call: every
-daemon-scoped value a client states (`--provider`, `--tools`, and the limits;
-`--model` belongs to `run` alone) is compared with `ready`
+daemon-scoped value a client states (`--provider` and the limits; `--model`
+and `--tools` belong to `run` alone) is compared with `ready`
 at attach, and a difference fails with `daemon_configuration_mismatch` naming
 each one, before anything is submitted. Defaults and providers implied by
 environment keys never conflict; a stated provider must be registered with the
-same family and URL, and a stated toolset must match as a set. Limit comparisons
+same family and URL. Limit comparisons
 use effective values: `--idle-exit 0` disables idle exit, and positive context
 limits below 1,024 bytes or two items are raised to those minimums.
 Providers are selected explicitly with `--provider`, or implied by which of the
@@ -428,8 +433,7 @@ remain available through replay if the drain deadline is reached.
 ```sh
 .local/target/release/agent serve \
   --store .local/runtime/state.sqlite --socket .local/runtime/state.sqlite.sock \
-  --provider anthropic --provider openai \
-  --tools shell,read,write,edit,wait,history
+  --provider anthropic --provider openai
 ```
 
 Requests include a string or nonnegative integer `id`. Responses carry the same
@@ -660,11 +664,14 @@ files are rejected. Do not replace or rename the database or its lock while
 open. The schema version lives in SQLite's `user_version`; a store created
 before versioning is refused with `store_schema_unsupported`, one written by a
 newer binary with `store_schema_newer`, and an older versioned store is
-migrated forward one version at a time inside the opening transaction (a
-version-6 store gains turn ordinals rebuilt from its accepted events). The
-migration is the only code that knows an earlier format. The store records no
-provider set or toolset; a bot's provider is checked by family when its turn
-starts.
+migrated inside the opening transaction when its data can be converted without
+guessing. Schema 18 requires each bot's tool selection. Older stores with bots
+but no recorded selection are refused with `store_migration_tools_unknown`;
+their data and schema version remain intact. Keep those stores and use a new
+store path. Empty stores can migrate. The migration is the only code that
+knows an earlier format. The store records no daemon-wide provider set or
+toolset; each bot retains its tools, and its provider is checked by family
+when its turn starts.
 
 Accepted user input is committed before the submission response. Provider output,
 usage, and tool plans are committed before tool dispatch. Tool intent is
@@ -820,8 +827,8 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 14; a version-6
-store is migrated at open. Store initialization and migration run in one
+the `context_window` capability. Stores are schema version 18; supported
+migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -914,8 +921,9 @@ which is future work, or deleting the bot.
 
 ## Tools and validation scope
 
-`--tools` names any subset of `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
-`history`. The
+The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
+`history`; each bot is created with the subset it may call (`run --tools`),
+which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, timeout, output
 overflow) returns an error result to the model and the turn continues. Only a

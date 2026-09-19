@@ -31,6 +31,7 @@ fn binding() -> Binding<'static> {
         instructions: "test",
         reasoning: None,
         budget_tokens: None,
+        tools: &[],
     }
 }
 /// Every stored item of a bot, through the same window the runtime streams.
@@ -649,6 +650,87 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
     let rest = db.turns("Bob", turn, 64).unwrap();
     assert_eq!(rest["turns"].as_array().unwrap().len(), 1);
     assert!(rest["next_after"].is_null());
+}
+
+#[test]
+fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
+    let path =
+        std::env::temp_dir().join(format!("agent-tool-migrate-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+    }
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE bots DROP COLUMN tools; PRAGMA user_version=17;")
+        .unwrap();
+    let nodes: Vec<(i64, Vec<u8>)> = conn
+        .prepare("SELECT id,item FROM nodes ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        Database::initialize(conn).err().unwrap().code,
+        "store_migration_tools_unknown"
+    );
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap(),
+        17
+    );
+    assert!(
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='tools')",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        conn.query_row("SELECT name FROM bots", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "Bob"
+    );
+    let retained: Vec<(i64, Vec<u8>)> = conn
+        .prepare("SELECT id,item FROM nodes ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(retained, nodes);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+
+    // No existing bot means there is no policy to invent.
+    let path = std::env::temp_dir().join(format!(
+        "agent-empty-tool-migrate-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    drop(Database::initialize(Connection::open(&path).unwrap()).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE bots DROP COLUMN tools; PRAGMA user_version=17;")
+        .unwrap();
+    let mut db = Database::initialize(conn).unwrap();
+    let tools = vec!["echo".to_owned()];
+    db.create(
+        "New",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            ..binding()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("New").unwrap().tools, tools);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

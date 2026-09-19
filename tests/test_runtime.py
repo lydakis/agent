@@ -448,6 +448,43 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
         self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
 
+    def test_tools_are_per_bot_shown_to_the_model_and_enforced_at_dispatch(self):
+        client = self.client('echo,shell')
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(self.path), tools=['echo', 'sudo'])['error'],
+                         'unsupported_tool_set')
+        self.assertEqual(client.request('create', bot='Twice', workspace=str(self.path), tools=['echo', 'echo'])['error'],
+                         'unsupported_tool_set')
+        client.next_id += 1
+        client.process.stdin.write(json.dumps({'id': client.next_id, 'op': 'create', 'bot': 'None', 'workspace': str(self.path),
+                                               'model': 'openai/synthetic-model', 'instructions': 'x'}) + '\n')
+        client.process.stdin.flush()
+        self.assertEqual(client.receive(lambda m: m.get('id') == client.next_id)['error'], 'tools_required')
+        echo_only = client.request('create', bot='Echo', workspace=str(self.path), tools=['echo'])['result']
+        self.assertEqual(echo_only['tools'], ['echo'])
+        both = client.request('create', bot='Both', workspace=str(self.path), tools=['shell', 'echo'])['result']
+        self.assertEqual(both['tools'], ['shell', 'echo'])
+        # Each bot's request carries its own tools, and the daemon announces the universe.
+        turn = client.request('submit', bot='Echo', request_id='1', prompt='shell:true')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in first['tools']], ['echo'])
+        events = client.request('events', bot='Echo', after=0, limit=64)['result']['events']
+        done = [e for e in events if e['event'] == 'tool_completed'][0]
+        output = client.request('item', bot='Echo', node=done['data']['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+        turn = client.request('submit', bot='Both', request_id='1', prompt='shell:true')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.model.requests.get(timeout=3)
+        second = self.model.requests.get(timeout=3)
+        self.assertEqual([t['name'] for t in second['tools']], ['shell', 'echo'])
+        # A fork keeps its source's selection; a restart with other ideas changes nothing.
+        fork = client.request('fork', source='Echo', bot='Branch')['result']
+        self.assertEqual(fork['tools'], ['echo'])
+        client.close()
+        client = self.client('shell')
+        self.assertEqual(client.request('resume', bot='Both')['result']['tools'], ['shell', 'echo'])
+        self.assertEqual(client.request('stats')['result']['active_turns'], 0)
+
     def test_a_bot_is_created_with_what_its_client_states_and_keeps_it(self):
         client = self.client()
         raw = lambda **params: client.request('create', bot='Bob', workspace=str(self.path), **params)

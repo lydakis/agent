@@ -1902,3 +1902,72 @@ The peer regression fails before the fix and passes after it. It covers new
 peer inheritance, continuation with a different stored provider/model, explicit
 turn overrides, and preservation of the stored choice. Validation: 76 Rust
 tests, 28 focused Python tests, strict Clippy, formatting, and diff checks.
+
+## Per-bot tools
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. Compared the committed tree `df1d4563…` (rebuilt from a worktree and
+screened with its own bench code, since its `create` does not know a `tools`
+field) with the slice binary `4682cf7d…`. The daemon registers every tool
+this build knows and `serve` takes no `--tools`; `create` requires the bot's
+selection; the model is shown that selection and dispatch enforces it with a
+`tool_not_available` result; definitions live once in the registry and the
+request encoding once per distinct selection and family, in a bounded map.
+Per turn that is one map lookup at start and one scan of the bot's names per
+tool call.
+
+The 32-agent socket echo workload as before, one excluded warmup and four
+measured runs per binary:
+
+| Metric | Committed tree | This slice |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.66 (17.62–17.78) | 17.64 (17.56–17.78) |
+| Observed target CPU, seconds | 0.323 (0.298–0.343) | 0.344 (0.315–0.351) |
+| Per-run p95 turn latency, ms | 597.1 (591.3–623.0) | 604.6 (594.9–625.8) |
+
+The CPU medians differ by 6% with ranges that overlap almost entirely; RSS
+is level and p95 within noise. The two were not run back to back (the
+baseline followed a full rebuild), so the median gap is not attributed to
+the slice's per-turn lookup. Captures: ignored
+`.local/bench/slice-prev5-socket-32/` and `slice-tools-socket-32/`.
+
+Validation: 76 Rust tests, strict Clippy, formatting, and 152 Python tests.
+New regressions: `create` refuses an unknown or repeated tool and a missing
+selection by name; a bot created with `echo` alone is shown only `echo` and
+gets `tool_not_available` when its model calls `shell`, while a bot with
+both is shown both; a fork keeps its source's selection; a daemon restarted
+with other ideas changes nothing; `run --tools` on an existing bot is a
+usage error, as `--instructions` now is; `ls` lists each bot's tools.
+
+### Tool-selection review fixes
+
+Observed 2026-09-18, Darwin arm64 on external power, Rust 1.98.0. Compared
+the pre-fix per-bot-tools binary `06fcc5ec…` with `1d3c41a8…`, using the same
+current observer and 32-agent socket echo workload above. Run order was
+baseline, candidate, candidate, baseline; each batch had one excluded warmup
+and two measured runs, giving four measured runs per binary. Builds and tests
+finished before measurement. Every run passed, achieved the requested provider
+concurrency, and reported no quality warnings.
+
+| Metric | Before fixes | After fixes |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.74 (17.59–17.86) | 17.78 (17.58–17.91) |
+| Observed target CPU, seconds | 0.316 (0.298–0.323) | 0.307 (0.302–0.311) |
+| Per-run p95 turn latency, ms | 590.7 (586.8–601.0) | 589.5 (587.8–599.6) |
+
+These overlapping ranges show no material regression from the fixes; the
+2.8% lower CPU median is not evidence of a speedup. This isolates the review
+fixes, not the entire per-bot-tools slice versus the earlier committed runtime.
+The workload checks durable replay/follow equality, restart, resume, and forks;
+it measures the daemon tree, excluding Python observers and Rust CLI invocations.
+Captures and the alternating driver are under ignored `.local/toolset-fix/`.
+
+The migration now refuses populated stores whose tool selection was never
+recorded, leaving their data and schema version intact; empty stores migrate.
+It uses an existence query only on migration, with no turn-loop work added.
+The live fleet driver now supplies its same five tools to every measured bot
+and the warmup. Its regression checks actual synthetic provider requests;
+this restores the intended workload rather than claiming an efficiency gain
+from removing the accidentally advertised `history` tool. No paid calls ran.
+Validation: 77 Rust tests, 66 Python tests, strict Clippy, formatting, and diff
+checks. Both new regression assertions failed before the fixes.

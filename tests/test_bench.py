@@ -202,7 +202,7 @@ class DaemonRunnerTests(unittest.TestCase):
                 config = dict(version=1, concurrency=1, turns=2, chunks=3,
                               chunk_bytes=chunk_bytes, chunk_delay_ms=100, history_bytes=32)
                 (directory / 'workload.json').write_text(json.dumps(config))
-                result = run_once([str(binary), 'serve', '--tools', 'echo'],
+                result = run_once([str(binary), 'serve'],
                                   config, options, directory, 0)
                 self.assertEqual(result['status'], 'ok', result)
                 self.assertEqual(result['events']['stream_payload_bytes'], 6 * chunk_bytes)
@@ -211,7 +211,7 @@ class DaemonRunnerTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1',
                      'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class LiveFleetTests(ModelFixture):
-    def test_selected_model_reaches_every_bot_without_environment_dependence(self):
+    def test_selected_model_and_tools_reach_every_bot_without_environment_dependence(self):
         import subprocess
         from bench import live_fleet
 
@@ -244,6 +244,9 @@ class LiveFleetTests(ModelFixture):
                 # One warmup plus a shell call and final answer for each bot.
                 requests = [self.model.requests.get(timeout=3) for _ in range(5)]
                 self.assertEqual({r['model'] for r in requests}, {'synthetic-model'})
+                for request in requests:
+                    self.assertEqual([tool['name'] for tool in request['tools']],
+                                     ['shell', 'read', 'write', 'edit', 'wait'])
                 self.assertTrue(self.model.requests.empty())
 
 

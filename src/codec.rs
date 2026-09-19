@@ -4,7 +4,7 @@
 use crate::{Result, fail};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     /// OpenAI Responses API and compatible gateways.
     Responses,

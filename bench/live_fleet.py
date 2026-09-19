@@ -32,8 +32,9 @@ def run(agent, out, bots, model, max_connecting, reasoning):
     (workspace / 'notes.txt').write_text('alpha\nbeta\ngamma\n')
     provider = model.split('/', 1)[0]
     env = os.environ.copy()
+    tools = 'shell,read,write,edit,wait'
     common = ['--store', str(store), '--provider', provider, '--model', model, '--reasoning', reasoning,
-              '--tools', 'shell,read,write,edit,wait', '--workspace', str(workspace),
+              '--tools', tools, '--workspace', str(workspace),
               *(['--max-connecting', str(max_connecting)] if max_connecting is not None else [])]
     # One detached turn starts the daemon so every fleet submission races a live one.
     subprocess.run([str(agent), 'run', *common, '--new', '--bot', 'warm', '--detach',
@@ -56,7 +57,7 @@ def run(agent, out, bots, model, max_connecting, reasoning):
 
     def submit(i):
         r = subprocess.run([str(agent), 'run', '--store', str(store), '--workspace', str(workspace), '--new',
-                            '--model', model, '--bot', f'f{i}', '--detach', PROMPT],
+                            '--model', model, '--tools', tools, '--bot', f'f{i}', '--detach', PROMPT],
                            capture_output=True, text=True, env=env)
         with lock:
             if r.returncode == 0:

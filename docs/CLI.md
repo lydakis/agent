@@ -80,7 +80,7 @@ socket override, the socket is derived from the selected store.
 
 `run` may start the daemon. `stats`, `turns`, `result`, `rm`, and `prune` may
 restart it only for an existing store. These commands accept the startup
-provider/tool/limit flags shown in help and `--no-spawn` to require an
+provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match
 fails the command with `daemon_configuration_mismatch` naming the difference.
@@ -91,7 +91,10 @@ daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
 `AGENT_MODEL` is only a creation default. An existing bot uses its stored
 model unless `--model` explicitly overrides it for this turn.
 `run --instructions` and `--instructions-file` set a new bot's instructions,
-with the CLI's built-in text as the default; the daemon has none.
+with the CLI's built-in text as the default; the daemon has none. `run
+--tools LIST` chooses a new bot's tools from those the daemon registers,
+default `shell,read,write,edit,wait,history`; an existing bot keeps its own,
+so `--tools` while continuing one is a usage error.
 Other client commands require an already running daemon.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon

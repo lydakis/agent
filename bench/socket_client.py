@@ -54,6 +54,7 @@ class Connection:
             # This client's choice for a new bot; the daemon supplies none.
             params.setdefault('model', 'openai/synthetic-model')
             params.setdefault('instructions', 'Test agent.')
+            params.setdefault('tools', getattr(self, 'tools', ['echo']))
         self.next_id += 1
         self.socket.sendall((json.dumps(dict(id=self.next_id, op=op, **params)) + '\n').encode())
         return self.receive(lambda e: e.get('id') == self.next_id)
@@ -86,6 +87,7 @@ class SocketClient:
                     raise RuntimeError('daemon startup failed')
                 time.sleep(.01)
             self.control = Connection(self.socket_path)
+            self.control.tools = tools.split(',')
         except Exception:
             self.close(kill=True)
             raise

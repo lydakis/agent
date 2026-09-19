@@ -1,10 +1,16 @@
 //! Registered tools share an execution budget; no per-bot worker or shell exists.
 //! Tools run with the caller's OS permissions inside the bot workspace path;
 //! nothing here is a sandbox.
-use crate::{Error, Result, codec::ToolSchema, fail};
+use crate::{
+    Error, Result,
+    codec::{Family, ToolSchema},
+    fail, fail_with,
+};
 use serde::Deserialize;
 use serde_json::json;
+use serde_json::value::RawValue;
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -126,7 +132,10 @@ pub struct Registry {
     pending: Arc<std::sync::atomic::AtomicUsize>,
     credentials: Arc<Vec<Credential>>,
     environment: Arc<Vec<(String, String)>>,
+    /// Request encodings per (family, selection); see `encoded`.
+    encodings: Encodings,
 }
+type Encodings = Arc<std::sync::Mutex<HashMap<(Family, String), Arc<RawValue>>>>;
 /// A background command's admission: a slot taken at once when one was
 /// free, otherwise a counted place in line released when it gets a slot
 /// or is dropped before starting.
@@ -230,6 +239,15 @@ impl Outcome {
 }
 
 impl Registry {
+    /// Every tool this build knows: what a daemon registers at start. Which
+    /// of them a bot may call is the bot's own, chosen at creation.
+    pub fn all() -> Result<Self> {
+        Self::new(if cfg!(unix) {
+            "echo,shell,read,write,edit,wait,history"
+        } else {
+            "echo,read,write,edit,wait,history"
+        })
+    }
     pub fn new(names: &str) -> Result<Self> {
         let mut tools = Vec::new();
         for name in names.split(',') {
@@ -249,7 +267,44 @@ impl Registry {
             pending: Arc::default(),
             credentials: Arc::new(Vec::new()),
             environment: Arc::new(Vec::new()),
+            encodings: Arc::default(),
         })
+    }
+    /// A bot's selection must name registered tools, each once.
+    pub fn validate(&self, names: &[String]) -> Result<()> {
+        for (index, name) in names.iter().enumerate() {
+            let tool =
+                Tool::parse(name).ok_or_else(|| Error::with("unsupported_tool_set", name))?;
+            if !self.tools.contains(&tool) || names[..index].contains(name) {
+                return fail_with("unsupported_tool_set", name);
+            }
+        }
+        Ok(())
+    }
+    /// The request encoding of a bot's tools for one family, shared by every
+    /// bot with the same selection: definitions live once in the registry
+    /// and encodings once per distinct selection, never per bot or turn.
+    pub fn encoded(&self, family: Family, names: &[String]) -> Result<Arc<RawValue>> {
+        let key = (family, names.join(","));
+        if let Some(found) = self.encodings.lock().unwrap().get(&key) {
+            return Ok(found.clone());
+        }
+        let schemas: Vec<ToolSchema> = names
+            .iter()
+            .filter_map(|name| Tool::parse(name))
+            .filter(|tool| self.tools.contains(tool))
+            .map(Tool::schema)
+            .collect();
+        let encoded: Arc<RawValue> = Arc::from(RawValue::from_string(serde_json::to_string(
+            &family.tools(&schemas),
+        )?)?);
+        let mut encodings = self.encodings.lock().unwrap();
+        // Fleets share a few selections; a flood of distinct ones is served
+        // without being remembered.
+        if encodings.len() < 256 {
+            encodings.insert(key, encoded.clone());
+        }
+        Ok(encoded)
     }
     /// Exact occurrences of these values are redacted from tool results and the
     /// named variables are removed from shell environments.

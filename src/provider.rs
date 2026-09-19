@@ -1,11 +1,6 @@
 //! Streaming model calls. One shared HTTP transport; per-family request
 //! encoding and SSE parsing. History items are streamed by reference.
-use crate::{
-    Error, Result,
-    codec::{Family, ToolSchema},
-    fail,
-    sse::Decoder,
-};
+use crate::{Error, Result, codec::Family, fail, sse::Decoder};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde::Serialize;
@@ -118,8 +113,6 @@ pub struct Provider {
     family: Family,
     url: reqwest::Url,
     key: Option<String>,
-    tools: Arc<RawValue>,
-    has_tools: bool,
     max_output_tokens: Option<u32>,
 }
 
@@ -166,6 +159,8 @@ pub struct Request<'a> {
     pub model: &'a str,
     pub instructions: &'a str,
     pub reasoning: Option<&'a str>,
+    /// The bot's tools, encoded for this family; `[]` when it has none.
+    pub tools: &'a RawValue,
     pub items: Items,
 }
 
@@ -200,7 +195,6 @@ impl Provider {
         family: Family,
         base_url: &str,
         key: Option<String>,
-        tools: &[ToolSchema],
     ) -> Result<Self> {
         let mut url =
             reqwest::Url::parse(base_url).map_err(|_| Error::new("invalid_provider_url"))?;
@@ -217,15 +211,12 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
-        let encoded = serde_json::to_string(&family.tools(tools))?;
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
             family,
             url,
             key,
-            tools: Arc::from(RawValue::from_string(encoded)?),
-            has_tools: !tools.is_empty(),
             max_output_tokens: None,
         })
     }
@@ -291,7 +282,7 @@ impl Provider {
                     // Request opaque reasoning for stateless continuation across endpoints.
                     include: ["reasoning.encrypted_content"],
                     max_output_tokens: self.max_output_tokens,
-                    tools: &self.tools,
+                    tools: request.tools,
                     reasoning: request
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
@@ -310,7 +301,7 @@ impl Provider {
                     }),
                     stream: true,
                     cache_control: json!({"type":"ephemeral"}),
-                    tools: self.has_tools.then_some(&*self.tools),
+                    tools: (request.tools.get() != "[]").then_some(request.tools),
                     // Current Claude models take adaptive thinking with an
                     // effort level and reject budgets; Haiku 4.5 and older
                     // models still need an explicit budget.
@@ -660,6 +651,9 @@ fn sanitize_error(mut error: Error, key: Option<&str>) -> Error {
 mod tests {
     use super::*;
     use crate::codec::Family;
+    fn none() -> Box<RawValue> {
+        RawValue::from_string("[]".into()).unwrap()
+    }
 
     #[test]
     fn request_prefix_streams_history_after_family_specific_fields() {
@@ -669,7 +663,6 @@ mod tests {
             Family::Anthropic,
             "https://api.example.test",
             None,
-            &[],
         )
         .unwrap();
         let prefix = provider
@@ -677,6 +670,7 @@ mod tests {
                 model: "m",
                 instructions: "i",
                 reasoning: Some("low"),
+                tools: &none(),
                 items: Items::empty(),
             })
             .unwrap();
@@ -690,6 +684,7 @@ mod tests {
                 model: "claude-haiku-4-5-20251001",
                 instructions: "i",
                 reasoning: Some("low"),
+                tools: &none(),
                 items: Items::empty(),
             })
             .unwrap();
@@ -702,6 +697,7 @@ mod tests {
                 model: "m",
                 instructions: "",
                 reasoning: None,
+                tools: &none(),
                 items: Items::empty(),
             })
             .unwrap();
@@ -711,8 +707,7 @@ mod tests {
         assert_eq!(empty["cache_control"], json!({"type":"ephemeral"}));
         assert!(!text.contains("\"tools\""));
         assert_eq!(provider.url.path(), "/messages");
-        let responses =
-            Provider::new(transport, Family::Responses, "http://h/v1/", None, &[]).unwrap();
+        let responses = Provider::new(transport, Family::Responses, "http://h/v1/", None).unwrap();
         assert_eq!(responses.url.path(), "/v1/responses");
         assert!(responses.clone().with_max_output_tokens(0).is_err());
         assert!(provider.with_max_output_tokens(2048).is_err());
@@ -722,6 +717,7 @@ mod tests {
                 model: "m",
                 instructions: "i",
                 reasoning: None,
+                tools: &none(),
                 items: Items::empty(),
             })
             .unwrap();
@@ -753,8 +749,7 @@ mod tests {
     #[test]
     fn body_length_counts_prefix_items_separators_and_close() {
         let transport = Transport::new(64, 1).unwrap();
-        let provider =
-            Provider::new(transport, Family::Responses, "http://h/v1/", None, &[]).unwrap();
+        let provider = Provider::new(transport, Family::Responses, "http://h/v1/", None).unwrap();
         let items: Vec<Bytes> = (0..3)
             .map(|n| Bytes::from(Family::Responses.user_item(&format!("m{n}")).unwrap()))
             .collect();

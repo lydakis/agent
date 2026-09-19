@@ -29,6 +29,8 @@ pub struct Bot {
     pub model: String,
     pub instructions: String,
     pub reasoning: Option<String>,
+    /// The tools this bot may call, chosen at creation and kept with it.
+    pub tools: Vec<String>,
 }
 impl Bot {
     pub fn family(&self) -> Result<Family> {
@@ -43,6 +45,7 @@ pub struct Binding<'a> {
     pub instructions: &'a str,
     pub reasoning: Option<&'a str>,
     pub budget_tokens: Option<u64>,
+    pub tools: &'a [String],
 }
 #[derive(Debug)]
 pub struct Started {
@@ -154,6 +157,13 @@ pub struct Database {
     outcomes: Vec<(String, i64, Value)>,
 }
 
+fn split_tools(joined: &str) -> Vec<String> {
+    joined
+        .split(',')
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
 /// Durable events and their live copies share one shape.
 fn entry(cursor: i64, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Value {
     json!({"cursor":cursor,"bot":bot,"turn":turn,"event":kind,"data":data})
@@ -163,7 +173,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 17;
+    pub const SCHEMA: i32 = 18;
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -208,7 +218,8 @@ impl Database {
                 instructions TEXT NOT NULL, reasoning TEXT,
                 budget_tokens INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0,
                 context_start INTEGER REFERENCES nodes(id),
-                pruned_cursor INTEGER NOT NULL DEFAULT 0);
+                pruned_cursor INTEGER NOT NULL DEFAULT 0,
+                tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history');
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
@@ -367,9 +378,10 @@ impl Database {
             model: r.get(7)?,
             instructions: r.get(8)?,
             reasoning: r.get(9)?,
+            tools: split_tools(&r.get::<_, String>(12)?),
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools";
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -386,7 +398,7 @@ impl Database {
             return fail("invalid_bot_page");
         }
         let mut statement = self.conn.prepare(
-            "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used
+            "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -399,7 +411,8 @@ impl Database {
                 "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
                 "reasoning":r.get::<_, Option<String>>(8)?,
-                "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?});
+                "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?,
+                "tools":split_tools(&r.get::<_, String>(11)?)});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -432,7 +445,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0)",
+            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
             params![
                 name,
                 workspace,
@@ -441,7 +454,8 @@ impl Database {
                 binding.model,
                 binding.instructions,
                 binding.reasoning,
-                binding.budget_tokens.map(|b| b as i64)
+                binding.budget_tokens.map(|b| b as i64),
+                binding.tools.join(",")
             ],
         )?;
         let data = json!({"model":format!("{}/{}", binding.provider, binding.model)});
@@ -1665,7 +1679,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0)",
+            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
             params![
                 name,
                 checkpoint,
@@ -1675,7 +1689,8 @@ impl Database {
                 parent.model,
                 parent.instructions,
                 parent.reasoning,
-                budget_tokens.map(|b| b as i64)
+                budget_tokens.map(|b| b as i64),
+                parent.tools.join(",")
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -2288,6 +2303,26 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     "ALTER TABLE turns ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
                 ))?;
             }
+        }
+    }
+    if from < 18 {
+        // 17 -> 18: tools are chosen per bot. Earlier stores did not retain
+        // that choice, so only an empty store can be converted without guessing.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='tools')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            let has_bots: bool =
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM bots)", [], |r| r.get(0))?;
+            if has_bots {
+                return fail_with(
+                    "store_migration_tools_unknown",
+                    "existing bots have no recorded tool selection; keep this store and use a new store path",
+                );
+            }
+            conn.execute_batch("ALTER TABLE bots ADD COLUMN tools TEXT NOT NULL;")?;
         }
     }
     if from < 17 {

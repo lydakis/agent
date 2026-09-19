@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --tools --max-processes --max-active --max-connecting --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -164,7 +164,10 @@ fn print_flags(flags: &str) {
                 "PROVIDER/MODEL",
                 "Set the model; new bots default to AGENT_MODEL, existing bots keep theirs",
             ),
-            "--tools" => ("LIST", "Comma-separated enabled tools"),
+            "--tools" => (
+                "LIST",
+                "A new bot's tools; default shell,read,write,edit,wait,history",
+            ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),

@@ -389,23 +389,6 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             }
         }
     }
-    if options.tools_explicit {
-        let mut requested: Vec<&str> = options.tools.split(',').filter(|t| !t.is_empty()).collect();
-        requested.sort_unstable();
-        requested.dedup();
-        let mut running: Vec<&str> = ready["tools"]
-            .as_array()
-            .map(|tools| tools.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        running.sort_unstable();
-        if requested != running {
-            differences.push(format!(
-                "--tools: requested {} but daemon has {}",
-                requested.join(","),
-                running.join(",")
-            ));
-        }
-    }
     for (flag, value) in &options.daemon_flags {
         let key = match flag.as_str() {
             "--max-processes" => "processes",
@@ -488,9 +471,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
         .arg("--store")
         .arg(&options.store)
         .arg("--socket")
-        .arg(&options.socket)
-        .arg("--tools")
-        .arg(&options.tools);
+        .arg(&options.socket);
     for provider in &options.providers {
         command.arg("--provider").arg(provider);
     }
@@ -613,6 +594,18 @@ fn run(options: &Options) -> Result<i32> {
     // A named bot is continued, never silently replaced: an unknown name is an
     // error unless --new asks for creation. No name means a fresh identity.
     let created = options.new || options.bot.is_none();
+    if !created && options.tools_explicit {
+        return fail_with(
+            "usage",
+            "--tools chooses a new bot's tools; an existing bot keeps its own",
+        );
+    }
+    if !created && options.instructions.is_some() {
+        return fail_with(
+            "usage",
+            "--instructions sets a new bot's instructions; an existing bot keeps its own",
+        );
+    }
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
     if created {
         // The client chooses; the bot retains. Nothing about a bot comes
@@ -633,7 +626,8 @@ fn run(options: &Options) -> Result<i32> {
             "create",
             json!({"bot":bot,"workspace":workspace,"model":model,
                 "instructions":instructions,"reasoning":options.reasoning,
-                "budget_tokens":options.budget_tokens}),
+                "budget_tokens":options.budget_tokens,
+                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>()}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));

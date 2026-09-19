@@ -289,13 +289,15 @@ impl Turn {
                 .await?;
             // Calls that followed the wait in the same model response.
             if self
-                .execute_calls(waiting.pending, &workspace, &environment)
+                .execute_calls(waiting.pending, &workspace, &environment, &record.tools)
                 .await?
             {
                 return Ok(Round::Parked);
             }
         }
         let mut model_rounds = context.model_rounds;
+        // This bot's tools, encoded once per distinct selection and shared.
+        let tools = self.registry.encoded(provider.family(), &record.tools)?;
         // Steers submitted since the last boundary go in before this call.
         self.absorb().await?;
         while model_rounds < MAX_ROUNDS {
@@ -307,6 +309,7 @@ impl Turn {
                 .call(
                     provider,
                     model,
+                    &tools,
                     &mut record,
                     &mut model_rounds,
                     turn,
@@ -340,7 +343,7 @@ impl Turn {
                 return Ok(Round::Finished);
             }
             if self
-                .execute_calls(response.calls, &workspace, &environment)
+                .execute_calls(response.calls, &workspace, &environment, &record.tools)
                 .await?
             {
                 return Ok(Round::Parked);
@@ -377,10 +380,12 @@ impl Turn {
     /// One model call with retries. Each attempt rebuilds the request from
     /// the store, so nothing about the turn changes between attempts; a
     /// refusal for pace holds the provider's pool rather than this turn.
+    #[allow(clippy::too_many_arguments)]
     async fn call(
         &self,
         provider: &Provider,
         model: &str,
+        tools: &serde_json::value::RawValue,
         record: &mut agent_runtime::store::Bot,
         model_rounds: &mut usize,
         turn: i64,
@@ -398,6 +403,7 @@ impl Turn {
                         model,
                         instructions: &record.instructions,
                         reasoning: record.reasoning.as_deref(),
+                        tools,
                         items,
                     },
                     |delta| {
@@ -491,6 +497,7 @@ impl Turn {
         calls: Vec<ToolCall>,
         workspace: &std::path::Path,
         environment: &[(String, String)],
+        allowed: &[String],
     ) -> Result<bool> {
         let turn = self.turn;
         let mut calls = calls.into_iter();
@@ -500,8 +507,14 @@ impl Turn {
                 .call(move |db| db.tool_start(turn, &started))
                 .await?;
             // A tool failure is a result the model can act on. Only the
-            // scheduler closing is a runtime failure.
-            let outcome = match self.registry.prepare(&call.name, &call.arguments) {
+            // scheduler closing is a runtime failure. The bot's selection is
+            // enforced here, not only by what the model was shown.
+            let prepared = if allowed.iter().any(|name| name == &call.name) {
+                self.registry.prepare(&call.name, &call.arguments)
+            } else {
+                Err(Error::with("tool_not_available", call.name.as_str()))
+            };
+            let outcome = match prepared {
                 Ok(Prepared::Wait {
                     handles,
                     timeout_ms,
@@ -844,6 +857,7 @@ mod tests {
                             instructions: "",
                             reasoning: None,
                             budget_tokens: None,
+                            tools: &[],
                         },
                     )?;
                     let turn = db
@@ -915,7 +929,6 @@ mod tests {
                     Family::Responses,
                     "http://127.0.0.1:9/v1",
                     None,
-                    &[],
                 )
                 .unwrap(),
             )])),

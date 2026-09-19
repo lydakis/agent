@@ -29,6 +29,8 @@ class SocketAndCliTests(ModelFixture):
         self.base = [str(self.binary)]
         self.common = ['--store', str(self.store), '--provider', f'openai=responses,{self.url}',
                        '--model', 'openai/synthetic-model', '--tools', 'echo,shell']
+        # Continuing a bot: what it runs and may call is its own, not a flag.
+        self.again = self.common[:4]
         self.addCleanup(self.shutdown)
 
     def shutdown(self):
@@ -47,7 +49,7 @@ class SocketAndCliTests(ModelFixture):
         return result
 
     def test_run_starts_a_daemon_streams_the_turn_and_resumes_the_bot(self):
-        missing = self.agent('run', *self.common, '--bot', 'Bob', 'hello', check=False)
+        missing = self.agent('run', *self.again, '--bot', 'Bob', 'hello', check=False)
         self.assertEqual(missing.returncode, 1)
         self.assertIn('bot_not_found', missing.stderr)
         first = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', 'hello')
@@ -157,6 +159,23 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_busy', overridden.stderr + overridden.stdout)
         self.agent('wait', '--store', str(self.store), queued['handle'])
 
+    def test_tools_are_chosen_per_bot_and_enforced(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
+        # --tools names a new bot's tools; an existing bot keeps its own.
+        kept = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--tools', 'echo', 'hi', check=False)
+        self.assertEqual(kept.returncode, 2)
+        self.assertIn('keeps its own', kept.stderr)
+        only = json.loads(self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
+                                     '--tools', 'echo', '--new', '--bot', 'Only', '--detach', 'shell:true').stdout)
+        self.agent('wait', '--store', str(self.store), only['handle'])
+        listed = {b['name']: b['tools'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual((listed['Bob'], listed['Only']), (['echo', 'shell'], ['echo']))
+        # The model asked for shell; the bot may not call it, and the result says so.
+        bad = self.agent('run', '--store', str(self.store), '--model', 'openai/synthetic-model',
+                         '--tools', 'nothing', '--new', '--bot', 'Odd', '--detach', 'hi', check=False)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn('unsupported_tool_set', bad.stderr + bad.stdout)
+
     def test_a_new_bot_needs_a_model_from_the_client(self):
         without = self.agent('run', '--store', str(self.store), '--provider', f'openai=responses,{self.url}',
                              '--tools', 'echo', '--new', '--bot', 'Nobody', 'hello', check=False)
@@ -198,11 +217,9 @@ class SocketAndCliTests(ModelFixture):
             return self.agent('run', '--store', str(self.store), *flags, '--bot', 'Bob', '--detach', 'hi', check=False)
         # Nothing stated, or the same thing stated differently, attaches.
         self.assertEqual(attempt().returncode, 0)
-        self.assertEqual(attempt('--tools', 'shell,echo').returncode, 0)
         self.assertEqual(attempt('--provider', f'openai=responses,{self.url}').returncode, 0)
         # A stated value the daemon does not serve fails before any submission.
-        for flags, named in ((('--tools', 'echo'), '--tools'),
-                             (('--provider', 'openai=responses,http://127.0.0.1:1/v1'), '--provider openai'),
+        for flags, named in ((('--provider', 'openai=responses,http://127.0.0.1:1/v1'), '--provider openai'),
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--max-processes', '3'), '--max-processes'),
                              (('--retain-turns', '2'), '--retain-turns')):
@@ -221,8 +238,8 @@ class SocketAndCliTests(ModelFixture):
     def test_normalized_daemon_limits_match_on_startup_and_attach(self):
         flags = ['--idle-exit', '0', '--context-bytes', '512', '--context-items', '1']
         self.agent('run', *self.common, *flags, '--new', '--bot', 'Bob', 'hi')
-        self.agent('run', *self.common, *flags, '--bot', 'Bob', 'again')
-        self.agent('run', *self.common, '--context-bytes', '1024', '--context-items', '2',
+        self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
+        self.agent('run', *self.again, '--context-bytes', '1024', '--context-items', '2',
                    '--bot', 'Bob', 'effective')
         refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
@@ -279,7 +296,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_rm_and_prune_bound_a_bot_and_remove_it(self):
         for n in range(3):
-            self.agent('run', *self.common, *(['--new'] if n == 0 else []), '--bot', 'Bob', f'p{n}')
+            self.agent('run', *(self.common + ['--new'] if n == 0 else self.again), '--bot', 'Bob', f'p{n}')
         pruned = json.loads(self.agent('prune', '--store', str(self.store), '--bot', 'Bob', '--keep-turns', '1').stdout)
         self.assertGreater(pruned['events'], 0)
         self.assertIn('usage', self.agent('prune', '--store', str(self.store), '--bot', 'Bob', check=False).stderr)
@@ -330,13 +347,13 @@ class SocketAndCliTests(ModelFixture):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', '--request-id', 'old', 'first')
         retry = ['run', '--store', str(self.store), '--bot', 'Bob', '--request-id', 'old', 'first']
         self.assertIn('turn_finished', self.agent(*retry, timeout=3).stdout)
-        self.agent('run', *self.common, '--bot', 'Bob', '--request-id', 'new', 'second')
+        self.agent('run', *self.again, '--bot', 'Bob', '--request-id', 'new', 'second')
         self.agent('prune', '--store', str(self.store), '--bot', 'Bob', '--keep-turns', '1')
         expired = self.agent(*retry, check=False, timeout=3)
         self.assertEqual(expired.returncode, 1)
         self.assertIn('turn_result_pruned', expired.stderr)
         # A gap in earlier history must not reject a retained terminal event.
-        kept = self.agent('run', *self.common, '--bot', 'Bob', '--request-id', 'new', 'second', timeout=3)
+        kept = self.agent('run', *self.again, '--bot', 'Bob', '--request-id', 'new', 'second', timeout=3)
         self.assertIn('turn_finished', kept.stdout)
 
     def test_detached_peer_handle_is_collected_by_wait(self):

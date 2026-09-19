@@ -193,7 +193,8 @@ class IdleExitTests(ModelFixture):
             time.sleep(.05)
         self.assertFalse(socket.exists(), 'daemon should exit when idle')
         # Inspection restarts without submitting any model work. Respect --no-spawn.
-        inspect = [flag for i, flag in enumerate(common) if flag != '--model' and common[i - 1] != '--model']
+        creation = ('--model', '--tools')
+        inspect = [flag for i, flag in enumerate(common) if flag not in creation and common[i - 1] not in creation]
         stopped = subprocess.run([str(self.binary), 'result', *inspect, '--bot', 'Bob', '--turn', '1', '--no-spawn'],
                                  env=clean_env(), capture_output=True, text=True, timeout=10)
         self.assertEqual(stopped.returncode, 1)
@@ -208,7 +209,7 @@ class IdleExitTests(ModelFixture):
                            env=clean_env(), capture_output=True, timeout=5, check=True)
         self.assertEqual(self.model.requests.qsize(), 1)
         # A later command restarts the daemon and continues the same bot.
-        again = subprocess.run([str(self.binary), 'run', *common, '--bot', 'Bob', 'tool:again'],
+        again = subprocess.run([str(self.binary), 'run', *inspect, '--bot', 'Bob', 'tool:again'],
                                env=clean_env(), capture_output=True, text=True, timeout=30, cwd=self.path)
         self.assertEqual(again.returncode, 0, again.stderr)
         turns = json.loads(subprocess.run([str(self.binary), 'turns', '--store', str(store), '--bot', 'Bob'],

@@ -49,6 +49,8 @@ enum Command {
         instructions: Option<String>,
         reasoning: Option<String>,
         budget_tokens: Option<u64>,
+        /// The tools this bot may call, from the daemon's registered set.
+        tools: Option<Vec<String>>,
     },
     Resume {
         bot: String,
@@ -210,7 +212,6 @@ pub struct Configuration {
     pub store: PathBuf,
     pub socket: Option<PathBuf>,
     pub providers: Vec<ProviderSpec>,
-    pub tools: String,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
@@ -350,8 +351,7 @@ pub(crate) async fn publish(
 pub async fn run(config: Configuration) -> Result<()> {
     let limits = Limits::resolve(&config);
     let transport = Transport::new(limits.connecting, limits.connections)?;
-    let registry = Registry::new(&config.tools)?;
-    let schemas = registry.schemas();
+    let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let mut credentials = Vec::new();
     let mut bindings = serde_json::Map::new();
@@ -367,7 +367,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         if let (Some(env), Some(value)) = (&spec.key_env, &key) {
             credentials.push((env.clone(), value.clone()));
         }
-        let mut provider = Provider::new(transport.clone(), spec.family, &spec.url, key, &schemas)?;
+        let mut provider = Provider::new(transport.clone(), spec.family, &spec.url, key)?;
         if let Some(cap) = config.max_output_tokens
             && spec.family == Family::Responses
         {
@@ -812,6 +812,7 @@ impl Service {
                 instructions,
                 reasoning,
                 budget_tokens,
+                tools,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
@@ -836,6 +837,8 @@ impl Service {
                 if instructions.len() > 64 * 1024 {
                     return fail("instructions_limit");
                 }
+                let tools = tools.ok_or(Error::new("tools_required"))?;
+                self.registry.validate(&tools)?;
                 let (provider, model) = (provider.to_owned(), model.to_owned());
                 let (created, event) = store
                     .call(move |db| {
@@ -849,6 +852,7 @@ impl Service {
                                 instructions: &instructions,
                                 reasoning: reasoning.as_deref(),
                                 budget_tokens,
+                                tools: &tools,
                             },
                         )
                     })
@@ -1206,6 +1210,7 @@ mod tests {
                         instructions: "test",
                         reasoning: None,
                         budget_tokens: None,
+                        tools: &[],
                     },
                 )?;
                 let turn = db
@@ -1370,6 +1375,7 @@ mod tests {
             instructions: "test",
             reasoning: None,
             budget_tokens: None,
+            tools: &[],
         };
         let turn = store
             .call(move |db| {
@@ -1395,7 +1401,6 @@ mod tests {
             Family::Responses,
             "http://127.0.0.1:1/v1",
             None,
-            &registry.schemas(),
         )
         .unwrap();
         let (output, writer) = Output::stdout();
