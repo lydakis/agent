@@ -55,7 +55,8 @@ function tree() {
       if (seen.has(b.name)) continue; seen.add(b.name);
       const prefix = depth === 0 ? '' : cont + (last ? '└ ' : '├ ');
       out.push({ b, depth, prefix });
-      pushKids(b.name, depth + 1, depth === 0 ? '' : cont + (last ? '  ' : '│ '));
+      // The continuation stops growing past a few levels: a chain of thousands must not cost thousands per row.
+      pushKids(b.name, depth + 1, depth === 0 ? '' : depth > 6 ? cont : cont + (last ? '  ' : '│ '));
     }
     // A creator cycle (delete and recreate) reaches nothing from the roots; root it so nothing is hidden.
     const orphan = [...S.bots.values()].find((b) => !seen.has(b.name));
@@ -63,15 +64,6 @@ function tree() {
     stack.push([orphan, 0, true, '']);
   }
   return out;
-}
-function creatorOf(name) {
-  const needles = [`--bot ${name}`, `--bot=${name}`];
-  for (const [owner, t] of S.transcripts) {
-    for (const it of t.items.slice(-20).reverse()) {
-      if (it.kind === 'tool' && it.name === 'shell' && !it.done && needles.some((n) => it.args.includes(n))) return owner;
-    }
-  }
-  return null;
 }
 function callSummary(name, args) {
   let a = {}; try { a = JSON.parse(args); } catch (_) {}
@@ -90,19 +82,17 @@ async function onEvent(ev) {
       S.autoSelect = false;
       break;
     }
-    case 'follow_lagged': S.attached = false; toast('event stream lagged; attaching again'); attach(); return;
-    case 'closed': S.attached = false; S.live = false; showDetached('the daemon closed the session'); return;
+    case 'follow_lagged': S.attached = false; toast('event stream lagged; attaching again'); await attach(); return true;
+    case 'closed': S.attached = false; S.live = false; showDetached('the daemon closed the session'); return true;
     case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; t.text += ev.text ?? ''; break; }
     case 'thinking_delta': { const t = transcript(name); t.streamingTurn = turn; if (!t.thinkingSince) t.thinkingSince = Date.now(); t.thinking += ev.text ?? ''; break; }
     case 'created': case 'forked': {
-      // Who is running the shell call that names this bot, before anything else moves.
-      const inferred = kind === 'created' ? creatorOf(name) : null;
       // The snapshot already holds every bot that existed at attach; only a bot born after it needs a fetch.
       if (!S.bots.has(name)) await refreshBot(name);
       if (data.created_by && bot(name)) bot(name).parent = data.created_by;
       if (kind === 'created') {
-        // The record's creator wins; inference covers bots the daemon did not attribute.
-        const parent = bot(name)?.parent || inferred;
+        // Lineage comes from the daemon's record or the event, never from guessing at shell text.
+        const parent = bot(name)?.parent;
         if (parent && bot(name) && S.bots.has(parent)) { bot(name).parent = parent; transcript(parent).items.push({ kind: 'peer', who: name, turn: bot(parent)?.runningTurn ?? null }); }
       } else transcript(name).items.push({ kind: 'note', text: `forked from ${data.source ?? '?'}`, turn: null });
       break;
@@ -152,7 +142,8 @@ async function onEvent(ev) {
     case 'turn_finished': {
       const status = data.status ?? '?';
       const b = bot(name);
-      if (b) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
+      // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
+      if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
       if (t.streamingTurn === turn) { if (t.text) t.items.push({ kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; }
       if (status !== 'completed' && status !== 'steered') t.items.push({ kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
@@ -171,6 +162,10 @@ async function onEvent(ev) {
 }
 async function loadWaitOrProc(name, node, call) {
   let item; try { item = await Daemon.request('item', { bot: name, node }); } catch (_) { return; }
+  applyWaitOrProc(name, item, call);
+}
+// Decode a background start (a proc handle) or a wait result into the cards; also reached by a retried load.
+function applyWaitOrProc(name, item, call) {
   const output = item.output ?? item.content?.[0]?.content ?? '';
   let value; try { value = JSON.parse(output); } catch (_) { return; }
   const t = transcript(name);
@@ -210,7 +205,7 @@ async function loadBatch(name) {
   const pending = t.items.map((it, i) => [i, it]).filter(([, it]) => it.kind === 'node').slice(-LAZY_ITEMS).reverse();
   if (!pending.length) { t.nodes = 0; return false; }
   const fetched = await Promise.all(pending.map(([, it]) => Daemon.request('item', { bot: name, node: it.node }).then((v) => ({ ok: v }), (e) => ({ err: String(e?.message ?? e) }))));
-  let progressed = false;
+  let progressed = false; const deferred = [];
   pending.forEach(([index, it], k) => {
     const r = fetched[k];
     // A lost session is not the item's fault: the node stays and the next attach fetches it. Anything else is final.
@@ -218,6 +213,7 @@ async function loadBatch(name) {
     progressed = true; t.nodes = Math.max(0, t.nodes - 1);
     let es = r.ok ? entries(r.ok) : [{ kind: 'note', text: `node ${it.node}: ${r.err}` }];
     const call = it.callId ? t.items.slice(0, index).reverse().find((x) => x.kind === 'tool' && x.callId === it.callId) : null;
+    if (call && r.ok && (call.background || call.name === 'wait')) deferred.push([call, r.ok]);
     if (call && (call.background || call.spawns || call.name === 'wait')) es = es.filter((e) => e.kind !== 'out');
     const rep = [];
     for (const e of es) {
@@ -225,7 +221,9 @@ async function loadBatch(name) {
       rep.push({ ...e, turn: it.turn });
     }
     t.items.splice(index, 1, ...rep);
+    t.gen = (t.gen ?? 0) + 1;
   });
+  for (const [call, item] of deferred) applyWaitOrProc(name, item, call);
   return progressed;
 }
 async function loadVisible() {
@@ -246,8 +244,14 @@ let unlisten = null;
 async function attach() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    if (!unlisten) unlisten = await Daemon.onEvent((ev) => enqueue(async () => { await onEvent(ev); await loadVisible(); render(); }));
+    if (!unlisten) unlisten = await Daemon.onEvent((ev) => enqueue(async () => {
+      // An event from a session this page already left behind is noise.
+      if (ev.session !== undefined && S.session !== undefined && ev.session !== S.session) return;
+      const terminal = await onEvent(ev);
+      if (!terminal) { await loadVisible(); render(); }
+    }));
     const result = await Daemon.attach(S.cursor);
+    if (result.session !== undefined) S.session = result.session;
     // The snapshot is authoritative: a bot deleted while this page had no session is gone from it and
     // its live-only `deleted` notice cannot be replayed; anything newer arrives on the subscription.
     const listed = new Set((result.bots ?? []).map((r) => r.name));
@@ -319,16 +323,35 @@ function itemHTML(it) {
     default: return '';
   }
 }
-function transcriptHTML(name) {
-  const t = S.transcripts.get(name); if (!t) return '';
+function itemsHTML(t) {
   let h = ''; let lastTurn = null;
   for (const it of t.items) { if (it.turn != null && it.turn !== lastTurn) { if (h) h += '<div class="line"></div>'; lastTurn = it.turn; } h += itemHTML(it); }
-  if (t.thinking) h += `<div class="line think">${esc(t.thinking.split('. ').pop())}<span class="cursor"></span></div>`;
-  else if (t.text) h += markdown(t.text).replace(/<\/div>$/, '<span class="cursor"></span></div>');
-  else if (bot(name)?.status === 'running') h += `<div class="line text"><span class="cursor"></span></div>`;
   return h;
 }
-function keepBottom(el, html) { const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40; el.innerHTML = html; if (atBottom) el.scrollTop = el.scrollHeight; }
+function tailHTML(name, t) {
+  if (t.thinking) return `<div class="line think">${esc(t.thinking.split('. ').pop())}<span class="cursor"></span></div>`;
+  if (t.text) return markdown(t.text).replace(/<\/div>$/, '<span class="cursor"></span></div>');
+  if (bot(name)?.status === 'running') return `<div class="line text"><span class="cursor"></span></div>`;
+  return '';
+}
+// A streamed delta touches only the tail. The items rebuild when their
+// count or a fold changes, when a load replaced nodes (gen), or on the
+// slow tick that refreshes elapsed counters and cards.
+let forceRebuild = false;
+function renderTranscript(el, name) {
+  const t = S.transcripts.get(name);
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  if (!t) { el.innerHTML = ''; return; }
+  const key = `${name}|${t.items.length}|${t.gen ?? 0}|${S.ui.thoughts}|${S.ui.output}|${S.ui.peek}`;
+  let tail = el.lastElementChild;
+  if (forceRebuild || el.dataset.key !== key || !tail || !tail.classList.contains('tail')) {
+    el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
+    el.dataset.key = key;
+    tail = el.lastElementChild;
+  }
+  tail.innerHTML = tailHTML(name, t);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
 function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><b>${esc(b.name)}</b><span>${labelOf(b.status)}</span>${closable ? '<span class="x">Esc closes</span>' : ''}`; }
 function botRowHTML(n, sel) {
   const b = n.b;
@@ -356,15 +379,16 @@ function render() {
   const app = $('app'); const b = bot(S.selected);
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('peek', !!S.ui.peek && S.bots.has(S.ui.peek));
   $('title').innerHTML = b ? titleHTML(b) : '<span>no bots · /new NAME creates one</span>';
-  keepBottom($('log'), b ? transcriptHTML(b.name) : '');
+  if (b) renderTranscript($('log'), b.name); else $('log').innerHTML = '';
   if (S.ui.rail) $('bots').innerHTML = tree().map((n) => botRowHTML(n, n.b.name === S.selected)).join('');
-  if (S.ui.peek && bot(S.ui.peek)) { $('peektitle').innerHTML = titleHTML(bot(S.ui.peek), true); keepBottom($('peek'), transcriptHTML(S.ui.peek)); }
+  if (S.ui.peek && bot(S.ui.peek)) { $('peektitle').innerHTML = titleHTML(bot(S.ui.peek), true); renderTranscript($('peek'), S.ui.peek); }
+  forceRebuild = false;
   $('who').textContent = b ? `${b.name} ›` : '›';
   $('input').placeholder = b ? (b.status === 'idle' ? '' : `${b.name} is ${labelOf(b.status)}; your message queues`) : '/new NAME [PROVIDER/MODEL]';
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
 }
-setInterval(() => { if (S.attached && [...S.bots.values()].some((b) => isActive(b.status))) render(); }, 1000);
+setInterval(() => { if (S.attached && [...S.bots.values()].some((b) => isActive(b.status))) { forceRebuild = true; render(); } }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {

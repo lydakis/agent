@@ -29,11 +29,11 @@ window.Daemon = (() => {
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
 
-  async function create(name, model) {
+  async function create(name, model, createdBy = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
-    const b = { ...record(name, model), turns: 0, interrupted: false };
+    const b = { ...record(name, model), created_by: createdBy, turns: 0, interrupted: false };
     S.bots.set(name, b);
-    emit({ event: 'created', bot: name, turn: null, data: { model } });
+    emit({ event: 'created', bot: name, turn: null, data: { model, created_by: createdBy } });
     return b;
   }
   async function stream(name, turn, text, pace = 40) {
@@ -114,7 +114,7 @@ window.Daemon = (() => {
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
-      await create(n, `${m.provider}/${m.model}`);
+      await create(n, `${m.provider}/${m.model}`, name);
       const t = start(n, tasks[n]);
       handles.push(`turn:${n}/${t}`);
       emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: n, handle: `turn:${n}/${t}`, status: 'running', turn: t }) + '\n', success: true }) }), artifacts: [] } });
@@ -148,7 +148,7 @@ window.Daemon = (() => {
       emit({ event: 'tool_started', bot: n, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
       const b = S.bots.get(n);
-      await create('review', `${b.provider}/${b.model}`);
+      await create('review', `${b.provider}/${b.model}`, n);
       const rt = start('review', 'Review the auth diff for regressions.');
       emit({ event: 'tool_completed', bot: n, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: 'review', handle: `turn:review/${rt}`, status: 'running', turn: rt }) + '\n', success: true }) }), artifacts: [] } });
       const wid = `call_${++calls}`;
@@ -186,7 +186,7 @@ window.Daemon = (() => {
       switch (op) {
         case 'item': { const item = S.nodes.get(params.node); if (!item) throw new Error('item_not_in_bot_history'); return item; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
-        case 'create': { await create(params.bot, params.model); return { ...S.bots.get(params.bot) }; }
+        case 'create': { await create(params.bot, params.model, params.created_by ?? null); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy'); reply(params.bot, params.prompt); return { bot: params.bot, turn: S.nextTurn, status: 'running', handle: `turn:${params.bot}/${S.nextTurn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`); return { ...S.bots.get(params.bot) }; }

@@ -19,6 +19,9 @@ struct Config {
 struct Shared {
     config: Config,
     client: Mutex<Option<Arc<Client>>>,
+    /// Counts attachments; every forwarded event carries its session so the
+    /// page can ignore the tail of one it has already left behind.
+    session: std::sync::atomic::AtomicU64,
 }
 
 /// Socket selection matches the CLI and the TUI: --socket, then AGENT_SOCKET,
@@ -125,36 +128,69 @@ async fn attach(app: AppHandle, state: State<'_, Shared>, after: i64) -> Result<
     let (client, mut events) = Client::connect(&state.config.socket)
         .await
         .map_err(|e| e.to_string())?;
+    let session = state
+        .session
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     // Subscribe before the snapshot: deletions are live-only notices, so
     // nothing can fall between listing and following.
     client
         .request("follow", json!({"bot": "*", "after": after}))
         .await
         .map_err(|e| e.to_string())?;
-    let mut bots = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let page = client
-            .request("bots", json!({"after": cursor, "limit": 256}))
-            .await
-            .map_err(|e| e.to_string())?;
-        bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-        match page["next_after"].as_str() {
-            Some(next) => cursor = Some(next.to_owned()),
-            None => break,
+    // Page the snapshot on a task while this loop drains the replay the
+    // subscription is already sending; unread, a large replay would fill
+    // the client queue under the very request that lists the bots.
+    let pager = {
+        let client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut bots = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = client
+                    .request("bots", json!({"after": cursor, "limit": 256}))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+                match page["next_after"].as_str() {
+                    Some(next) => cursor = Some(next.to_owned()),
+                    None => break,
+                }
+            }
+            Ok::<Vec<Value>, String>(bots)
+        })
+    };
+    tokio::pin!(pager);
+    let mut backlog: Vec<Value> = Vec::new();
+    let bots = loop {
+        tokio::select! {
+            paged = &mut pager => break paged.map_err(|e| e.to_string())??,
+            event = events.recv() => match event {
+                Some(event) => backlog.push(event),
+                None => return Err("daemon_disconnected".into()),
+            },
         }
-    }
+    };
     *state.client.lock().await = Some(client);
     let window = app.clone();
     tauri::async_runtime::spawn(async move {
+        let stamp = |mut event: Value| {
+            event["session"] = json!(session);
+            event
+        };
+        for event in backlog {
+            if window.emit("daemon", stamp(event)).is_err() {
+                return;
+            }
+        }
         while let Some(event) = events.recv().await {
-            if window.emit("daemon", event).is_err() {
+            if window.emit("daemon", stamp(event)).is_err() {
                 break;
             }
         }
-        let _ = window.emit("daemon", json!({"event": "closed"}));
+        let _ = window.emit("daemon", json!({"event": "closed", "session": session}));
     });
-    Ok(json!({"bots": bots}))
+    Ok(json!({"bots": bots, "session": session}))
 }
 
 /// Page diagnostics land on stderr, where a terminal can see them.
@@ -182,6 +218,7 @@ fn main() {
         .manage(Shared {
             config,
             client: Mutex::new(None),
+            session: std::sync::atomic::AtomicU64::new(0),
         })
         .invoke_handler(tauri::generate_handler![
             setup, policy, attach, request, log

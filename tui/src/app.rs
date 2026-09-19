@@ -158,6 +158,9 @@ pub struct App {
     pub auto_select: bool,
     /// The follower lagged and was dropped; the loop attaches again from the cursor.
     pub reattach: bool,
+    /// Replay that arrived while the attach snapshot was still paging; the
+    /// loop applies it before reading the live receiver.
+    pub backlog: Vec<Value>,
     pub default_model: Option<String>,
     pub default_workspace: String,
     pub instructions: String,
@@ -202,6 +205,7 @@ impl App {
             },
             auto_select: true,
             reattach: false,
+            backlog: Vec::new(),
             default_model,
             default_workspace,
             instructions: String::new(),
@@ -300,8 +304,16 @@ impl App {
                 if !seen.insert(b.name.as_str()) {
                     continue;
                 }
+                // The continuation stops growing past a few levels: the rail
+                // is narrow, and a chain of thousands must not cost a string
+                // of thousands per row.
                 let (prefix, next) = if depth == 0 {
                     (String::new(), String::new())
+                } else if depth > 6 {
+                    (
+                        format!("{cont}{}", if last { "└ " } else { "├ " }),
+                        cont.clone(),
+                    )
                 } else {
                     (
                         format!("{cont}{}", if last { "└ " } else { "├ " }),
@@ -331,7 +343,7 @@ impl App {
     // ----- lifecycle -----
 
     pub async fn attach(&mut self) -> Result<tokio::sync::mpsc::Receiver<Value>> {
-        let (client, events) = Client::connect(&self.socket).await?;
+        let (client, mut events) = Client::connect(&self.socket).await?;
         self.client = Some(client.clone());
         // Subscribe before taking the snapshot: a deletion is a live-only
         // notice, so anything that happens after the list is seen on the
@@ -339,23 +351,47 @@ impl App {
         client
             .request("follow", json!({"bot": "*", "after": self.cursor}))
             .await?;
-        let mut after: Option<String> = None;
-        let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        loop {
-            let page = client
-                .request("bots", json!({"after": after, "limit": 256}))
-                .await?;
-            for record in page["bots"].as_array().into_iter().flatten() {
-                self.upsert(record);
-                if let Some(name) = record["name"].as_str() {
-                    listed.insert(name.to_owned());
+        // Page the snapshot on a task while this loop drains the replay the
+        // subscription is already sending. A large store replays more than
+        // the client queue holds; left unread, it would drop the session
+        // under the very request that is listing it.
+        let pager = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let mut bots = Vec::new();
+                let mut after: Option<String> = None;
+                loop {
+                    let page = client
+                        .request("bots", json!({"after": after, "limit": 256}))
+                        .await?;
+                    bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
+                    match page["next_after"].as_str() {
+                        Some(next) => after = Some(next.to_owned()),
+                        None => break,
+                    }
                 }
+                Ok::<Vec<Value>, Error>(bots)
+            })
+        };
+        tokio::pin!(pager);
+        let mut backlog = Vec::new();
+        let records = loop {
+            tokio::select! {
+                paged = &mut pager => break paged.map_err(|_| Error::new("attach_failed"))??,
+                event = events.recv() => match event {
+                    Some(event) => backlog.push(event),
+                    None => return Err(Error::new("daemon_disconnected")),
+                },
             }
-            match page["next_after"].as_str() {
-                Some(next) => after = Some(next.to_owned()),
-                None => break,
+        };
+        let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for record in &records {
+            self.upsert(record);
+            if let Some(name) = record["name"].as_str() {
+                listed.insert(name.to_owned());
             }
         }
+        self.backlog = backlog;
         // The snapshot is authoritative: a bot deleted while this client had
         // no session is gone from it, and its live-only `deleted` notice
         // cannot be replayed. Anything created after the snapshot arrives as
@@ -450,29 +486,6 @@ impl App {
         t.items.push((turn, item));
     }
 
-    /// Which bot has a running shell call that names `--bot NAME`?
-    fn creator_of(&self, name: &str) -> Option<String> {
-        let needle = format!("--bot {name}");
-        let needle_eq = format!("--bot={name}");
-        for (owner, t) in &self.transcripts {
-            for (_, item) in t.items.iter().rev().take(20) {
-                // Replay carries no clock, so "in progress" is "not completed yet".
-                if let Item::Tool {
-                    name: tool,
-                    args,
-                    done: false,
-                    ..
-                } = item
-                    && tool == "shell"
-                    && (args.contains(&needle) || args.contains(&needle_eq))
-                {
-                    return Some(owner.clone());
-                }
-            }
-        }
-        None
-    }
-
     /// Apply one notification from the daemon.
     pub async fn event(&mut self, event: Value) {
         let kind = event["event"].as_str().unwrap_or("").to_owned();
@@ -524,11 +537,11 @@ impl App {
                 {
                     b.parent = Some(creator.to_owned());
                 }
-                // The record's creator wins; the shell-call inference covers
-                // bots created before the daemon recorded one.
+                // Lineage comes from the daemon's record or the event, never
+                // from guessing at shell text; a bot without one is a root.
                 let declared = self.bots.get(&bot).and_then(|b| b.parent.clone());
                 if kind == "created"
-                    && let Some(parent) = declared.or_else(|| self.creator_of(&bot))
+                    && let Some(parent) = declared
                     && self.bots.contains_key(&parent)
                 {
                     if let Some(b) = self.bots.get_mut(&bot) {
@@ -709,7 +722,12 @@ impl App {
                             .unwrap_or_default()
                     )
                 });
-                if let Some(b) = self.bots.get_mut(&bot) {
+                // A steer absorbed into a running turn finishes as its own
+                // turn while that turn goes on; only the running turn's own
+                // end changes the bot's state.
+                if let Some(b) = self.bots.get_mut(&bot)
+                    && (b.running_turn.is_none() || b.running_turn == turn)
+                {
                     b.running_turn = None;
                     b.waiting_on.clear();
                     b.elapsed = b.turn_started.map(|s| s.elapsed());
@@ -780,6 +798,11 @@ impl App {
         else {
             return;
         };
+        self.apply_wait_or_proc(bot, &item, tool);
+    }
+    /// Decode a background start (a proc handle) or a wait result (which
+    /// handles resolved) into the cards; also reached by a retried load.
+    fn apply_wait_or_proc(&mut self, bot: &str, item: &Value, tool: &str) {
         let output = item["output"]
             .as_str()
             .or_else(|| item["content"][0]["content"].as_str())
@@ -850,8 +873,21 @@ impl App {
         if let Some(p) = &self.ui.peek {
             names.push(p.clone());
         }
+        // Cards on screen show their peer's last line; a peer whose final
+        // text just became a node would otherwise show a stale tool line.
+        for peer in self.peers().into_iter().rev().take(12) {
+            if !names.contains(&peer) {
+                names.push(peer);
+            }
+        }
         for name in names {
             self.load(&name).await;
+        }
+    }
+    /// Replay buffered while the attach snapshot paged, applied in order.
+    pub async fn drain_backlog(&mut self) {
+        for event in std::mem::take(&mut self.backlog) {
+            self.event(event).await;
         }
     }
     async fn load(&mut self, name: &str) {
@@ -900,8 +936,30 @@ impl App {
         };
         // `pending` runs from the back already, so earlier indices stay valid.
         let mut progressed = false;
+        // Background starts and wait results decoded after the borrow ends:
+        // a load retried after a lost session must still build its card.
+        let mut deferred: Vec<(String, Value)> = Vec::new();
         for ((index, node), result) in pending.into_iter().zip(fetched) {
             let turn = t.items[index].0;
+            if let Ok(item) = &result
+                && let (
+                    _,
+                    Item::Node {
+                        call_id: Some(id), ..
+                    },
+                ) = &t.items[index]
+                && let Some(tool) = t.items[..index].iter().rev().find_map(|(_, i)| match i {
+                    Item::Tool {
+                        call_id,
+                        name,
+                        background,
+                        ..
+                    } if call_id == id && (*background || name == "wait") => Some(name.clone()),
+                    _ => None,
+                })
+            {
+                deferred.push((tool, item.clone()));
+            }
             let mut entries = match result {
                 Ok(item) => items::entries(&item),
                 // A lost session is not the item's fault: the node stays and
@@ -945,6 +1003,9 @@ impl App {
                 replacement.push((turn, item));
             }
             t.items.splice(index..index + 1, replacement);
+        }
+        for (tool, item) in deferred {
+            self.apply_wait_or_proc(name, &item, &tool);
         }
         progressed
     }

@@ -266,148 +266,164 @@ fn markdown_rows(text: &str, width: usize, shade: Option<Color>) -> Vec<Line<'st
     rows
 }
 
-fn transcript_rows(app: &App, name: &str, width: usize, pulse: bool) -> Vec<Line<'static>> {
-    let Some(t) = app.transcripts.get(name) else {
-        return Vec::new();
-    };
+/// The rows one item draws. `rows` is the destination so a wrapped item
+/// stays one unit for the tail builder below.
+fn item_rows(app: &App, item: &Item, width: usize, pulse: bool, rows: &mut Vec<Line<'static>>) {
     let shade = app.ui.shade;
-    let mut rows: Vec<Line> = Vec::new();
-    let mut last_turn: Option<i64> = None;
-    for (turn, item) in &t.items {
-        if turn.is_some() && *turn != last_turn && !rows.is_empty() {
-            rows.push(Line::from(""));
+    match item {
+        Item::User(s) => rows.extend(wrap(
+            &format!("› {s}"),
+            width,
+            Style::default().fg(Palette::USER),
+            "  ",
+        )),
+        Item::Text(s) => rows.extend(markdown_rows(s, width, shade)),
+        Item::Thought { text, secs } => {
+            if app.ui.thoughts {
+                rows.extend(wrap(
+                    &format!("  {text}"),
+                    width,
+                    dim().add_modifier(Modifier::ITALIC),
+                    "  ",
+                ));
+            } else {
+                rows.push(Line::from(Span::styled(
+                    format!("thought {}", fmt_secs(Duration::from_secs(*secs))),
+                    faint().add_modifier(Modifier::ITALIC),
+                )));
+            }
         }
-        if turn.is_some() {
-            last_turn = *turn;
+        Item::Tool {
+            name,
+            summary,
+            started,
+            took,
+            ..
+        } => {
+            let accent = Style::default().fg(Palette::ACCENT);
+            let mut lines = wrap(&format!("▸ {name} {summary}"), width, accent, "  ");
+            let stamp = match (started, took) {
+                (Some(s), _) => Some(fmt_secs(s.elapsed())),
+                (None, Some(d)) if *d >= Duration::from_millis(1500) => Some(fmt_secs(*d)),
+                _ => None,
+            };
+            let single = lines.len() == 1;
+            if let Some(first) = lines.first_mut() {
+                // The tool's name is the bold part of the line.
+                let head = format!("▸ {name}");
+                let rest: String = first
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .chars()
+                    .skip(head.chars().count())
+                    .collect();
+                let mut spans = vec![
+                    Span::styled("▸ ", accent),
+                    Span::styled(name.clone(), accent.add_modifier(Modifier::BOLD)),
+                    Span::styled(rest, accent),
+                ];
+                if let Some(stamp) = stamp
+                    && single
+                {
+                    spans.push(Span::styled(format!("  {stamp}"), faint()));
+                }
+                *first = Line::from(spans);
+            }
+            rows.extend(lines);
         }
-        match item {
-            Item::User(s) => rows.extend(wrap(
-                &format!("› {s}"),
-                width,
-                Style::default().fg(Palette::USER),
-                "  ",
-            )),
-            Item::Text(s) => rows.extend(markdown_rows(s, width, shade)),
-            Item::Thought { text, secs } => {
-                if app.ui.thoughts {
-                    rows.extend(wrap(
-                        &format!("  {text}"),
-                        width,
-                        dim().add_modifier(Modifier::ITALIC),
-                        "  ",
-                    ));
-                } else {
-                    rows.push(Line::from(Span::styled(
-                        format!("thought {}", fmt_secs(Duration::from_secs(*secs))),
-                        faint().add_modifier(Modifier::ITALIC),
-                    )));
-                }
+        Item::Output(s) => {
+            let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
+            let shown = if !app.ui.output && lines.len() > 2 {
+                &lines[..2]
+            } else {
+                &lines[..]
+            };
+            for l in shown {
+                rows.extend(wrap(&format!("  {l}"), width, dim(), "  "));
             }
-            Item::Tool {
-                name,
-                summary,
-                started,
-                took,
-                ..
-            } => {
-                let accent = Style::default().fg(Palette::ACCENT);
-                let mut lines = wrap(&format!("▸ {name} {summary}"), width, accent, "  ");
-                let stamp = match (started, took) {
-                    (Some(s), _) => Some(fmt_secs(s.elapsed())),
-                    (None, Some(d)) if *d >= Duration::from_millis(1500) => Some(fmt_secs(*d)),
-                    _ => None,
-                };
-                let single = lines.len() == 1;
-                if let Some(first) = lines.first_mut() {
-                    // The tool's name is the bold part of the line.
-                    let head = format!("▸ {name}");
-                    let rest: String = first
-                        .spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                        .chars()
-                        .skip(head.chars().count())
-                        .collect();
-                    let mut spans = vec![
-                        Span::styled("▸ ", accent),
-                        Span::styled(name.clone(), accent.add_modifier(Modifier::BOLD)),
-                        Span::styled(rest, accent),
-                    ];
-                    if let Some(stamp) = stamp
-                        && single
-                    {
-                        spans.push(Span::styled(format!("  {stamp}"), faint()));
-                    }
-                    *first = Line::from(spans);
-                }
-                rows.extend(lines);
+            if shown.len() < lines.len() {
+                rows.push(Line::from(Span::styled(
+                    format!("  +{} lines", lines.len() - shown.len()),
+                    faint(),
+                )));
             }
-            Item::Output(s) => {
-                let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
-                let shown = if !app.ui.output && lines.len() > 2 {
-                    &lines[..2]
-                } else {
-                    &lines[..]
-                };
-                for l in shown {
-                    rows.extend(wrap(&format!("  {l}"), width, dim(), "  "));
-                }
-                if shown.len() < lines.len() {
-                    rows.push(Line::from(Span::styled(
-                        format!("  +{} lines", lines.len() - shown.len()),
-                        faint(),
-                    )));
-                }
-            }
-            Item::Note(s) => {
-                rows.extend(wrap(s, width, faint().add_modifier(Modifier::ITALIC), ""))
-            }
-            Item::Peer(peer) => {
-                if let Some(b) = app.bots.get(peer) {
-                    let last = app.transcripts.get(peer).map(last_line).unwrap_or_default();
-                    let elapsed = b
-                        .turn_started
-                        .map(|s| fmt_secs(s.elapsed()))
-                        .or_else(|| b.elapsed.map(fmt_secs));
-                    rows.extend(card(
-                        &b.status,
-                        peer,
-                        elapsed,
-                        &last,
-                        app.ui.peek.as_deref() == Some(peer.as_str()),
-                        width,
-                        shade,
-                        pulse,
-                    ));
-                }
-            }
-            Item::Proc {
-                handle,
-                cmd,
-                done,
-                open,
-            } => {
-                let status = if done.is_some() { "idle" } else { "running" };
-                let last = match done {
-                    Some(d) if d.is_empty() => "done".to_owned(),
-                    Some(d) => d.clone(),
-                    None => handle.clone(),
-                };
+        }
+        Item::Note(s) => rows.extend(wrap(s, width, faint().add_modifier(Modifier::ITALIC), "")),
+        Item::Peer(peer) => {
+            if let Some(b) = app.bots.get(peer) {
+                let last = app.transcripts.get(peer).map(last_line).unwrap_or_default();
+                let elapsed = b
+                    .turn_started
+                    .map(|s| fmt_secs(s.elapsed()))
+                    .or_else(|| b.elapsed.map(fmt_secs));
                 rows.extend(card(
-                    status,
-                    &format!("$ {cmd}"),
-                    None,
+                    &b.status,
+                    peer,
+                    elapsed,
                     &last,
-                    *open,
+                    app.ui.peek.as_deref() == Some(peer.as_str()),
                     width,
                     shade,
                     pulse,
                 ));
             }
-            Item::Node { .. } => rows.push(Line::from(Span::styled("…", faint()))),
+        }
+        Item::Proc {
+            handle,
+            cmd,
+            done,
+            open,
+        } => {
+            let status = if done.is_some() { "idle" } else { "running" };
+            let last = match done {
+                Some(d) if d.is_empty() => "done".to_owned(),
+                Some(d) => d.clone(),
+                None => handle.clone(),
+            };
+            rows.extend(card(
+                status,
+                &format!("$ {cmd}"),
+                None,
+                &last,
+                *open,
+                width,
+                shade,
+                pulse,
+            ));
+        }
+        Item::Node { .. } => rows.push(Line::from(Span::styled("…", faint()))),
+    }
+}
+
+/// The last `needed` rows of a transcript, built from the newest item
+/// backwards. A long conversation costs what is on screen, not its length:
+/// every streamed delta redraws, and the screen holds a few dozen rows.
+fn transcript_rows(
+    app: &App,
+    name: &str,
+    width: usize,
+    pulse: bool,
+    needed: usize,
+) -> Vec<Line<'static>> {
+    let Some(t) = app.transcripts.get(name) else {
+        return Vec::new();
+    };
+    // A blank row separates turns: before an item whose turn differs from
+    // the nearest earlier item that had one.
+    let mut separator = vec![false; t.items.len()];
+    let mut last_turn: Option<i64> = None;
+    for (i, (turn, _)) in t.items.iter().enumerate() {
+        if turn.is_some() && *turn != last_turn && i > 0 {
+            separator[i] = true;
+        }
+        if turn.is_some() {
+            last_turn = *turn;
         }
     }
+    let shade = app.ui.shade;
+    let mut rows: Vec<Line> = Vec::new();
     if !t.thinking.is_empty() {
         let tail = t.thinking.rsplit(". ").next().unwrap_or("").trim();
         rows.extend(wrap(
@@ -424,6 +440,23 @@ fn transcript_rows(app: &App, name: &str, width: usize, pulse: bool) -> Vec<Line
             Style::default().fg(Palette::ACCENT),
         )));
     }
+    let tail = rows;
+    let mut chunks: Vec<Vec<Line>> = Vec::new();
+    let mut total = tail.len();
+    for (i, (_, item)) in t.items.iter().enumerate().rev() {
+        if total >= needed {
+            break;
+        }
+        let mut chunk = Vec::new();
+        if separator[i] {
+            chunk.push(Line::from(""));
+        }
+        item_rows(app, item, width, pulse, &mut chunk);
+        total += chunk.len();
+        chunks.push(chunk);
+    }
+    let mut rows: Vec<Line> = chunks.into_iter().rev().flatten().collect();
+    rows.extend(tail);
     rows
 }
 
@@ -497,13 +530,14 @@ fn pane(
         width: width as u16,
         height: body.height.saturating_sub(1),
     };
-    let rows = transcript_rows(app, name, width, pulse);
     let height = inner.height as usize;
     let wanted = if centered {
         app.ui.scroll
     } else {
         app.ui.peek_scroll
     } as usize;
+    // One extra row tells the clamp below whether there is more above.
+    let rows = transcript_rows(app, name, width, pulse, height + wanted + 1);
     let scroll = wanted.min(rows.len().saturating_sub(height));
     let bottom = rows.len().saturating_sub(scroll);
     let start = bottom.saturating_sub(height);

@@ -166,6 +166,7 @@ async fn main() {
         }
     };
     app.restore(&saved);
+    app.drain_backlog().await;
     app.load_visible().await;
 
     let hook = std::panic::take_hook();
@@ -231,7 +232,7 @@ async fn main() {
                         if app.reattach {
                             app.reattach = false;
                             match app.attach().await {
-                                Ok(receiver) => events = receiver,
+                                Ok(receiver) => { events = receiver; app.drain_backlog().await; }
                                 Err(error) => { closed = Some(format!("{error}")); break; }
                             }
                         }
@@ -244,6 +245,7 @@ async fn main() {
                         match app.attach().await {
                             Ok(receiver) => {
                                 events = receiver;
+                                app.drain_backlog().await;
                                 app.toast("session dropped; attached again from the cursor");
                                 app.load_visible().await;
                             }

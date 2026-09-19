@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 /// The daemon refuses instructions above 64 KiB; stay under it with room
 /// for the prompt cache to matter.
 pub const MAX_INSTRUCTIONS: usize = 60 * 1024;
-const MAX_SKILLS: usize = 64;
 
 pub const PREAMBLE: &str = "You are a software engineering agent working in the current workspace. \
 Complete the requested task using the available tools, verify your work, and finish with a short summary. \
@@ -151,8 +150,9 @@ pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
             });
         }
     }
+    // No count cap: the byte bound on the whole text is the only limit, and
+    // it fails loudly rather than dropping the alphabetically later skills.
     found.sort_by(|a, b| a.name.cmp(&b.name));
-    found.truncate(MAX_SKILLS);
     Ok(found)
 }
 
