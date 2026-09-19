@@ -40,6 +40,7 @@ const MAX_ATTEMPTS: u32 = 8;
 /// Refusals for pace are spaced by the pool and are not the request's fault,
 /// so they get many more attempts inside the same time budget.
 const MAX_PACED_ATTEMPTS: u32 = 64;
+use agent_runtime::provider::pace::MIN_PARK;
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 /// Read-ahead while a body streams: a batch stops at either bound, so the
 /// memory held per in-flight request is a number, not a function of item
@@ -120,6 +121,11 @@ struct Accounting {
     paced_ms: u64,
     retrying: bool,
     report: Report,
+    /// Attempts and non-pacing time spent by the unfinished model call.
+    call_attempts: u32,
+    call_spent_ms: u64,
+    /// Set when a call parked the turn on a closed pool.
+    parked_until: u64,
 }
 impl Accounting {
     fn totals(&self) -> (u64, u64) {
@@ -139,11 +145,15 @@ enum Round {
     Finished,
     /// The turn is parked or was ended elsewhere; nothing to finish here.
     Parked,
+    /// Parked on a closed pool until the given time.
+    Paced(u64),
 }
 
 pub enum Exit {
     Finished(Option<Error>),
     Parked,
+    /// Parked on a rate-limited pool; the service resumes it at this time.
+    Paced(u64),
 }
 
 /// Completion as one storage job: the terminal event, the outcome its
@@ -193,15 +203,25 @@ impl Turn {
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
         let (retries, paced_ms) = accounting.totals();
-        if retries > 0 || paced_ms > 0 {
-            let turn = self.turn;
-            if let Err(error) = self
-                .store
+        let turn = self.turn;
+        let flushed = if let Ok(Round::Paced(at)) = &result {
+            let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
+            // Commit the park and its accounting together, outside cancellation.
+            self.store
+                .call(move |db| {
+                    db.suspend_paced(turn, at, attempts, spent, retries, paced_ms)
+                        .map(|_| ())
+                })
+                .await
+        } else if retries > 0 || paced_ms > 0 {
+            self.store
                 .call(move |db| db.note_pacing(turn, retries, paced_ms))
                 .await
-            {
-                result = Err(error);
-            }
+        } else {
+            Ok(())
+        };
+        if let Err(error) = flushed {
+            result = Err(error);
         }
         // An interrupt may arrive while the non-cancellable flush is pending.
         // Honor it before retiring a parked task whose receiver is still live.
@@ -210,6 +230,7 @@ impl Turn {
         }
         let error = match result {
             Ok(Round::Parked) => return Exit::Parked,
+            Ok(Round::Paced(resume_at_ms)) => return Exit::Paced(resume_at_ms),
             Ok(Round::Finished) => None,
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
@@ -309,17 +330,23 @@ impl Turn {
                 // Queued while parked: absorbed at the first boundary below.
                 self.steers.store(true, Relaxed);
             }
-            let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
-            let id = waiting.call_id;
-            self.store
-                .call(move |db| db.tool_finish(turn, &id, &outcome))
-                .await?;
-            // Calls that followed the wait in the same model response.
-            if self
-                .execute_calls(waiting.pending, &workspace, &environment, &record.tools)
-                .await?
-            {
-                return Ok(Round::Parked);
+            // Only a pool park continues the same model call's retry budget.
+            if waiting.paced_since_ms.is_some() {
+                accounting.call_attempts = waiting.call_attempts;
+                accounting.call_spent_ms = waiting.call_spent_ms;
+            } else {
+                let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
+                let id = waiting.call_id;
+                self.store
+                    .call(move |db| db.tool_finish(turn, &id, &outcome))
+                    .await?;
+                // Calls that followed the wait in the same model response.
+                if self
+                    .execute_calls(waiting.pending, &workspace, &environment, &record.tools)
+                    .await?
+                {
+                    return Ok(Round::Parked);
+                }
             }
         }
         let mut model_rounds = context.model_rounds;
@@ -332,7 +359,7 @@ impl Turn {
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
             }
-            let response = self
+            let Some(response) = self
                 .call(
                     provider,
                     model,
@@ -342,7 +369,10 @@ impl Turn {
                     turn,
                     accounting,
                 )
-                .await?;
+                .await?
+            else {
+                return Ok(Round::Paced(accounting.parked_until));
+            };
             model_rounds += 1;
             if let Some(usage) = &response.usage {
                 record.tokens_used = record
@@ -417,9 +447,11 @@ impl Turn {
         model_rounds: &mut usize,
         turn: i64,
         accounting: &mut Accounting,
-    ) -> Result<agent_runtime::provider::Completion> {
+    ) -> Result<Option<agent_runtime::provider::Completion>> {
         let started = std::time::Instant::now();
-        let mut attempt = 0u32;
+        let mut attempt = std::mem::take(&mut accounting.call_attempts);
+        let prior_spent =
+            std::time::Duration::from_millis(std::mem::take(&mut accounting.call_spent_ms));
         let paced_before = accounting.totals().1;
         loop {
             let items = self.items().await?;
@@ -446,16 +478,28 @@ impl Turn {
                     &mut accounting.report,
                 )
                 .await;
-            let paced_ms = accounting.totals().1 - paced_before;
             let error = match result {
                 Ok(completion) => {
                     if let Some(usage) = &completion.usage {
                         self.tokens.add(usage);
                     }
-                    return Ok(completion);
+                    return Ok(Some(completion));
                 }
                 Err(error) => error,
             };
+            let paced_ms = accounting.totals().1 - paced_before;
+            let spent = prior_spent
+                + started
+                    .elapsed()
+                    .saturating_sub(std::time::Duration::from_millis(paced_ms));
+            if let Some(block) = accounting.report.park_for {
+                // No HTTP call took place. Keep its retry state without
+                // incrementing attempts or cumulative dispatched retries.
+                accounting.call_attempts = attempt;
+                accounting.call_spent_ms = spent.as_millis() as u64;
+                accounting.parked_until = now_ms() + block.as_millis() as u64;
+                return Ok(None);
+            }
             // Whatever the provider billed for a failed attempt is still spent.
             if let Some(usage) = &accounting.report.usage {
                 self.tokens.add(usage);
@@ -486,27 +530,39 @@ impl Turn {
             };
             // Time spent waiting fairly in the pool is the fleet's, not this
             // call's; the budget counts only the attempts and their backoff.
-            let spent = started
-                .elapsed()
-                .saturating_sub(std::time::Duration::from_millis(paced_ms));
             if !retryable(&error.code) || attempt >= cap || spent >= RETRY_BUDGET {
                 return Err(error);
             }
+            // A pool closed by a rate limit for a while is not this turn's to
+            // wait out with a live task and an active slot: park durably
+            // and let the service retry when the block lifts. The retry is
+            // announced now and counted only when dispatched. Its call-local
+            // budget survives the park independently of cumulative totals.
+            let park = paced
+                .then(|| provider.blocked_for(model))
+                .flatten()
+                .filter(|block| *block >= MIN_PARK);
             // Rate limits already hold the pool; other transient failures
             // back off exponentially with a little spread.
-            let delay = if paced {
-                std::time::Duration::ZERO
-            } else {
-                backoff(attempt, turn as u64)
+            let delay = match park {
+                Some(block) => block,
+                None if paced => std::time::Duration::ZERO,
+                None => backoff(attempt, turn as u64),
             };
             self.hub
                 .live(
                     &self.bot,
                     json!({"event":"retry","bot":self.bot,"turn":turn,"durable":false,
                         "attempt":attempt,"error":error.code,"detail":error.detail,
-                        "delay_ms":delay.as_millis() as u64}),
+                        "delay_ms":delay.as_millis() as u64,"parked":park.is_some()}),
                 )
                 .await?;
+            if let Some(block) = park {
+                accounting.call_attempts = attempt;
+                accounting.call_spent_ms = spent.as_millis() as u64;
+                accounting.parked_until = now_ms() + block.as_millis() as u64;
+                return Ok(None);
+            }
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }

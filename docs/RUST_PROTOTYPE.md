@@ -22,6 +22,16 @@ AGENT_TEST_RUNTIME=1 AGENT_BENCH_TEST_ENGINES=1 .local/venv/bin/python -m unitte
 .local/venv/bin/python -m bench.matrix --out .local/bench/three-engines
 ```
 
+The same checks run on Linux amd64 through Errand, with the build tree and
+the Python venv kept as named runner caches so a job pays for a build once
+(`.errand.toml`; the `live` profile also forwards the provider keys in
+`.env.local` for checks that spend tokens):
+
+```sh
+errand --profile cabal -- sh -c 'test -x .local/venv/bin/python || python3 -m venv .local/venv; .local/venv/bin/pip -q install psutil; cargo build --release --locked && cargo test'
+errand --profile cabal -- sh -c 'AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m unittest discover -s tests'
+```
+
 The Python dependencies and Pi installation are described in [BENCHMARKS.md](BENCHMARKS.md).
 The matrix now defaults to Pi, Codex, and Rust. `--engines pi rust` selects a pair.
 Build before collecting results. The Rust target records the release binary and
@@ -549,7 +559,10 @@ are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
 (with a 2 KiB argument preview), `tool_completed` (with retained artifact
 names), `turn_waiting` and `turn_resumed` (a parked turn's handles and its
-wake-up), `steered` (a steer's item joining the running turn), and
+wake-up), `turn_paced` (a turn parked at its model-call boundary because its
+provider's pool is closed by a rate limit, with `resume_at_ms`; it resumes
+through `turn_resumed` like a parked wait), `steered` (a steer's item joining
+the running turn), and
 `turn_finished` (with status, checkpoint, error code, and detail; a steered
 turn's carries `into` and `node`). A `submit` response includes the turn's
 `handle`, `turn:BOT/N`, and its `status`.
@@ -750,8 +763,25 @@ continuous refill are heuristics, not a guarantee of exact provider-limit
 utilization. A refusal for pace, a 429 with
 `Retry-After`, an Anthropic 529, or a rate limit named inside the stream
 (`provider_rate_limited`, with "try again in N" parsed from the message), holds
-the pool until that time; the turns behind it wait rather than fail. The gate
-adds a lock and a few arithmetic operations on an unpaced call. See the
+the pool until that time; the turns behind it wait rather than fail. A turn
+whose admission finds the pool closed by a rate limit for 250 ms or more
+does not wait with a live task and an active slot: it parks at its
+model-call boundary as a durable `paced` row with a resume time
+(`turn_paced`), holding nothing, and the service resumes it when due
+(`turn_resumed`) to continue the call. This includes callers already waiting
+when another request closes the pool. The unfinished call's attempt count
+and retry-time budget persist with the park; a successful call resets them
+for the next tool round. Cumulative retries count only dispatched retries,
+separately from that call-local state, and commit with the park. Admission
+waiting spends no attempt. A persisted park-start timestamp measures actual
+elapsed waiting through resumption or interruption, including downtime and
+capacity delays after its wake-up deadline. The elapsed time is added once
+when the park ends; `paced_ms` does not precharge future waiting. `stats`
+reports such turns as `paced_turns`. These long rate-limit waits therefore
+release `--max-active` capacity for healthy providers
+([measured](DAEMON_MEASUREMENTS.md#paced-turns-and-active-slots)). Shorter
+blocks are waited out in place. The gate adds a lock and a few arithmetic
+operations on an unpaced call. See the
 [matched follow-up](DAEMON_MEASUREMENTS.md#pacing-review-fixes) for CPU, memory,
 latency, and the measurement limits.
 

@@ -15,10 +15,15 @@ use std::{
 // Tokio's clock, so the pool pauses and advances with the runtime under test.
 use tokio::time::Instant;
 
+/// Rate-limit waits below this threshold stay in the gate.
+pub const MIN_PARK: Duration = Duration::from_millis(250);
+
 /// What one call reports back besides its completion: provider usage when
 /// the stream carried it, and how long pacing held the call.
 #[derive(Debug, Default)]
 pub struct Report {
+    /// Admission deferred before dispatch; no attempt or reservation was spent.
+    pub park_for: Option<Duration>,
     pub usage: Option<Usage>,
     pub paced_ms: u64,
     /// The HTTP send future was entered, even if the attempt was interrupted.
@@ -177,17 +182,21 @@ impl Pace {
     pub(super) async fn acquire_reported(
         &self,
         tokens: u64,
-        elapsed_ms: &mut u64,
+        report: &mut Report,
     ) -> crate::Result<Reservation<'_>> {
         let _time = WaitTime {
-            elapsed_ms,
+            elapsed_ms: &mut report.paced_ms,
             started: Instant::now(),
         };
-        self.acquire(tokens).await
+        self.acquire(tokens, &mut report.park_for).await
     }
     /// Hold the caller until the pool can afford one request of `tokens`,
     /// then reserve it until headers, final usage, or cancellation account for it.
-    pub async fn acquire(&self, tokens: u64) -> crate::Result<Reservation<'_>> {
+    pub async fn acquire<'a>(
+        &'a self,
+        tokens: u64,
+        park_for: &mut Option<Duration>,
+    ) -> crate::Result<Reservation<'a>> {
         let started = Instant::now();
         let _turn = self.gate.lock().await;
         loop {
@@ -206,7 +215,14 @@ impl Pace {
                     ));
                 }
                 match state.blocked_until {
-                    Some(until) if until > now => until - now,
+                    Some(until) if until > now => {
+                        let left = until - now;
+                        if left >= MIN_PARK {
+                            *park_for = Some(left);
+                            return Err(crate::Error::new("provider_paced"));
+                        }
+                        left
+                    }
                     _ => {
                         state.blocked_until = None;
                         state.requests.refill(now);
@@ -240,11 +256,23 @@ impl Pace {
             }
         }
     }
+    /// How much longer a rate limit closes this pool, if it does.
+    pub fn blocked_for(&self) -> Option<Duration> {
+        let state = self.state.lock().unwrap();
+        state
+            .blocked_until
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+    }
     /// The provider refused for pace; nothing is admitted before `after`.
     pub fn limited(&self, after: Option<Duration>) {
         let mut state = self.state.lock().unwrap();
         let until = Instant::now() + after.unwrap_or(Duration::from_secs(1));
         state.blocked_until = Some(state.blocked_until.map_or(until, |u| u.max(until)));
+        drop(state);
+        // Wake the FIFO head even when it was waiting for allowance refill.
+        // It parks and releases the gate; queued callers then observe the block.
+        self.changed.notify_one();
     }
     /// Learn the allowance from a response's rate-limit headers. Returns
     /// whether token headers accounted for and released this estimate. Request
@@ -452,9 +480,52 @@ mod tests {
     }
 
     async fn sent(pace: &Pace, tokens: u64) -> crate::Result<Reservation<'_>> {
-        let mut call = pace.acquire(tokens).await?;
+        let mut call = pace.acquire(tokens, &mut None).await?;
         call.dispatch();
         Ok(call)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_pool_releases_existing_fifo_waiters_without_reserving() {
+        let pace = Arc::new(Pace::default());
+        pace.learn(
+            &headers(&[
+                ("x-ratelimit-limit-requests", "1"),
+                ("x-ratelimit-remaining-requests", "0"),
+            ]),
+            crate::codec::Family::Responses,
+            0,
+            0,
+        );
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let pace = pace.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut report = Report::default();
+                let code = pace
+                    .acquire_reported(1, &mut report)
+                    .await
+                    .err()
+                    .unwrap()
+                    .code;
+                (code, report.park_for, report.dispatched)
+            }));
+        }
+        // The head waits for refill; the other callers wait on its FIFO gate.
+        tokio::task::yield_now().await;
+        pace.limited(Some(Duration::from_secs(10)));
+        for task in tasks {
+            let (code, park, dispatched) = tokio::time::timeout(Duration::from_millis(100), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(code, "provider_paced");
+            assert!(park.unwrap() >= Duration::from_secs(9));
+            assert!(!dispatched);
+        }
+        let state = pace.state.lock().unwrap();
+        assert_eq!(state.reserved, 0);
+        assert_eq!(state.reserved_requests, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -471,8 +542,9 @@ mod tests {
             0,
             0,
         );
-        let held = pace.acquire(800).await.unwrap();
-        let (next, ()) = tokio::join!(pace.acquire(800), async {
+        let held = pace.acquire(800, &mut None).await.unwrap();
+        let mut park = None;
+        let (next, ()) = tokio::join!(pace.acquire(800, &mut park), async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             drop(held);
         });
@@ -484,7 +556,7 @@ mod tests {
         // timeout's early return, without ever marking the request dispatched.
         let semaphore = tokio::sync::Semaphore::new(0);
         let result = tokio::time::timeout(Duration::from_secs(60), async {
-            let _reservation = pace.acquire(800).await.unwrap();
+            let _reservation = pace.acquire(800, &mut None).await.unwrap();
             let _permit = semaphore.acquire().await.unwrap();
         })
         .await;
@@ -498,7 +570,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unsent_refunds_do_not_credit_unknown_request_buckets() {
         let pace = Pace::default();
-        let waiting = pace.acquire(800).await.unwrap();
+        let waiting = pace.acquire(800, &mut None).await.unwrap();
         let mut reporting = sent(&pace, 10).await.unwrap();
         reporting.learn(
             &headers(&[
@@ -539,21 +611,21 @@ mod tests {
         drop(newer);
         drop(older);
         assert_eq!(pace.snapshot().1, 2.0);
-        let unsent = pace.acquire(0).await.unwrap();
+        let unsent = pace.acquire(0, &mut None).await.unwrap();
         let mut reporting = sent(&pace, 0).await.unwrap();
         // Another client spent the rest of the provider's allowance.
         reporting.learn(&request_headers("0"), family);
         drop(reporting);
         drop(unsent);
         assert_eq!(pace.snapshot().1, 0.0);
-        let next = pace.acquire(0).await.unwrap();
+        let next = pace.acquire(0, &mut None).await.unwrap();
         assert!(next.waited >= Duration::from_secs(1));
         drop(next);
         // No headers: a dispatched call still consumes one request.
         let mut no_headers = sent(&pace, 0).await.unwrap();
         no_headers.learn(&HeaderMap::new(), family);
         drop(no_headers);
-        assert!(pace.acquire(0).await.unwrap().waited >= Duration::from_millis(990));
+        assert!(pace.acquire(0, &mut None).await.unwrap().waited >= Duration::from_millis(990));
     }
 
     #[test]
@@ -661,8 +733,17 @@ mod tests {
         assert!(pace.snapshot().3 <= 10.0, "{}", pace.snapshot().3);
         // A refusal blocks the pool until the named time, whatever the buckets say.
         pace.limited(Some(Duration::from_secs(3)));
-        let waited = sent(&pace, 1).await.unwrap().waited;
-        assert!(waited >= Duration::from_secs(3), "{waited:?}");
+        let mut report = Report::default();
+        assert_eq!(
+            pace.acquire_reported(1, &mut report)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "provider_paced"
+        );
+        assert_eq!(report.park_for, Some(Duration::from_secs(3)));
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // A spent allowance is a level to refill from, not a block: 60 per
         // minute means the next request waits one second, not until a reset.
         pace.learn(

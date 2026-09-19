@@ -214,7 +214,12 @@ class SocketAndCliTests(ModelFixture):
     def test_attach_refuses_a_running_daemon_with_a_different_configuration(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         def attempt(*flags):
-            return self.agent('run', '--store', str(self.store), *flags, '--bot', 'Bob', '--detach', 'hi', check=False)
+            result = self.agent('run', '--store', str(self.store), *flags, '--bot', 'Bob', '--detach', 'hi', check=False)
+            if result.returncode == 0:
+                # Let the detached turn finish, so the next attempt finds Bob idle
+                # on a slow host too rather than answering bot_busy.
+                self.agent('wait', '--store', str(self.store), json.loads(result.stdout)['handle'])
+            return result
         # Nothing stated, or the same thing stated differently, attaches.
         self.assertEqual(attempt().returncode, 0)
         self.assertEqual(attempt('--provider', f'openai=responses,{self.url}').returncode, 0)

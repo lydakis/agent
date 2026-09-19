@@ -1,0 +1,35 @@
+# Errand workspace configuration: run this repository's checks on another
+# machine you own. Runs stay explicit (select a profile); nothing is applied
+# back to this checkout unless asked.
+#
+#   errand --profile cabal -- sh -c 'cargo build --release --locked && cargo test'
+#   errand --profile cabal -- sh -c 'AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m unittest discover -s tests'
+#
+# The build tree and the Python venv are named runner caches at their usual
+# ignored paths, so a job pays for a build once and the venv persists. The
+# `live` profile also forwards the provider keys in .env.local for checks that
+# spend tokens; select it deliberately.
+
+[caches]
+target = ".local/target"
+venv = ".local/venv"
+
+[changes]
+apply_on_success = false
+
+[profiles.cabal.run]
+peer = "cabal"
+workdir = "."
+
+[profiles.cabal.changes]
+apply_on_success = false
+
+[profiles.live.run]
+peer = "cabal"
+workdir = "."
+
+[profiles.live.env]
+files = [".env.local"]
+
+[profiles.live.changes]
+apply_on_success = false

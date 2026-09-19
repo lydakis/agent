@@ -15,7 +15,7 @@ use agent_runtime::{
     store::{Binding, Bot, Delivery, Publication, Store, TurnOptions},
     tools::Registry,
 };
-use handles::{Completion, Handles, Waiter};
+use handles::{Completion, Handles, Waiter, now_ms};
 use hub::{Hub, replay};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -315,6 +315,9 @@ struct Service {
     ready_hint: bool,
     /// Provider-reported tokens since this daemon started, for `stats`.
     tokens: Arc<turn::TokenTotals>,
+    /// Turns parked on a rate-limited pool, by resume time. Each holds no
+    /// task and no slot; the run loop resumes them as they come due.
+    paced: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String, i64)>>,
 }
 
 /// A bot's live turn: which turn, the task owning it, its cancel signal,
@@ -465,7 +468,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     let handles = Handles::new(resume_sender);
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
     // Turns parked before a restart keep waiting; their processes are gone.
+    // Those parked on a closed pool wait for their time, not for handles.
+    let mut paced_at_start = Vec::new();
     for waiting in store.call(|db| db.waiting_turns()).await? {
+        if waiting.paced_since_ms.is_some() {
+            paced_at_start.push((waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn));
+            continue;
+        }
         handles
             .attach(
                 &store,
@@ -499,7 +508,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
+        paced: std::collections::BinaryHeap::new(),
     };
+    for (at, bot, turn) in paced_at_start {
+        service.paced.push(std::cmp::Reverse((at, bot, turn)));
+    }
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -508,6 +521,8 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
+        // Computed before the select so its arms borrow the service freely.
+        let (paced_due, paced_delay) = (service.paced.peek().is_some(), service.paced_delay());
         tokio::select! {
             _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
             Some(error) = failures.recv() => return Err(error),
@@ -536,6 +551,13 @@ pub async fn run(config: Configuration) -> Result<()> {
             // the branch choice is fair.
             _ = std::future::ready(()), if service.ready_hint && service.has_capacity() => {
                 service.dispatch_ready().await?;
+            }
+            // A paced turn comes due: resume it like any parked turn, capacity
+            // permitting; a stale entry (interrupted, deleted) is dropped.
+            _ = tokio::time::sleep(paced_delay), if paced_due && service.has_capacity() => {
+                if let Some(std::cmp::Reverse((_, bot, turn))) = service.paced.pop() {
+                    service.resume(bot, turn).await?;
+                }
             }
             message = inbound.recv() => {
                 let Some(message) = message else { break };
@@ -660,6 +682,14 @@ fn validate_provider(
 impl Service {
     fn has_capacity(&self) -> bool {
         self.limit_active == 0 || self.active.len() < self.limit_active
+    }
+
+    /// How long until the earliest paced turn is due.
+    fn paced_delay(&self) -> Duration {
+        self.paced
+            .peek()
+            .map(|std::cmp::Reverse((at, _, _))| Duration::from_millis(at.saturating_sub(now_ms())))
+            .unwrap_or(Duration::MAX)
     }
 
     async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
@@ -788,14 +818,18 @@ impl Service {
             // A slot opened, and a finish may promote the bot's next turn.
             self.ready_hint = true;
         }
-        if let turn::Exit::Finished(error) = exit {
-            let keep = self.retain_turns;
-            self.store
-                .call(move |db| turn::Finished::record(db, &bot, turn, error.as_ref(), keep))
-                .await?;
-            // Interrupt may already have released the task's active slot.
-            // Finishing still promotes queued work in that case.
-            self.ready_hint = true;
+        match exit {
+            turn::Exit::Finished(error) => {
+                let keep = self.retain_turns;
+                self.store
+                    .call(move |db| turn::Finished::record(db, &bot, turn, error.as_ref(), keep))
+                    .await?;
+                // Interrupt may already have released the task's active slot.
+                // Finishing still promotes queued work in that case.
+                self.ready_hint = true;
+            }
+            turn::Exit::Paced(at) => self.paced.push(std::cmp::Reverse((at, bot, turn))),
+            turn::Exit::Parked => {}
         }
         Ok(())
     }
@@ -901,7 +935,7 @@ impl Service {
                     .await
             }
             Command::Stats => {
-                let (waiting, running, queued) = store.call(|db| db.counts()).await?;
+                let (waiting, running, queued, paced) = store.call(|db| db.counts()).await?;
                 let (waiters, retained) = self.handles.stats();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
@@ -913,6 +947,7 @@ impl Service {
                     "active_turns": self.active.len(),
                     "active_limit": self.limit_active,
                     "waiting_turns": waiting,
+                    "paced_turns": paced,
                     "queued_turns": queued,
                     "running_processes": running,
                     "queued_processes": self.registry.pending(),
@@ -1124,7 +1159,9 @@ impl Service {
                 if state.running_turn.is_none() {
                     return fail("no_active_turn");
                 }
-                if state.running_turn != Some(turn) || state.status != "waiting" {
+                if state.running_turn != Some(turn)
+                    || (state.status != "waiting" && state.status != "paced")
+                {
                     return fail("stale_turn");
                 }
                 self.handles.forget(Waiter::Turn(turn));
@@ -1277,6 +1314,7 @@ mod tests {
             replays: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
+            paced: std::collections::BinaryHeap::new(),
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -1447,6 +1485,7 @@ mod tests {
             replays: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
+            paced: std::collections::BinaryHeap::new(),
         };
         let duplicate = service
             .dispatch(

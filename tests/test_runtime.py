@@ -39,6 +39,16 @@ class Model(http.server.BaseHTTPRequestHandler):
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
+            if user == 'tool:park-rounds' and (attempt <= 8 or attempt == 10):
+                body = b'{"error":{"message":"try later"}}'
+                self.send_response(429 if attempt <= 8 else 503)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                if attempt <= 8:
+                    self.send_header('Retry-After', '0.3')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if (user.startswith(('flaky:', 'limited:', 'waitretry:')) and attempt == 1) or user.startswith('limited-forever:'):
                 # Transport-level refusals: a 503 the next attempt clears, a
                 # 429 with Retry-After, or a 429 that never lifts.

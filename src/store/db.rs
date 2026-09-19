@@ -135,6 +135,21 @@ pub struct Waiting {
     pub any: bool,
     /// Tool calls from the same model response that follow the wait.
     pub pending: Vec<ToolCall>,
+    /// A rate-limit park's start time. Its deadline is only a wake-up hint;
+    /// elapsed waiting is charged when resumed or finished, even after restart.
+    #[serde(default)]
+    pub paced_since_ms: Option<i64>,
+    /// Retry state of the unfinished model call, separate from turn totals.
+    #[serde(default)]
+    pub call_attempts: u32,
+    #[serde(default)]
+    pub call_spent_ms: u64,
+}
+impl Waiting {
+    fn paced_elapsed_ms(&self) -> i64 {
+        self.paced_since_ms
+            .map_or(0, |since| epoch_ms().saturating_sub(since).max(0))
+    }
 }
 /// The bounded request context: ordered node ids and exact item bytes.
 #[derive(Debug)]
@@ -274,6 +289,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS checkpoints_head ON checkpoints(head);
             CREATE INDEX IF NOT EXISTS turns_running ON turns(id) WHERE status='running';
             CREATE INDEX IF NOT EXISTS turns_waiting ON turns(id) WHERE status='waiting';
+            CREATE INDEX IF NOT EXISTS turns_paced ON turns(id) WHERE status='paced';
             CREATE INDEX IF NOT EXISTS turns_queued ON turns(bot,id) WHERE status='queued';
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
@@ -1327,7 +1343,7 @@ impl Database {
         let tx = self.conn.transaction()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        if waiting.is_some() {
+        if let Some(waiting) = &waiting {
             // A parked turn's wait, and the planned calls behind it, never had
             // an external effect. Answer them so the conversation stays valid
             // for continuation, instead of leaving the bot uncertain.
@@ -1350,7 +1366,10 @@ impl Database {
                 let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
                 entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
             }
-            tx.execute("UPDATE turns SET waiting=NULL WHERE id=?", [turn])?;
+            tx.execute(
+                "UPDATE turns SET waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
+                params![waiting.paced_elapsed_ms(), turn],
+            )?;
         }
         let pending: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
@@ -1431,6 +1450,9 @@ impl Database {
             deadline_ms,
             any,
             pending: pending.to_vec(),
+            paced_since_ms: None,
+            call_attempts: 0,
+            call_spent_ms: 0,
         };
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1443,11 +1465,52 @@ impl Database {
         tx.commit()?;
         Ok(entry(cursor, &bot.name, Some(turn), "turn_waiting", data))
     }
-    /// Every parked turn, for re-registration after a restart.
+    /// Park a running turn at its model-call boundary until `resume_at_ms`,
+    /// because its provider's pool is closed by a rate limit. It holds no
+    /// task and no slot until then; retries stay in the turn row.
+    pub fn suspend_paced(
+        &mut self,
+        turn: i64,
+        resume_at_ms: u64,
+        call_attempts: u32,
+        call_spent_ms: u64,
+        retries: u64,
+        paced_ms: u64,
+    ) -> Result<Value> {
+        let bot = self.active(turn)?;
+        if bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: String::new(),
+            handles: Vec::new(),
+            deadline_ms: Some(resume_at_ms),
+            any: false,
+            pending: Vec::new(),
+            paced_since_ms: Some(epoch_ms()),
+            call_attempts,
+            call_spent_ms,
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, retries as i64, paced_ms as i64, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='paced' WHERE name=?", [&bot.name])?;
+        let data = json!({"resume_at_ms":resume_at_ms});
+        let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
+        tx.commit()?;
+        Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
+    }
+    /// Every parked turn, on handles or on a pool, for re-registration after
+    /// a restart.
     pub fn waiting_turns(&self) -> Result<Vec<Waiting>> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT id FROM turns WHERE status='waiting' ORDER BY id")?;
+        let mut statement = self.conn.prepare(
+            "SELECT id FROM turns WHERE status='waiting'
+             UNION ALL SELECT id FROM turns WHERE status='paced' ORDER BY id",
+        )?;
         let ids = statement
             .query_map([], |r| r.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1462,7 +1525,7 @@ impl Database {
             .conn
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM bots
-                 WHERE name=? AND status='waiting' AND running_turn=?)",
+                 WHERE name=? AND status IN ('waiting','paced') AND running_turn=?)",
             )?
             .query_row(params![name, turn], |r| r.get(0))?)
     }
@@ -1472,13 +1535,13 @@ impl Database {
     pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value, bool)> {
         let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
         let bot = self.active(turn)?;
-        if bot.status != "waiting" {
+        if bot.status != "waiting" && bot.status != "paced" {
             return fail("turn_not_waiting");
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE turns SET status='running',waiting=NULL WHERE id=?",
-            [turn],
+            "UPDATE turns SET status='running',waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
+            params![waiting.paced_elapsed_ms(), turn],
         )?;
         tx.execute("UPDATE bots SET status='running' WHERE name=?", [&bot.name])?;
         let data = json!({"call_id":waiting.call_id});
@@ -1506,7 +1569,10 @@ impl Database {
         if owner != name {
             return fail("turn_not_found");
         }
-        if matches!(status.as_str(), "running" | "waiting" | "queued" | "ready") {
+        if matches!(
+            status.as_str(),
+            "running" | "waiting" | "paced" | "queued" | "ready"
+        ) {
             return Ok(None);
         }
         let finished: Option<String> = self
@@ -1978,20 +2044,26 @@ impl Database {
     /// finishes, is interrupted, or parks; zero counters need no write.
     /// Counts a controller reads instead of scanning: parked turns and
     /// running background commands, both from the active-status indexes.
-    /// Waiting turns, running processes, and turns queued or ready to start.
-    pub fn counts(&self) -> Result<(i64, i64, i64)> {
+    /// Waiting turns, running processes, turns queued or ready to start,
+    /// and turns paced on a closed pool.
+    pub fn counts(&self) -> Result<(i64, i64, i64, i64)> {
         let waiting: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM turns WHERE status='waiting'",
             [],
             |r| r.get(0),
         )?;
+        let paced: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM turns WHERE status='paced'", [], |r| {
+                    r.get(0)
+                })?;
         let queued: i64 = self.conn.query_row(
             "SELECT (SELECT COUNT(*) FROM turns WHERE status='queued')
                   + (SELECT COUNT(*) FROM turns WHERE status='ready')",
             [],
             |r| r.get(0),
         )?;
-        Ok((waiting, self.running_processes()?, queued))
+        Ok((waiting, self.running_processes()?, queued, paced))
     }
     pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {
         self.conn.execute(
@@ -2237,6 +2309,7 @@ fn turn_status_name(status: &str) -> &'static str {
         "queued" => "queued",
         "ready" => "ready",
         "waiting" => "waiting",
+        "paced" => "paced",
         "running" => "running",
         _ => "finished",
     }

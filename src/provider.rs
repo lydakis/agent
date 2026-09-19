@@ -229,6 +229,10 @@ impl Provider {
     pub fn family(&self) -> Family {
         self.family
     }
+    /// How much longer this model's pool is closed by a rate limit, if it is.
+    pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
+        self.pools.get(model).blocked_for()
+    }
 
     /// Bound generated tokens (including reasoning) for Responses calls.
     /// Other families need their own budget validation and reject this option.
@@ -386,9 +390,7 @@ impl Provider {
         let prefix = self.prefix(&request)?;
         let estimate = ((prefix.len() + request.items.bytes) / 4) as u64
             + u64::from(self.max_output_tokens.unwrap_or(512));
-        let mut reservation = pace
-            .acquire_reported(estimate, &mut report.paced_ms)
-            .await?;
+        let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
         let admission =

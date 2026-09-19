@@ -4,7 +4,8 @@ Replies to any prompt with a short message. `hold:` prompts block until the
 server's `release` event is set, which lets a screen park many bots on one
 anchor turn. `shell:` prompts return one shell tool call and then a reply; `wait:` prompts
 return one wait tool call on the given handles and then a reply; `delay:N`
-prompts reply after N milliseconds so many turns overlap.
+prompts reply after N milliseconds so many turns overlap; `limited:` prompts
+are refused with 429 and a one-second Retry-After every time.
 No history validation: the daemon's request bodies are counted, not checked.
 """
 import http.server
@@ -35,6 +36,17 @@ class Model(http.server.BaseHTTPRequestHandler):
         self.server.request_bytes += length
         user = [i for i in request['input'] if i.get('role') == 'user'][-1]['content'][0]['text']
         last = request['input'][-1]
+        if user.startswith('limited:'):
+            # A provider that never lets this turn through: 429 with a short
+            # Retry-After, so its pool stays closed and the turn keeps waiting.
+            body = json.dumps({'error': {'message': 'try later'}}).encode()
+            self.send_response(429)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Retry-After', '1')
+            self.end_headers()
+            self.wfile.write(body)
+            return
         held = user.startswith('hold:')
         delay = float(user[6:]) / 1000 if user.startswith('delay:') else 0
         if user.startswith('shell:') and last.get('type') != 'function_call_output':

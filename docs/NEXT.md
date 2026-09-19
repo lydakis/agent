@@ -391,15 +391,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     unrelated bots nothing.
 23. Done: strict steering with `expected_turn`, `agent run --delivery
     steer --turn N`.
-24. Provider pacing must not hold active slots. A turn waiting in a
-    closed pacing gate keeps its slot in `--max-active`, so at small
-    limits a throttled provider can keep a healthy one from starting.
-    Measure first with two synthetic providers and a tiny active limit,
-    one throttled to zero. If it matters, the composable fix is to park a
-    turn at the model-call boundary while its pool is closed, like a
-    `wait`, holding no slot until the pool opens; not a second scheduler
-    with pool-aware admission. Pending submissions also want their own
-    count and byte bound, separate from the active-turn bound.
+24. Done: [paced turns and active slots](DAEMON_MEASUREMENTS.md#paced-turns-and-active-slots).
+    Measured first: when a throttled provider's retrying turns filled
+    `--max-active`, a healthy provider's queued turns did not start at all.
+    Now a turn whose pool is closed by a rate limit for 250 ms or more
+    parks at the model-call boundary as a durable `paced` row with a resume
+    time, holding no task and no slot; the service resumes it when due and
+    it re-enters the model call. Admission waiters park too, including those
+    already queued when the pool closes. The unfinished call's attempts and
+    retry-time budget persist across parks and restarts; cumulative turn
+    retries stay separate and count only dispatched retries. No second scheduler.
+    Still open from the item: pending submissions want their own count and
+    byte bound, separate from the active-turn bound.
 25. Pacing inputs per provider. The request estimate's output term is an
     estimate, not a billing ceiling (fix the comment now). Quota identity
     is not always model identity: some providers share limits across

@@ -2073,3 +2073,145 @@ and diff checks. Regressions cover migrated multi-report turns, failed usage,
 forks, reopen, rollback when usage was pruned, and exactly-once daemon totals
 for rejected completions and failed/retried provider calls. The two new
 regressions failed before the fixes. Only synthetic providers were used.
+
+## Paced turns and active slots
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0, binary
+`652b9fa`'s tree. Two synthetic providers on one daemon: A refuses every
+call with 429 and a one-second Retry-After, so its turns sit in the pacing
+gate and retry; B answers instantly. Eight bots on each. Eight A turns are
+submitted first and given a second to reach the gate, then eight B turns
+with `delivery: queue`; the driver waits fifteen seconds for them
+(ignored `.local/pacing-slots/bench.py`).
+
+| `--max-active` | A turns waiting | B admitted as | B finished in 15 s | B latency, max |
+| ---: | ---: | --- | ---: | ---: |
+| 8 | 0 | running | 8 of 8 | 6 ms |
+| 8 | 8 | ready | 0 of 8 | blocked |
+| 9 | 8 | ready, then running | 8 of 8 | 4 ms |
+| 12 | 8 | ready, then running | 8 of 8 | 6 ms |
+| unbounded | 8 | running | 8 of 8 | 8 ms |
+
+A turn waiting on a closed pool holds its active slot for as long as it
+retries, up to 64 paced attempts or the 300 s retry budget. When the
+throttled provider's turns fill the limit, a healthy provider's work does
+not start at all; one free slot is enough for it to proceed, serially. So
+the coupling is real and total at the boundary, and it reaches any fleet
+that sets an explicit limit and mixes providers: the ten-thousand-bot
+screen ran at 1,024, and one throttled provider could have parked 1,024
+turns in its gate while every other provider's bots waited as `ready`.
+
+After the fix, the same driver on the slice binary: a turn whose pool is
+closed by a rate limit for 250 ms or more parks at the model-call boundary
+as a durable `paced` row, holding no task and no slot, and the service
+resumes it when its time comes. With the same eight throttled turns:
+
+| `--max-active` | A turns paced | B admitted as | B finished in 15 s | B latency, max |
+| ---: | ---: | --- | ---: | ---: |
+| 8 | 8 | running | 8 of 8 | 2 ms |
+| 9 | 8 | running | 8 of 8 | 7 ms |
+| 12 | 8 | running | 8 of 8 | 7 ms |
+| unbounded | 8 | running | 8 of 8 | 5 ms |
+
+A throttled turn now costs the limit nothing while it waits; it is live
+only for the attempt itself. On ordinary turns the change adds one
+comparison per retry decision. Captures: ignored
+`.local/pacing-slots/before.json` and `after.json`.
+
+The ordinary-turn screen, committed tree `29cfe068…` (rebuilt from a
+worktree, screened with its own bench) against the slice binary
+`bbaf9d65…`, one excluded warmup and four measured runs each: RSS 17.59
+(17.41–17.64) versus 17.80 (17.75–17.92) MiB, CPU 0.351 (0.347–0.354)
+versus 0.344 (0.329–0.354) s, p95 593.4 (591.0–598.6) versus 597.3
+(591.6–691.7) ms. CPU and p95 medians are level; one slice run carried a
+692 ms p95 outlier with no matching CPU movement, and RSS is up about 200
+KiB, both inside what this screen has shown for one binary. Nothing here
+runs on an unpaced turn beyond one comparison per retry decision and one
+timer arm in the run loop that sleeps while no turn is paced. Captures:
+ignored `.local/bench/slice-prev7-socket-32/` and `slice-paced-socket-32/`.
+
+Validation: 79 Rust tests, strict Clippy, formatting, and 156 Python tests.
+New regressions: four throttled turns on a four-slot daemon park and a
+healthy provider's four queued turns complete within three seconds, with
+the paced turn still busy to submit and interruptible; a paced turn
+survives a restart, resumes, and ends at the paced-attempt cap with its
+retries kept across both segments, after which the bot runs again. The
+existing retry and pacing tests hold with retry numbering and pacing time
+continuing across a park.
+
+### Paced-admission and retry-scope review fixes
+
+Observed 2026-09-19, Darwin arm64, external power, Rust 1.98.0. The review
+found that a call joining an already-closed pool still held an active slot,
+and cumulative retries from an earlier model call could exhaust a later
+call's budget. Admission now returns long rate-limit waits to the turn for
+parking, including FIFO waiters present when another call closes the pool.
+The unfinished call's attempts and retry-time budget persist with the park;
+the next successful tool round starts a fresh call budget. Cumulative retries
+count only dispatched retries. Park state and accounting commit together.
+
+A synthetic four-second pool closure with one active slot compared pre-fix
+binary `78ac55d4…` with `74e8cf67…`, in baseline/candidate/candidate/baseline
+order. After one turn closed its pool, another bot joined that pool and
+healthy-provider work was submitted. Healthy submit-to-finish latency was
+4,005–4,012 ms before and 2.3–3.1 ms after. This isolates admission blocking;
+it is not a model-throughput measurement.
+
+The ordinary 32-agent socket echo lifecycle screen used the same observer,
+three turns per agent, 20 chunks of 256 bytes at 25 ms intervals, a 4 KiB
+history fixture, and the `echo,shell,read,write,edit` selection. Four alternating
+batches each had one excluded warmup and two measured runs, giving four
+measured runs per binary. Builds and tests finished before measurement.
+All runs passed the lifecycle checks and reported no quality warnings.
+
+| Metric, median (range) | Before fixes | After fixes |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.73 (17.66–17.81) | 17.90 (17.81–18.06) |
+| Observed target CPU, seconds | 0.337 (0.335–0.339) | 0.328 (0.324–0.342) |
+| Per-run p95 turn latency, ms | 593.1 (591.8–598.3) | 594.1 (591.5–594.9) |
+
+CPU median is 2.8% lower, but overlapping ranges do not establish a speedup.
+P95 is effectively level (+0.18%); RSS median increased 0.16 MiB (+0.9%).
+The charged boundary is the daemon and descendants; Python observers and
+Rust CLI invocations are excluded. Captures, binaries, and drivers are in
+ignored `.local/paced-fix/`.
+
+Validation: 80 Rust tests, 78 relevant Python tests, strict Clippy, formatting,
+and diff checks. Both new integration regressions failed before the fixes.
+Coverage also checks already-waiting FIFO callers, no reservation or retry
+spent by admission parking, and exactly 64 attempts/63 dispatched retries
+across a parked restart. Only synthetic providers were used.
+
+### Elapsed parked-time accounting
+
+Observed 2026-09-19, Darwin arm64, external power, Rust 1.98.0. A park now
+stores its start timestamp and charges elapsed time when it resumes or
+finishes, in the same transaction that clears the park. This includes daemon
+downtime and capacity delays past the wake-up deadline, without charging
+unused future waiting on interruption. It adds no query or write; ordinary
+turns do not read the clock for this accounting.
+
+Before the fix, interruption after roughly 50 ms charged 9,999 ms, and a
+restart after 600 ms charged only the scheduled 299 ms. Both regression
+tests now pass; another restart preserves the settled counter exactly.
+
+The same 32-agent socket echo workload and charged boundary described above
+compared binaries `74e8cf67…` and `bdaa0295…` in baseline/candidate/candidate/
+baseline order. Each batch excluded one warmup and measured two runs, giving
+four measured runs per binary. Builds and tests finished before measurement;
+all lifecycle checks passed with no quality warnings.
+
+| Metric, median (range) | Before elapsed-time fix | After elapsed-time fix |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.80 (17.77–17.84) | 17.88 (17.80–18.06) |
+| Observed target CPU, seconds | 0.335 (0.287–0.371) | 0.350 (0.323–0.367) |
+| Per-run p95 turn latency, ms | 589.0 (587.4–594.8) | 596.2 (591.0–597.9) |
+
+RSS median increased 0.08 MiB, CPU 4.5%, and p95 1.2%. Ranges overlap;
+this small screen establishes neither a speedup nor a regression and does
+not prove exact performance equality. Captures, binary hashes, and the driver
+are in ignored `.local/paced-elapsed-fix/`.
+
+Validation: 80 Rust tests, 31 relevant Python tests, strict Clippy, formatting,
+and diff checks. The interruption and late-restart regressions failed before
+the fix. Only synthetic providers were used.
