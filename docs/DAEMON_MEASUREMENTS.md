@@ -2414,3 +2414,93 @@ speedup. It does not measure sustained high-frequency stats polling. Captures,
 binary hashes, and probes are in ignored `.local/review-store-counters/`.
 Validation: 84 Rust tests, two focused daemon stats tests, strict Clippy,
 formatting, and diff checks passed.
+
+## Mass interrupt
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0, binary
+`437fbc6`'s tree. Two fleets, interrupted all at once (ignored
+`.local/mass-interrupt/bench.py`): in `stream` every turn is mid-request
+against a provider that holds the response open; in `shell` every turn is
+running a foreground `sleep 60`. All N interrupts are written back to back
+on one stdio connection. Time runs from the first interrupt written to the
+last `turn_finished` received; for `shell`, also until no child process
+remains. Daemon CPU is the delta over the stop.
+
+| Fleet | Bots | All sent | Last terminal event | Processes gone | Daemon CPU | Every turn ended |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| stream | 256 | 0.4 ms | 49 ms | n/a | 50 ms | `interrupted` |
+| shell | 256 | 0.4 ms | 66 ms | 80 ms | 82 ms | `uncertain` |
+| stream | 1,024 | 2.0 ms | 198 ms | n/a | 207 ms | `interrupted` |
+| shell | 1,024 | 2.5 ms | 768 ms | 782 ms | 892 ms | `uncertain` |
+
+This single screen observed about 0.2 ms of daemon CPU per streaming turn
+and 0.8 ms per shell turn, the latter being the process-group kill, the
+reap, and the finish job; the stream fleet's `finish` histogram put 989 of 1,024
+finishes under 250 µs. A thousand bots mid-request are durably stopped in
+0.2 s and a thousand with live commands in 0.8 s, their processes gone at
+the same moment according to the sampler. This is exploratory: child-count
+readiness includes both shells and their children, and daemon-descendant
+enumeration can miss reparented processes. These samples do not establish
+linear scaling or prove every owned process has stopped.
+
+The screen exposed a usability gap: turns stopped mid-shell ended `uncertain`
+and their bots refused new work until forked. Streaming turns ended
+`interrupted` and stayed usable. The initial fix below recorded cancelled
+results for explicit stops. Subsequent review found its claim that every tool
+had stopped was too strong: native file I/O and background commands can outlive
+cancellation. The current contract records unknown execution outcomes honestly
+and keeps the bot usable after either cancellation or crash recovery.
+After the change, the same screen at a thousand bots on the slice binary:
+
+| Fleet | Bots | Last terminal event | Processes gone | Daemon CPU | Every turn ended |
+| --- | ---: | ---: | ---: | ---: | --- |
+| stream | 1,024 | 193 ms | n/a | 200 ms | `interrupted` |
+| shell | 1,024 | 712 ms | 724 ms | 866 ms | `interrupted` |
+
+In that initial fix, the shell fleet ended `interrupted` with a `cancelled` result recorded
+for each killed command, and every bot accepted new work at once. This was a single interruption screen,
+not a repeated performance comparison. The finish job answers the executing call in the
+same transaction that ends the turn, one more node and event per bot.
+
+The 32-agent socket echo screen, committed tree `a4215d72…` (rebuilt from a
+worktree) against the slice binary `9e14f646…`, one excluded warmup and four
+measured runs each: RSS 17.98 (17.81–18.08) versus 17.66 (17.58–17.73) MiB,
+CPU 0.302 (0.289–0.321) versus 0.310 (0.296–0.330) s, p95 588.5
+(587.7–612.1) versus 593.7 (590.0–596.9) ms. Level within noise; an
+ordinary turn never takes the interrupt path. Captures: ignored
+`.local/mass-interrupt/{before,after}.json`,
+`.local/bench/slice-prev10-socket-32/` and `slice-interrupt-socket-32/`.
+
+Validation: 84 Rust tests, strict Clippy, formatting, and 159 Python tests.
+Those checks described the initial slice. The follow-up below replaces the
+strong cancellation claim and the blocked recovery contract.
+
+### Usable bots after unknown tool outcomes
+
+2026-09-19 follow-up: cancellation and crash recovery now append an honest
+`tool_outcome_unknown` result for executing calls without a committed result,
+close planned calls as cancelled, and release the same named bot for more work.
+No tool is replayed. Schema 20 repairs previously blocked bots once at startup,
+including when operational records were pruned. Normal successful completion
+keeps its existing pending-tool query; transcript repair is off that path.
+
+Matched 32-agent socket echo lifecycle screen, pre-fix binary `9e14f646…`
+versus candidate `585031a4…`. ABBA batch order, two excluded warmups and four
+measured runs per binary. Same tools (`echo,shell,read,write,edit`), three turns,
+4 KiB retained history, and restart/replay/fork/follower checks. All runs passed.
+These measurements cover normal lifecycle overhead, not interruption latency.
+
+| Metric, median (range) | Before | After |
+| --- | ---: | ---: |
+| Daemon CPU | 352 (325–371) ms | 346 (339–353) ms |
+| Sampled peak RSS | 17.75 (17.67–18.02) MiB | 17.80 (17.61–18.22) MiB |
+| Turn p95 | 623 (614–628) ms | 621 (618–650) ms |
+
+Ranges overlap: no clear regression or established speedup. Captures and the
+comparison driver are under ignored `.local/review-interrupt/`.
+
+Validation: 85 Rust tests, 55 targeted Python runtime/wait/accounting tests,
+strict Clippy, formatting, and diff checks. Coverage includes cancellation,
+crash during a shell call followed by successful use of the same bot, queued
+continuation, both provider result formats, pruned-record migration, and
+idempotent reopening without duplicate tool results.

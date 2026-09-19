@@ -202,7 +202,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 19;
+    pub const SCHEMA: i32 = 20;
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -299,8 +299,8 @@ impl Database {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
         tx.commit()?;
-        // Background commands died with the previous daemon; their handles
-        // must report loss rather than resolve to some later command.
+        // Background command ownership is lost across daemon restart. This
+        // does not prove the OS process stopped; never reuse its handle.
         conn.execute(
             "UPDATE processes SET status='lost',result=? WHERE status='running'",
             [json!({"error":"process_lost"}).to_string()],
@@ -920,9 +920,6 @@ impl Database {
         if busy && reject {
             return fail("bot_busy");
         }
-        if bot.status == "uncertain" {
-            return fail("tool_outcome_uncertain");
-        }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
         }
@@ -1029,9 +1026,6 @@ impl Database {
             self.conn
                 .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
             return fail("bot_busy");
-        }
-        if bot.status == "uncertain" {
-            return fail("tool_outcome_uncertain");
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
@@ -1343,18 +1337,31 @@ impl Database {
         let tx = self.conn.transaction()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        if let Some(waiting) = &waiting {
-            // A parked turn's wait, and the planned calls behind it, never had
-            // an external effect. Answer them so the conversation stays valid
-            // for continuation, instead of leaving the bot uncertain.
-            let unanswered: Vec<String> = tx
-                .prepare("SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
-                .query_map([turn], |r| r.get(0))?
+        // Complete the transcript, not the external operation. Dropped native
+        // I/O and background commands can outlive cancellation or a crash.
+        // Report missing outcomes honestly and leave the bot usable; never
+        // automatically repeat a tool whose result was not committed.
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
+            [turn],
+            |r| r.get(0),
+        )?;
+        if pending {
+            let unanswered: Vec<(String, String)> = tx
+                .prepare("SELECT call_id,status FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
+                .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             let family = bot.family()?;
-            for call_id in unanswered {
-                let output = json!({"error":"cancelled","detail":"turn interrupted while parked"})
-                    .to_string();
+            for (call_id, status) in unanswered {
+                let unknown = status == "executing" && waiting.is_none();
+                let detail = if unknown {
+                    "turn ended before this tool's result was recorded; it may have had effects and may still be running. Inspect the current state before retrying"
+                } else if waiting.is_some() && status == "executing" {
+                    "turn interrupted while parked"
+                } else {
+                    "turn ended before this call ran"
+                };
+                let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },"detail":detail}).to_string();
                 let item = family.tool_result_item(&call_id, &output)?;
                 let id = node(&tx, head, &item)?;
                 head = Some(id);
@@ -1362,24 +1369,21 @@ impl Database {
                     "UPDATE tools SET status='completed' WHERE turn=? AND call_id=?",
                     params![turn, call_id],
                 )?;
-                let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":true});
+                let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":!unknown,"outcome_unknown":unknown});
                 let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
                 entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
             }
+        }
+        if let Some(waiting) = &waiting {
             tx.execute(
                 "UPDATE turns SET waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
                 params![waiting.paced_elapsed_ms(), turn],
             )?;
         }
-        let pending: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
-            [turn],
-            |r| r.get(0),
-        )?;
         let code = error.map(|e| e.code.as_str());
-        let status = if pending {
-            "uncertain"
-        } else if matches!(code, Some("process_interrupted" | "cancelled")) {
+        let status = if matches!(code, Some("process_interrupted" | "cancelled"))
+            || (pending && code.is_none())
+        {
             "interrupted"
         } else if code.is_some() {
             "failed"
@@ -2502,6 +2506,80 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     THEN (SELECT seq FROM sqlite_sequence WHERE name='events') ELSE 0 END);",
         )?;
     }
+    if from < 20 {
+        // Retire the old blocked state once. Stage its unfinished turn for
+        // normal startup reconciliation, which appends missing results and
+        // releases the bot. Persisting this staging makes recovery retryable
+        // if the daemon dies between migration and turn finalization.
+        let blocked: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT name,(SELECT id FROM turns WHERE bot=bots.name AND status='uncertain' ORDER BY id DESC LIMIT 1) FROM bots WHERE status='uncertain' AND running_turn IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (bot, turn) in blocked {
+            let Some(turn) = turn else {
+                return fail("store_migration_missing_uncertain_turn");
+            };
+            migrate_unanswered_tools(conn, &bot, turn)?;
+            conn.execute(
+                "UPDATE bots SET status='running',running_turn=? WHERE name=?",
+                params![turn, bot],
+            )?;
+            conn.execute("UPDATE turns SET status='running' WHERE id=?", [turn])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Operational tool records can have been pruned after a blocked turn's
+/// queued successors failed. Reconstruct missing intents from its durable
+/// transcript, one item at a time. With no retained intent, execution is unknown.
+fn migrate_unanswered_tools(conn: &Connection, bot: &str, turn: i64) -> Result<()> {
+    let mut next: Option<i64> =
+        conn.query_row("SELECT head FROM bots WHERE name=?", [bot], |r| r.get(0))?;
+    let mut read = conn.prepare("SELECT parent,item,turn FROM nodes WHERE id=?")?;
+    let mut insert =
+        conn.prepare("INSERT OR IGNORE INTO tools(turn,call_id,status) VALUES (?,?,'executing')")?;
+    let mut answered = std::collections::HashSet::new();
+    while let Some(id) = next {
+        let (parent, raw, marker): (Option<i64>, Vec<u8>, Option<i64>) =
+            read.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let item: Value = serde_json::from_slice(&raw)?;
+        let blocks: Vec<&Value> = if item["type"].is_string() {
+            vec![&item]
+        } else {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .collect()
+        };
+        for block in blocks {
+            let (call, result) = match block["type"].as_str() {
+                Some("function_call") => (block["call_id"].as_str(), false),
+                Some("tool_use") => (block["id"].as_str(), false),
+                Some("function_call_output") => (block["call_id"].as_str(), true),
+                Some("tool_result") => (block["tool_use_id"].as_str(), true),
+                _ => (None, false),
+            };
+            if let Some(call) = call {
+                if result {
+                    answered.insert(call.to_owned());
+                } else if !answered.remove(call) {
+                    insert.execute(params![turn, call])?;
+                }
+            }
+        }
+        if marker == Some(turn) {
+            break;
+        }
+        next = parent;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO retained_turns(turn,bot) VALUES (?,?)",
+        params![turn, bot],
+    )?;
     Ok(())
 }
 

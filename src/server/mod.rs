@@ -708,7 +708,7 @@ impl Service {
     }
 
     /// Start the oldest turn waiting for a slot, or learn there is none.
-    /// A turn that cannot start (its bot's outcome uncertain, budget spent)
+    /// A turn that cannot start (for example, its bot's budget is spent)
     /// ends with that error; the bot's next queued turn takes its place.
     async fn dispatch_ready(&mut self) -> Result<()> {
         let Some((bot, turn)) = self.store.op("next_ready", |db| db.next_ready()).await? else {

@@ -625,6 +625,32 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(any(e.get('turn') == pending and e['data'].get('error') == 'process_interrupted' for e in events))
         self.assertTrue(self.model.requests.empty())  # Restart did not launch a paid/repeated request.
 
+    def test_crash_during_a_tool_keeps_the_same_bot_usable(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='crash',
+                              prompt='shell:echo started > crash-marker; sleep 1')['result']['turn']
+        deadline = time.monotonic() + 3
+        while not (self.path / 'crash-marker').exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue((self.path / 'crash-marker').exists())
+        client.close(kill=True)
+        self.model.requests.get(timeout=1)
+        client = self.client('echo,shell')
+        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'interrupted')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        results = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]['data']['outcome_unknown'])
+        self.assertTrue(self.model.requests.empty())  # Recovery never replays the tool.
+        again = client.request('submit', bot='Bob', request_id='continue', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(again)['data']['status'], 'completed')
+        history = self.model.requests.get(timeout=1)['input']
+        call = next(i for i in history if i.get('type') == 'function_call')
+        result = next(i for i in history if i.get('type') == 'function_call_output')
+        self.assertEqual(result['call_id'], call['call_id'])
+        self.assertEqual(json.loads(result['output'])['error'], 'tool_outcome_unknown')
+
     def test_shell_workspace_result_and_cancelled_descendants(self):
         import psutil
         client = self.client('echo,shell')
@@ -645,7 +671,9 @@ class RuntimeTests(ModelFixture):
         pid = int((self.path / 'child.pid').read_text())
         child = psutil.Process(pid)
         client.request('interrupt', bot='Bob', turn=turn)
-        self.assertEqual(client.finished(turn)['data']['status'], 'uncertain')
+        # The shell is killed, but its unrecorded effects remain unknown.
+        # The result states that uncertainty and the bot stays usable.
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         deadline = time.monotonic() + 2
         def alive():
             try:
@@ -655,7 +683,14 @@ class RuntimeTests(ModelFixture):
         while alive() and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertFalse(alive())
-        self.assertEqual(client.request('submit', bot='Bob', request_id='retry', prompt='hi')['error'], 'tool_outcome_uncertain')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        killed = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
+        self.assertEqual(len(killed), 1)
+        output = json.loads(client.request('item', bot='Bob', node=killed[0]['data']['node'])['result']['output'])
+        self.assertEqual(output['error'], 'tool_outcome_unknown')
+        self.assertIn('may still be running', output['detail'])
+        again = client.request('submit', bot='Bob', request_id='retry', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(again)['data']['status'], 'completed')
 
     def test_second_owner_cannot_recover_another_process_turn(self):
         client = self.client()

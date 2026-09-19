@@ -289,47 +289,211 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
 }
 
 #[test]
-fn unrecorded_tool_outcomes_block_automatic_reexecution() {
-    let mut db = db();
-    db.create("Bob", Some("/synthetic"), binding()).unwrap();
-    let turn = db
-        .begin(
-            "Bob",
-            "request",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    let call = ToolCall {
-        name: "echo".into(),
-        call_id: "c1".into(),
-        arguments: r#"{"text":"hi"}"#.into(),
-    };
-    db.append(turn, vec![], std::slice::from_ref(&call), None)
-        .unwrap();
-    db.tool_start(turn, &call).unwrap();
-    assert_eq!(
-        db.finish(turn, Some(&Error::new("process_interrupted")))
-            .unwrap()
-            .last()
-            .unwrap()["data"]["status"],
-        "uncertain"
-    );
-    assert!(
-        db.begin(
-            "Bob",
-            "retry",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider
-        )
-        .is_err()
-    );
-    assert_eq!(db.inspect("Bob").unwrap().status, "uncertain");
+fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
+    for family in [Family::Responses, Family::Anthropic] {
+        for error in ["cancelled", "process_interrupted", "provider_failed"] {
+            let mut db = db();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    family,
+                    ..binding()
+                },
+            )
+            .unwrap();
+            let turn = db
+                .begin(
+                    "Bob",
+                    "request",
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let calls = ["executing", "planned"].map(|id| ToolCall {
+                name: "write".into(),
+                call_id: id.into(),
+                arguments: r#"{"path":"file","content":"hello"}"#.into(),
+            });
+            let items = match family {
+                Family::Responses => calls.iter().map(|call| json!({"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>(),
+                Family::Anthropic => vec![json!({"role":"assistant","content":calls.iter().map(|call| json!({"type":"tool_use","id":call.call_id,"name":call.name,"input":{"path":"file","content":"hello"}})).collect::<Vec<_>>()})],
+            };
+            db.append(
+                turn,
+                items
+                    .iter()
+                    .map(|item| serde_json::to_vec(item).unwrap().into())
+                    .collect(),
+                &calls,
+                None,
+            )
+            .unwrap();
+            db.tool_start(turn, &calls[0]).unwrap();
+            let events = db.finish(turn, Some(&Error::new(error))).unwrap();
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0]["data"]["outcome_unknown"], true);
+            assert_eq!(events[1]["data"]["cancelled"], true);
+            let history = stored(&mut db, "Bob");
+            for (entry, expected) in history[history.len() - 2..]
+                .iter()
+                .zip(["tool_outcome_unknown", "cancelled"])
+            {
+                let output = match family {
+                    Family::Responses => &entry["output"],
+                    Family::Anthropic => &entry["content"][0]["content"],
+                };
+                let output: Value = serde_json::from_str(output.as_str().unwrap()).unwrap();
+                assert_eq!(output["error"], expected);
+                if expected == "tool_outcome_unknown" {
+                    assert!(
+                        output["detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("may still be running")
+                    );
+                }
+            }
+            assert_eq!(
+                db.inspect("Bob").unwrap().status,
+                if error == "provider_failed" {
+                    "failed"
+                } else {
+                    "interrupted"
+                }
+            );
+            assert!(
+                db.begin(
+                    "Bob",
+                    "retry",
+                    "inspect before continuing",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider
+                )
+                .unwrap()
+                .fresh
+            );
+        }
+    }
+}
+
+#[test]
+fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
+    for (family, state) in [
+        (Family::Responses, "running"),
+        (Family::Responses, "blocked"),
+        (Family::Responses, "pruned"),
+        (Family::Anthropic, "pruned"),
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-repair-{}-{}-{state}.sqlite",
+            std::process::id(),
+            family.name()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let turn;
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    family,
+                    ..binding()
+                },
+            )
+            .unwrap();
+            turn = db
+                .begin(
+                    "Bob",
+                    "request",
+                    "write",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let call = ToolCall {
+                name: "write".into(),
+                call_id: "c1".into(),
+                arguments: "{}".into(),
+            };
+            // Keep a completed call in the same turn. A pruned migration
+            // must repair only the unanswered suffix, not duplicate results.
+            for id in ["done", "c1"] {
+                let call = ToolCall {
+                    call_id: id.into(),
+                    ..call.clone()
+                };
+                let item = match family {
+                    Family::Responses => {
+                        json!({"type":"function_call","call_id":id,"name":"write","arguments":"{}"})
+                    }
+                    Family::Anthropic => {
+                        json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"write","input":{}}]})
+                    }
+                };
+                db.append(
+                    turn,
+                    vec![serde_json::to_vec(&item).unwrap().into()],
+                    std::slice::from_ref(&call),
+                    None,
+                )
+                .unwrap();
+                db.tool_start(turn, &call).unwrap();
+                if id == "done" {
+                    db.tool_finish(turn, id, &result("written")).unwrap();
+                }
+            }
+        }
+        if state != "running" {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("UPDATE bots SET status='uncertain',running_turn=NULL; UPDATE turns SET status='uncertain'; PRAGMA user_version=19;").unwrap();
+            if state == "pruned" {
+                conn.execute_batch(
+                    "DELETE FROM tools; DELETE FROM events; DELETE FROM retained_turns;",
+                )
+                .unwrap();
+            }
+        }
+        let mut original = None;
+        for _ in 0..2 {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            assert_eq!(db.turn_status("Bob", turn).unwrap(), "interrupted");
+            let history = stored(&mut db, "Bob");
+            assert_eq!(history.len(), 5);
+            let encoded = match family {
+                Family::Responses => &history[4]["output"],
+                Family::Anthropic => &history[4]["content"][0]["content"],
+            };
+            let output: Value = serde_json::from_str(encoded.as_str().unwrap()).unwrap();
+            assert_eq!(output["error"], "tool_outcome_unknown");
+            if let Some(ref original) = original {
+                assert_eq!(&history, original);
+            }
+            original = Some(history);
+        }
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.begin(
+                "Bob",
+                "next",
+                "inspect and continue",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap();
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }
 
 #[test]
@@ -1936,7 +2100,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
 }
 
 #[test]
-fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
+fn ready_turns_wait_for_a_slot_and_survive_interrupted_predecessors() {
     let mut db = db();
     db.create("Alice", Some("/synthetic"), binding()).unwrap();
     let queue = TurnOptions {
@@ -1968,8 +2132,7 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
     );
     db.start(waiting.turn, allow_provider).unwrap();
 
-    // A turn queued behind one that ends uncertain cannot start; it fails
-    // with that reason and its waiters hear it.
+    // An interrupted predecessor closes its planned calls and releases queued work.
     db.create("Carol", Some("/synthetic"), binding()).unwrap();
     let first = db
         .begin(
@@ -1993,18 +2156,14 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
         .unwrap();
     db.finish(first.turn, Some(&Error::new("process_interrupted")))
         .unwrap();
-    assert_eq!(db.inspect("Carol").unwrap().status, "uncertain");
+    assert_eq!(db.inspect("Carol").unwrap().status, "interrupted");
     assert_eq!(db.turn_status("Carol", second.turn).unwrap(), "ready");
-    let error = db.start(second.turn, allow_provider).unwrap_err();
-    assert_eq!(error.code, "tool_outcome_uncertain");
-    let (_, outcome) = db.end_queued(second.turn, &error).unwrap();
-    assert_eq!(outcome["status"], "failed");
-    assert_eq!(outcome["error"], "tool_outcome_uncertain");
-    assert_eq!(
+    db.start(second.turn, allow_provider).unwrap();
+    db.finish(second.turn, None).unwrap();
+    assert!(
         db.begin("Carol", "c3", "again", true, &queue, allow_provider)
-            .unwrap_err()
-            .code,
-        "tool_outcome_uncertain"
+            .unwrap()
+            .fresh
     );
 }
 

@@ -105,8 +105,8 @@ The first Interrogate review is complete. Its four accepted fixes cover canonica
 store ownership, byte-bounded replay, duplicate reconciliation under admission
 pressure, and selected provider-credential filtering for tools. Before expanding
 the protocol, also settle durable/live event alignment, slow-consumer handling,
-store versioning, and total versus idle provider deadlines. Conservative uncertain
-tool outcomes remain explicit; caller-directed resolution is future work.
+store versioning, and total versus idle provider deadlines. Unknown tool
+outcomes are explicit results in history; they never disable the named bot.
 
 The 2026-09-14 slice (daemon, `agent` client, two provider families, file
 tools, per-turn workspace and model, review fixes) is described in
@@ -300,10 +300,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    raise the ratio at the price of less average context; that is item 15's
    call, so the three-quarters rule stays until the quality evaluation
    exists.
-14. Mass interrupt. Interrupting one bot is tested; stopping a thousand at
-   once, how long until their processes are gone and their turns durable, is
-   not. Cancellation latency is on the unmeasured list and matters most for
-   fleets.
+14. An exploratory [mass interrupt screen](DAEMON_MEASUREMENTS.md#mass-interrupt)
+   measured terminal events for a thousand bots in 0.2 s mid-request and
+   0.8 s with shell commands. Repeat with tracked process identities before
+   claiming that every child has stopped. The screen exposed a
+   contract gap: stopped bots refused further work. Cancellation and crash
+   recovery now close unanswered calls with honest results and keep the same
+   named bot usable. Planned calls are cancelled; executing calls without a
+   committed result report `tool_outcome_unknown`, including that execution
+   may still be running. Nothing is automatically retried. Version 20 repairs
+   previously blocked bots once at store open. Automatically continuing
+   crash-interrupted model work remains a separate policy decision; explicit
+   stops must stay stopped.
 15. Make context management accountable for task quality, not only cost. The
    window, the omission note, and the `history` tool answer whether context is
    cheap to build; they do not answer whether the agent finishes correctly

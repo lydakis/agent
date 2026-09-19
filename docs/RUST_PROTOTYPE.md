@@ -111,7 +111,7 @@ Other startup failures return immediately; contention is identified by exit
 status rather than text from the shared daemon log.
 
 A blocking `run` exits 0 when it observes the turn completed, 1 when it fails,
-is interrupted, leaves an uncertain tool outcome, or loses its connection, and
+is interrupted or loses its connection, and
 2 for usage errors. A connection error means the outcome was not observed;
 it does not assert that execution failed or cancel the turn. `--request-id` makes a
 submission idempotent across retries.
@@ -667,8 +667,8 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   with `stale_turn`. `agent run --delivery steer --turn N`. The
   steer-or-queue behavior stays the default.
 
-A queued or ready turn that cannot start when its place comes (the bot's last
-outcome is `uncertain`, its budget is spent) finishes as `failed` with that
+A queued or ready turn that cannot start when its place comes (for example,
+the bot's budget is spent) finishes as `failed` with that
 error, and the next in line takes its place. `interrupt` on a queued or ready
 turn ends it as `interrupted` and answers `queued: true`; interrupting the
 running turn does not touch the line behind it. `delete` refuses a bot with
@@ -710,11 +710,15 @@ committed before execution and the result before continuing the model loop. A
 completed checkpoint and terminal event are committed together before emitting
 completion.
 
-On recovery, unfinished turns are marked interrupted. A planned/executing tool
-without a committed result is conservatively marked uncertain, and further
-submission on that bot is blocked. No external request or tool is automatically
-repeated. The caller can inspect records and fork a known completed checkpoint;
-in-place resolution of uncertain outcomes is not implemented.
+On recovery, unfinished active turns are marked interrupted and their bots
+accept new work. Every unanswered tool call receives a durable result: a
+planned call is cancelled before execution; an executing call with no committed
+result receives `tool_outcome_unknown`. Its effects may already have happened,
+and execution may still be running. The model sees this in history and can
+inspect current state before deciding what to do. The same rule applies to
+explicit cancellation and other terminal failures. Uncertainty never blocks the
+named bot, and no external request or tool is automatically repeated. Existing
+queued work remains eligible to start. Explicitly stopped turns stay stopped.
 
 `resume` restores access to the exact identity and reports its state; it does not
 automatically continue an interrupted network request. A new submission is an
@@ -889,8 +893,11 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 19; supported
-migrations run at open. Store initialization and migration run in one
+the `context_window` capability. Version 20 repairs previously blocked
+`uncertain` bots once, appending missing tool results without rewriting original
+history. If operational tool records were pruned, repair reconstructs unanswered
+calls from the interrupted turn's durable transcript. Stores are schema version
+20; supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -1009,9 +1016,11 @@ retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. Timeout and overflow kill
-the owned process group. Turn cancellation kills that group; an interrupted tool
-without a committed result leaves the bot uncertain rather than repeating
-possible side effects.
+the owned process group. Turn cancellation requests the same kill for a
+foreground shell, but native file I/O or background commands can outlive the
+cancelled turn. Without a committed result the tool outcome is unknown, not a
+claim that all work stopped. The turn ends `interrupted` and the bot stays
+usable; history tells the model to inspect current state before retrying.
 
 `read` returns numbered lines with `offset`/`limit` paging and a 64 KiB result
 bound including paging notices (files up to 4 MiB). If the first requested line
