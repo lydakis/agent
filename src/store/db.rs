@@ -9,10 +9,6 @@ use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering::Relaxed},
-};
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
@@ -63,6 +59,9 @@ pub struct TurnOptions {
     pub workspace: Option<String>,
     pub model: Option<String>,
     pub delivery: Delivery,
+    /// A strict steer: for this running turn or nobody. Never absorbed by
+    /// another turn, never started as new work; `stale_turn` instead.
+    pub expected_turn: Option<i64>,
 }
 /// What a submission does when the bot is busy or the daemon is full.
 /// `Reject` answers `bot_busy` or `active_agent_limit`. `Queue` records the
@@ -91,6 +90,18 @@ impl Delivery {
             Self::Steer => "steer",
         }
     }
+}
+/// What the storage worker hands to the publisher after each job, in commit
+/// order: every durable event committed past its watermark, then the
+/// outcomes of turns that job ended, for their waiters.
+#[derive(Debug)]
+pub enum Publication {
+    Event(Value),
+    Finished {
+        bot: String,
+        turn: i64,
+        outcome: Value,
+    },
 }
 /// Steers a running turn absorbed at a round boundary: their user items are
 /// on the lineage and their rows are finished as `steered`.
@@ -137,10 +148,10 @@ pub struct TurnContext {
 }
 pub struct Database {
     conn: Connection,
-    /// Exact count of queued steer rows, kept by every function that
-    /// changes one, so a running turn's boundary costs one atomic load
-    /// when there is nothing to absorb.
-    queued_steers: Arc<AtomicUsize>,
+    /// Outcomes of turns ended by the current job, published after its
+    /// events. Captured inside the job, so retention in the same job
+    /// cannot remove what a waiter is owed.
+    outcomes: Vec<(String, i64, Value)>,
 }
 
 /// Durable events and their live copies share one shape.
@@ -152,7 +163,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 16;
+    pub const SCHEMA: i32 = 17;
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -207,7 +218,7 @@ impl Database {
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
-                delivery TEXT NOT NULL DEFAULT 'reject',
+                delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
@@ -252,7 +263,7 @@ impl Database {
         )?;
         let mut db = Self {
             conn,
-            queued_steers: Arc::default(),
+            outcomes: Vec::new(),
         };
         // A committed tool intent without a result is never automatically
         // retried. Turns parked on handles keep their state and resume.
@@ -274,17 +285,72 @@ impl Database {
                 GROUP BY t.bot)",
             [],
         )?;
-        let steers: usize = db.conn.query_row(
-            "SELECT COUNT(*) FROM turns WHERE status='queued' AND delivery='steer'",
-            [],
-            |r| r.get::<_, i64>(0).map(|n| n.max(0) as usize),
-        )?;
-        db.queued_steers.store(steers, Relaxed);
         Ok(db)
     }
-    /// Shared with the runtime; see `queued_steers` on the struct.
-    pub fn queued_steers(&self) -> Arc<AtomicUsize> {
-        self.queued_steers.clone()
+    /// The newest committed event id: the publication watermark at open.
+    /// Older events belong to replay, never to live delivery.
+    pub fn last_event_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM events", [], |r| r.get(0))?)
+    }
+    /// A turn's outcome for its waiters, published after this job's events.
+    pub fn announce(&mut self, bot: &str, turn: i64, outcome: Value) {
+        self.outcomes.push((bot.to_owned(), turn, outcome));
+    }
+    /// Hand everything the last job committed to the publisher, in commit
+    /// order: events past the watermark, then announced outcomes. Only
+    /// committed rows are read, so a job that failed mid-transaction
+    /// publishes nothing. Stops early when the sink is gone.
+    pub fn publish_since(
+        &mut self,
+        watermark: &mut i64,
+        mut sink: impl FnMut(Publication) -> bool,
+    ) -> Result<()> {
+        loop {
+            let mut statement = self.conn.prepare_cached(
+                "SELECT id,bot,turn,kind,data FROM events WHERE id>? ORDER BY id LIMIT 256",
+            )?;
+            let mut rows = statement.query([*watermark])?;
+            let mut delivered = 0;
+            while let Some(row) = rows.next()? {
+                let cursor: i64 = row.get(0)?;
+                let data: Value = serde_json::from_str(&row.get::<_, String>(4)?)?;
+                let event = entry(
+                    cursor,
+                    &row.get::<_, String>(1)?,
+                    row.get(2)?,
+                    &row.get::<_, String>(3)?,
+                    data,
+                );
+                *watermark = cursor;
+                delivered += 1;
+                if !sink(Publication::Event(event)) {
+                    self.outcomes.clear();
+                    return Ok(());
+                }
+            }
+            if delivered < 256 {
+                break;
+            }
+        }
+        for (bot, turn, outcome) in self.outcomes.drain(..) {
+            if !sink(Publication::Finished { bot, turn, outcome }) {
+                break;
+            }
+        }
+        self.outcomes.clear();
+        Ok(())
+    }
+    /// Whether a steer is queued for this bot: one indexed existence check,
+    /// answered inside the jobs that start or resume its turn.
+    pub fn steers_waiting(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM turns WHERE bot=? AND status='queued' AND delivery='steer')",
+            )?
+            .query_row([name], |r| r.get(0))?)
     }
 
     fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bot> {
@@ -728,7 +794,7 @@ impl Database {
         let prior: Option<(i64, String, String, TurnOptions)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery FROM turns WHERE bot=? AND request_id=?",
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
                     Ok((
@@ -740,6 +806,7 @@ impl Database {
                             model: r.get(4)?,
                             delivery: Delivery::parse(&r.get::<_, String>(5)?)
                                 .unwrap_or_default(),
+                            expected_turn: r.get(6)?,
                         },
                     ))
                 },
@@ -762,6 +829,13 @@ impl Database {
             return fail("active_agent_limit");
         }
         let bot = self.inspect(name)?;
+        // A strict steer is for one running turn; anything else is stale
+        // before a byte is written.
+        if let Some(expected) = options.expected_turn
+            && (options.delivery != Delivery::Steer || bot.running_turn != Some(expected))
+        {
+            return fail("stale_turn");
+        }
         if let Err(error) = validate(&bot, options.model.as_deref()) {
             // An omitted steer model inherits the active turn for absorption.
             // Only look it up when the default fails validation: ordinary
@@ -821,9 +895,9 @@ impl Database {
             )?
             .query_row([], |r| r.get(0))?;
         tx.prepare_cached(
-            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn) VALUES (?,?,?,?,?,?,?,?,?)",
         )?.execute(
-            params![turn, name, request_id, prompt, status, options.workspace, options.model, options.delivery.name()],
+            params![turn, name, request_id, prompt, status, options.workspace, options.model, options.delivery.name(), options.expected_turn],
         )?;
         tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
             .execute(params![turn, name])?;
@@ -846,9 +920,6 @@ impl Database {
         };
         let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
         tx.commit()?;
-        if status == "queued" && options.delivery == Delivery::Steer {
-            self.queued_steers.fetch_add(1, Relaxed);
-        }
         Ok(Started {
             turn,
             fresh: true,
@@ -857,24 +928,25 @@ impl Database {
         })
     }
     /// Start a queued or ready turn on an idle bot: its user item joins the
-    /// lineage and the bot becomes busy. Returns the durable `accepted` entry.
+    /// lineage and the bot becomes busy. Returns the durable `accepted` entry
+    /// and whether a steer already waits for this bot.
     pub fn start(
         &mut self,
         turn: i64,
         validate: impl FnOnce(&Bot, Option<&str>) -> Result<()>,
-    ) -> Result<Value> {
-        let (name, request_id, prompt, status, workspace, model, delivery): (
+    ) -> Result<(Value, bool)> {
+        let (name, request_id, prompt, status, workspace, model, strict): (
             String,
             String,
             String,
             String,
             Option<String>,
             Option<String>,
-            String,
+            bool,
         ) = self
             .conn
             .query_row(
-                "SELECT bot,request_id,prompt,status,workspace,model,delivery FROM turns WHERE id=?",
+                "SELECT bot,request_id,prompt,status,workspace,model,expected_turn IS NOT NULL FROM turns WHERE id=?",
                 [turn],
                 |r| {
                     Ok((
@@ -893,15 +965,16 @@ impl Database {
         if !matches!(status.as_str(), "queued" | "ready") {
             return fail("stale_turn");
         }
+        if strict {
+            // The turn it was for is over; it must not become new work.
+            return fail("stale_turn");
+        }
         let bot = self.inspect(&name)?;
         if bot.running_turn.is_some() {
             // Back in line behind the bot's work, so the dispatcher never
             // picks the same ready row twice.
             self.conn
                 .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
-            if delivery == "steer" {
-                self.queued_steers.fetch_add(1, Relaxed);
-            }
             return fail("bot_busy");
         }
         if bot.status == "uncertain" {
@@ -920,10 +993,8 @@ impl Database {
         let data = json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
-        if status == "queued" && delivery == "steer" {
-            self.queued_steers.fetch_sub(1, Relaxed);
-        }
-        Ok(entry(cursor, &name, Some(turn), "accepted", data))
+        let steers = self.steers_waiting(&name)?;
+        Ok((entry(cursor, &name, Some(turn), "accepted", data), steers))
     }
     /// An idle bot's line has exactly one ready head, including after recovery.
     /// Only inspect that head; running/parked bots are checked by the caller.
@@ -952,13 +1023,11 @@ impl Database {
     /// End a turn that never started. A ready turn's place goes to the bot's
     /// next queued one.
     pub fn end_queued(&mut self, turn: i64, error: &Error) -> Result<(Vec<Value>, Value)> {
-        let (name, status, delivery): (String, String, String) = self
+        let (name, status): (String, String) = self
             .conn
-            .query_row(
-                "SELECT bot,status,delivery FROM turns WHERE id=?",
-                [turn],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?
             .ok_or(Error::new("turn_not_found"))?;
         if !matches!(status.as_str(), "queued" | "ready") {
@@ -974,18 +1043,16 @@ impl Database {
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
             params![ended, epoch_ms(), turn],
         )?;
-        let promoted_steer = status == "ready" && promote(&tx, &name)?;
+        if status == "ready" {
+            promote(&tx, &name)?;
+        }
         let data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
         let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
-        let left =
-            usize::from(status == "queued" && delivery == "steer") + usize::from(promoted_steer);
-        if left > 0 {
-            self.queued_steers.fetch_sub(left, Relaxed);
-        }
         let outcome = self
             .turn_outcome(&name, turn)?
             .ok_or_else(|| Error::new("stale_turn"))?;
+        self.announce(&name, turn, outcome.clone());
         Ok((
             vec![entry(cursor, &name, Some(turn), "turn_finished", data)],
             outcome,
@@ -1016,6 +1083,7 @@ impl Database {
                     AND (s.model IS NULL OR s.model=COALESCE(t.model,b.provider||'/'||b.model))
                  FROM turns s JOIN turns t ON t.id=?2 JOIN bots b ON b.name=s.bot
                  WHERE s.bot=?1 AND s.status='queued' AND s.delivery='steer' AND s.id<=?4
+                   AND (s.expected_turn IS NULL OR s.expected_turn=?2)
                  ORDER BY s.id LIMIT ?3",
             )?;
             let mut rows =
@@ -1073,11 +1141,11 @@ impl Database {
             params![head, bot.name],
         )?;
         tx.commit()?;
-        self.queued_steers.fetch_sub(steered.len(), Relaxed);
         for steer in steered {
             let outcome = self
                 .turn_outcome(&bot.name, steer)?
                 .ok_or_else(|| Error::new("stale_turn"))?;
+            self.announce(&bot.name, steer, outcome.clone());
             absorbed.outcomes.push((steer, outcome));
         }
         Ok(absorbed)
@@ -1270,7 +1338,7 @@ impl Database {
             "UPDATE bots SET head=?,running_turn=NULL,status=? WHERE name=?",
             params![head, status, bot.name],
         )?;
-        let promoted_steer = promote(&tx, &bot.name)?;
+        promote(&tx, &bot.name)?;
         if status == "completed" {
             tx.execute(
                 "INSERT INTO checkpoints VALUES (?,?)",
@@ -1281,9 +1349,6 @@ impl Database {
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
-        if promoted_steer {
-            self.queued_steers.fetch_sub(1, Relaxed);
-        }
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
         Ok(entries)
     }
@@ -1365,8 +1430,9 @@ impl Database {
             .query_row(params![name, turn], |r| r.get(0))?)
     }
 
-    /// Bring a parked turn back to running; the caller then records the wait result.
-    pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value)> {
+    /// Bring a parked turn back to running; the caller then records the wait
+    /// result. Also answers whether a steer queued while it was parked.
+    pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value, bool)> {
         let waiting = self.waiting(turn)?.ok_or(Error::new("turn_not_waiting"))?;
         let bot = self.active(turn)?;
         if bot.status != "waiting" {
@@ -1381,9 +1447,11 @@ impl Database {
         let data = json!({"call_id":waiting.call_id});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_resumed", data.clone())?;
         tx.commit()?;
+        let steers = self.steers_waiting(&bot.name)?;
         Ok((
             waiting,
             entry(cursor, &bot.name, Some(turn), "turn_resumed", data),
+            steers,
         ))
     }
     /// A finished turn's outcome for a waiter: terminal status, error, and the
@@ -1768,6 +1836,17 @@ impl Database {
     /// and the turn rows themselves stay: retention here bounds what replay
     /// and tool retrieval keep, never what the model said.
     pub fn prune(&mut self, name: &str, keep_turns: usize) -> Result<Value> {
+        self.prune_except(name, keep_turns, None)
+    }
+    /// Retention as part of a completion: the turn ending in this job keeps
+    /// its records, so its terminal event is published and replayable until
+    /// the next pass. Live delivery is what the store holds, never more.
+    pub fn prune_except(
+        &mut self,
+        name: &str,
+        keep_turns: usize,
+        protect: Option<i64>,
+    ) -> Result<Value> {
         // Retention only needs identity, not a copy of instructions and binding.
         if !self.exists(name)? {
             return fail("bot_not_found");
@@ -1807,27 +1886,27 @@ impl Database {
             };
             tx.prepare_cached(&format!(
                 "DELETE FROM {table} WHERE turn IN
-                 (SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2)
+                 (SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)
                  {finished}"
             ))?
-            .execute(params![name, floor])?;
+            .execute(params![name, floor, protect])?;
         }
         let cursor: Option<i64> = tx.query_row(
-            "SELECT MAX(id) FROM events WHERE bot=? AND turn<?",
-            params![name, floor],
+            "SELECT MAX(id) FROM events WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3",
+            params![name, floor, protect],
             |r| r.get(0),
         )?;
         let events = tx.execute(
-            "DELETE FROM events WHERE bot=? AND turn<?",
-            params![name, floor],
+            "DELETE FROM events WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3",
+            params![name, floor, protect],
         )?;
         // Keep pending background results discoverable by later prunes, even
         // after their launching turn's events and tool records are gone.
         tx.prepare_cached(
-            "DELETE FROM retained_turns WHERE bot=?1 AND turn<?2
+            "DELETE FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3
              AND NOT EXISTS(SELECT 1 FROM processes WHERE turn=retained_turns.turn AND status='running')",
         )?
-        .execute(params![name, floor])?;
+        .execute(params![name, floor, protect])?;
         if let Some(cursor) = cursor {
             tx.prepare_cached(
                 "UPDATE event_retention SET pruned_cursor=? WHERE singleton=1 AND pruned_cursor<?",
@@ -2209,6 +2288,17 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     "ALTER TABLE turns ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
                 ))?;
             }
+        }
+    }
+    if from < 17 {
+        // 16 -> 17: strict steers name the turn they are for.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='expected_turn')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch("ALTER TABLE turns ADD COLUMN expected_turn INTEGER;")?;
         }
     }
     if from < 16 {

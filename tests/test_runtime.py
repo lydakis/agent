@@ -24,6 +24,13 @@ class Model(http.server.BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             self.server.requests.put(request)
+            if hasattr(self.server, 'request_gates'):
+                try:
+                    gate = self.server.request_gates.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    gate.wait(timeout=5)
             if hasattr(self.server, 'expected_authorization'):
                 self.server.auth_checks.append(self.headers.get('Authorization') == self.server.expected_authorization)
             assert self.path == '/v1/responses'
@@ -80,7 +87,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 command = user.split(':', 1)[1]
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'bg-1',
-                           'arguments': json.dumps({'command': command, 'timeout_ms': 5000, 'background': True})}]
+                           'arguments': json.dumps({'command': command,
+                               'timeout_ms': getattr(self.server, 'background_timeout_ms', 5000), 'background': True})}]
             elif user.startswith('readart:'):
                 text = ''
                 reference, _, rest = user[8:].partition(' ')
@@ -351,6 +359,26 @@ class ModelFixture(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
+    def test_stdio_shutdown_with_background_work_releases_publisher_and_store(self):
+        self.model.background_timeout_ms = 30000
+        client = self.client('shell')
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='background',
+                              prompt='bg:sleep 30')['result']['turn']
+        terminal = client.finished(turn)
+        self.assertEqual(terminal['data']['status'], 'completed')
+        self.assertEqual(client.request('stats')['result']['running_processes'], 1)
+        # The background result task still owns a Store clone. Keep stdin
+        # open and stdout draining: shutdown must release its publisher even
+        # though that clone keeps the publication channel open.
+        self.assertTrue(client.request('shutdown')['result']['shutting_down'])
+        self.assertEqual(client.process.wait(timeout=8), 0)
+        restarted = self.client('shell')
+        replay = restarted.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual(next(e for e in replay if e['event'] == 'turn_finished')['data'], terminal['data'])
+        self.assertEqual(restarted.request('stats')['result']['running_processes'], 0)
+
     def test_stdio_shutdown_exits_and_releases_store_without_stdin_eof(self):
         client = self.client()
         self.addCleanup(lambda: client.close(kill=True))

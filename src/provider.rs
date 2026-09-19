@@ -386,9 +386,11 @@ impl Provider {
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        // Pace first: the provider's allowance is the scarce resource, and
-        // the estimate is what the request will bill at most, corrected by
-        // the usage the response reports.
+        // Pace first: the provider's allowance is the scarce resource. The
+        // estimate is input bytes over four plus the output cap, or 512 when
+        // none is configured; that is an estimate to reserve against, not a
+        // ceiling on what the provider generates or bills, and the usage the
+        // response reports corrects it.
         let pace = self.pools.get(request.model);
         let prefix = self.prefix(&request)?;
         let estimate = ((prefix.len() + request.items.bytes) / 4) as u64

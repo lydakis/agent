@@ -130,6 +130,15 @@ class SocketAndCliTests(ModelFixture):
         self.assertRegex(steered.stderr, r'steered into turn|completed')
         done = json.loads(self.agent('wait', '--store', str(self.store), queued['handle']).stdout)
         self.assertEqual(done['results'][queued['handle']]['text'], 'reply:second')
+        busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
+        strict = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
+                                       '--delivery', 'steer', '--turn', str(busy['turn']), 'now').stdout)
+        self.assertEqual(strict['status'], 'queued')
+        stale = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
+                           '--delivery', 'steer', '--turn', str(busy['turn'] + 50), 'never', check=False)
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn('stale_turn', stale.stderr + stale.stdout)
+        self.agent('wait', '--store', str(self.store), busy['handle'])
         usage = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery', 'later', 'x', check=False)
         self.assertEqual(usage.returncode, 1)
         self.assertIn('invalid_delivery', usage.stderr + usage.stdout)

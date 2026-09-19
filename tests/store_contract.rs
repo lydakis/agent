@@ -8,7 +8,6 @@ use agent_runtime::{
 use bytes::Bytes;
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use std::sync::atomic::Ordering;
 
 // These tests isolate store contracts; runtime tests cover provider admission.
 fn allow_provider(_: &Bot, _: Option<&str>) -> Result<()> {
@@ -110,6 +109,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         workspace: Some("/synthetic/alternative".into()),
         model: None,
         delivery: Delivery::Reject,
+        expected_turn: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -476,6 +476,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         workspace: Some("/synthetic/elsewhere".into()),
         model: Some("openai/other-model".into()),
         delivery: Delivery::Reject,
+        expected_turn: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -546,6 +547,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         workspace: Some("/synthetic/today".into()),
         model: None,
         delivery: Delivery::Reject,
+        expected_turn: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -835,6 +837,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 workspace: Some("/synthetic/b".into()),
                 model: None,
                 delivery: Delivery::Reject,
+                expected_turn: None,
             },
             allow_provider,
         )
@@ -1755,8 +1758,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
         .begin("Bob", "r3", "third", true, &steer, allow_provider)
         .unwrap();
     assert_eq!(third.status, "queued");
-    let steers = db.queued_steers();
-    assert_eq!(steers.load(Ordering::Relaxed), 1);
+    assert!(db.steers_waiting("Bob").unwrap());
     assert_eq!(
         db.begin(
             "Bob",
@@ -1791,7 +1793,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
         .map(|e| e["event"].as_str().unwrap())
         .collect();
     assert_eq!(kinds, ["turn_finished", "steered"]);
-    assert_eq!(steers.load(Ordering::Relaxed), 0);
+    assert!(!db.steers_waiting("Bob").unwrap());
     let items = stored(&mut db, "Bob");
     assert_eq!(items.len(), 2);
     assert_eq!(items[1]["content"][0]["text"], "third");
@@ -1806,7 +1808,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "ready");
     assert_eq!(db.next_ready().unwrap(), Some(("Bob".into(), second.turn)));
     assert_eq!(db.delete_bot("Bob").unwrap_err().code, "bot_busy");
-    let accepted = db.start(second.turn, allow_provider).unwrap();
+    let (accepted, _) = db.start(second.turn, allow_provider).unwrap();
     assert_eq!(accepted["event"], "accepted");
     assert_eq!(db.inspect("Bob").unwrap().running_turn, Some(second.turn));
     assert_eq!(db.next_ready().unwrap(), None);
@@ -1826,14 +1828,14 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
         .begin("Bob", "r5", "fifth", false, &queue, allow_provider)
         .unwrap();
     assert_eq!((fourth.status, fifth.status), ("queued", "queued"));
-    assert_eq!(steers.load(Ordering::Relaxed), 1);
+    assert!(db.steers_waiting("Bob").unwrap());
     db.append(second.turn, vec![assistant("done")], &[], None)
         .unwrap();
     db.finish(second.turn, None).unwrap();
     // The steer at the head of the line is promoted, so it is no longer
     // absorbable and leaves the count.
     assert_eq!(db.turn_status("Bob", fourth.turn).unwrap(), "ready");
-    assert_eq!(steers.load(Ordering::Relaxed), 0);
+    assert!(!db.steers_waiting("Bob").unwrap());
     let (entries, outcome) = db
         .end_queued(fourth.turn, &Error::new("cancelled"))
         .unwrap();
@@ -2118,7 +2120,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         [matched]
     );
     assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
-    assert_eq!(db.queued_steers().load(Ordering::Relaxed), 3);
+    assert!(db.steers_waiting("Bob").unwrap());
     db.finish(first, None).unwrap();
     db.start(moved, allow_provider).unwrap();
     assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
@@ -2127,7 +2129,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(changed, allow_provider).unwrap();
     assert_eq!(db.context(changed).unwrap().model, "openai/other");
     assert_eq!(db.absorb(changed, None).unwrap().outcomes[0].0, inherited);
-    assert_eq!(db.queued_steers().load(Ordering::Relaxed), 0);
+    assert!(!db.steers_waiting("Bob").unwrap());
 }
 
 #[test]
@@ -2180,10 +2182,7 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
                         .turn,
                 );
             }
-            assert_eq!(
-                db.queued_steers().load(Ordering::Relaxed),
-                count - seen.len() + 1
-            );
+            assert!(db.steers_waiting("Bob").unwrap());
         }
         assert!(through.is_none());
         assert_eq!(seen, submitted);
@@ -2191,4 +2190,209 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         assert_eq!(db.absorb(first, None).unwrap().outcomes[0].0, late.unwrap());
         assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
     }
+}
+
+#[test]
+fn the_worker_publishes_only_what_committed_in_commit_order() {
+    use agent_runtime::store::Publication;
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.create("Alice", Some("/synthetic"), binding()).unwrap();
+    let mut watermark = 0;
+    let mut seen = Vec::new();
+    db.publish_since(&mut watermark, |p| {
+        seen.push(p);
+        true
+    })
+    .unwrap();
+    assert!(watermark > 0);
+    let kinds: Vec<&str> = seen
+        .iter()
+        .map(|p| match p {
+            Publication::Event(e) => e["event"].as_str().unwrap(),
+            Publication::Finished { .. } => "finished",
+        })
+        .collect();
+    assert_eq!(kinds, ["created", "created"]);
+    // Nothing new: nothing published, watermark unchanged.
+    let before = watermark;
+    let mut none = 0;
+    db.publish_since(&mut watermark, |_| {
+        none += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!((none, watermark), (0, before));
+    // A job that fails after inserting an event leaves nothing to publish:
+    // only committed rows are read.
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let first = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    assert!(
+        db.begin("Bob", "r2", "more", true, &queue, |_, _| Err(Error::new(
+            "provider_unavailable"
+        )))
+        .is_err()
+    );
+    let mut cursors = Vec::new();
+    db.publish_since(&mut watermark, |p| {
+        if let Publication::Event(e) = p {
+            cursors.push(e["cursor"].as_i64().unwrap());
+        }
+        true
+    })
+    .unwrap();
+    assert_eq!(
+        cursors.len(),
+        1,
+        "the accepted event, and no trace of the refused submission"
+    );
+    // A finished turn publishes its events, then its outcome for waiters,
+    // and a sink that stops reading stops publication without losing the
+    // watermark's meaning.
+    db.append(first.turn, vec![assistant("done")], &[], None)
+        .unwrap();
+    db.finish(first.turn, None).unwrap();
+    db.announce("Bob", first.turn, json!({"status":"completed"}));
+    let mut order = Vec::new();
+    db.publish_since(&mut watermark, |p| {
+        order.push(match p {
+            Publication::Event(e) => e["event"].as_str().unwrap().to_owned(),
+            Publication::Finished { turn, .. } => format!("finished:{turn}"),
+        });
+        true
+    })
+    .unwrap();
+    assert_eq!(
+        order,
+        [
+            "message",
+            "turn_finished",
+            format!("finished:{}", first.turn).as_str()
+        ]
+    );
+    assert_eq!(watermark, db.last_event_id().unwrap());
+}
+
+#[test]
+fn strict_steers_are_for_one_running_turn_or_nobody() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let first = db
+        .begin(
+            "Bob",
+            "r1",
+            "first",
+            true,
+            &TurnOptions::default(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    let strict = |turn| TurnOptions {
+        delivery: Delivery::Steer,
+        expected_turn: Some(turn),
+        ..TurnOptions::default()
+    };
+    // The wrong turn, or the wrong mode, is stale before anything is written.
+    assert_eq!(
+        db.begin("Bob", "s0", "no", true, &strict(first.turn + 1), |_, _| Ok(
+            ()
+        ))
+        .unwrap_err()
+        .code,
+        "stale_turn"
+    );
+    let wrong_mode = TurnOptions {
+        delivery: Delivery::Queue,
+        expected_turn: Some(first.turn),
+        ..TurnOptions::default()
+    };
+    assert_eq!(
+        db.begin("Bob", "s0", "no", true, &wrong_mode, |_, _| Ok(()))
+            .unwrap_err()
+            .code,
+        "stale_turn"
+    );
+    assert_eq!(
+        db.turns("Bob", 0, 10).unwrap()["turns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // The right turn absorbs it like any steer.
+    let hit = db
+        .begin(
+            "Bob",
+            "s1",
+            "correction",
+            true,
+            &strict(first.turn),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(hit.status, "queued");
+    let absorbed = db.absorb(first.turn, None).unwrap();
+    assert_eq!(absorbed.outcomes[0].0, hit.turn);
+    // One that misses its boundary is never absorbed by the next turn and
+    // never starts as new work.
+    let late = db
+        .begin(
+            "Bob",
+            "s2",
+            "too late",
+            true,
+            &strict(first.turn),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    let plain = db
+        .begin(
+            "Bob",
+            "r2",
+            "next",
+            true,
+            &TurnOptions {
+                delivery: Delivery::Queue,
+                ..TurnOptions::default()
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    db.append(first.turn, vec![assistant("done")], &[], None)
+        .unwrap();
+    db.finish(first.turn, None).unwrap();
+    // The strict steer is the head of the line and cannot start.
+    assert_eq!(db.turn_status("Bob", late.turn).unwrap(), "ready");
+    assert_eq!(
+        db.start(late.turn, |_, _| Ok(())).unwrap_err().code,
+        "stale_turn"
+    );
+    let (_, outcome) = db.end_queued(late.turn, &Error::new("stale_turn")).unwrap();
+    assert_eq!(
+        (outcome["status"].as_str(), outcome["error"].as_str()),
+        (Some("failed"), Some("stale_turn"))
+    );
+    db.start(plain.turn, |_, _| Ok(())).unwrap();
+    // A strict steer for the finished turn is not absorbed by the running one.
+    assert_eq!(
+        db.begin("Bob", "s3", "stale", true, &strict(first.turn), |_, _| Ok(
+            ()
+        ))
+        .unwrap_err()
+        .code,
+        "stale_turn"
+    );
+    assert!(db.absorb(plain.turn, None).unwrap().outcomes.is_empty());
 }

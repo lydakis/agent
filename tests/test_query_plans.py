@@ -18,10 +18,10 @@ class QueryPlanTests(unittest.TestCase):
             with self.subTest(table=table):
                 self.assertIn(f'DELETE FROM {table} WHERE turn IN (SELECT id FROM turns WHERE bot=?)', queries)
                 prune = (f'DELETE FROM {table} WHERE turn IN '
-                         '(SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2)')
+                         '(SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)')
                 self.assertIn(prune + (" AND status!='running'" if table == 'processes' else ''), queries)
         self.assertNotIn('DELETE FROM processes WHERE turn IN '
-                         '(SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2)', queries)
+                         '(SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)', queries)
 
     def test_current_schema_passes_and_missing_indexes_fail(self):
         root = Path(__file__).resolve().parent.parent

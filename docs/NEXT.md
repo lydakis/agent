@@ -358,42 +358,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     check was made one atomic load on the per-turn path, and the client-side
     configuration check moved nothing on it; both were confirmed by the
     screen, not assumed.
-21. Publish durable events in commit order. Before everything else below.
-    The hub advances a follower's watermark on each durable delivery and
-    drops anything at or below it, but tasks publish after their own store
-    await, so nothing guarantees publication in commit order: in socket
-    mode it holds because the worker completes jobs in order and a task
-    does not yield between its entries; in stdio mode the firehose send
-    yields per entry, so one task's two-entry batch can be split by
-    another task's later entry and the second entry is dropped, on the
-    live path and on reconnect alike. Make the storage worker the single
-    publisher: after each job it reads the events committed past its
-    watermark, in id order, and hands them with any turn outcomes to one
-    publisher task; tasks and the service stop publishing durable entries
-    and stop resolving waiters themselves. Rollback safety comes free,
-    since only committed rows are read. Then the cursor filter only ever
-    drops true duplicates, the absorbing turn's cancellation guard is
-    unnecessary because a committed batch is published whether or not its
-    task lives, and a follower's greatest cursor is a complete resume
-    watermark. Regression: a mixed live workload, including queued
-    submissions on a running bot, whose `*` follower receives strictly
-    increasing cursors equal to the replay, and a store test that a job
-    failing after inserting events publishes nothing. (From the second
-    Astra Pro review.)
-22. Per-bot steer hint. `steers_queued` is one counter for the whole
-    store, so one parked bot with a queued steer makes every other running
-    turn pay a storage hop at each boundary. Give each live turn one
-    atomic flag, set by a steer submission for that bot and by spawn when
-    the store's count is nonzero, cleared by the boundary before it reads;
-    idle bots hold nothing. Screen: one parked bot with a pending steer
-    while the fleet does ordinary work, against the no-steer baseline.
-23. Strict steering. `submit` takes an optional `expected_turn` with
-    `steer`: the message is for that running turn or nobody. A different
-    or finished turn answers `stale_turn` with nothing written; a strict
-    steer that misses its last boundary ends as `stale_turn` when its
-    place in the line comes instead of becoming new work, and the running
-    turn only absorbs strict steers addressed to it. `agent run --delivery
-    steer --turn N`. The steer-or-queue behavior stays the default.
+21. Done: durable events are published by the storage worker in commit
+    order, through one publisher, with turn outcomes for waiters behind
+    the events that end them. Tasks and the service no longer publish or
+    resolve waiters, the absorbing turn's cancellation guard is gone, and
+    a `*` follower's cursors rise strictly and equal the replay. (From the
+    second Astra Pro review.)
+22. Done: each live turn carries its own steer flag; a boundary with
+    nothing waiting is one atomic swap, and one bot's pending steer costs
+    unrelated bots nothing.
+23. Done: strict steering with `expected_turn`, `agent run --delivery
+    steer --turn N`.
 24. Provider pacing must not hold active slots. A turn waiting in a
     closed pacing gate keeps its slot in `--max-active`, so at small
     limits a throttled provider can keep a healthy one from starting.

@@ -411,6 +411,13 @@ number of Unix-socket sessions, and runs until `shutdown`, SIGTERM, or SIGINT.
 Each socket session begins with a `ready` line and must `follow` the bots it
 wants to observe.
 
+On shutdown, committed turn events get up to five seconds to drain through
+the publisher. Background commands can keep the storage stream open; when
+that deadline expires, the service cancels and awaits the publisher before
+joining the stdout writer. A still-running background command therefore
+cannot keep shutdown waiting for the stream to close. Committed events
+remain available through replay if the drain deadline is reached.
+
 ```sh
 .local/target/release/agent serve \
   --store .local/runtime/state.sqlite --socket .local/runtime/state.sqlite.sock \
@@ -421,7 +428,15 @@ wants to observe.
 Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
-`data`, in exactly the shape `events` replays them. Example requests:
+`data`, in exactly the shape `events` replays them. Durable events reach
+followers in commit order: the storage worker itself hands each job's
+committed events, and the outcomes of turns the job ended, to one publisher
+before taking the next job. Tasks never publish durable events, so a
+follower's cursors only rise, its greatest cursor is a complete resume
+point, and a committed batch is delivered whether or not the task that
+asked for it was cancelled meanwhile. Wait answers follow the terminal event
+they report. Live `text_delta` and `thinking_delta` notifications keep their
+own path from the turn. Example requests:
 
 ```json
 {"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low"}
@@ -601,8 +616,19 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   batch's commit, event publication, and waiter notifications before stopping;
   it does not drain further batches. Unabsorbed work stays durable.
   A partial queued-steer index keeps ordinary queued work out of the scan.
-  The store keeps an exact count of queued steers, so a boundary with
-  nothing to absorb costs one atomic load and no storage round trip.
+  Each live turn carries one flag, set when a steer is queued for its bot
+  or queued cancellation can expose steers behind a blocker, and answered
+  exactly by the job that starts or resumes the turn, cleared
+  by the boundary before it reads; a boundary with nothing waiting costs
+  one atomic swap and no storage round trip, and one bot's pending steer
+  costs unrelated bots nothing.
+- strict steering: `expected_turn` with `steer` says the message is for
+  that running turn or nobody. A different or finished turn, or an idle
+  bot, answers `stale_turn` with nothing written. A strict steer that
+  misses its last boundary is never absorbed by a later turn and never
+  starts as new work: when its place in the line comes it ends as `failed`
+  with `stale_turn`. `agent run --delivery steer --turn N`. The
+  steer-or-queue behavior stays the default.
 
 A queued or ready turn that cannot start when its place comes (the bot's last
 outcome is `uncertain`, its budget is spent) finishes as `failed` with that
@@ -822,6 +848,10 @@ needs, and one optional policy composes them:
   submission ID. It drops older events, tool intents, finished processes, and artifacts.
   Queuing new work or cancelling a later queued turn cannot prune a live
   turn's tool intents or move retention past work that has not finished.
+  A completion's own retention pass never removes that turn's records:
+  the storage worker publishes what the store holds after the job, so the
+  terminal event stays published and replayable until the next pass, at
+  most one turn beyond `keep_turns` per bot.
   Running process rows survive so their results can commit; a later prune
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the

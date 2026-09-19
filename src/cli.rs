@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -134,7 +134,10 @@ fn print_flags(flags: &str) {
             "--source" => ("NAME", "Select the bot to fork"),
             "--checkpoint" => ("NODE", "Fork at this history node; default: current head"),
             "--after" => ("ID", "Start after this event cursor or turn ID"),
-            "--turn" => ("ID", "Select a turn"),
+            "--turn" => (
+                "ID",
+                "Select a turn; with run --delivery steer, the turn to steer",
+            ),
             "--new" => ("", "Create a new bot instead of continuing a named bot"),
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
             "--delivery" => (

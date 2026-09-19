@@ -9,7 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 
 mod db;
 pub use db::{
-    Absorbed, Binding, Bot, Database, Delivery, Started, TurnContext, TurnOptions, Waiting, Window,
+    Absorbed, Binding, Bot, Database, Delivery, Publication, Started, TurnContext, TurnOptions,
+    Waiting, Window,
 };
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
@@ -27,7 +28,6 @@ pub struct Store {
     sender: mpsc::Sender<Job>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
-    queued_steers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -37,15 +37,14 @@ impl From<rusqlite::Error> for Error {
 }
 
 impl Store {
-    /// Whether any bot has a steer queued, without a storage round trip.
-    pub fn steers_queued(&self) -> bool {
-        self.queued_steers
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-    }
-    pub async fn open(path: &Path) -> Result<Self> {
+    /// Open the store and its publication stream. The worker publishes
+    /// what each job committed, in commit order, before taking the next
+    /// job; the stream is bounded, so a publisher that stops reading
+    /// eventually holds the worker, never memory.
+    pub async fn open(path: &Path) -> Result<(Self, mpsc::Receiver<Publication>)> {
         let path = path.to_path_buf();
         let (sender, mut receiver) = mpsc::channel::<Job>(32);
+        let (publisher, publications) = mpsc::channel::<Publication>(1024);
         let (ready, opened) = oneshot::channel();
         std::thread::Builder::new()
             .name("agent-storage".into())
@@ -100,9 +99,21 @@ impl Store {
                 })();
                 match opened {
                     Ok((mut db, _lock, path)) => {
-                        let _ = ready.send(Ok((path, db.queued_steers())));
+                        let mut watermark = match db.last_event_id() {
+                            Ok(id) => id,
+                            Err(error) => {
+                                let _ = ready.send(Err(error));
+                                return;
+                            }
+                        };
+                        let _ = ready.send(Ok(path));
                         while let Some(job) = receiver.blocking_recv() {
                             job(&mut db);
+                            // A storage error here has no caller to answer;
+                            // the next job's read reports it.
+                            let _ = db.publish_since(&mut watermark, |publication| {
+                                publisher.blocking_send(publication).is_ok()
+                            });
                         }
                     }
                     Err(error) => {
@@ -110,15 +121,17 @@ impl Store {
                     }
                 }
             })?;
-        let (store_path, queued_steers) = opened
+        let store_path = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
-        Ok(Self {
-            queued_steers,
-            sender,
-            path: std::sync::Arc::new(store_path),
-            counters: std::sync::Arc::default(),
-        })
+        Ok((
+            Self {
+                sender,
+                path: std::sync::Arc::new(store_path),
+                counters: std::sync::Arc::default(),
+            },
+            publications,
+        ))
     }
 
     /// Worker counters and on-disk size, for `stats`.

@@ -634,7 +634,7 @@ fn run(options: &Options) -> Result<i32> {
         "submit",
         json!({"bot":bot,"request_id":request_id,"prompt":prompt,"workspace":workspace,
             "model":if created { Value::Null } else { json!(options.model) },
-            "delivery":options.delivery}),
+            "delivery":options.delivery,"expected_turn":options.turn}),
     )?;
     if options.detach {
         print_json(&submitted, options.pretty)?;

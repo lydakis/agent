@@ -1697,3 +1697,134 @@ model, an idle bot, and cancellation that forces separate execution without
 history mutation. Captures and scripts are in ignored `.local/inherited-steer-fix/`:
 `runtime-results.json`, `repeat-results.json`, `cold-results.json`, and their
 measurement scripts; the `inline` series in the final comparison is retained.
+
+## Commit-ordered publication, per-bot steer flag, strict steering
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. Compared the committed tree `8bd5fd5b…` (rebuilt from a worktree)
+with the slice binary `c35037ce…`, back to back. The storage worker now
+publishes each job's committed events, and the outcomes of turns the job
+ended, to one publisher before taking the next job; tasks and the service
+publish nothing durable and resolve no waiters. Per job that is one indexed
+read past the watermark (empty for most jobs) and, per event, one JSON parse
+and one bounded channel send; the task-side entry publishing it replaces is
+gone, as is the absorbing turn's cancellation guard. Each live turn carries
+its own steer flag, answered by the job that starts or resumes it. A
+completion's retention pass keeps that turn's own records.
+
+The 32-agent socket echo workload as before, one excluded warmup and four
+measured runs per binary:
+
+| Metric | Committed tree | This slice |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.75 (17.70–17.81) | 17.92 (17.70–18.20) |
+| Observed target CPU, seconds | 0.332 (0.327–0.346) | 0.344 (0.331–0.351) |
+| Per-run p95 turn latency, ms | 627.3 (618.1–651.2) | 621.7 (618.9–631.9) |
+
+CPU is up 3.6% at the median with overlapping ranges; p95 and RSS are within
+noise. The read-back per job is the candidate if that difference holds up on
+a quieter host; it is not attributed here.
+
+The one-parked-bot screen (ignored `.local/steer-hint/bench.py`): 48 bots run
+ten two-round `shell` turns each against the instant synthetic model, with
+and without one further bot parked on a held peer and holding a queued
+steer. Daemon CPU and storage jobs span the 480 turns; three alternating
+pairs after one warmup, medians:
+
+| Binary | Case | Daemon CPU, s | Storage jobs | Wall, s |
+| --- | --- | ---: | ---: | ---: |
+| Committed tree | no steer | 0.875 | 6,564 | 0.677 |
+| Committed tree | one parked steer | 0.890 | 7,993 | 0.698 |
+| This slice | no steer | 0.894 | 6,551 | 0.690 |
+| This slice | one parked steer | 0.901 | 6,561 | 0.698 |
+
+On the committed tree one bot's pending steer added about 1,430 storage
+jobs to 480 unrelated turns, three per two-round turn, exactly the boundary
+checks its global flag forced. On the slice the parked bot adds its own ten
+jobs and nothing else. Captures: `.local/bench/slice-prev3-socket-32/`,
+`slice-order-socket-32/`, and `.local/steer-hint/{prev,new}.json`.
+
+Validation: 76 Rust tests, strict Clippy, formatting, and 144 Python tests.
+New regressions: a store test that the worker publishes only committed rows
+in commit order with outcomes after the events that end their turns; a
+cancellation test where every committed steer batch is published and its
+waiters answered although the task was cancelled, in rising cursor order,
+exactly once; a daemon test where the firehose over eight bots with queued
+and steered work receives strictly rising cursors equal to the replay;
+strict-steer tests at store, protocol, and CLI level; and the two retention
+tests adjusted for a completion keeping its own records.
+
+### Bounded publisher shutdown
+
+Observed 2026-09-18 on the same Darwin arm64 host, external power, Rust
+1.98.0. A background result task can retain the store after shutdown drops
+the service. The publication stream then stays open; timing out an owned
+publisher task handle detached it and left its stdout sender alive. Joining
+the writer blocked the current-thread runtime indefinitely. Shutdown now
+borrows that handle during the existing five-second drain and, on timeout,
+cancels and awaits the publisher before joining stdout. The fix adds no
+normal-turn queries, messages, allocations, or processing branches.
+
+Compared the pre-fix binary `c35037ce…` with `af3c5811…`: one excluded
+warmup each and four alternating measured pairs of the 32-agent socket echo
+lifecycle workload, 96 completed turns and 192 synthetic provider requests
+per run. SQLite FULL durability, follower/replay equality, restart, resume,
+item retrieval, duplicate reconciliation, and historical forks were checked.
+The Python controller/provider are outside the target accounting; these
+figures do not measure Rust CLI invocation costs or background shutdown time.
+
+| Metric | Before fix | After fix |
+| --- | ---: | ---: |
+| Sampled peak daemon RSS, MiB | 17.84 (17.83–17.94) | 17.66 (17.62–17.75) |
+| Observed target CPU, seconds | 0.344 (0.340–0.357) | 0.334 (0.314–0.356) |
+| Per-run p95 turn latency, ms | 629.0 (618.8–645.9) | 621.9 (620.0–623.1) |
+
+No regression observed in this screen. CPU and latency ranges overlap;
+these small samples do not establish a general speedup. Captures and the
+paired driver are in ignored `.local/publisher-shutdown-fix/`.
+
+The new regression starts a 30-second background command, keeps stdin open
+and stdout draining, then shuts down. The baseline exceeded its eight-second
+exit deadline; the fixed binary exits within it, releases the store for
+restart, and preserves the completed turn's replay. Validation: 76 Rust tests,
+20 focused Python tests, strict Clippy, formatting, and diff checks passed.
+
+### Rechecking steers after queued cancellation
+
+Observed 2026-09-18 on the same Darwin arm64 host with Rust 1.98.0. When
+an incompatible workspace/model steer blocked absorption, the per-bot flag
+was cleared. Cancelling that blocker did not re-arm it, so a strict steer
+behind it could fail as stale despite another boundary remaining. The
+cancellation job now sets the affected live turn's existing flag after the
+queued turn ends. There is no added query in that job or change to ordinary
+turn processing; only that bot rechecks its queue at the next boundary.
+
+Compared `af3c5811…` with `c86e8d94…` on the one-parked-bot screen described
+above: 48 workers, ten two-round shell turns each, with and without one
+additional parked bot holding a steer. One warmup per binary/scenario was
+excluded, followed by four alternating measured pairs. Medians:
+
+| Case | Metric | Before | After |
+| --- | --- | ---: | ---: |
+| Ordinary work | Daemon CPU, s | 0.906 | 0.906 |
+| Ordinary work | Storage jobs | 6,564 | 6,560 |
+| Ordinary work | Wall time, s | 0.712 | 0.710 |
+| Ordinary work | Daemon RSS after work, MiB | 14.41 | 14.46 |
+| Unrelated parked steer | Daemon CPU, s | 0.902 | 0.904 |
+| Unrelated parked steer | Storage jobs | 6,553.5 | 6,556.5 |
+| Unrelated parked steer | Wall time, s | 0.702 | 0.703 |
+| Unrelated parked steer | Daemon RSS after work, MiB | 14.55 | 14.46 |
+
+No material steady-work regression observed, and no per-boundary storage
+work returned on unrelated bots. This is a daemon-only screen using the
+instant synthetic provider, not a peak-memory or cancellation-latency
+measurement. One candidate ordinary-work run took 0.996 s; other measured
+runs took 0.690–0.738 s. The small samples establish no speedup. Raw runs
+and the driver are in ignored `.local/steer-rearm-fix/`.
+
+A deterministic regression holds provider responses around the blocked
+boundary, cancels the incompatible head, and checks both absorption into
+the original turn and the model's subsequent input and answer. Both workspace
+and model variants failed on the baseline and pass with the fix. Validation:
+76 Rust tests, 19 focused Python tests, strict Clippy, formatting, and diff
+checks passed.
