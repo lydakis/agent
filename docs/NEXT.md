@@ -336,28 +336,40 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 19. Add equivalent lifecycle adapters for Pi/Codex only where native semantics
     can satisfy the same contract. Unsupported guarantees remain an explicit
     gap.
-20. The daemon holds no defaults. Next after items 7 and 8, ahead of 13. The
-    split that pays is mechanism in the daemon and policy in the client:
-    anything that must be true for every client at once (durable truth,
-    shared pacing, processes, the per-turn invariants) stays in the daemon;
-    anything that is an opinion belongs to whoever is asking. Rendering,
-    the delivery default (`AGENT_DELIVERY`), and configuration judgment
-    (item 7) already live in the client. Three opinions remain in the
-    daemon, and each is also a configuration axis that can mismatch:
-    default instructions filled in when `create` names none; the default
-    model, which `create` should always name (the CLI keeps the user's in
-    `AGENT_MODEL`); and tools chosen per daemon, where the daemon should
-    register the universe of tools at start and each bot select its set at
-    `create`, which heterogeneous fleets need anyway and which retires the
-    toolset mismatch check. Afterwards daemon configuration is store,
-    socket, providers, and limits; everything else is stated per bot or per
-    turn. Two cautions bound this: client-side work is paid per invocation,
-    and every bot's shell tool that runs `agent run` is a client, so shared
-    mechanisms such as pacing must not move; and the regression screen, not
-    the principle, decides whether a move was free. The delivery boundary
-    check was made one atomic load on the per-turn path, and the client-side
-    configuration check moved nothing on it; both were confirmed by the
-    screen, not assumed.
+20. The daemon supplies no implicit agent behavior. Next after item 23,
+    ahead of 13. The split that pays is mechanism in the daemon and policy
+    in the client: anything that must be true for every client at once
+    (durable truth, shared pacing and pooling, processes, cancellation, the
+    model and tool loop, the per-turn invariants, resource limits and
+    protocol defaults) stays in the daemon; anything that is an opinion
+    about an agent belongs to whoever is asking. Rendering, the delivery
+    default (`AGENT_DELIVERY`), and configuration judgment (item 7) already
+    live in the client. Three opinions remain in the daemon, and each is
+    also a configuration axis that can mismatch. The distinction to keep is
+    choosing a value versus retaining it: once a bot exists its model,
+    instructions, and tools are durable with it, and resuming or forking it
+    never depends on the environment of whichever client connects next.
+    Model and instructions are already retained in the bot's row, so those
+    two moves only change who supplies the value: `create` always names a
+    model (the CLI keeps the user's in `AGENT_MODEL`) and always sends
+    instructions. Tools are the real change: today they are daemon-wide,
+    so the daemon should register the universe of tools at start and each
+    bot select its set at `create`, durably, with the schemas the model
+    sees filtered per bot and the selection enforced at dispatch, not just
+    hidden from the model; definitions stay shared, never copied per bot.
+    Heterogeneous fleets need this anyway, and it retires the toolset
+    mismatch check. Afterwards daemon configuration is store, socket,
+    providers, and limits; everything about an agent is stated per bot or
+    per turn. Two slices: explicit model and instructions first, then
+    durable per-bot tool selection. Two cautions bound this: client-side
+    work is paid per invocation, and every bot's shell tool that runs
+    `agent run` is a client, so shared mechanisms must not move and the
+    measurement is daemon plus clients plus tool processes, including
+    frequent CLI invocations and detached execution; and the screen, not
+    the principle, decides whether a move was free. Removing a default
+    string saves little; the benefit is heterogeneous bots sharing one
+    runtime and its connections, with any performance change demonstrated,
+    not assumed. (Refined with Astra's review of the item.)
 21. Done: durable events are published by the storage worker in commit
     order, through one publisher, with turn outcomes for waiters behind
     the events that end them. Tasks and the service no longer publish or
