@@ -735,7 +735,17 @@ fn picker(frame: &mut Frame, area: Rect, app: &App, pulse: bool) {
             faint().add_modifier(Modifier::ITALIC),
         )));
     }
-    for (i, (name, prefix, hint)) in rows.iter().enumerate() {
+    // A window of rows that keeps the selection visible when the fleet is
+    // taller than the popup.
+    let visible = height.saturating_sub(3) as usize;
+    let first = if visible == 0 {
+        0
+    } else {
+        p.sel
+            .saturating_sub(visible - 1)
+            .min(rows.len().saturating_sub(visible))
+    };
+    for (i, (name, prefix, hint)) in rows.iter().enumerate().skip(first).take(visible.max(1)) {
         let b = &app.bots[name];
         let sel = i == p.sel;
         let mut spans = vec![

@@ -32,10 +32,17 @@ function upsert(record) {
   S.bots.set(b.name, b);
 }
 async function refreshBot(name) { try { upsert(await Daemon.request('resume', { bot: name })); } catch (_) {} }
+const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
+const isActive = (status) => ACTIVE.has(status);
+// Only the agent CLI's detached run yields the handle JSON a peer card already shows.
+const spawnsPeer = (command) => command.includes('--detach') && (command.includes('$AGENT_BIN') || command.includes('agent run'));
 function tree() {
+  // One pass builds the children index; the walk is linear in the fleet.
+  const children = new Map();
+  for (const b of S.bots.values()) { const key = b.parent && S.bots.has(b.parent) ? b.parent : null; if (!children.has(key)) children.set(key, []); children.get(key).push(b); }
   const out = []; const seen = new Set();
   const walk = (parent, depth, trail) => {
-    const kids = [...S.bots.values()].filter((b) => !seen.has(b.name) && (parent === null ? !b.parent || !S.bots.has(b.parent) : b.parent === parent));
+    const kids = (children.get(parent) ?? []).filter((b) => !seen.has(b.name));
     kids.forEach((b, i) => { seen.add(b.name); const last = i === kids.length - 1; out.push({ b, depth, last, trail }); walk(b.name, depth + 1, trail.concat(last)); });
   };
   walk(null, 0, []);
@@ -77,7 +84,9 @@ async function onEvent(ev) {
     case 'created': case 'forked': {
       // Who is running the shell call that names this bot, before anything else moves.
       const inferred = kind === 'created' ? creatorOf(name) : null;
-      await refreshBot(name);
+      // The snapshot already holds every bot that existed at attach; only a bot born after it needs a fetch.
+      if (!S.bots.has(name)) await refreshBot(name);
+      if (data.created_by && bot(name)) bot(name).parent = data.created_by;
       if (kind === 'created') {
         // The record's creator wins; inference covers bots the daemon did not attribute.
         const parent = bot(name)?.parent || inferred;
@@ -104,7 +113,7 @@ async function onEvent(ev) {
       const args = data.arguments ?? '';
       let parsed = {}; try { parsed = JSON.parse(args); } catch (_) {}
       const tname = data.name ?? 'tool';
-      transcript(name).items.push({ kind: 'tool', callId: data.call_id, name: tname, summary: callSummary(tname, args), args, background: tname === 'shell' && parsed.background === true, spawns: tname === 'shell' && String(parsed.command ?? '').includes('--detach'), done: false, started: S.live ? Date.now() : 0, took: 0, turn });
+      transcript(name).items.push({ kind: 'tool', callId: data.call_id, name: tname, summary: callSummary(tname, args), args, background: tname === 'shell' && parsed.background === true, spawns: tname === 'shell' && spawnsPeer(String(parsed.command ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn });
       break;
     }
     case 'tool_completed': {
@@ -128,7 +137,7 @@ async function onEvent(ev) {
       const t = transcript(name);
       if (t.streamingTurn === turn) { if (t.text) t.items.push({ kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; }
       if (status !== 'completed' && status !== 'steered') t.items.push({ kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
-      for (const it of t.items) if (it.turn === turn && it.kind === 'proc' && it.done === null) it.done = '';
+      // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
     case 'deleted': S.bots.delete(name); S.transcripts.delete(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; if (S.ui.peek === name) S.ui.peek = null; break;
@@ -146,7 +155,7 @@ async function loadWaitOrProc(name, node, call) {
   } else if (value.results) {
     for (const [handle, result] of Object.entries(value.results)) {
       if (result.pending) continue;
-      for (const it of t.items) if (it.kind === 'proc' && it.handle === handle && it.done === null) {
+      for (const it of t.items) if (it.kind === 'proc' && it.handle === handle) {
         const out = result.stdout ?? result.output ?? ''; const code = result.exit_code ?? 0;
         it.done = code ? `exit ${code}` : (out.trimEnd().split('\n').pop() ?? '');
       }
@@ -211,7 +220,11 @@ async function attach() {
     if (!S.config) S.config = await Daemon.setup();
     if (!unlisten) unlisten = await Daemon.onEvent((ev) => enqueue(async () => { await onEvent(ev); await loadVisible(); render(); }));
     const result = await Daemon.attach(S.cursor);
+    // The snapshot is authoritative: a bot deleted while this page had no session is gone from it and
+    // its live-only `deleted` notice cannot be replayed; anything newer arrives on the subscription.
+    const listed = new Set((result.bots ?? []).map((r) => r.name));
     for (const record of result.bots ?? []) upsert(record);
+    for (const name of [...S.bots.keys()]) if (!listed.has(name)) { S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null; }
     S.attached = true;
     restore();
     await enqueue(loadVisible);
@@ -296,7 +309,7 @@ function botRowHTML(n, sel) {
 }
 function peers() { return (S.transcripts.get(S.selected)?.items ?? []).filter((i) => i.kind === 'peer' && S.bots.has(i.who)).map((i) => i.who); }
 function keybarHTML(b) {
-  const busy = b && b.status !== 'idle';
+  const busy = b && isActive(b.status);
   const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : busy ? labelOf(b.status) : 'live'}</span>`;
   const keys = [];
   if (S.ui.picker) keys.push('<kbd>↑↓</kbd> choose', '<kbd>Enter</kbd> switch', '<kbd>Esc</kbd> cancel');
@@ -316,14 +329,14 @@ function render() {
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('peek', !!S.ui.peek && S.bots.has(S.ui.peek));
   $('title').innerHTML = b ? titleHTML(b) : '<span>no bots · /new NAME creates one</span>';
   keepBottom($('log'), b ? transcriptHTML(b.name) : '');
-  $('bots').innerHTML = tree().map((n) => botRowHTML(n, n.b.name === S.selected)).join('');
+  if (S.ui.rail) $('bots').innerHTML = tree().map((n) => botRowHTML(n, n.b.name === S.selected)).join('');
   if (S.ui.peek && bot(S.ui.peek)) { $('peektitle').innerHTML = titleHTML(bot(S.ui.peek), true); keepBottom($('peek'), transcriptHTML(S.ui.peek)); }
   $('who').textContent = b ? `${b.name} ›` : '›';
   $('input').placeholder = b ? (b.status === 'idle' ? '' : `${b.name} is ${labelOf(b.status)}; your message queues`) : '/new NAME [PROVIDER/MODEL]';
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
 }
-setInterval(() => { if (S.attached && [...S.bots.values()].some((b) => b.status !== 'idle')) render(); }, 1000);
+setInterval(() => { if (S.attached && [...S.bots.values()].some((b) => isActive(b.status))) render(); }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {

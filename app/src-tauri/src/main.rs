@@ -65,8 +65,13 @@ fn config() -> Result<Config, String> {
             }
         },
     };
+    // The daemon wants an existing absolute workspace; resolve what was given
+    // the same way the default is resolved.
     let workspace = match workspace {
-        Some(dir) => dir,
+        Some(dir) => std::fs::canonicalize(&dir)
+            .map_err(|e| format!("--workspace {dir}: {e}"))?
+            .to_string_lossy()
+            .into_owned(),
         None => std::env::current_dir()
             .map_err(|e| e.to_string())?
             .to_string_lossy()

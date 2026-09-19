@@ -240,10 +240,10 @@ impl App {
     pub fn animating(&self) -> bool {
         self.ui.rail.active() || self.ui.peek_w.active()
     }
+    /// Something is in flight: a redraw tick is worth paying for. A failed
+    /// or interrupted bot keeps its glyph but costs nothing while it sits.
     pub fn busy(&self) -> bool {
-        self.bots
-            .values()
-            .any(|b| b.status != "idle" && b.status != "completed")
+        self.bots.values().any(|b| is_active(&b.status))
     }
     pub fn slide(&self) -> Duration {
         if self.ui.motion {
@@ -255,60 +255,56 @@ impl App {
 
     /// Bots as a tree by creator, depth first: (bot, depth, is last child, ancestors' last flags).
     pub fn tree(&self) -> Vec<(&Bot, usize, bool, Vec<bool>)> {
-        let mut out = Vec::new();
+        // One pass builds the children index; the walk is then linear in
+        // the fleet, not quadratic, which matters at thousands of bots.
+        let mut children: HashMap<Option<&str>, Vec<&Bot>> = HashMap::new();
+        for b in self.bots.values() {
+            let parent = b.parent.as_deref().filter(|p| self.bots.contains_key(*p));
+            children.entry(parent).or_default().push(b);
+        }
+        let mut out: Vec<(&Bot, usize, bool, Vec<bool>)> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         fn walk<'a>(
-            app: &'a App,
-            parent: Option<&str>,
+            children: &HashMap<Option<&'a str>, Vec<&'a Bot>>,
+            seen: &mut std::collections::HashSet<&'a str>,
+            parent: Option<&'a str>,
             depth: usize,
             trail: &[bool],
             out: &mut Vec<(&'a Bot, usize, bool, Vec<bool>)>,
         ) {
-            let kids: Vec<&Bot> = app
-                .bots
-                .values()
-                .filter(|b| {
-                    b.parent.as_deref() == parent && (parent.is_some() || b.parent.is_none())
+            let kids: Vec<&Bot> = children
+                .get(&parent)
+                .map(|v| {
+                    v.iter()
+                        .copied()
+                        .filter(|b| !seen.contains(b.name.as_str()))
+                        .collect()
                 })
-                .collect();
+                .unwrap_or_default();
             let n = kids.len();
             for (i, kid) in kids.into_iter().enumerate() {
                 let last = i + 1 == n;
+                seen.insert(&kid.name);
                 let mut t = trail.to_vec();
                 t.push(last);
                 out.push((kid, depth, last, trail.to_vec()));
-                walk(app, Some(&kid.name), depth + 1, &t, out);
+                walk(children, seen, Some(&kid.name), depth + 1, &t, out);
             }
         }
-        walk(self, None, 0, &[], &mut out);
-        // Whatever the walk did not reach still needs a row: a bot whose
-        // creator is gone, or a creator cycle left by delete-and-recreate.
-        // Each such bot roots its own subtree, so nothing is ever hidden.
-        fn walk_from<'a>(
-            app: &'a App,
-            parent: &str,
-            out: &mut Vec<(&'a Bot, usize, bool, Vec<bool>)>,
-        ) {
-            let kids: Vec<&Bot> = app
-                .bots
-                .values()
-                .filter(|b| {
-                    b.parent.as_deref() == Some(parent)
-                        && !out.iter().any(|(x, ..)| x.name == b.name)
-                })
-                .collect();
-            let n = kids.len();
-            for (i, kid) in kids.into_iter().enumerate() {
-                out.push((kid, 1, i + 1 == n, vec![true]));
-                walk_from(app, &kid.name, out);
-            }
-        }
-        while let Some(orphan) = self
-            .bots
-            .values()
-            .find(|b| !out.iter().any(|(x, ..)| x.name == b.name))
-        {
+        walk(&children, &mut seen, None, 0, &[], &mut out);
+        // Whatever the walk did not reach still needs a row: a creator cycle
+        // left by delete-and-recreate. Each such bot roots its own subtree.
+        while let Some(orphan) = self.bots.values().find(|b| !seen.contains(b.name.as_str())) {
+            seen.insert(&orphan.name);
             out.push((orphan, 0, true, Vec::new()));
-            walk_from(self, &orphan.name, &mut out);
+            walk(
+                &children,
+                &mut seen,
+                Some(&orphan.name),
+                1,
+                &[true],
+                &mut out,
+            );
         }
         out
     }
@@ -325,16 +321,37 @@ impl App {
             .request("follow", json!({"bot": "*", "after": self.cursor}))
             .await?;
         let mut after: Option<String> = None;
+        let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             let page = client
                 .request("bots", json!({"after": after, "limit": 256}))
                 .await?;
             for record in page["bots"].as_array().into_iter().flatten() {
                 self.upsert(record);
+                if let Some(name) = record["name"].as_str() {
+                    listed.insert(name.to_owned());
+                }
             }
             match page["next_after"].as_str() {
                 Some(next) => after = Some(next.to_owned()),
                 None => break,
+            }
+        }
+        // The snapshot is authoritative: a bot deleted while this client had
+        // no session is gone from it, and its live-only `deleted` notice
+        // cannot be replayed. Anything created after the snapshot arrives as
+        // an event on the subscription taken before it.
+        let gone: Vec<String> = self
+            .bots
+            .keys()
+            .filter(|n| !listed.contains(*n))
+            .cloned()
+            .collect();
+        for name in gone {
+            self.bots.remove(&name);
+            self.transcripts.remove(&name);
+            if self.ui.peek.as_deref() == Some(name.as_str()) {
+                self.ui.peek = None;
             }
         }
         if self.selected.is_empty() || !self.bots.contains_key(&self.selected) {
@@ -477,7 +494,17 @@ impl App {
                 t.thinking.push_str(event["text"].as_str().unwrap_or(""));
             }
             "created" | "forked" => {
-                self.refresh_bot(&bot).await;
+                // The snapshot already holds every bot that existed at attach,
+                // creator included; only a bot born after it needs a fetch.
+                // Replaying a 10,000-bot store must not cost 10,000 requests.
+                if !self.bots.contains_key(&bot) {
+                    self.refresh_bot(&bot).await;
+                }
+                if let Some(creator) = data["created_by"].as_str()
+                    && let Some(b) = self.bots.get_mut(&bot)
+                {
+                    b.parent = Some(creator.to_owned());
+                }
                 // The record's creator wins; the shell-call inference covers
                 // bots created before the daemon recorded one.
                 let declared = self.bots.get(&bot).and_then(|b| b.parent.clone());
@@ -550,10 +577,7 @@ impl App {
                 let call_id = data["call_id"].as_str().unwrap_or("").to_owned();
                 let parsed: Value = serde_json::from_str(&args).unwrap_or(Value::Null);
                 let background = name == "shell" && parsed["background"].as_bool() == Some(true);
-                let spawns = name == "shell"
-                    && parsed["command"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("--detach"));
+                let spawns = name == "shell" && parsed["command"].as_str().is_some_and(spawns_peer);
                 let started = self.live.then(Instant::now);
                 self.push(
                     &bot,
@@ -685,17 +709,8 @@ impl App {
                         }),
                     );
                 }
-                // Every proc this turn started is over with the turn.
-                if let Some(t) = self.transcripts.get_mut(&bot) {
-                    for (t_turn, item) in t.items.iter_mut() {
-                        if *t_turn == turn
-                            && let Item::Proc { done, .. } = item
-                            && done.is_none()
-                        {
-                            *done = Some(String::new());
-                        }
-                    }
-                }
+                // A background command may outlive the turn that started it;
+                // only a wait result says how it ended, so its card stays as is.
             }
             "deleted" => {
                 self.bots.remove(&bot);
@@ -767,7 +782,6 @@ impl App {
                         handle: h, done, ..
                     } = item
                         && h == handle
-                        && done.is_none()
                     {
                         let out = result["stdout"]
                             .as_str()
@@ -814,11 +828,11 @@ impl App {
                     .iter()
                     .enumerate()
                     .rev()
-                    .take(LAZY_ITEMS)
                     .filter_map(|(i, (_, item))| match item {
                         Item::Node { node, .. } => Some((i, *node)),
                         _ => None,
                     })
+                    .take(LAZY_ITEMS)
                     .collect()
             })
             .unwrap_or_default();
@@ -994,6 +1008,19 @@ impl App {
             .await?;
         Ok(())
     }
+}
+
+/// Turn states with work in flight, as the daemon names them.
+pub fn is_active(status: &str) -> bool {
+    matches!(status, "running" | "waiting" | "paced" | "queued" | "ready")
+}
+
+/// Does this shell command run the agent CLI's detached submission? Only
+/// that call's output is the handle JSON a peer card already shows; any
+/// other program's `--detach` keeps its output.
+pub fn spawns_peer(command: &str) -> bool {
+    command.contains("--detach")
+        && (command.contains("$AGENT_BIN") || command.contains("agent run"))
 }
 
 pub fn now_ms() -> u128 {
