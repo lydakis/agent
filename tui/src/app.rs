@@ -16,6 +16,9 @@ pub const TOAST: Duration = Duration::from_millis(2200);
 #[derive(Debug, Default, Clone)]
 pub struct Bot {
     pub name: String,
+    /// The daemon's store-wide identity: a recreated name is a new bot, and
+    /// nothing kept for the old one may leak into it.
+    pub id: Option<i64>,
     pub status: String,
     pub running_turn: Option<i64>,
     pub model: String,
@@ -134,8 +137,8 @@ pub struct Ui {
     pub thoughts: bool,
     pub output: bool,
     pub toast: Option<(String, Instant)>,
-    pub scroll: u16,
-    pub peek_scroll: u16,
+    pub scroll: usize,
+    pub peek_scroll: usize,
     pub motion: bool,
     /// Mouse captured: the wheel scrolls panes; released: the terminal selects text.
     pub mouse: bool,
@@ -450,8 +453,22 @@ impl App {
         let Some(name) = record["name"].as_str() else {
             return;
         };
+        let id = record["id"].as_i64();
+        if let Some(existing) = self.bots.get(name)
+            && existing.id.is_some()
+            && id.is_some()
+            && existing.id != id
+        {
+            // Same name, different identity: everything known about the old
+            // bot belongs to the old bot.
+            self.bots.remove(name);
+            self.transcripts.remove(name);
+        }
         let bot = self.bots.entry(name.to_owned()).or_default();
         bot.name = name.to_owned();
+        if id.is_some() {
+            bot.id = id;
+        }
         let status = record["status"].as_str().unwrap_or("?");
         bot.status = if status == "completed" {
             "idle".into()
@@ -799,6 +816,17 @@ impl App {
             return;
         };
         self.apply_wait_or_proc(bot, &item, tool);
+        // The node is spent: its output is what the cards now show, and a
+        // later lazy load must not decode it a second time.
+        if let Some(t) = self.transcripts.get_mut(bot)
+            && let Some(pos) = t
+                .items
+                .iter()
+                .rposition(|(_, i)| matches!(i, Item::Node { node: n, .. } if *n == node))
+        {
+            t.items.remove(pos);
+            t.nodes = t.nodes.saturating_sub(1);
+        }
     }
     /// Decode a background start (a proc handle) or a wait result (which
     /// handles resolved) into the cards; also reached by a retried load.
@@ -853,10 +881,20 @@ impl App {
                             .as_str()
                             .or(result["output"].as_str())
                             .unwrap_or("");
-                        let code = result["exit_code"].as_i64().unwrap_or(0);
                         let last = out.trim_end().lines().last().unwrap_or("").to_owned();
-                        *done = Some(if code != 0 {
+                        // A process can end without an exit status: a spawn
+                        // failure, a timeout, an output limit. Say which.
+                        *done = Some(if let Some(error) = result["error"].as_str() {
+                            match result["detail"].as_str() {
+                                Some(detail) => format!("{error}: {detail}"),
+                                None => error.to_owned(),
+                            }
+                        } else if let Some(code) = result["exit_code"].as_i64()
+                            && code != 0
+                        {
                             format!("exit {code}")
+                        } else if result["success"].as_bool() == Some(false) {
+                            "failed".to_owned()
                         } else {
                             last
                         });
@@ -891,8 +929,10 @@ impl App {
         }
     }
     async fn load(&mut self, name: &str) {
-        // Batches of LAZY_ITEMS, pipelined, until no bare node is left.
-        while self.load_batch(name).await {}
+        // One batch of the newest bare nodes: what the screen can show.
+        // Scrolling up asks for the next batch, so a long history is
+        // materialized only as far as someone reads.
+        self.load_batch(name).await;
     }
     /// One batch; `false` when there was nothing left to fetch.
     async fn load_batch(&mut self, name: &str) -> bool {
@@ -1022,7 +1062,7 @@ impl App {
             } else {
                 &mut self.ui.scroll
             };
-        *target = (*target as i32 + delta).max(0) as u16;
+        *target = (*target as i64 + i64::from(delta)).max(0) as usize;
     }
     pub fn open_peek(&mut self, name: &str) {
         self.ui.peek = Some(name.to_owned());
@@ -1139,8 +1179,26 @@ pub fn is_active(status: &str) -> bool {
 /// that call's output is the handle JSON a peer card already shows; any
 /// other program's `--detach` keeps its output.
 pub fn spawns_peer(command: &str) -> bool {
-    command.contains("--detach")
-        && (command.contains("$AGENT_BIN") || command.contains("agent run"))
+    // Each shell segment on its own: the executable must be the agent CLI,
+    // its first argument `run`, and `--detach` among the rest before `--`.
+    command
+        .split([';', '|', '&', '\n'])
+        .any(|segment| {
+            let mut tokens = segment
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c| c == '"' || c == '\''));
+            let Some(exe) = tokens.next() else {
+                return false;
+            };
+            let is_agent = exe == "$AGENT_BIN"
+                || exe == "${AGENT_BIN}"
+                || exe == "agent"
+                || exe.ends_with("/agent");
+            if !is_agent || tokens.next() != Some("run") {
+                return false;
+            }
+            tokens.take_while(|t| *t != "--").any(|t| t == "--detach")
+        })
 }
 
 pub fn now_ms() -> u128 {
@@ -1203,5 +1261,36 @@ mod tests {
         let a = rows.iter().find(|(n, _)| n == "A").unwrap().1;
         let b = rows.iter().find(|(n, _)| n == "B").unwrap().1;
         assert_eq!(a.min(b), 0, "one member of the cycle roots it");
+    }
+
+    #[test]
+    fn a_spawn_is_the_agent_cli_running_detached_not_a_mention_of_it() {
+        for yes in [
+            "\"$AGENT_BIN\" run --detach --new --bot Bob -- do it",
+            "cd /tmp && $AGENT_BIN run --new --detach --bot Bob -- task",
+            "/usr/local/bin/agent run --detach --bot Bob -- go",
+        ] {
+            assert!(spawns_peer(yes), "{yes}");
+        }
+        for no in [
+            "echo '$AGENT_BIN run --detach' > notes.md; cat notes.md",
+            "\"$AGENT_BIN\" run --new --bot Bob -- explain --detach",
+            "\"$AGENT_BIN\" wait --detach turn:Bob/1",
+            "grep -- --detach docs/CLI.md",
+        ] {
+            assert!(!spawns_peer(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn a_recreated_name_is_a_new_bot_with_nothing_of_the_old_one() {
+        let mut app = app_with(&[("Bob", Some("Alice"))]);
+        app.transcripts.entry("Bob".into()).or_default().text = "old".into();
+        app.upsert(&serde_json::json!({"name": "Bob", "id": 7, "status": "idle"}));
+        assert_eq!(app.transcripts["Bob"].text, "old", "same identity keeps its history");
+        app.upsert(&serde_json::json!({"name": "Bob", "id": 8, "status": "idle"}));
+        assert_eq!(app.bots["Bob"].id, Some(8));
+        assert_eq!(app.bots["Bob"].parent, None, "the old lineage is gone");
+        assert!(!app.transcripts.contains_key("Bob"), "the old transcript is gone");
     }
 }

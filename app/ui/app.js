@@ -25,7 +25,11 @@ function toast(text, ms = 2200) { S.ui.toast = text; render(); setTimeout(() => 
 // ---------- bots ----------
 function upsert(record) {
   if (!record?.name) return;
-  const b = bot(record.name) || { name: record.name, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
+  // Same name, different identity: everything known about the old bot belongs to the old bot.
+  const known = bot(record.name);
+  if (known && known.id != null && record.id != null && known.id !== record.id) { S.bots.delete(record.name); S.transcripts.delete(record.name); }
+  const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
+  if (record.id != null) b.id = record.id;
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
@@ -37,7 +41,16 @@ async function refreshBot(name) { try { upsert(await Daemon.request('resume', { 
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
 // Only the agent CLI's detached run yields the handle JSON a peer card already shows.
-const spawnsPeer = (command) => command.includes('--detach') && (command.includes('$AGENT_BIN') || command.includes('agent run'));
+// Each shell segment on its own: the executable must be the agent CLI, its first argument `run`,
+// and `--detach` among the rest before `--`. A command that merely prints those words does not count.
+const spawnsPeer = (command) => command.split(/[;|&\n]/).some((segment) => {
+  const tokens = segment.trim().split(/\s+/).map((t) => t.replace(/^["']|["']$/g, ''));
+  const exe = tokens[0] ?? '';
+  const isAgent = exe === '$AGENT_BIN' || exe === '${AGENT_BIN}' || exe === 'agent' || exe.endsWith('/agent');
+  if (!isAgent || tokens[1] !== 'run') return false;
+  const end = tokens.indexOf('--', 2);
+  return tokens.slice(2, end < 0 ? undefined : end).includes('--detach');
+});
 function tree() {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
@@ -131,7 +144,12 @@ async function onEvent(ev) {
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; }
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
-        if (call && (call.background || call.name === 'wait')) await loadWaitOrProc(name, data.node, call);
+        if (call && (call.background || call.name === 'wait')) {
+          await loadWaitOrProc(name, data.node, call);
+          // The node is spent: the cards show its result, and a later lazy load must not decode it again.
+          const pos = t.items.findLastIndex((it) => it.kind === 'node' && it.node === data.node);
+          if (pos >= 0) { t.items.splice(pos, 1); t.nodes = Math.max(0, t.nodes - 1); t.gen = (t.gen ?? 0) + 1; }
+        }
       }
       break;
     }
@@ -175,8 +193,12 @@ function applyWaitOrProc(name, item, call) {
     for (const [handle, result] of Object.entries(value.results)) {
       if (result.pending) continue;
       for (const it of t.items) if (it.kind === 'proc' && it.handle === handle) {
-        const out = result.stdout ?? result.output ?? ''; const code = result.exit_code ?? 0;
-        it.done = code ? `exit ${code}` : (out.trimEnd().split('\n').pop() ?? '');
+        const out = result.stdout ?? result.output ?? '';
+        // A process can end without an exit status: a spawn failure, a timeout, an output limit. Say which.
+        if (result.error) it.done = result.detail ? `${result.error}: ${result.detail}` : String(result.error);
+        else if (typeof result.exit_code === 'number' && result.exit_code !== 0) it.done = `exit ${result.exit_code}`;
+        else if (result.success === false) it.done = 'failed';
+        else it.done = out.trimEnd().split('\n').pop() ?? '';
       }
     }
   }
@@ -197,8 +219,9 @@ function entries(item) {
   return out;
 }
 async function load(name) {
-  // Batches of LAZY_ITEMS until no bare node is left.
-  for (let guard = 0; guard < 64; guard++) { if (!(await loadBatch(name))) break; }
+  // One batch of the newest bare nodes: what the pane can show. Scrolling up asks for the next
+  // batch, so a long history is materialized only as far as someone reads.
+  await loadBatch(name);
 }
 async function loadBatch(name) {
   const t = S.transcripts.get(name); if (!t || !t.nodes) return false;
@@ -248,7 +271,9 @@ async function attach() {
       // An event from a session this page already left behind is noise.
       if (ev.session !== undefined && S.session !== undefined && ev.session !== S.session) return;
       const terminal = await onEvent(ev);
-      if (!terminal) { await loadVisible(); render(); }
+      // During replay nothing is fetched: a load per node-producing event would serialize a long history
+      // into one request each. The first load runs once follow_live arrives.
+      if (!terminal) { if (S.live) await loadVisible(); render(); }
     }));
     const result = await Daemon.attach(S.cursor);
     if (result.session !== undefined) S.session = result.session;
@@ -341,6 +366,7 @@ let forceRebuild = false;
 function renderTranscript(el, name) {
   const t = S.transcripts.get(name);
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const before = el.scrollHeight;
   if (!t) { el.innerHTML = ''; return; }
   const key = `${name}|${t.items.length}|${t.gen ?? 0}|${S.ui.thoughts}|${S.ui.output}|${S.ui.peek}`;
   let tail = el.lastElementChild;
@@ -348,9 +374,17 @@ function renderTranscript(el, name) {
     el.innerHTML = itemsHTML(t) + '<div class="tail"></div>';
     el.dataset.key = key;
     tail = el.lastElementChild;
+    // History loaded above the reader keeps their place instead of shoving it down.
+    if (!atBottom) el.scrollTop += el.scrollHeight - before;
   }
   tail.innerHTML = tailHTML(name, t);
   if (atBottom) el.scrollTop = el.scrollHeight;
+}
+for (const [id, who] of [['log', () => S.selected], ['peek', () => S.ui.peek]]) {
+  $(id).addEventListener('scroll', () => {
+    const el = $(id); const name = who();
+    if (el.scrollTop < 200 && name && (S.transcripts.get(name)?.nodes ?? 0) > 0) enqueue(async () => { await load(name); render(); });
+  });
 }
 function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><b>${esc(b.name)}</b><span>${labelOf(b.status)}</span>${closable ? '<span class="x">Esc closes</span>' : ''}`; }
 function botRowHTML(n, sel) {

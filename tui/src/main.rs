@@ -359,7 +359,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         (_, KeyCode::PageUp) => {
-            app.ui.scroll = app.ui.scroll.saturating_add(10);
+            app.ui.scroll += 10;
             app.load_visible().await;
         }
         (_, KeyCode::PageDown) => app.ui.scroll = app.ui.scroll.saturating_sub(10),

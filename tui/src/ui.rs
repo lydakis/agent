@@ -411,17 +411,19 @@ fn transcript_rows(
         return Vec::new();
     };
     // A blank row separates turns: before an item whose turn differs from
-    // the nearest earlier item that had one.
-    let mut separator = vec![false; t.items.len()];
-    let mut last_turn: Option<i64> = None;
-    for (i, (turn, _)) in t.items.iter().enumerate() {
-        if turn.is_some() && *turn != last_turn && i > 0 {
-            separator[i] = true;
-        }
-        if turn.is_some() {
-            last_turn = *turn;
-        }
-    }
+    // the nearest earlier item that had one. Decided per item during the
+    // bounded walk below, never with a pass over the whole history.
+    let separator = |i: usize| -> bool {
+        let Some(turn) = t.items[i].0 else {
+            return false;
+        };
+        i > 0
+            && t.items[..i]
+                .iter()
+                .rev()
+                .find_map(|(turn, _)| *turn)
+                .is_some_and(|earlier| earlier != turn)
+    };
     let shade = app.ui.shade;
     let mut rows: Vec<Line> = Vec::new();
     if !t.thinking.is_empty() {
@@ -448,7 +450,7 @@ fn transcript_rows(
             break;
         }
         let mut chunk = Vec::new();
-        if separator[i] {
+        if separator(i) {
             chunk.push(Line::from(""));
         }
         item_rows(app, item, width, pulse, &mut chunk);
@@ -535,7 +537,7 @@ fn pane(
         app.ui.scroll
     } else {
         app.ui.peek_scroll
-    } as usize;
+    };
     // One extra row tells the clamp below whether there is more above.
     let rows = transcript_rows(app, name, width, pulse, height + wanted + 1);
     let scroll = wanted.min(rows.len().saturating_sub(height));
@@ -590,6 +592,16 @@ fn rail(frame: &mut Frame, area: Rect, app: &App, pulse: bool) {
             )));
         }
     }
+    // A fleet taller than the pane scrolls to keep the selected row visible.
+    let visible = area.height as usize;
+    let selected_row = rows
+        .iter()
+        .position(|l| l.spans.first().is_some_and(|s| s.content == "▎"))
+        .unwrap_or(0);
+    let first = selected_row
+        .saturating_sub(visible.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible));
+    let rows: Vec<Line> = rows.into_iter().skip(first).collect();
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(faint())
