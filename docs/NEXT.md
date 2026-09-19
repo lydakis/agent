@@ -401,8 +401,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     already queued when the pool closes. The unfinished call's attempts and
     retry-time budget persist across parks and restarts; cumulative turn
     retries stay separate and count only dispatched retries. No second scheduler.
-    Still open from the item: pending submissions want their own count and
-    byte bound, separate from the active-turn bound.
+    The pending-submission bound followed as item 31.
 25. Done: pacing inputs per provider. The pool key is the family's
     (dated snapshots share their alias's pool); the estimate is a cost with
     input and output shares, paced per dimension the provider publishes
@@ -453,6 +452,31 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     so a long history's window is no longer read on the thread every other
     bot's commit waits for. Only byte-returning reads move; decisions stay
     on the worker.
+31. Done: pending-submission bounds. `--max-pending` and
+    `--max-pending-bytes` bound submissions waiting to start, daemon-wide,
+    answering `pending_limit` before anything is written; the storage worker
+    keeps the count and prompt bytes at each transition and recounts them at
+    open, so admission and `stats` cost the store nothing. A first version
+    used store triggers and cost 8% daemon CPU on the 32-agent screen and
+    17% burst throughput on the ten-thousand-bot screen, so it was replaced
+    before commit. Unbounded by default: waiting work is durable
+    rows, and the bound exists for an honest admission answer, not memory.
+    Performance follow-up: the [alternating comparison](DAEMON_MEASUREMENTS.md#alternating-follow-up)
+    leaves a small CPU cost unresolved; do not call this performance-neutral.
+32. Compaction, the context work, in three slices. First, the evaluation
+    from item 15 run on the daemon as it is: a constraint stated early,
+    enough work after it to push it out of the window, and a later decision
+    that depends on it; the score is whether the agent retrieves it through
+    the `history` tool and acts on it. That is the baseline. Second, the
+    mechanism: a versioned context view that summarizes older turns, with
+    history untouched, forks bound to the view valid at their checkpoint,
+    and the window reading the view; the daemon supplies no policy, so a
+    client names the summarizer model and the threshold, and with neither
+    set nothing compacts. Third, its performance: what a compaction costs on
+    the storage thread and the reader, what rewriting the prefix does to the
+    prompt-cache hit rate, and the evaluation rerun on the compacted daemon.
+    Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
+    socket-protocol client already covers the human way in.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

@@ -81,6 +81,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_processes = None;
     let mut max_active = None;
     let mut max_connecting = None;
+    let mut max_pending = None;
+    let mut max_pending_bytes = None;
     let mut max_output_tokens = None;
     let mut idle_exit = None;
     let mut context_bytes = None;
@@ -95,13 +97,19 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--store" => store = Some(value.into()),
             "--socket" => socket = Some(value.into()),
             "--provider" => providers.push(server::ProviderSpec::parse(value)?),
-            "--max-processes" | "--max-active" | "--max-connecting" => {
+            "--max-processes"
+            | "--max-active"
+            | "--max-connecting"
+            | "--max-pending"
+            | "--max-pending-bytes" => {
                 let parsed: usize = value
                     .parse()
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
                 match flag.as_str() {
                     "--max-processes" => max_processes = Some(parsed),
                     "--max-active" => max_active = Some(parsed),
+                    "--max-pending" => max_pending = Some(parsed),
+                    "--max-pending-bytes" => max_pending_bytes = Some(parsed),
                     _ => max_connecting = Some(parsed),
                 }
             }
@@ -145,6 +153,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_processes,
         max_active,
         max_connecting,
+        max_pending,
+        max_pending_bytes,
         max_output_tokens,
         idle_exit,
         context_bytes,

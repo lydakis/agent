@@ -294,6 +294,8 @@ bound; the operating system is then the only limit.
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
+| `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
+| `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -540,7 +542,8 @@ does not, and each is one op:
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
   still in line for a slot (`queued_processes`), turns queued or ready to
-  start (`queued_turns`), daemon-wide in-flight
+  start (`queued_turns`) with their prompt bytes (`pending_bytes`) and the
+  bounds on both (`pending_limit`, `pending_bytes_limit`), daemon-wide in-flight
   requests per shared HTTP client shard (`transport.in_flight_by_shard`),
   and every provider's model pools with their learned allowance and current
   level (`providers.NAME.pools`). Shard loads count requests, not physical
@@ -657,7 +660,9 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   once, `queued` behind the bot's own work, or `ready` when only a slot is
   missing. A bot's line runs in submission order; only its head is `ready`,
   and ready turns across bots start oldest first, one per loop iteration so
-  requests interleave with a long backlog. A `queued` event records the
+  requests interleave with a long backlog. `--max-pending` and
+  `--max-pending-bytes` bound the waiting work; past either, a submission
+  that would wait answers `pending_limit`. A `queued` event records the
   submission; the `accepted` event comes when the turn actually starts, with
   the node its prompt became. Queued turns survive restart: recovery ends
   the interrupted running turn and the line moves at once.
@@ -714,7 +719,9 @@ error, and the next in line takes its place. `interrupt` on a queued or ready
 turn ends it as `interrupted` and answers `queued: true`; interrupting the
 running turn does not touch the line behind it. `delete` refuses a bot with
 queued work as `bot_busy`. `stats` reports queued and ready turns together
-as `queued_turns`. `agent run --delivery MODE` sets the field, defaulting
+as `queued_turns`, a count the storage worker keeps at each transition
+and recounts at open, so admission and `stats` cost the store nothing.
+`agent run --delivery MODE` sets the field, defaulting
 to `AGENT_DELIVERY` in the client's environment, never in the daemon; with
 `--detach` a peer can hand a busy bot work or a mid-turn message without
 racing on `bot_busy`.

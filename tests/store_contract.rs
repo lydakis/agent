@@ -3375,3 +3375,116 @@ fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
     db.finish(bob, None).unwrap();
     assert_eq!(db.turn_usage("Bob", bob).unwrap_err().code, "stale_turn");
 }
+
+#[test]
+fn pending_counters_follow_every_transition_and_bound_admission() {
+    let path = std::env::temp_dir().join(format!("agent-pending-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let options = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        db.create("Ann", Some("/synthetic"), binding()).unwrap();
+        assert_eq!(db.pending().unwrap(), (0, 0));
+        let first = db
+            .begin(
+                "Bob",
+                "r1",
+                "first",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // A running turn is not pending; queued ones count with their prompt bytes.
+        assert_eq!(db.pending().unwrap(), (0, 0));
+        let second = db
+            .begin("Bob", "r2", "sécond", true, &options, allow_provider)
+            .unwrap()
+            .turn;
+        let third = db
+            .begin("Bob", "r3", "third", true, &steer, allow_provider)
+            .unwrap()
+            .turn;
+        assert_eq!(db.pending().unwrap(), (2, 7 + 5));
+        // A ready turn on another bot counts too; a duplicate does not.
+        let ready = db
+            .begin("Ann", "a1", "ready", false, &options, allow_provider)
+            .unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(db.pending().unwrap(), (3, 17));
+        assert!(
+            !db.begin("Ann", "a1", "ready", false, &options, allow_provider)
+                .unwrap()
+                .fresh
+        );
+        assert_eq!(db.pending().unwrap(), (3, 17));
+        // Bounds: a count, then bytes; refusals write nothing.
+        db.set_pending_limits(3, 0);
+        let refused = db
+            .begin("Ann", "a2", "more", false, &options, allow_provider)
+            .unwrap_err();
+        assert_eq!(refused.code, "pending_limit");
+        db.set_pending_limits(0, 20);
+        assert_eq!(
+            db.begin("Ann", "a2", "four", false, &options, allow_provider)
+                .unwrap_err()
+                .code,
+            "pending_limit"
+        );
+        assert_eq!(
+            db.begin("Ann", "a2", "abc", false, &options, allow_provider)
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(db.pending().unwrap(), (4, 20));
+        // A running submission is never refused by the pending bounds.
+        db.create("Cid", Some("/synthetic"), binding()).unwrap();
+        assert_eq!(
+            db.begin("Cid", "c1", "now", true, &options, allow_provider)
+                .unwrap()
+                .status,
+            "running"
+        );
+        db.set_pending_limits(0, 0);
+        // Leaving: absorbed into the running turn, cancelled, started.
+        assert_eq!(
+            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            third
+        );
+        assert_eq!(db.pending().unwrap(), (3, 15));
+        db.end_queued(second, &Error::new("cancelled")).unwrap();
+        assert_eq!(db.pending().unwrap(), (2, 8));
+        let (ann, turn) = db.next_ready().unwrap().unwrap();
+        assert_eq!(ann, "Ann");
+        db.start(turn, |_, _| Ok(())).unwrap();
+        assert_eq!(db.pending().unwrap(), (1, 3));
+        db.set_pending_limits(1, 0);
+        assert_eq!(
+            db.begin("Bob", "r4", "wait", true, &options, allow_provider)
+                .unwrap_err()
+                .code,
+            "pending_limit"
+        );
+    }
+    // The counters are recounted from the rows at open, after recovery has
+    // ended the running turns.
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.pending().unwrap(), (1, 3));
+        // Recovery ended Bob's running turn; without a slot the next waits.
+        db.begin("Bob", "r5", "again", false, &options, allow_provider)
+            .unwrap();
+        assert_eq!(db.pending().unwrap(), (2, 8));
+    }
+    std::fs::remove_file(path).unwrap();
+}

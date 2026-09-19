@@ -243,6 +243,7 @@ class SocketAndCliTests(ModelFixture):
         for flags, named in ((('--provider', 'openai=responses,http://127.0.0.1:1/v1'), '--provider openai'),
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--max-processes', '3'), '--max-processes'),
+                             (('--max-pending', '5'), '--max-pending'),
                              (('--retain-turns', '2'), '--retain-turns')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)

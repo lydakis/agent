@@ -3074,3 +3074,101 @@ query-plan tests, strict Clippy, formatting, and diff checks pass. Coverage
 includes absorbed UTF-8 content, prior-turn exclusion, fork isolation, stale
 turns, old-store migration, and rejecting a plan that scans nodes after the
 new index is removed.
+
+## Pending-submission bounds
+
+2026-09-19. `--max-pending` and `--max-pending-bytes` bound submissions
+waiting to start, daemon-wide, with `pending_limit` answered before anything
+is written. Two designs were measured; the first was dropped.
+
+**Store triggers.** The first version kept a `pending` row exact with four
+SQLite triggers on the turns table, so admission and `stats` read one row.
+Every status change of every turn paid a trigger evaluation, and the
+ordinary path showed it: on the 32-agent socket echo screen daemon CPU went
+from 0.310 (0.304–0.331) to 0.334 (0.314–0.353) s, and on the
+ten-thousand-bot fleet screen the burst went from 1,154 to 957 turns per
+second with creation from 2,567 to 2,238 bots per second, one run each.
+Rejected before commit.
+
+**Worker-kept counters.** The candidate keeps the count and prompt
+bytes in the storage worker's memory, updated at the four transitions that
+move a turn into or out of the waiting set (submission, start, absorption,
+cancellation), and recounted from the rows at open after recovery through
+the partial status indexes. Nothing is read or written on the store for it;
+a submission that would wait reads two integers when a bound is set and
+nothing when none is. Baseline binary `61c0b77d…` against the slice binary,
+same host, external power:
+
+| Screen | Before | After |
+| --- | ---: | ---: |
+| 32-agent socket echo, CPU s, two pairs | 0.310 (0.304–0.331), 0.304 (0.302–0.309) | 0.330 (0.309–0.356), 0.320 (0.298–0.339) |
+| 32-agent socket echo, RSS MiB | 18.17, 17.99 | 18.36, 18.28 |
+| 32-agent socket echo, p95 ms | 588.6, 592.6 | 601.2, 593.9 |
+| Fleet burst, turns/s, two runs | 1,154, 1,090 | 1,048, 1,086 |
+| Fleet create, bots/s | 2,567, 2,433 | 2,257, 2,535 |
+| 480-turn steer screen, CPU s, ABAB | 1.092, 1.080 | 1.063, 1.100 |
+
+The 32-agent CPU medians are higher in both pairs with overlapping ranges.
+Host noise is one possible explanation, but these measurements do not identify
+the cause or establish performance neutrality. Other workloads cannot rule out
+a cost in this one. Treat the repeated difference as unresolved until a
+controlled follow-up or profiling explains it.
+Captures: ignored `.local/bench/slice-prev15*-socket-32/`,
+`slice-pending*-socket-32/`, `fleet-prev15*/`, `fleet-pending*/`,
+`.local/steer-hint/pending-*.json`.
+
+### Alternating follow-up
+
+2026-09-19. Rebuilt baseline `b01c241` and compared it with the current
+uncommitted pending-bounds candidate on the same macOS arm64 host, on AC
+power, with no concurrent builds or tests. Both used the release profile,
+the same lockfile and benchmark observer, socket transport, the echo tool,
+FULL durability, and unbounded pending admission. Binary SHA-256:
+
+- Baseline: `c29fef2444fc62ef07f9bd60d1567ee4c3e7ea5a59167b2a800befcac6e71613`.
+- Candidate: `5962f9ce85581237ccbb8ae211ed27e4d28ba490c34bed0c7d4b00895da27b1e`.
+- Observer source digest: `a392e822ad89fe435a024367e13ffd7654fe680b05d650b9c687b4a38ebaa86f`.
+
+Each shape had one warmup per binary, followed by two baseline/candidate/
+candidate/baseline blocks: four measured runs per binary. Both shapes used
+32 bots, 20 chunks of 256 bytes with 25 ms chunk delay, and 4,096-byte
+history fixtures; the longer shape used twelve turns per bot instead of
+three. All twenty runs passed the lifecycle, replay, duplicate and
+historical-fork checks and achieved 32 concurrent provider requests.
+Request counts, tool-result counts, and request/response body bytes matched
+exactly between binaries within each shape: 192 requests and 96 tool
+results for three turns; 768 requests and 384 tool results for twelve.
+
+Medians (min–max), retaining every measured run:
+
+| Shape and metric | Baseline | Candidate |
+| --- | ---: | ---: |
+| Three turns/bot, observed target CPU s | 0.303 (0.295–0.334) | 0.306 (0.289–0.386) |
+| Three turns/bot, peak RSS MiB | 18.20 (18.11–18.22) | 18.10 (16.98–18.38) |
+| Three turns/bot, p95 turn ms | 589.9 (586.4–744.2) | 588.7 (586.3–605.2) |
+| Twelve turns/bot, observed target CPU s | 1.280 (1.107–1.550) | 1.203 (1.091–1.336) |
+| Twelve turns/bot, peak RSS MiB | 19.77 (19.53–19.97) | 19.45 (19.41–19.48) |
+| Twelve turns/bot, p95 turn ms | 602.4 (589.5–635.0) | 598.3 (590.4–622.1) |
+
+One twelve-turn baseline run raised `sampler exceeded 10% of wall time`.
+It remains in the table and capture. Excluding only that flagged sample
+changes the baseline CPU median to 1.195 s, leaving the candidate 0.7%
+higher; the three-turn candidate median is 1.0% higher. Thus the apparent
+longer-run CPU improvement is sensitive to an observer warning. CPU is
+sampled process lifetime, not an exact accounting through process exit.
+The smaller differences and overlapping ranges do not establish either
+a regression or a speedup, and do not explain the earlier increases.
+No runtime optimization was retained from this follow-up. A small CPU cost
+remains unresolved; these results do not support claiming performance
+neutrality or attributing the earlier gap to host noise.
+
+Capture: ignored `.local/bench/pending-controlled/result.json`, with
+per-run samples alongside it. The driver stopped on the observer warning;
+that completed result was retained and the three remaining scheduled runs
+were completed without rerunning or replacing any sample.
+
+Validation: 96 Rust tests, strict Clippy, formatting, the query-plan audit,
+and the Python suite. New coverage: counters through submission, ready,
+absorption, cancellation, start, duplicate, and restart; both bounds
+refusing and the running path never refused; the flags on `ready`, `stats`,
+and the attach mismatch check.

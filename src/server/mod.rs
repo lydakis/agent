@@ -223,6 +223,10 @@ pub struct Configuration {
     /// since providers hold headers until the first token and the bound
     /// would cap throughput at permits per first-token latency.
     pub max_connecting: Option<usize>,
+    /// Submissions waiting to start, as a count and as prompt bytes; both
+    /// unbounded by default, since waiting work is durable rows.
+    pub max_pending: Option<usize>,
+    pub max_pending_bytes: Option<usize>,
     /// Generated tokens per Responses call, including reasoning; none by default.
     pub max_output_tokens: Option<u32>,
     /// Exit a socket daemon after this many seconds with no sessions, no
@@ -242,6 +246,8 @@ pub struct Limits {
     pub processes: usize,
     pub active: usize,
     pub connecting: usize,
+    pub pending: usize,
+    pub pending_bytes: usize,
     /// HTTP/2 connections per provider, enough for `active` turns to stream
     /// at once at the providers' advertised streams per connection.
     pub connections: usize,
@@ -259,6 +265,8 @@ impl Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
             active,
             connecting: config.max_connecting.unwrap_or(0),
+            pending: config.max_pending.unwrap_or(0),
+            pending_bytes: config.max_pending_bytes.unwrap_or(0),
             connections: if active == 0 {
                 64
             } else {
@@ -395,6 +403,13 @@ pub async fn run(config: Configuration) -> Result<()> {
         return fail("no_providers");
     }
     let (store, publications) = Store::open(&config.store).await?;
+    let (pending, pending_bytes) = (limits.pending, limits.pending_bytes);
+    store
+        .call(move |db| {
+            db.set_pending_limits(pending, pending_bytes);
+            Ok(())
+        })
+        .await?;
     let mut environment = vec![
         (
             "AGENT_BIN".into(),
@@ -422,6 +437,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let ready = json!({"event":"ready","protocol":3,
         "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
+            "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
@@ -1032,8 +1048,12 @@ impl Service {
                     .await
             }
             Command::Stats => {
-                let (waiting, running, queued, paced) =
-                    store.op("counts", |db| db.counts()).await?;
+                let (waiting, running, queued, paced, pending_bytes) = store
+                    .op("counts", |db| {
+                        let (waiting, running, queued, paced) = db.counts()?;
+                        Ok((waiting, running, queued, paced, db.pending()?.1))
+                    })
+                    .await?;
                 let (waiters, retained) = self.handles.stats();
                 let providers: serde_json::Map<String, Value> = self
                     .providers
@@ -1047,6 +1067,9 @@ impl Service {
                     "waiting_turns": waiting,
                     "paced_turns": paced,
                     "queued_turns": queued,
+                    "pending_bytes": pending_bytes,
+                    "pending_limit": self.limits.pending,
+                    "pending_bytes_limit": self.limits.pending_bytes,
                     "running_processes": running,
                     "queued_processes": self.registry.pending(),
                     "process_limit": self.limits.processes,
@@ -1465,6 +1488,8 @@ mod tests {
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
             limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
                 processes: 16,
                 active: 1024,
                 connecting: 64,
@@ -1639,6 +1664,8 @@ mod tests {
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
             limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
                 processes: 16,
                 active: 1024,
                 connecting: 64,
