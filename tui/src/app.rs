@@ -280,24 +280,50 @@ impl App {
             }
         }
         walk(self, None, 0, &[], &mut out);
-        // Bots whose parent is unknown to us (deleted) still need a row.
-        for b in self.bots.values() {
-            if b.parent
-                .as_ref()
-                .is_some_and(|p| !self.bots.contains_key(p))
-                && !out.iter().any(|(x, ..)| x.name == b.name)
-            {
-                out.push((b, 0, true, Vec::new()));
+        // Whatever the walk did not reach still needs a row: a bot whose
+        // creator is gone, or a creator cycle left by delete-and-recreate.
+        // Each such bot roots its own subtree, so nothing is ever hidden.
+        fn walk_from<'a>(
+            app: &'a App,
+            parent: &str,
+            out: &mut Vec<(&'a Bot, usize, bool, Vec<bool>)>,
+        ) {
+            let kids: Vec<&Bot> = app
+                .bots
+                .values()
+                .filter(|b| {
+                    b.parent.as_deref() == Some(parent)
+                        && !out.iter().any(|(x, ..)| x.name == b.name)
+                })
+                .collect();
+            let n = kids.len();
+            for (i, kid) in kids.into_iter().enumerate() {
+                out.push((kid, 1, i + 1 == n, vec![true]));
+                walk_from(app, &kid.name, out);
             }
+        }
+        while let Some(orphan) = self
+            .bots
+            .values()
+            .find(|b| !out.iter().any(|(x, ..)| x.name == b.name))
+        {
+            out.push((orphan, 0, true, Vec::new()));
+            walk_from(self, &orphan.name, &mut out);
         }
         out
     }
 
     // ----- lifecycle -----
 
-    pub async fn attach(&mut self) -> Result<tokio::sync::mpsc::Receiver<Value>> {
+    pub async fn attach(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         let (client, events) = Client::connect(&self.socket).await?;
         self.client = Some(client.clone());
+        // Subscribe before taking the snapshot: a deletion is a live-only
+        // notice, so anything that happens after the list is seen on the
+        // stream, and nothing can fall between the two.
+        client
+            .request("follow", json!({"bot": "*", "after": self.cursor}))
+            .await?;
         let mut after: Option<String> = None;
         loop {
             let page = client
@@ -314,9 +340,6 @@ impl App {
         if self.selected.is_empty() || !self.bots.contains_key(&self.selected) {
             self.selected = self.bots.keys().next().cloned().unwrap_or_default();
         }
-        client
-            .request("follow", json!({"bot": "*", "after": self.cursor}))
-            .await?;
         self.live = false;
         Ok(events)
     }
@@ -775,7 +798,14 @@ impl App {
         }
     }
     async fn load(&mut self, name: &str) {
-        let Ok(client) = self.client() else { return };
+        // Batches of LAZY_ITEMS, pipelined, until no bare node is left.
+        while self.load_batch(name).await {}
+    }
+    /// One batch; `false` when there was nothing left to fetch.
+    async fn load_batch(&mut self, name: &str) -> bool {
+        let Ok(client) = self.client() else {
+            return false;
+        };
         let pending: Vec<(usize, i64)> = self
             .transcripts
             .get(name)
@@ -793,7 +823,7 @@ impl App {
             })
             .unwrap_or_default();
         if pending.is_empty() {
-            return;
+            return false;
         }
         let fetched = futures_util::future::join_all(pending.iter().map(|(_, node)| {
             let client = client.clone();
@@ -806,7 +836,7 @@ impl App {
         }))
         .await;
         let Some(t) = self.transcripts.get_mut(name) else {
-            return;
+            return false;
         };
         // `pending` runs from the back already, so earlier indices stay valid.
         for ((index, node), result) in pending.into_iter().zip(fetched) {
@@ -843,6 +873,7 @@ impl App {
             }
             t.items.splice(index..index + 1, replacement);
         }
+        true
     }
 
     // ----- actions -----
@@ -940,6 +971,8 @@ impl App {
                 "NAME PROVIDER/MODEL, or set AGENT_MODEL",
             ))?;
         let client = self.client()?;
+        // Compose now: an AGENTS.md edited since startup reaches this bot.
+        self.compose_instructions();
         client
             .request(
                 "create",
@@ -976,5 +1009,52 @@ pub fn fmt_secs(d: Duration) -> String {
         format!("{s}s")
     } else {
         format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with(parents: &[(&str, Option<&str>)]) -> App {
+        let mut app = App::new(
+            std::path::PathBuf::from("/nonexistent.sock"),
+            None,
+            "/tmp".into(),
+            false,
+        );
+        for (name, parent) in parents {
+            app.bots.insert(
+                (*name).to_owned(),
+                Bot {
+                    name: (*name).to_owned(),
+                    parent: parent.map(str::to_owned),
+                    ..Bot::default()
+                },
+            );
+        }
+        app
+    }
+
+    #[test]
+    fn the_tree_shows_every_bot_even_inside_a_creator_cycle() {
+        // A created B, A was deleted, B created a new A: A -> B -> A.
+        let app = app_with(&[
+            ("A", Some("B")),
+            ("B", Some("A")),
+            ("solo", None),
+            ("kid", Some("solo")),
+        ]);
+        let rows: Vec<(String, usize)> = app
+            .tree()
+            .into_iter()
+            .map(|(b, d, ..)| (b.name.clone(), d))
+            .collect();
+        assert_eq!(rows.len(), 4, "nothing hidden: {rows:?}");
+        assert!(rows.contains(&("solo".into(), 0)));
+        assert!(rows.contains(&("kid".into(), 1)));
+        let a = rows.iter().find(|(n, _)| n == "A").unwrap().1;
+        let b = rows.iter().find(|(n, _)| n == "B").unwrap().1;
+        assert_eq!(a.min(b), 0, "one member of the cycle roots it");
     }
 }

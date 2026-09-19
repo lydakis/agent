@@ -69,7 +69,13 @@ impl Client {
     /// Connect and wait for the daemon's `ready` line. Notifications (lines
     /// without an `id`) go to the returned receiver; a closed receiver means
     /// the daemon hung up.
-    pub async fn connect(socket: &Path) -> Result<(Arc<Self>, mpsc::Receiver<Value>)> {
+    ///
+    /// The receiver is unbounded on purpose: the one socket reader must never
+    /// wait for the UI to drain notifications, or a response the UI is
+    /// awaiting could sit behind them and deadlock both. The daemon already
+    /// bounds a follower by dropping it when it lags, so this queue only
+    /// ever holds what the daemon was willing to send.
+    pub async fn connect(socket: &Path) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Value>)> {
         let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
             .await
             .map_err(|_| Error::new("daemon_connect_timeout"))?
@@ -87,7 +93,7 @@ impl Client {
             return Err(Error::new("daemon_protocol_mismatch"));
         }
         let pending: Pending = Arc::default();
-        let (events, receiver) = mpsc::channel(1024);
+        let (events, receiver) = mpsc::unbounded_channel();
         let routed = pending.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -101,13 +107,16 @@ impl Client {
                         }
                     }
                     None => {
-                        if events.send(message).await.is_err() {
+                        if events.send(message).is_err() {
                             break;
                         }
                     }
                 }
             }
-            // Dropping `events` closes the receiver: the UI sees a disconnect.
+            // The socket is gone: every request still waiting fails with
+            // `daemon_disconnected` now, and dropping `events` closes the
+            // receiver so the UI sees the same.
+            routed.lock().await.clear();
         });
         Ok((
             Arc::new(Self {

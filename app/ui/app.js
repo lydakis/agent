@@ -33,12 +33,14 @@ function upsert(record) {
 }
 async function refreshBot(name) { try { upsert(await Daemon.request('resume', { bot: name })); } catch (_) {} }
 function tree() {
-  const out = [];
+  const out = []; const seen = new Set();
   const walk = (parent, depth, trail) => {
-    const kids = [...S.bots.values()].filter((b) => (parent === null ? !b.parent || !S.bots.has(b.parent) : b.parent === parent));
-    kids.forEach((b, i) => { const last = i === kids.length - 1; out.push({ b, depth, last, trail }); walk(b.name, depth + 1, trail.concat(last)); });
+    const kids = [...S.bots.values()].filter((b) => !seen.has(b.name) && (parent === null ? !b.parent || !S.bots.has(b.parent) : b.parent === parent));
+    kids.forEach((b, i) => { seen.add(b.name); const last = i === kids.length - 1; out.push({ b, depth, last, trail }); walk(b.name, depth + 1, trail.concat(last)); });
   };
   walk(null, 0, []);
+  // A creator cycle (delete and recreate) reaches nothing from the roots; root it so nothing is hidden.
+  for (const b of S.bots.values()) if (!seen.has(b.name)) { seen.add(b.name); out.push({ b, depth: 0, last: true, trail: [] }); walk(b.name, 1, [true]); }
   return out;
 }
 const treePrefix = (n) => !n.depth ? '' : n.trail.slice(1).map((l) => (l ? '  ' : '│ ')).join('') + (n.last ? '└ ' : '├ ');
@@ -167,9 +169,13 @@ function entries(item) {
   return out;
 }
 async function load(name) {
-  const t = S.transcripts.get(name); if (!t) return;
+  // Batches of LAZY_ITEMS until no bare node is left.
+  for (let guard = 0; guard < 64; guard++) { if (!(await loadBatch(name))) break; }
+}
+async function loadBatch(name) {
+  const t = S.transcripts.get(name); if (!t) return false;
   const pending = t.items.map((it, i) => [i, it]).filter(([, it]) => it.kind === 'node').slice(-LAZY_ITEMS).reverse();
-  if (!pending.length) return;
+  if (!pending.length) return false;
   const fetched = await Promise.all(pending.map(([, it]) => Daemon.request('item', { bot: name, node: it.node }).then((v) => ({ ok: v }), (e) => ({ err: String(e) }))));
   pending.forEach(([index, it], k) => {
     const r = fetched[k];
@@ -183,6 +189,7 @@ async function load(name) {
     }
     t.items.splice(index, 1, ...rep);
   });
+  return true;
 }
 async function loadVisible() {
   await load(S.selected);
@@ -345,8 +352,10 @@ async function submit(text) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
     const m = model || S.config?.model; if (!m) throw new Error('model_required: NAME PROVIDER/MODEL, or set AGENT_MODEL');
-    await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: S.config.instructions, tools: S.config.tools });
-    await refreshBot(name); await switchTo(name); toast(`created ${name} · ${S.config?.instructions_note ?? ''}`); return;
+    // Composed now, so an AGENTS.md edited since the window opened reaches this bot.
+    const policy = await Daemon.policy();
+    await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: policy.instructions, tools: S.config.tools });
+    await refreshBot(name); await switchTo(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(); return; }
   const b = bot(S.selected); if (!b) throw new Error('no bot selected; /new NAME creates one');

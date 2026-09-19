@@ -288,6 +288,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
     for (a, b) in [
         ("--all", "--bot"),
         ("--instructions", "--instructions-file"),
+        ("--agents", "--instructions"),
+        ("--agents", "--instructions-file"),
     ] {
         if has(a) && has(b) {
             return fail_with("usage", format!("{a} conflicts with {b}"));
@@ -302,6 +304,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         && [
             "--instructions",
             "--instructions-file",
+            "--agents",
             "--reasoning",
             "--budget-tokens",
         ]

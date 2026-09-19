@@ -49,19 +49,35 @@ pub struct Instructions {
     pub skills: Vec<Skill>,
 }
 
+/// Why the text could not be composed. Both are reported, never worked
+/// around: a bot created without a rule it should have had is worse than
+/// no bot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TooLong {
-    pub path: PathBuf,
-    pub total: usize,
+pub enum Failure {
+    TooLong { path: PathBuf, total: usize },
+    Unreadable { path: PathBuf, reason: String },
 }
-impl std::fmt::Display for TooLong {
+impl Failure {
+    /// A stable code for programs, in the daemon's error style.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Failure::TooLong { .. } => "instructions_limit",
+            Failure::Unreadable { .. } => "instructions_unreadable",
+        }
+    }
+}
+impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "instructions would be {} bytes with {}, above {MAX_INSTRUCTIONS}",
-            self.total,
-            self.path.display()
-        )
+        match self {
+            Failure::TooLong { path, total } => write!(
+                f,
+                "instructions would be {total} bytes with {}, above {MAX_INSTRUCTIONS}",
+                path.display()
+            ),
+            Failure::Unreadable { path, reason } => {
+                write!(f, "cannot read {}: {reason}", path.display())
+            }
+        }
     }
 }
 
@@ -96,7 +112,7 @@ pub fn agents_files(workspace: &Path) -> Vec<PathBuf> {
 
 /// Skill files: `<workspace>/.agent/skills/*.md` after `~/.agent/skills/*.md`,
 /// by name, the workspace's winning on a clash.
-pub fn skills(workspace: &Path) -> Vec<Skill> {
+pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
     let mut found: Vec<Skill> = Vec::new();
     let mut dirs = Vec::new();
     if let Some(h) = home() {
@@ -104,7 +120,9 @@ pub fn skills(workspace: &Path) -> Vec<Skill> {
     }
     dirs.push(workspace.join(".agent").join("skills"));
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut names: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
@@ -112,56 +130,86 @@ pub fn skills(workspace: &Path) -> Vec<Skill> {
             .collect();
         names.sort();
         for path in names {
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else { continue };
-            let summary = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| {
-                    text.lines()
-                        .map(|l| l.trim().trim_start_matches('#').trim())
-                        .find(|l| !l.is_empty())
-                        .map(|l| l.chars().take(160).collect::<String>())
-                })
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&path).map_err(|error| Failure::Unreadable {
+                path: path.clone(),
+                reason: error.to_string(),
+            })?;
+            let summary = text
+                .lines()
+                .map(|l| l.trim().trim_start_matches('#').trim())
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(160).collect::<String>())
                 .unwrap_or_default();
             found.retain(|s| s.name != name);
-            found.push(Skill { name, path, summary });
+            found.push(Skill {
+                name,
+                path,
+                summary,
+            });
         }
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found.truncate(MAX_SKILLS);
-    found
+    Ok(found)
 }
 
 /// The full text for a new bot in `workspace`. Fails rather than truncates
 /// when the files do not fit: a silently shortened AGENTS.md is worse than
 /// none.
-pub fn instructions(workspace: &Path) -> Result<Instructions, TooLong> {
+pub fn instructions(workspace: &Path) -> Result<Instructions, Failure> {
     let mut text = String::from(PREAMBLE);
     let mut sources = Vec::new();
     for path in agents_files(workspace) {
-        let Ok(body) = std::fs::read_to_string(&path) else { continue };
+        let body = std::fs::read_to_string(&path).map_err(|error| Failure::Unreadable {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
         let body = body.trim();
         if body.is_empty() {
             continue;
         }
         let block = format!("\n\n# Instructions from {}\n\n{body}", path.display());
         if text.len() + block.len() > MAX_INSTRUCTIONS {
-            return Err(TooLong { path, total: text.len() + block.len() });
+            return Err(Failure::TooLong {
+                path,
+                total: text.len() + block.len(),
+            });
         }
         text.push_str(&block);
-        sources.push(Source { path, bytes: body.len() });
+        sources.push(Source {
+            path,
+            bytes: body.len(),
+        });
     }
-    let skills = skills(workspace);
+    let skills = skills(workspace)?;
     if !skills.is_empty() {
-        let mut block = String::from("\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n");
+        let mut block = String::from(
+            "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n",
+        );
         for skill in &skills {
-            block.push_str(&format!("\n- {}: {} ({})", skill.name, skill.summary, skill.path.display()));
+            block.push_str(&format!(
+                "\n- {}: {} ({})",
+                skill.name,
+                skill.summary,
+                skill.path.display()
+            ));
         }
         if text.len() + block.len() > MAX_INSTRUCTIONS {
-            return Err(TooLong { path: skills[0].path.clone(), total: text.len() + block.len() });
+            return Err(Failure::TooLong {
+                path: skills[0].path.clone(),
+                total: text.len() + block.len(),
+            });
         }
         text.push_str(&block);
     }
-    Ok(Instructions { text, sources, skills })
+    Ok(Instructions {
+        text,
+        sources,
+        skills,
+    })
 }
 
 #[cfg(test)]
@@ -183,16 +231,26 @@ mod tests {
         std::fs::create_dir_all(deep.join(".agent").join("skills")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "outer rule").unwrap();
         std::fs::write(deep.join("AGENTS.md"), "# inner\n\ninner rule").unwrap();
-        std::fs::write(deep.join(".agent/skills/deploy.md"), "# Deploy\n\nShip a release safely.").unwrap();
+        std::fs::write(
+            deep.join(".agent/skills/deploy.md"),
+            "# Deploy\n\nShip a release safely.",
+        )
+        .unwrap();
         std::fs::write(deep.join(".agent/skills/notes.txt"), "not a skill").unwrap();
         let files = agents_files(&deep);
-        assert_eq!(files.iter().rev().take(2).collect::<Vec<_>>(), vec![&deep.join("AGENTS.md"), &root.join("AGENTS.md")]);
+        assert_eq!(
+            files.iter().rev().take(2).collect::<Vec<_>>(),
+            vec![&deep.join("AGENTS.md"), &root.join("AGENTS.md")]
+        );
         let composed = instructions(&deep).unwrap();
         assert!(composed.text.starts_with(PREAMBLE));
         let outer = composed.text.find("outer rule").unwrap();
         let inner = composed.text.find("inner rule").unwrap();
         assert!(outer < inner, "the nearest file is read last");
-        assert_eq!(composed.sources.iter().next_back().map(|s| s.bytes), Some("# inner\n\ninner rule".len()));
+        assert_eq!(
+            composed.sources.iter().next_back().map(|s| s.bytes),
+            Some("# inner\n\ninner rule".len())
+        );
         assert_eq!(composed.skills.len(), 1);
         assert_eq!(composed.skills[0].name, "deploy");
         assert_eq!(composed.skills[0].summary, "Deploy");
@@ -205,8 +263,22 @@ mod tests {
         let root = temp("big");
         std::fs::write(root.join("AGENTS.md"), "x".repeat(MAX_INSTRUCTIONS)).unwrap();
         let error = instructions(&root).unwrap_err();
-        assert_eq!(error.path, root.join("AGENTS.md"));
-        assert!(error.total > MAX_INSTRUCTIONS);
+        assert_eq!(error.code(), "instructions_limit");
+        assert!(
+            matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > MAX_INSTRUCTIONS)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_a_silent_omission() {
+        let root = temp("unreadable");
+        std::fs::write(root.join("AGENTS.md"), [0xff, 0xfe, b'x']).unwrap();
+        let error = instructions(&root).unwrap_err();
+        assert_eq!(error.code(), "instructions_unreadable");
+        assert!(
+            matches!(&error, Failure::Unreadable { path, .. } if *path == root.join("AGENTS.md"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

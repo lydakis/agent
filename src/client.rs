@@ -514,7 +514,10 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
 /// workspace; otherwise the preamble alone.
 fn composed_instructions(options: &Options, workspace: &str) -> Result<String> {
     if options.agents && options.instructions.is_some() {
-        return fail_with("usage", "--agents and --instructions are mutually exclusive");
+        return fail_with(
+            "usage",
+            "--agents and --instructions are mutually exclusive",
+        );
     }
     if let Some(text) = &options.instructions {
         return Ok(text.clone());
@@ -522,7 +525,7 @@ fn composed_instructions(options: &Options, workspace: &str) -> Result<String> {
     if options.agents {
         return agent_client::policy::instructions(std::path::Path::new(workspace))
             .map(|composed| composed.text)
-            .map_err(|error| Error::with("instructions_limit", error.to_string()));
+            .map_err(|error| Error::with(error.code(), error.to_string()));
     }
     Ok(DEFAULT_INSTRUCTIONS.to_owned())
 }

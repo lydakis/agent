@@ -212,7 +212,10 @@ async fn main() {
                     Some(Ok(Event::Mouse(mouse))) => {
                         let width = terminal.size().map(|s| s.width).unwrap_or(0);
                         match mouse.kind {
-                            MouseEventKind::ScrollUp => app.scroll_by(3, mouse.column, width),
+                            MouseEventKind::ScrollUp => {
+                                app.scroll_by(3, mouse.column, width);
+                                app.load_visible().await;
+                            }
                             MouseEventKind::ScrollDown => app.scroll_by(-3, mouse.column, width),
                             _ => continue,
                         }
@@ -236,7 +239,19 @@ async fn main() {
                         }
                         app.load_visible().await;
                     }
-                    None => { closed = Some("the daemon closed the session".into()); break; }
+                    None => {
+                        // EOF is either the daemon going away or this follower
+                        // dropped for lagging; the daemon sends no notice for
+                        // the latter. One attach from the cursor tells them apart.
+                        match app.attach().await {
+                            Ok(receiver) => {
+                                events = receiver;
+                                app.toast("session dropped; attached again from the cursor");
+                                app.load_visible().await;
+                            }
+                            Err(error) => { closed = Some(format!("{error}")); break; }
+                        }
+                    }
                 }
                 dirty = true;
             }
@@ -343,7 +358,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 app.load_visible().await;
             }
         }
-        (_, KeyCode::PageUp) => app.ui.scroll = app.ui.scroll.saturating_add(10),
+        (_, KeyCode::PageUp) => {
+            app.ui.scroll = app.ui.scroll.saturating_add(10);
+            app.load_visible().await;
+        }
         (_, KeyCode::PageDown) => app.ui.scroll = app.ui.scroll.saturating_sub(10),
         (_, KeyCode::End) => app.ui.scroll = 0,
         (_, KeyCode::Enter) => {

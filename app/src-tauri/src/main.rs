@@ -82,24 +82,34 @@ fn config() -> Result<Config, String> {
 /// What the page needs to create bots and to say where it is.
 #[tauri::command]
 fn setup(state: State<'_, Shared>) -> Value {
-    // The shared client policy for this workspace: preamble, AGENTS.md
-    // files, skills. Too much text falls back to the preamble and says so.
-    let workspace = std::path::Path::new(&state.config.workspace);
-    let (instructions, note) = match agent_client::policy::instructions(workspace) {
-        Ok(composed) => {
-            let note = format!("preamble + {} AGENTS.md + {} skills", composed.sources.len(), composed.skills.len());
-            (composed.text, note)
-        }
-        Err(error) => (agent_client::policy::PREAMBLE.to_owned(), format!("preamble only: {error}")),
-    };
     json!({
         "socket": state.config.socket.to_string_lossy(),
         "model": state.config.model,
         "workspace": state.config.workspace,
-        "instructions": instructions,
-        "instructions_note": note,
         "tools": ["shell", "read", "write", "edit", "wait", "history"],
     })
+}
+
+/// The shared client policy for this workspace, composed now so an edited
+/// AGENTS.md reaches the next bot: preamble, AGENTS.md files, skills. Too
+/// much or unreadable text falls back to the preamble and says so.
+#[tauri::command]
+fn policy(state: State<'_, Shared>) -> Value {
+    let workspace = std::path::Path::new(&state.config.workspace);
+    match agent_client::policy::instructions(workspace) {
+        Ok(composed) => json!({
+            "instructions": composed.text,
+            "note": format!(
+                "preamble + {} AGENTS.md + {} skills",
+                composed.sources.len(),
+                composed.skills.len()
+            ),
+        }),
+        Err(error) => json!({
+            "instructions": agent_client::policy::PREAMBLE,
+            "note": format!("preamble only: {error}"),
+        }),
+    }
 }
 
 /// Connect, list every bot, follow `*` from the page's cursor, and forward
@@ -108,6 +118,12 @@ fn setup(state: State<'_, Shared>) -> Value {
 #[tauri::command]
 async fn attach(app: AppHandle, state: State<'_, Shared>, after: i64) -> Result<Value, String> {
     let (client, mut events) = Client::connect(&state.config.socket)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Subscribe before the snapshot: deletions are live-only notices, so
+    // nothing can fall between listing and following.
+    client
+        .request("follow", json!({"bot": "*", "after": after}))
         .await
         .map_err(|e| e.to_string())?;
     let mut bots = Vec::new();
@@ -123,10 +139,6 @@ async fn attach(app: AppHandle, state: State<'_, Shared>, after: i64) -> Result<
             None => break,
         }
     }
-    client
-        .request("follow", json!({"bot": "*", "after": after}))
-        .await
-        .map_err(|e| e.to_string())?;
     *state.client.lock().await = Some(client);
     let window = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -166,7 +178,9 @@ fn main() {
             config,
             client: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![setup, attach, request, log])
+        .invoke_handler(tauri::generate_handler![
+            setup, policy, attach, request, log
+        ])
         .setup(|app| {
             let _ = app.get_webview_window("main");
             Ok(())

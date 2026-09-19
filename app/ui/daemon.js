@@ -14,6 +14,7 @@ window.Daemon = (() => {
       mode: 'live',
       log,
       setup: () => invoke('setup'),
+      policy: () => invoke('policy'),
       attach: (after) => invoke('attach', { after }),
       request: (op, params = {}) => invoke('request', { op, params }),
       onEvent: (cb) => listen('daemon', (e) => cb(e.payload)),
@@ -168,7 +169,8 @@ window.Daemon = (() => {
 
   return {
     mode: 'demo',
-    setup: async () => ({ socket: 'demo', model: 'openai/gpt-5.6-luna', workspace: '/workspace', instructions: 'demo', instructions_note: 'demo', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    setup: async () => ({ socket: 'demo', model: 'openai/gpt-5.6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    policy: async () => ({ instructions: 'demo', note: 'demo policy' }),
     attach: async () => {
       if (!S.bots.size) {
         await create('main', 'openai/gpt-5.6-luna');
