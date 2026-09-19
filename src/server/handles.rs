@@ -295,7 +295,10 @@ impl Handles {
                 let result = match parsed {
                     Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
                     Ok(Handle::Turn { bot, turn }) => {
-                        match store.call(move |db| db.turn_outcome(&bot, turn)).await {
+                        match store
+                            .op("turn_outcome", move |db| db.turn_outcome(&bot, turn))
+                            .await
+                        {
                             Ok(Some(outcome)) => Some((outcome, true)),
                             Ok(None) => None,
                             Err(error) => {
@@ -304,7 +307,10 @@ impl Handles {
                         }
                     }
                     Ok(Handle::Process(id)) => {
-                        match store.call(move |db| db.process_result(id)).await {
+                        match store
+                            .op("process_result", move |db| db.process_result(id))
+                            .await
+                        {
                             Ok(None) => Some((json!({"error":"unknown_handle"}), false)),
                             Ok(Some((_, Some(result)))) => Some((result, true)),
                             Ok(Some((_, None))) => None,

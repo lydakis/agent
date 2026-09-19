@@ -143,7 +143,7 @@ pub async fn replay(store: Store, hub: Hub, bot: String, sub: Sub) -> Result<()>
     loop {
         let (page_sub, page_bot) = (sub.clone(), bot.clone());
         let mut page = store
-            .call(move |db| {
+            .op("events_after", move |db| {
                 let mut s = page_sub.lock().unwrap();
                 if s.cancelled {
                     return Ok(json!({"events":[]}));

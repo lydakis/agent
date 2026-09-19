@@ -106,7 +106,7 @@ Rules, each with its reason:
   `--no-motion` snaps instead. Idle cost measured at 0.1% CPU.
 
 Bots are shown as a tree by creator in the rail and the switcher, from the
-record's `created_by` (schema 20: the CLI declares it from `AGENT_BOT` when a
+record's `created_by` (schema 22: the CLI declares it from `AGENT_BOT` when a
 bot's shell tool creates a peer). Bots without one, created before that,
 fall back to inference from the shell call that ran `agent run --new --bot
 NAME` at the moment the `created` event arrives, live or on replay.

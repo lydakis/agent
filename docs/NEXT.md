@@ -105,8 +105,8 @@ The first Interrogate review is complete. Its four accepted fixes cover canonica
 store ownership, byte-bounded replay, duplicate reconciliation under admission
 pressure, and selected provider-credential filtering for tools. Before expanding
 the protocol, also settle durable/live event alignment, slow-consumer handling,
-store versioning, and total versus idle provider deadlines. Conservative uncertain
-tool outcomes remain explicit; caller-directed resolution is future work.
+store versioning, and total versus idle provider deadlines. Unknown tool
+outcomes are explicit results in history; they never disable the named bot.
 
 The 2026-09-14 slice (daemon, `agent` client, two provider families, file
 tools, per-turn workspace and model, review fixes) is described in
@@ -157,20 +157,19 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    compaction that rewrites the prefix every turn can cost more in cache
    misses than it saves in tokens. Also remaining: checkpoint indexes so
    forks and reads of very old turns stop walking node metadata.
-3. Store scale, in two steps. First, done: the
-   [query-plan audit](DAEMON_MEASUREMENTS.md#query-plan-audit), now covering
-   93 runtime statement variants, found four full scans by unindexed `status` (startup
-   recovery, parked-turn resumption, the idle-exit check); schema 12 adds
-   partial indexes on the active statuses, taking each from tens of
-   milliseconds per million rows to microseconds. Second, after compaction: a
-   store-scale screen that grows one
-   store with the synthetic provider to 1 GB and then 10 GB across thousands
-   of bots and, at each size, measures daemon start and recovery, submit to
-   finish latency, window construction, `bots` and `turns` paging, a fork, a
-   delete, and a migration, with RSS and WAL size sampled throughout. The
-   2 MiB page cache means the hot indexes eventually stop fitting; the screen
-   should find where that cliff is and how WAL checkpoints behave under hours
-   of writes. Seeding costs no provider spend, only background time.
+3. Done: store scale, in two steps. First, the
+   [query-plan audit](DAEMON_MEASUREMENTS.md#query-plan-audit), covering
+   93 runtime statement variants, found four full scans by unindexed `status`;
+   schema 12 added partial indexes on the active statuses. Second, the
+   [store-scale screen](DAEMON_MEASUREMENTS.md#store-scale): one store grown
+   to 1 GB and 10 GB across 4,104 bots. In the corrected mixed workload,
+   startup, recovery, and bounded paging took tens of milliseconds; sampled
+   daemon RSS peaked at 55.7 MiB. A heavy text turn averaged 8 ms of storage
+   work with a 7.24 MiB request body, at at most eight concurrent heavy turns.
+   Deleting a bot with 596 turns and 298 shell outputs blocked the storage
+   worker for 693 ms. Cache state was uncontrolled; this is not a cold-cache
+   or capacity claim. Both stalls are addressed by items 29 and 30. Still
+   open: the WAL under hours of writes (item 16).
 4. Done: the [ten-thousand-bot screen](LIVE_FLEET.md#ten-thousand-bots)
    through the protocol. Synthetic: 10,000 bots created in 1.5 s, all
    submitted with 1,024 in flight throughout at 1,470 turns per second,
@@ -268,29 +267,23 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    never by replaying a turn, and are observable: attempt counts, provider
    request ids, and retry delays in the turn record. Leaving retries off by
    default is acceptable while the policy is new.
-11. Make `process_lost` unmistakably different from a stopped process. Shell
-   cleanup relies on a process-group guard and kill-on-drop, which cover normal
-   cleanup and cancellation but not a hard kill of the daemon; a child can
-   keep running and writing after its parent dies. The tools section says
-   so, but other recovery text and the store-initialization comment say
-   background commands "died with" the daemon while initialization only marks
-   their rows `process_lost`. Reconcile the contract to: supervision ended, the
-   command may still be running or may already have had effects, and a
-   controller must not read `process_lost` as permission to start conflicting
-   work in that workspace. Extend the restart test to observe a filesystem
-   write after killing only the daemon, not just the recovered handle's status.
-12. Retention correctness follow-ups. `prune` keeps turn rows, so submission
-   deduplication by `(bot, request_id)` survives pruning, and an expired event
-   cursor is answered with `pruned_before` and a `pruned` notice rather than an
-   empty page. Two intersections remain open: `delete` removes a bot's turn
-   rows with it, so a late retry of a deleted bot's request gets
-   `bot_not_found` rather than a duplicate (acceptable, but state it); and
-   `prune` drops a bot's old artifacts even though a fork reading through its
-   lineage could still ask for them, so either artifacts referenced by
-   surviving branches stay alive or the fork's read answers with an explicit
-   retention error. Retention and expensive historical reads should run in
-   bounded pieces on the storage thread once the queue-wait instrumentation
-   exists.
+11. Done: `process_lost` means supervision ended. The recovery text now
+    says the daemon no longer owns the process and never records its result,
+    that a hard kill of the daemon leaves children running, and that a
+    controller must not read the code as permission to start conflicting work
+    in that workspace. The restart test kills only the daemon and observes the
+    background command's write landing afterwards, not just the recovered
+    handle's status.
+12. Done: retention intersections. A late retry of a deleted bot's request
+    answers `bot_not_found`, stated in the retention section. An artifact
+    read for a turn retention has emptied answers `artifact_pruned` for the
+    producing bot and for a fork whose transcript holds the output node,
+    through the protocol operation and the model's `read`; the transcript
+    nodes that retention keeps decide it, so `artifact_not_found` and
+    `turn_not_found` keep their meanings. Deleting the producer after a fork
+    inherited its output answers the same way. Still open from the item:
+    retention and expensive historical reads in bounded pieces on the storage
+    thread; the operation histograms from item 27 show where they wait.
 13. Done: [cache-hit accounting](DAEMON_MEASUREMENTS.md#cache-hit-accounting).
    `cached_input_tokens` and `cache_hit` per turn and per bot, and
    daemon-lifetime totals in `stats`. The live check on luna and Sonnet
@@ -300,10 +293,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    raise the ratio at the price of less average context; that is item 15's
    call, so the three-quarters rule stays until the quality evaluation
    exists.
-14. Mass interrupt. Interrupting one bot is tested; stopping a thousand at
-   once, how long until their processes are gone and their turns durable, is
-   not. Cancellation latency is on the unmeasured list and matters most for
-   fleets.
+14. An exploratory [mass interrupt screen](DAEMON_MEASUREMENTS.md#mass-interrupt)
+   measured terminal events for a thousand bots in 0.2 s mid-request and
+   0.8 s with shell commands. Repeat with tracked process identities before
+   claiming that every child has stopped. The screen exposed a
+   contract gap: stopped bots refused further work. Cancellation and crash
+   recovery now close unanswered calls with honest results and keep the same
+   named bot usable. Planned calls are cancelled; executing calls without a
+   committed result report `tool_outcome_unknown`, including that execution
+   may still be running. Nothing is automatically retried. Version 20 repairs
+   previously blocked bots once at store open. Automatically continuing
+   crash-interrupted model work remains a separate policy decision; explicit
+   stops must stay stopped.
 15. Make context management accountable for task quality, not only cost. The
    window, the omission note, and the `history` tool answer whether context is
    cheap to build; they do not answer whether the agent finishes correctly
@@ -340,8 +341,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 19. Add equivalent lifecycle adapters for Pi/Codex only where native semantics
     can satisfy the same contract. Unsupported guarantees remain an explicit
     gap.
-20. The daemon supplies no implicit agent behavior. Next after item 23,
-    ahead of 13. The split that pays is mechanism in the daemon and policy
+20. Done: the daemon supplies no implicit agent behavior. The split that pays is mechanism in the daemon and policy
     in the client: anything that must be true for every client at once
     (durable truth, shared pacing and pooling, processes, cancellation, the
     model and tool loop, the per-turn invariants, resource limits and
@@ -403,27 +403,46 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     retries stay separate and count only dispatched retries. No second scheduler.
     Still open from the item: pending submissions want their own count and
     byte bound, separate from the active-turn bound.
-25. Pacing inputs per provider. The request estimate's output term is an
-    estimate, not a billing ceiling (fix the comment now). Quota identity
-    is not always model identity: some providers share limits across
-    model families and separate request, input-token, and output-token
-    limits, so put the pool key and the cost dimensions behind the
-    provider adapter without building a model registry. Unknown pools
-    admit freely until headers arrive; a small bootstrap allowance would
-    keep a cold daemon from rediscovering the limit with its first burst.
+25. Done: pacing inputs per provider. The pool key is the family's
+    (dated snapshots share their alias's pool); the estimate is a cost with
+    input and output shares, paced per dimension the provider publishes
+    (Anthropic's input and output token limits alongside the total).
+    Unknown pools admit freely within caller-selected local resource limits;
+    reported limits and 429s supply pacing feedback. No hidden cold-start cap.
+    No model registry: a shared quota the provider does not name is still
+    corrected by every response's headers.
 26. Absorption against context capacity. A boundary drains the whole
     steer snapshot in storage batches, so the absorbed total can exceed
     what the next request carries; the same is true of any turn whose own
     items outgrow the window. Budget the boundary against encoded context,
     leaving excess steers queued, as part of the compaction work.
-27. Storage counters by operation. `stats` reports the worker's cumulative
-    jobs, queued time, and ran time, which cannot show whether a few long
-    retention or history jobs dominate the tail, or separate database CPU
-    from disk wait. Label each job by operation and keep a small latency
-    histogram per label (fixed log-spaced buckets, no allocation per job),
-    so a fleet controller can see which operations are slow and how often.
-    Pays for itself in the store-scale screen (item 3). (From the second
-    Astra Pro review.)
+27. Done: storage counters by operation. Every store job is labeled by
+    the method it performs, and `stats` reports per operation the count,
+    queued and ran totals, the slowest run, and two fourteen-bucket
+    log-spaced latency histograms, at one short lock per job. Totals and
+    histograms come from one consistent snapshot, formatted outside the lock. The
+    store-scale screen (item 3) reads them. (From the second Astra Pro
+    review.)
+28. Done: bot identities. A bot has a store-wide integer `id`, allocated
+    from a sequence and never reused after delete; `create`, `fork`,
+    `resume`, `bots`, and `submit` report it and the `created` and `forked`
+    events carry it. `submit` accepts `bot_id`, and `run --bot-id N`: a retry
+    pinned to an identity the name no longer holds answers `bot_not_found`
+    with the current identity in `detail`, so a recycled name cannot absorb
+    a stale retry as fresh work. A fork is its own identity with an empty
+    request namespace. One primary-key lookup per submission. (From the
+    item 12 discussion.)
+29. Done: [retention in bounded pieces](DAEMON_MEASUREMENTS.md#retention-in-pieces-and-the-storage-reader).
+    `delete` and explicit `prune` run as series of storage jobs of four
+    turns each, so other bots' commits interleave with a large deletion; the
+    bot is marked `deleting` from the first piece and refuses work, and an
+    interrupted deletion finishes at the next open. Closes the item 12
+    leftover.
+30. Done: a [storage reader](DAEMON_MEASUREMENTS.md#retention-in-pieces-and-the-storage-reader)
+    connection on its own thread streams context items into model requests,
+    so a long history's window is no longer read on the thread every other
+    bot's commit waits for. Only byte-returning reads move; decisions stay
+    on the worker.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

@@ -47,6 +47,7 @@ struct Options {
     source: Option<String>,
     checkpoint: Option<i64>,
     request_id: Option<String>,
+    bot_id: Option<i64>,
     after: i64,
     pretty: bool,
     new: bool,
@@ -85,6 +86,7 @@ fn parse(args: &[String]) -> Result<Options> {
         source: None,
         checkpoint: None,
         request_id: None,
+        bot_id: None,
         after: 0,
         pretty: false,
         new: false,
@@ -150,6 +152,13 @@ fn parse(args: &[String]) -> Result<Options> {
                             })?)
                     }
                     "--request-id" => options.request_id = Some(value),
+                    "--bot-id" => {
+                        options.bot_id = Some(
+                            value
+                                .parse()
+                                .map_err(|_| Error::with("usage", "--bot-id needs an integer"))?,
+                        )
+                    }
                     "--keep-turns" => {
                         options.keep_turns = Some(value.parse().ok().filter(|n| *n > 0).ok_or(
                             Error::with("usage", "--keep-turns needs a positive integer"),
@@ -655,7 +664,8 @@ fn run(options: &Options) -> Result<i32> {
     // AGENT_MODEL is only a creation default, including inside a peer's shell.
     let submitted = connection.request(
         "submit",
-        json!({"bot":bot,"request_id":request_id,"prompt":prompt,"workspace":workspace,
+        json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
+            "workspace":workspace,
             "model":if created { Value::Null } else { json!(options.model) },
             "delivery":options.delivery,"expected_turn":options.turn}),
     )?;

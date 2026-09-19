@@ -123,6 +123,16 @@ class DaemonTests(ModelFixture):
         self.assertIsNone(provider['pools']['synthetic-model']['tokens_per_minute'])
         self.assertGreater(stats['store']['jobs'], 0)
         self.assertGreater(stats['store']['bytes'], 0)
+        # Every job is counted under the store method it ran, with a
+        # latency histogram whose buckets sum to the count.
+        operations = stats['store']['operations']
+        self.assertEqual(len(stats['store']['buckets_us']), 13)
+        for label in ('create', 'begin', 'append', 'finish'):
+            self.assertIn(label, operations, sorted(operations))
+            self.assertEqual(sum(operations[label]['ran']), operations[label]['count'])
+            self.assertEqual(sum(operations[label]['queued']), operations[label]['count'])
+            self.assertGreaterEqual(operations[label]['slowest_ms'], 0)
+        self.assertEqual(sum(o['count'] for o in operations.values()), stats['store']['jobs'])
         self.assertEqual(stats['handles'], {'waiters': 0, 'retained': 0})
 
     def test_stats_count_shared_transport_once_across_providers(self):

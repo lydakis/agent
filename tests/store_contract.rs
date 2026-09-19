@@ -304,47 +304,211 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
 }
 
 #[test]
-fn unrecorded_tool_outcomes_block_automatic_reexecution() {
-    let mut db = db();
-    db.create("Bob", Some("/synthetic"), binding()).unwrap();
-    let turn = db
-        .begin(
-            "Bob",
-            "request",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    let call = ToolCall {
-        name: "echo".into(),
-        call_id: "c1".into(),
-        arguments: r#"{"text":"hi"}"#.into(),
-    };
-    db.append(turn, vec![], std::slice::from_ref(&call), None)
-        .unwrap();
-    db.tool_start(turn, &call).unwrap();
-    assert_eq!(
-        db.finish(turn, Some(&Error::new("process_interrupted")))
-            .unwrap()
-            .last()
-            .unwrap()["data"]["status"],
-        "uncertain"
-    );
-    assert!(
-        db.begin(
-            "Bob",
-            "retry",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider
-        )
-        .is_err()
-    );
-    assert_eq!(db.inspect("Bob").unwrap().status, "uncertain");
+fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
+    for family in [Family::Responses, Family::Anthropic] {
+        for error in ["cancelled", "process_interrupted", "provider_failed"] {
+            let mut db = db();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    family,
+                    ..binding()
+                },
+            )
+            .unwrap();
+            let turn = db
+                .begin(
+                    "Bob",
+                    "request",
+                    "work",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let calls = ["executing", "planned"].map(|id| ToolCall {
+                name: "write".into(),
+                call_id: id.into(),
+                arguments: r#"{"path":"file","content":"hello"}"#.into(),
+            });
+            let items = match family {
+                Family::Responses => calls.iter().map(|call| json!({"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>(),
+                Family::Anthropic => vec![json!({"role":"assistant","content":calls.iter().map(|call| json!({"type":"tool_use","id":call.call_id,"name":call.name,"input":{"path":"file","content":"hello"}})).collect::<Vec<_>>()})],
+            };
+            db.append(
+                turn,
+                items
+                    .iter()
+                    .map(|item| serde_json::to_vec(item).unwrap().into())
+                    .collect(),
+                &calls,
+                None,
+            )
+            .unwrap();
+            db.tool_start(turn, &calls[0]).unwrap();
+            let events = db.finish(turn, Some(&Error::new(error))).unwrap();
+            assert_eq!(events.len(), 3);
+            assert_eq!(events[0]["data"]["outcome_unknown"], true);
+            assert_eq!(events[1]["data"]["cancelled"], true);
+            let history = stored(&mut db, "Bob");
+            for (entry, expected) in history[history.len() - 2..]
+                .iter()
+                .zip(["tool_outcome_unknown", "cancelled"])
+            {
+                let output = match family {
+                    Family::Responses => &entry["output"],
+                    Family::Anthropic => &entry["content"][0]["content"],
+                };
+                let output: Value = serde_json::from_str(output.as_str().unwrap()).unwrap();
+                assert_eq!(output["error"], expected);
+                if expected == "tool_outcome_unknown" {
+                    assert!(
+                        output["detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("may still be running")
+                    );
+                }
+            }
+            assert_eq!(
+                db.inspect("Bob").unwrap().status,
+                if error == "provider_failed" {
+                    "failed"
+                } else {
+                    "interrupted"
+                }
+            );
+            assert!(
+                db.begin(
+                    "Bob",
+                    "retry",
+                    "inspect before continuing",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider
+                )
+                .unwrap()
+                .fresh
+            );
+        }
+    }
+}
+
+#[test]
+fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
+    for (family, state) in [
+        (Family::Responses, "running"),
+        (Family::Responses, "blocked"),
+        (Family::Responses, "pruned"),
+        (Family::Anthropic, "pruned"),
+    ] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-repair-{}-{}-{state}.sqlite",
+            std::process::id(),
+            family.name()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let turn;
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    family,
+                    ..binding()
+                },
+            )
+            .unwrap();
+            turn = db
+                .begin(
+                    "Bob",
+                    "request",
+                    "write",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            let call = ToolCall {
+                name: "write".into(),
+                call_id: "c1".into(),
+                arguments: "{}".into(),
+            };
+            // Keep a completed call in the same turn. A pruned migration
+            // must repair only the unanswered suffix, not duplicate results.
+            for id in ["done", "c1"] {
+                let call = ToolCall {
+                    call_id: id.into(),
+                    ..call.clone()
+                };
+                let item = match family {
+                    Family::Responses => {
+                        json!({"type":"function_call","call_id":id,"name":"write","arguments":"{}"})
+                    }
+                    Family::Anthropic => {
+                        json!({"role":"assistant","content":[{"type":"tool_use","id":id,"name":"write","input":{}}]})
+                    }
+                };
+                db.append(
+                    turn,
+                    vec![serde_json::to_vec(&item).unwrap().into()],
+                    std::slice::from_ref(&call),
+                    None,
+                )
+                .unwrap();
+                db.tool_start(turn, &call).unwrap();
+                if id == "done" {
+                    db.tool_finish(turn, id, &result("written")).unwrap();
+                }
+            }
+        }
+        if state != "running" {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("UPDATE bots SET status='uncertain',running_turn=NULL; UPDATE turns SET status='uncertain'; PRAGMA user_version=19;").unwrap();
+            if state == "pruned" {
+                conn.execute_batch(
+                    "DELETE FROM tools; DELETE FROM events; DELETE FROM retained_turns;",
+                )
+                .unwrap();
+            }
+        }
+        let mut original = None;
+        for _ in 0..2 {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            assert_eq!(db.turn_status("Bob", turn).unwrap(), "interrupted");
+            let history = stored(&mut db, "Bob");
+            assert_eq!(history.len(), 5);
+            let encoded = match family {
+                Family::Responses => &history[4]["output"],
+                Family::Anthropic => &history[4]["content"][0]["content"],
+            };
+            let output: Value = serde_json::from_str(encoded.as_str().unwrap()).unwrap();
+            assert_eq!(output["error"], "tool_outcome_unknown");
+            if let Some(ref original) = original {
+                assert_eq!(&history, original);
+            }
+            original = Some(history);
+        }
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.begin(
+                "Bob",
+                "next",
+                "inspect and continue",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap();
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }
 
 #[test]
@@ -481,6 +645,63 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     assert!(db.item("Bob", node).is_ok());
     assert!(db.item("Other", node).is_err());
     assert!(db.item("Bob", node + 1000).is_err());
+    // Retention empties the turn: the owner and a fork holding the output
+    // node learn that, an unrelated bot and an unanswered call still do not.
+    let checkpoint = db.finish(turn, None).unwrap().last().unwrap()["data"]["checkpoint"]
+        .as_i64()
+        .unwrap();
+    db.fork(
+        "Bob",
+        "Fork",
+        Fork {
+            checkpoint: Some(checkpoint),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    let later = db
+        .begin(
+            "Bob",
+            "later",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.finish(later, None).unwrap();
+    db.prune("Bob", 1).unwrap();
+    for reader in ["Bob", "Fork"] {
+        assert_eq!(
+            db.artifact(reader, turn, "c1").unwrap_err().code,
+            "artifact_pruned"
+        );
+        assert_eq!(
+            db.artifact_page(reader, turn, "c1", "stdout", 0, 4)
+                .unwrap_err()
+                .code,
+            "artifact_pruned"
+        );
+        assert_eq!(
+            db.artifact_lines(reader, turn, "c1", "stdout", 1, 5)
+                .unwrap_err()
+                .code,
+            "artifact_pruned"
+        );
+    }
+    assert_eq!(
+        db.artifact("Other", turn, "c1").unwrap_err().code,
+        "turn_not_found"
+    );
+    assert_eq!(
+        db.artifact("Fork", turn, "c9").unwrap_err().code,
+        "turn_not_found"
+    );
+    assert_eq!(
+        db.artifact("Bob", later, "c1").unwrap_err().code,
+        "artifact_not_found"
+    );
 }
 
 #[test]
@@ -2103,7 +2324,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
 }
 
 #[test]
-fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
+fn ready_turns_wait_for_a_slot_and_survive_interrupted_predecessors() {
     let mut db = db();
     db.create("Alice", Some("/synthetic"), binding()).unwrap();
     let queue = TurnOptions {
@@ -2135,8 +2356,7 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
     );
     db.start(waiting.turn, allow_provider).unwrap();
 
-    // A turn queued behind one that ends uncertain cannot start; it fails
-    // with that reason and its waiters hear it.
+    // An interrupted predecessor closes its planned calls and releases queued work.
     db.create("Carol", Some("/synthetic"), binding()).unwrap();
     let first = db
         .begin(
@@ -2160,18 +2380,14 @@ fn ready_turns_wait_for_a_slot_and_fail_with_their_bots_reason() {
         .unwrap();
     db.finish(first.turn, Some(&Error::new("process_interrupted")))
         .unwrap();
-    assert_eq!(db.inspect("Carol").unwrap().status, "uncertain");
+    assert_eq!(db.inspect("Carol").unwrap().status, "interrupted");
     assert_eq!(db.turn_status("Carol", second.turn).unwrap(), "ready");
-    let error = db.start(second.turn, allow_provider).unwrap_err();
-    assert_eq!(error.code, "tool_outcome_uncertain");
-    let (_, outcome) = db.end_queued(second.turn, &error).unwrap();
-    assert_eq!(outcome["status"], "failed");
-    assert_eq!(outcome["error"], "tool_outcome_uncertain");
-    assert_eq!(
+    db.start(second.turn, allow_provider).unwrap();
+    db.finish(second.turn, None).unwrap();
+    assert!(
         db.begin("Carol", "c3", "again", true, &queue, allow_provider)
-            .unwrap_err()
-            .code,
-        "tool_outcome_uncertain"
+            .unwrap()
+            .fresh
     );
 }
 
@@ -2838,4 +3054,372 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
         }
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+fn bot_identities_are_assigned_in_creation_order_and_never_reused() {
+    let path = std::env::temp_dir().join(format!("agent-identity-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let (bob, event) = db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        assert_eq!((bob.id, event["data"]["id"].as_i64()), (1, Some(1)));
+        converse(&mut db, "Bob", 1);
+        let (fork, event) = db
+            .fork(
+                "Bob",
+                "Fork",
+                Fork {
+                    workspace: Some("/synthetic"),
+                    ..Fork::default()
+                },
+            )
+            .unwrap();
+        assert_eq!((fork.id, event["data"]["id"].as_i64()), (2, Some(2)));
+        assert_eq!(db.identity("Bob", Some(1)).unwrap(), 1);
+        let stale = db.identity("Fork", Some(1)).unwrap_err();
+        assert_eq!(stale.code, "bot_not_found");
+        assert!(stale.detail.unwrap().contains("identity 2"));
+        assert_eq!(
+            db.identity("Nobody", None).unwrap_err().code,
+            "bot_not_found"
+        );
+        db.delete_bot("Fork").unwrap();
+        assert_eq!(
+            db.create("Fork", Some("/synthetic"), binding())
+                .unwrap()
+                .0
+                .id,
+            3
+        );
+    }
+    // A schema-20 store numbers its bots in creation order once; a reset
+    // version keeps the identities it already has.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;
+             PRAGMA user_version=20;",
+        )
+        .unwrap();
+    }
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.inspect("Bob").unwrap().id, 1);
+        assert_eq!(db.inspect("Fork").unwrap().id, 2);
+        assert_eq!(
+            db.create("New", Some("/synthetic"), binding())
+                .unwrap()
+                .0
+                .id,
+            3
+        );
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 20).unwrap();
+    }
+    {
+        let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.inspect("New").unwrap().id, 3);
+        assert_eq!(db.list(None, 8).unwrap()["bots"][0]["id"], 1);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn identity_migration_seeds_allocation_after_sparse_and_empty_stores() {
+    for empty in [false, true] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-identity-gaps-{}-{empty}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            if !empty {
+                for name in ["First", "Deleted", "Last"] {
+                    db.create(name, Some("/synthetic"), binding()).unwrap();
+                }
+                db.delete_bot("Deleted").unwrap();
+            }
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX bots_id; ALTER TABLE bots DROP COLUMN id; DROP TABLE bot_sequence;
+                 PRAGMA user_version=20;",
+            )
+            .unwrap();
+        }
+        let last;
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let maximum = if empty {
+                0
+            } else {
+                let first = db.inspect("First").unwrap().id;
+                let last = db.inspect("Last").unwrap().id;
+                assert!(first > 0 && last > first);
+                last
+            };
+            let created = db.create("New", Some("/synthetic"), binding()).unwrap().0;
+            assert!(created.id > maximum);
+            last = db
+                .fork("New", "Fork", Fork { ..Fork::default() })
+                .unwrap()
+                .0
+                .id;
+            assert!(last > created.id);
+            db.delete_bot("Fork").unwrap();
+        }
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            assert!(db.create("AfterRestart", None, binding()).unwrap().0.id > last);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn deletion_runs_in_pieces_refuses_work_and_resumes_after_interruption() {
+    let path =
+        std::env::temp_dir().join(format!("agent-delete-pieces-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=40 {
+            converse(&mut db, "Bob", n);
+        }
+        db.fork(
+            "Bob",
+            "branch",
+            Fork {
+                workspace: Some("/synthetic"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+        for n in 41..=44 {
+            converse(&mut db, "Bob", n);
+        }
+        // Pieces of 16 turns: records, then turn rows, then nodes, then the bot.
+        let (id, first) = db.start_delete_bot("Bob", 16).unwrap();
+        assert_eq!(
+            (
+                first["done"].as_bool(),
+                first["events"].as_i64().unwrap() > 0
+            ),
+            (Some(false), true)
+        );
+        assert_eq!(db.inspect("Bob").unwrap().status, "deleting");
+        assert_eq!(db.identity("Bob", None).unwrap_err().code, "bot_not_found");
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "late",
+                "p",
+                true,
+                &TurnOptions::default(),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "bot_not_found"
+        );
+        assert_eq!(
+            db.begin(
+                "Bob",
+                "r1",
+                "p1",
+                true,
+                &TurnOptions::default(),
+                allow_provider
+            )
+            .unwrap_err()
+            .code,
+            "bot_not_found"
+        );
+        assert_eq!(
+            db.fork("Bob", "late", Fork { ..Fork::default() })
+                .unwrap_err()
+                .code,
+            "bot_not_found"
+        );
+        assert_eq!(
+            db.create("Bob", None, binding()).unwrap_err().code,
+            "bot_exists"
+        );
+        assert_eq!(db.delete_bot_piece("Bob", id, 16).unwrap()["done"], false);
+    }
+    // Reopening finishes the deletion; the branch keeps the shared prefix.
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        assert_eq!(db.inspect("Bob").unwrap_err().code, "bot_not_found");
+        assert_eq!(stored(&mut db, "branch").len(), 80);
+        assert!(
+            db.history_read("branch", 40, 0, 65536).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("p40")
+        );
+    }
+    let conn = Connection::open(&path).unwrap();
+    for (table, column) in [
+        ("turns", "bot"),
+        ("events", "bot"),
+        ("retained_turns", "bot"),
+        ("checkpoints", "bot"),
+    ] {
+        let left: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {column}='Bob'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "{table}");
+    }
+    // The branch's 80 nodes are all that survive: Bob's suffix of 8 is gone.
+    let nodes: i64 = conn
+        .query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(nodes, 80);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn explicit_prune_pieces_cover_the_same_records_as_one_pass() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=40 {
+        converse(&mut db, "Bob", n);
+    }
+    let id = db.inspect("Bob").unwrap().id;
+    let mut after = 0;
+    let mut events = 0;
+    let mut pieces = 0;
+    loop {
+        let piece = db.prune_piece("Bob", id, 2, after, 16).unwrap();
+        events += piece["events"].as_i64().unwrap();
+        pieces += 1;
+        match piece["next_after"].as_i64() {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    // 38 turns of three events each, in three pieces of at most 16 turns.
+    assert_eq!((events, pieces), (38 * 3, 3));
+    assert_eq!(db.prune("Bob", 2).unwrap()["events"], 0);
+    let page = db.events("Bob", 0, 256).unwrap();
+    assert!(page["pruned_before"].as_i64().unwrap() > 0);
+    assert_eq!(page["events"].as_array().unwrap().len(), 1 + 2 * 3);
+}
+
+#[test]
+fn stale_deletion_piece_cannot_remove_a_replacement_bot() {
+    let mut db = db();
+    let original = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    converse(&mut db, "Bob", 1);
+    converse(&mut db, "Bob", 2);
+    let (id, first) = db.start_delete_bot("Bob", 1).unwrap();
+    assert_eq!(id, original);
+    assert_eq!(first["done"], false);
+    // Another deletion finishes while the first caller is between pieces.
+    db.delete_bot("Bob").unwrap();
+    let replacement = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    assert_ne!(original, replacement);
+    converse(&mut db, "Bob", 3);
+    let history = stored(&mut db, "Bob");
+    assert_eq!(
+        db.delete_bot_piece("Bob", original, 1).unwrap_err().code,
+        "bot_not_found"
+    );
+    assert_eq!(db.inspect("Bob").unwrap().id, replacement);
+    assert_eq!(db.inspect("Bob").unwrap().status, "completed");
+    assert_eq!(stored(&mut db, "Bob"), history);
+    assert!(db.delete_bot("Bob").is_ok());
+}
+
+#[test]
+fn deletion_pieces_report_replay_gaps_until_the_bot_is_gone() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=10 {
+        converse(&mut db, "Bob", n);
+    }
+    let original = db.events("Bob", 0, 256).unwrap();
+    let first_cursor = original["events"][0]["cursor"].as_i64().unwrap();
+    let last_cursor = original["next_cursor"].as_i64().unwrap();
+    db.create("Other", None, binding()).unwrap();
+    let other = db.events("Other", 0, 256).unwrap();
+    let (id, mut piece) = db.start_delete_bot("Bob", 4).unwrap();
+    while piece["done"] != true {
+        let page = db.events("Bob", first_cursor, 256).unwrap();
+        // Deletion reserves its whole event range as a conservative gap,
+        // including the later piece that removes all remaining bot events.
+        assert_eq!(page["pruned_before"], last_cursor);
+        assert_eq!(
+            db.events_after(first_cursor, 256).unwrap()["pruned_before"],
+            last_cursor
+        );
+        assert!(
+            db.events("Bob", last_cursor, 256)
+                .unwrap()
+                .get("pruned_before")
+                .is_none()
+        );
+        assert_eq!(db.events("Other", 0, 256).unwrap(), other);
+        piece = db.delete_bot_piece("Bob", id, 4).unwrap();
+    }
+    assert_eq!(db.events("Bob", 0, 256).unwrap_err().code, "bot_not_found");
+}
+
+#[test]
+fn stale_prune_piece_preserves_replacement_records() {
+    let mut db = db();
+    let original = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    for n in 1..=10 {
+        converse(&mut db, "Bob", n);
+    }
+    let first = db.prune_piece("Bob", original, 1, 0, 4).unwrap();
+    let after = first["next_after"].as_i64().unwrap();
+    db.delete_bot("Bob").unwrap();
+    let replacement = db
+        .create("Bob", Some("/synthetic"), binding())
+        .unwrap()
+        .0
+        .id;
+    assert_ne!(original, replacement);
+    for n in 11..=12 {
+        converse(&mut db, "Bob", n);
+    }
+    let events = db.events("Bob", 0, 256).unwrap();
+    let history = stored(&mut db, "Bob");
+    // Both a delayed first piece and a continuation must reject name reuse.
+    for cursor in [0, after] {
+        assert_eq!(
+            db.prune_piece("Bob", original, 1, cursor, 4)
+                .unwrap_err()
+                .code,
+            "bot_not_found"
+        );
+        assert_eq!(db.events("Bob", 0, 256).unwrap(), events);
+        assert_eq!(stored(&mut db, "Bob"), history);
+    }
+    assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
 }

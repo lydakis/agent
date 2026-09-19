@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --agents --reasoning --request-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --agents --reasoning --request-id --bot-id --budget-tokens --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -159,6 +159,7 @@ fn print_flags(flags: &str) {
             ),
             "--reasoning" => ("LEVEL", "low, medium, high, xhigh, or max"),
             "--request-id" => ("ID", "Idempotency key for this submission"),
+            "--bot-id" => ("N", "Refuse if --bot no longer names this identity"),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
             "--pretty" => ("", "Render human-readable output"),
             "--no-spawn" => ("", "Require an already running daemon"),

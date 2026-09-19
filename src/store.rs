@@ -1,4 +1,5 @@
-//! One database worker for all agents. Durable writes never block the I/O runtime.
+//! One database worker for all agents, plus one reader for bulk context
+//! reads. Durable writes never block the I/O runtime.
 use crate::{Error, Result};
 use rusqlite::Connection;
 use std::{
@@ -14,18 +15,80 @@ pub use db::{
 };
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;
+type ReadJob = Box<dyn FnOnce(&Database) + Send>;
 /// Storage worker counters: how long jobs queued for the worker versus how
-/// long they ran on it. The split says whether the worker or the disk is the
-/// bottleneck; three clock reads per job.
+/// long they ran on it, in total and per operation. The split says whether
+/// the worker or the disk is the bottleneck; the per-operation histograms
+/// say which jobs make the tail. Three clock reads and one short lock per
+/// job; no allocation once an operation has been seen.
 #[derive(Default)]
 pub struct Counters {
-    pub jobs: std::sync::atomic::AtomicU64,
-    pub queued_ns: std::sync::atomic::AtomicU64,
-    pub ran_ns: std::sync::atomic::AtomicU64,
+    operations: std::sync::Mutex<std::collections::HashMap<&'static str, Operation>>,
+}
+/// Upper bounds of the latency buckets, in microseconds; the last bucket is
+/// everything above the last bound. Log-spaced, so a histogram of fourteen
+/// counters covers a microsecond read and a second-long retention pass.
+pub const BUCKETS_US: [u64; 13] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000,
+];
+#[derive(Default, Clone)]
+struct Operation {
+    count: u64,
+    queued_ns: u64,
+    ran_ns: u64,
+    slowest_ns: u64,
+    ran: [u64; BUCKETS_US.len() + 1],
+    queued: [u64; BUCKETS_US.len() + 1],
+}
+fn bucket(ns: u64) -> usize {
+    let us = ns / 1_000;
+    BUCKETS_US
+        .iter()
+        .position(|bound| us < *bound)
+        .unwrap_or(BUCKETS_US.len())
+}
+impl Counters {
+    fn record(&self, label: &'static str, queued_ns: u64, ran_ns: u64) {
+        let mut operations = self.operations.lock().unwrap();
+        let operation = operations.entry(label).or_default();
+        operation.count += 1;
+        operation.queued_ns += queued_ns;
+        operation.ran_ns += ran_ns;
+        operation.slowest_ns = operation.slowest_ns.max(ran_ns);
+        operation.ran[bucket(ran_ns)] += 1;
+        operation.queued[bucket(queued_ns)] += 1;
+    }
+    fn snapshot(&self) -> serde_json::Value {
+        // Copy the small fixed-size records while locked; JSON construction
+        // and aggregate sums cannot stall the worker or observe later writes.
+        let operations = self.operations.lock().unwrap().clone();
+        let (mut jobs, mut queued_ns, mut ran_ns) = (0u64, 0u64, 0u64);
+        let mut out = serde_json::Map::new();
+        for (label, o) in operations.iter() {
+            jobs += o.count;
+            queued_ns += o.queued_ns;
+            ran_ns += o.ran_ns;
+            out.insert(
+                (*label).to_owned(),
+                serde_json::json!({"count": o.count, "queued_ms": o.queued_ns / 1_000_000,
+                    "ran_ms": o.ran_ns / 1_000_000, "slowest_ms": o.slowest_ns / 1_000_000,
+                    "ran": o.ran, "queued": o.queued}),
+            );
+        }
+        serde_json::json!({
+            "jobs": jobs,
+            "queued_ms": queued_ns / 1_000_000,
+            "ran_ms": ran_ns / 1_000_000,
+            "buckets_us": BUCKETS_US,
+            "operations": out,
+        })
+    }
 }
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Job>,
+    reader: mpsc::Sender<ReadJob>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
 }
@@ -124,9 +187,39 @@ impl Store {
         let store_path = opened
             .await
             .map_err(|_| Error::new("storage_worker_failed"))??;
+        // A second connection on its own thread for reads that carry bytes
+        // rather than decide anything: streaming a context window out of
+        // the store must not hold every other bot's commit behind it. It
+        // opens after the worker, so the file, its WAL, and the current
+        // schema exist, and it sees each job's commit once that job is done.
+        let (reader, mut reads) = mpsc::channel::<ReadJob>(32);
+        let (ready, opened) = oneshot::channel();
+        let reader_path = store_path.clone();
+        std::thread::Builder::new()
+            .name("agent-storage-reader".into())
+            .spawn(move || {
+                let db = Connection::open(&reader_path)
+                    .map_err(Error::from)
+                    .and_then(Database::reader);
+                match db {
+                    Ok(db) => {
+                        let _ = ready.send(Ok(()));
+                        while let Some(job) = reads.blocking_recv() {
+                            job(&db);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            })?;
+        opened
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))??;
         Ok((
             Self {
                 sender,
+                reader,
                 path: std::sync::Arc::new(store_path),
                 counters: std::sync::Arc::default(),
             },
@@ -136,45 +229,136 @@ impl Store {
 
     /// Worker counters and on-disk size, for `stats`.
     pub fn stats(&self) -> serde_json::Value {
-        use std::sync::atomic::Ordering::Relaxed;
         let size = |suffix: &str| {
             let mut name = self.path.as_os_str().to_owned();
             name.push(suffix);
             std::fs::metadata(name).map(|m| m.len()).unwrap_or(0)
         };
-        serde_json::json!({
-            "bytes": size(""),
-            "wal_bytes": size("-wal"),
-            "jobs": self.counters.jobs.load(Relaxed),
-            "queued_ms": self.counters.queued_ns.load(Relaxed) / 1_000_000,
-            "ran_ms": self.counters.ran_ns.load(Relaxed) / 1_000_000,
-        })
+        let mut stats = self.counters.snapshot();
+        stats["bytes"] = size("").into();
+        stats["wal_bytes"] = size("-wal").into();
+        stats
     }
 
-    pub async fn call<T: Send + 'static>(
+    /// Run a job on the storage worker, counted under `label`: the store
+    /// method it performs, as `stats` reports it.
+    pub async fn op<T: Send + 'static>(
         &self,
+        label: &'static str,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        use std::sync::atomic::Ordering::Relaxed;
         let (sender, receiver) = oneshot::channel();
         let counters = self.counters.clone();
         let queued = std::time::Instant::now();
         self.sender
             .send(Box::new(move |db| {
                 let started = std::time::Instant::now();
-                counters
-                    .queued_ns
-                    .fetch_add((started - queued).as_nanos() as u64, Relaxed);
                 let _ = sender.send(operation(db));
-                counters
-                    .ran_ns
-                    .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
-                counters.jobs.fetch_add(1, Relaxed);
+                counters.record(
+                    label,
+                    (started - queued).as_nanos() as u64,
+                    started.elapsed().as_nanos() as u64,
+                );
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;
         receiver
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?
+    }
+    /// Run a read on the reader connection, counted like any job. Only for
+    /// reads whose result is bytes for a caller, never for decisions that
+    /// must see the write the caller is about to make.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (sender, receiver) = oneshot::channel();
+        let counters = self.counters.clone();
+        let queued = std::time::Instant::now();
+        self.reader
+            .send(Box::new(move |db| {
+                let started = std::time::Instant::now();
+                let _ = sender.send(operation(db));
+                counters.record(
+                    label,
+                    (started - queued).as_nanos() as u64,
+                    started.elapsed().as_nanos() as u64,
+                );
+            }))
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))?;
+        receiver
+            .await
+            .map_err(|_| Error::new("storage_worker_failed"))?
+    }
+    /// A job without a named operation, counted as `other`.
+    pub async fn call<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.op("other", operation).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn live_counter_snapshots_reconcile_totals_and_histograms() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (reader, _reads) = mpsc::channel(1);
+        let store = Store {
+            sender,
+            reader,
+            path: Arc::new(std::path::PathBuf::new()),
+            counters: Arc::default(),
+        };
+        let start = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let counters = store.counters.clone();
+            let ready = start.clone();
+            scope.spawn(move || {
+                ready.wait();
+                for index in 0..100_000 {
+                    counters.record(
+                        if index % 2 == 0 { "read" } else { "write" },
+                        1_000_000,
+                        2_000_000,
+                    );
+                }
+            });
+            start.wait();
+            for _ in 0..2_000 {
+                let stats = store.stats();
+                let operations = stats["operations"].as_object().unwrap();
+                for (total, field) in [
+                    ("jobs", "count"),
+                    ("queued_ms", "queued_ms"),
+                    ("ran_ms", "ran_ms"),
+                ] {
+                    let sum: u64 = operations
+                        .values()
+                        .map(|o| o[field].as_u64().unwrap())
+                        .sum();
+                    assert_eq!(stats[total].as_u64().unwrap(), sum, "{total}");
+                }
+                for operation in operations.values() {
+                    for histogram in ["ran", "queued"] {
+                        let sum: u64 = operation[histogram]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|n| n.as_u64().unwrap())
+                            .sum();
+                        assert_eq!(sum, operation["count"].as_u64().unwrap());
+                    }
+                }
+            }
+        });
+        assert_eq!(store.stats()["jobs"], 100_000);
     }
 }

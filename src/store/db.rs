@@ -16,6 +16,9 @@ const STEER_BATCH_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
+    /// Store-wide identity, never reused after deletion. A name can be
+    /// recycled; a retry that carries the id cannot land on the new holder.
+    pub id: i64,
     pub head: Option<i64>,
     /// Lifetime cap on input plus output tokens; checked before each model call.
     pub budget_tokens: Option<u64>,
@@ -219,7 +222,23 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 20;
+    pub const SCHEMA: i32 = 22;
+    /// Turns per retention piece: a delete or explicit prune of a large bot
+    /// runs as a series of jobs this size, so other bots' work interleaves.
+    /// Small, because every job of a turn in flight can land behind one
+    /// piece; a piece of four turns' records runs in about two milliseconds.
+    pub const RETENTION_PIECE: usize = 4;
+
+    /// A second connection that only reads. The writer owns the file, its
+    /// lock, migration, and recovery; this one sees each job's commit once
+    /// it is done and never takes the write lock.
+    pub fn reader(conn: Connection) -> Result<Self> {
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-2048;")?;
+        Ok(Self {
+            conn,
+            outcomes: Vec::new(),
+        })
+    }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -259,6 +278,7 @@ impl Database {
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO node_sequence VALUES (1,0);
             CREATE TABLE IF NOT EXISTS bots(name TEXT PRIMARY KEY, head INTEGER REFERENCES nodes(id),
+                id INTEGER NOT NULL,
                 workspace TEXT, status TEXT NOT NULL, running_turn INTEGER,
                 provider TEXT NOT NULL, family TEXT NOT NULL, model TEXT NOT NULL,
                 instructions TEXT NOT NULL, reasoning TEXT,
@@ -269,6 +289,10 @@ impl Database {
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
+            CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                last_id INTEGER NOT NULL CHECK(last_id>=0));
+            INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
@@ -312,13 +336,14 @@ impl Database {
             CREATE INDEX IF NOT EXISTS turns_steers ON turns(bot,id) WHERE status='queued' AND delivery='steer';
             CREATE INDEX IF NOT EXISTS turns_ready ON turns(id) WHERE status='ready';
             CREATE INDEX IF NOT EXISTS turns_ready_bot ON turns(bot) WHERE status='ready';
-            CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';")?;
+            CREATE INDEX IF NOT EXISTS processes_running ON processes(turn) WHERE status='running';
+            CREATE INDEX IF NOT EXISTS bots_deleting ON bots(name) WHERE status='deleting';")?;
         if version != Self::SCHEMA {
             tx.pragma_update(None, "user_version", Self::SCHEMA)?;
         }
         tx.commit()?;
-        // Background commands died with the previous daemon; their handles
-        // must report loss rather than resolve to some later command.
+        // Background command ownership is lost across daemon restart. This
+        // does not prove the OS process stopped; never reuse its handle.
         conn.execute(
             "UPDATE processes SET status='lost',result=? WHERE status='running'",
             [json!({"error":"process_lost"}).to_string()],
@@ -327,6 +352,16 @@ impl Database {
             conn,
             outcomes: Vec::new(),
         };
+        // A deletion interrupted between pieces finishes now: the bot was
+        // already refusing work, and nothing else may see it half gone.
+        let deleting: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM bots WHERE status='deleting'")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for name in deleting {
+            db.delete_bot(&name)?;
+        }
         // A committed tool intent without a result is never automatically
         // retried. Turns parked on handles keep their state and resume.
         let pending: Vec<i64> = db
@@ -433,10 +468,11 @@ impl Database {
             input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
-            created_by: r.get(15)?,
+            id: r.get(15)?,
+            created_by: r.get(16)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,created_by";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by";
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -454,7 +490,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,created_by
+                    input_tokens,cached_input_tokens,id,created_by
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -462,7 +498,8 @@ impl Database {
         let mut bytes = 0;
         let mut more = false;
         while let Some(r) = rows.next()? {
-            let bot = json!({"name":r.get::<_, String>(0)?,"head":r.get::<_, Option<i64>>(1)?,
+            let bot = json!({"name":r.get::<_, String>(0)?,"id":r.get::<_, i64>(14)?,
+                "head":r.get::<_, Option<i64>>(1)?,
                 "workspace":r.get::<_, Option<String>>(2)?,"status":r.get::<_, String>(3)?,
                 "running_turn":r.get::<_, Option<i64>>(4)?,"provider":r.get::<_, String>(5)?,
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
@@ -471,7 +508,7 @@ impl Database {
                 "tools":split_tools(&r.get::<_, String>(11)?),
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
                 "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
-                "created_by":r.get::<_, Option<String>>(14)?});
+                "created_by":r.get::<_, Option<String>>(15)?});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -503,10 +540,12 @@ impl Database {
             return fail("bot_exists");
         }
         let tx = self.conn.transaction()?;
+        let id = identity(&tx)?;
         tx.execute(
-            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
             params![
                 name,
+                id,
                 workspace,
                 binding.provider,
                 binding.family.name(),
@@ -518,7 +557,7 @@ impl Database {
                 binding.created_by
             ],
         )?;
-        let data = json!({"model":format!("{}/{}", binding.provider, binding.model),
+        let data = json!({"id":id,"model":format!("{}/{}", binding.provider, binding.model),
             "created_by":binding.created_by});
         let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
@@ -857,6 +896,29 @@ impl Database {
 
     /// Reconcile duplicates first, then validate the effective provider using
     /// the bot already loaded for admission, before any durable mutation.
+    /// The identity currently holding `name`. A submission that carries the
+    /// identity it was first made against is refused once the name belongs to
+    /// another bot, so a late retry never becomes fresh work on a namesake.
+    pub fn identity(&self, name: &str, expected: Option<i64>) -> Result<i64> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .prepare_cached("SELECT id,status FROM bots WHERE name=?")?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((id, status)) = row else {
+            return fail("bot_not_found");
+        };
+        if status == "deleting" {
+            return fail_with("bot_not_found", format!("{name} is being deleted"));
+        }
+        match expected {
+            Some(expected) if expected != id => fail_with(
+                "bot_not_found",
+                format!("{name} is identity {id}; identity {expected} no longer exists"),
+            ),
+            _ => Ok(id),
+        }
+    }
     pub fn begin(
         &mut self,
         name: &str,
@@ -866,6 +928,15 @@ impl Database {
         options: &TurnOptions,
         validate: impl Fn(&Bot, Option<&str>) -> Result<()>,
     ) -> Result<Started> {
+        // A bot being deleted refuses work before its turn rows are gone,
+        // so a retry cannot be answered from records about to vanish.
+        let deleting: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM bots WHERE name=? AND status='deleting')")?
+            .query_row([name], |r| r.get(0))?;
+        if deleting {
+            return fail_with("bot_not_found", format!("{name} is being deleted"));
+        }
         let prior: Option<(i64, String, String, TurnOptions)> = self
             .conn
             .query_row(
@@ -941,9 +1012,6 @@ impl Database {
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
             return fail("bot_busy");
-        }
-        if bot.status == "uncertain" {
-            return fail("tool_outcome_uncertain");
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
@@ -1051,9 +1119,6 @@ impl Database {
             self.conn
                 .execute("UPDATE turns SET status='queued' WHERE id=?", [turn])?;
             return fail("bot_busy");
-        }
-        if bot.status == "uncertain" {
-            return fail("tool_outcome_uncertain");
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
@@ -1366,18 +1431,31 @@ impl Database {
         let tx = self.conn.transaction()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        if let Some(waiting) = &waiting {
-            // A parked turn's wait, and the planned calls behind it, never had
-            // an external effect. Answer them so the conversation stays valid
-            // for continuation, instead of leaving the bot uncertain.
-            let unanswered: Vec<String> = tx
-                .prepare("SELECT call_id FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
-                .query_map([turn], |r| r.get(0))?
+        // Complete the transcript, not the external operation. Dropped native
+        // I/O and background commands can outlive cancellation or a crash.
+        // Report missing outcomes honestly and leave the bot usable; never
+        // automatically repeat a tool whose result was not committed.
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
+            [turn],
+            |r| r.get(0),
+        )?;
+        if pending {
+            let unanswered: Vec<(String, String)> = tx
+                .prepare("SELECT call_id,status FROM tools WHERE turn=? AND status IN ('planned','executing') ORDER BY rowid")?
+                .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             let family = bot.family()?;
-            for call_id in unanswered {
-                let output = json!({"error":"cancelled","detail":"turn interrupted while parked"})
-                    .to_string();
+            for (call_id, status) in unanswered {
+                let unknown = status == "executing" && waiting.is_none();
+                let detail = if unknown {
+                    "turn ended before this tool's result was recorded; it may have had effects and may still be running. Inspect the current state before retrying"
+                } else if waiting.is_some() && status == "executing" {
+                    "turn interrupted while parked"
+                } else {
+                    "turn ended before this call ran"
+                };
+                let output = json!({"error":if unknown { "tool_outcome_unknown" } else { "cancelled" },"detail":detail}).to_string();
                 let item = family.tool_result_item(&call_id, &output)?;
                 let id = node(&tx, head, &item)?;
                 head = Some(id);
@@ -1385,24 +1463,21 @@ impl Database {
                     "UPDATE tools SET status='completed' WHERE turn=? AND call_id=?",
                     params![turn, call_id],
                 )?;
-                let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":true});
+                let data = json!({"call_id":call_id,"node":id,"artifacts":[],"cancelled":!unknown,"outcome_unknown":unknown});
                 let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
                 entries.push(entry(cursor, &bot.name, Some(turn), "tool_completed", data));
             }
+        }
+        if let Some(waiting) = &waiting {
             tx.execute(
                 "UPDATE turns SET waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
                 params![waiting.paced_elapsed_ms(), turn],
             )?;
         }
-        let pending: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tools WHERE turn=? AND status IN ('planned','executing'))",
-            [turn],
-            |r| r.get(0),
-        )?;
         let code = error.map(|e| e.code.as_str());
-        let status = if pending {
-            "uncertain"
-        } else if matches!(code, Some("process_interrupted" | "cancelled")) {
+        let status = if matches!(code, Some("process_interrupted" | "cancelled"))
+            || (pending && code.is_none())
+        {
             "interrupted"
         } else if code.is_some() {
             "failed"
@@ -1759,11 +1834,10 @@ impl Database {
     /// Branch a new bot from any message in the source's history. Without a
     /// node, the source's current head is used and the source must be idle,
     /// since a live head is still moving. The point must leave no tool call
-    /// unanswered; the source itself is never changed.
-    /// Branch a bot at a history node. The fork keeps the source's binding;
-    /// `instructions` replaces the source's text for the new bot only, so a
-    /// changed AGENTS.md reaches a fresh bot while every existing one stays
-    /// immutable.
+    /// unanswered; the source itself is never changed. The fork keeps the
+    /// source's binding; `instructions` replaces the source's text for the
+    /// new bot only, so a changed AGENTS.md reaches a fresh bot while every
+    /// existing one stays immutable.
     pub fn fork(&mut self, source: &str, name: &str, fork: Fork<'_>) -> Result<(Bot, Value)> {
         let Fork {
             checkpoint: node,
@@ -1793,11 +1867,16 @@ impl Database {
         if self.exists(name)? {
             return fail("bot_exists");
         }
+        if parent.status == "deleting" {
+            return fail_with("bot_not_found", format!("{source} is being deleted"));
+        }
         let tx = self.conn.transaction()?;
+        let id = identity(&tx)?;
         tx.execute(
-            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
             params![
                 name,
+                id,
                 checkpoint,
                 workspace,
                 parent.provider,
@@ -1813,7 +1892,7 @@ impl Database {
         if let Some(node) = checkpoint {
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
         }
-        let data = json!({"source":source,"checkpoint":checkpoint,"node":checkpoint,
+        let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "created_by":created_by});
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
@@ -1892,62 +1971,141 @@ impl Database {
     /// Remove an idle bot with everything only it owns: its turns, tool
     /// intents, processes, artifacts, events, checkpoints, and the history
     /// nodes no other bot's lineage reaches. Shared prefixes stay for forks.
+    /// Remove a bot and everything only it owns, running every piece to
+    /// completion on this thread. Services run the pieces as separate jobs.
     pub fn delete_bot(&mut self, name: &str) -> Result<Value> {
+        let (id, mut piece) = self.start_delete_bot(name, Self::RETENTION_PIECE)?;
+        let mut totals = json!({"turns":0,"events":0,"nodes":0});
+        loop {
+            for key in ["turns", "events", "nodes"] {
+                totals[key] =
+                    json!(totals[key].as_i64().unwrap_or(0) + piece[key].as_i64().unwrap_or(0));
+            }
+            if piece["done"] == true {
+                return Ok(totals);
+            }
+            piece = self.delete_bot_piece(name, id, Self::RETENTION_PIECE)?;
+        }
+    }
+    /// Bind a synchronous deletion to the current identity and commit its
+    /// first piece using the same loaded record.
+    pub fn start_delete_bot(&mut self, name: &str, piece: usize) -> Result<(i64, Value)> {
         let bot = self.inspect(name)?;
-        if bot.running_turn.is_some() {
-            return fail("bot_busy");
+        let id = bot.id;
+        Ok((id, self.delete_bot_piece_for(name, bot, piece)?))
+    }
+    /// One bounded piece of a deletion. The first piece checks the bot is
+    /// idle and marks it `deleting`, after which it refuses new work; each
+    /// later piece drops the records of up to `piece` turns, then the turn
+    /// rows, then up to `piece` nodes of the exclusive suffix with `head`
+    /// moved back as they go, so an interruption resumes exactly. The last
+    /// piece removes the bot row and answers `done`.
+    pub fn delete_bot_piece(
+        &mut self,
+        name: &str,
+        expected_id: i64,
+        piece: usize,
+    ) -> Result<Value> {
+        let bot = self.inspect(name)?;
+        if bot.id != expected_id {
+            return fail("bot_not_found");
         }
-        let running: bool = self
-            .conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
-             WHERE t.bot=? AND p.status='running')
-             OR EXISTS(SELECT 1 FROM turns WHERE bot=? AND status IN ('queued','ready'))",
-            )?
-            .query_row([name, name], |r| r.get(0))?;
-        if running {
-            return fail("bot_busy");
-        }
+        self.delete_bot_piece_for(name, bot, piece)
+    }
+    fn delete_bot_piece_for(&mut self, name: &str, bot: Bot, piece: usize) -> Result<Value> {
+        let piece = piece.max(1) as i64;
         let tx = self.conn.transaction()?;
-        // Preserve identity before freeing the suffix, in the same transaction.
-        // The head is the largest ID on this append-only lineage. Together
-        // with surviving nodes, this floor covers every committed node ID.
-        if let Some(head) = bot.head {
-            tx.execute(
-                "UPDATE node_sequence SET last_id=MAX(last_id,?) WHERE singleton=1",
-                [head],
-            )?;
-        }
-        let mut deleted = json!({"turns":0,"events":0,"nodes":0});
-        for (table, key) in [
-            ("artifacts", "turn"),
-            ("processes", "turn"),
-            ("tools", "turn"),
-        ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE {key} IN (SELECT id FROM turns WHERE bot=?)"),
+        let mut out = json!({"turns":0,"events":0,"nodes":0,"done":false});
+        if bot.status != "deleting" {
+            if bot.running_turn.is_some() {
+                return fail("bot_busy");
+            }
+            let running: bool = tx
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM turns t JOIN processes p ON p.turn=t.id
+                 WHERE t.bot=? AND p.status='running')
+                 OR EXISTS(SELECT 1 FROM turns WHERE bot=? AND status IN ('queued','ready'))",
+                )?
+                .query_row([name, name], |r| r.get(0))?;
+            if running {
+                return fail("bot_busy");
+            }
+            // Preserve identity before freeing the suffix, in the same transaction.
+            // The head is the largest ID on this append-only lineage. Together
+            // with surviving nodes, this floor covers every committed node ID.
+            if let Some(head) = bot.head {
+                tx.execute(
+                    "UPDATE node_sequence SET last_id=MAX(last_id,?) WHERE singleton=1",
+                    [head],
+                )?;
+            }
+            // Reserve the deletion's event range for both replay scopes before
+            // any piece commits. RETURNING shares the existing indexed lookup
+            // with the global watermark, without another query per piece.
+            let pruned: i64 = tx.query_row(
+                "UPDATE bots SET status='deleting',context_start=NULL,
+                    pruned_cursor=MAX(pruned_cursor,
+                        COALESCE((SELECT MAX(id) FROM events WHERE bot=?1),0))
+                 WHERE name=?1 RETURNING pruned_cursor",
                 [name],
+                |r| r.get(0),
             )?;
+            tx.execute(
+                "UPDATE event_retention SET pruned_cursor=MAX(pruned_cursor,?) WHERE singleton=1",
+                [pruned],
+            )?;
+            // Its checkpoints reference nodes the walk below will free.
+            tx.execute("DELETE FROM checkpoints WHERE bot=?", [name])?;
         }
-        tx.execute(
-            "UPDATE event_retention SET pruned_cursor=MAX(pruned_cursor,
-                COALESCE((SELECT MAX(id) FROM events WHERE bot=?),0)) WHERE singleton=1",
-            [name],
-        )?;
-        deleted["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
-        tx.execute("DELETE FROM checkpoints WHERE bot=?", [name])?;
-        deleted["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
-        tx.execute("DELETE FROM bots WHERE name=?", [name])?;
+        // Operational records, a piece of turns at a time.
+        let turns: Vec<i64> = tx
+            .prepare_cached("SELECT turn FROM retained_turns WHERE bot=? ORDER BY turn LIMIT ?")?
+            .query_map(params![name, piece], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !turns.is_empty() {
+            let mut events = 0;
+            for turn in &turns {
+                for table in ["artifacts", "processes", "tools"] {
+                    tx.prepare_cached(&format!("DELETE FROM {table} WHERE turn=?"))?
+                        .execute([turn])?;
+                }
+                events += tx
+                    .prepare_cached("DELETE FROM events WHERE turn=?")?
+                    .execute([turn])?;
+                tx.prepare_cached("DELETE FROM retained_turns WHERE turn=?")?
+                    .execute([turn])?;
+            }
+            out["events"] = json!(events);
+            tx.commit()?;
+            return Ok(out);
+        }
+        // Then the turn rows and what remains keyed by the bot alone.
+        let has_turns: bool = tx
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM turns WHERE bot=?)")?
+            .query_row([name], |r| r.get(0))?;
+        if has_turns {
+            out["events"] = json!(tx.execute("DELETE FROM events WHERE bot=?", [name])?);
+            out["turns"] = json!(tx.execute("DELETE FROM turns WHERE bot=?", [name])?);
+            tx.commit()?;
+            return Ok(out);
+        }
         // Walk back from the head, freeing nodes until one is still reached
         // by another bot: as a head, a saved context start, or a parent of
         // a surviving branch. A fork's own suffix is what it leaves behind.
+        // Nodes are small rows; a piece of them is a multiple of the turn piece.
         let mut node = bot.head;
         let mut freed = 0;
         while let Some(id) = node {
+            if freed == piece * 32 {
+                tx.execute("UPDATE bots SET head=? WHERE name=?", params![id, name])?;
+                out["nodes"] = json!(freed);
+                tx.commit()?;
+                return Ok(out);
+            }
             let referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bots WHERE head=?1 OR context_start=?1)
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1))
                     OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)",
-                [id],
+                params![id, name],
                 |r| r.get(0),
             )?;
             if referenced {
@@ -1955,13 +2113,17 @@ impl Database {
             }
             let parent: Option<i64> =
                 tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
+            tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
         }
-        deleted["nodes"] = json!(freed);
+        tx.execute("DELETE FROM events WHERE bot=?", [name])?;
+        tx.execute("DELETE FROM bots WHERE name=?", [name])?;
+        out["nodes"] = json!(freed);
+        out["done"] = json!(true);
         tx.commit()?;
-        Ok(deleted)
+        Ok(out)
     }
     /// Keep unfinished work and the preceding `keep_turns` turns' records.
     /// With no unfinished work, keep the newest `keep_turns`. Drop the rest of the
@@ -1980,10 +2142,42 @@ impl Database {
         keep_turns: usize,
         protect: Option<i64>,
     ) -> Result<Value> {
-        // Retention only needs identity, not a copy of instructions and binding.
         if !self.exists(name)? {
             return fail("bot_not_found");
         }
+        self.prune_records(name, keep_turns, protect, 0, None)
+    }
+    /// One identity-bound piece: the records of up to `limit` prunable turns
+    /// after `after`, oldest first. `next_after` names where the next piece
+    /// starts, or is null when this one reached the retention boundary.
+    pub fn prune_piece(
+        &mut self,
+        name: &str,
+        expected_id: i64,
+        keep_turns: usize,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
+        // Replace the existing existence read with an identity check. The
+        // worker cannot interleave another mutation inside this storage job.
+        let matches: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM bots WHERE name=? AND id=?)")?
+            .query_row(params![name, expected_id], |r| r.get(0))?;
+        if !matches {
+            return fail("bot_not_found");
+        }
+        self.prune_records(name, keep_turns, None, after, Some(limit))
+    }
+    /// Without a limit the whole prune is one piece, as completion needs.
+    fn prune_records(
+        &mut self,
+        name: &str,
+        keep_turns: usize,
+        protect: Option<i64>,
+        after: i64,
+        limit: Option<usize>,
+    ) -> Result<Value> {
         if keep_turns == 0 {
             return fail("invalid_retention");
         }
@@ -2004,42 +2198,47 @@ impl Database {
             .query_row(params![name, (keep_turns - 1) as i64], |r| r.get(0))
             .optional()?;
         let Some(floor) = floor else {
-            return Ok(json!({"events":0,"pruned_cursor":Value::Null}));
+            return Ok(json!({"events":0,"pruned_cursor":Value::Null,"next_after":Value::Null}));
         };
         let tx = self.conn.transaction()?;
-        for table in ["artifacts", "processes", "tools"] {
-            // The candidate index contains only this bot's unpruned turns, not
-            // its entire history or operational records owned by other bots.
+        // The candidate index contains only this bot's unpruned turns, not
+        // its entire history or operational records owned by other bots.
+        let turns: Vec<i64> = tx
+            .prepare_cached(
+                "SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
+                 ORDER BY turn LIMIT ?5",
+            )?
+            .query_map(
+                params![name, floor, protect, after, limit.map(|l| l as i64).unwrap_or(-1)],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut events = 0;
+        let mut cursor: Option<i64> = None;
+        for turn in &turns {
             // Background commands may outlive their launching turn; their
             // running row is required when the result commits and waiters wake.
-            let finished = if table == "processes" {
-                "AND status!='running'"
-            } else {
-                ""
-            };
-            tx.prepare_cached(&format!(
-                "DELETE FROM {table} WHERE turn IN
-                 (SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3)
-                 {finished}"
-            ))?
-            .execute(params![name, floor, protect])?;
+            tx.prepare_cached("DELETE FROM artifacts WHERE turn=?")?
+                .execute([turn])?;
+            tx.prepare_cached("DELETE FROM processes WHERE turn=? AND status!='running'")?
+                .execute([turn])?;
+            tx.prepare_cached("DELETE FROM tools WHERE turn=?")?
+                .execute([turn])?;
+            let last: Option<i64> = tx
+                .prepare_cached("SELECT MAX(id) FROM events WHERE turn=?")?
+                .query_row([turn], |r| r.get(0))?;
+            cursor = cursor.max(last);
+            events += tx
+                .prepare_cached("DELETE FROM events WHERE turn=?")?
+                .execute([turn])?;
+            // Keep pending background results discoverable by later prunes, even
+            // after their launching turn's events and tool records are gone.
+            tx.prepare_cached(
+                "DELETE FROM retained_turns WHERE turn=?1
+                 AND NOT EXISTS(SELECT 1 FROM processes WHERE turn=?1 AND status='running')",
+            )?
+            .execute([turn])?;
         }
-        let cursor: Option<i64> = tx.query_row(
-            "SELECT MAX(id) FROM events WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3",
-            params![name, floor, protect],
-            |r| r.get(0),
-        )?;
-        let events = tx.execute(
-            "DELETE FROM events WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3",
-            params![name, floor, protect],
-        )?;
-        // Keep pending background results discoverable by later prunes, even
-        // after their launching turn's events and tool records are gone.
-        tx.prepare_cached(
-            "DELETE FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3
-             AND NOT EXISTS(SELECT 1 FROM processes WHERE turn=retained_turns.turn AND status='running')",
-        )?
-        .execute(params![name, floor, protect])?;
         if let Some(cursor) = cursor {
             tx.prepare_cached(
                 "UPDATE event_retention SET pruned_cursor=? WHERE singleton=1 AND pruned_cursor<?",
@@ -2055,7 +2254,11 @@ impl Database {
                 r.get(0)
             })?;
         tx.commit()?;
-        Ok(json!({"events":events,"pruned_cursor":pruned}))
+        let next_after = match limit {
+            Some(limit) if turns.len() == limit => turns.last().copied(),
+            _ => None,
+        };
+        Ok(json!({"events":events,"pruned_cursor":pruned,"next_after":next_after}))
     }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
         let head = self.inspect(name)?.head;
@@ -2166,7 +2369,55 @@ impl Database {
         {
             return Ok(());
         }
+        // Retention removed the turn's events with its artifacts, but the
+        // transcript keeps the nodes: a branch that inherited the output is
+        // told the artifact is gone, not that the turn is somebody else's.
+        if let (Some(Some(head)), None) = (head, node)
+            && self.pruned(turn)?
+            && self.lineage_holds_output(head, turn, call_id)?
+        {
+            return fail("artifact_pruned");
+        }
         fail("turn_not_found")
+    }
+    /// An existing turn keeps at least its start event until retention
+    /// removes them together with its artifacts.
+    fn pruned(&self, turn: i64) -> Result<bool> {
+        Ok(!self
+            .conn
+            .prepare_cached("SELECT 1 FROM events WHERE turn=? LIMIT 1")?
+            .exists([turn])?)
+    }
+    /// Whether the tool result of `call_id` in `turn` is on the chain ending
+    /// at `head`. Only a turn's prompt node records its turn, and ids grow
+    /// along a chain, so the turn's nodes are those between its prompt and
+    /// the next prompt; the walk stops at the turn's own prompt.
+    fn lineage_holds_output(&self, head: i64, turn: i64, call_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,turn) AS (
+                    SELECT id,parent,turn FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,n.turn FROM nodes n JOIN chain c ON n.id=c.parent
+                    WHERE c.turn IS NULL OR c.turn>?2)
+                 SELECT 1 FROM chain c JOIN nodes n ON n.id=c.id
+                 WHERE c.id>(SELECT id FROM chain WHERE turn=?2)
+                   AND c.id<COALESCE((SELECT MIN(id) FROM chain WHERE turn>?2),9223372036854775807)
+                   AND ((json_extract(CAST(n.item AS TEXT),'$.type')='function_call_output'
+                         AND json_extract(CAST(n.item AS TEXT),'$.call_id')=?3)
+                     OR EXISTS(SELECT 1 FROM json_each(CAST(n.item AS TEXT),'$.content')
+                        WHERE json_extract(value,'$.type')='tool_result'
+                        AND json_extract(value,'$.tool_use_id')=?3)) LIMIT 1",
+            )?
+            .exists(params![head, turn, call_id])?)
+    }
+    /// The turn is the caller's to read, and no stream is stored for the call.
+    fn missing_artifact<T>(&self, turn: i64) -> Result<T> {
+        if self.pruned(turn)? {
+            fail("artifact_pruned")
+        } else {
+            fail("artifact_not_found")
+        }
     }
     /// A retained stream as text, for the model's own `read`.
     pub fn artifact_lines(
@@ -2190,7 +2441,9 @@ impl Database {
                 |r| r.get(0),
             )
             .optional()?;
-        let data = data.ok_or(Error::new("artifact_not_found"))?;
+        let Some(data) = data else {
+            return self.missing_artifact(turn);
+        };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
     }
     pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
@@ -2208,7 +2461,7 @@ impl Database {
             );
         }
         if streams.is_empty() {
-            return fail("artifact_not_found");
+            return self.missing_artifact(turn);
         }
         Ok(Value::Object(streams))
     }
@@ -2232,7 +2485,9 @@ impl Database {
             "SELECT length(data),substr(data,?,?) FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
             params![offset as i64 + 1, limit as i64, turn, call_id, stream],
             |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let (total, bytes) = row.ok_or(Error::new("artifact_not_found"))?;
+        let Some((total, bytes)) = row else {
+            return self.missing_artifact(turn);
+        };
         let total = u64::try_from(total).map_err(|_| Error::new("storage_error"))?;
         if offset > total {
             return fail("invalid_artifact_page");
@@ -2467,18 +2722,6 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             migrate_cache_usage(conn)?;
         }
     }
-    if from < 20 {
-        // 19 -> 20: who created a bot, as its creating client declared.
-        // Earlier bots have no record of it and stay unattributed.
-        let present: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='created_by')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !present {
-            conn.execute_batch("ALTER TABLE bots ADD COLUMN created_by TEXT;")?;
-        }
-    }
     if from < 18 {
         // 17 -> 18: tools are chosen per bot. Earlier stores did not retain
         // that choice, so only an empty store can be converted without guessing.
@@ -2543,6 +2786,121 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     THEN (SELECT seq FROM sqlite_sequence WHERE name='events') ELSE 0 END);",
         )?;
     }
+    if from < 20 {
+        // Retire the old blocked state once. Stage its unfinished turn for
+        // normal startup reconciliation, which appends missing results and
+        // releases the bot. Persisting this staging makes recovery retryable
+        // if the daemon dies between migration and turn finalization.
+        let blocked: Vec<(String, Option<i64>)> = conn
+            .prepare("SELECT name,(SELECT id FROM turns WHERE bot=bots.name AND status='uncertain' ORDER BY id DESC LIMIT 1) FROM bots WHERE status='uncertain' AND running_turn IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (bot, turn) in blocked {
+            let Some(turn) = turn else {
+                return fail("store_migration_missing_uncertain_turn");
+            };
+            migrate_unanswered_tools(conn, &bot, turn)?;
+            conn.execute(
+                "UPDATE bots SET status='running',running_turn=? WHERE name=?",
+                params![turn, bot],
+            )?;
+            conn.execute("UPDATE turns SET status='running' WHERE id=?", [turn])?;
+        }
+    }
+    if from < 21 {
+        // 20 -> 21: bots gain a store-wide identity that is never reused.
+        // Existing positive rowids give creation order without counting each
+        // prefix again. Preserve gaps left by deletion and seed the sequence
+        // above the largest assigned id, not the number of surviving bots.
+        // Added only when missing, so a reset version keeps its identities.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='id')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(
+                "ALTER TABLE bots ADD COLUMN id INTEGER;
+                 UPDATE bots SET id=rowid;
+                 CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    last_id INTEGER NOT NULL CHECK(last_id>=0));
+                 INSERT OR REPLACE INTO bot_sequence SELECT 1,COALESCE(MAX(id),0) FROM bots;",
+            )?;
+        }
+    }
+    if from < 22 {
+        // 21 -> 22: who created a bot, as its creating client declared.
+        // Earlier bots have no record of it and stay unattributed.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='created_by')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch("ALTER TABLE bots ADD COLUMN created_by TEXT;")?;
+        }
+    }
+
+    Ok(())
+}
+/// Allocate the next bot identity inside the caller's transaction.
+fn identity(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "UPDATE bot_sequence SET last_id=last_id+1 WHERE singleton=1 RETURNING last_id",
+        )?
+        .query_row([], |r| r.get(0))?)
+}
+
+/// Operational tool records can have been pruned after a blocked turn's
+/// queued successors failed. Reconstruct missing intents from its durable
+/// transcript, one item at a time. With no retained intent, execution is unknown.
+fn migrate_unanswered_tools(conn: &Connection, bot: &str, turn: i64) -> Result<()> {
+    let mut next: Option<i64> =
+        conn.query_row("SELECT head FROM bots WHERE name=?", [bot], |r| r.get(0))?;
+    let mut read = conn.prepare("SELECT parent,item,turn FROM nodes WHERE id=?")?;
+    let mut insert =
+        conn.prepare("INSERT OR IGNORE INTO tools(turn,call_id,status) VALUES (?,?,'executing')")?;
+    let mut answered = std::collections::HashSet::new();
+    while let Some(id) = next {
+        let (parent, raw, marker): (Option<i64>, Vec<u8>, Option<i64>) =
+            read.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let item: Value = serde_json::from_slice(&raw)?;
+        let blocks: Vec<&Value> = if item["type"].is_string() {
+            vec![&item]
+        } else {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .collect()
+        };
+        for block in blocks {
+            let (call, result) = match block["type"].as_str() {
+                Some("function_call") => (block["call_id"].as_str(), false),
+                Some("tool_use") => (block["id"].as_str(), false),
+                Some("function_call_output") => (block["call_id"].as_str(), true),
+                Some("tool_result") => (block["tool_use_id"].as_str(), true),
+                _ => (None, false),
+            };
+            if let Some(call) = call {
+                if result {
+                    answered.insert(call.to_owned());
+                } else if !answered.remove(call) {
+                    insert.execute(params![turn, call])?;
+                }
+            }
+        }
+        if marker == Some(turn) {
+            break;
+        }
+        next = parent;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO retained_turns(turn,bot) VALUES (?,?)",
+        params![turn, bot],
+    )?;
     Ok(())
 }
 

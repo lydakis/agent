@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -374,6 +375,50 @@ class ModelFixture(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
+    def test_shutdown_cancels_pending_retention_without_stdin_eof(self):
+        client = self.client()
+        client.request('create', bot='Big')
+        client.request('shutdown')
+        client.close()
+        store = self.path / 'state.sqlite'
+        # Synthetic cancelled queued turns need no transcript. Enough small
+        # records to keep retention pending beyond shutdown's drain deadline,
+        # without allocating large artifacts or making provider calls.
+        with sqlite3.connect(store) as db:
+            db.execute("""WITH RECURSIVE n(x) AS (
+                VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000)
+                INSERT INTO turns(id,bot,request_id,prompt,status)
+                SELECT x,'Big',CAST(x AS TEXT),'p','cancelled' FROM n""")
+            db.execute('INSERT INTO retained_turns SELECT id,bot FROM turns')
+            db.execute('UPDATE turn_sequence SET last_id=1000000')
+        for operation in ('prune', 'delete'):
+            with self.subTest(operation=operation):
+                client = self.client()
+                try:
+                    client.next_id += 1
+                    request = {'id': client.next_id, 'op': operation, 'bot': 'Big'}
+                    if operation == 'prune':
+                        request['keep_turns'] = 1
+                    client.process.stdin.write(json.dumps(request) + '\n')
+                    client.process.stdin.flush()
+                    # Ensure at least one piece committed before asking to stop.
+                    label = 'delete_bot' if operation == 'delete' else 'prune'
+                    deadline = time.monotonic() + 5
+                    while True:
+                        ops = client.request('stats')['result']['store']['operations']
+                        if ops.get(label, {}).get('count', 0):
+                            break
+                        self.assertLess(time.monotonic(), deadline)
+                    self.assertTrue(client.request('shutdown')['result']['shutting_down'])
+                    self.assertFalse(client.process.stdin.closed)
+                    self.assertEqual(client.process.wait(timeout=3), 0)
+                    with sqlite3.connect(store) as db:
+                        self.assertGreater(db.execute('SELECT count(*) FROM retained_turns').fetchone()[0], 0)
+                        status = db.execute("SELECT status FROM bots WHERE name='Big'").fetchone()[0]
+                        self.assertEqual(status, 'deleting' if operation == 'delete' else 'idle')
+                finally:
+                    client.close(kill=True)
+
     def test_stdio_shutdown_with_background_work_releases_publisher_and_store(self):
         self.model.background_timeout_ms = 30000
         client = self.client('shell')
@@ -625,6 +670,32 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(any(e.get('turn') == pending and e['data'].get('error') == 'process_interrupted' for e in events))
         self.assertTrue(self.model.requests.empty())  # Restart did not launch a paid/repeated request.
 
+    def test_crash_during_a_tool_keeps_the_same_bot_usable(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='crash',
+                              prompt='shell:echo started > crash-marker; sleep 1')['result']['turn']
+        deadline = time.monotonic() + 3
+        while not (self.path / 'crash-marker').exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue((self.path / 'crash-marker').exists())
+        client.close(kill=True)
+        self.model.requests.get(timeout=1)
+        client = self.client('echo,shell')
+        self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'interrupted')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        results = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]['data']['outcome_unknown'])
+        self.assertTrue(self.model.requests.empty())  # Recovery never replays the tool.
+        again = client.request('submit', bot='Bob', request_id='continue', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(again)['data']['status'], 'completed')
+        history = self.model.requests.get(timeout=1)['input']
+        call = next(i for i in history if i.get('type') == 'function_call')
+        result = next(i for i in history if i.get('type') == 'function_call_output')
+        self.assertEqual(result['call_id'], call['call_id'])
+        self.assertEqual(json.loads(result['output'])['error'], 'tool_outcome_unknown')
+
     def test_shell_workspace_result_and_cancelled_descendants(self):
         import psutil
         client = self.client('echo,shell')
@@ -645,7 +716,9 @@ class RuntimeTests(ModelFixture):
         pid = int((self.path / 'child.pid').read_text())
         child = psutil.Process(pid)
         client.request('interrupt', bot='Bob', turn=turn)
-        self.assertEqual(client.finished(turn)['data']['status'], 'uncertain')
+        # The shell is killed, but its unrecorded effects remain unknown.
+        # The result states that uncertainty and the bot stays usable.
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
         deadline = time.monotonic() + 2
         def alive():
             try:
@@ -655,7 +728,14 @@ class RuntimeTests(ModelFixture):
         while alive() and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertFalse(alive())
-        self.assertEqual(client.request('submit', bot='Bob', request_id='retry', prompt='hi')['error'], 'tool_outcome_uncertain')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        killed = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
+        self.assertEqual(len(killed), 1)
+        output = json.loads(client.request('item', bot='Bob', node=killed[0]['data']['node'])['result']['output'])
+        self.assertEqual(output['error'], 'tool_outcome_unknown')
+        self.assertIn('may still be running', output['detail'])
+        again = client.request('submit', bot='Bob', request_id='retry', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(again)['data']['status'], 'completed')
 
     def test_second_owner_cannot_recover_another_process_turn(self):
         client = self.client()
@@ -929,6 +1009,59 @@ class RuntimeTests(ModelFixture):
             # No retry or sleep after the terminal event should be necessary.
             self.assertIn('result', client.request('delete', bot='Bob'))
             later = new
+
+    def test_large_deletions_run_in_pieces_and_refuse_work_meanwhile(self):
+        client = self.client('echo,shell')
+        for bot in ('Big', 'Other'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        for n in range(40):
+            turn = client.request('submit', bot='Big', request_id=str(n), prompt='shell:printf big')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        before = client.request('stats')['result']['store']['operations'].get('delete_bot', {}).get('count', 0)
+        freed = client.request('delete', bot='Big')['result']
+        self.assertEqual(freed['turns'], 40)
+        after = client.request('stats')['result']['store']['operations']['delete_bot']['count']
+        # 40 turns of records in pieces of 16, then the turn rows, then nodes, then the bot.
+        self.assertGreaterEqual(after - before, 5)
+        self.assertEqual(client.request('resume', bot='Big')['error'], 'bot_not_found')
+        turn = client.request('submit', bot='Other', request_id='o', prompt='hi')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    def test_bot_identities_outlive_names_and_refuse_stale_retries(self):
+        client = self.client()
+        bob = client.request('create', bot='Bob', workspace=str(self.path))['result']
+        first = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['id'], prompt='hello')['result']
+        self.assertEqual((first['bot_id'], first['duplicate']), (bob['id'], False))
+        checkpoint = client.finished(first['turn'])['data']['checkpoint']
+        fork = client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', workspace=str(self.path))['result']
+        self.assertNotEqual(fork['id'], bob['id'])
+        # The request namespace is per identity: the fork never ran r7.
+        forked = client.request('submit', bot='Fork', request_id='r7', bot_id=fork['id'], prompt='hello')['result']
+        self.assertEqual((forked['duplicate'], forked['bot_id']), (False, fork['id']))
+        client.finished(forked['turn'])
+        self.assertEqual(client.request('submit', bot='Fork', request_id='r7', bot_id=bob['id'], prompt='hello')['error'],
+                         'bot_not_found')
+        # Identities survive restart and never move to another name.
+        client.close(kill=True)
+        client = self.client()
+        listed = {b['name']: b['id'] for b in client.request('bots')['result']['bots']}
+        self.assertEqual(listed, {'Bob': bob['id'], 'Fork': fork['id']})
+        self.assertEqual(client.request('resume', bot='Bob')['result']['id'], bob['id'])
+        again = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['id'], prompt='hello')['result']
+        self.assertEqual((again['duplicate'], again['turn']), (True, first['turn']))
+        # A recycled name is a new identity: a stale retry is refused, a plain one is fresh work.
+        client.request('delete', bot='Bob')
+        reborn = client.request('create', bot='Bob', workspace=str(self.path))['result']
+        self.assertGreater(reborn['id'], fork['id'])
+        stale = client.request('submit', bot='Bob', request_id='r7', bot_id=bob['id'], prompt='hello')
+        self.assertEqual(stale['error'], 'bot_not_found')
+        self.assertIn(str(reborn['id']), stale['detail'])
+        fresh = client.request('submit', bot='Bob', request_id='r7', prompt='hello')['result']
+        self.assertEqual((fresh['duplicate'], fresh['bot_id']), (False, reborn['id']))
+        self.assertNotEqual(fresh['turn'], first['turn'])
+        client.finished(fresh['turn'])
+        self.assertEqual(client.request('submit', bot='Gone', request_id='r7', bot_id=bob['id'], prompt='hello')['error'],
+                         'bot_not_found')
 
     def test_transient_failures_are_retried_and_rate_limits_pace_the_pool(self):
         client = self.client()

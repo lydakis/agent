@@ -231,7 +231,7 @@ impl Provider {
     }
     /// How much longer this model's pool is closed by a rate limit, if it is.
     pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
-        self.pools.get(model).blocked_for()
+        self.pools.get(&self.family.pool_key(model)).blocked_for()
     }
 
     /// Bound generated tokens (including reasoning) for Responses calls.
@@ -386,10 +386,12 @@ impl Provider {
         // none is configured; that is an estimate to reserve against, not a
         // ceiling on what the provider generates or bills, and the usage the
         // response reports corrects it.
-        let pace = self.pools.get(request.model);
+        let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = self.prefix(&request)?;
-        let estimate = ((prefix.len() + request.items.bytes) / 4) as u64
-            + u64::from(self.max_output_tokens.unwrap_or(512));
+        let estimate = pace::Cost {
+            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            output: u64::from(self.max_output_tokens.unwrap_or(512)),
+        };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
@@ -496,11 +498,7 @@ impl Provider {
         }
         .await;
         report.usage = parser.usage();
-        let billed = report
-            .usage
-            .as_ref()
-            .map_or(estimate, |u| u.input_tokens.saturating_add(u.output_tokens));
-        reservation.settle(billed);
+        reservation.settle_usage(report.usage.as_ref(), estimate);
         if let Err(error) = &result
             && error.code == "provider_rate_limited"
         {

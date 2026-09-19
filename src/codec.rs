@@ -28,6 +28,29 @@ impl Family {
             _ => None,
         }
     }
+    /// The quota a model draws on. Dated snapshots and their alias share one
+    /// allowance at both providers, so they share one pool: `gpt-5.6-luna`
+    /// and `gpt-5.6-luna-2026-05-01`, `claude-sonnet-5` and
+    /// `claude-sonnet-5-20260401`. Anything else is its own pool; a shared
+    /// quota the provider does not name is still corrected by every
+    /// response's headers, bounded by what is in flight.
+    pub fn pool_key(self, model: &str) -> String {
+        let stripped = match self {
+            Family::Responses => model
+                .rsplit_once('-')
+                .filter(|(_, tail)| tail.len() == 2 && tail.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|(head, _)| head.rsplit_once('-'))
+                .filter(|(_, tail)| tail.len() == 2 && tail.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|(head, _)| head.rsplit_once('-'))
+                .filter(|(_, tail)| tail.len() == 4 && tail.bytes().all(|b| b.is_ascii_digit()))
+                .map(|(head, _)| head),
+            Family::Anthropic => model
+                .rsplit_once('-')
+                .filter(|(_, tail)| tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()))
+                .map(|(head, _)| head),
+        };
+        stripped.unwrap_or(model).to_owned()
+    }
     pub fn name(self) -> &'static str {
         match self {
             Family::Responses => "responses",
@@ -87,6 +110,30 @@ pub fn split_model(reference: &str) -> Result<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dated_snapshots_share_their_alias_pool() {
+        use super::Family;
+        assert_eq!(
+            Family::Responses.pool_key("gpt-5.6-luna-2026-05-01"),
+            "gpt-5.6-luna"
+        );
+        assert_eq!(Family::Responses.pool_key("gpt-5.6-luna"), "gpt-5.6-luna");
+        assert_eq!(Family::Responses.pool_key("o3-mini-2025-01-31"), "o3-mini");
+        assert_eq!(
+            Family::Anthropic.pool_key("claude-sonnet-5-20260401"),
+            "claude-sonnet-5"
+        );
+        assert_eq!(
+            Family::Anthropic.pool_key("claude-sonnet-5"),
+            "claude-sonnet-5"
+        );
+        // Not dates: version numbers and short numeric tails stay distinct.
+        assert_eq!(
+            Family::Anthropic.pool_key("claude-haiku-4-5"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(Family::Responses.pool_key("gpt-4-32k"), "gpt-4-32k");
+    }
     use super::*;
     #[test]
     fn model_references_name_a_provider_then_a_model_id() {

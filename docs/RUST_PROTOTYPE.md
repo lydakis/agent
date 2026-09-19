@@ -111,10 +111,11 @@ Other startup failures return immediately; contention is identified by exit
 status rather than text from the shared daemon log.
 
 A blocking `run` exits 0 when it observes the turn completed, 1 when it fails,
-is interrupted, leaves an uncertain tool outcome, or loses its connection, and
+is interrupted or loses its connection, and
 2 for usage errors. A connection error means the outcome was not observed;
 it does not assert that execution failed or cancel the turn. `--request-id` makes a
-submission idempotent across retries.
+submission idempotent across retries; `--bot-id N` pins the retry to the bot
+identity it was first made against (see below).
 
 The `follow` CLI snapshots the running turn before subscribing and waits for
 that turn's `turn_finished` event, whether delivered during replay or live.
@@ -126,7 +127,10 @@ A bot is an identity with a retained conversation: every turn appends to it.
 `--bot NAME` continues that bot and fails with `bot_not_found` if it does not
 exist; `--new --bot NAME` creates it and fails with `bot_exists` if the name is
 taken; no `--bot` creates a fresh generated identity. A typo can therefore never
-silently start an empty conversation under a familiar name.
+silently start an empty conversation under a familiar name. Names are the
+address; the identity is a store-wide integer `id` that `create`, `fork`,
+`resume`, `bots`, and every `submit` answer report, and that is never reused
+after a delete. A fork is a new identity with an empty request namespace.
 
 A bot is not bound to a directory. Each turn runs in the directory `run` was
 invoked from (or `--workspace`), so the same conversation can continue in a new
@@ -202,8 +206,14 @@ can be waited on more than once, and daemon memory holds only in-flight
 commands. Completion commits the result and its overflow artifacts in one
 transaction before waking waiters. A persistence failure stops the daemon with
 an error and disconnects clients. After storage is repaired, restart marks an
-unrecorded completion as `process_lost`; it never reruns the command, whose
-external effects may already have happened.
+unrecorded completion as `process_lost`. The code means supervision ended: the
+daemon no longer owns the process and its result will never be recorded. It is
+not evidence that the OS process stopped or that its effects did not happen. The
+process-group kill runs only when the daemon itself drops the command, so a hard
+kill of the daemon leaves its children running, possibly still writing to the
+workspace. The daemon never reruns the command, and a controller must not read
+`process_lost` as permission to start conflicting work in that workspace;
+inspect the workspace first.
 Waiters share immutable completed outcomes, including when they register after
 completion. The last waiter releases the shared outcome; the daemon does not
 cache past results indefinitely. Turn outcome queries use an index on turn,
@@ -211,7 +221,8 @@ event kind, and cursor rather than scanning unrelated agents' events.
 Parked turns survive a daemon restart: they are re-registered at
 startup, peer handles resolve from durable state (a peer interrupted by the
 restart reports `interrupted`), and commands that were still running resolve
-to `process_lost` because they died with the daemon. Interrupting a parked
+to `process_lost`: their supervision ended with the daemon, whether or not the
+OS process did. Interrupting a parked
 turn ends it as `interrupted`: the wait and any planned calls behind it get a
 `cancelled` tool result in the same transaction, so the conversation stays
 valid and the bot is not left uncertain. A bot whose turn is parked reports
@@ -267,6 +278,9 @@ example `["12/call_abc/stdout"]`, and the model can page through one with
 `read` by passing `artifact` instead of `path`. Artifact reads allow the producing
 bot or a branch containing the original tool-result node. Historical forks can
 read inherited outputs, but cannot read later source turns or unrelated branches.
+A stream the call never retained answers `artifact_not_found`, a turn outside
+the reader's lineage `turn_not_found`, and a turn whose records retention has
+removed `artifact_pruned` (see Retention).
 Line pages are assembled on the storage worker; only the bounded page crosses
 into the async runtime. Byte-oriented protocol pages continue to use SQL slicing.
 
@@ -387,8 +401,14 @@ tests; see [NEXT.md](NEXT.md).
 One process uses a Tokio I/O runtime with one scheduler thread, one shared reqwest
 client, and asynchronous agent tasks. Each client session drains its output
 independently (a thread for stdio, a task per socket). Durable mode adds one
-storage worker for all bots and one reader per session. These are threads and
-tasks, not one process per bot.
+storage worker for all bots, one storage reader, and one reader per session.
+These are threads and tasks, not one process per bot. The storage reader is a
+second SQLite connection in query-only mode on its own thread; it serves
+reads whose result is bytes for a caller, today the batches of context items
+that stream into a model request, so a long history's 8 MiB window is not
+read on the thread every other bot's commit waits for. It sees each job's
+commit once that job is done; anything that decides against the store's
+current state stays on the worker.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
@@ -419,8 +439,12 @@ follower whose queue is full has its entire session closed, including blocked
 writes. This is deliberate: one session multiplexes replies and events, so
 keeping its control channel open would not provide reliable delivery. Socket
 RPC replies also use nonblocking enqueue and close a saturated session without
-waiting in the shared command loop. The CLI exits with a connection error;
-clients reconnect and re-follow from their last received durable cursor, or
+waiting in the shared command loop.
+Deferred deletion and pruning replies preserve this distinction: stdio waits
+up to five seconds for capacity, matching ordinary replies, while sockets
+close immediately on saturation. The wait runs in the retention task.
+The CLI exits with a connection error; clients reconnect and re-follow from
+their last received durable cursor, or
 inspect the bot and turn through the protocol. The submitted turn continues
 independently. This signal does not depend on free queue capacity.
 The input channel holds at most 64 bounded
@@ -527,10 +551,19 @@ does not, and each is one op:
   while the shared transport load continues through stream completion.
   Stats also reports the store's on-disk and WAL sizes with the storage worker's
   job count and its time queued versus time running (whether the worker or
-  the disk is the bottleneck), and the handle registry's size. `agent stats
+  the disk is the bottleneck; jobs on the storage reader are counted the
+  same way under their operation), the same per operation under `operations`
+  (each store method's count, queued and ran totals, slowest run, and two
+  fourteen-bucket latency histograms, `ran` and `queued`, over the
+  log-spaced bounds in `buckets_us`, so a controller can see which jobs
+  make the tail and how often), and the handle registry's size. `agent stats
   [--pretty]`. Store sizes use the canonical database path established at
   open, including when the caller used a symlink. The counters cost three
-  clock reads per storage job.
+  clock reads and one short lock per storage job, and allocate only the
+  first time an operation is seen. Stats copies the operation records under
+  that lock, then derives totals and builds JSON outside it. The totals and
+  histograms describe the same snapshot; time totals are summed before
+  rounding to milliseconds.
 
 Protocol version 3 changes `bots` to return `{bots, next_after}`. It pages by
 name, with a default limit of 64, maximum 256, and a 512 KiB encoded metadata
@@ -606,7 +639,11 @@ creates no workspace or historical side effects.
 
 Submission is idempotent on `(bot, request_id)`. An identical retry returns the
 same turn without executing again, including after restart. Reusing that key
-with a different prompt, workspace, or model fails. `workspace` and `model` on
+with a different prompt, workspace, or model fails. A retry may carry `bot_id`,
+the identity the name had when the request was first made: if the name has
+since been deleted and recreated, the retry answers `bot_not_found` with the
+current identity in `detail`, instead of starting fresh work on the namesake.
+Without `bot_id` a submission addresses whoever holds the name now. `workspace` and `model` on
 `submit` are optional per-turn overrides of the bot's defaults; the `accepted`
 event records the values actually used. Duplicate reconciliation still works when all active
 turn slots are occupied; capacity rejection never writes a fresh submission.
@@ -666,8 +703,8 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   with `stale_turn`. `agent run --delivery steer --turn N`. The
   steer-or-queue behavior stays the default.
 
-A queued or ready turn that cannot start when its place comes (the bot's last
-outcome is `uncertain`, its budget is spent) finishes as `failed` with that
+A queued or ready turn that cannot start when its place comes (for example,
+the bot's budget is spent) finishes as `failed` with that
 error, and the next in line takes its place. `interrupt` on a queued or ready
 turn ends it as `interrupted` and answers `queued: true`; interrupting the
 running turn does not touch the line behind it. `delete` refuses a bot with
@@ -698,7 +735,10 @@ retained usage events, checking them against durable turn and bot totals. If
 pruning or invalid records make those totals unrecoverable, opening fails with
 `store_migration_usage_unavailable` and leaves data and schema intact; keep
 that store and use a new store path. Usage events are streamed through their
-turn index, without loading the transcript. The migration is the only code that
+turn index, without loading the transcript. Schema 21 copies existing bot row IDs
+in one pass, preserving creation order and gaps from deletion, and starts the
+identity sequence above the highest assigned ID (zero for an empty store).
+The migration is the only code that
 knows an earlier format. The store records no daemon-wide provider set or
 toolset; each bot retains its tools, and its provider is checked by family
 when its turn starts.
@@ -709,11 +749,15 @@ committed before execution and the result before continuing the model loop. A
 completed checkpoint and terminal event are committed together before emitting
 completion.
 
-On recovery, unfinished turns are marked interrupted. A planned/executing tool
-without a committed result is conservatively marked uncertain, and further
-submission on that bot is blocked. No external request or tool is automatically
-repeated. The caller can inspect records and fork a known completed checkpoint;
-in-place resolution of uncertain outcomes is not implemented.
+On recovery, unfinished active turns are marked interrupted and their bots
+accept new work. Every unanswered tool call receives a durable result: a
+planned call is cancelled before execution; an executing call with no committed
+result receives `tool_outcome_unknown`. Its effects may already have happened,
+and execution may still be running. The model sees this in history and can
+inspect current state before deciding what to do. The same rule applies to
+explicit cancellation and other terminal failures. Uncertainty never blocks the
+named bot, and no external request or tool is automatically repeated. Existing
+queued work remains eligible to start. Explicitly stopped turns stay stopped.
 
 `resume` restores access to the exact identity and reports its state; it does not
 automatically continue an interrupted network request. A new submission is an
@@ -742,12 +786,24 @@ needs its own benchmark.
 ## Pacing and retries
 
 A provider's allowance is the scarce resource in a fleet, so every model call
-passes through one pace per provider and model: a fair FIFO gate holding two
-buckets, requests and tokens per minute. The pool is unbounded until the
-provider reports its limits in headers
-(`x-ratelimit-*` on OpenAI, `anthropic-ratelimit-*` on Anthropic); from then
-on a call is admitted only when both buckets can afford it, debited by an
-estimate (request bytes divided by four plus the output cap). Reported token
+passes through one pace per provider and pool: a fair FIFO gate holding a
+bucket for requests per minute and one for each token dimension the provider
+limits. The pool key is the family's idea of a quota, not the model string:
+a dated snapshot shares its alias's pool (`gpt-5.6-luna-2026-05-01` with
+`gpt-5.6-luna`, `claude-sonnet-5-20260401` with `claude-sonnet-5`), and
+`stats` lists pools by that key. A shared quota the provider does not name is
+still corrected by every response's headers, bounded by what is in flight.
+The pool is unbounded until the provider reports its limits in headers
+(`x-ratelimit-*` on OpenAI, `anthropic-ratelimit-*` on Anthropic).
+There is no extra cold-start cap: caller-selected local resource limits
+still apply, and a 429 is feedback to the shared pool. A first burst may
+therefore need retries. Once limits are known, a call is admitted only when
+every learned bucket can afford it, debited by an estimate
+(request bytes divided by four as input, plus the output cap as output).
+OpenAI publishes one token limit and the estimate's total is paced against
+it; Anthropic also publishes input-token and output-token limits, and each
+share of the estimate is paced against its own, so an output-heavy call
+waits on the output bucket while input-heavy work proceeds. Reported token
 balances are reduced by outstanding reservations before taking the minimum
 with the local balance, so stale high headers cannot replenish spent tokens.
 Token headers release their request's reservation immediately, in the same
@@ -796,7 +852,9 @@ An estimate above the learned per-minute token limit fails with
 `provider_pacing_limit`, without consuming allowance or blocking the next
 request. This is a local estimate limit, not a provider refusal; reduce the
 context or configured output cap before resubmitting. Unknown pools remain
-unbounded until headers teach them a limit.
+unbounded until headers teach them a limit. A provider that publishes no
+limits imposes no inferred rate bound, though explicit rate-limit refusals
+still pause its pool.
 
 A model call has no side effects, so a failed one is retried by rebuilding
 the request from the store: within 5 minutes, up to 8 attempts for capacity
@@ -874,8 +932,11 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 19; supported
-migrations run at open. Store initialization and migration run in one
+the `context_window` capability. Version 20 repairs previously blocked
+`uncertain` bots once, appending missing tool results without rewriting original
+history. If operational tool records were pruned, repair reconstructs unanswered
+calls from the interrupted turn's durable transcript. Stores are schema version
+20; supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -898,15 +959,50 @@ needs, and one optional policy composes them:
   deleted bot's own suffix is freed by walking back from its head until a
   node is still some bot's head, saved context start, or the parent of a
   surviving branch. A running or parked bot, or one with a background command
-  still running, answers `bot_busy`. Live
+  still running, answers `bot_busy`. A deletion runs as a series of bounded
+  storage jobs, four turns of records at a time, then the turn rows, then
+  the exclusive nodes in larger pieces with the head moved back as they go, so
+  other bots' work interleaves with a large deletion. The first piece marks
+  the bot `deleting`: from then on `submit` and `fork` answer
+  `bot_not_found`, `create` under the name still answers `bot_exists`, and
+  `resume` reports the status. Shutdown cancels and awaits pending retention
+  tasks before closing outputs; committed pieces remain. Whether shutdown
+  or a crash interrupts deletion, the next open finishes it before readiness. Live
   followers receive a non-durable `deleted` notification. `agent rm --bot`.
+  The first piece marks the bot's original event range as a possible replay
+  gap for both bot and global followers. Reads between pieces therefore
+  report `pruned_before` even before every event in that range is removed.
+  Admission captures the bot's identity before spawning the deletion task;
+  each piece checks that identity against the record it already reads.
+  If concurrent deletion removes the original, an old task returns
+  `bot_not_found` rather than deleting a replacement with the same name.
   Queued wake-ups for interrupted or deleted turns are discarded when capacity
   opens; reusing a bot name cannot resume its old turn. This internal check
   does not change explicit `resume` requests: a missing bot returns `bot_not_found`.
+  The bot's turn rows go with it, so a late retry of one of its requests (the
+  same `bot` and `request_id`) answers `bot_not_found`, never the old outcome
+  or a duplicate turn. If the name was recreated meanwhile, a retry carrying
+  the old `bot_id` is still refused; one without it is fresh work on the new
+  identity.
 - `prune {bot, keep_turns}` protects the unfinished suffix (running, parked,
   ready, and queued work) and keeps the `keep_turns` finished turns preceding
   it. With no unfinished work it keeps the newest `keep_turns` turns by
   submission ID. It drops older events, tool intents, finished processes, and artifacts.
+  An explicit `prune` runs as pieces of four turns, oldest first, each
+  its own storage job; the prune a completion applies is one job, so whoever
+  sees `turn_finished` sees the store as retention left it. An explicit prune
+  interrupted by shutdown can be reissued to finish the remaining work.
+  Admission captures the bot ID; every piece checks it before pruning, so a
+  delayed request cannot remove records from a replacement with the same name.
+  This check replaces the piece's existing existence read. Automatic retention
+  still runs within its completion job, with no extra admission read.
+  An artifact read for a turn retention has emptied answers `artifact_pruned`,
+  whether the reader is the producing bot or a fork that inherited the output,
+  through the protocol `artifact` operation or the model's `read`. The answer
+  comes from the transcript nodes retention keeps, so it stays distinct from
+  `artifact_not_found` (the call retained no such stream) and `turn_not_found`
+  (the turn is outside the reader's lineage). Deleting the producing bot after
+  a fork inherited its output answers the same way.
   Queuing new work or cancelling a later queued turn cannot prune a live
   turn's tool intents or move retention past work that has not finished.
   A completion's own retention pass never removes that turn's records:
@@ -994,9 +1090,11 @@ retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Results include separate output, exit code, and
 success status. Nonzero exit is a recorded tool result. Timeout and overflow kill
-the owned process group. Turn cancellation kills that group; an interrupted tool
-without a committed result leaves the bot uncertain rather than repeating
-possible side effects.
+the owned process group. Turn cancellation requests the same kill for a
+foreground shell, but native file I/O or background commands can outlive the
+cancelled turn. Without a committed result the tool outcome is unknown, not a
+claim that all work stopped. The turn ends `interrupted` and the bot stays
+usable; history tells the model to inspect current state before retrying.
 
 `read` returns numbered lines with `offset`/`limit` paging and a 64 KiB result
 bound including paging notices (files up to 4 MiB). If the first requested line

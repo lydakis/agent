@@ -189,6 +189,34 @@ class AccountingTests(ModelFixture):
         client.finished(denied)
         self.assertEqual(json.loads(self.tool_output(client, 'Fork', 'readart-1'))['error'], 'turn_not_found')
 
+    def test_pruned_artifacts_answer_a_retention_error_to_the_owner_and_its_forks(self):
+        client = self.client('echo,shell,read')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        big = client.request('submit', bot='Bob', request_id='big',
+                             prompt="shell:i=0; while [ $i -lt 20000 ]; do echo line-$i; i=$((i+1)); done")['result']['turn']
+        self.assertEqual(client.finished(big)['data']['status'], 'completed')
+        checkpoint = client.request('resume', bot='Bob')['result']['head']
+        client.request('fork', source='Bob', checkpoint=checkpoint, bot='Fork', workspace=str(self.path))
+        client.request('create', bot='Other', workspace=str(self.path))
+        later = client.request('submit', bot='Bob', request_id='later', prompt='later')['result']['turn']
+        client.finished(later)
+        self.assertIn('result', client.request('prune', bot='Bob', keep_turns=1))
+        for bot in ('Bob', 'Fork'):
+            self.assertEqual(client.request('artifact', bot=bot, turn=big, call_id='shell-1')['error'], 'artifact_pruned')
+            self.assertEqual(client.request('artifact', bot=bot, turn=big, call_id='shell-1', stream='stdout',
+                                            offset=0, limit=64)['error'], 'artifact_pruned')
+        # Lineage still decides who is told: an unrelated bot and an unanswered call see no turn.
+        self.assertEqual(client.request('artifact', bot='Other', turn=big, call_id='shell-1')['error'], 'turn_not_found')
+        self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-9')['error'], 'turn_not_found')
+        read = client.request('submit', bot='Fork', request_id='read',
+                              prompt=f'readart:{big}/shell-1/stdout 1,5')['result']['turn']
+        self.assertEqual(client.finished(read)['data']['status'], 'completed')
+        self.assertEqual(json.loads(self.tool_output(client, 'Fork', 'readart-1'))['error'], 'artifact_pruned')
+        # Deleting the producer removes what it owned; the fork's inherited output is still reported as pruned.
+        self.assertIn('result', client.request('delete', bot='Bob'))
+        self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-1')['error'], 'artifact_pruned')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='big', prompt='retry')['error'], 'bot_not_found')
+
     def test_unversioned_and_newer_stores_are_refused_with_clear_codes(self):
         path = self.path / 'old.sqlite'
         with sqlite3.connect(path) as db:

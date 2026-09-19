@@ -239,9 +239,13 @@ class WaitTests(ModelFixture):
         alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
         bob = client.request('submit', bot='Bob', request_id='b', prompt='wait:' + alice['handle'])['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == bob)
-        dave = client.request('submit', bot='Dave', request_id='d', prompt='bgwait:sleep 30')['result']['turn']
+        # The command keeps running after only the daemon is killed: its write lands later.
+        survivor = self.path / 'survived'
+        dave = client.request('submit', bot='Dave', request_id='d',
+                              prompt='bgwait:sleep 1; printf written > survived')['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == dave)
         client.close(kill=True)
+        self.assertFalse(survivor.exists())
         client = self.client('echo,shell,wait')
         self.assertEqual(client.request('resume', bot='Alice')['result']['status'], 'interrupted')
         self.assertEqual(client.finished(bob)['data']['status'], 'completed')
@@ -251,6 +255,11 @@ class WaitTests(ModelFixture):
         outcome = self.tool_output(client, 'Dave', 'wait-1')
         lost = list(outcome['results'].keys())[0]
         self.assertEqual(outcome['results'][lost]['error'], 'process_lost')
+        # process_lost reports ended supervision, not a stopped process.
+        deadline = time.monotonic() + 10
+        while not survivor.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(survivor.read_text(), 'written')
         # Process ids are store-wide: a new background command never reuses the lost handle.
         fresh = client.request('submit', bot='Dave', request_id='d2', prompt='bg:printf fresh')['result']['turn']
         self.assertEqual(client.finished(fresh)['data']['status'], 'completed')

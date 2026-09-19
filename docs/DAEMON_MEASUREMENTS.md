@@ -2215,3 +2215,719 @@ are in ignored `.local/paced-elapsed-fix/`.
 Validation: 80 Rust tests, 31 relevant Python tests, strict Clippy, formatting,
 and diff checks. The interruption and late-restart regressions failed before
 the fix. Only synthetic providers were used.
+
+## Pacing inputs per provider
+
+The following screen records the initial implementation, including its
+experimental sixteen-request cold-start cap. That cap was subsequently
+removed: unknown pools now admit freely, with reported limits and refusals
+providing feedback. These results do not describe the current cold-start
+policy; the comparison below records the removal separately.
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0. Compared
+the committed tree `8ba85986…` (rebuilt from a worktree) with the slice
+binary `e3ee0cde…`. Three changes to the pacing gate: pools are keyed by the
+family's idea of a quota, so a dated snapshot shares its alias's pool; the
+estimate is a cost with input and output shares, paced per dimension the
+provider publishes, which for Anthropic adds the input-token and
+output-token limits beside the total; and a cold pool lets sixteen requests
+out and holds the rest until any response's headers have arrived. On a
+warm pool the gate does what it did, over three buckets instead of one;
+the bootstrap branch is one flag test per admission.
+
+The cold-burst screen (ignored `.local/bootstrap/bench.py`): 96 bots submit
+one turn each at once to a daemon that has never seen the provider. The
+fixture keeps a continuously refilling allowance of 60 requests per minute,
+publishes the Responses rate-limit headers on every reply, answers 429 with
+a one-second Retry-After when empty, and holds every reply's headers for
+500 ms, as a real provider holds them until the first token. Two runs per
+binary:
+
+| | Committed tree | This slice |
+| --- | ---: | ---: |
+| Provider calls for 96 turns | 132 | 96 |
+| Refused with 429 | 36 | 0 |
+| Turns that retried | 36 | 0 |
+| Wall to finish all 96, s | 37.8 | 37.2 |
+
+Before, the whole burst went out before any headers came back, the 36
+calls beyond the allowance were refused, and each of those turns retried.
+After, sixteen went out, their headers taught the limit half a second
+later, and the rest were paced into the allowance; the wall is the
+allowance's own 36 seconds either way. With the fixture answering
+instantly instead, neither binary is refused: the store spaces turn starts
+by a few milliseconds and the first headers arrive within that, which is
+why the screen holds headers.
+
+The 32-agent socket echo screen, committed tree against the slice binary,
+one excluded warmup and four measured runs each: RSS 17.80 (17.66–18.03)
+versus 17.79 (17.69–17.91) MiB, CPU 0.323 (0.308–0.327) versus 0.322
+(0.310–0.345) s, p95 592.3 (590.5–593.9) versus 590.8 (584.5–643.1) ms.
+Level on every median; one slice run carried a 643 ms p95 outlier. Captures:
+ignored `.local/bootstrap/{before,after}.json`,
+`.local/bench/slice-prev8-socket-32/`, and `slice-pacing-socket-32/`.
+
+Validation: 83 Rust tests, strict Clippy, formatting, and 159 Python tests.
+New unit tests: a cold pool caps at sixteen until headers arrive and never
+again after; Anthropic's output limit paces an output-heavy call while an
+input-heavy one proceeds, and a dimension the provider never publishes
+constrains nothing; dated snapshots map to their alias's pool and version
+numbers do not. The startup-bound test warms its pool with one answered
+turn first, since it is about `--max-connecting`, not cold pools.
+
+Review follow-up: the first response now wakes bootstrap waiters even when
+it carries no rate-limit headers. The same paused-clock probe, with sixteen
+initial streams kept open, measured admission delay after those headers at
+50 ms before and 0 ms after the fix. This isolates an unnecessary timer
+wait; it is not a wall-clock throughput or CPU measurement. The existing
+bootstrap test now requires admission within 10 ms of virtual time and
+failed before the fix. An informed pool gains no extra notifications, and
+the change adds no allocations, locks, or database work. All 83 Rust tests,
+strict Clippy, formatting, and diff checks pass after this correction.
+
+### Removing the cold-start cap
+
+Decision and observation, 2026-09-19: unknown provider capacity does not
+justify an inferred concurrency limit. The sixteen-request cap, its
+`informed` flag, polling branch, and special notification were removed.
+Reported limits still teach the shared buckets, and rate-limit refusals
+still pause and park affected turns. Caller-selected local resource bounds
+remain independent. Initial refusals are an accepted discovery cost.
+
+Compared the capped binary `4b0ef97e…` with uncapped `10bbd5cf…` on Darwin
+arm64, external power, Rust 1.98.0. Each run started a fresh daemon and
+submitted 32 short synthetic turns. Every case used baseline/candidate/
+candidate/baseline order, with two cold runs per binary and no warmup.
+Fast fixtures returned headers immediately; slow fixtures delayed them by
+200 ms. Ample fixtures allowed 100,000 requests/minute; the constrained
+fixture allowed 30, continuously refilled, and returned a one-second
+Retry-After with each refusal. Header-less fixtures omitted limit headers.
+Builds and tests finished before measurement. All turns completed.
+
+| Fixture | Batch wall ms, capped → uncapped | Per-run p95 ms, capped → uncapped | Refusals per run, capped → uncapped |
+| --- | ---: | ---: | ---: |
+| Ample, fast | 36.4 → 38.5 | 7.2 → 7.8 | 0 → 0 |
+| Ample, slow | 424.8 → 224.5 | 411.2 → 213.0 | 0 → 0 |
+| No limit headers, fast | 32.7 → 36.9 | 6.4 → 7.7 | 0 → 0 |
+| No limit headers, slow | 425.4 → 228.7 | 409.0 → 217.7 | 0 → 0 |
+| Constrained, slow | 4,836.0 → 4,643.4 | 2,609.1 → 2,417.7 | 0 → 2 |
+
+Values are medians of two runs. Slow ample and header-less fixtures finish
+about 46–47% sooner because admission no longer waits for the first replies.
+The constrained fixture makes 34 provider calls instead of 32, with two
+successful retries; slightly lower completion time here does not establish
+a general improvement under rate limits.
+
+Initial fast header-less CPU readings increased from 33.9 to 38.3 ms, so
+that case received six further cold runs per binary in alternating ABBA
+batches. Median CPU was then 37.9 (31.3–38.5) versus 35.8 (30.7–39.8) ms;
+batch wall time 32.5 (26.7–32.7) versus 30.3 (26.0–33.9) ms; sampled peak
+RSS 12.38 (12.30–12.41) versus 12.37 (12.23–12.44) MiB. These overlapping
+ranges establish no fast-provider speedup or regression. Across the initial
+matrix, median RSS changes stayed within 0.11 MiB. This is a short cold-start
+screen, not sustained-load or active-capacity evidence.
+
+CPU is the daemon's process CPU between submissions and observed completion;
+RSS is sampled every 5 ms through bot creation, turns, and result inspection.
+The Python controller and provider are excluded; these turns execute no
+tools. Latencies use controller receive timestamps. Captures, full ranges,
+binary hashes, and the driver are in ignored `.local/unrestricted-pacing/`.
+
+Validation: all 83 Rust tests, 10 targeted Python runtime tests, strict
+Clippy, formatting, and diff checks passed. The new burst regression failed
+with the cap and now admits 128 requests without waiting for any headers.
+The caller-selected startup-bound test again starts cold, without a warmup;
+pacing, retry, interruption, and restart tests continue to pass.
+
+## Storage counters by operation
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0. Every
+store job now carries the name of the store method it performs, and the
+worker keeps per label a count, queued and ran totals, the slowest run, and
+two fourteen-bucket log-spaced latency histograms (bounds in `buckets_us`,
+100 µs to 1 s), reported by `stats` under `store.operations`. Per job that
+is one uncontended lock and a few adds after the three clock reads it
+already paid; the map allocates once per distinct operation.
+
+A sample from sixteen bots running four two-round `shell` turns each
+against the instant synthetic model, the eight busiest operations by time
+run (percentiles read from the histograms):
+
+| Operation | Jobs | Ran, ms | Slowest, ms | Ran p50 | Ran p99 | Queued p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `append` | 128 | 28 | 0 | <250us | <500us | <2500us |
+| `begin` | 64 | 17 | 0 | <500us | <1000us | <2500us |
+| `finish` | 64 | 17 | 0 | <250us | <1000us | <2500us |
+| `tool_finish` | 64 | 12 | 0 | <250us | <500us | <2500us |
+| `tool_start` | 64 | 10 | 0 | <250us | <500us | <2500us |
+| `window` | 128 | 5 | 0 | <100us | <500us | <2500us |
+| `create` | 16 | 2 | 0 | <250us | <250us | <100us |
+| `items_by_ids` | 128 | 2 | 0 | <100us | <100us | <2500us |
+
+The screen the item was written for is the store-scale one (item 3); this
+sample shows the shape a controller sees: which operations are slow, how
+often, and whether the wait was in the queue or on the disk.
+
+The 32-agent socket echo screen, committed tree `ad739fa2…` (rebuilt from a
+worktree) against the slice binary `c47c1be0…`, one excluded warmup and four
+measured runs each: RSS 17.77 (17.73–17.81) versus 17.92 (17.83–17.95) MiB,
+CPU 0.309 (0.290–0.322) versus 0.315 (0.304–0.326) s, p95 593.4
+(591.6–644.0) versus 593.0 (589.8–597.8) ms. Level within noise; RSS is up
+about 150 KiB, inside this screen's own spread. Captures: ignored
+`.local/bench/slice-prev9-socket-32/` and `slice-counters-socket-32/`.
+
+Validation: 83 Rust tests, strict Clippy, formatting, and 159 Python tests.
+The fleet stats test now checks that every job is counted under its method,
+that each histogram's buckets sum to that method's count, and that the
+per-operation counts sum to the worker's job count.
+
+### Consistent counter snapshots
+
+Review follow-up, 2026-09-19: aggregate atomics and operation counters could
+describe different instants. A concurrent regression failed before the fix
+with 382 total jobs and 495 in the operation breakdown. Stats now copies the
+operation records under one short lock, then derives totals and formats JSON
+outside it. This removes three atomic updates per job. Totals sum nanoseconds
+before rounding; independently rounded operation times can still differ from
+the rounded total by less than one millisecond per operation.
+
+The release probe performed 10,000 storage jobs while repeatedly reading
+stats: the original run found 620 inconsistent snapshots in 61,099 reads;
+the fixed run found none in 61,880. Read counts depend on scheduling; this
+probe establishes reconciliation, not relative throughput.
+
+Matched 32-agent socket echo screen on Darwin arm64, external power,
+Rust 1.98.0: pre-fix binary `c47c1be0…` versus fixed `561c7be0…`, in
+before/after/after/before batches. Each batch excluded one warmup and measured
+two runs, for four measured runs per binary. Identical three-turn workloads
+completed with the lifecycle and follower/replay checks intact. Median
+(minimum–maximum):
+
+| Metric | Before | Fixed |
+| --- | ---: | ---: |
+| Daemon CPU, ms | 282.9 (279.0–290.7) | 284.9 (280.2–300.0) |
+| Sampled peak RSS, MiB | 17.89 (17.88–17.94) | 17.95 (17.84–18.00) |
+| Per-run p95 turn latency, ms | 588.16 (586.11–589.61) | 588.22 (586.64–589.64) |
+
+The ranges overlap; this screen establishes neither a regression nor a
+speedup. It does not measure sustained high-frequency stats polling. Captures,
+binary hashes, and probes are in ignored `.local/review-store-counters/`.
+Validation: 84 Rust tests, two focused daemon stats tests, strict Clippy,
+formatting, and diff checks passed.
+
+## Mass interrupt
+
+Observed 2026-09-19 on Darwin arm64, external power, Rust 1.98.0, binary
+`437fbc6`'s tree. Two fleets, interrupted all at once (ignored
+`.local/mass-interrupt/bench.py`): in `stream` every turn is mid-request
+against a provider that holds the response open; in `shell` every turn is
+running a foreground `sleep 60`. All N interrupts are written back to back
+on one stdio connection. Time runs from the first interrupt written to the
+last `turn_finished` received; for `shell`, also until no child process
+remains. Daemon CPU is the delta over the stop.
+
+| Fleet | Bots | All sent | Last terminal event | Processes gone | Daemon CPU | Every turn ended |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| stream | 256 | 0.4 ms | 49 ms | n/a | 50 ms | `interrupted` |
+| shell | 256 | 0.4 ms | 66 ms | 80 ms | 82 ms | `uncertain` |
+| stream | 1,024 | 2.0 ms | 198 ms | n/a | 207 ms | `interrupted` |
+| shell | 1,024 | 2.5 ms | 768 ms | 782 ms | 892 ms | `uncertain` |
+
+This single screen observed about 0.2 ms of daemon CPU per streaming turn
+and 0.8 ms per shell turn, the latter being the process-group kill, the
+reap, and the finish job; the stream fleet's `finish` histogram put 989 of 1,024
+finishes under 250 µs. A thousand bots mid-request are durably stopped in
+0.2 s and a thousand with live commands in 0.8 s, their processes gone at
+the same moment according to the sampler. This is exploratory: child-count
+readiness includes both shells and their children, and daemon-descendant
+enumeration can miss reparented processes. These samples do not establish
+linear scaling or prove every owned process has stopped.
+
+The screen exposed a usability gap: turns stopped mid-shell ended `uncertain`
+and their bots refused new work until forked. Streaming turns ended
+`interrupted` and stayed usable. The initial fix below recorded cancelled
+results for explicit stops. Subsequent review found its claim that every tool
+had stopped was too strong: native file I/O and background commands can outlive
+cancellation. The current contract records unknown execution outcomes honestly
+and keeps the bot usable after either cancellation or crash recovery.
+After the change, the same screen at a thousand bots on the slice binary:
+
+| Fleet | Bots | Last terminal event | Processes gone | Daemon CPU | Every turn ended |
+| --- | ---: | ---: | ---: | ---: | --- |
+| stream | 1,024 | 193 ms | n/a | 200 ms | `interrupted` |
+| shell | 1,024 | 712 ms | 724 ms | 866 ms | `interrupted` |
+
+In that initial fix, the shell fleet ended `interrupted` with a `cancelled` result recorded
+for each killed command, and every bot accepted new work at once. This was a single interruption screen,
+not a repeated performance comparison. The finish job answers the executing call in the
+same transaction that ends the turn, one more node and event per bot.
+
+The 32-agent socket echo screen, committed tree `a4215d72…` (rebuilt from a
+worktree) against the slice binary `9e14f646…`, one excluded warmup and four
+measured runs each: RSS 17.98 (17.81–18.08) versus 17.66 (17.58–17.73) MiB,
+CPU 0.302 (0.289–0.321) versus 0.310 (0.296–0.330) s, p95 588.5
+(587.7–612.1) versus 593.7 (590.0–596.9) ms. Level within noise; an
+ordinary turn never takes the interrupt path. Captures: ignored
+`.local/mass-interrupt/{before,after}.json`,
+`.local/bench/slice-prev10-socket-32/` and `slice-interrupt-socket-32/`.
+
+Validation: 84 Rust tests, strict Clippy, formatting, and 159 Python tests.
+Those checks described the initial slice. The follow-up below replaces the
+strong cancellation claim and the blocked recovery contract.
+
+### Usable bots after unknown tool outcomes
+
+2026-09-19 follow-up: cancellation and crash recovery now append an honest
+`tool_outcome_unknown` result for executing calls without a committed result,
+close planned calls as cancelled, and release the same named bot for more work.
+No tool is replayed. Schema 20 repairs previously blocked bots once at startup,
+including when operational records were pruned. Normal successful completion
+keeps its existing pending-tool query; transcript repair is off that path.
+
+Matched 32-agent socket echo lifecycle screen, pre-fix binary `9e14f646…`
+versus candidate `585031a4…`. ABBA batch order, two excluded warmups and four
+measured runs per binary. Same tools (`echo,shell,read,write,edit`), three turns,
+4 KiB retained history, and restart/replay/fork/follower checks. All runs passed.
+These measurements cover normal lifecycle overhead, not interruption latency.
+
+| Metric, median (range) | Before | After |
+| --- | ---: | ---: |
+| Daemon CPU | 352 (325–371) ms | 346 (339–353) ms |
+| Sampled peak RSS | 17.75 (17.67–18.02) MiB | 17.80 (17.61–18.22) MiB |
+| Turn p95 | 623 (614–628) ms | 621 (618–650) ms |
+
+Ranges overlap: no clear regression or established speedup. Captures and the
+comparison driver are under ignored `.local/review-interrupt/`.
+
+Validation: 85 Rust tests, 55 targeted Python runtime/wait/accounting tests,
+strict Clippy, formatting, and diff checks. Coverage includes cancellation,
+crash during a shell call followed by successful use of the same bot, queued
+continuation, both provider result formats, pruned-record migration, and
+idempotent reopening without duplicate tool results.
+
+## Lost processes and pruned artifacts
+
+2026-09-19. Two contract slices, no scheduler or storage-path change on the
+ordinary turn. `process_lost` now means supervision ended: the daemon no
+longer owns the command and never records its result, and a hard kill of the
+daemon leaves the child running. The restart test kills only the daemon while
+a background `sleep 1; printf written > survived` is parked on, confirms the
+file is absent at the kill, recovers the handle as `process_lost`, and then
+observes the write landing about a second later. An artifact read for a turn
+retention has emptied answers `artifact_pruned` for the producer and for a
+fork whose transcript holds the output node; the check runs only on the miss
+path, walks the reader's lineage back to the turn's own prompt node, and
+tests the turn's nodes for the call's result.
+
+The 32-agent socket echo screen, committed tree `c971efbe…` (rebuilt from a
+worktree) against the slice binary `a17d4b18…`, one excluded warmup and four
+measured runs each, run back to back on external power: RSS 17.91
+(17.77–18.02) versus 17.77 (17.66–17.81) MiB, CPU 0.323 (0.319–0.335) versus
+0.326 (0.310–0.360) s, p95 618.1 (615.1–620.8) versus 624.7 (618.6–630.1) ms.
+Level within noise, as expected for a change confined to artifact misses.
+Captures: ignored `.local/bench/slice-prev11-socket-32/` and
+`slice-retention-socket-32/`.
+
+Validation: 85 Rust tests, strict Clippy, formatting, the query-plan audit,
+and 161 Python tests.
+
+## Bot identities
+
+2026-09-19. Bots gained a store-wide integer identity that is never reused
+after delete, and `submit` accepts `bot_id` so a retry pinned to an identity
+the name no longer holds is refused rather than started as fresh work on the
+namesake. The cost on the ordinary path is one primary-key lookup per
+submission, on the storage thread inside the same job as `begin`.
+
+The 32-agent socket echo screen, committed tree `c971efbe…` (rebuilt from a
+worktree) against the slice binary `e378e056…`, one excluded warmup and four
+measured runs each, run back to back on external power: RSS 18.00
+(17.77–18.64) versus 18.22 (18.11–18.25) MiB, CPU 0.313 (0.303–0.318) versus
+0.313 (0.301–0.321) s, p95 590.3 (588.8–620.0) versus 590.5 (585.8–654.8) ms.
+Level within noise. The slice binary also carries the items 11 and 12 changes
+screened above. Captures: ignored `.local/bench/slice-prev12-socket-32/` and
+`slice-identity-socket-32/`.
+
+Validation: 86 Rust tests, strict Clippy, formatting, the query-plan audit,
+and 163 Python tests.
+
+### Identity migration at fleet scale
+
+2026-09-19 follow-up. The first schema-21 backfill counted every preceding bot
+for every row, making startup quadratic. It now copies each existing row ID
+once and seeds allocation from `MAX(id)`, preserving deletion gaps. Empty
+stores start at zero. This changes only migration; ordinary turn execution and
+already-migrated stores take the same paths as before.
+
+Two runs per binary in ABBA order, using fresh copies of the same schema-20
+store with 40,000 idle bots, empty instructions, and no turns. Pre-fix binary
+`e378e056…`, candidate `ad6cff8f…`, Darwin arm64, Rust 1.98.0. No warmups excluded.
+Readiness measures process spawn through the stdio `ready` event. CPU and peak
+RSS use `/usr/bin/time -l` through clean shutdown; CPU has 0.01-second reporting
+resolution. No provider requests occur. Every migrated store was checked for
+40,000 distinct positive IDs and a sequence matching the maximum assigned ID.
+
+| Metric | Before, two runs | After, two runs |
+| --- | ---: | ---: |
+| Ready | 18.766 / 18.721 s | 0.346 / 0.054 s |
+| CPU | 18.28 / 18.29 s | 0.04 / 0.03 s |
+| Peak RSS | 14.39 / 14.41 MiB | 14.33 / 14.30 MiB |
+
+The CLI's automatic migration/startup path on another identical copy completed
+`turns --bot b0` in 0.063 s, below its 10-second deadline. These are migration
+measurements, not active-agent throughput claims. Captures and comparison
+script: ignored `.local/review-identities/`.
+
+Validation: 41 store-contract tests, strict Clippy, formatting, diff checks,
+and the real CLI startup probe. Regression coverage includes sparse and empty
+stores, allocation and forking after migration, and non-reuse after deleting
+the highest identity and restarting.
+
+## Store scale
+
+2026-09-19. Corrected `bench.store_scale` screen: one store grown past 1 GB
+and then 10 GB across 4,096 light bots and 8 heavy bots. The heavy group
+receives a quarter of the growth turns. Both groups receive half text turns
+(4 KiB prompts) and half shell turns (1,000,000 bytes of requested output,
+retained as an artifact with a bounded preview). Each heavy bot receives both
+shapes. The result records the actual submitted mix at each growth stage.
+
+Darwin arm64, external power, 32 GiB RAM; binary SHA-256
+`ad6cff8f98d0b5fa532fbe7111636000cb9cdf46569a426fd052f3ee9ed2392b`.
+The binary is identical to the candidate in the preceding identity-migration
+screen. These fixes change only benchmark code and documentation, not the
+Rust runtime. This is one exploratory run, not a speedup or regression claim.
+
+Each latency cell covers 32 completed turns. Light batches admit at most 32
+turns at once; heavy batches admit at most 8 because each bot runs one turn
+at a time. These are bounds, not achieved provider-stream concurrency. The
+first/repeat paging columns are consecutive reads on the live store: neither
+establishes a cold cache. Request body sizes come from the synthetic HTTP
+server and include protocol fields and tool schemas as well as context.
+
+| At target | 1 GB | 10 GB |
+| --- | ---: | ---: |
+| Store plus WAL before checkpoint probes | 992 MiB | 9,593 MiB |
+| Cumulative growth submissions (excludes checkpoint probes) | 1,920 | 18,560 |
+| Heavy bot history before deletion | 68 turns | 596 turns |
+| Shell turns on the deleted heavy bot | 34 | 298 |
+| Growth rate | 169 turns/s | 119 turns/s |
+| Light bot, text turn p50 / p95 | 3.8 / 9.6 ms | 7.3 / 10.5 ms |
+| Heavy bot, text turn p50 / p95 | 34.2 / 66.7 ms | 114.1 / 125.4 ms |
+| Light bot, shell turn p50 / p95 | 206.7 / 362.6 ms | 291.2 / 361.4 ms |
+| Heavy bot, shell turn p50 / p95 | 143.8 / 150.2 ms | 314.2 / 333.0 ms |
+| Storage per light text turn | 1.3 ms | 1.7 ms |
+| Storage per heavy text turn | 4.3 ms | 8.0 ms |
+| Heavy text mean request body | 2.03 MiB | 7.24 MiB |
+| `window` per call (light / heavy text) | 0.13 / 1.25 ms | 0.53 / 3.13 ms |
+| `tool_finish`, 1 MB output, daemon-lifetime mean | 4.4 ms | 4.8 ms |
+| `bots`, 17 pages of 256, first / repeat | 27.3 / 30.2 ms | 39.6 / 44.4 ms |
+| `turns`, heavy bot, first / repeat | 1.3 / 1.0 ms (2 pages) | 40.8 / 8.1 ms (10 pages) |
+| `events`, 256 rows, first / repeat | 1.1 / 0.9 ms | 5.7 / 1.2 ms |
+| Fork, delete fork | 1.46, 0.85 ms | 0.55, 0.47 ms |
+| Delete heavy bot | 40.2 ms | 692.8 ms |
+| Clean restart to `ready` | 13.0 ms | 24.6 ms |
+| Crash restart to `ready`, 32 held requests | 25.6 ms | 29.0 ms |
+| Held requests observed / interrupted turns verified | 32 / 32 | 32 / 32 |
+| Schema-21 migration replayed, restart to `ready` | 20.4 ms | 24.2 ms |
+| Sampled daemon peak RSS through checkpoint | 52.8 MiB | 55.7 MiB |
+| Sampled WAL peak through checkpoint | 5.0 MiB | 19.5 MiB |
+
+The storage-per-turn rows sum the per-operation count times its mean running
+cost during each batch and divide by 32; queue wait is excluded. Counts and
+means come from the daemon's storage worker. `tool_finish` is the mean since
+that daemon started, including growth and checkpoint turns, not only the
+32-turn shell probe. Startup includes process launch and waiting for `ready`.
+Every crash probe captures a fresh provider request count, waits for 32 new
+held requests, fails on timeout, kills the daemon, and checks all 32 exact
+turn IDs after restart. Recovery verification is outside the startup timing.
+
+What this run supports:
+
+- Startup, recovery, and these bounded reads remained in the tens of
+  milliseconds on this host. The 10 GB store fits within its 32 GiB RAM;
+  this does not establish a cold-storage or page-cache limit.
+- Larger heavy histories increase context-reading work: the heavy text
+  batch averages 10 `items_by_ids` jobs per call at 1 GB and 35.9 at 10 GB,
+  with measured request bodies growing from 2.03 to 7.24 MiB. Storage time
+  is only part of end-to-end latency, which also includes the synthetic
+  provider's parsing and transport. This run does not isolate store size
+  from history length or prove identical costs at other sizes.
+- Deletion remains one storage job. The 693 ms deletion with 596 turns
+  and 298 shell outputs identifies a concrete stall to address with bounded
+  retention work. It does not establish that the cost depends only on the
+  deleted bot's data.
+- The WAL reached a sampled 19.5 MiB peak. Sampling is every 500 ms, so
+  short memory/WAL peaks can be missed. The run does not establish checkpoint
+  behavior over hours, and no CPU profile attributes the throughput limit.
+
+The earlier `store-scale-1-10-c` interpretation is superseded: growth gave
+heavy bots only text, its crash barrier reused stale counts, and consecutive
+reads were labeled cold/warm. Its latency values are not comparable to this
+corrected workload. The earlier `store-scale-1-10` and `-b` runs also suffered
+from accumulated observer notifications. The current screen clears those
+notifications per batch and snapshots phase peaks without later mutation.
+
+Not covered: hours of sustained writes (item 16's soak), a store larger than
+host RAM, achieved stream concurrency during growth, model quality, or total
+provider/observer/descendant-process resources. RSS here is the daemon alone.
+Capture: ignored `.local/bench/store-scale-reviewed-1-10/result.json`; the
+10 GB temporary store was removed after completion. Validation: 21 focused
+benchmark tests, including workload balance, timeout rejection, and two
+successive real crash/restart checkpoints; Python compilation and diff checks.
+
+## Retention in pieces and the storage reader
+
+2026-09-19. Two follow-ups from the store-scale screen, measured with
+targeted probes before and after, then the 32-agent socket screen. Slice
+binary versus the committed tree `80c97dc` rebuilt from a worktree; Darwin
+arm64, external power.
+
+**Context reads.** Eight heavy bots with 300 turns of 32 KiB prompts, so each
+model call carries the full 8 MiB default context, and 32 light bots. The
+probe (ignored `.local/context-read/bench.py`) runs three batches of 32
+turns three times each: heavy only (at most eight in flight, one per bot),
+light only, and eight heavy with 24 light. Client latency, and the storage
+worker's own per-batch accounting of `items_by_ids`, the batches that stream
+window items into the request body.
+
+| Batch | Before p50 / p95 | After p50 / p95 | `items_by_ids` queued, before → after |
+| --- | ---: | ---: | ---: |
+| Heavy only | 78–85 / 97–98 ms | 32–45 / 46–68 ms | 560–634 ms → 5–6 ms |
+| Light only | 2.4–2.5 / 3.5–3.9 ms | 2.3–2.6 / 3.4–3.9 ms | 5–8 ms → 0–1 ms |
+| Mixed, all 32 | 13.5–16.5 / 103–107 ms | 2.7–3.5 / 52–55 ms | 284–300 ms → 1–6 ms |
+
+Before, the 34 item batches of every heavy call ran on the writer, and every
+other job in the batch queued behind them: a light turn sharing the batch
+went from 2.4 to 14 ms at the median. After, those batches run on a second
+query-only connection on its own thread. The heavy calls still serialize on
+that reader (their total ran time rose from 180 to 245–268 ms per batch,
+the reader's cache being cold where the writer's was warm), but nothing else
+waits for them: the mixed batch's light turns are back at their light-only
+cost, and the mixed p95 is now the heavy turns themselves.
+
+**Deletion.** One bot with 300 shell turns whose 1 MB outputs are artifacts
+(307 MiB store), a socket daemon, the `delete` sent on one connection and 64
+text turns on 64 other bots run on another connection meanwhile (ignored
+`.local/retention-pieces/bench.py`). The same 64 turns with nothing else
+running cost 2.9–3.2 ms at the median and at most 7 ms.
+
+| Retention piece | Light turns during the delete, p50 / p95 / max | Delete wall | Jobs, slowest |
+| --- | ---: | ---: | ---: |
+| One job (before) | 3.1 / 10.1 / 99.8 ms | 155 ms | 1, 97 ms |
+| 16 turns | 7.9 / 46.5 / 62.3 ms | 189 ms | 95, 8 ms |
+| 4 turns (chosen) | 13.4 / 28.3 / 30.8 ms | 226 ms | 86, 4 ms |
+
+The one-job delete stalls whoever is queued behind it for its whole length,
+here 100 ms and at 10 GB 693 ms, and leaves the rest untouched. Pieces
+spread that cost: every job of a turn in flight can land behind one piece,
+so the worst case falls with the piece size while the median rises with
+the number of pieces, and the delete itself takes longer. Four turns bounds
+the worst wait at about thirty milliseconds for a 300 MB deletion and is the
+default; the constant is one line. The piece loop runs on a task of its
+own, not in the service loop: the first version looped inside `dispatch`,
+and a turn submitted on another connection still waited the whole delete,
+because the loop was holding every request behind it.
+
+**Ordinary path.** The 32-agent socket echo screen, committed tree
+`7b36ecd6…` against the slice binary, one excluded warmup and four measured
+runs each, run in separate batches an hour apart: RSS 17.84 (17.75–17.91)
+versus 18.22 (18.16–18.30) MiB, CPU 0.344 (0.326–0.353) versus 0.334
+(0.322–0.369) s, p95 620.0 (615.9–638.2) versus 589.4 (587.6–590.9) ms. The
+extra 0.4 MiB is the reader connection and its page cache. The p95 gap is
+between batches, not back to back, and matches earlier runs of the same
+committed tree at 590 ms, so it is host noise, not a speedup. Captures:
+ignored `.local/bench/slice-prev13-socket-32/` and `slice-reader-socket-32/`,
+`.local/context-read/{before,after}.json`,
+`.local/retention-pieces/socket-{before,after,after4}.json`.
+
+Validation: 87 Rust tests, strict Clippy, formatting, the query-plan audit,
+and the Python suite. New coverage: a deletion interrupted between pieces
+finishes at the next open and leaves the fork's shared prefix intact; a bot
+being deleted refuses `submit` and `fork` and still answers `bot_exists` to
+`create`; explicit prune pieces cover the same records as one pass; a
+40-turn delete runs as several storage jobs through the protocol.
+
+**Retention shutdown follow-up (2026-09-19).** Pending explicit prune/delete
+loops now belong to a reaped task set. Shutdown cancels and awaits them before
+joining stdout; committed pieces survive and deletion resumes at next open.
+A regression seeds one million small cancelled turns, starts each operation,
+and keeps stdin open through shutdown. Both paths timed out before the fix
+and now exit within the test's three-second deadline with retention unfinished.
+All 89 Rust tests, five focused runtime tests, strict Clippy, and formatting pass.
+
+Matched 32-agent socket echo lifecycle screen on macOS arm64 with AC power:
+pre-fix binary `283e7903…` versus candidate `1d6c80e3…`, before/after/after/before
+batches, one excluded warmup plus two measured runs per batch (four per binary).
+Both execute the same 96 turns, tools, restart, replay, and historical forks.
+
+| Metric | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Target peak RSS | 18.18 (18.13–18.33) MiB | 18.13 (17.95–18.19) MiB |
+| Observed target CPU | 0.310 (0.307–0.313) s | 0.314 (0.306–0.322) s |
+| Turn p95 | 588.1 (586.9–595.3) ms | 586.8 (585.4–587.4) ms |
+
+The deletion-interference probe above also ran in before/after/after/before
+order, two runs per binary, with 300 shell turns, a 307 MiB store, and 64 light
+turns during deletion. Light-turn p50 was 13.33–14.12 ms before versus
+13.08–13.32 ms after; p95 was 26.10–32.06 versus 22.17–27.29 ms, and maximum
+latency was 32.58–34.90 versus 34.56–36.91 ms. Every deletion used 86 storage
+jobs and removed the same 300 turns, 2,401 events, and 1,200 nodes. The task
+tracking adds no storage jobs. The probe's delete wall time includes waiting
+for the light batch, so it is not used as deletion-completion latency here.
+
+These screens show no meaningful overall regression; the overlapping ranges
+and slightly higher observed maximum do not establish a speedup. Captures:
+ignored `.local/bench/retention-shutdown-fix/`.
+
+**Deletion identity follow-up (2026-09-19).** Admission captures the current
+bot ID before spawning deletion, and every piece checks that ID against the
+bot record it already reads. This adds one admission read per deletion, with
+no extra lookup per piece. Artifact deletion stays off the dispatch path so
+other clients can continue while it runs. A stale task cannot delete a bot
+that reuses the original name.
+
+The deterministic store regression failed before the fix by deleting three
+of the replacement's events; it now rejects the stale piece and preserves the
+replacement's identity, status, and transcript. The original protocol probe
+also passes 30 repetitions each with two and ten concurrent deletions and
+name reuse. All 90 Rust tests, three focused runtime tests, two query-plan
+tests, strict Clippy, formatting, and diff checks pass.
+
+Matched 32-agent socket echo lifecycle screen on macOS arm64 with AC power:
+pre-fix `1d6c80e3…` versus final candidate `cd0c733a…`, before/after/after/before
+batches, each with one excluded warmup and two measured runs. Both binaries
+complete the same 96 turns, tools, restart, replay, and historical forks.
+
+| Metric | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Target peak RSS | 18.10 (18.05–18.33) MiB | 17.93 (17.91–18.09) MiB |
+| Observed target CPU | 0.294 (0.288–0.300) s | 0.301 (0.279–0.334) s |
+| Turn p95 | 586.2 (585.2–610.3) ms | 587.9 (585.6–594.9) ms |
+
+The CPU and latency ranges overlap. This lifecycle screen shows no meaningful
+regression and does not establish a speedup; the lower sampled RSS is small.
+
+The 307 MiB deletion-interference probe also ran in
+before/after/after/before order, with 300 shell turns and 64 light turns during
+deletion. Light-turn p50 was 10.48–11.73 ms before versus 13.06–13.94 ms after;
+p95 was 25.13–26.87 versus 25.32–25.73 ms, and maximum latency was
+28.50–36.46 versus 30.42–39.81 ms. The median increased by about 2.4 ms in
+this screen; p95 was stable. This is a measured tradeoff, not a claim that
+all latency percentiles improved. Every run removed the same 300 turns,
+2,401 events, and 1,200 nodes in 86 deletion jobs. The candidate additionally
+performed one admission `inspect`; there is no extra read per piece or turn.
+As above, the probe's wall time includes waiting for the light batch, so it
+is not used as deletion-completion latency. Captures: ignored
+`.local/bench/retention-identity-fix-v2/`.
+
+**Pruning identity follow-up (2026-09-19).** Explicit prune admission captures
+the bot ID before spawning its task. Each piece checks that ID in place of
+its existing existence query, rejecting stale work before any mutation. This
+adds one small admission read per explicit request, no query per piece, and
+no extra work for automatic retention. A deterministic regression failed on
+the old code by pruning three replacement events; it now preserves the
+replacement's events and transcript for both delayed first pieces and
+continuations. All 91 Rust tests, three focused runtime tests, two query-plan
+tests, and strict Clippy pass.
+
+Matched 32-agent socket echo lifecycle screen on macOS arm64 with AC power:
+pre-fix `cd0c733a…` versus candidate `6c494683…`, before/after/after/before
+batches, each with one excluded warmup and two measured runs. Both binaries
+complete the same 96 turns, tools, restart, replay, and historical forks;
+all runs pass without benchmark quality warnings.
+
+| Metric | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Target peak RSS | 18.19 (18.14–18.48) MiB | 18.14 (17.89–18.22) MiB |
+| Observed target CPU | 0.414 (0.379–0.439) s | 0.349 (0.332–0.416) s |
+| Turn p95 | 593.6 (587.4–600.3) ms | 587.0 (586.1–749.8) ms |
+
+Medians are lower, but the candidate has one higher tail-latency observation;
+this screen does not establish a speedup or uniform latency non-regression.
+
+A separate explicit-prune interference probe ran in the same order, two
+runs per binary: 300 shell turns with 1 MB artifacts, a 307 MiB store, and
+64 light turns on other bots during pruning. Every run removed 2,392 events
+in 75 prune jobs and retained the final turn's eight events plus the bot's
+creation event. Light-turn p50 was 5.92–6.70 ms before versus 6.05–8.48 ms
+after; p95 was 23.02–24.92 versus 25.34–30.16 ms; maximum latency was
+23.96–27.67 versus 27.02–37.91 ms. Total prune worker time was 110–128 ms
+before versus 115–143 ms after, with the slowest piece at 4 ms before and
+3–4 ms after. The higher interference latencies remain visible as a small
+measured tradeoff; these runs do not isolate its cause. The probe's wall time
+includes waiting for the light batch and is not treated as prune-completion
+latency. Captures: ignored `.local/bench/prune-identity-fix/`.
+
+**Deletion replay-gap follow-up (2026-09-19).** The first deletion piece
+stores the original event range's upper bound on the bot as well as globally,
+so a reader between pieces receives a conservative `pruned_before` warning.
+The existing bot update returns that bound for the global update: SQL
+statement count and indexed lookups are unchanged, with no added work per
+continuation piece. The regression failed before the fix and now checks every
+intermediate piece, both replay scopes, the upper cursor boundary, and an
+unaffected bot. All 92 Rust tests, seven focused Python checks (including
+three runtime tests), strict Clippy, formatting, and diff checks pass.
+
+Matched macOS arm64 lifecycle screen: pre-fix `6c494683…` versus candidate
+`4ac94445…`, 32 socket agents, echo tools, 96 turns plus restart, replay, and
+historical forks. Before/after/after/before batches each had one excluded
+warmup and two measured runs. All completed with no quality warnings.
+
+| Metric | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Target peak RSS | 18.16 (18.13–18.33) MiB | 17.91 (17.84–17.95) MiB |
+| Observed target CPU | 0.328 (0.322–0.331) s | 0.342 (0.330–0.364) s |
+| Turn p95 | 592.6 (587.1–608.6) ms | 587.3 (586.5–654.7) ms |
+
+The deletion-interference probe used 300 shell turns with 1 MB artifacts,
+a 307 MiB store, and 64 competing light turns. One candidate run had a large
+latency spike, so the before/after/after/before sequence was repeated once.
+All eight runs are retained below, four per binary. Every deletion removed
+300 turns, 2,401 events, and 1,200 nodes in 86 storage jobs.
+
+| Metric | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Competing turn p50 | 13.09 (12.56–13.31) ms | 13.47 (12.97–31.78) ms |
+| Competing turn p95 | 30.08 (25.20–32.76) ms | 30.77 (25.58–96.13) ms |
+| Competing maximum | 38.92 (33.06–45.31) ms | 36.31 (33.32–128.82) ms |
+| Total deletion worker time | 145 (132–155) ms | 145 (135–372) ms |
+
+Typical deletion timings are similar; the isolated candidate spike did not
+repeat, but its cause was not established. The lifecycle CPU median increased
+by 15 ms. These results do not prove a speedup or uniform tail-latency
+non-regression. As above, the probe's wall time includes waiting for competing
+turns and is not deletion-completion latency. Captures: ignored
+`.local/bench/deletion-gap-fix/`.
+
+**Retention stdio backpressure follow-up (2026-09-19).** Deferred `prune`
+and `delete` replies now use the ordinary five-second asynchronous response
+deadline for the stdio owner. Socket replies remain nonblocking. Both call
+one shared helper; no storage jobs, queries, or output buffers were added.
+A bounded-output regression failed on the old path and now verifies stdio
+recovery and socket eviction. Real-process probes paused stdout consumption
+for three seconds during each operation: both delivered all 201 replies,
+answered a subsequent stats request, and shut down cleanly. All 93 Rust tests,
+three focused retention runtime tests, strict Clippy, and formatting pass.
+
+Matched stdio lifecycle screen on macOS arm64: pre-fix `4ac94445…` versus
+candidate `83dc1d9b…`, 32 agents, echo tools, 96 turns plus restart, replay,
+and historical forks. Before/after/after/before batches each had one excluded
+warmup and two measured runs. All passed with no quality warnings.
+
+| Metric | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Target peak RSS | 17.45 (17.41–17.61) MiB | 17.59 (17.41–17.89) MiB |
+| Observed target CPU | 0.302 (0.282–0.316) s | 0.290 (0.279–0.300) s |
+| Turn p95 | 589.1 (585.4–589.5) ms | 592.1 (588.0–622.1) ms |
+
+The deletion-interference probe also used stdio, with 300 shell turns,
+1 MB artifacts, a 307 MiB store, and 64 competing light turns. Two runs per
+binary, in the same order, removed identical records in 86 storage jobs.
+Competing p50 was 13.20–15.17 ms before versus 11.70–14.00 ms after; p95 was
+28.52–30.59 versus 26.68–30.29 ms; maximum latency was 34.93–45.51 versus
+29.91–34.55 ms. Total deletion worker time was 138–144 versus 135–137 ms.
+As in earlier probes, wall time includes the light batch and is not pure
+deletion-completion latency. The overlapping ranges suggest comparable
+typical performance, not a proven speedup; lifecycle RSS and latency were
+slightly higher. Captures: ignored `.local/bench/retention-stdio-fix/`.

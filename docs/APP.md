@@ -79,7 +79,7 @@ bundle, so it could not be screenshotted here), a real provider, and macOS
 packaging, which needs `bundle.active` and real icons.
 
 The tree uses the daemon's `created_by` when the record has one (bots created
-from a shell tool since schema 20) and falls back to inferring the creator
+from a shell tool since schema 22) and falls back to inferring the creator
 from the spawning shell call for older bots.
 
 `/new` gives a bot the shared client policy ([CLIENT.md](CLIENT.md)); the

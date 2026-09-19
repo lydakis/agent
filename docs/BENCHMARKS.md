@@ -466,6 +466,29 @@ and numeric OS error. URLs, error messages, stderr, prompts, and credentials are
 not retained as diagnostic data. The new observer fingerprint means older and
 newer captures must not be silently combined.
 
+## Store scale
+
+```sh
+.local/venv/bin/python -m bench.store_scale --sizes-gb 1 10 --out .local/bench/store-scale
+```
+
+This separate screen grows one store through the stdio service with synthetic
+text and shell turns. A quarter of the turns go to eight heavy bots; both
+heavy and light groups receive equal numbers of text and shell turns. Each
+checkpoint measures 32 turns per shape, with at most eight concurrent heavy
+turns or 32 light turns. These are submission bounds, not measured stream
+concurrency. The result records the growth mix, binary hash, mean request body
+bytes, operation costs, and sampled daemon RSS and WAL size.
+
+The crash probe waits for 32 new held requests to arrive at the provider,
+fails on timeout, and checks every interrupted turn after restart. Paging
+results are first/repeated reads with uncontrolled cache state. The provider
+does not validate prior conversation content; provider, observer, and child
+process memory are not included in daemon RSS. This is an exploratory screen,
+not a matched regression comparison or a capacity claim. The temporary store
+is removed afterwards unless `--keep` is given. `--bots` must be at least 32.
+See [the results and limitations](DAEMON_MEASUREMENTS.md#store-scale).
+
 ## Optional detailed memory counters
 
 `bench.lifecycle --memory-detail` adds `pss_bytes` and `private_bytes` to each
