@@ -2,7 +2,7 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, Database, Delivery, TurnOptions},
+    store::{Binding, Bot, Database, Delivery, Fork, TurnOptions},
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -32,6 +32,7 @@ fn binding() -> Binding<'static> {
         reasoning: None,
         budget_tokens: None,
         tools: &[],
+        created_by: None,
     }
 }
 /// Every stored item of a bot, through the same window the runtime streams.
@@ -84,13 +85,27 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
     db.append(second, vec![assistant("answer two")], &[], None)
         .unwrap();
     db.finish(second, None).unwrap();
-    db.fork("Bob", Some(checkpoint), "Alternative", None, None)
-        .unwrap();
+    db.fork(
+        "Bob",
+        "Alternative",
+        Fork {
+            checkpoint: Some(checkpoint),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
     assert_eq!(stored(&mut db, "Alternative").len(), 2);
     assert_eq!(stored(&mut db, "Bob").len(), 4);
     assert!(
-        db.fork("Bob", Some(checkpoint + 1000), "bad", None, None)
-            .is_err()
+        db.fork(
+            "Bob",
+            "bad",
+            Fork {
+                checkpoint: Some(checkpoint + 1000),
+                ..Fork::default()
+            }
+        )
+        .is_err()
     );
     // The fork carries no default directory; each of its turns names one.
     assert_eq!(
@@ -766,8 +781,15 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
         for n in 1..=3 {
             converse(&mut db, "Bob", n);
         }
-        db.fork("Bob", None, "branch", Some("/synthetic"), None)
-            .unwrap();
+        db.fork(
+            "Bob",
+            "branch",
+            Fork {
+                workspace: Some("/synthetic"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
         converse(&mut db, "branch", 4);
         converse(&mut db, "Bob", 5);
     }
@@ -851,6 +873,62 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
 }
 
 #[test]
+fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
+    let mut db = db();
+    let mut created = binding();
+    created.instructions = "first text";
+    created.created_by = Some("Parent");
+    let (bot, event) = db.create("Bob", Some("/synthetic"), created).unwrap();
+    assert_eq!(bot.created_by.as_deref(), Some("Parent"));
+    assert_eq!(event["data"]["created_by"], "Parent");
+    // A fork without an override keeps the source's text and names its own creator.
+    let (same, _) = db
+        .fork(
+            "Bob",
+            "same",
+            Fork {
+                created_by: Some("Bob"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(same.instructions, "first text");
+    assert_eq!(same.created_by.as_deref(), Some("Bob"));
+    // With an override the fork gets the new text; the source is untouched.
+    let (changed, forked) = db
+        .fork(
+            "Bob",
+            "changed",
+            Fork {
+                instructions: Some("second text"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(changed.instructions, "second text");
+    assert_eq!(changed.created_by, None);
+    assert_eq!(forked["data"]["created_by"], serde_json::Value::Null);
+    assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
+    // Listing carries the creator; a fork keeps the model and tools.
+    let page = db.list(None, 64).unwrap();
+    let listed: Vec<(&str, Option<&str>)> = page["bots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["name"].as_str().unwrap(), b["created_by"].as_str()))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("Bob", Some("Parent")),
+            ("changed", None),
+            ("same", Some("Bob"))
+        ]
+    );
+    assert_eq!(changed.model, bot.model);
+}
+
+#[test]
 fn forks_start_at_any_answered_message_and_default_to_the_head() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -885,27 +963,43 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
     let mid = planned[1]["data"]["node"].as_i64().unwrap();
     // Between a planned call and its result there is an unanswered tool call.
     assert_eq!(
-        db.fork("Bob", Some(mid), "early", None, None)
-            .unwrap_err()
-            .code,
+        db.fork(
+            "Bob",
+            "early",
+            Fork {
+                checkpoint: Some(mid),
+                ..Fork::default()
+            }
+        )
+        .unwrap_err()
+        .code,
         "fork_point_has_open_tool_calls"
     );
     // While the turn runs, forking the moving head is refused; an explicit answered node is fine.
     assert_eq!(
-        db.fork("Bob", None, "live", None, None).unwrap_err().code,
+        db.fork("Bob", "live", Fork { ..Fork::default() })
+            .unwrap_err()
+            .code,
         "bot_busy"
     );
     db.tool_start(turn, &call).unwrap();
     let (_, entry) = db.tool_finish(turn, "c1", &result("hi")).unwrap();
     let answered = entry["data"]["node"].as_i64().unwrap();
     let (branch, _) = db
-        .fork("Bob", Some(answered), "branch", None, None)
+        .fork(
+            "Bob",
+            "branch",
+            Fork {
+                checkpoint: Some(answered),
+                ..Fork::default()
+            },
+        )
         .unwrap();
     assert_eq!(branch.head, Some(answered));
     assert_eq!(stored(&mut db, "branch").len(), 4);
     db.append(turn, vec![assistant("done")], &[], None).unwrap();
     db.finish(turn, None).unwrap();
-    let (tip, _) = db.fork("Bob", None, "tip", None, None).unwrap();
+    let (tip, _) = db.fork("Bob", "tip", Fork { ..Fork::default() }).unwrap();
     assert_eq!(tip.head, db.inspect("Bob").unwrap().head);
     assert_eq!(stored(&mut db, "tip").len(), 5);
     // Branches are independent of the source and of each other.
@@ -993,9 +1087,16 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
     let events = db.append(turn, items, &calls, None).unwrap();
     let reasoning_node = events[0]["data"]["node"].as_i64().unwrap();
     assert_eq!(
-        db.fork("Bob", Some(reasoning_node), "split", None, None)
-            .unwrap_err()
-            .code,
+        db.fork(
+            "Bob",
+            "split",
+            Fork {
+                checkpoint: Some(reasoning_node),
+                ..Fork::default()
+            }
+        )
+        .unwrap_err()
+        .code,
         "fork_point_splits_reasoning"
     );
     assert!(db.inspect("split").is_err());
@@ -1005,26 +1106,42 @@ fn forks_preserve_reasoning_pairs_and_require_every_parallel_result() {
         let node = event["data"]["node"].as_i64().unwrap();
         if index == 0 {
             assert_eq!(
-                db.fork("Bob", Some(node), "partial", None, None)
-                    .unwrap_err()
-                    .code,
+                db.fork(
+                    "Bob",
+                    "partial",
+                    Fork {
+                        checkpoint: Some(node),
+                        ..Fork::default()
+                    }
+                )
+                .unwrap_err()
+                .code,
                 "fork_point_has_open_tool_calls"
             );
         } else {
-            db.fork("Bob", Some(node), "answered", None, None).unwrap();
+            db.fork(
+                "Bob",
+                "answered",
+                Fork {
+                    checkpoint: Some(node),
+                    ..Fork::default()
+                },
+            )
+            .unwrap();
             assert_eq!(
                 serde_json::to_vec(&stored(&mut db, "answered")[1]).unwrap(),
                 reasoning
             );
             // A validated intermediate checkpoint is also safe for another branch.
-            db.fork("answered", None, "nested", None, None).unwrap();
+            db.fork("answered", "nested", Fork { ..Fork::default() })
+                .unwrap();
         }
     }
     // A reasoning-only completion must not bypass the boundary check either.
     db.append(turn, vec![reasoning], &[], None).unwrap();
     db.finish(turn, None).unwrap();
     assert_eq!(
-        db.fork("Bob", None, "unpaired_head", None, None)
+        db.fork("Bob", "unpaired_head", Fork { ..Fork::default() })
             .unwrap_err()
             .code,
         "fork_point_splits_reasoning"
@@ -1096,13 +1213,28 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
         let node = event["data"]["node"].as_i64().unwrap();
         if index == 0 {
             assert_eq!(
-                db.fork("Bob", Some(node), "partial", None, None)
-                    .unwrap_err()
-                    .code,
+                db.fork(
+                    "Bob",
+                    "partial",
+                    Fork {
+                        checkpoint: Some(node),
+                        ..Fork::default()
+                    }
+                )
+                .unwrap_err()
+                .code,
                 "fork_point_has_open_tool_calls"
             );
         } else {
-            db.fork("Bob", Some(node), "answered", None, None).unwrap();
+            db.fork(
+                "Bob",
+                "answered",
+                Fork {
+                    checkpoint: Some(node),
+                    ..Fork::default()
+                },
+            )
+            .unwrap();
             assert_eq!(stored(&mut db, "answered").len(), 6);
         }
     }
@@ -1224,8 +1356,15 @@ fn history_reads_one_turn_by_ordinal_along_the_lineage() {
     );
     // A fork shares the numbering of its source up to the fork point and
     // continues it; the source never sees the branch's turns.
-    db.fork("Bob", None, "branch", Some("/synthetic"), None)
-        .unwrap();
+    db.fork(
+        "Bob",
+        "branch",
+        Fork {
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
     converse(&mut db, "branch", 4);
     assert!(
         db.history_read("branch", 1, 0, 1024).unwrap()["text"]
@@ -1416,8 +1555,15 @@ fn deleting_a_bot_frees_only_its_exclusive_history() {
     for n in 1..=3 {
         converse(&mut db, "Bob", n);
     }
-    db.fork("Bob", None, "branch", Some("/synthetic"), None)
-        .unwrap();
+    db.fork(
+        "Bob",
+        "branch",
+        Fork {
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
     converse(&mut db, "branch", 4);
     converse(&mut db, "Bob", 5);
     let before: i64 = db
@@ -1531,8 +1677,15 @@ fn turn_identity_migrates_above_fork_retained_history() {
         last = db.turns("Bob", 0, 64).unwrap()["turns"][1]["turn"]
             .as_i64()
             .unwrap();
-        db.fork("Bob", None, "branch", Some("/synthetic"), None)
-            .unwrap();
+        db.fork(
+            "Bob",
+            "branch",
+            Fork {
+                workspace: Some("/synthetic"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
         db.delete_bot("Bob").unwrap();
     }
     {
@@ -1606,15 +1759,29 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
             "item_not_in_bot_history"
         );
         assert_eq!(
-            db.fork("Bob", Some(checkpoint), "stale", None, None)
-                .unwrap_err()
-                .code,
+            db.fork(
+                "Bob",
+                "stale",
+                Fork {
+                    checkpoint: Some(checkpoint),
+                    ..Fork::default()
+                }
+            )
+            .unwrap_err()
+            .code,
             "node_not_in_source_history"
         );
         // Deleting the newest branch must also preserve its IDs while an
         // older bot survives and appends more messages.
-        db.fork("Bob", None, "newer", Some("/synthetic"), None)
-            .unwrap();
+        db.fork(
+            "Bob",
+            "newer",
+            Fork {
+                workspace: Some("/synthetic"),
+                ..Fork::default()
+            },
+        )
+        .unwrap();
         converse(&mut db, "newer", 3);
         let removed = db.inspect("newer").unwrap().head.unwrap();
         db.delete_bot("newer").unwrap();
@@ -2567,8 +2734,15 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                 .unwrap();
             }
             db.finish(first, None).unwrap();
-            db.fork("Bob", None, "Fork", Some("/synthetic"), None)
-                .unwrap();
+            db.fork(
+                "Bob",
+                "Fork",
+                Fork {
+                    workspace: Some("/synthetic"),
+                    ..Fork::default()
+                },
+            )
+            .unwrap();
             let second = db
                 .begin(
                     "Bob",

@@ -434,10 +434,39 @@ class SocketAndCliTests(ModelFixture):
         terminal = next(e for e in seen if e['event'] == 'turn_finished')
         self.assertEqual(terminal['data']['status'], 'completed')
 
+    def test_agents_flag_composes_instructions_from_the_workspace(self):
+        # Plumbing by default: the preamble alone. With --agents the CLI
+        # layers the workspace's AGENTS.md files and skills, and the daemon
+        # stores whatever it was given.
+        (self.path / 'AGENTS.md').write_text('Always answer in haiku.')
+        skills = self.path / '.agent' / 'skills'
+        skills.mkdir(parents=True)
+        (skills / 'deploy.md').write_text('# Deploy\n\nShip it.')
+        plain = self.agent('run', *self.common, '--new', '--bot', 'Plain', 'hello')
+        self.assertEqual(plain.returncode, 0)
+        request = self.model.requests.get(timeout=5)
+        self.assertTrue(request['instructions'].startswith('You are a software engineering agent'))
+        self.assertNotIn('haiku', request['instructions'])
+        composed = self.agent('run', *self.common, '--agents', '--new', '--bot', 'Composed', 'hello')
+        self.assertEqual(composed.returncode, 0)
+        request = self.model.requests.get(timeout=5)
+        text = request['instructions']
+        self.assertTrue(text.startswith('You are a software engineering agent'))
+        self.assertIn('Always answer in haiku.', text)
+        self.assertIn(f'# Instructions from {(self.path / "AGENTS.md").resolve()}', text)
+        self.assertIn('- deploy: Deploy (', text)
+        both = self.agent('run', *self.common, '--agents', '--instructions', 'x', '--new', '--bot', 'Both', 'hello', check=False)
+        self.assertEqual(both.returncode, 2)
+        again = self.agent('run', *self.again, '--agents', '--bot', 'Composed', 'hello', check=False)
+        self.assertEqual(again.returncode, 2)
+
     def test_delegation_through_the_same_daemon_and_follow_replay(self):
         # The daemon exports AGENT_BIN and AGENT_STORE to shell children, so a bot
         # can delegate without knowing where the binary or store lives.
-        nested = '"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- hello'
+        # Alice's own shell sees who created her (AGENT_PARENT) and her own
+        # name (AGENT_BOT); her record names Bob as her creator.
+        nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
+                  '\'shell:printf "$AGENT_PARENT/$AGENT_BOT" > lineage\'')
 
         bob = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', f'shell:{nested}')
         # Bob's shell tool ran the client, which created Alice on the same daemon.
@@ -452,6 +481,8 @@ class SocketAndCliTests(ModelFixture):
         listing = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
         self.assertEqual({b['name'] for b in listing}, {'Alice', 'Bob'})
         self.assertTrue(all(b['status'] == 'completed' for b in listing))
+        self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
+        self.assertEqual((self.path / 'lineage').read_text(), 'Bob/Alice')
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]
         self.assertEqual([e['event'] for e in events][:2], ['created', 'accepted'])

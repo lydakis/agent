@@ -37,11 +37,26 @@ pub struct Bot {
     pub reasoning: Option<String>,
     /// The tools this bot may call, chosen at creation and kept with it.
     pub tools: Vec<String>,
+    /// The bot whose client created or forked this one, as that client
+    /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
+    /// this is lineage for people, not authority.
+    pub created_by: Option<String>,
 }
 impl Bot {
     pub fn family(&self) -> Result<Family> {
         Family::parse(&self.family).ok_or(Error::new("store_family_unsupported"))
     }
+}
+/// What a fork may choose for itself; everything else comes from the source.
+#[derive(Default, Clone, Copy)]
+pub struct Fork<'a> {
+    /// A node id from the source's history; `None` is its current head.
+    pub checkpoint: Option<i64>,
+    pub workspace: Option<&'a str>,
+    pub budget_tokens: Option<u64>,
+    /// Replaces the source's instructions for the new bot only.
+    pub instructions: Option<&'a str>,
+    pub created_by: Option<&'a str>,
 }
 /// Provider binding chosen at creation; immutable for the bot's lifetime.
 pub struct Binding<'a> {
@@ -52,6 +67,7 @@ pub struct Binding<'a> {
     pub reasoning: Option<&'a str>,
     pub budget_tokens: Option<u64>,
     pub tools: &'a [String],
+    pub created_by: Option<&'a str>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -167,6 +183,7 @@ pub struct Window {
 pub struct TurnContext {
     pub model_rounds: usize,
     pub bot: String,
+    pub created_by: Option<String>,
     pub workspace: String,
     pub model: String,
 }
@@ -202,7 +219,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 19;
+    pub const SCHEMA: i32 = 20;
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -250,7 +267,8 @@ impl Database {
                 pruned_cursor INTEGER NOT NULL DEFAULT 0,
                 tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history',
                 input_tokens INTEGER NOT NULL DEFAULT 0,
-                cached_input_tokens INTEGER NOT NULL DEFAULT 0);
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT);
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
@@ -415,9 +433,10 @@ impl Database {
             input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
+            created_by: r.get(15)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,created_by";
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -435,7 +454,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens
+                    input_tokens,cached_input_tokens,created_by
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -451,7 +470,8 @@ impl Database {
                 "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?,
                 "tools":split_tools(&r.get::<_, String>(11)?),
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
-                "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?)});
+                "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
+                "created_by":r.get::<_, Option<String>>(14)?});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -484,7 +504,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
+            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
             params![
                 name,
                 workspace,
@@ -494,10 +514,12 @@ impl Database {
                 binding.instructions,
                 binding.reasoning,
                 binding.budget_tokens.map(|b| b as i64),
-                binding.tools.join(",")
+                binding.tools.join(","),
+                binding.created_by
             ],
         )?;
-        let data = json!({"model":format!("{}/{}", binding.provider, binding.model)});
+        let data = json!({"model":format!("{}/{}", binding.provider, binding.model),
+            "created_by":binding.created_by});
         let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
         Ok((
@@ -1323,6 +1345,7 @@ impl Database {
                 .or(bot.workspace)
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
+            created_by: bot.created_by,
             bot: bot.name,
         })
     }
@@ -1737,14 +1760,18 @@ impl Database {
     /// node, the source's current head is used and the source must be idle,
     /// since a live head is still moving. The point must leave no tool call
     /// unanswered; the source itself is never changed.
-    pub fn fork(
-        &mut self,
-        source: &str,
-        node: Option<i64>,
-        name: &str,
-        workspace: Option<&str>,
-        budget_tokens: Option<u64>,
-    ) -> Result<(Bot, Value)> {
+    /// Branch a bot at a history node. The fork keeps the source's binding;
+    /// `instructions` replaces the source's text for the new bot only, so a
+    /// changed AGENTS.md reaches a fresh bot while every existing one stays
+    /// immutable.
+    pub fn fork(&mut self, source: &str, name: &str, fork: Fork<'_>) -> Result<(Bot, Value)> {
+        let Fork {
+            checkpoint: node,
+            workspace,
+            budget_tokens,
+            instructions,
+            created_by,
+        } = fork;
         let parent = self.inspect(source)?;
         let checkpoint = match node {
             Some(node) => {
@@ -1768,7 +1795,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
+            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
             params![
                 name,
                 checkpoint,
@@ -1776,16 +1803,18 @@ impl Database {
                 parent.provider,
                 parent.family,
                 parent.model,
-                parent.instructions,
+                instructions.unwrap_or(&parent.instructions),
                 parent.reasoning,
                 budget_tokens.map(|b| b as i64),
-                parent.tools.join(",")
+                parent.tools.join(","),
+                created_by
             ],
         )?;
         if let Some(node) = checkpoint {
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
         }
-        let data = json!({"source":source,"checkpoint":checkpoint,"node":checkpoint});
+        let data = json!({"source":source,"checkpoint":checkpoint,"node":checkpoint,
+            "created_by":created_by});
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
         Ok((
@@ -2436,6 +2465,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
         if added {
             migrate_cache_usage(conn)?;
+        }
+    }
+    if from < 20 {
+        // 19 -> 20: who created a bot, as its creating client declared.
+        // Earlier bots have no record of it and stay unattributed.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='created_by')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch("ALTER TABLE bots ADD COLUMN created_by TEXT;")?;
         }
     }
     if from < 18 {

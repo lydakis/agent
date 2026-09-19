@@ -1,0 +1,19 @@
+[package]
+name = "agent-app"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+# The desktop client: the Thread design as a page in the system webview, with
+# a Rust core that speaks the daemon's socket protocol. Attach is opening the
+# window; the daemon keeps running when it closes.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agent-client = { path = "../../client" }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt", "sync"] }

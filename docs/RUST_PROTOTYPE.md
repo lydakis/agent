@@ -465,7 +465,7 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low"}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","created_by":"Alice"}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-4-1"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
@@ -474,7 +474,7 @@ own path from the turn. Example requests:
 {"id":6,"op":"item","bot":"Bob","node":2}
 {"id":7,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1"}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
-{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative"}
+{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","instructions":"Replaces the source's text for the fork only"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":10,"op":"unfollow","bot":"Bob"}
 {"id":11,"op":"bots","after":null,"limit":64}
@@ -578,7 +578,14 @@ it may return `response_size_limit`, in which case use pages. Offset and limit
 require a stream. This keeps even escaped, multi-stream artifacts retrievable
 within the 1 MiB response bound.
 
-Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
+`created_by` on `create` and `fork` is the client's declaration of which bot
+it acts for; the CLI fills it from `AGENT_BOT`, which the daemon sets in every
+shell tool's environment along with `AGENT_PARENT`, the running bot's own
+creator when it has one. The record, the `created` and `forked` events, and
+`bots` pages carry it. Bots remain peers: the field is lineage for people and
+clients, never authority. A fork keeps the source's binding and instructions
+unless `instructions` replaces the text for the new bot; the source is never
+changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
 from any message in the source's history: `checkpoint` names a node id (every

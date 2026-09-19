@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --agents --reasoning --request-id --budget-tokens --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -26,8 +26,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "fork",
-        usage: "fork --source NAME --bot NAME [--checkpoint NODE]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --pretty",
+        usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--instructions TEXT]",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --instructions --instructions-file --agents --pretty",
         startup: false,
     },
     Command {
@@ -150,9 +150,13 @@ fn print_flags(flags: &str) {
             "--workspace" => ("DIR", "Select the working directory"),
             "--instructions" => (
                 "TEXT",
-                "A new bot's instructions; default: the built-in text",
+                "A new bot's instructions (default: the built-in text); for fork, replace the source's",
             ),
-            "--instructions-file" => ("FILE", "Read a new bot's instructions from a file"),
+            "--instructions-file" => ("FILE", "Read the instructions from a file"),
+            "--agents" => (
+                "",
+                "Compose instructions: the preamble, AGENTS.md files from the workspace up, and skills",
+            ),
             "--reasoning" => ("LEVEL", "low, medium, high, xhigh, or max"),
             "--request-id" => ("ID", "Idempotency key for this submission"),
             "--budget-tokens" => ("N", "New bot's lifetime input + output token cap"),
@@ -232,7 +236,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         out.push(flag.to_owned());
         if matches!(
             flag,
-            "--pretty" | "--no-spawn" | "--new" | "--detach" | "--all" | "--any"
+            "--pretty" | "--no-spawn" | "--new" | "--detach" | "--all" | "--any" | "--agents"
         ) {
             if inline.is_some() {
                 return fail_with("usage", format!("{flag} takes no value"));

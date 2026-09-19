@@ -1,0 +1,980 @@
+//! Client-side state built from the daemon's event stream, and the actions the
+//! keys trigger. Everything here is derived from protocol events plus the bot
+//! records the daemon returns; no other channel exists.
+use crate::client::{Client, Error, Result};
+use crate::items::{self, Entry};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+const LAZY_ITEMS: usize = 400;
+pub const TOAST: Duration = Duration::from_millis(2200);
+
+#[derive(Debug, Default, Clone)]
+pub struct Bot {
+    pub name: String,
+    pub status: String,
+    pub running_turn: Option<i64>,
+    pub model: String,
+    pub workspace: Option<String>,
+    /// Inferred from the shell call that ran `agent run --new --bot NAME`
+    /// until the daemon records a creator itself.
+    pub parent: Option<String>,
+    pub waiting_on: Vec<String>,
+    pub turn_started: Option<Instant>,
+    pub elapsed: Option<Duration>,
+}
+
+/// One transcript item. Nodes are fetched lazily for the bot on screen.
+#[derive(Debug, Clone)]
+pub enum Item {
+    User(String),
+    Text(String),
+    Thought {
+        text: String,
+        secs: u64,
+    },
+    Tool {
+        call_id: String,
+        name: String,
+        summary: String,
+        args: String,
+        background: bool,
+        spawns: bool,
+        done: bool,
+        started: Option<Instant>,
+        took: Option<Duration>,
+    },
+    Output(String),
+    Note(String),
+    /// A peer this bot created; rendered as a card, opened as a peek.
+    Peer(String),
+    /// A background command this bot started; the same card shape.
+    Proc {
+        handle: String,
+        cmd: String,
+        done: Option<String>,
+        open: bool,
+    },
+    Node {
+        node: i64,
+        call_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct Transcript {
+    pub items: Vec<(Option<i64>, Item)>,
+    pub text: String,
+    pub thinking: String,
+    pub thinking_since: Option<Instant>,
+    pub streaming_turn: Option<i64>,
+}
+
+/// A width moving from one value to another over a short time.
+#[derive(Debug, Clone)]
+pub struct Tween {
+    from: u16,
+    to: u16,
+    start: Instant,
+    dur: Duration,
+}
+impl Tween {
+    pub fn at(value: u16) -> Self {
+        Self {
+            from: value,
+            to: value,
+            start: Instant::now(),
+            dur: Duration::ZERO,
+        }
+    }
+    pub fn go(&mut self, to: u16, dur: Duration) {
+        let now = self.value();
+        *self = Self {
+            from: now,
+            to,
+            start: Instant::now(),
+            dur,
+        };
+    }
+    pub fn value(&self) -> u16 {
+        if self.dur.is_zero() {
+            return self.to;
+        }
+        let t = (self.start.elapsed().as_secs_f32() / self.dur.as_secs_f32()).min(1.0);
+        let eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+        (self.from as f32 + (self.to as f32 - self.from as f32) * eased).round() as u16
+    }
+    pub fn active(&self) -> bool {
+        !self.dur.is_zero() && self.start.elapsed() < self.dur
+    }
+    pub fn target(&self) -> u16 {
+        self.to
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Picker {
+    pub query: String,
+    pub sel: usize,
+}
+
+pub struct Ui {
+    pub rail: Tween,
+    pub peek: Option<String>,
+    pub peek_w: Tween,
+    pub picker: Option<Picker>,
+    pub help: bool,
+    pub thoughts: bool,
+    pub output: bool,
+    pub toast: Option<(String, Instant)>,
+    pub scroll: u16,
+    pub peek_scroll: u16,
+    pub motion: bool,
+    /// Mouse captured: the wheel scrolls panes; released: the terminal selects text.
+    pub mouse: bool,
+    /// A near-background gray for code and tool output, chosen from the
+    /// terminal's reported theme; none when the terminal did not answer.
+    pub shade: Option<ratatui::style::Color>,
+}
+
+pub struct App {
+    pub client: Option<Arc<Client>>,
+    pub socket: std::path::PathBuf,
+    pub bots: BTreeMap<String, Bot>,
+    pub transcripts: HashMap<String, Transcript>,
+    pub selected: String,
+    pub input: String,
+    pub cursor: i64,
+    pub live: bool,
+    pub ui: Ui,
+    /// No bot chosen yet: pick the first root once replay has built the tree.
+    pub auto_select: bool,
+    /// The follower lagged and was dropped; the loop attaches again from the cursor.
+    pub reattach: bool,
+    pub default_model: Option<String>,
+    pub default_workspace: String,
+    pub instructions: String,
+    /// What the instructions were composed from, for the create notice.
+    pub instructions_note: String,
+    pub tools: Vec<String>,
+}
+
+pub const RAIL_W: u16 = 26;
+pub const SLIDE: Duration = Duration::from_millis(160);
+
+impl App {
+    pub fn new(
+        socket: std::path::PathBuf,
+        default_model: Option<String>,
+        default_workspace: String,
+        motion: bool,
+    ) -> Self {
+        Self {
+            client: None,
+            socket,
+            bots: BTreeMap::new(),
+            transcripts: HashMap::new(),
+            selected: String::new(),
+            input: String::new(),
+            cursor: 0,
+            live: false,
+            ui: Ui {
+                rail: Tween::at(0),
+                peek: None,
+                peek_w: Tween::at(0),
+                picker: None,
+                help: false,
+                thoughts: false,
+                output: false,
+                toast: None,
+                scroll: 0,
+                peek_scroll: 0,
+                motion,
+                mouse: true,
+                shade: None,
+            },
+            auto_select: true,
+            reattach: false,
+            default_model,
+            default_workspace,
+            instructions: String::new(),
+            instructions_note: String::new(),
+            tools: ["shell", "read", "write", "edit", "wait", "history"]
+                .map(String::from)
+                .to_vec(),
+        }
+    }
+
+    /// The shared client policy for this workspace: preamble, AGENTS.md
+    /// files, skills. Too much text falls back to the preamble and says so.
+    pub fn compose_instructions(&mut self) {
+        match agent_client::policy::instructions(std::path::Path::new(&self.default_workspace)) {
+            Ok(composed) => {
+                self.instructions_note = format!(
+                    "preamble + {} AGENTS.md + {} skills",
+                    composed.sources.len(),
+                    composed.skills.len()
+                );
+                self.instructions = composed.text;
+            }
+            Err(error) => {
+                self.instructions_note = format!("preamble only: {error}");
+                self.instructions = agent_client::policy::PREAMBLE.to_owned();
+            }
+        }
+    }
+
+    pub fn bot(&self) -> Option<&Bot> {
+        self.bots.get(&self.selected)
+    }
+    fn client(&self) -> Result<Arc<Client>> {
+        self.client.clone().ok_or(Error::new("detached"))
+    }
+    pub fn toast(&mut self, text: impl Into<String>) {
+        self.ui.toast = Some((text.into(), Instant::now()));
+    }
+    pub fn animating(&self) -> bool {
+        self.ui.rail.active() || self.ui.peek_w.active()
+    }
+    pub fn busy(&self) -> bool {
+        self.bots
+            .values()
+            .any(|b| b.status != "idle" && b.status != "completed")
+    }
+    pub fn slide(&self) -> Duration {
+        if self.ui.motion {
+            SLIDE
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// Bots as a tree by creator, depth first: (bot, depth, is last child, ancestors' last flags).
+    pub fn tree(&self) -> Vec<(&Bot, usize, bool, Vec<bool>)> {
+        let mut out = Vec::new();
+        fn walk<'a>(
+            app: &'a App,
+            parent: Option<&str>,
+            depth: usize,
+            trail: &[bool],
+            out: &mut Vec<(&'a Bot, usize, bool, Vec<bool>)>,
+        ) {
+            let kids: Vec<&Bot> = app
+                .bots
+                .values()
+                .filter(|b| {
+                    b.parent.as_deref() == parent && (parent.is_some() || b.parent.is_none())
+                })
+                .collect();
+            let n = kids.len();
+            for (i, kid) in kids.into_iter().enumerate() {
+                let last = i + 1 == n;
+                let mut t = trail.to_vec();
+                t.push(last);
+                out.push((kid, depth, last, trail.to_vec()));
+                walk(app, Some(&kid.name), depth + 1, &t, out);
+            }
+        }
+        walk(self, None, 0, &[], &mut out);
+        // Bots whose parent is unknown to us (deleted) still need a row.
+        for b in self.bots.values() {
+            if b.parent
+                .as_ref()
+                .is_some_and(|p| !self.bots.contains_key(p))
+                && !out.iter().any(|(x, ..)| x.name == b.name)
+            {
+                out.push((b, 0, true, Vec::new()));
+            }
+        }
+        out
+    }
+
+    // ----- lifecycle -----
+
+    pub async fn attach(&mut self) -> Result<tokio::sync::mpsc::Receiver<Value>> {
+        let (client, events) = Client::connect(&self.socket).await?;
+        self.client = Some(client.clone());
+        let mut after: Option<String> = None;
+        loop {
+            let page = client
+                .request("bots", json!({"after": after, "limit": 256}))
+                .await?;
+            for record in page["bots"].as_array().into_iter().flatten() {
+                self.upsert(record);
+            }
+            match page["next_after"].as_str() {
+                Some(next) => after = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        if self.selected.is_empty() || !self.bots.contains_key(&self.selected) {
+            self.selected = self.bots.keys().next().cloned().unwrap_or_default();
+        }
+        client
+            .request("follow", json!({"bot": "*", "after": self.cursor}))
+            .await?;
+        self.live = false;
+        Ok(events)
+    }
+
+    /// What to remember for next time, and how to come back to it.
+    pub fn session(&self) -> crate::session::Session {
+        crate::session::Session {
+            selected: (!self.selected.is_empty()).then(|| self.selected.clone()),
+            peek: self.ui.peek.clone(),
+            rail: self.ui.rail.target() > 0,
+            thoughts: self.ui.thoughts,
+            output: self.ui.output,
+        }
+    }
+    pub fn restore(&mut self, saved: &crate::session::Session) {
+        if let Some(name) = &saved.selected
+            && self.bots.contains_key(name)
+        {
+            self.selected = name.clone();
+            self.auto_select = false;
+        }
+        if let Some(peek) = &saved.peek
+            && self.bots.contains_key(peek)
+        {
+            self.ui.peek = Some(peek.clone());
+            self.ui.peek_w = Tween::at(44);
+        }
+        if saved.rail {
+            self.ui.rail = Tween::at(RAIL_W);
+        }
+        self.ui.thoughts = saved.thoughts;
+        self.ui.output = saved.output;
+    }
+
+    fn upsert(&mut self, record: &Value) {
+        let Some(name) = record["name"].as_str() else {
+            return;
+        };
+        let bot = self.bots.entry(name.to_owned()).or_default();
+        bot.name = name.to_owned();
+        let status = record["status"].as_str().unwrap_or("?");
+        bot.status = if status == "completed" {
+            "idle".into()
+        } else {
+            status.to_owned()
+        };
+        bot.running_turn = record["running_turn"].as_i64();
+        bot.model = format!(
+            "{}/{}",
+            record["provider"].as_str().unwrap_or("?"),
+            record["model"].as_str().unwrap_or("?")
+        );
+        bot.workspace = record["workspace"].as_str().map(str::to_owned);
+        if let Some(creator) = record["created_by"].as_str() {
+            bot.parent = Some(creator.to_owned());
+        }
+    }
+
+    async fn refresh_bot(&mut self, name: &str) {
+        if let Ok(client) = self.client()
+            && let Ok(record) = client.request("resume", json!({"bot": name})).await
+        {
+            self.upsert(&record);
+        }
+    }
+
+    fn push(&mut self, bot: &str, turn: Option<i64>, item: Item) {
+        self.transcripts
+            .entry(bot.to_owned())
+            .or_default()
+            .items
+            .push((turn, item));
+    }
+
+    /// Which bot has a running shell call that names `--bot NAME`?
+    fn creator_of(&self, name: &str) -> Option<String> {
+        let needle = format!("--bot {name}");
+        let needle_eq = format!("--bot={name}");
+        for (owner, t) in &self.transcripts {
+            for (_, item) in t.items.iter().rev().take(20) {
+                // Replay carries no clock, so "in progress" is "not completed yet".
+                if let Item::Tool {
+                    name: tool,
+                    args,
+                    done: false,
+                    ..
+                } = item
+                    && tool == "shell"
+                    && (args.contains(&needle) || args.contains(&needle_eq))
+                {
+                    return Some(owner.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply one notification from the daemon.
+    pub async fn event(&mut self, event: Value) {
+        let kind = event["event"].as_str().unwrap_or("").to_owned();
+        let bot = event["bot"].as_str().unwrap_or("").to_owned();
+        let turn = event["turn"].as_i64();
+        if let Some(cursor) = event["cursor"].as_i64() {
+            self.cursor = self.cursor.max(cursor);
+        }
+        let data = event["data"].clone();
+        match kind.as_str() {
+            "follow_live" => {
+                self.live = true;
+                if self.auto_select
+                    && let Some((root, ..)) = self.tree().first()
+                {
+                    let name = root.name.clone();
+                    self.selected = name;
+                }
+                self.auto_select = false;
+            }
+            "follow_lagged" => {
+                self.client = None;
+                self.live = false;
+                self.reattach = true;
+                self.toast("event stream lagged; attaching again");
+            }
+            "text_delta" => {
+                let t = self.transcripts.entry(bot).or_default();
+                t.streaming_turn = turn;
+                t.text.push_str(event["text"].as_str().unwrap_or(""));
+            }
+            "thinking_delta" => {
+                let t = self.transcripts.entry(bot).or_default();
+                t.streaming_turn = turn;
+                if t.thinking_since.is_none() {
+                    t.thinking_since = Some(Instant::now());
+                }
+                t.thinking.push_str(event["text"].as_str().unwrap_or(""));
+            }
+            "created" | "forked" => {
+                self.refresh_bot(&bot).await;
+                // The record's creator wins; the shell-call inference covers
+                // bots created before the daemon recorded one.
+                let declared = self.bots.get(&bot).and_then(|b| b.parent.clone());
+                if kind == "created"
+                    && let Some(parent) = declared.or_else(|| self.creator_of(&bot))
+                    && self.bots.contains_key(&parent)
+                {
+                    if let Some(b) = self.bots.get_mut(&bot) {
+                        b.parent = Some(parent.clone());
+                    }
+                    let pturn = self.bots.get(&parent).and_then(|p| p.running_turn);
+                    self.push(&parent, pturn, Item::Peer(bot.clone()));
+                }
+                if kind == "forked" {
+                    let source = data["source"].as_str().unwrap_or("?").to_owned();
+                    self.push(&bot, None, Item::Note(format!("forked from {source}")));
+                }
+            }
+            "accepted" => {
+                if let Some(b) = self.bots.get_mut(&bot) {
+                    b.status = "running".into();
+                    b.running_turn = turn;
+                    b.waiting_on.clear();
+                    // Replayed events carry no clock; only live turns get timed.
+                    b.turn_started = self.live.then(Instant::now);
+                    b.elapsed = None;
+                }
+                if let Some(node) = data["node"].as_i64() {
+                    self.push(
+                        &bot,
+                        turn,
+                        Item::Node {
+                            node,
+                            call_id: None,
+                        },
+                    );
+                }
+            }
+            "queued" => self.push(
+                &bot,
+                turn,
+                Item::Note("queued behind the running turn".into()),
+            ),
+            "message" => {
+                let t = self.transcripts.entry(bot.clone()).or_default();
+                if t.streaming_turn == turn {
+                    if !t.thinking.is_empty() {
+                        let secs = t.thinking_since.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+                        let text = std::mem::take(&mut t.thinking);
+                        t.thinking_since = None;
+                        t.items.push((turn, Item::Thought { text, secs }));
+                    }
+                    t.text.clear();
+                }
+                if let Some(node) = data["node"].as_i64() {
+                    self.push(
+                        &bot,
+                        turn,
+                        Item::Node {
+                            node,
+                            call_id: None,
+                        },
+                    );
+                }
+            }
+            "tool_started" => {
+                let name = data["name"].as_str().unwrap_or("tool").to_owned();
+                let args = data["arguments"].as_str().unwrap_or("").to_owned();
+                let summary = items::call_summary(&name, &args);
+                let call_id = data["call_id"].as_str().unwrap_or("").to_owned();
+                let parsed: Value = serde_json::from_str(&args).unwrap_or(Value::Null);
+                let background = name == "shell" && parsed["background"].as_bool() == Some(true);
+                let spawns = name == "shell"
+                    && parsed["command"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("--detach"));
+                let started = self.live.then(Instant::now);
+                self.push(
+                    &bot,
+                    turn,
+                    Item::Tool {
+                        call_id,
+                        name,
+                        summary,
+                        args,
+                        background,
+                        spawns,
+                        done: false,
+                        started,
+                        took: None,
+                    },
+                );
+            }
+            "tool_completed" => {
+                let call_id = data["call_id"].as_str().unwrap_or("").to_owned();
+                let mut eager = None;
+                if let Some(t) = self.transcripts.get_mut(&bot) {
+                    for (_, item) in t.items.iter_mut().rev() {
+                        if let Item::Tool {
+                            call_id: id,
+                            started,
+                            took,
+                            name,
+                            background,
+                            done,
+                            ..
+                        } = item
+                            && *id == call_id
+                        {
+                            *took = started.map(|s| s.elapsed());
+                            *started = None;
+                            *done = true;
+                            if *background || name == "wait" {
+                                eager = Some(name.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+                if let Some(node) = data["node"].as_i64() {
+                    self.push(
+                        &bot,
+                        turn,
+                        Item::Node {
+                            node,
+                            call_id: Some(call_id.clone()),
+                        },
+                    );
+                    if let Some(tool) = eager {
+                        self.load_wait_or_proc(&bot, node, &tool).await;
+                    }
+                }
+            }
+            "turn_waiting" => {
+                let handles: Vec<String> = data["handles"]
+                    .as_array()
+                    .map(|h| {
+                        h.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(b) = self.bots.get_mut(&bot) {
+                    b.status = "waiting".into();
+                    b.waiting_on = handles;
+                }
+            }
+            "turn_paced" => {
+                if let Some(b) = self.bots.get_mut(&bot) {
+                    b.status = "paced".into();
+                }
+            }
+            "turn_resumed" => {
+                if let Some(b) = self.bots.get_mut(&bot) {
+                    b.status = "running".into();
+                    b.waiting_on.clear();
+                }
+            }
+            "steered" => self.push(
+                &bot,
+                turn,
+                Item::Note("steered into the running turn".into()),
+            ),
+            "turn_finished" => {
+                let status = data["status"].as_str().unwrap_or("?").to_owned();
+                let error = data["error"].as_str().map(|e| {
+                    format!(
+                        "{e}{}",
+                        data["detail"]
+                            .as_str()
+                            .map(|d| format!(": {d}"))
+                            .unwrap_or_default()
+                    )
+                });
+                if let Some(b) = self.bots.get_mut(&bot) {
+                    b.running_turn = None;
+                    b.waiting_on.clear();
+                    b.elapsed = b.turn_started.map(|s| s.elapsed());
+                    b.turn_started = None;
+                    b.status = if status == "completed" || status == "steered" {
+                        "idle".into()
+                    } else {
+                        status.clone()
+                    };
+                }
+                if let Some(t) = self.transcripts.get_mut(&bot)
+                    && t.streaming_turn == turn
+                {
+                    if !t.text.is_empty() {
+                        let text = std::mem::take(&mut t.text);
+                        t.items.push((turn, Item::Text(text)));
+                    }
+                    t.thinking.clear();
+                    t.thinking_since = None;
+                    t.streaming_turn = None;
+                }
+                if status != "completed" && status != "steered" {
+                    self.push(
+                        &bot,
+                        turn,
+                        Item::Note(match error {
+                            Some(e) => format!("{status}: {e}"),
+                            None => status,
+                        }),
+                    );
+                }
+                // Every proc this turn started is over with the turn.
+                if let Some(t) = self.transcripts.get_mut(&bot) {
+                    for (t_turn, item) in t.items.iter_mut() {
+                        if *t_turn == turn
+                            && let Item::Proc { done, .. } = item
+                            && done.is_none()
+                        {
+                            *done = Some(String::new());
+                        }
+                    }
+                }
+            }
+            "deleted" => {
+                self.bots.remove(&bot);
+                self.transcripts.remove(&bot);
+                if self.selected == bot {
+                    self.selected = self.bots.keys().next().cloned().unwrap_or_default();
+                }
+                if self.ui.peek.as_deref() == Some(bot.as_str()) {
+                    self.close_peek();
+                }
+            }
+            "pruned" => self.push(&bot, None, Item::Note("earlier history pruned".into())),
+            _ => {}
+        }
+    }
+
+    /// A background shell's result names its proc handle; a wait's result
+    /// names which handles resolved. Both are read eagerly, they are rare.
+    async fn load_wait_or_proc(&mut self, bot: &str, node: i64, tool: &str) {
+        let Ok(client) = self.client() else { return };
+        let Ok(item) = client
+            .request("item", json!({"bot": bot, "node": node}))
+            .await
+        else {
+            return;
+        };
+        let output = item["output"]
+            .as_str()
+            .or_else(|| item["content"][0]["content"].as_str())
+            .unwrap_or("");
+        let Ok(value) = serde_json::from_str::<Value>(output) else {
+            return;
+        };
+        let turn = self.bots.get(bot).and_then(|b| b.running_turn);
+        if tool == "shell" {
+            if let Some(handle) = value["handle"].as_str() {
+                let cmd = self
+                    .transcripts
+                    .get(bot)
+                    .and_then(|t| {
+                        t.items.iter().rev().find_map(|(_, i)| match i {
+                            Item::Tool { name, summary, .. } if name == "shell" => {
+                                Some(summary.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default();
+                self.push(
+                    bot,
+                    turn,
+                    Item::Proc {
+                        handle: handle.to_owned(),
+                        cmd,
+                        done: None,
+                        open: false,
+                    },
+                );
+            }
+        } else if let Some(results) = value["results"].as_object()
+            && let Some(t) = self.transcripts.get_mut(bot)
+        {
+            for (handle, result) in results {
+                if result["pending"].as_bool() == Some(true) {
+                    continue;
+                }
+                for (_, item) in t.items.iter_mut() {
+                    if let Item::Proc {
+                        handle: h, done, ..
+                    } = item
+                        && h == handle
+                        && done.is_none()
+                    {
+                        let out = result["stdout"]
+                            .as_str()
+                            .or(result["output"].as_str())
+                            .unwrap_or("");
+                        let code = result["exit_code"].as_i64().unwrap_or(0);
+                        let last = out.trim_end().lines().last().unwrap_or("").to_owned();
+                        *done = Some(if code != 0 {
+                            format!("exit {code}")
+                        } else {
+                            last
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fetch the items behind unloaded nodes for the bots on screen, in one
+    /// pipelined batch per bot, so history is paid for only when looked at.
+    pub async fn load_visible(&mut self) {
+        let mut names = vec![self.selected.clone()];
+        if let Some(p) = &self.ui.peek {
+            names.push(p.clone());
+        }
+        for name in names {
+            self.load(&name).await;
+        }
+    }
+    async fn load(&mut self, name: &str) {
+        let Ok(client) = self.client() else { return };
+        let pending: Vec<(usize, i64)> = self
+            .transcripts
+            .get(name)
+            .map(|t| {
+                t.items
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .take(LAZY_ITEMS)
+                    .filter_map(|(i, (_, item))| match item {
+                        Item::Node { node, .. } => Some((i, *node)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        let fetched = futures_util::future::join_all(pending.iter().map(|(_, node)| {
+            let client = client.clone();
+            let name = name.to_owned();
+            async move {
+                client
+                    .request("item", json!({"bot": name, "node": node}))
+                    .await
+            }
+        }))
+        .await;
+        let Some(t) = self.transcripts.get_mut(name) else {
+            return;
+        };
+        // `pending` runs from the back already, so earlier indices stay valid.
+        for ((index, node), result) in pending.into_iter().zip(fetched) {
+            let turn = t.items[index].0;
+            let mut entries = match result {
+                Ok(item) => items::entries(&item),
+                Err(error) => vec![Entry::Note(format!("node {node}: {error}"))],
+            };
+            // A delegate call's result is the handle JSON the peer cards already
+            // show, a background start's result is its proc card, and a wait's
+            // result is what those cards became. None of it is shown twice.
+            if let (_, Item::Node { call_id: Some(id), .. }) = &t.items[index]
+                && t.items[..index].iter().rev().any(|(_, i)| matches!(i, Item::Tool { call_id, name, background, spawns, .. } if call_id == id && (*background || *spawns || name == "wait")))
+            {
+                entries.retain(|e| !matches!(e, Entry::ToolOutput(_)));
+            }
+            let mut replacement: Vec<(Option<i64>, Item)> = Vec::new();
+            for e in entries {
+                let item = match e {
+                    Entry::User(s) => Item::User(s),
+                    Entry::Assistant(s) => Item::Text(s),
+                    Entry::Thinking(s) => {
+                        // A live thought was already recorded with its duration.
+                        if let Some((_, Item::Thought { text, .. })) = t.items[..index].last_mut() {
+                            *text = s;
+                            continue;
+                        }
+                        Item::Thought { text: s, secs: 0 }
+                    }
+                    Entry::ToolOutput(s) => Item::Output(s),
+                    Entry::Note(s) => Item::Note(s),
+                };
+                replacement.push((turn, item));
+            }
+            t.items.splice(index..index + 1, replacement);
+        }
+    }
+
+    // ----- actions -----
+
+    /// Scroll the pane under `column` (the peek if it is open there, else the thread).
+    pub fn scroll_by(&mut self, delta: i32, column: u16, width: u16) {
+        let peek_cols = (width as u32 * self.ui.peek_w.value() as u32 / 100) as u16;
+        let target =
+            if self.ui.peek.is_some() && peek_cols > 0 && column >= width.saturating_sub(peek_cols)
+            {
+                &mut self.ui.peek_scroll
+            } else {
+                &mut self.ui.scroll
+            };
+        *target = (*target as i32 + delta).max(0) as u16;
+    }
+    pub fn open_peek(&mut self, name: &str) {
+        self.ui.peek = Some(name.to_owned());
+        self.ui.peek_scroll = 0;
+        let dur = self.slide();
+        self.ui.peek_w.go(44, dur);
+    }
+    pub fn close_peek(&mut self) {
+        self.ui.peek = None;
+        let dur = self.slide();
+        self.ui.peek_w.go(0, dur);
+    }
+    pub fn toggle_rail(&mut self) {
+        let to = if self.ui.rail.target() == 0 {
+            RAIL_W
+        } else {
+            0
+        };
+        let dur = self.slide();
+        self.ui.rail.go(to, dur);
+    }
+    pub fn select(&mut self, name: &str) {
+        if self.bots.contains_key(name) {
+            self.selected = name.to_owned();
+            self.auto_select = false;
+            self.ui.scroll = 0;
+            if self.ui.peek.as_deref() == Some(name) {
+                self.close_peek();
+            }
+        }
+    }
+    /// Peers this bot created, in order, for ^p cycling.
+    pub fn peers(&self) -> Vec<String> {
+        self.transcripts
+            .get(&self.selected)
+            .map(|t| {
+                t.items
+                    .iter()
+                    .filter_map(|(_, i)| match i {
+                        Item::Peer(n) if self.bots.contains_key(n) => Some(n.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub async fn submit(&mut self, prompt: String) -> Result<()> {
+        let name = self.selected.clone();
+        if name.is_empty() {
+            return Err(Error::new("no_bot"));
+        }
+        let client = self.client()?;
+        let workspace = self
+            .bots
+            .get(&name)
+            .and_then(|b| b.workspace.clone())
+            .unwrap_or_else(|| self.default_workspace.clone());
+        let busy = self.bots.get(&name).is_some_and(|b| b.status != "idle");
+        client
+            .request(
+                "submit",
+                json!({"bot": name, "request_id": format!("tui-{}", now_ms()), "prompt": prompt,
+                "workspace": workspace, "delivery": if busy { "queue" } else { "reject" }}),
+            )
+            .await?;
+        self.ui.scroll = 0;
+        Ok(())
+    }
+
+    pub async fn create(&mut self, spec: &str) -> Result<()> {
+        let mut parts = spec.split_whitespace();
+        let name = parts.next().ok_or(Error::new("name_required"))?.to_owned();
+        let model = parts
+            .next()
+            .map(str::to_owned)
+            .or_else(|| self.default_model.clone())
+            .ok_or(Error::with(
+                "model_required",
+                "NAME PROVIDER/MODEL, or set AGENT_MODEL",
+            ))?;
+        let client = self.client()?;
+        client
+            .request(
+                "create",
+                json!({"bot": name, "workspace": self.default_workspace, "model": model,
+                "instructions": self.instructions, "tools": self.tools}),
+            )
+            .await?;
+        self.refresh_bot(&name).await;
+        self.select(&name);
+        self.toast(format!("created {name} · {}", self.instructions_note));
+        Ok(())
+    }
+
+    pub async fn interrupt(&mut self) -> Result<()> {
+        let bot = self.bot().cloned().ok_or(Error::new("no_bot"))?;
+        let turn = bot.running_turn.ok_or(Error::new("idle"))?;
+        self.client()?
+            .request("interrupt", json!({"bot": bot.name, "turn": turn}))
+            .await?;
+        Ok(())
+    }
+}
+
+pub fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+pub fn fmt_secs(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}

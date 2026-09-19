@@ -14,17 +14,10 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
-/// What a new bot is told when the caller gives no instructions. The
-/// daemon has no such text; the bot keeps whatever it was created with.
-const DEFAULT_INSTRUCTIONS: &str = "You are a software engineering agent working in the current workspace. \
-Complete the requested task using the available tools, verify your work, and finish with a short summary. \
-To delegate a subtask to another agent with its own conversation, run \
-\"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
-Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
-Collect results with the wait tool on that handle; it returns the peer's status and final text. \
-Long commands can run with shell background=true and be collected the same way. \
-Blocking run/follow inside a shell tool is rejected. \
-Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an earlier checkpoint.";
+/// What a new bot is told when the caller gives no instructions: the
+/// harness preamble every client shares. `--agents` layers AGENTS.md files
+/// and skills on top; a program that wants that asks for it.
+const DEFAULT_INSTRUCTIONS: &str = agent_client::policy::PREAMBLE;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -57,6 +50,7 @@ struct Options {
     after: i64,
     pretty: bool,
     new: bool,
+    agents: bool,
     detach: bool,
     no_spawn: bool,
     timeout_ms: Option<u64>,
@@ -94,6 +88,7 @@ fn parse(args: &[String]) -> Result<Options> {
         after: 0,
         pretty: false,
         new: false,
+        agents: false,
         detach: false,
         no_spawn: false,
         timeout_ms: None,
@@ -114,6 +109,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--pretty" => options.pretty = true,
             "--no-spawn" => options.no_spawn = true,
             "--new" => options.new = true,
+            "--agents" => options.agents = true,
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
@@ -514,6 +510,29 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     }
 }
 
+/// Explicit text wins; `--agents` composes the shared policy for the
+/// workspace; otherwise the preamble alone.
+fn composed_instructions(options: &Options, workspace: &str) -> Result<String> {
+    if options.agents && options.instructions.is_some() {
+        return fail_with("usage", "--agents and --instructions are mutually exclusive");
+    }
+    if let Some(text) = &options.instructions {
+        return Ok(text.clone());
+    }
+    if options.agents {
+        return agent_client::policy::instructions(std::path::Path::new(workspace))
+            .map(|composed| composed.text)
+            .map_err(|error| Error::with("instructions_limit", error.to_string()));
+    }
+    Ok(DEFAULT_INSTRUCTIONS.to_owned())
+}
+
+/// Inside a bot's shell tool the daemon names the bot; a client run there
+/// declares that bot as the creator of anything it creates or forks.
+fn created_by() -> Option<String> {
+    std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty())
+}
+
 fn unique(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -600,10 +619,10 @@ fn run(options: &Options) -> Result<i32> {
             "--tools chooses a new bot's tools; an existing bot keeps its own",
         );
     }
-    if !created && options.instructions.is_some() {
+    if !created && (options.instructions.is_some() || options.agents) {
         return fail_with(
             "usage",
-            "--instructions sets a new bot's instructions; an existing bot keeps its own",
+            "--instructions and --agents set a new bot's instructions; an existing bot keeps its own",
         );
     }
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
@@ -618,16 +637,14 @@ fn run(options: &Options) -> Result<i32> {
                 "usage",
                 "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
             ))?;
-        let instructions = options
-            .instructions
-            .clone()
-            .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned());
+        let instructions = composed_instructions(options, &workspace)?;
         connection.request(
             "create",
             json!({"bot":bot,"workspace":workspace,"model":model,
                 "instructions":instructions,"reasoning":options.reasoning,
                 "budget_tokens":options.budget_tokens,
-                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>()}),
+                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>(),
+                "created_by":created_by()}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
@@ -715,7 +732,9 @@ fn fork(options: &Options) -> Result<i32> {
         "fork",
         json!({"source":source,"checkpoint":checkpoint,"bot":bot,
             "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-            "budget_tokens":options.budget_tokens}),
+            "budget_tokens":options.budget_tokens,
+            "instructions":if options.agents { Some(composed_instructions(options, &workspace(options)?)?) } else { options.instructions.clone() },
+            "created_by":created_by()}),
     )?;
     print_json(&result, options.pretty)?;
     Ok(0)

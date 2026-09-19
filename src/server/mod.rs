@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Binding, Bot, Delivery, Publication, Store, TurnOptions},
+    store::{Binding, Bot, Delivery, Fork, Publication, Store, TurnOptions},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -51,6 +51,8 @@ enum Command {
         budget_tokens: Option<u64>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
+        /// The bot on whose behalf the client creates this one, if any.
+        created_by: Option<String>,
     },
     Resume {
         bot: String,
@@ -62,6 +64,9 @@ enum Command {
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
+        /// Replace the source's instructions for the fork; the source keeps its own.
+        instructions: Option<String>,
+        created_by: Option<String>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -851,11 +856,15 @@ impl Service {
                 reasoning,
                 budget_tokens,
                 tools,
+                created_by,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
                 name(&bot)?;
+                if let Some(creator) = &created_by {
+                    name(creator)?;
+                }
                 let path = path.as_deref().map(workspace).transpose()?;
                 // The daemon supplies no agent behavior: who creates a bot
                 // says what it runs and what it is told, and the bot keeps both.
@@ -891,6 +900,7 @@ impl Service {
                                 reasoning: reasoning.as_deref(),
                                 budget_tokens,
                                 tools: &tools,
+                                created_by: created_by.as_deref(),
                             },
                         )
                     })
@@ -1003,15 +1013,33 @@ impl Service {
                 bot,
                 workspace: path,
                 budget_tokens,
+                instructions,
+                created_by,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
                 name(&bot)?;
+                if let Some(creator) = &created_by {
+                    name(creator)?;
+                }
+                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
+                    return fail("instructions_limit");
+                }
                 let path = path.as_deref().map(workspace).transpose()?;
                 let (created, event) = store
                     .call(move |db| {
-                        db.fork(&source, checkpoint, &bot, path.as_deref(), budget_tokens)
+                        db.fork(
+                            &source,
+                            &bot,
+                            Fork {
+                                checkpoint,
+                                workspace: path.as_deref(),
+                                budget_tokens,
+                                instructions: instructions.as_deref(),
+                                created_by: created_by.as_deref(),
+                            },
+                        )
                     })
                     .await?;
                 let _ = event;
@@ -1253,6 +1281,7 @@ mod tests {
                         reasoning: None,
                         budget_tokens: None,
                         tools: &[],
+                        created_by: None,
                     },
                 )?;
                 let turn = db
@@ -1420,6 +1449,7 @@ mod tests {
             reasoning: None,
             budget_tokens: None,
             tools: &[],
+            created_by: None,
         };
         let turn = store
             .call(move |db| {

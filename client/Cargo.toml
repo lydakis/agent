@@ -1,0 +1,12 @@
+[package]
+name = "agent-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+# The daemon's socket protocol as a library for human-facing clients.
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "sync", "io-util", "time"] }

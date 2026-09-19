@@ -8,6 +8,9 @@ Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
 `-h` also works. Help writes to stdout and exits successfully without opening
 a store or connecting to a daemon.
 
+Inside a bot's shell tool, `AGENT_BOT` names that bot and the client records
+it as the creator of anything it creates or forks (`created_by`);
+`AGENT_PARENT` names the running bot's own creator when it has one.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 `follow --bot NAME` replays and follows the selected current turn to its end;
@@ -36,7 +39,13 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   turn stays queued and runs separately with those choices.
 - Unknown flags, flags belonging to another command, unexpected operands,
   and repeated singleton flags are usage errors. `--provider` is repeatable.
-- `--instructions` and `--instructions-file` are mutually exclusive.
+- `--instructions` and `--instructions-file` are mutually exclusive. On
+  `fork` they replace the source's instructions for the new bot only.
+  `--agents` composes the shared client policy instead: the harness preamble,
+  every AGENTS.md from the workspace up to the root plus `~/.agent/AGENTS.md`,
+  and an index of `.agent/skills/*.md` files ([CLIENT.md](CLIENT.md)). It is
+  opt-in on the CLI, the default in the TUI and the app, and exclusive with
+  `--instructions`.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit` is

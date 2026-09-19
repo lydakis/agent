@@ -319,7 +319,17 @@ impl Turn {
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's children inherit: the CLI a bot runs to delegate
         // needs a model for the peer, and the natural default is its own.
-        let environment = vec![("AGENT_MODEL".to_owned(), context.model.clone())];
+        // What this turn's children inherit: the CLI a bot runs to delegate
+        // needs a model for the peer (its own by default), the bot's own name
+        // so a created peer records who created it, and its creator so a peer
+        // can address the bot that spawned it.
+        let mut environment = vec![
+            ("AGENT_MODEL".to_owned(), context.model.clone()),
+            ("AGENT_BOT".to_owned(), context.bot.clone()),
+        ];
+        if let Some(parent) = &context.created_by {
+            environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
+        }
         if self.resume {
             let (waiting, _, steers) = match self.store.call(move |db| db.resume(turn)).await {
                 Ok(resumed) => resumed,
@@ -947,6 +957,7 @@ mod tests {
                             reasoning: None,
                             budget_tokens: None,
                             tools: &[],
+                            created_by: None,
                         },
                     )?;
                     let turn = db

@@ -10,6 +10,7 @@ name = "agent"
 path = "src/main.rs"
 
 [dependencies]
+agent-client = { path = "client" }
 bytes = "1.11"
 dhat = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -35,3 +36,6 @@ heap-profile = ["dep:dhat"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+
+[workspace]
+members = ["client", "tui", "app/src-tauri"]
