@@ -59,6 +59,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
+/// Notifications queued ahead of the UI before the session is let go.
+/// Larger than any replay page, so a normal attach never trips it.
+const QUEUE: usize = 4096;
+
 pub struct Client {
     writer: Mutex<OwnedWriteHalf>,
     pending: Pending,
@@ -70,12 +74,13 @@ impl Client {
     /// without an `id`) go to the returned receiver; a closed receiver means
     /// the daemon hung up.
     ///
-    /// The receiver is unbounded on purpose: the one socket reader must never
-    /// wait for the UI to drain notifications, or a response the UI is
-    /// awaiting could sit behind them and deadlock both. The daemon already
-    /// bounds a follower by dropping it when it lags, so this queue only
-    /// ever holds what the daemon was willing to send.
-    pub async fn connect(socket: &Path) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Value>)> {
+    /// The reader never waits for the UI: a response the UI is awaiting must
+    /// not sit behind notifications it has not drained, or both deadlock.
+    /// The queue is bounded all the same, so a UI slower than the fleet
+    /// cannot grow it without limit. When it fills, the reader does what the
+    /// daemon does to a lagging follower: it drops the session and tells the
+    /// UI `follow_lagged`, and the UI attaches again from its cursor.
+    pub async fn connect(socket: &Path) -> Result<(Arc<Self>, mpsc::Receiver<Value>)> {
         let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
             .await
             .map_err(|_| Error::new("daemon_connect_timeout"))?
@@ -93,9 +98,10 @@ impl Client {
             return Err(Error::new("daemon_protocol_mismatch"));
         }
         let pending: Pending = Arc::default();
-        let (events, receiver) = mpsc::unbounded_channel();
+        let (events, receiver) = mpsc::channel(QUEUE);
         let routed = pending.clone();
         tokio::spawn(async move {
+            let mut lagged = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 let Ok(message) = serde_json::from_str::<Value>(&line) else {
                     continue;
@@ -106,17 +112,26 @@ impl Client {
                             let _ = sender.send(message);
                         }
                     }
-                    None => {
-                        if events.send(message).is_err() {
+                    None => match events.try_send(message) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            lagged = true;
                             break;
                         }
-                    }
+                    },
                 }
             }
-            // The socket is gone: every request still waiting fails with
-            // `daemon_disconnected` now, and dropping `events` closes the
-            // receiver so the UI sees the same.
+            // The socket is gone, or we let go of it: every request still
+            // waiting fails with `daemon_disconnected` now. A lag is
+            // announced after the queue drains, then the receiver closes.
             routed.lock().await.clear();
+            drop(lines);
+            if lagged {
+                let _ = events
+                    .send(json!({"event": "follow_lagged", "durable": false, "reason": "client_lagged"}))
+                    .await;
+            }
         });
         Ok((
             Arc::new(Self {

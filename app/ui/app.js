@@ -13,7 +13,9 @@ const S = {
 };
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
-const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], text: '', thinking: '', thinkingSince: 0, streamingTurn: null }); return S.transcripts.get(name); };
+const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null }); return S.transcripts.get(name); };
+// Every bare node goes through here so the count stays right; loads skip a transcript at zero.
+const pushNode = (t, item) => { t.nodes += 1; t.items.push(item); };
 const glyphOf = (status) => GLYPH[status] || '✘';
 const labelOf = (status) => LABEL[status] || 'failed';
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
@@ -37,20 +39,31 @@ const isActive = (status) => ACTIVE.has(status);
 // Only the agent CLI's detached run yields the handle JSON a peer card already shows.
 const spawnsPeer = (command) => command.includes('--detach') && (command.includes('$AGENT_BIN') || command.includes('agent run'));
 function tree() {
-  // One pass builds the children index; the walk is linear in the fleet.
+  // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
+  // costs one prefix string per row and no recursion.
   const children = new Map();
   for (const b of S.bots.values()) { const key = b.parent && S.bots.has(b.parent) ? b.parent : null; if (!children.has(key)) children.set(key, []); children.get(key).push(b); }
-  const out = []; const seen = new Set();
-  const walk = (parent, depth, trail) => {
+  const out = []; const seen = new Set(); const stack = [];
+  const pushKids = (parent, depth, cont) => {
     const kids = (children.get(parent) ?? []).filter((b) => !seen.has(b.name));
-    kids.forEach((b, i) => { seen.add(b.name); const last = i === kids.length - 1; out.push({ b, depth, last, trail }); walk(b.name, depth + 1, trail.concat(last)); });
+    for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth, i === kids.length - 1, cont]);
   };
-  walk(null, 0, []);
-  // A creator cycle (delete and recreate) reaches nothing from the roots; root it so nothing is hidden.
-  for (const b of S.bots.values()) if (!seen.has(b.name)) { seen.add(b.name); out.push({ b, depth: 0, last: true, trail: [] }); walk(b.name, 1, [true]); }
+  pushKids(null, 0, '');
+  for (;;) {
+    while (stack.length) {
+      const [b, depth, last, cont] = stack.pop();
+      if (seen.has(b.name)) continue; seen.add(b.name);
+      const prefix = depth === 0 ? '' : cont + (last ? '└ ' : '├ ');
+      out.push({ b, depth, prefix });
+      pushKids(b.name, depth + 1, depth === 0 ? '' : cont + (last ? '  ' : '│ '));
+    }
+    // A creator cycle (delete and recreate) reaches nothing from the roots; root it so nothing is hidden.
+    const orphan = [...S.bots.values()].find((b) => !seen.has(b.name));
+    if (!orphan) break;
+    stack.push([orphan, 0, true, '']);
+  }
   return out;
 }
-const treePrefix = (n) => !n.depth ? '' : n.trail.slice(1).map((l) => (l ? '  ' : '│ ')).join('') + (n.last ? '└ ' : '├ ');
 function creatorOf(name) {
   const needles = [`--bot ${name}`, `--bot=${name}`];
   for (const [owner, t] of S.transcripts) {
@@ -96,17 +109,23 @@ async function onEvent(ev) {
     }
     case 'accepted': {
       const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
-      if (typeof data.node === 'number') transcript(name).items.push({ kind: 'node', node: data.node, turn });
+      if (typeof data.node === 'number') pushNode(transcript(name), { kind: 'node', node: data.node, turn });
       break;
     }
-    case 'queued': transcript(name).items.push({ kind: 'note', text: 'queued behind the running turn', turn }); break;
+    case 'queued': {
+      // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
+      const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
+      if (b && !behindOwn) b.status = data.status ?? 'queued';
+      transcript(name).items.push({ kind: 'note', text: behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
+      break;
+    }
     case 'message': {
       const t = transcript(name);
       if (t.streamingTurn === turn) {
         if (t.thinking) { t.items.push({ kind: 'thought', text: t.thinking, secs: t.thinkingSince ? Math.round((Date.now() - t.thinkingSince) / 1000) : 0, turn }); t.thinking = ''; t.thinkingSince = 0; }
         t.text = '';
       }
-      if (typeof data.node === 'number') t.items.push({ kind: 'node', node: data.node, turn });
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn });
       break;
     }
     case 'tool_started': {
@@ -121,7 +140,7 @@ async function onEvent(ev) {
       const call = [...t.items].reverse().find((i) => i.kind === 'tool' && i.callId === data.call_id);
       if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; }
       if (typeof data.node === 'number') {
-        t.items.push({ kind: 'node', node: data.node, callId: data.call_id, turn });
+        pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait')) await loadWaitOrProc(name, data.node, call);
       }
       break;
@@ -141,7 +160,12 @@ async function onEvent(ev) {
       break;
     }
     case 'deleted': S.bots.delete(name); S.transcripts.delete(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; if (S.ui.peek === name) S.ui.peek = null; break;
-    case 'pruned': transcript(name).items.push({ kind: 'note', text: 'earlier history pruned', turn: null }); break;
+    case 'pruned': {
+      // A `follow *` replay reports a retention gap with bot "*": a notice about the store, not a transcript.
+      if (name === '*') toast(`events before cursor ${ev.before ?? 0} were pruned; older history is gone`, 5000);
+      else transcript(name).items.push({ kind: 'note', text: 'earlier history pruned', turn: null });
+      break;
+    }
     default: break;
   }
 }
@@ -182,12 +206,16 @@ async function load(name) {
   for (let guard = 0; guard < 64; guard++) { if (!(await loadBatch(name))) break; }
 }
 async function loadBatch(name) {
-  const t = S.transcripts.get(name); if (!t) return false;
+  const t = S.transcripts.get(name); if (!t || !t.nodes) return false;
   const pending = t.items.map((it, i) => [i, it]).filter(([, it]) => it.kind === 'node').slice(-LAZY_ITEMS).reverse();
-  if (!pending.length) return false;
-  const fetched = await Promise.all(pending.map(([, it]) => Daemon.request('item', { bot: name, node: it.node }).then((v) => ({ ok: v }), (e) => ({ err: String(e) }))));
+  if (!pending.length) { t.nodes = 0; return false; }
+  const fetched = await Promise.all(pending.map(([, it]) => Daemon.request('item', { bot: name, node: it.node }).then((v) => ({ ok: v }), (e) => ({ err: String(e?.message ?? e) }))));
+  let progressed = false;
   pending.forEach(([index, it], k) => {
     const r = fetched[k];
+    // A lost session is not the item's fault: the node stays and the next attach fetches it. Anything else is final.
+    if (r.err && /daemon_disconnected|detached|^io\b/.test(r.err)) return;
+    progressed = true; t.nodes = Math.max(0, t.nodes - 1);
     let es = r.ok ? entries(r.ok) : [{ kind: 'note', text: `node ${it.node}: ${r.err}` }];
     const call = it.callId ? t.items.slice(0, index).reverse().find((x) => x.kind === 'tool' && x.callId === it.callId) : null;
     if (call && (call.background || call.spawns || call.name === 'wait')) es = es.filter((e) => e.kind !== 'out');
@@ -198,7 +226,7 @@ async function loadBatch(name) {
     }
     t.items.splice(index, 1, ...rep);
   });
-  return true;
+  return progressed;
 }
 async function loadVisible() {
   await load(S.selected);
@@ -305,7 +333,7 @@ function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyp
 function botRowHTML(n, sel) {
   const b = n.b;
   const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => h.replace(/^turn:/, '').split('/')[0]).join(' ')}</div>` : '';
-  return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${treePrefix(n)}</span><span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="n">${esc(b.name)}</span></div>${w}`;
+  return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="n">${esc(b.name)}</span></div>${w}`;
 }
 function peers() { return (S.transcripts.get(S.selected)?.items ?? []).filter((i) => i.kind === 'peer' && S.bots.has(i.who)).map((i) => i.who); }
 function keybarHTML(b) {
@@ -350,7 +378,7 @@ function renderPicker() {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
     const state = r.b.status === 'idle' ? '' : labelOf(r.b.status);
     const hint = q ? [r.b.parent ? `↳ ${r.b.parent}` : '', state].filter(Boolean).join(' · ') : state;
-    return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${treePrefix(r)}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
+    return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
   }).join('') : '<div class="empty">no bot matches</div>';
 }
 function openPicker() { S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }

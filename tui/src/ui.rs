@@ -516,14 +516,7 @@ fn rail(frame: &mut Frame, area: Rect, app: &App, pulse: bool) {
         return;
     }
     let mut rows: Vec<Line> = vec![Line::from(Span::styled(" bots", dim())), Line::from("")];
-    for (b, depth, last, trail) in app.tree() {
-        let mut prefix = String::new();
-        if depth > 0 {
-            for l in trail.iter().skip(1) {
-                prefix.push_str(if *l { "  " } else { "│ " });
-            }
-            prefix.push_str(if last { "└ " } else { "├ " });
-        }
+    for (b, depth, prefix) in app.tree() {
         let sel = b.name == app.selected;
         let mark = Span::styled(
             if sel { "▎" } else { " " },

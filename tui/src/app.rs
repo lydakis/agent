@@ -68,6 +68,9 @@ pub enum Item {
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub items: Vec<(Option<i64>, Item)>,
+    /// How many items are still bare nodes; loads skip a transcript at zero
+    /// instead of scanning it on every event.
+    pub nodes: usize,
     pub text: String,
     pub thinking: String,
     pub thinking_since: Option<Instant>,
@@ -254,64 +257,80 @@ impl App {
     }
 
     /// Bots as a tree by creator, depth first: (bot, depth, is last child, ancestors' last flags).
-    pub fn tree(&self) -> Vec<(&Bot, usize, bool, Vec<bool>)> {
-        // One pass builds the children index; the walk is then linear in
-        // the fleet, not quadratic, which matters at thousands of bots.
-        let mut children: HashMap<Option<&str>, Vec<&Bot>> = HashMap::new();
+    /// Bots as a tree by creator, depth first: (bot, depth, prefix). The
+    /// prefix is the rail's connector text; it is built from the parent's
+    /// continuation, so a deep chain costs one string per row and no
+    /// recursion.
+    pub fn tree<'a>(&'a self) -> Vec<(&'a Bot, usize, String)> {
+        type Stack<'a> = Vec<(&'a Bot, usize, bool, String)>;
+        // One pass builds the children index; the walk is linear in the fleet.
+        let mut children: HashMap<Option<&'a str>, Vec<&'a Bot>> = HashMap::new();
         for b in self.bots.values() {
             let parent = b.parent.as_deref().filter(|p| self.bots.contains_key(*p));
             children.entry(parent).or_default().push(b);
         }
-        let mut out: Vec<(&Bot, usize, bool, Vec<bool>)> = Vec::new();
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        fn walk<'a>(
+        fn push_kids<'a>(
             children: &HashMap<Option<&'a str>, Vec<&'a Bot>>,
-            seen: &mut std::collections::HashSet<&'a str>,
+            seen: &std::collections::HashSet<&'a str>,
+            stack: &mut Stack<'a>,
             parent: Option<&'a str>,
             depth: usize,
-            trail: &[bool],
-            out: &mut Vec<(&'a Bot, usize, bool, Vec<bool>)>,
+            cont: &str,
         ) {
-            let kids: Vec<&Bot> = children
-                .get(&parent)
-                .map(|v| {
-                    v.iter()
-                        .copied()
-                        .filter(|b| !seen.contains(b.name.as_str()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let Some(kids) = children.get(&parent) else {
+                return;
+            };
+            let kids: Vec<&'a Bot> = kids
+                .iter()
+                .copied()
+                .filter(|b| !seen.contains(b.name.as_str()))
+                .collect();
             let n = kids.len();
-            for (i, kid) in kids.into_iter().enumerate() {
-                let last = i + 1 == n;
-                seen.insert(&kid.name);
-                let mut t = trail.to_vec();
-                t.push(last);
-                out.push((kid, depth, last, trail.to_vec()));
-                walk(children, seen, Some(&kid.name), depth + 1, &t, out);
+            for (i, kid) in kids.into_iter().enumerate().rev() {
+                stack.push((kid, depth, i + 1 == n, cont.to_owned()));
             }
         }
-        walk(&children, &mut seen, None, 0, &[], &mut out);
-        // Whatever the walk did not reach still needs a row: a creator cycle
-        // left by delete-and-recreate. Each such bot roots its own subtree.
-        while let Some(orphan) = self.bots.values().find(|b| !seen.contains(b.name.as_str())) {
-            seen.insert(&orphan.name);
-            out.push((orphan, 0, true, Vec::new()));
-            walk(
-                &children,
-                &mut seen,
-                Some(&orphan.name),
-                1,
-                &[true],
-                &mut out,
-            );
+        let mut out: Vec<(&'a Bot, usize, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+        // Explicit stack of (bot, depth, is last sibling, parent's continuation).
+        let mut stack: Stack<'a> = Vec::new();
+        push_kids(&children, &seen, &mut stack, None, 0, "");
+        loop {
+            while let Some((b, depth, last, cont)) = stack.pop() {
+                if !seen.insert(b.name.as_str()) {
+                    continue;
+                }
+                let (prefix, next) = if depth == 0 {
+                    (String::new(), String::new())
+                } else {
+                    (
+                        format!("{cont}{}", if last { "└ " } else { "├ " }),
+                        format!("{cont}{}", if last { "  " } else { "│ " }),
+                    )
+                };
+                out.push((b, depth, prefix));
+                push_kids(
+                    &children,
+                    &seen,
+                    &mut stack,
+                    Some(b.name.as_str()),
+                    depth + 1,
+                    &next,
+                );
+            }
+            // Whatever the walk did not reach still needs a row: a creator cycle
+            // left by delete-and-recreate. Each such bot roots its own subtree.
+            match self.bots.values().find(|b| !seen.contains(b.name.as_str())) {
+                Some(orphan) => stack.push((orphan, 0, true, String::new())),
+                None => break,
+            }
         }
         out
     }
 
     // ----- lifecycle -----
 
-    pub async fn attach(&mut self) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+    pub async fn attach(&mut self) -> Result<tokio::sync::mpsc::Receiver<Value>> {
         let (client, events) = Client::connect(&self.socket).await?;
         self.client = Some(client.clone());
         // Subscribe before taking the snapshot: a deletion is a live-only
@@ -424,11 +443,11 @@ impl App {
     }
 
     fn push(&mut self, bot: &str, turn: Option<i64>, item: Item) {
-        self.transcripts
-            .entry(bot.to_owned())
-            .or_default()
-            .items
-            .push((turn, item));
+        let t = self.transcripts.entry(bot.to_owned()).or_default();
+        if matches!(item, Item::Node { .. }) {
+            t.nodes += 1;
+        }
+        t.items.push((turn, item));
     }
 
     /// Which bot has a running shell call that names `--bot NAME`?
@@ -543,11 +562,24 @@ impl App {
                     );
                 }
             }
-            "queued" => self.push(
-                &bot,
-                turn,
-                Item::Note("queued behind the running turn".into()),
-            ),
+            "queued" => {
+                // `ready` waits for a daemon-wide slot with nothing else
+                // running on the bot; `queued` sits behind the bot's own turn.
+                let state = data["status"].as_str().unwrap_or("queued");
+                let behind_own = self
+                    .bots
+                    .get(&bot)
+                    .is_some_and(|b| b.running_turn.is_some() || is_active(&b.status));
+                if !behind_own && let Some(b) = self.bots.get_mut(&bot) {
+                    b.status = state.to_owned();
+                }
+                let note = if behind_own {
+                    "queued behind the running turn"
+                } else {
+                    "queued for a slot"
+                };
+                self.push(&bot, turn, Item::Note(note.into()));
+            }
             "message" => {
                 let t = self.transcripts.entry(bot.clone()).or_default();
                 if t.streaming_turn == turn {
@@ -722,7 +754,18 @@ impl App {
                     self.close_peek();
                 }
             }
-            "pruned" => self.push(&bot, None, Item::Note("earlier history pruned".into())),
+            "pruned" => {
+                // A `follow *` replay reports a retention gap with bot "*":
+                // it is a notice about the store, not a transcript.
+                let before = event["before"].as_i64().unwrap_or(0);
+                if bot == "*" {
+                    self.toast(format!(
+                        "events before cursor {before} were pruned; older history is gone"
+                    ));
+                } else {
+                    self.push(&bot, None, Item::Note("earlier history pruned".into()));
+                }
+            }
             _ => {}
         }
     }
@@ -820,6 +863,9 @@ impl App {
         let Ok(client) = self.client() else {
             return false;
         };
+        if self.transcripts.get(name).is_none_or(|t| t.nodes == 0) {
+            return false;
+        }
         let pending: Vec<(usize, i64)> = self
             .transcripts
             .get(name)
@@ -853,12 +899,25 @@ impl App {
             return false;
         };
         // `pending` runs from the back already, so earlier indices stay valid.
+        let mut progressed = false;
         for ((index, node), result) in pending.into_iter().zip(fetched) {
             let turn = t.items[index].0;
             let mut entries = match result {
                 Ok(item) => items::entries(&item),
+                // A lost session is not the item's fault: the node stays and
+                // the next attach fetches it. Anything else is final.
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "daemon_disconnected" | "io" | "detached"
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => vec![Entry::Note(format!("node {node}: {error}"))],
             };
+            progressed = true;
+            t.nodes = t.nodes.saturating_sub(1);
             // A delegate call's result is the handle JSON the peer cards already
             // show, a background start's result is its proc card, and a wait's
             // result is what those cards became. None of it is shown twice.
@@ -887,7 +946,7 @@ impl App {
             }
             t.items.splice(index..index + 1, replacement);
         }
-        true
+        progressed
     }
 
     // ----- actions -----

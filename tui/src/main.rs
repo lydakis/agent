@@ -107,16 +107,9 @@ pub fn picker_rows(app: &App) -> Vec<(String, String, String)> {
     app.tree()
         .into_iter()
         .filter(|(b, ..)| query.is_empty() || b.name.to_lowercase().contains(&query))
-        .map(|(b, depth, last, trail)| {
+        .map(|(b, _depth, prefix)| {
             let state = ui::label(&b.status).to_owned();
             if query.is_empty() {
-                let mut prefix = String::new();
-                if depth > 0 {
-                    for l in trail.iter().skip(1) {
-                        prefix.push_str(if *l { "  " } else { "│ " });
-                    }
-                    prefix.push_str(if last { "└ " } else { "├ " });
-                }
                 (b.name.clone(), prefix, state)
             } else {
                 let hint = [
