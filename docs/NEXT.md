@@ -291,11 +291,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    retention error. Retention and expensive historical reads should run in
    bounded pieces on the storage thread once the queue-wait instrumentation
    exists.
-13. Cache-hit accounting. The window's hysteresis exists to keep provider
-   prompt caches warm and the daemon already receives cached-token counts,
-   but records only cache-inclusive input tokens. Record and report the hit
-   ratio per turn and per bot; it decides whether the three-quarters rule is
-   right, with a live long-conversation run as the check.
+13. Done: [cache-hit accounting](DAEMON_MEASUREMENTS.md#cache-hit-accounting).
+   `cached_input_tokens` and `cache_hit` per turn and per bot, and
+   daemon-lifetime totals in `stats`. The live check on luna and Sonnet
+   (0.72 and 0.85 overall) shows the ratio is set by how often
+   the window start moves: every move is one full-miss turn, the turns
+   between hit at 0.91 and 0.95. A lower hysteresis target would
+   raise the ratio at the price of less average context; that is item 15's
+   call, so the three-quarters rule stays until the quality evaluation
+   exists.
 14. Mass interrupt. Interrupting one bot is tested; stopping a thousand at
    once, how long until their processes are gone and their turns durable, is
    not. Cancellation latency is on the unmeasured list and matters most for

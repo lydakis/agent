@@ -34,6 +34,8 @@ class AccountingTests(ModelFixture):
                 self.assertEqual(row['retries'], int(calls > 1))
                 self.assertEqual(self.model.requests.qsize() - prior_calls, calls)
                 self.assertEqual(client.request('resume', bot=bot)['result']['tokens_used'], calls * 110)
+                self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'],
+                                 (prior_calls + calls) * 100)
                 page = client.request('events', bot=bot, after=0, limit=256)['result']['events']
                 self.assertEqual(sum(e['event'] == 'tool_completed' for e in page), int(calls > 1))
 
@@ -83,6 +85,23 @@ class AccountingTests(ModelFixture):
         self.assertEqual((row['input_tokens'], row['output_tokens'], row['model_rounds']), (100, 10, 1))
 
 
+    def test_cache_hits_are_recorded_per_turn_per_bot_and_per_daemon(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        cold = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
+        client.finished(cold)
+        warm = client.request('submit', bot='Bob', request_id='2', prompt='cached:again')['result']['turn']
+        client.finished(warm)
+        turns = {t['turn']: t for t in client.request('turns', bot='Bob', after=0)['result']['turns']}
+        self.assertEqual((turns[cold]['cached_input_tokens'], turns[cold]['cache_hit']), (0, 0.0))
+        self.assertEqual((turns[warm]['cached_input_tokens'], turns[warm]['cache_hit']), (40, 0.4))
+        bot = client.request('resume', bot='Bob')['result']
+        self.assertEqual((bot['input_tokens'], bot['cached_input_tokens'], bot['cache_hit']), (200, 40, 0.2))
+        listed = client.request('bots')['result']['bots'][0]
+        self.assertEqual((listed['input_tokens'], listed['cache_hit']), (200, 0.2))
+        tokens = client.request('stats')['result']['tokens']
+        self.assertEqual(tokens, {'input_tokens': 200, 'cached_input_tokens': 40, 'output_tokens': 20, 'cache_hit': 0.2})
+
     def test_incomplete_usage_is_durable_and_exhausts_budget(self):
         client = self.client('echo')
         client.request('create', bot='Bob', workspace=str(self.path), budget_tokens=100)
@@ -92,6 +111,7 @@ class AccountingTests(ModelFixture):
         self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 110)
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual(len([e for e in events if e['event'] == 'usage']), 1)
+        self.assertEqual(client.request('stats')['result']['tokens']['input_tokens'], 100)
         self.assertFalse(any(e['event'] == 'message' for e in events))
         client.close()
         client = self.client('echo')
@@ -99,6 +119,17 @@ class AccountingTests(ModelFixture):
                          'budget_exhausted')
         row = client.request('turns', bot='Bob')['result']['turns'][0]
         self.assertEqual((row['input_tokens'], row['output_tokens'], row['model_rounds']), (100, 10, 1))
+
+    def test_rejected_completion_counts_usage_once_in_daemon_totals(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='cached:reused-call')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['error'], 'storage_error')
+        row = client.request('turns', bot='Bob')['result']['turns'][0]
+        totals = client.request('stats')['result']['tokens']
+        self.assertEqual(totals, {'input_tokens': 200, 'cached_input_tokens': 80,
+                                  'output_tokens': 20, 'cache_hit': 0.4})
+        self.assertEqual({key: row[key] for key in totals}, totals)
 
     def test_result_reports_outcomes_and_live_status(self):
         client = self.client('echo')

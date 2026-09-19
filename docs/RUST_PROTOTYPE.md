@@ -220,8 +220,13 @@ a process budget of two, because waiters hold nothing.
 ## Accounting and budgets
 
 Provider-reported usage records a durable `usage` event, and the store keeps running
-totals: per turn (`input_tokens`, `output_tokens`, `model_rounds`, `started_ms`,
-`finished_ms`) and per bot (`tokens_used`). `create` and `fork` accept
+totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
+`model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
+`input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
+input tokens the provider served from its prompt cache, to three places; it
+is the number the context window's hysteresis exists to keep high, and
+`stats` reports the same totals and ratio for every turn since the daemon
+started, from three atomics and no storage read. `create` and `fork` accept
 `budget_tokens`, a lifetime cap on input plus output tokens for that bot. The
 cap is checked before each model call and before each submission: a
 submission on an exhausted bot fails with `budget_exhausted`, and a turn whose
@@ -668,7 +673,12 @@ migrated inside the opening transaction when its data can be converted without
 guessing. Schema 18 requires each bot's tool selection. Older stores with bots
 but no recorded selection are refused with `store_migration_tools_unknown`;
 their data and schema version remain intact. Keep those stores and use a new
-store path. Empty stores can migrate. The migration is the only code that
+store path. Empty stores can migrate. Schema 19 rebuilds cache counters from
+retained usage events, checking them against durable turn and bot totals. If
+pruning or invalid records make those totals unrecoverable, opening fails with
+`store_migration_usage_unavailable` and leaves data and schema intact; keep
+that store and use a new store path. Usage events are streamed through their
+turn index, without loading the transcript. The migration is the only code that
 knows an earlier format. The store records no daemon-wide provider set or
 toolset; each bot retains its tools, and its provider is checked by family
 when its turn starts.
@@ -827,7 +837,7 @@ The window always contains the whole current turn. If that turn alone exceeds
 a budget, the turn fails with `context_limit` rather than sending a truncated
 request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
-the `context_window` capability. Stores are schema version 18; supported
+the `context_window` capability. Stores are schema version 19; supported
 migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.

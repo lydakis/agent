@@ -114,9 +114,13 @@ compaction, which is where a fleet's cost actually lands.
 Measure every layer on the same long conversation, live and synthetic:
 
 - tokens per turn as the conversation grows, and where the curve flattens;
-- cache-hit ratio per turn (item 13 of [NEXT.md](NEXT.md) makes it
-  observable), since a compaction that rewrites the prefix every turn can cost
-  more than the tokens it saves;
+- cache-hit ratio per turn (recorded per turn and per bot since item 13 of
+  [NEXT.md](NEXT.md)), since a compaction that rewrites the prefix every turn
+  can cost more than the tokens it saves. The live baseline without
+  compaction: 0.72 on luna and 0.85 on Sonnet over 48 turns with a
+  12 KiB window, every window move a full-miss turn and the turns between
+  at 0.91 to 0.95; a compaction that rewrites the prefix has to beat
+  that;
 - compaction cost itself: summary calls, tokens, latency, and storage;
 - quality on the task-level evaluation (item 15): a constraint appears early,
   work pushes it out of the window, a later decision depends on it; measure

@@ -1971,3 +1971,105 @@ this restores the intended workload rather than claiming an efficiency gain
 from removing the accidentally advertised `history` tool. No paid calls ran.
 Validation: 77 Rust tests, 66 Python tests, strict Clippy, formatting, and diff
 checks. Both new regression assertions failed before the fixes.
+
+## Cache-hit accounting
+
+Observed 2026-09-18 on Darwin arm64, external power, Rust 1.98.0. The store
+now keeps `cached_input_tokens` per turn and `input_tokens` plus
+`cached_input_tokens` per bot, both reporting `cache_hit`, and `stats`
+carries daemon-lifetime totals from three atomics. Per usage report that is
+two more columns in the same `UPDATE`s and three relaxed adds; no new
+statement, hop, or index.
+
+The live check is one long conversation per provider through the real
+endpoints (ignored `.local/cache-hit/run.py`): 48 turns of a fixed
+500-byte prompt answered with one word, `--context-bytes 12288` so the
+window's hysteretic start moves several times during the run, and the ratio
+read back from `turns` after each turn. Spend was cheap tokens only.
+
+| | gpt-5.6-luna | claude-sonnet-5 |
+| --- | ---: | ---: |
+| Overall cache hit, whole conversation | 0.724 | 0.851 |
+| Turns whose prefix missed (window moved) | 13 of 48 | 6 of 48 |
+| Cache hit on the other turns, median (min) | 0.911 (0.797) | 0.951 (0.938) |
+| Largest request, input tokens | 3,672 | 7,927 |
+| Turn latency, median, miss / hit, s | 1.04 / 0.80 | 1.48 / 1.57 |
+
+The shape is the same on both: between window moves the provider serves
+everything but the new prompt from its cache, and every move costs one turn
+that misses in full, because the request prefix after the instructions
+begins with a different item. The miss turns fell at
+0, 1, 2, 3, 12, 16, 20, 24, 29, 32, 38, 43, 46 on luna (the first four are the cache warming up
+below the provider's minimum prompt) and at 0, 20, 26, 32, 38, 44 on
+Sonnet, whose tokenizer fits about twice as many turns in the same bytes.
+So the hit ratio is set by move frequency, and move frequency by the
+three-quarters target: dropping a quarter of the window per move here meant
+a full miss every three turns on luna and every six on Sonnet. A lower
+target would move less often, at the price of less context on the average
+turn; with luna's numbers, a half-window target would raise the overall hit
+from about 0.72 to about 0.83 while the average request shrank by a sixth.
+Whether that trade is worth it is a context-quality question (item 15), not
+a cost one, and the rule stays at three quarters until that evaluation
+exists. Captures: `.local/cache-hit/luna.json` and `sonnet.json`.
+
+The 32-agent socket echo screen, committed tree `a2140ed5…` (rebuilt from
+a worktree, screened with its own bench) against the slice binary
+`b28804b6…`, one excluded warmup and four measured runs each: RSS 17.75
+(17.58–17.91) versus 17.90 (17.84–17.92) MiB, CPU 0.345 (0.328–0.351)
+versus 0.339 (0.320–0.351) s, p95 604.3 (596.8–641.7) versus 604.6
+(591.9–617.3) ms. Level within noise, as two more columns in existing
+updates and three atomic adds should be. Captures: ignored
+`.local/bench/slice-prev6-socket-32/` and `slice-cache-socket-32/`.
+
+Validation: 78 Rust tests, strict Clippy, formatting, and 153 Python tests.
+New regressions: a store test for per-turn and per-bot cached counts
+and the ratio's rounding and zero case; a daemon test where a fixture that
+reports cached tokens on one turn shows the expected per-turn, per-bot,
+listing, and `stats` figures.
+
+### Cache-accounting review fixes
+
+The daemon now counts usage once when each provider attempt returns. Recording
+a completion's usage after its output was rejected by storage does not add it
+again. Schema-19 migration reconstructs cached counts from retained usage
+events and validates them against existing turn and bot totals. Pruned or
+invalid usage that prevents reconstruction fails the opening transaction with
+`store_migration_usage_unavailable`, preserving the store and its version.
+Backfill streams events through the turn/kind index, uses prepared updates,
+and never loads conversation content. Current-schema startup and the turn loop
+do not run the backfill.
+
+Observed 2026-09-18. The matched 32-agent socket echo screen compared the pre-fix binary
+`24d3af43…` with `492be79e…`, on Darwin arm64, external power, Rust 1.98.0.
+Both used the same current observer. Order: baseline, candidate, candidate,
+baseline; each batch had one excluded warmup and two measured runs. Builds and
+tests finished before measurement. All runs passed replay/follow equality,
+restart, resume, and fork checks, achieved requested provider concurrency, and
+reported no quality warnings.
+
+| Metric | Before fixes | After fixes |
+| --- | ---: | ---: |
+| Sampled peak target RSS, MiB | 17.87 (17.66–17.98) | 17.85 (17.72–18.00) |
+| Observed target CPU, seconds | 0.305 (0.282–0.315) | 0.288 (0.284–0.296) |
+| Per-run p95 turn latency, ms | 588.4 (588.1–615.1) | 590.0 (587.0–606.8) |
+
+Ranges overlap. No material regression is visible; the 5.5% lower CPU median
+does not establish a speedup. This measures these fixes against the cache
+accounting slice, not the entire slice against an earlier runtime. The charged
+boundary is the daemon tree; Python observers and Rust CLI invocations are
+outside it. Captures and the alternating driver: ignored `.local/cache-fix/`.
+
+A separate synthetic migration screen seeded 100 bots with one retained usage
+event per turn in schema 18, then opened copies with the fixed binary. Across
+three runs each, startup through ready **including migration** took 12.9 ms
+(12.2–13.3) for 1,000 turns and 30.6 ms (30.2–30.8) for 10,000. RSS at ready
+was 11.05 and 13.22 MiB respectively; these are ready samples, not peak-memory
+measurements. A bot's migrated totals were checked against the seeded values
+in each run. This measures the one-time
+reconstruction cost separately from the steady workload.
+
+Validation: 79 Rust tests, 32 focused Python tests, strict Clippy, formatting,
+and diff checks. Regressions cover migrated multi-report turns, failed usage,
+forks, reopen, rollback when usage was pruned, and exactly-once daemon totals
+for rejected completions and failed/retried provider calls. The two new
+regressions failed before the fixes. Only synthetic providers were used.

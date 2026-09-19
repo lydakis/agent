@@ -83,6 +83,33 @@ pub struct Turn {
     /// the boundary before it reads, so unrelated bots never pay for one
     /// bot's pending steer.
     pub steers: Arc<AtomicBool>,
+    pub tokens: Arc<TokenTotals>,
+}
+
+/// Provider-reported tokens across every turn since the daemon started:
+/// three relaxed atomics, no lock, no storage read for `stats`.
+#[derive(Default)]
+pub struct TokenTotals {
+    input: std::sync::atomic::AtomicU64,
+    cached_input: std::sync::atomic::AtomicU64,
+    output: std::sync::atomic::AtomicU64,
+}
+impl TokenTotals {
+    pub fn add(&self, usage: &agent_runtime::provider::Usage) {
+        self.input.fetch_add(usage.input_tokens, Relaxed);
+        self.cached_input
+            .fetch_add(usage.cached_input_tokens, Relaxed);
+        self.output.fetch_add(usage.output_tokens, Relaxed);
+    }
+    pub fn snapshot(&self) -> serde_json::Value {
+        let (input, cached, output) = (
+            self.input.load(Relaxed),
+            self.cached_input.load(Relaxed),
+            self.output.load(Relaxed),
+        );
+        json!({"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output,
+            "cache_hit":agent_runtime::store::cache_hit(cached as i64, input as i64)})
+    }
 }
 
 /// Lives outside the cancellable rounds future. No allocation or per-attempt
@@ -421,11 +448,17 @@ impl Turn {
                 .await;
             let paced_ms = accounting.totals().1 - paced_before;
             let error = match result {
-                Ok(completion) => return Ok(completion),
+                Ok(completion) => {
+                    if let Some(usage) = &completion.usage {
+                        self.tokens.add(usage);
+                    }
+                    return Ok(completion);
+                }
                 Err(error) => error,
             };
             // Whatever the provider billed for a failed attempt is still spent.
             if let Some(usage) = &accounting.report.usage {
+                self.tokens.add(usage);
                 *model_rounds += 1;
                 record.tokens_used = record
                     .tokens_used
@@ -940,6 +973,7 @@ mod tests {
             context_items: 4096,
             resume: false,
             steers: Arc::new(AtomicBool::new(true)),
+            tokens: Arc::default(),
         };
         let running = tokio::spawn(async move { task.execute(cancelled).await });
         let last = steers[31];

@@ -46,9 +46,11 @@ def main():
         print(__doc__)
         return 2
     source = (Path(__file__).resolve().parent.parent / 'src/store/db.rs').read_text()
-    # One-time migrations may read a whole table by design; audit the runtime paths.
-    head, _, tail = source.partition('\nfn migrate(')
-    source = head + '\nfn ' + tail.partition('\nfn ')[2]
+    # One-time migrations may read a whole table by design; audit the runtime
+    # paths. Every `fn migrate*` is one, including the backfills it calls.
+    while '\nfn migrate' in source:
+        head, _, tail = source.partition('\nfn migrate')
+        source = head + '\nfn ' + tail.partition('\nfn ')[2]
     conn = sqlite3.connect(sys.argv[1])
     conn.execute('PRAGMA foreign_keys=ON')  # Include the daemon's constraint-check plans.
     seen, scans, structural = set(), [], []

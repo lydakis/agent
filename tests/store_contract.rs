@@ -1,7 +1,7 @@
 use agent_runtime::{
     Error, Result,
     codec::Family,
-    provider::ToolCall,
+    provider::{ToolCall, Usage},
     store::{Binding, Bot, Database, Delivery, TurnOptions},
     tools::Outcome,
 };
@@ -2477,4 +2477,191 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         "stale_turn"
     );
     assert!(db.absorb(plain.turn, None).unwrap().outcomes.is_empty());
+}
+
+#[test]
+fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            |_, _| Ok(()),
+        )
+        .unwrap()
+        .turn;
+    let cold = Usage {
+        input_tokens: 100,
+        output_tokens: 10,
+        cached_input_tokens: 0,
+    };
+    let warm = Usage {
+        input_tokens: 300,
+        output_tokens: 10,
+        cached_input_tokens: 240,
+    };
+    db.append(turn, vec![assistant("one")], &[], Some(&cold))
+        .unwrap();
+    db.append(turn, vec![assistant("two")], &[], Some(&warm))
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let listed = db.turns("Bob", 0, 10).unwrap();
+    let row = &listed["turns"][0];
+    assert_eq!(
+        (
+            row["input_tokens"].as_i64(),
+            row["cached_input_tokens"].as_i64()
+        ),
+        (Some(400), Some(240))
+    );
+    assert_eq!(row["cache_hit"], 0.6);
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(
+        (bot.input_tokens, bot.cached_input_tokens, bot.cache_hit),
+        (400, 240, 0.6)
+    );
+    assert_eq!(bot.tokens_used, 420);
+    let page = db.list(None, 10).unwrap();
+    assert_eq!(page["bots"][0]["cache_hit"], 0.6);
+    assert_eq!(agent_runtime::store::cache_hit(0, 0), 0.0);
+    assert_eq!(agent_runtime::store::cache_hit(1, 3), 0.333);
+}
+
+#[test]
+fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
+    for pruned in [false, true] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-cache-migrate-{}-{pruned}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.create("Bob", Some("/synthetic"), binding()).unwrap();
+            let first = db
+                .begin(
+                    "Bob",
+                    "1",
+                    "first",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            for (input, cached) in [(100, 0), (300, 240)] {
+                db.append(
+                    first,
+                    vec![assistant("answer")],
+                    &[],
+                    Some(&Usage {
+                        input_tokens: input,
+                        cached_input_tokens: cached,
+                        output_tokens: 10,
+                    }),
+                )
+                .unwrap();
+            }
+            db.finish(first, None).unwrap();
+            db.fork("Bob", None, "Fork", Some("/synthetic"), None)
+                .unwrap();
+            let second = db
+                .begin(
+                    "Bob",
+                    "2",
+                    "second",
+                    true,
+                    &TurnOptions::default(),
+                    allow_provider,
+                )
+                .unwrap()
+                .turn;
+            db.failed_usage(
+                second,
+                &Usage {
+                    input_tokens: 100,
+                    cached_input_tokens: 40,
+                    output_tokens: 10,
+                },
+            )
+            .unwrap();
+            db.finish(second, Some(&Error::new("provider_incomplete")))
+                .unwrap();
+            if pruned {
+                db.prune("Bob", 1).unwrap();
+            }
+        }
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE turns DROP COLUMN cached_input_tokens;
+            ALTER TABLE bots DROP COLUMN input_tokens;
+            ALTER TABLE bots DROP COLUMN cached_input_tokens; PRAGMA user_version=18;",
+        )
+        .unwrap();
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        if pruned {
+            assert_eq!(
+                Database::initialize(conn).err().unwrap().code,
+                "store_migration_usage_unavailable"
+            );
+            let conn = Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                    .unwrap(),
+                18
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('bots') WHERE name='input_tokens'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                events
+            );
+            assert_eq!(
+                conn.query_row("SELECT tokens_used FROM bots WHERE name='Bob'", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+                530
+            );
+        } else {
+            let db = Database::initialize(conn).unwrap();
+            let bot = db.inspect("Bob").unwrap();
+            assert_eq!(
+                (bot.input_tokens, bot.cached_input_tokens, bot.tokens_used),
+                (500, 280, 530)
+            );
+            assert_eq!(bot.cache_hit, 0.56);
+            let turns = db.turns("Bob", 0, 10).unwrap();
+            assert_eq!(turns["turns"][0]["cached_input_tokens"], 240);
+            assert_eq!(turns["turns"][1]["cached_input_tokens"], 40);
+            let fork = db.inspect("Fork").unwrap();
+            assert_eq!(
+                (
+                    fork.input_tokens,
+                    fork.cached_input_tokens,
+                    fork.tokens_used
+                ),
+                (0, 0, 0)
+            );
+            drop(db);
+            let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            assert_eq!(db.inspect("Bob").unwrap().cache_hit, 0.56);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -313,6 +313,8 @@ struct Service {
     /// is queued, cleared when the store has none. Keeps the idle loop free
     /// of a store read per iteration.
     ready_hint: bool,
+    /// Provider-reported tokens since this daemon started, for `stats`.
+    tokens: Arc<turn::TokenTotals>,
 }
 
 /// A bot's live turn: which turn, the task owning it, its cancel signal,
@@ -496,6 +498,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         replays: JoinSet::new(),
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
+        tokens: Arc::default(),
     };
     let idle_exit = config
         .idle_exit
@@ -761,6 +764,7 @@ impl Service {
             context_items: self.limits.context_items,
             resume,
             steers,
+            tokens: self.tokens.clone(),
         };
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
@@ -916,6 +920,7 @@ impl Service {
                     "transport": {"in_flight_by_shard": self.transport.loads()},
                     "providers": providers,
                     "store": store.stats(),
+                    "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
                 }))
             }
@@ -1271,6 +1276,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             ready_hint: false,
+            tokens: Arc::default(),
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -1440,6 +1446,7 @@ mod tests {
             jobs: JoinSet::new(),
             replays: JoinSet::new(),
             ready_hint: false,
+            tokens: Arc::default(),
         };
         let duplicate = service
             .dispatch(

@@ -79,6 +79,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
                            'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
+            elif user == 'cached:reused-call':
+                text = ''
+                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
+                           'arguments': '{"text":"ok"}'}]
             elif last.get('type') == 'function_call_output':
                 text = 'echo:' + last['output']
                 output = [{'id': 'msg_echo', 'type': 'message', 'role': 'assistant',
@@ -155,7 +159,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 events.append({'type': 'response.output_text.delta', 'delta': text})
             if user != 'truncate':
                 events.append({'type': 'response.completed', 'response': {'status': 'completed', 'output': output,
-                    'usage': {'input_tokens': 100, 'output_tokens': 10, 'input_tokens_details': {'cached_tokens': 0}}}})
+                    'usage': {'input_tokens': 100, 'output_tokens': 10,
+                              'input_tokens_details': {'cached_tokens': 40 if user.startswith('cached:') else 0}}}})
             if user == 'incomplete':
                 events = [{'type': 'response.incomplete', 'response': {'status': 'incomplete',
                     'incomplete_details': {'reason': 'max_output_tokens'}, 'output': [],

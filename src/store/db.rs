@@ -20,6 +20,12 @@ pub struct Bot {
     /// Lifetime cap on input plus output tokens; checked before each model call.
     pub budget_tokens: Option<u64>,
     pub tokens_used: u64,
+    /// Input tokens sent and, of those, the ones the provider served from
+    /// its prompt cache. Their ratio is what the context window's hysteresis
+    /// exists to keep high.
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_hit: f64,
     /// Default directory for submissions that name none; a bot need not have one.
     pub workspace: Option<String>,
     pub status: String,
@@ -157,6 +163,14 @@ pub struct Database {
     outcomes: Vec<(String, i64, Value)>,
 }
 
+/// The share of input tokens the provider served from its prompt cache,
+/// to three places; zero when nothing was sent.
+pub fn cache_hit(cached: i64, input: i64) -> f64 {
+    if input <= 0 {
+        return 0.0;
+    }
+    ((cached.max(0) as f64 / input as f64) * 1000.0).round() / 1000.0
+}
 fn split_tools(joined: &str) -> Vec<String> {
     joined
         .split(',')
@@ -173,7 +187,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 18;
+    pub const SCHEMA: i32 = 19;
 
     pub fn initialize(conn: Connection) -> Result<Self> {
         conn.execute_batch(
@@ -219,7 +233,9 @@ impl Database {
                 budget_tokens INTEGER, tokens_used INTEGER NOT NULL DEFAULT 0,
                 context_start INTEGER REFERENCES nodes(id),
                 pruned_cursor INTEGER NOT NULL DEFAULT 0,
-                tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history');
+                tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history',
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
@@ -230,6 +246,7 @@ impl Database {
                 started_ms INTEGER, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'reject', expected_turn INTEGER,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
@@ -379,9 +396,12 @@ impl Database {
             instructions: r.get(8)?,
             reasoning: r.get(9)?,
             tools: split_tools(&r.get::<_, String>(12)?),
+            input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
+            cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
+            cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens";
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -398,7 +418,8 @@ impl Database {
             return fail("invalid_bot_page");
         }
         let mut statement = self.conn.prepare(
-            "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools
+            "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
+                    input_tokens,cached_input_tokens
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -412,7 +433,9 @@ impl Database {
                 "family":r.get::<_, String>(6)?,"model":r.get::<_, String>(7)?,
                 "reasoning":r.get::<_, Option<String>>(8)?,
                 "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?,
-                "tools":split_tools(&r.get::<_, String>(11)?)});
+                "tools":split_tools(&r.get::<_, String>(11)?),
+                "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
+                "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?)});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -445,7 +468,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
+            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
             params![
                 name,
                 workspace,
@@ -1679,7 +1702,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO bots VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
+            "INSERT INTO bots(name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools) VALUES (?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?)",
             params![
                 name,
                 checkpoint,
@@ -1986,7 +2009,7 @@ impl Database {
             "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,b.provider||'/'||b.model),t.input_tokens,t.output_tokens,
                     t.model_rounds,t.started_ms,t.finished_ms,substr(t.prompt,1,200),length(t.prompt),
-                    t.retries,t.paced_ms,t.delivery
+                    t.retries,t.paced_ms,t.delivery,t.cached_input_tokens
              FROM turns t JOIN bots b ON b.name=t.bot WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
         let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
@@ -2006,7 +2029,9 @@ impl Database {
                 "started_ms":r.get::<_, Option<i64>>(8)?,"finished_ms":r.get::<_, Option<i64>>(9)?,
                 "prompt_preview":preview,"prompt_bytes":r.get::<_, i64>(11)?,
                 "retries":r.get::<_, i64>(12)?,"paced_ms":r.get::<_, i64>(13)?,
-                "delivery":r.get::<_, String>(14)?}),
+                "delivery":r.get::<_, String>(14)?,
+                "cached_input_tokens":r.get::<_, i64>(15)?,
+                "cache_hit":cache_hit(r.get::<_, i64>(15)?, r.get::<_, i64>(5)?)}),
             );
         }
         let next = more.then(|| {
@@ -2144,13 +2169,22 @@ fn record_usage(conn: &Connection, bot: &str, turn: i64, usage: &Usage) -> Resul
     let data = serde_json::to_value(usage)?;
     let cursor = event(conn, bot, Some(turn), "usage", data.clone())?;
     conn.execute(
-        "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+? WHERE id=?",
-        params![usage.input_tokens as i64, usage.output_tokens as i64, turn],
+        "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,
+             cached_input_tokens=cached_input_tokens+? WHERE id=?",
+        params![
+            usage.input_tokens as i64,
+            usage.output_tokens as i64,
+            usage.cached_input_tokens as i64,
+            turn
+        ],
     )?;
     conn.execute(
-        "UPDATE bots SET tokens_used=tokens_used+? WHERE name=?",
+        "UPDATE bots SET tokens_used=tokens_used+?,input_tokens=input_tokens+?,
+             cached_input_tokens=cached_input_tokens+? WHERE name=?",
         params![
             usage.input_tokens.saturating_add(usage.output_tokens) as i64,
+            usage.input_tokens as i64,
+            usage.cached_input_tokens as i64,
             bot
         ],
     )?;
@@ -2305,6 +2339,32 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             }
         }
     }
+    if from < 19 {
+        // 18 -> 19: cached input tokens per turn and per bot, for the hit ratio.
+        let mut added = false;
+        for (table, column) in [
+            ("turns", "cached_input_tokens"),
+            ("bots", "input_tokens"),
+            ("bots", "cached_input_tokens"),
+        ] {
+            let present: bool = conn.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"
+                ),
+                [],
+                |r| r.get(0),
+            )?;
+            if !present {
+                added = true;
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
+        }
+        if added {
+            migrate_cache_usage(conn)?;
+        }
+    }
     if from < 18 {
         // 17 -> 18: tools are chosen per bot. Earlier stores did not retain
         // that choice, so only an empty store can be converted without guessing.
@@ -2368,6 +2428,72 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                     > COALESCE((SELECT MAX(id) FROM events),0)
                     THEN (SELECT seq FROM sqlite_sequence WHERE name='events') ELSE 0 END);",
         )?;
+    }
+    Ok(())
+}
+
+/// Backfill once at open, streaming usage events through the turn/kind index.
+/// Missing retained usage is unknown, not a cache miss. The caller's opening
+/// transaction rolls back both these updates and the new columns on failure.
+fn migrate_cache_usage(conn: &Connection) -> Result<()> {
+    let unavailable = || {
+        Error::with(
+            "store_migration_usage_unavailable",
+            "retained usage cannot reconstruct cache totals; keep this store and use a new store path",
+        )
+    };
+    let mut turns = conn.prepare("SELECT id,input_tokens,output_tokens FROM turns")?;
+    let mut events = conn.prepare("SELECT data FROM events WHERE turn=? AND kind='usage'")?;
+    let mut update = conn.prepare("UPDATE turns SET cached_input_tokens=? WHERE id=?")?;
+    let mut rows = turns.query([])?;
+    while let Some(row) = rows.next()? {
+        let (turn, input, output): (i64, i64, i64) = (row.get(0)?, row.get(1)?, row.get(2)?);
+        let mut usage = events.query([turn])?;
+        let (mut sent, mut received, mut cached) = (0i64, 0i64, 0i64);
+        while let Some(event) = usage.next()? {
+            let data: Value =
+                serde_json::from_str(&event.get::<_, String>(0)?).map_err(|_| unavailable())?;
+            let read = |key: &str| {
+                data[key]
+                    .as_i64()
+                    .filter(|n| *n >= 0)
+                    .ok_or_else(unavailable)
+            };
+            let (i, o, c) = (
+                read("input_tokens")?,
+                read("output_tokens")?,
+                read("cached_input_tokens")?,
+            );
+            if c > i {
+                return Err(unavailable());
+            }
+            sent = sent.checked_add(i).ok_or_else(unavailable)?;
+            received = received.checked_add(o).ok_or_else(unavailable)?;
+            cached = cached.checked_add(c).ok_or_else(unavailable)?;
+        }
+        if (sent, received) != (input, output) {
+            return Err(unavailable());
+        }
+        update.execute(params![cached, turn])?;
+    }
+    // Turns survive pruning, and forked bots own only their own usage.
+    let mut bots = conn.prepare(
+        "SELECT b.name,b.tokens_used,COALESCE(SUM(t.input_tokens),0),
+            COALESCE(SUM(t.cached_input_tokens),0),COALESCE(SUM(t.input_tokens+t.output_tokens),0)
+         FROM bots b LEFT JOIN turns t ON t.bot=b.name GROUP BY b.name",
+    )?;
+    let mut update =
+        conn.prepare("UPDATE bots SET input_tokens=?,cached_input_tokens=? WHERE name=?")?;
+    let mut rows = bots.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, i64>(1)? != row.get::<_, i64>(4)? {
+            return Err(unavailable());
+        }
+        update.execute(params![
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(0)?
+        ])?;
     }
     Ok(())
 }
