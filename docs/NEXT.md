@@ -411,11 +411,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     reported limits and 429s supply pacing feedback. No hidden cold-start cap.
     No model registry: a shared quota the provider does not name is still
     corrected by every response's headers.
-26. Absorption against context capacity. A boundary drains the whole
-    steer snapshot in storage batches, so the absorbed total can exceed
-    what the next request carries; the same is true of any turn whose own
-    items outgrow the window. Budget the boundary against encoded context,
-    leaving excess steers queued, as part of the compaction work.
+26. Done: absorption against context capacity. A boundary takes steers only
+    while the running turn's own items plus each encoded steer stay within
+    the window's three-quarter target of the context budget; the rest stay
+    queued and start as their own turns when the line moves, so a burst of
+    large steers can no longer make the running turn fail with
+    `context_limit`. A turn whose own tool outputs outgrow the window is
+    still bounded only by the 64 KiB preview and the round limit; that
+    belongs with compaction (items 15 and the context work).
+    The [active-steering follow-up](DAEMON_MEASUREMENTS.md#active-steering-follow-up)
+    found 3.9–6.4% higher daemon CPU with flat memory and increasing absorption
+    cost as the current turn grows. [Indexed accounting](DAEMON_MEASUREMENTS.md#indexed-turn-accounting)
+    now replaces those walks with fixed-count indexed lookups. The matched
+    follow-up returns absorption time near the pre-budget baseline, with
+    overlapping CPU and memory ranges; small CPU differences remain, so this
+    is not a universal non-regression claim.
 27. Done: storage counters by operation. Every store job is labeled by
     the method it performs, and `stats` reports per operation the count,
     queued and ran totals, the slowest run, and two fourteen-bucket

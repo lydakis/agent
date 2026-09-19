@@ -257,6 +257,7 @@ impl Database {
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO node_sequence VALUES (1,0);
@@ -727,19 +728,15 @@ impl Database {
         Ok(out)
     }
     /// Bytes and items in the active turn alone. Older turns can be removed
-    /// from the context window; the current turn cannot. Walk metadata only.
+    /// from the context window; the current turn cannot. The indexed first
+    /// node and head supply cumulative totals without walking the turn.
     pub fn turn_usage(&self, name: &str, turn: i64) -> Result<(Family, usize, usize)> {
         let row: Option<(String, i64, i64)> = self
             .conn
             .prepare_cached(
-                "WITH RECURSIVE chain(id,parent,turn) AS (
-                SELECT n.id,n.parent,n.turn FROM bots b JOIN nodes n ON n.id=b.head
-                WHERE b.name=?1 AND b.running_turn=?2
-                UNION ALL SELECT n.id,n.parent,n.turn FROM nodes n JOIN chain c ON n.id=c.parent
-                WHERE c.turn IS NULL)
-             SELECT b.family,h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0)
-             FROM chain c JOIN bots b ON b.name=?1 JOIN nodes h ON h.id=b.head
-             LEFT JOIN nodes p ON p.id=c.parent WHERE c.turn=?2",
+                "SELECT b.family,h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0)
+             FROM bots b JOIN nodes h ON h.id=b.head JOIN nodes s ON s.turn=?2
+             LEFT JOIN nodes p ON p.id=s.parent WHERE b.name=?1 AND b.running_turn=?2",
             )?
             .query_row(params![name, turn], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -1179,7 +1176,13 @@ impl Database {
     /// Deliver a bounded prefix of queued steers into the running turn.
     /// Stop at an incompatible explicit override; it and later steers stay
     /// queued, so a later message cannot overtake the deferred steer.
-    pub fn absorb(&mut self, turn: i64, through: Option<i64>) -> Result<Absorbed> {
+    pub fn absorb(
+        &mut self,
+        turn: i64,
+        through: Option<i64>,
+        context_bytes: usize,
+        context_items: usize,
+    ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
             Some(id) => Some(id),
@@ -1190,8 +1193,16 @@ impl Database {
         let Some(through) = through else {
             return Ok(Absorbed::default());
         };
-        let mut steers: Vec<(i64, String)> = Vec::new();
+        // Absorbed steers join the running turn's own items, which the window
+        // must carry whole. Budget them against the same three-quarter target
+        // the window keeps, less what the turn already holds; what does not
+        // fit stays queued and starts as its own turn when the line moves.
+        let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
+        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes);
+        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items);
+        let mut steers: Vec<(i64, Vec<u8>)> = Vec::new();
         let mut more = false;
+        let mut capped = false;
         {
             // The partial index skips ordinary queued work. Read at most one
             // candidate beyond the byte budget, without copying its prompt.
@@ -1219,22 +1230,27 @@ impl Database {
                     break;
                 }
                 bytes += size;
-                steers.push((row.get(0)?, row.get(1)?));
+                let item = family.user_item(&row.get::<_, String>(1)?)?;
+                if item.len() > room_bytes || room_items == 0 {
+                    capped = true;
+                    break;
+                }
+                room_bytes -= item.len();
+                room_items -= 1;
+                steers.push((row.get(0)?, item));
             }
         }
         let mut absorbed = Absorbed::default();
         if steers.is_empty() {
             return Ok(absorbed);
         }
-        if more || steers.len() == STEER_BATCH_ITEMS {
+        if !capped && (more || steers.len() == STEER_BATCH_ITEMS) {
             absorbed.next_through = Some(through);
         }
-        let family = bot.family()?;
         let tx = self.conn.transaction()?;
         let mut head = bot.head;
         let mut steered = Vec::with_capacity(steers.len());
-        for (steer, prompt) in steers {
-            let item = family.user_item(&prompt)?;
+        for (steer, item) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             tx.execute(

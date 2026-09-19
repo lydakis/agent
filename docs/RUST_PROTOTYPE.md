@@ -681,6 +681,18 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   the snapshot wait for the next boundary. An interrupt completes any in-flight
   batch's commit, event publication, and waiter notifications before stopping;
   it does not drain further batches. Unabsorbed work stays durable.
+  Absorption is budgeted against the context: a boundary takes steers,
+  oldest first, only while the running turn's own items plus each encoded
+  steer stay within three quarters of `--context-bytes` and
+  `--context-items`, the target the window itself keeps, so a burst of
+  large steers cannot make the running turn exceed its context and fail
+  with `context_limit`. Steers that do not fit stay queued and start as
+  their own turns when the line moves; later steers do not overtake them.
+  Usage comes from cumulative byte and depth totals at the head and the parent
+  of the turn's first node, found through a partial `nodes(turn)` index. This
+  takes a fixed number of indexed lookups regardless of current-turn length;
+  the same accounting serves the `history` tool. The index has one entry per
+  started turn and is built once on first open of an existing unindexed store.
   A partial queued-steer index keeps ordinary queued work out of the scan.
   Each live turn carries one flag, set when a steer is queued for its bot
   or queued cancellation can expose steers behind a blocker, and answered

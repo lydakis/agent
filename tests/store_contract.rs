@@ -989,7 +989,7 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "DROP TABLE retained_turns;
-             DROP TABLE node_sequence; DROP TABLE turn_sequence; DROP INDEX nodes_turn_seq; DROP INDEX nodes_parent; DROP INDEX bots_head;
+             DROP TABLE node_sequence; DROP TABLE turn_sequence; DROP INDEX nodes_turn_seq; DROP INDEX nodes_turn; DROP INDEX nodes_parent; DROP INDEX bots_head;
              DROP INDEX bots_context_start; ALTER TABLE bots DROP COLUMN pruned_cursor;
              ALTER TABLE nodes DROP COLUMN turn; ALTER TABLE nodes DROP COLUMN turn_seq;
              ALTER TABLE bots DROP COLUMN context_start;",
@@ -2077,7 +2077,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert!(db.turn_outcome("Bob", second.turn).unwrap().is_none());
 
     // The boundary takes the steer, not the queued turn, and answers its waiters.
-    let absorbed = db.absorb(first.turn, None).unwrap();
+    let absorbed = db.absorb(first.turn, None, 8 << 20, 4096).unwrap();
     assert_eq!(absorbed.outcomes.len(), 1);
     let (steered, outcome) = &absorbed.outcomes[0];
     assert_eq!(*steered, third.turn);
@@ -2094,7 +2094,12 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(items.len(), 2);
     assert_eq!(items[1]["content"][0]["text"], "third");
     assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "queued");
-    assert!(db.absorb(first.turn, None).unwrap().outcomes.is_empty());
+    assert!(
+        db.absorb(first.turn, None, 8 << 20, 4096)
+            .unwrap()
+            .outcomes
+            .is_empty()
+    );
 
     // Finishing promotes the bot's oldest queued turn to ready; starting it
     // puts its prompt after the whole first turn.
@@ -2401,7 +2406,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         )
         .unwrap()
         .turn;
-    let result = db.absorb(first, None).unwrap();
+    let result = db.absorb(first, None, 8 << 20, 4096).unwrap();
     assert_eq!(
         result
             .outcomes
@@ -2410,16 +2415,29 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
             .collect::<Vec<_>>(),
         [matched]
     );
-    assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
+    assert!(
+        db.absorb(first, None, 8 << 20, 4096)
+            .unwrap()
+            .outcomes
+            .is_empty()
+    );
     assert!(db.steers_waiting("Bob").unwrap());
     db.finish(first, None).unwrap();
     db.start(moved, allow_provider).unwrap();
     assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
-    assert!(db.absorb(moved, None).unwrap().outcomes.is_empty());
+    assert!(
+        db.absorb(moved, None, 8 << 20, 4096)
+            .unwrap()
+            .outcomes
+            .is_empty()
+    );
     db.finish(moved, None).unwrap();
     db.start(changed, allow_provider).unwrap();
     assert_eq!(db.context(changed).unwrap().model, "openai/other");
-    assert_eq!(db.absorb(changed, None).unwrap().outcomes[0].0, inherited);
+    assert_eq!(
+        db.absorb(changed, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+        inherited
+    );
     assert!(!db.steers_waiting("Bob").unwrap());
 }
 
@@ -2462,7 +2480,7 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         let mut through = None;
         let mut late = None;
         while seen.len() < count {
-            let absorbed = db.absorb(first, through).unwrap();
+            let absorbed = db.absorb(first, through, 8 << 20, 4096).unwrap();
             through = absorbed.next_through;
             assert_eq!(absorbed.outcomes.len(), batch.min(count - seen.len()));
             seen.extend(absorbed.outcomes.into_iter().map(|(id, _)| id));
@@ -2478,8 +2496,16 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         assert!(through.is_none());
         assert_eq!(seen, submitted);
         assert_eq!(db.turn_status("Bob", late.unwrap()).unwrap(), "queued");
-        assert_eq!(db.absorb(first, None).unwrap().outcomes[0].0, late.unwrap());
-        assert!(db.absorb(first, None).unwrap().outcomes.is_empty());
+        assert_eq!(
+            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            late.unwrap()
+        );
+        assert!(
+            db.absorb(first, None, 8 << 20, 4096)
+                .unwrap()
+                .outcomes
+                .is_empty()
+        );
     }
 }
 
@@ -2634,7 +2660,7 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         )
         .unwrap();
     assert_eq!(hit.status, "queued");
-    let absorbed = db.absorb(first.turn, None).unwrap();
+    let absorbed = db.absorb(first.turn, None, 8 << 20, 4096).unwrap();
     assert_eq!(absorbed.outcomes[0].0, hit.turn);
     // One that misses its boundary is never absorbed by the next turn and
     // never starts as new work.
@@ -2685,7 +2711,12 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         .code,
         "stale_turn"
     );
-    assert!(db.absorb(plain.turn, None).unwrap().outcomes.is_empty());
+    assert!(
+        db.absorb(plain.turn, None, 8 << 20, 4096)
+            .unwrap()
+            .outcomes
+            .is_empty()
+    );
 }
 
 #[test]
@@ -3221,4 +3252,126 @@ fn stale_prune_piece_preserves_replacement_records() {
         assert_eq!(stored(&mut db, "Bob"), history);
     }
     assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
+    // Bytes: a 4 KiB context keeps three quarters, 3,072 bytes, for the
+    // running turn; its prompt item takes some, and two of three 1,000-byte
+    // steers fit. Items: with room for two more items, two fit as well.
+    for (context_bytes, context_items) in [(4096usize, 4096usize), (8 << 20, 4)] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let first = db
+            .begin(
+                "Bob",
+                "first",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let options = TurnOptions {
+            delivery: Delivery::Steer,
+            ..TurnOptions::default()
+        };
+        let steers: Vec<i64> = (0..3)
+            .map(|n| {
+                db.begin(
+                    "Bob",
+                    &n.to_string(),
+                    &"s".repeat(1000),
+                    true,
+                    &options,
+                    allow_provider,
+                )
+                .unwrap()
+                .turn
+            })
+            .collect();
+        let absorbed = db
+            .absorb(first, None, context_bytes, context_items)
+            .unwrap();
+        let taken: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(taken, steers[..2]);
+        assert!(absorbed.next_through.is_none());
+        // The third does not fit now and is not retried into a full turn.
+        assert!(
+            db.absorb(first, None, context_bytes, context_items)
+                .unwrap()
+                .outcomes
+                .is_empty()
+        );
+        assert_eq!(db.turn_status("Bob", steers[2]).unwrap(), "queued");
+        // With room it would have been taken: the budget is the only reason.
+        assert_eq!(
+            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            steers[2]
+        );
+    }
+}
+
+#[test]
+fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let old = db
+        .begin(
+            "Bob",
+            "old",
+            "old history",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(old, vec![assistant("old answer")], &[], None)
+        .unwrap();
+    db.finish(old, None).unwrap();
+    db.fork("Bob", None, "Alice", Some("/synthetic"), None)
+        .unwrap();
+    let options = TurnOptions::default();
+    let bob = db
+        .begin("Bob", "current", "bob", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    let alice = db
+        .begin("Alice", "current", "alice", true, &options, allow_provider)
+        .unwrap()
+        .turn;
+    let answer = assistant("unicode: é🙂");
+    db.append(bob, vec![answer.clone(); 64], &[], None).unwrap();
+    let steer_options = TurnOptions {
+        delivery: Delivery::Steer,
+        ..options
+    };
+    db.begin(
+        "Bob",
+        "steer",
+        "correction",
+        true,
+        &steer_options,
+        allow_provider,
+    )
+    .unwrap();
+    db.absorb(bob, None, 8 << 20, 4096).unwrap();
+    let (_, bytes, count) = db.turn_usage("Bob", bob).unwrap();
+    assert_eq!(count, 66);
+    assert_eq!(
+        bytes,
+        Family::Responses.user_item("bob").unwrap().len()
+            + 64 * answer.len()
+            + Family::Responses.user_item("correction").unwrap().len()
+    );
+    let (_, bytes, count) = db.turn_usage("Alice", alice).unwrap();
+    assert_eq!(
+        (bytes, count),
+        (Family::Responses.user_item("alice").unwrap().len(), 1)
+    );
+    assert_eq!(db.turn_usage("Alice", bob).unwrap_err().code, "stale_turn");
+    db.finish(bob, None).unwrap();
+    assert_eq!(db.turn_usage("Bob", bob).unwrap_err().code, "stale_turn");
 }

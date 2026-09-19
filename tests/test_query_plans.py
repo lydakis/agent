@@ -33,6 +33,7 @@ class QueryPlanTests(unittest.TestCase):
         ddl = source.split('tx.execute_batch("', 1)[1].split('")?;', 1)[0]
         # Use the current runtime's schema and statements, not simplified copies.
         for index, table in [(None, None), ('checkpoints_head', 'checkpoints'),
+                             ('nodes_turn', 's'),
                              ('processes_turn', 'processes'),
                              ('turns_running', 'turns'), ('turns_waiting', 'turns'),
                              ('processes_running', 'processes')]:

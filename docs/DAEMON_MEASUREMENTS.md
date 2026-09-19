@@ -2931,3 +2931,146 @@ As in earlier probes, wall time includes the light batch and is not pure
 deletion-completion latency. The overlapping ranges suggest comparable
 typical performance, not a proven speedup; lifecycle RSS and latency were
 slightly higher. Captures: ignored `.local/bench/retention-stdio-fix/`.
+
+## Absorption against context capacity
+
+2026-09-19. A round boundary now absorbs queued steers only while the
+running turn's own items plus each encoded steer stay within three quarters
+of the context budget, the target the window keeps; the rest stay queued
+and start as their own turns. Before, a burst of large steers could push the
+running turn past its context and fail it with `context_limit`. The
+regression test runs a 4 KiB context with three 1.5 KiB steers queued
+during a shell call: one is absorbed, two complete as their own turns, and
+the running turn completes.
+
+Initial cost: one turn-usage walk over the running turn's own nodes per absorb
+call, and each candidate steer is encoded before it is chosen instead of
+after. The parked-steer screen (48 workers, ten two-round turns each, with
+and without one bot holding a queued steer, ignored
+`.local/steer-hint/bench.py`), committed tree `055257d3…` versus the slice
+binary `4ffd9922…`, medians of three runs each:
+
+| | Daemon CPU, plain / parked | Wall, plain / parked | Store jobs |
+| --- | ---: | ---: | ---: |
+| Before | 1.186 / 1.125 s | 1.09 / 1.08 s | 6,521 / 6,515 |
+| After | 1.080 / 1.047 s | 0.90 / 0.86 s | 6,510 / 6,524 |
+
+The 32-agent socket echo screen, same two binaries back to back, one
+excluded warmup and four measured runs each: RSS 18.24 (18.14–18.45)
+versus 18.25 (18.19–18.34) MiB, CPU 0.333 (0.301–0.361) versus 0.339
+(0.330–0.356) s, p95 597.0 (588.9–612.1) versus 590.4 (584.1–595.8) ms.
+Level within noise; the ordinary path never absorbs. Captures: ignored
+`.local/bench/slice-prev14-socket-32/`, `slice-absorb-socket-32/`,
+`.local/steer-hint/absorb-{before,after}.json`. The steer screen's after
+numbers are lower, but its runs are short and noisy. Its timed workload leaves
+the steer parked, so these measurements establish neither the cost of active
+absorption nor a speedup. The active follow-up below measures that path.
+
+Validation: 94 Rust tests, strict Clippy, formatting, the query-plan audit,
+and the Python suite.
+
+### Active-steering follow-up
+
+2026-09-19, macOS 27 arm64 on AC power, Rust 1.98.0, locked offline release
+builds. Baseline is commit `3652b7f`, binary SHA-256 `83dc1d9b…`; candidate is
+that tree plus the absorption-budget changes above, binary `57cdc685…`.
+The tracked `bench.active_steering` screen uses the same observer and synthetic
+provider for both binaries. Each shape excludes one complete warmup per binary,
+then runs two before/after/after/before blocks, four samples per binary.
+
+Eight active bots each receive 40 strict steers at each of 20 gated model
+boundaries: 6,400 absorbed steers, 168 model calls, and 320 absorption jobs per
+run. Every steer resolves into its original turn, and every provider request
+matches the complete expected history. Call counts, history hashes, and request
+bytes match across binaries. The one-item response shape sends 21,812,512
+request bytes per run; the 48-item shape sends 29,793,032. Before its final
+response, the growing turn holds 1,761 items, exercising longer metadata walks
+without exceeding the default context. No overload deferral is compared.
+
+Medians, with minimum–maximum ranges in parentheses:
+
+| Metric | One item: before | One item: after | 48 items: before | 48 items: after |
+| --- | ---: | ---: | ---: | ---: |
+| Daemon CPU, s | 1.644 (1.635–1.657) | 1.709 (1.682–1.744) | 1.960 (1.944–1.989) | 2.085 (2.064–2.110) |
+| Sampled daemon peak RSS, MiB | 18.99 (18.81–19.36) | 19.07 (19.03–19.16) | 19.59 (19.50–19.77) | 19.57 (19.44–19.67) |
+| Wall time, s | 2.416 (2.268–2.905) | 2.480 (2.360–2.864) | 2.670 (2.623–2.768) | 2.905 (2.756–3.217) |
+| Boundary p50, ms | 20.77 (19.64–21.71) | 23.40 (22.66–24.60) | 27.07 (25.95–28.49) | 32.15 (31.62–33.30) |
+| Boundary p95, ms | 34.06 (29.08–68.77) | 36.05 (33.52–53.19) | 41.17 (41.01–46.27) | 56.20 (50.25–81.11) |
+| Absorption worker time, ms | 332 (301–399) | 382 (365–456) | 304.5 (296–313) | 426.5 (408–447) |
+
+The candidate costs more under active steering: median daemon CPU rises 3.9%
+and 6.4%, respectively, with non-overlapping observed CPU ranges. Memory is
+essentially unchanged. The growing-turn shape's absorption worker time rises
+40%, consistent with the added current-turn metadata walk on each batch.
+This supports targeting that walk next; it is not an instruction-level profile
+or proof that the walk explains every timing difference. The correctness fix
+has a measurable cost, so performance neutrality is not established.
+
+Boundary latency includes response delivery, append, absorption, context
+construction, and receiving/decoding the next request in the Python fixture.
+Wall time additionally includes sequential submissions and validation. Storage
+execution counters include SQLite work and are reported in whole milliseconds;
+they are wall time on the worker, not CPU. RSS is sampled every 5 ms. Provider
+and observer CPU/memory are excluded. Runs are short, cache state is uncontrolled,
+and tail latency is noisy; this is a matched synthetic workload, not a real
+provider or active-capacity result. Raw captures, full binary hashes, operation
+counters, and excluded warmups: ignored `.local/bench/active-steering/result.json`.
+
+### Indexed turn accounting
+
+2026-09-19. Replace the recursive `turn_usage` walk with indexed lookups of the
+turn's first node, its parent, and the bot's current head. Subtract cumulative
+bytes and depths to count the current turn. A partial unique `nodes(turn)` index
+contains only turn-start nodes. Accounting work no longer grows with the
+current turn's length, and the history tool uses the same query. There are no
+cached counters to reconcile after forks or restart. The existing budget,
+queue order, and encoded-item accounting are unchanged.
+
+The index adds disk space and maintenance for one entry per started turn.
+Opening an existing store builds it once by scanning nodes; that first-open
+cost on a large existing store is not measured here. Subsequent opens reuse
+the index. No transcript data or logical schema fields change.
+
+Repeat the active-steering contract above on the same host and toolchain,
+again with a full warmup per binary and two ABBA blocks per shape. Baseline
+remains the pre-budget `83dc1d9b…` binary; indexed candidate is `c29fef24…`.
+All runs match the expected 6,400 absorbed steers, 168 provider calls, 320
+absorption jobs, complete histories, and request bytes.
+
+Medians (minimum–maximum):
+
+| Metric | One item: baseline | One item: indexed | 48 items: baseline | 48 items: indexed |
+| --- | ---: | ---: | ---: | ---: |
+| Daemon CPU, s | 1.694 (1.660–1.766) | 1.740 (1.650–1.761) | 1.971 (1.956–2.072) | 1.983 (1.936–2.097) |
+| Sampled daemon peak RSS, MiB | 18.86 (18.67–19.00) | 18.88 (18.86–19.11) | 19.53 (19.45–19.95) | 19.37 (19.33–19.64) |
+| Wall time, s | 2.307 (2.208–2.832) | 2.374 (2.268–2.530) | 2.777 (2.667–2.928) | 2.662 (2.600–3.135) |
+| Boundary p95, ms | 27.17 (26.64–40.24) | 27.91 (25.40–42.34) | 42.29 (38.84–91.80) | 39.98 (39.07–53.05) |
+| Absorption worker time, ms | 306 (303–357) | 308 (298–322) | 313.5 (299–419) | 300.5 (294–311) |
+
+The previous large absorption regression is absent in this follow-up. Median
+CPU remains 2.7% higher for one-item responses and 0.6% higher for 48-item
+responses, with overlapping observed ranges; these short runs support near-
+baseline performance, not a universal non-regression guarantee or a speedup.
+The prior unindexed and current indexed measurements are separate campaigns;
+do not treat their ratio as a matched optimization speedup. All boundaries and
+limitations of the active-steering screen still apply. Captures:
+ignored `.local/bench/active-steering-indexed/result.json`.
+
+Ordinary-path check: the 32-bot socket echo lifecycle screen, baseline/indexed/
+indexed/baseline batches, each with one excluded warmup and two measured runs
+(four samples per binary). All runs complete 96 turns, achieve 32 overlapping
+provider requests, preserve restart/replay/forks, and have no quality warnings.
+Median target RSS is 18.22 (18.02–18.23) versus 18.11 (17.97–18.23) MiB;
+observed target CPU is 0.298 (0.279–0.323) versus 0.290 (0.287–0.313) s;
+turn p95 is 586.95 (586.07–589.01) versus 588.14 (586.89–590.27) ms.
+Restart readiness is slightly slower: 16.87 (16.13–17.67) versus
+18.95 (17.75–20.12) ms. This check includes ordinary turn-start index maintenance
+and reopening an already indexed store; it does not measure first-open index
+construction on a large store. Captures: ignored
+`.local/bench/steering-index-lifecycle-*/result.json`.
+
+Validation: 95 Rust tests, 18 delivery/active-steering Python tests, two
+query-plan tests, strict Clippy, formatting, and diff checks pass. Coverage
+includes absorbed UTF-8 content, prior-turn exclusion, fork isolation, stale
+turns, old-store migration, and rejecting a plan that scans nodes after the
+new index is removed.

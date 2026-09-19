@@ -489,6 +489,35 @@ not a matched regression comparison or a capacity claim. The temporary store
 is removed afterwards unless `--keep` is given. `--bots` must be at least 32.
 See [the results and limitations](DAEMON_MEASUREMENTS.md#store-scale).
 
+## Active steering
+
+```sh
+.local/venv/bin/python -m bench.active_steering \
+  --before PATH_TO_BASELINE --after PATH_TO_CANDIDATE \
+  --out .local/bench/active-steering
+```
+
+This matched stdio screen holds eight concurrent synthetic provider requests,
+queues 40 strict steers per bot, then releases the responses. It repeats for
+20 boundaries of the same active turns, crossing the 32-steer storage batch
+on every boundary. Two shapes emit either one or 48 assistant items per
+response, exercising increasingly long current-turn accounting walks. All
+work fits the default context in both binaries. Every steer must finish as
+`steered` into its original turn; every subsequent provider request must contain
+the exact expected conversation. Request bytes, call counts, absorbed counts,
+and history hashes must match before comparing results.
+
+Each shape excludes one full warmup per binary, then runs two
+before/after/after/before blocks (four samples per binary). It records daemon
+CPU, daemon RSS sampled every 5 ms, total wall time, and each storage operation's
+count, execution time, and queue time. Boundary latency runs from releasing a
+provider response to receiving the next complete request, including provider
+and observer scheduling, response storage, absorption, and context construction.
+Wall time also includes sequential steer submission and validation. Provider,
+observer, and client memory/CPU are outside daemon accounting. This screen has
+no tool processes, overload, context eviction, real provider latency, or capacity
+claim. Captures are local; a failed contract assertion stops the comparison.
+
 ## Optional detailed memory counters
 
 `bench.lifecycle --memory-detail` adds `pss_bytes` and `private_bytes` to each
