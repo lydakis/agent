@@ -118,7 +118,11 @@ not by the history or the fleet:
   the reader is at; bodies outside it fold back into their history nodes, and
   a scroll toward them loads the next batch of 400. A run of unloaded nodes
   renders as one placeholder row, so unloaded history costs one element per
-  gap. Counters (thoughts, long outputs, peers) are kept in step with the
+  gap. Event-derived tool rows fold into compact summaries and reappear on
+  scroll; their original argument previews are discarded after folding. A fork
+  pages its inherited node references from the fork checkpoint using
+  `history_nodes`, then decodes only the requested window, even when its source
+  was deleted. Counters (thoughts, long outputs, peers) are kept in step with the
   items, so the key bar reads them. Peer cards compact from 601 to the newest
   300 with a count of earlier peers; older bots remain reachable through the
   switcher. Deleted peers leave the parent transcript.
@@ -134,7 +138,8 @@ not by the history or the fleet:
   rows, and the activity check behind the clock is cached per fleet change.
 - **Creation** costs no request: the `created` and `forked` events carry the
   record's list fields, so a burst of ten thousand bots is ten thousand
-  events, not ten thousand `resume` round trips. Lineage is the store's
+  events, not ten thousand `resume` round trips. An event missing its provider
+  field is a protocol error, with no legacy `resume` fallback. Lineage is the store's
   `created_by_id`: a bot links under its creator only while the bot holding
   that name is the identity that created it.
 - **Sessions** count up; an event from an older session is dropped, a
@@ -180,6 +185,8 @@ create notice says what went in.
 
 Run `node --test app/tests/state.test.cjs` for malformed tool arguments,
 reconnect serialization, historical process results across batches, whole-node
-eviction, a 10,000-peer fan-out, and incremental text/thinking rendering.
+eviction, a 10,000-peer fan-out, incremental text/thinking rendering, tool-row
+windowing, CSS control-character escaping, creation-event validation, concurrent
+submission IDs, and fork-history paging.
 `cargo test --workspace` includes the silent-listener readiness deadline and
 fork workspace parity between durable records, live events, and replay.

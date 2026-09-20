@@ -496,6 +496,7 @@ own path from the turn. Example requests:
 {"id":4,"op":"resume","bot":"Bob"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":6,"op":"item","bot":"Bob","node":2}
+{"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":7,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1"}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","instructions":"Replaces the source's text for the fork only"}
@@ -509,6 +510,14 @@ own path from the turn. Example requests:
 {"id":18,"op":"stats"}
 {"id":12,"op":"shutdown"}
 ```
+
+`history_nodes` lists immutable node references in a bot's lineage, newest first,
+including inherited fork history. `from` is an inclusive node ID and defaults to
+the current head. The response contains `nodes: [{node: ID}, ...]` and
+`next_from`, the next older node or null at the root. `limit` defaults to 400
+and must be 1 through 400. Bodies are fetched through `item`; pagination does
+not copy bodies. Membership validation walks the lineage, as `item` does.
+The fork can read its shared prefix after its source is deleted.
 
 ## Fleet controllers
 

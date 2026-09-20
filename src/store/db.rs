@@ -2288,6 +2288,33 @@ impl Database {
         };
         Ok(json!({"events":events,"pruned_cursor":pruned,"next_after":next_after}))
     }
+    /// Page immutable lineage metadata newest first, including a fork's shared prefix.
+    /// `from` is inclusive; `next_from` is the parent to pass for the next page.
+    pub fn history_nodes(&self, name: &str, from: Option<i64>, limit: usize) -> Result<Value> {
+        if !(1..=400).contains(&limit) {
+            return fail("invalid_history_limit");
+        }
+        let head = self.inspect(name)?.head;
+        let mut next = from.or(head);
+        if let Some(wanted) = from
+            && !self.in_lineage(head, wanted)?
+        {
+            return fail("item_not_in_bot_history");
+        }
+        let mut nodes = Vec::with_capacity(limit);
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT parent FROM nodes WHERE id=?")?;
+        while let Some(id) = next {
+            let parent: Option<i64> = statement.query_row([id], |r| r.get(0))?;
+            nodes.push(json!({"node":id}));
+            next = parent;
+            if nodes.len() == limit {
+                break;
+            }
+        }
+        Ok(json!({"nodes":nodes,"next_from":next}))
+    }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
         let head = self.inspect(name)?.head;
         if !self.in_lineage(head, wanted)? {

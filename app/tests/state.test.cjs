@@ -13,7 +13,7 @@ function page(daemon = {}) {
     addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
   });
   const context = vm.createContext({
-    Daemon: daemon, console, queueMicrotask,
+    Daemon: daemon, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, addEventListener() {},
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
     window: { addEventListener() {} }, localStorage: { getItem() { return null; } },
@@ -21,7 +21,7 @@ function page(daemon = {}) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { S, transcript, upsert, onEvent, handle, loadBatch, evict, itemsHTML, attach, lost, enqueue, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
+    'globalThis.app = { S, transcript, upsert, onEvent, handle, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -31,7 +31,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 test('schema-invalid tool arguments do not stop subsequent events', async () => {
   const p = page();
   for (const args of ['null', '{"handles":"proc:1"}', '{"handles":[null,12,"turn:Bob:1"]}']) {
-    await p.onEvent({ event: 'tool_started', bot: 'Bob', data: { name: 'wait', arguments: args } });
+    await p.onEvent({ event: 'tool_started', bot: 'Bob', data: { call_id: args, name: 'wait', arguments: args } });
   }
   await p.onEvent({ event: 'text_delta', bot: 'Bob', text: 'still running' });
   assert.equal(p.transcript('Bob').text, 'still running');
@@ -112,5 +112,82 @@ test('stream rendering appends only new characters and resets between messages',
     t[field] = 'new'; t.streamGen += 1;
     p.renderTail(el, 'Bob', t);
     assert.equal(el.children[0].children[0].data, 'new');
+  }
+});
+
+
+test('tool-heavy history folds rows and restores their summaries on scroll', async () => {
+  const p = page();
+  for (let i = 0; i < 4000; i++) {
+    await p.onEvent({event:'tool_started', bot:'Bob', turn:i, data:{call_id:`c${i}`, name:'shell', arguments:JSON.stringify({command:`echo ${i}`})}});
+    await p.onEvent({event:'tool_completed', bot:'Bob', turn:i, data:{call_id:`c${i}`}});
+  }
+  const t = p.transcript('Bob'); p.evict(t);
+  assert.ok((p.itemsHTML(t).match(/data-call=/g) || []).length <= 1600);
+  t.anchor = 'top'; await p.loadBatch('Bob');
+  assert.ok(t.items.some(it => it.kind === 'tool' && it.summary === 'echo 2799'));
+  assert.ok(t.items.filter(it => it.kind === 'tool').every(it => it.done));
+});
+
+test('CSS string escaping removes literal line controls and preserves escaped quotes', () => {
+  const { cssEsc, esc } = page();
+  assert.equal(esc("id\rpart"), "id&#13;part", "preserve carriage return through HTML attribute parsing");
+  assert.equal(cssEsc('a\n\r\f"\\z'), 'a\\a \\d \\c \\"\\\\z');
+});
+
+test('incomplete creation events fail explicitly without a resume round trip', async () => {
+  let requests = 0; const p = page({request:async () => {requests++; return {name:'bad'};}});
+  await assert.rejects(p.onEvent({event:'created',bot:'bad',data:{}}), /invalid_created_event/);
+  assert.equal(requests,0); assert.equal(p.S.bots.has('bad'),false);
+});
+
+test('same-millisecond submissions use distinct idempotency keys across clients', async () => {
+  const ids = [];
+  for (let i = 0; i < 2; i++) {
+    const p = page({request:async (_,params) => {ids.push(params.request_id);}});
+    vm.runInContext('Date.now = () => 123',p.context);
+    p.upsert({name:'Bob',id:1}); p.S.selected='Bob'; p.S.config={workspace:'/synthetic'};
+    await Promise.all([p.submit('first'),p.submit('second')]);
+  }
+  assert.equal(new Set(ids).size,4);
+});
+
+test('fork history loads by checkpoint in pages even without its source bot', async () => {
+  const pages = [];
+  const p = page({request:async (op,params) => {
+    if (op === 'history_nodes') { pages.push(params.from); return params.from === 4 ? {nodes:[{node:4,turn_seq:2},{node:3,turn_seq:2}],next_from:2} : {nodes:[{node:2,turn_seq:1},{node:1,turn_seq:1}],next_from:null}; }
+    assert.equal(op,'item'); return {role:params.node % 2 ? 'user':'assistant',content:[{type:'text',text:`inherited ${params.node}`}]};
+  }});
+  await p.onEvent({event:'forked',bot:'branch',data:{provider:'test',id:2,source:'deleted-source',checkpoint:4}});
+  await p.onEvent({event:'text_delta',bot:'branch',turn:3,text:'new work'});
+  await p.load('branch');
+  let t=p.transcript('branch'); assert.match(p.itemsHTML(t), /inherited 3/); assert.match(p.itemsHTML(t), /inherited 4/);
+  assert.equal(t.text,'new work'); assert.deepEqual(pages,[4]);
+  t.anchor='top'; await p.load('branch',true);
+  assert.deepEqual(pages,[4,2]);
+  const html=p.itemsHTML(t); assert.ok(html.indexOf('inherited 1') < html.indexOf('inherited 4'));
+  assert.equal(t.items.some(it=>it.kind==='history'),false);
+});
+
+
+test('persisted tool calls render for both providers without duplicating live events', async () => {
+  for (const item of [
+    {type:'function_call',name:'shell',call_id:'call',arguments:'{"command":"echo hello"}'},
+    {role:'assistant',content:[{type:'tool_use',name:'shell',id:'call',input:{command:'echo hello'}}]},
+  ]) {
+    const p=page({request:async()=>item}); const t=p.transcript('Bob');
+    t.items=[{kind:'node',node:1,turn:1}];t.nodes=1;
+    await p.loadBatch('Bob');
+    assert.equal(t.items.filter(it=>it.kind==='tool').length,1);
+    await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{name:'shell',call_id:'call',arguments:'{"command":"echo hello"}'}});
+    assert.equal(t.items.filter(it=>it.kind==='tool').length,1);
+    assert.equal(t.items[0].done,false);
+    await p.onEvent({event:'tool_completed',bot:'Bob',turn:1,data:{call_id:'call'}});
+    assert.equal(t.items[0].done,true);
+    assert.match(p.itemsHTML(t),/echo hello/);
+    const inherited=p.transcript('branch');
+    inherited.items=[{kind:'node',node:1,turn:null},{kind:'node',node:2,turn:null}]; inherited.nodes=2;
+    await p.loadBatch('branch');
+    assert.equal(inherited.items.filter(it=>it.kind==='tool').length,2,'inherited turns may reuse call IDs');
   }
 });

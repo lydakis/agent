@@ -113,6 +113,11 @@ enum Command {
         after: i64,
         limit: usize,
     },
+    HistoryNodes {
+        bot: String,
+        from: Option<i64>,
+        limit: Option<usize>,
+    },
     Item {
         bot: String,
         node: i64,
@@ -425,7 +430,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_process_budget(limits.processes);
     let hub = Hub::default();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
@@ -1148,6 +1153,13 @@ impl Service {
             Command::Events { bot, after, limit } => {
                 store
                     .op("events", move |db| db.events(&bot, after, limit))
+                    .await
+            }
+            Command::HistoryNodes { bot, from, limit } => {
+                store
+                    .op("history_nodes", move |db| {
+                        db.history_nodes(&bot, from, limit.unwrap_or(400))
+                    })
                     .await
             }
             Command::Item { bot, node } => store.op("item", move |db| db.item(&bot, node)).await,

@@ -1119,6 +1119,60 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
 }
 
 #[test]
+fn fork_lineage_pages_are_bounded_and_survive_source_deletion() {
+    let mut db = db();
+    db.create("source", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "source",
+            "r1",
+            "prompt",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("answer")], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    let checkpoint = db.inspect("source").unwrap().head.unwrap();
+    db.fork("source", "branch", Fork::default()).unwrap();
+    let later = db
+        .begin(
+            "source",
+            "r2",
+            "later",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(later, vec![assistant("later answer")], &[], None)
+        .unwrap();
+    db.finish(later, None).unwrap();
+    let unrelated = db.inspect("source").unwrap().head.unwrap();
+    assert!(db.history_nodes("branch", Some(unrelated), 1).is_err());
+    assert!(db.history_nodes("branch", None, 0).is_err());
+    assert!(db.history_nodes("branch", None, 401).is_err());
+    db.delete_bot("source").unwrap();
+    let first = db.history_nodes("branch", Some(checkpoint), 1).unwrap();
+    assert_eq!(first["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(first["nodes"][0]["node"], checkpoint);
+    let older = first["next_from"].as_i64().unwrap();
+    let second = db.history_nodes("branch", Some(older), 1).unwrap();
+    assert_eq!(second["nodes"][0]["node"], older);
+    assert!(second["next_from"].is_null());
+    assert_eq!(db.item("branch", older).unwrap()["role"], "user");
+    db.create("empty", None, binding()).unwrap();
+    assert_eq!(
+        db.history_nodes("empty", None, 10).unwrap()["nodes"],
+        json!([])
+    );
+}
+
+#[test]
 fn fork_events_publish_the_persisted_workspace() {
     let mut db = db();
     db.create("source", Some("/source"), binding()).unwrap();
