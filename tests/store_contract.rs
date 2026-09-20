@@ -1119,6 +1119,28 @@ fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
 }
 
 #[test]
+fn fork_events_publish_the_persisted_workspace() {
+    let mut db = db();
+    db.create("source", Some("/source"), binding()).unwrap();
+    for (name, workspace) in [("default", None), ("explicit", Some("/branch"))] {
+        let (fork, event) = db
+            .fork(
+                "source",
+                name,
+                Fork {
+                    workspace,
+                    ..Fork::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(fork.workspace.as_deref(), workspace);
+        assert_eq!(event["data"]["workspace"], json!(workspace));
+        let replay = db.events(name, 0, 10).unwrap();
+        assert_eq!(replay["events"][0]["data"]["workspace"], json!(workspace));
+    }
+}
+
+#[test]
 fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
     let mut db = db();
     let mut created = binding();

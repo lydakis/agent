@@ -83,7 +83,8 @@ Closing the window is detaching; the daemon and its bots continue. The page
 remembers the bot on screen, the open peek, the rail and the folds per socket
 and workspace in the webview's local storage, and restores them on the next
 start. If the daemon is unreachable or closes the session, the page shows why
-and retries every two seconds.
+and retries every two seconds. Only one attachment runs at a time, including
+the snapshot pages. A connected peer must send its ready line within five seconds.
 
 Keys are the concept's: `^k` switch, `^b` rail, `^p` peek, `^t` thoughts,
 `^o` output, `Esc` close then interrupt, `↑` `↓` on an empty prompt to move
@@ -118,11 +119,14 @@ not by the history or the fleet:
   a scroll toward them loads the next batch of 400. A run of unloaded nodes
   renders as one placeholder row, so unloaded history costs one element per
   gap. Counters (thoughts, long outputs, peers) are kept in step with the
-  items, so the key bar reads them.
+  items, so the key bar reads them. Peer cards compact from 601 to the newest
+  300 with a count of earlier peers; older bots remain reachable through the
+  switcher. Deleted peers leave the parent transcript.
 - **Rendering** rebuilds the window's HTML only on a structural change (a
   load, a fold, another bot). Items appended since the last render are added
   on their own; a tool finishing or a process ending replaces its own line; a
-  streamed delta touches only the tail; the once-a-second clock refreshes the
+  streamed delta appends plain text to the tail; Markdown is parsed once the
+  durable message arrives; the once-a-second clock refreshes the
   elapsed spans and peer cards in place. The rail shows a window of 300 rows
   around the selection, extended by scrolling to an edge; its tree is rebuilt
   when the fleet's shape changes (a bot created, forked or deleted) and a
@@ -171,3 +175,11 @@ create notice says what went in.
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
 2. Packaging: a real icon set, `bundle.active`, a signed build.
+
+## Regression checks
+
+Run `node --test app/tests/state.test.cjs` for malformed tool arguments,
+reconnect serialization, historical process results across batches, whole-node
+eviction, a 10,000-peer fan-out, and incremental text/thinking rendering.
+`cargo test --workspace` includes the silent-listener readiness deadline and
+fork workspace parity between durable records, live events, and replay.

@@ -9,6 +9,7 @@ const LAZY_ITEMS = 400;
 // Decoded items kept around the reader's end of a transcript; bodies beyond it fold back into their
 // nodes and a scroll toward them loads them again.
 const WINDOW = 3 * LAZY_ITEMS;
+const PEER_WINDOW = 300;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
@@ -20,7 +21,7 @@ const S = {
 };
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
-const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null }); return S.transcripts.get(name); };
+const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
 function count(t, it, d) {
   if (it.kind === 'node') t.nodes = Math.max(0, t.nodes + d);
@@ -28,7 +29,19 @@ function count(t, it, d) {
   else if (it.kind === 'out' && it.text.split('\n', 3).length > 2) t.longOut = Math.max(0, t.longOut + d);
   else if (it.kind === 'peer' && d > 0 && !t.peers.includes(it.who)) t.peers.push(it.who);
 }
-const addItem = (t, it) => { count(t, it, 1); t.items.push(it); };
+const addItem = (t, it) => {
+  if (it.kind === 'peer' && t.peers.includes(it.who)) return;
+  count(t, it, 1); t.items.push(it);
+  if (it.kind === 'peer' && t.peers.length > PEER_WINDOW * 2) {
+    const keep = new Set(t.peers.slice(-PEER_WINDOW));
+    let removed = 0;
+    t.items = t.items.filter((entry) => { if (entry.kind !== 'peer' || keep.has(entry.who)) return true; removed++; return false; });
+    t.peers = [...keep];
+    const gap = t.items.find((entry) => entry.kind === 'peer_gap');
+    if (gap) gap.total += removed; else t.items.unshift({ kind: 'peer_gap', total: removed });
+    t.gen += 1;
+  }
+};
 // Replace the bare node at `at` with what it decoded to; each entry remembers its node.
 function decodeAt(t, at, entries) {
   const bare = t.items[at]; if (bare.kind !== 'node') return;
@@ -46,15 +59,18 @@ function evict(t) {
   let outside;
   if (t.anchor === 'end') { const limit = len - WINDOW; outside = (i) => i < limit; }
   else { const first = t.items.findIndex((it) => it.kind !== 'node'); if (first < 0) return; const limit = first + WINDOW; outside = (i) => i > limit; }
-  const items = t.items; t.items = []; let folding = null; let changed = false;
-  items.forEach((it, i) => {
-    if (it.from !== undefined && folding === it.from) { count(t, it, -1); changed = true; return; }
-    if (it.from !== undefined && outside(i)) {
-      folding = it.from; count(t, it, -1); changed = true;
-      const bare = { kind: 'node', node: it.from, callId: it.fromCall, turn: it.turn }; count(t, bare, 1); t.items.push(bare); return;
-    }
-    folding = null; t.items.push(it);
-  });
+  const items = t.items; t.items = []; let changed = false;
+  for (let i = 0; i < items.length;) {
+    const it = items[i]; let end = i + 1;
+    if (it.from !== undefined) while (end < items.length && items[end].from === it.from) end++;
+    // Either edge can cross the boundary. Decide once for the complete node.
+    if (it.from !== undefined && (outside(i) || outside(end - 1))) {
+      for (let j = i; j < end; j++) count(t, items[j], -1);
+      const bare = { kind: 'node', node: it.from, callId: it.fromCall, turn: it.turn };
+      count(t, bare, 1); t.items.push(bare); changed = true;
+    } else for (let j = i; j < end; j++) t.items.push(items[j]);
+    i = end;
+  }
   if (changed) t.gen += 1;
 }
 // Every bare node goes through here so the count stays right; loads skip a transcript at zero.
@@ -126,8 +142,8 @@ function tree() {
   return out;
 }
 function callSummary(name, args) {
-  let a = {}; try { a = JSON.parse(args); } catch (_) {}
-  let s = name === 'shell' ? a.command ?? '' : ['read', 'write', 'edit'].includes(name) ? a.path ?? '' : name === 'wait' ? (a.handles || []).map((h) => h.replace(/^turn:/, '')).join(', ') : args;
+  let a = {}; try { a = JSON.parse(args) ?? {}; } catch (_) {}
+  let s = name === 'shell' ? a.command ?? '' : ['read', 'write', 'edit'].includes(name) ? a.path ?? '' : name === 'wait' ? (Array.isArray(a.handles) ? a.handles : []).filter((h) => typeof h === 'string').map((h) => h.replace(/^turn:/, '')).join(', ') : args;
   return String(s).split('\n')[0].slice(0, 300);
 }
 
@@ -149,7 +165,7 @@ async function onEvent(ev) {
       break;
     }
     // Attaching queues its own load on the chain this handler runs in; done here it would wait on itself.
-    case 'follow_lagged': S.attached = false; S.live = false; toast('event stream lagged; attaching again'); setTimeout(() => { if (!S.attached) attach(); }, 0); return true;
+    case 'follow_lagged': lost('event stream lagged; attaching again'); retryAttach(0); return true;
     case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; t.text += ev.text ?? ''; break; }
     case 'thinking_delta': { const t = transcript(name); t.streamingTurn = turn; if (!t.thinkingSince) t.thinkingSince = Date.now(); t.thinking += ev.text ?? ''; break; }
     case 'created': case 'forked': {
@@ -179,14 +195,14 @@ async function onEvent(ev) {
       const t = transcript(name);
       if (t.streamingTurn === turn) {
         if (t.thinking) { addItem(t, { kind: 'thought', text: t.thinking, secs: t.thinkingSince ? Math.round((Date.now() - t.thinkingSince) / 1000) : 0, turn }); t.thinking = ''; t.thinkingSince = 0; }
-        t.text = '';
+        t.text = ''; t.streamGen += 1;
       }
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn });
       break;
     }
     case 'tool_started': {
       const args = data.arguments ?? '';
-      let parsed = {}; try { parsed = JSON.parse(args); } catch (_) {}
+      let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       addItem(transcript(name), { kind: 'tool', callId: data.call_id, name: tname, summary: callSummary(tname, args), args, background: tname === 'shell' && parsed.background === true, spawns: tname === 'shell' && spawnsPeer(String(parsed.command ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn });
       break;
@@ -217,12 +233,17 @@ async function onEvent(ev) {
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
-      if (t.streamingTurn === turn) { if (t.text) addItem(t, { kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; }
+      if (t.streamingTurn === turn) { if (t.text) addItem(t, { kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
-    case 'deleted': S.bots.delete(name); S.transcripts.delete(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; if (S.ui.peek === name) S.ui.peek = null; break;
+    case 'deleted': {
+      const parent = bot(name) && creatorOf(bot(name));
+      const t = parent && S.transcripts.get(parent.name);
+      if (t) { t.items = t.items.filter((it) => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter((who) => who !== name); t.gen += 1; }
+      S.bots.delete(name); S.transcripts.delete(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; if (S.ui.peek === name) S.ui.peek = null; break;
+    }
     case 'pruned': {
       // A `follow *` replay reports a retention gap with bot "*": a notice about the store, not a transcript.
       if (name === '*') toast(`events before cursor ${ev.before ?? 0} were pruned; older history is gone`, 5000);
@@ -241,22 +262,29 @@ async function loadWaitOrProc(name, node, call) {
 function applyWaitOrProc(name, item, call) {
   const output = item.output ?? item.content?.[0]?.content ?? '';
   let value; try { value = JSON.parse(output); } catch (_) { return; }
+  if (!value || typeof value !== 'object') return;
   const t = transcript(name);
   if (call.background) {
     // A decode seen twice adds no second card.
-    if (typeof value.handle === 'string' && !t.items.some((it) => it.kind === 'proc' && it.handle === value.handle)) addItem(t, { kind: 'proc', handle: value.handle, cmd: call.summary, done: null, open: false, turn: bot(name)?.runningTurn ?? null });
+    if (typeof value.handle === 'string') {
+      const existing = t.items.find((it) => it.kind === 'proc' && it.handle === value.handle);
+      if (existing) { existing.cmd = call.summary; t.gen += 1; }
+      else addItem(t, { kind: 'proc', handle: value.handle, cmd: call.summary, done: null, open: false, turn: call.turn ?? null });
+    }
   } else if (value.results) {
     for (const [handle, result] of Object.entries(value.results)) {
-      if (result.pending) continue;
-      for (const it of t.items) if (it.kind === 'proc' && it.handle === handle) {
-        const out = result.stdout ?? result.output ?? '';
-        queueMicrotask(() => patchItem(name, `[data-proc="${cssEsc(handle)}"]`, it));
-        // A process can end without an exit status: a spawn failure, a timeout, an output limit. Say which.
-        if (result.error) it.done = result.detail ? `${result.error}: ${result.detail}` : String(result.error);
-        else if (typeof result.exit_code === 'number' && result.exit_code !== 0) it.done = `exit ${result.exit_code}`;
-        else if (result.success === false) it.done = 'failed';
-        else it.done = out.trimEnd().split('\n').pop() ?? '';
-      }
+      if (!handle.startsWith('proc:') || !result || typeof result !== 'object' || result.pending) continue;
+      // History is fetched newest first, sometimes in separate batches. Keep the terminal card
+      // even before its start is decoded; that start fills in its command without clearing done.
+      let it = t.items.find((entry) => entry.kind === 'proc' && entry.handle === handle);
+      if (!it) { it = { kind: 'proc', handle, cmd: handle, done: null, open: false, turn: call.turn ?? null }; addItem(t, it); }
+      const out = String(result.stdout ?? result.output ?? '');
+      queueMicrotask(() => patchItem(name, `[data-proc="${cssEsc(handle)}"]`, it));
+      // A process can end without an exit status: a spawn failure, a timeout, an output limit. Say which.
+      if (result.error) it.done = result.detail ? `${result.error}: ${result.detail}` : String(result.error);
+      else if (typeof result.exit_code === 'number' && result.exit_code !== 0) it.done = `exit ${result.exit_code}`;
+      else if (result.success === false) it.done = 'failed';
+      else it.done = out.trimEnd().split('\n').pop() ?? '';
     }
   }
 }
@@ -338,6 +366,7 @@ async function pump(session) {
   }
 }
 async function handle(ev, session) {
+  if (S.session !== session) return;
   const terminal = await onEvent(ev);
   if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
   if (ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = session;
@@ -345,7 +374,7 @@ async function handle(ev, session) {
   // into one request each. The first load runs once follow_live arrives.
   if (!terminal) { if (S.live) await loadVisible(); render(); }
 }
-function lost(reason) { S.attached = false; S.live = false; showDetached(reason); }
+function lost(reason) { S.session = null; S.attached = false; S.live = false; showDetached(reason); }
 // A record from the snapshot. A bot this session's events already touched keeps the state those events
 // built and takes only what events do not carry; any other is seated from the record whole.
 function seat(record, session) {
@@ -357,7 +386,22 @@ function seat(record, session) {
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
 }
-async function attach() {
+let attaching = null, retryTimer = null;
+function retryAttach(delay = 2000) {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => { retryTimer = null; if (!S.attached) attach(); }, delay);
+}
+function attach() {
+  if (!attaching) {
+    clearTimeout(retryTimer); retryTimer = null;
+    attaching = attachOnce().finally(() => {
+      attaching = null;
+      if (!S.attached) retryAttach();
+    });
+  }
+  return attaching;
+}
+async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
     const { session } = await Daemon.attach(S.cursor);
@@ -381,12 +425,13 @@ async function attach() {
     if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
     S.botsGen += 1; S.shapeGen += 1;
     await enqueue(loadVisible);
+    if (S.session !== session) return false;
     $('detached').classList.remove('on');
     render();
     return true;
   } catch (e) {
     Daemon.log?.(`attach failed: ${e?.message ?? e}`);
-    showDetached(String(e?.message ?? e));
+    lost(String(e?.message ?? e));
     return false;
   }
 }
@@ -394,7 +439,7 @@ function showDetached(reason) {
   S.attached = false;
   $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · retrying</div>`;
   $('detached').classList.add('on');
-  setTimeout(() => { if (!S.attached) attach(); }, 2000);
+  retryAttach();
 }
 function restore() {
   let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
@@ -456,9 +501,9 @@ function refreshLive(el) {
 }
 // A card's one line: the last non-empty line of the newest text, bounded, so a long reply costs the
 // parent's render nothing.
-function tailOf(s) { const at = s.trimEnd().lastIndexOf('\n'); return s.slice(at + 1).trim().slice(0, 200); }
+function tailOf(s) { const end = s.slice(-400).trimEnd(); const at = end.lastIndexOf('\n'); return end.slice(at + 1).trim().slice(0, 200); }
 function lastLine(t) {
-  if (t.text) return tailOf(t.text); if (t.thinking) return t.thinking.split('. ').pop().slice(0, 200);
+  if (t.text) return tailOf(t.text); if (t.thinking) return t.thinking.slice(-400).split('. ').pop().slice(0, 200);
   for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if (it.kind === 'text') return tailOf(it.text); if (it.kind === 'tool') return `▸ ${it.name} ${it.summary}`; }
   return '';
 }
@@ -470,6 +515,7 @@ function itemHTML(it) {
     case 'tool': { const el = it.started ? `<span class="el">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}"${it.started ? ` data-started="${it.started}"` : ''}>▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
     case 'out': { const rows = it.text.split('\n').filter((l) => l.trim()); const shown = !S.ui.output && rows.length > 2 ? rows.slice(0, 2) : rows; return `<div class="line out">${esc(shown.join('\n'))}${shown.length < rows.length ? ` <span class="more">+${rows.length - shown.length} lines</span>` : ''}</div>`; }
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
+    case 'peer_gap': return `<div class="line note">${it.total} earlier peers · use ^k to find a bot</div>`;
     case 'peer': { const c = peerCard(it.who); return c ? cardHTML(c) : ''; }
     case 'proc': { const status = it.done === null ? 'running' : 'idle'; const last = it.done === null ? it.handle : (it.done || 'done'); return cardHTML({ attr: `data-proc="${esc(it.handle)}"`, status, name: `$ ${it.cmd}`, last, elapsed: '', sel: false }); }
     case 'node': return '';
@@ -492,11 +538,24 @@ function itemsHTML(t, from = 0) {
   flush();
   return h;
 }
-function tailHTML(name, t) {
-  if (t.thinking) return `<div class="line think">${esc(t.thinking.split('. ').pop())}<span class="cursor"></span></div>`;
-  if (t.text) return markdown(t.text).replace(/<\/div>$/, '<span class="cursor"></span></div>');
-  if (bot(name)?.status === 'running') return `<div class="line text"><span class="cursor"></span></div>`;
-  return '';
+const tails = new WeakMap();
+function renderTail(el, name, t) {
+  const kind = t.thinking ? 'thinking' : t.text ? 'text' : '';
+  const value = kind ? t[kind] : '';
+  let state = tails.get(el);
+  const running = bot(name)?.status === 'running';
+  if (!state || state.transcript !== t || state.kind !== kind || state.turn !== t.streamingTurn || state.gen !== t.streamGen || state.offset > value.length || state.running !== running) {
+    const line = document.createElement('div'); line.className = kind === 'thinking' ? 'line think' : 'line text';
+    const text = document.createTextNode('');
+    const cursor = document.createElement('span'); cursor.className = 'cursor';
+    line.replaceChildren(text, cursor);
+    el.replaceChildren(...(kind || running ? [line] : []));
+    state = { transcript: t, kind, turn: t.streamingTurn, gen: t.streamGen, offset: 0, text, running };
+    tails.set(el, state);
+  }
+  // Plain text while streaming; the durable message gets Markdown once. No full-prefix parsing
+  // or HTML replacement on each delta, and provider text never becomes markup.
+  if (value.length > state.offset) { state.text.appendData(value.slice(state.offset)); state.offset = value.length; }
 }
 // A streamed delta touches only the tail. The items rebuild when their
 // count or a fold changes, when a load replaced nodes (gen), or on the
@@ -523,7 +582,7 @@ function renderTranscript(el, name) {
   }
   el.dataset.len = String(t.items.length);
   refreshLive(el);
-  tail.innerHTML = tailHTML(name, t);
+  renderTail(tail, name, t);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
 for (const [id, who] of [['log', () => S.selected], ['peek', () => S.ui.peek]]) {

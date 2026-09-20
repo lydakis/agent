@@ -94,7 +94,10 @@ impl Client {
             })?;
         let (read, write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
-        let ready = match lines.next_line().await? {
+        let ready = match tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .map_err(|_| Error::new("daemon_ready_timeout"))??
+        {
             Some(line) => serde_json::from_str::<Value>(&line)?,
             None => return Err(Error::new("daemon_disconnected")),
         };

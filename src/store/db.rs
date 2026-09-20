@@ -1920,7 +1920,7 @@ impl Database {
         }
         let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,
-            "workspace":workspace.or(parent.workspace.as_deref()),"status":"idle","running_turn":null,
+            "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":created_by,"created_by_id":created_by_id});
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
