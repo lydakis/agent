@@ -161,6 +161,8 @@ pub struct Request<'a> {
     pub reasoning: Option<&'a str>,
     /// The bot's tools, encoded for this family; `[]` when it has none.
     pub tools: &'a RawValue,
+    /// Keep schemas needed to interpret history while disabling new calls.
+    pub allow_tool_calls: bool,
     pub items: Items,
 }
 
@@ -257,7 +259,13 @@ impl Provider {
             max_output_tokens: Option<u32>,
             tools: &'a RawValue,
             #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<Value>,
+        }
+        #[derive(Serialize)]
+        struct ToolChoice {
+            r#type: &'static str,
         }
         #[derive(Serialize)]
         struct Anthropic<'a> {
@@ -272,10 +280,13 @@ impl Provider {
             #[serde(skip_serializing_if = "Option::is_none")]
             tools: Option<&'a RawValue>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<ToolChoice>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             thinking: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             output_config: Option<Value>,
         }
+        let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
         let (mut bytes, field) = match self.family {
             Family::Responses => (
                 serde_json::to_vec(&Responses {
@@ -287,6 +298,7 @@ impl Provider {
                     include: ["reasoning.encrypted_content"],
                     max_output_tokens: self.max_output_tokens,
                     tools: request.tools,
+                    tool_choice: disable_tools.then_some("none"),
                     reasoning: request
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
@@ -306,6 +318,7 @@ impl Provider {
                     stream: true,
                     cache_control: json!({"type":"ephemeral"}),
                     tools: (request.tools.get() != "[]").then_some(request.tools),
+                    tool_choice: disable_tools.then_some(ToolChoice { r#type: "none" }),
                     // Current Claude models take adaptive thinking with an
                     // effort level and reject budgets; Haiku 4.5 and older
                     // models still need an explicit budget.
@@ -671,6 +684,7 @@ mod tests {
                 instructions: "i",
                 reasoning: Some("low"),
                 tools: &none(),
+                allow_tool_calls: true,
                 items: Items::empty(),
             })
             .unwrap();
@@ -685,6 +699,7 @@ mod tests {
                 instructions: "i",
                 reasoning: Some("low"),
                 tools: &none(),
+                allow_tool_calls: true,
                 items: Items::empty(),
             })
             .unwrap();
@@ -698,6 +713,7 @@ mod tests {
                 instructions: "",
                 reasoning: None,
                 tools: &none(),
+                allow_tool_calls: true,
                 items: Items::empty(),
             })
             .unwrap();
@@ -718,6 +734,7 @@ mod tests {
                 instructions: "i",
                 reasoning: None,
                 tools: &none(),
+                allow_tool_calls: true,
                 items: Items::empty(),
             })
             .unwrap();
@@ -726,6 +743,52 @@ mod tests {
         assert_eq!(body["max_output_tokens"], 2048);
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn tool_call_policy_preserves_schemas_and_uses_family_wire_format() {
+        let transport = Transport::new(64, 1).unwrap();
+        for family in [Family::Anthropic, Family::Responses] {
+            let provider =
+                Provider::new(transport.clone(), family, "http://example.test", None).unwrap();
+            let schemas = crate::tools::Registry::all()
+                .unwrap()
+                .encoded(family, &["echo".into()])
+                .unwrap();
+            for allow in [true, false] {
+                for tools in [&*schemas, &*none()] {
+                    let mut prefix = provider
+                        .prefix(&Request {
+                            model: "m",
+                            instructions: "i",
+                            reasoning: None,
+                            tools,
+                            allow_tool_calls: allow,
+                            items: Items::empty(),
+                        })
+                        .unwrap();
+                    prefix.extend_from_slice(b"]}");
+                    let request: Value = serde_json::from_slice(&prefix).unwrap();
+                    if tools.get() != "[]" {
+                        assert_eq!(
+                            request["tools"],
+                            serde_json::from_str::<Value>(tools.get()).unwrap()
+                        );
+                    }
+                    if allow || tools.get() == "[]" {
+                        assert!(request.get("tool_choice").is_none());
+                    } else {
+                        assert_eq!(
+                            request["tool_choice"],
+                            match family {
+                                Family::Anthropic => json!({"type":"none"}),
+                                Family::Responses => json!("none"),
+                            }
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

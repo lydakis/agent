@@ -10,8 +10,8 @@ use tokio::sync::{mpsc, oneshot};
 
 mod db;
 pub use db::{
-    Absorbed, Binding, Bot, Database, Delivery, Fork, Publication, Started, TurnContext,
-    TurnOptions, Waiting, Window, cache_hit,
+    Absorbed, Binding, Bot, CompactionPlan, CompactionView, Database, Delivery, Fork, Publication,
+    Started, TurnContext, TurnOptions, Waiting, Window, cache_hit,
 };
 
 type Job = Box<dyn FnOnce(&mut Database) + Send>;

@@ -30,7 +30,7 @@ and usage. Its protocol is experimental. The daemon has completed a bounded
 stored reasoning and thinking across turns, and delegation through detach and
 wait. Stored history is unbounded; each request carries a bounded window of
 whole turns with an explicit note and a `history` tool for what it omits.
-Compaction with summaries, cross-provider handoff, and MCP are not implemented.
+Compaction summaries and carry-forward notes are implemented; long-task quality and cost evaluation remain open. Cross-provider handoff and MCP are not implemented.
 
 This is an experiment with no users. Protocols, CLI defaults, and configuration
 may break between revisions, and the runtime carries no legacy modes or fallback

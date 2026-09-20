@@ -34,6 +34,8 @@ fn binding() -> Binding<'static> {
         tools: &[],
         created_by: None,
         created_by_id: None,
+        compaction_instructions: None,
+        compaction_model: None,
     }
 }
 /// Every stored item of a bot, through the same window the runtime streams.
@@ -48,6 +50,7 @@ fn result(output: &str) -> Outcome {
     Outcome {
         output: output.into(),
         artifacts: Vec::new(),
+        note: None,
     }
 }
 
@@ -314,6 +317,8 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                 Some("/synthetic"),
                 Binding {
                     family,
+                    compaction_instructions: None,
+                    compaction_model: None,
                     ..binding()
                 },
             )
@@ -419,6 +424,8 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                 Some("/synthetic"),
                 Binding {
                     family,
+                    compaction_instructions: None,
+                    compaction_model: None,
                     ..binding()
                 },
             )
@@ -583,6 +590,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stdout", b"full output".to_vec()),
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
+        note: None,
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -961,6 +969,8 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
         Some("/synthetic"),
         Binding {
             tools: &tools,
+            compaction_instructions: None,
+            compaction_model: None,
             ..binding()
         },
     )
@@ -1564,6 +1574,8 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
         Some("/synthetic"),
         Binding {
             family: Family::Anthropic,
+            compaction_instructions: None,
+            compaction_model: None,
             ..binding()
         },
     )
@@ -1907,6 +1919,8 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             Some("/synthetic"),
             Binding {
                 family,
+                compaction_instructions: None,
+                compaction_model: None,
                 ..binding()
             },
         )
@@ -4039,4 +4053,709 @@ fn batched_history_items_validate_the_branch_and_bound_payloads() {
             .len(),
         ids.len()
     );
+}
+
+#[test]
+fn the_context_note_lists_omitted_turns_newest_first_from_the_window_start() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=5 {
+        converse(&mut db, "Bob", n);
+    }
+    // A prompt with a second line and one too long for the preview.
+    let long = format!("{}\nsecond line", "w".repeat(300));
+    let turn = db
+        .begin(
+            "Bob",
+            "r6",
+            &long,
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![assistant("r6")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    converse(&mut db, "Bob", 7);
+    // The window's start is turn 7's prompt node: everything before is omitted.
+    let start: i64 = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["event"] == "accepted")
+        .unwrap()["data"]["node"]
+        .as_i64()
+        .unwrap();
+    let listed = db.omitted_turns(start, 3).unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(
+        (listed[0].0, listed[0].1.len()),
+        (6, "w".repeat(120).len() + '…'.len_utf8())
+    );
+    assert!(listed[0].1.ends_with('…'));
+    assert_eq!(listed[1], (5, "p5".into()));
+    assert_eq!(listed[2], (4, "p4".into()));
+    let all = db.omitted_turns(start, 48).unwrap();
+    assert_eq!(
+        all.iter().map(|(o, _)| *o).collect::<Vec<_>>(),
+        vec![6, 5, 4, 3, 2, 1]
+    );
+    assert_eq!(all[5], (1, "p1".into()));
+    // The first turn's window omits nothing.
+    let first: i64 = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["event"] == "accepted")
+        .unwrap()["data"]["node"]
+        .as_i64()
+        .unwrap();
+    assert!(db.omitted_turns(first, 48).unwrap().is_empty());
+}
+
+#[test]
+fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    assert!(db.window("Bob", i64::MAX, i64::MAX).unwrap().is_none());
+    let noted = |db: &mut Database, n: usize, text: &str| -> i64 {
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("n{n}"),
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let call = ToolCall {
+            name: "note".into(),
+            call_id: format!("note-{n}"),
+            arguments: json!({"text":text}).to_string(),
+        };
+        db.append(turn, vec![], std::slice::from_ref(&call), None)
+            .unwrap();
+        db.tool_start(turn, &call).unwrap();
+        let outcome = Outcome {
+            output: "{}".into(),
+            artifacts: Vec::new(),
+            note: Some(text.to_owned()),
+        };
+        let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
+        let version = entry["data"]["note"].as_i64().unwrap();
+        db.append(turn, vec![assistant("ok")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        version
+    };
+    let first = noted(&mut db, 1, "rule: end files with the marker");
+    assert_eq!(db.inspect("Bob").unwrap().note, Some(first));
+    assert_eq!(
+        db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap().note,
+        Some((first, "rule: end files with the marker".into()))
+    );
+    // A fork at the current head carries the note; one at an earlier
+    // checkpoint carries the version that existed there.
+    let checkpoint = db.inspect("Bob").unwrap().head.unwrap();
+    let second = noted(&mut db, 2, "rule, plus: tests must pass");
+    assert!(second > first);
+    assert_eq!(db.inspect("Bob").unwrap().note, Some(second));
+    db.fork(
+        "Bob",
+        "Early",
+        Fork {
+            checkpoint: Some(checkpoint),
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Early").unwrap().note, Some(first));
+    db.fork(
+        "Bob",
+        "Late",
+        Fork {
+            checkpoint: None,
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Late").unwrap().note, Some(second));
+    // Clearing is a version too: the window shows nothing, a fork before it still sees the note.
+    let cleared = noted(&mut db, 3, "");
+    assert_eq!(db.inspect("Bob").unwrap().note, Some(cleared));
+    assert_eq!(
+        db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap().note,
+        Some((cleared, String::new()))
+    );
+    // Deleting a fork frees its suffix; the shared prefix's notes stay for the others.
+    db.delete_bot("Late").unwrap();
+    assert_eq!(db.inspect("Early").unwrap().note, Some(first));
+    assert_eq!(
+        db.window("Early", i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .note
+            .unwrap()
+            .0,
+        first
+    );
+    // Deleting the source frees its exclusive suffix, notes included, and leaves Early whole.
+    db.delete_bot("Bob").unwrap();
+    assert_eq!(
+        db.window("Early", i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .note
+            .unwrap()
+            .0,
+        first
+    );
+}
+
+#[test]
+fn fork_prompt_views_survive_source_deletion_and_reopen() {
+    for family in [Family::Responses, Family::Anthropic] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-fork-prompts-{}-{}.sqlite",
+            std::process::id(),
+            family.name()
+        ));
+        let prompts = [
+            "Keep \"quotes\" and \\ paths.\nSecond line.",
+            "Unicode: λ🦀",
+            "",
+            "latest",
+        ];
+        let expected;
+        let cut;
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            db.create(
+                "Bob",
+                Some("/synthetic"),
+                Binding {
+                    family,
+                    ..binding()
+                },
+            )
+            .unwrap();
+            for (n, prompt) in prompts.iter().enumerate() {
+                let turn = db
+                    .begin(
+                        "Bob",
+                        &n.to_string(),
+                        prompt,
+                        true,
+                        &TurnOptions::default(),
+                        allow_provider,
+                    )
+                    .unwrap()
+                    .turn;
+                db.finish(turn, None).unwrap();
+            }
+            let plan = db.compaction_plan("Bob", 1, 4096, 256).unwrap().unwrap();
+            assert_eq!(plan.covered, (1, 3));
+            expected = prompts[..3]
+                .iter()
+                .enumerate()
+                .map(|(n, p)| (n as i64 + 1, (*p).to_owned()))
+                .collect::<Vec<_>>();
+            assert_eq!(plan.prompts, expected);
+            cut = plan.cut;
+            db.fork(
+                "Bob",
+                "Alice",
+                Fork {
+                    checkpoint: None,
+                    workspace: Some("/synthetic"),
+                    budget_tokens: None,
+                    ..Fork::default()
+                },
+            )
+            .unwrap();
+            db.delete_bot("Bob").unwrap();
+        }
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let plan = db.compaction_plan("Alice", 1, 4096, 256).unwrap().unwrap();
+            assert_eq!(plan.covered, (1, 3));
+            assert_eq!(plan.prompts, expected);
+            assert_eq!(
+                db.omitted_turns(cut, 3).unwrap(),
+                vec![
+                    (3, "".into()),
+                    (2, prompts[1].into()),
+                    (1, format!("{}…", prompts[0].lines().next().unwrap())),
+                ]
+            );
+            db.compact("Alice", &plan, "retained summary", None)
+                .unwrap();
+            let view = db
+                .window("Alice", 4096, 256)
+                .unwrap()
+                .unwrap()
+                .compaction
+                .unwrap();
+            assert_eq!(view.covered, (1, 3));
+            assert_eq!(view.prompts, expected);
+            // Compaction leaves the original native items retrievable.
+            let raw = db.items_by_ids(&plan.ids).unwrap();
+            let items: Vec<Value> =
+                serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
+            assert_eq!(items.len(), 3);
+            for (item, prompt) in items.iter().zip(prompts) {
+                assert_eq!(item["content"][0]["text"], prompt);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn compaction_prompt_metadata_stays_bounded_across_planning_and_merging() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    // Empty prompts are valid protocol input. Even their ordinals and empty
+    // strings occupy memory and appear in the summary prefix.
+    for n in 0..1800 {
+        let turn = db
+            .begin(
+                "Bob",
+                &n.to_string(),
+                "",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.finish(turn, None).unwrap();
+        if (n + 1) % 600 != 0 {
+            continue;
+        }
+        let plan = db
+            .compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let cost = |prompts: &[(i64, String)]| {
+            prompts
+                .iter()
+                .map(|(_, text)| std::mem::size_of::<(i64, String)>() + text.len())
+                .sum::<usize>()
+        };
+        assert!(cost(&plan.prompts) <= Database::COMPACTION_PROMPTS_BYTES);
+        assert_eq!(plan.prompts.last().unwrap().0, n as i64);
+        db.compact("Bob", &plan, "summary", None).unwrap();
+        let view = db
+            .window("Bob", i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap();
+        assert!(cost(&view.prompts) <= Database::COMPACTION_PROMPTS_BYTES);
+        assert_eq!(view.prompts.first().unwrap(), &(1, String::new()));
+        assert_eq!(view.prompts.last().unwrap(), &(n as i64, String::new()));
+        assert_eq!(view.covered, (1, n as i64));
+        // The omitted excerpt is only a view; the original empty prompt is
+        // still present in its native history item.
+        assert_eq!(db.history_read("Bob", 300, 0, 65536).unwrap()["items"], 1);
+    }
+}
+
+#[test]
+fn compaction_summarizes_older_turns_keeps_prompts_and_versions_bind_forks() {
+    let mut db = db();
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            compaction_instructions: Some("Summarize."),
+            ..binding()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.inspect("Bob")
+            .unwrap()
+            .compaction_instructions
+            .as_deref(),
+        Some("Summarize.")
+    );
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    let checkpoint_early = db.inspect("Bob").unwrap().head.unwrap();
+    for n in 4..=6 {
+        converse(&mut db, "Bob", n);
+    }
+    let before = db.window_bytes("Bob").unwrap();
+    assert!(before > 0);
+    // Keep at least one byte verbatim: the cut lands at the newest turn's
+    // prompt, and everything older is the span.
+    let plan = db
+        .compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.covered, (1, 5));
+    assert_eq!(
+        plan.prompts
+            .iter()
+            .map(|(o, p)| (*o, p.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "p1"), (2, "p2"), (3, "p3"), (4, "p4"), (5, "p5")]
+    );
+    assert_eq!(plan.ids.len(), 10);
+    assert_eq!(plan.ids.len(), plan.sizes.len());
+    assert!(plan.previous_summary.is_none());
+    let checkpoint_before = db.inspect("Bob").unwrap().head.unwrap();
+    let event = db.compact("Bob", &plan, "summary one", None).unwrap();
+    assert_eq!(event["event"], "compacted");
+    assert_eq!(event["data"]["covered_turns"], json!([1, 5]));
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(bot.compaction, Some(checkpoint_before));
+    // The window now starts at the cut and carries the view.
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!(window.omitted_turns, 5);
+    let view = window.compaction.unwrap();
+    assert_eq!(
+        (view.version, view.summary.as_str(), view.covered),
+        (checkpoint_before, "summary one", (1, 5))
+    );
+    assert_eq!(view.prompts.len(), 5);
+    assert!(db.window_bytes("Bob").unwrap() < before);
+    // Nothing older than the cut is left: no second compaction yet.
+    assert!(
+        db.compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+            .unwrap()
+            .is_none()
+    );
+    // More turns, then a second compaction merges from the previous summary.
+    for n in 7..=9 {
+        converse(&mut db, "Bob", n);
+    }
+    let second_version = db.inspect("Bob").unwrap().head.unwrap();
+    let second = db
+        .compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.covered, (6, 8));
+    assert_eq!(second.previous_summary.as_deref(), Some("summary one"));
+    assert!(second.ids.len() < 10);
+    db.compact("Bob", &second, "summary two", None).unwrap();
+    let view = db
+        .window("Bob", i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap()
+        .compaction
+        .unwrap();
+    // The second stands for everything since the first: its coverage starts
+    // at turn 1 and the kept prompts carry over.
+    assert_eq!(
+        (view.summary.as_str(), view.covered),
+        ("summary two", (1, 8))
+    );
+    assert_eq!(view.prompts.len(), 8);
+    // Forks bind to the newest compaction whose cut is at or before their
+    // checkpoint: its summary covers only turns the fork shares. Before the
+    // first cut there is none; after it, the first; at the head, the second.
+    db.fork(
+        "Bob",
+        "Early",
+        Fork {
+            checkpoint: Some(checkpoint_early),
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Early").unwrap().compaction, None);
+    db.fork(
+        "Bob",
+        "Mid",
+        Fork {
+            checkpoint: Some(checkpoint_before),
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        db.inspect("Mid").unwrap().compaction,
+        Some(checkpoint_before)
+    );
+    assert_eq!(
+        db.inspect("Early")
+            .unwrap()
+            .compaction_instructions
+            .as_deref(),
+        Some("Summarize.")
+    );
+    db.fork(
+        "Bob",
+        "Late",
+        Fork {
+            checkpoint: None,
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Late").unwrap().compaction, Some(second_version));
+    // Deletion frees a fork's suffix and the source's exclusive versions,
+    // leaving the fork that still points at one whole.
+    db.delete_bot("Early").unwrap();
+    db.delete_bot("Mid").unwrap();
+    db.delete_bot("Bob").unwrap();
+    assert_eq!(
+        db.window("Late", i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap()
+            .version,
+        second_version
+    );
+    db.delete_bot("Late").unwrap();
+}
+
+#[test]
+fn independent_branches_can_compact_the_same_cut_without_rewriting_each_other() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=5 {
+        converse(&mut db, "Bob", n);
+    }
+    let shared = db.inspect("Bob").unwrap().head.unwrap();
+    db.fork(
+        "Bob",
+        "Alice",
+        Fork {
+            checkpoint: None,
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    converse(&mut db, "Bob", 6);
+    converse(&mut db, "Alice", 7);
+    let p = db.compaction_plan("Bob", 250, 4096, 256).unwrap().unwrap();
+    let q = db
+        .compaction_plan("Alice", 250, 4096, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.cut, q.cut);
+    db.compact("Bob", &p, "Bob summary", None).unwrap();
+    db.compact("Alice", &q, "Alice summary", None).unwrap();
+    let b = db.window("Bob", 4096, 256).unwrap().unwrap();
+    let a = db.window("Alice", 4096, 256).unwrap().unwrap();
+    assert_ne!(
+        b.compaction.as_ref().unwrap().version,
+        a.compaction.as_ref().unwrap().version
+    );
+    assert_eq!(b.compaction.as_ref().unwrap().summary, "Bob summary");
+    assert_eq!(a.compaction.as_ref().unwrap().summary, "Alice summary");
+    db.fork(
+        "Bob",
+        "Before",
+        Fork {
+            checkpoint: Some(shared),
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert!(db.inspect("Before").unwrap().compaction.is_none());
+    db.fork(
+        "Bob",
+        "After",
+        Fork {
+            checkpoint: None,
+            workspace: Some("/synthetic"),
+            budget_tokens: None,
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.window("After", 4096, 256).unwrap().unwrap().ids, b.ids);
+    db.delete_bot("Bob").unwrap();
+    assert_eq!(
+        db.window("After", 4096, 256)
+            .unwrap()
+            .unwrap()
+            .compaction
+            .unwrap()
+            .summary,
+        "Bob summary"
+    );
+}
+
+#[test]
+fn compaction_planning_rejects_oversized_spans_before_collecting_history() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=100 {
+        converse(&mut db, "Bob", n);
+    }
+    assert_eq!(
+        db.compaction_plan("Bob", 1, 1024, 4096).unwrap_err().code,
+        "compaction_span_limit"
+    );
+    assert_eq!(
+        db.compaction_plan("Bob", 1, i64::MAX, 16).unwrap_err().code,
+        "compaction_span_limit"
+    );
+    // Rejection does not move the window or erase history.
+    assert!(db.inspect("Bob").unwrap().compaction.is_none());
+    assert_eq!(
+        db.window("Bob", i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .ids
+            .len(),
+        200
+    );
+}
+
+#[test]
+fn compaction_cut_migrates_without_replacing_the_recorded_summary() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-compaction-migrate-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let (version, cut);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=3 {
+            converse(&mut db, "Bob", n);
+        }
+        let plan = db.compaction_plan("Bob", 1, 4096, 256).unwrap().unwrap();
+        cut = plan.cut;
+        version = db.inspect("Bob").unwrap().head.unwrap();
+        db.compact("Bob", &plan, "retained summary", None).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute("UPDATE compactions SET node=?", [cut])
+            .unwrap();
+        conn.execute("UPDATE bots SET compaction=?", [cut]).unwrap();
+        conn.execute_batch("DROP INDEX compactions_cut; ALTER TABLE compactions DROP COLUMN cut; PRAGMA user_version=23;")
+            .unwrap();
+    }
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let w = db.window("Bob", 4096, 256).unwrap().unwrap();
+        assert_eq!(w.ids[0], cut);
+        assert_eq!(w.compaction.unwrap().summary, "retained summary");
+        converse(&mut db, "Bob", 4);
+        let plan = db.compaction_plan("Bob", 1, 4096, 256).unwrap().unwrap();
+        db.compact("Bob", &plan, "new summary", None).unwrap();
+        assert!(db.inspect("Bob").unwrap().compaction.unwrap() > version);
+        db.delete_bot("Bob").unwrap();
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn merged_schema_preserves_stores_from_both_published_branches() {
+    for lineage in [true, false] {
+        let path = std::env::temp_dir().join(format!(
+            "agent-schema-join-{}-{lineage}.sqlite",
+            std::process::id()
+        ));
+        let (id, parent_id, head, item);
+        {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let parent = db
+                .create("Parent", Some("/synthetic"), binding())
+                .unwrap()
+                .0;
+            parent_id = parent.id;
+            let mut b = binding();
+            b.created_by = Some("Parent");
+            b.created_by_id = Some(parent.id);
+            b.compaction_instructions = Some("preserve decisions");
+            db.create("Bob", Some("/synthetic"), b).unwrap();
+            converse(&mut db, "Bob", 1);
+            let bot = db.inspect("Bob").unwrap();
+            id = bot.id;
+            head = bot.head.unwrap();
+            item = db.item("Bob", head).unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            if lineage {
+                conn.execute_batch(
+                    "DROP INDEX bots_note; DROP INDEX bots_compaction;
+                    ALTER TABLE bots DROP COLUMN note;
+                    ALTER TABLE bots DROP COLUMN compaction;
+                    ALTER TABLE bots DROP COLUMN compaction_instructions;
+                    ALTER TABLE bots DROP COLUMN compaction_model;
+                    DROP TABLE compactions; DROP TABLE notes;
+                    PRAGMA user_version=23;",
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "INSERT INTO notes(node, text) VALUES (?, 'retained note')",
+                    [head],
+                )
+                .unwrap();
+                conn.execute("UPDATE bots SET note=? WHERE name='Bob'", [head])
+                    .unwrap();
+                conn.execute_batch(
+                    "ALTER TABLE bots DROP COLUMN created_by;
+                    ALTER TABLE bots DROP COLUMN created_by_id;
+                    PRAGMA user_version=24;",
+                )
+                .unwrap();
+            }
+        }
+        for _ in 0..2 {
+            let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+            let bot = db.inspect("Bob").unwrap();
+            assert_eq!((bot.id, bot.head), (id, Some(head)));
+            assert_eq!(db.item("Bob", head).unwrap(), item);
+            if lineage {
+                assert_eq!(bot.created_by.as_deref(), Some("Parent"));
+                assert_eq!(bot.created_by_id, Some(parent_id));
+                assert_eq!(bot.compaction_instructions, None);
+            } else {
+                assert_eq!(bot.created_by_id, None);
+                assert_eq!(
+                    bot.compaction_instructions.as_deref(),
+                    Some("preserve decisions")
+                );
+                assert_eq!(
+                    db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap().note,
+                    Some((head, "retained note".into()))
+                );
+            }
+            let fork = db.fork("Bob", "Fork", Fork::default()).unwrap().0;
+            assert_eq!(fork.head, bot.head);
+            assert_eq!(fork.compaction_instructions, bot.compaction_instructions);
+            db.delete_bot("Fork").unwrap();
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            Database::SCHEMA
+        );
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
 }

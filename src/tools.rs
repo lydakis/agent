@@ -27,6 +27,8 @@ use files::read_bounded;
 pub const PREVIEW_BYTES: usize = 64 * 1024;
 /// Retained full output per stream; more than this fails the tool.
 pub const ARTIFACT_BYTES: usize = 1024 * 1024;
+/// The carry-forward note a bot may keep ahead of its window.
+pub const NOTE_BYTES: usize = 8192;
 const FILE_BYTES: usize = 4 * 1024 * 1024;
 const WRITE_BYTES: usize = 1024 * 1024;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
@@ -44,6 +46,7 @@ enum Tool {
     Edit,
     Wait,
     History,
+    Note,
 }
 impl Tool {
     fn parse(name: &str) -> Option<Tool> {
@@ -55,6 +58,7 @@ impl Tool {
             "edit" => Tool::Edit,
             "wait" => Tool::Wait,
             "history" => Tool::History,
+            "note" => Tool::Note,
             _ => return None,
         })
     }
@@ -67,6 +71,7 @@ impl Tool {
             Tool::Edit => "edit",
             Tool::Wait => "wait",
             Tool::History => "history",
+            Tool::Note => "note",
         }
     }
     fn schema(self) -> ToolSchema {
@@ -104,6 +109,11 @@ impl Tool {
                 "Read an omitted conversation turn (numbered from 1; see the context note). Returns provider items as JSONL, omitting only encrypted_content from reasoning items; summaries remain. Pages contain at most 64 KiB and may shrink to fit context. Optional limit: 4 to 65536 bytes. Start at offset 0; use next_offset until done. Offsets count UTF-8 bytes of the filtered view. Pages may split records; concatenate text before decoding.",
                 json!({"type":"object","properties":{"turn":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":4,"maximum":65536}},
                 "required":["turn"],"additionalProperties":false}),
+            ),
+            Tool::Note => (
+                "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes; empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
+                json!({"type":"object","properties":{"text":{"type":"string","maxLength":8192}},
+                "required":["text"],"additionalProperties":false}),
             ),
             Tool::Wait => (
                 "Suspend until every handle resolves, without holding any execution capacity. Handles are 'turn:BOT/N' (a peer agent's turn, printed by run --detach) or 'proc:N' (a background shell). Each result reports the outcome: a peer's status and final text, or a process's output and exit code. With timeout_ms, unresolved handles are reported as pending and stay valid for a later wait; 0 polls without waiting. With any: true, the first resolved handle ends the wait and the rest are reported pending.",
@@ -174,6 +184,11 @@ pub enum Prepared {
         timeout_ms: Option<u64>,
         any: bool,
     },
+    /// Recorded by the store with the call's result, so the note's version
+    /// is the node of that result and forks bind to it by position.
+    Note {
+        text: String,
+    },
     Read {
         source: ReadSource,
         offset: usize,
@@ -228,12 +243,15 @@ impl ReadSource {
 pub struct Outcome {
     pub output: String,
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
+    /// A carry-forward note to record with this result; empty text clears.
+    pub note: Option<String>,
 }
 impl Outcome {
     pub fn text(output: String) -> Self {
         Self {
             output,
             artifacts: Vec::new(),
+            note: None,
         }
     }
 }
@@ -243,9 +261,9 @@ impl Registry {
     /// of them a bot may call is the bot's own, chosen at creation.
     pub fn all() -> Result<Self> {
         Self::new(if cfg!(unix) {
-            "echo,shell,read,write,edit,wait,history"
+            "echo,shell,read,write,edit,wait,history,note"
         } else {
-            "echo,read,write,edit,wait,history"
+            "echo,read,write,edit,wait,history,note"
         })
     }
     pub fn new(names: &str) -> Result<Self> {
@@ -492,6 +510,17 @@ impl Registry {
                     limit,
                 }
             }
+            Tool::Note => {
+                #[derive(serde::Deserialize)]
+                struct Note {
+                    text: String,
+                }
+                let args: Note = serde_json::from_str(args).map_err(invalid)?;
+                if args.text.len() > NOTE_BYTES {
+                    return fail("invalid_tool_arguments");
+                }
+                Prepared::Note { text: args.text }
+            }
             Tool::Wait => {
                 let args: Wait = serde_json::from_str(args).map_err(invalid)?;
                 if args.handles.is_empty()
@@ -568,6 +597,7 @@ impl Registry {
             } => fail("background_requires_runtime"),
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::History { .. } => fail("history_requires_runtime"),
+            Prepared::Note { .. } => fail("note_requires_runtime"),
             Prepared::Shell {
                 command,
                 timeout_ms,
@@ -684,7 +714,11 @@ impl Registry {
         let output = json!({"stdout":preview("stdout", stdout),"stderr":preview("stderr", stderr),
             "exit_code":status.code(),"success":status.success()})
         .to_string();
-        Outcome { output, artifacts }
+        Outcome {
+            output,
+            artifacts,
+            note: None,
+        }
     }
 
     /// Start a command whose result is delivered later. The process budget is

@@ -463,25 +463,54 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     rows, and the bound exists for an honest admission answer, not memory.
     Performance follow-up: the [alternating comparison](DAEMON_MEASUREMENTS.md#alternating-follow-up)
     leaves a small CPU cost unresolved; do not call this performance-neutral.
-32. Compaction, the context work, in three slices. First, an exploratory
+32. Compaction, the context work. Slice one is done: the
     [evaluation](DAEMON_MEASUREMENTS.md#context-quality-before-compaction)
-    from item 15 has run: luna honored the final file rule in 8/8 retained
-    conversations and 3/8 small-window conversations; Sonnet honored 0/3,
-    including one missing file. No history calls occurred in the 266 turns
-    of those cohorts. These captures record omission after the final turn,
-    not what the model saw before acting. The corrected evaluator separates
-    retained, omitted, transitional, and failed turns, with complete event
-    and usage paging. Its synthetic regression checks pass; a paid rerun
-    establishing stable-context scores remains before a compaction comparison.
-    Visible examples are a possible influence, not a demonstrated cause.
-    Second, the
-    mechanism: a versioned context view that summarizes older turns, with
-    history untouched, forks bound to the view valid at their checkpoint,
-    and the window reading the view; the daemon supplies no policy, so a
-    client names the summarizer model and the threshold, and with neither
-    set nothing compacts. Third, its performance: what a compaction costs on
-    the storage thread and the reader, what rewriting the prefix does to the
-    prompt-cache hit rate, and the evaluation rerun on the compacted daemon.
+    from item 15, rerun on the corrected evaluator: luna honors the rule
+    8/8 with it retained, 0/6 on the final file and 0/26 on fillers once
+    the window has dropped it, and never called `history` in 266 turns
+    although every request after the window moved named it. Read with the
+    [survey](COMPACTION_SURVEY.md): the daemon already has the shape the
+    research favors, whole old turns dropped and recoverable by number, and
+    the failure is that the model cannot see what it is missing. The
+    remaining slices, each measured with the evaluation:
+    - Slice two, done: the [legible omission
+      note](DAEMON_MEASUREMENTS.md#the-legible-omission-note). The request
+      lists the omitted turns, ordinal and the first line of each prompt,
+      newest first up to `--note-turns`. Data, not an instruction. With the
+      rule omitted, luna's final file went from 0/6 to 7/7 and half the
+      conversations read turn 1 through `history`; the rest acted on the
+      examples still in view, which the bare count had not made them do.
+    - Slice three, done as a mechanism: the [carry-forward
+      note](DAEMON_MEASUREMENTS.md#the-carry-forward-note), a `note` tool
+      that writes or replaces a bounded text pinned ahead of the window,
+      recorded with the tool result and versioned by its node, so forks
+      bind to the version at their checkpoint. Offered to luna with no
+      instruction, it was never called in 112 turns; the survey's finding
+      holds here. Whether the client's default instructions should mention
+      it is an open client-policy decision, to be made against that number.
+      The fullness signal proposed for the omission note was not built:
+      the listing already changed behavior, and a per-request status line
+      would cost prompt-cache prefix stability.
+    - Slice four, done: [compaction](DAEMON_MEASUREMENTS.md#compaction).
+      Harness-triggered at `--compact-at` percent of the context budget, at a
+      round boundary: one summarizer call under the client's compaction
+      instructions, the bot's own model or a client-named one of the same
+      family, over everything older than a verbatim tail, the covered turns'
+      user prompts kept verbatim within bounds, versioned at the head with a
+      separate cut so forks remain independent and history stays intact. No
+      instructions, no compaction; the CLI ships a default text. On the
+      evaluation the rule never left the request and 41 of 41 summaries
+      restated it. The original cost and cache figures excluded summarizer
+      usage; rerun with corrected accounting before claiming total cost.
+      Stable summaries now precede changing omission notices and forks restore
+      their inherited context start. Oversized unsummarized backlogs are rejected
+      before a history walk; automatic catch-up in bounded spans remains open. Jev was not used: its probes showed it answers the
+      judgments, but not that it beats the static rule of keeping user
+      prompts verbatim, and the daemon knows structurally when a boundary
+      is stable. If Jev has a place it is in permission automation, which
+      is deferred. Still open: a real 8 MiB window over a long task, Sonnet,
+      the summarizer's latency at size, and an evaluation that can see a
+      summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
 

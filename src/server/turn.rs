@@ -21,7 +21,7 @@ use agent_runtime::{
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -78,6 +78,11 @@ pub struct Turn {
     pub background_failures: mpsc::UnboundedSender<Error>,
     pub context_bytes: usize,
     pub context_items: usize,
+    /// Omitted turns the context note lists; zero for the bare count.
+    pub note_turns: usize,
+    /// Compaction threshold and verbatim tail, as percentages of the budget.
+    pub compact_at: usize,
+    pub compact_keep: usize,
     /// Continue a parked turn: record its wait results, then keep going.
     pub resume: bool,
     /// A steer for this bot may be queued. Set by the service, cleared by
@@ -126,6 +131,8 @@ struct Accounting {
     call_spent_ms: u64,
     /// Set when a call parked the turn on a closed pool.
     parked_until: u64,
+    /// Persist the call's phase with its existing park transaction.
+    compaction: bool,
 }
 impl Accounting {
     fn totals(&self) -> (u64, u64) {
@@ -206,10 +213,11 @@ impl Turn {
         let turn = self.turn;
         let flushed = if let Ok(Round::Paced(at)) = &result {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
+            let compaction = accounting.compaction;
             // Commit the park and its accounting together, outside cancellation.
             self.store
                 .op("suspend_paced", move |db| {
-                    db.suspend_paced(turn, at, attempts, spent, retries, paced_ms)
+                    db.suspend_paced(turn, at, attempts, spent, retries, paced_ms, compaction)
                         .map(|_| ())
                 })
                 .await
@@ -261,24 +269,84 @@ impl Turn {
             item_bytes,
             omitted_items,
             omitted_turns,
+            note,
+            compaction,
         }) = window
         else {
             return Ok(Items::empty());
         };
         let mut total = item_bytes as usize + ids.len().saturating_sub(1);
         let mut head = Vec::new();
+        // The compaction in place of the turns it covered: the summary and
+        // their prompts verbatim. Changes only at the next compaction.
+        if let Some(view) = compaction {
+            let mut text = format!(
+                "[compaction summary, version {}, covering turns {} to {}]\n{}",
+                view.version, view.covered.0, view.covered.1, view.summary
+            );
+            if !view.prompts.is_empty() {
+                text.push_str("\n\nUser messages from those turns, verbatim:");
+                for (ordinal, prompt) in &view.prompts {
+                    text.push_str(&format!("\n{ordinal}: {prompt}"));
+                }
+            }
+            let mut item = pinned_item(family, &text)?;
+            if !ids.is_empty() {
+                item.push(b',');
+            }
+            total += item.len();
+            head.extend_from_slice(&item);
+        }
+        // The bot's own carry-forward note, ahead of the window and behind
+        // the summary: it changes only when the bot rewrites it.
+        if let Some((version, text)) = note.filter(|(_, text)| !text.is_empty()) {
+            let mut pinned = pinned_item(
+                family,
+                &format!("[carry-forward note, version {version}]\n{text}"),
+            )?;
+            if !ids.is_empty() {
+                pinned.push(b',');
+            }
+            total += pinned.len();
+            head.extend_from_slice(&pinned);
+        }
         if omitted_items > 0 {
             // Omission is explicit: the model is told what is missing and how
-            // to read it. This note is part of the request, never the store.
-            let note = format!(
+            // to read it, and sees how each omitted turn began, so it can
+            // judge for itself whether one is worth reading. The note is
+            // part of the request, never the store; it changes only when the
+            // window's start moves, as the request prefix already does.
+            let mut note = format!(
                 "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown. \
                  Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
             );
-            head = family.user_item(&note)?;
-            if !ids.is_empty() {
-                head.push(b',');
+            if self.note_turns > 0 && !ids.is_empty() {
+                let (start, limit) = (ids[0], self.note_turns);
+                let listed = self
+                    .store
+                    .read("omitted_turns", move |db| db.omitted_turns(start, limit))
+                    .await?;
+                if !listed.is_empty() {
+                    note.push_str(" How they began, newest first:");
+                    for (ordinal, opening) in &listed {
+                        note.push_str(&format!("\n{ordinal}: {opening}"));
+                    }
+                    if let Some((oldest, _)) = listed.last()
+                        && *oldest > 1
+                    {
+                        note.push_str(&format!(
+                            "\nTurns 1 to {} are older than this list.",
+                            oldest - 1
+                        ));
+                    }
+                }
             }
-            total += head.len();
+            let mut item = family.user_item(&note)?;
+            if !ids.is_empty() {
+                item.push(b',');
+            }
+            total += item.len();
+            head.extend_from_slice(&item);
         }
         let store = self.store.clone();
         let batches = batches(&ids, &sizes);
@@ -297,6 +365,214 @@ impl Turn {
                 }
             }),
         );
+        Ok(Items {
+            bytes: total,
+            stream: body.boxed(),
+        })
+    }
+
+    /// Compaction at a round boundary: once the window holds `compact_at`
+    /// percent of the budget, summarize everything older than the newest
+    /// `compact_keep` percent with the client's instructions and summarizer,
+    /// and record the result as the new context start. A failed summary
+    /// leaves the context view unchanged and is reported live; the turn goes on
+    /// with the window as it is. Returns a park time if the summarizer's
+    /// call parked the turn.
+    async fn compact_if_due(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+    ) -> Result<Option<u64>> {
+        if record.compaction_instructions.is_none() {
+            return Ok(None);
+        }
+        let bot = self.bot.clone();
+        let bytes = self
+            .store
+            .op("window_bytes", move |db| db.window_bytes(&bot))
+            .await?;
+        if (bytes as usize) < self.context_bytes / 100 * self.compact_at {
+            return Ok(None);
+        }
+        let (bot, keep) = (
+            self.bot.clone(),
+            (self.context_bytes / 100 * self.compact_keep) as i64,
+        );
+        let (max_bytes, max_items) = (self.context_bytes as i64, self.context_items as i64);
+        let plan = match self
+            .store
+            .op("compaction_plan", move |db| {
+                db.compaction_plan(&bot, keep, max_bytes, max_items)
+            })
+            .await
+        {
+            Ok(Some(plan)) => plan,
+            Ok(None) => return Ok(None),
+            Err(error) if error.code == "compaction_span_limit" => {
+                self.compaction_failed(turn, &error).await?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        // The summarizer: the bot's own model unless the client named one
+        // of the same family, checked at creation.
+        let reference = record
+            .compaction_model
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", record.provider, record.model));
+        let (name, model) = split_model(&reference)?;
+        let Some(summarizer) = self.providers.get(name) else {
+            self.hub
+                .live(
+                    &self.bot,
+                    json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
+                        "error":"provider_unavailable","detail":name}),
+                )
+                .await?;
+            return Ok(None);
+        };
+        let instructions = record.compaction_instructions.clone().unwrap();
+        // Messages requires definitions for historical tool blocks. Reuse the
+        // already encoded bot selection; tool_choice disables new calls.
+        // Responses accepts historical calls without definitions.
+        let empty;
+        let summary_tools = match summarizer.family() {
+            agent_runtime::codec::Family::Anthropic => tools,
+            agent_runtime::codec::Family::Responses => {
+                empty = self.registry.encoded(summarizer.family(), &[])?;
+                &empty
+            }
+        };
+        let completion = match self
+            .call_with(
+                summarizer,
+                model,
+                &instructions,
+                summary_tools,
+                Body::Span(&plan),
+                record,
+                model_rounds,
+                turn,
+                accounting,
+            )
+            .await
+        {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return Ok(Some(accounting.parked_until)),
+            Err(error) => {
+                self.hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
+                            "error":error.code,"detail":error.detail}),
+                    )
+                    .await?;
+                return Ok(None);
+            }
+        };
+        // Success is billable even if its text is empty or too large to use.
+        *model_rounds += 1;
+        if let Some(usage) = &completion.usage {
+            record.tokens_used = record
+                .tokens_used
+                .saturating_add(usage.input_tokens)
+                .saturating_add(usage.output_tokens);
+        }
+        let usage = completion.usage;
+        let summary = completion_text(&completion.items);
+        let invalid = if summary.len() > (self.context_bytes / 4).min(64 * 1024) {
+            Some(Error::new("compaction_summary_limit"))
+        } else if summary.trim().is_empty() {
+            Some(Error::new("empty_summary"))
+        } else {
+            None
+        };
+        if let Some(error) = invalid {
+            self.store
+                .op("compaction_usage", move |db| {
+                    db.compaction_usage(turn, usage.as_ref())
+                })
+                .await?;
+            self.compaction_failed(turn, &error).await?;
+            return Ok(None);
+        }
+        let bot = self.bot.clone();
+        let billed = usage.clone();
+        if let Err(error) = self
+            .store
+            .op("compact", move |db| {
+                db.compact(&bot, &plan, &summary, usage.as_ref())
+            })
+            .await
+        {
+            self.store
+                .op("compaction_usage", move |db| {
+                    db.compaction_usage(turn, billed.as_ref())
+                })
+                .await?;
+            return Err(error);
+        }
+        Ok(None)
+    }
+
+    async fn compaction_failed(&self, turn: i64, error: &Error) -> Result<()> {
+        self.hub
+            .live(
+                &self.bot,
+                json!({"event":"compaction_failed","bot":self.bot,
+            "turn":turn,"durable":false,"error":error.code,"detail":error.detail}),
+            )
+            .await
+    }
+
+    /// The summarizer's request body: the previous summary, if any, then
+    /// the span's items in store-read batches, then the request to write.
+    async fn span_items(&self, plan: &agent_runtime::store::CompactionPlan) -> Result<Items> {
+        let bot = self.bot.clone();
+        let family = self
+            .store
+            .op("inspect", move |db| db.inspect(&bot)?.family())
+            .await?;
+        let mut head = Vec::new();
+        if let Some(previous) = &plan.previous_summary {
+            head = family.user_item(&format!(
+                "[previous summary, to merge with the turns below]\n{previous}"
+            ))?;
+            head.push(b',');
+        }
+        let mut tail = family.user_item(
+            "[compaction request] Write the summary of the conversation above now, following your instructions.",
+        )?;
+        tail.insert(0, b',');
+        let total = head.len()
+            + plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
+            + plan.ids.len().saturating_sub(1)
+            + tail.len();
+        if total > self.context_bytes {
+            return fail("compaction_input_limit");
+        }
+        let store = self.store.clone();
+        let batches = batches(&plan.ids, &plan.sizes);
+        let body = stream::iter([Ok(Bytes::from(head))])
+            .chain(
+                stream::iter(batches.into_iter().enumerate()).then(move |(index, chunk)| {
+                    let store = store.clone();
+                    async move {
+                        let mut bytes = store
+                            .read("items_by_ids", move |db| db.items_by_ids(&chunk))
+                            .await
+                            .map_err(|error| std::io::Error::other(error.code))?;
+                        if index != 0 {
+                            bytes.insert(0, b',');
+                        }
+                        Ok(Bytes::from(bytes))
+                    }
+                }),
+            )
+            .chain(stream::iter([Ok(Bytes::from(tail))]));
         Ok(Items {
             bytes: total,
             stream: body.boxed(),
@@ -334,6 +610,7 @@ impl Turn {
             environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
             environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
         }
+        let mut resume_window = false;
         if self.resume {
             let (waiting, _, steers) =
                 match self.store.op("resume", move |db| db.resume(turn)).await {
@@ -349,6 +626,7 @@ impl Turn {
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
+                resume_window = !waiting.compaction;
             } else {
                 let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
                 let id = waiting.call_id;
@@ -373,6 +651,24 @@ impl Turn {
             // The budget is checked before each call, so one call may overshoot.
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
+            }
+            // Past the threshold, the older turns are summarized before this
+            // call, with the summarizer's own call paced and billed like any.
+            // Resume the parked call, not the whole boundary. In particular,
+            // an exhausted summary must not start over when the ordinary call
+            // parks on the same pool. A later model round may compact again.
+            if !std::mem::take(&mut resume_window)
+                && let Some(parked) = self
+                    .compact_if_due(&mut record, &mut model_rounds, turn, accounting, &tools)
+                    .await?
+            {
+                return Ok(Round::Paced(parked));
+            }
+            if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
+                return Err(error);
+            }
+            if model_rounds >= MAX_ROUNDS {
+                return fail("tool_round_limit");
             }
             let Some(response) = self
                 .call(
@@ -468,27 +764,62 @@ impl Turn {
         turn: i64,
         accounting: &mut Accounting,
     ) -> Result<Option<agent_runtime::provider::Completion>> {
+        let instructions = record.instructions.clone();
+        self.call_with(
+            provider,
+            model,
+            &instructions,
+            tools,
+            Body::Window,
+            record,
+            model_rounds,
+            turn,
+            accounting,
+        )
+        .await
+    }
+
+    /// One model call with retries, pacing, and accounting: the turn's own
+    /// request, or a compaction's request over a span of history.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_with(
+        &self,
+        provider: &Provider,
+        model: &str,
+        instructions: &str,
+        tools: &serde_json::value::RawValue,
+        body: Body<'_>,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+    ) -> Result<Option<agent_runtime::provider::Completion>> {
+        accounting.compaction = matches!(body, Body::Span(_));
         let started = std::time::Instant::now();
         let mut attempt = std::mem::take(&mut accounting.call_attempts);
         let prior_spent =
             std::time::Duration::from_millis(std::mem::take(&mut accounting.call_spent_ms));
         let paced_before = accounting.totals().1;
         loop {
-            let items = self.items().await?;
+            let items = match body {
+                Body::Window => self.items().await?,
+                Body::Span(plan) => self.span_items(plan).await?,
+            };
             accounting.begin(attempt > 0);
             let result = provider
                 .complete_accounted(
                     ModelRequest {
                         model,
-                        instructions: &record.instructions,
+                        instructions,
                         reasoning: record.reasoning.as_deref(),
                         tools,
+                        allow_tool_calls: matches!(body, Body::Window),
                         items,
                     },
                     |delta| {
                         let (kind, text) = match delta {
-                            Delta::Text(text) => ("text_delta", text),
-                            Delta::Thinking(text) => ("thinking_delta", text),
+                            Delta::Text(text) => (if matches!(body, Body::Span(_)) { "compaction_text_delta" } else { "text_delta" }, text),
+                            Delta::Thinking(text) => (if matches!(body, Body::Span(_)) { "compaction_thinking_delta" } else { "thinking_delta" }, text),
                         };
                         self.hub.live(
                             &self.bot,
@@ -529,7 +860,18 @@ impl Turn {
                     .saturating_add(usage.input_tokens)
                     .saturating_add(usage.output_tokens);
             }
-            self.failed_usage(accounting.report.usage.take()).await?;
+            let usage = accounting.report.usage.take();
+            if matches!(body, Body::Span(_)) {
+                if let Some(usage) = usage {
+                    self.store
+                        .op("compaction_usage", move |db| {
+                            db.compaction_usage(turn, Some(&usage))
+                        })
+                        .await?;
+                }
+            } else {
+                self.failed_usage(usage).await?;
+            }
             // A retry is another billable call. Preserve final provider errors,
             // but stop retrying once failed usage has spent the bot's budget.
             let error = if retryable(&error.code) {
@@ -688,6 +1030,13 @@ impl Turn {
                 }) => match Box::pin(self.history(&call.call_id, wanted, offset, limit)).await {
                     Ok(outcome) => outcome,
                     Err(error) => failure(error),
+                },
+                // Stored with the result: one commit records the note, its
+                // version node, and the tool outcome together.
+                Ok(Prepared::Note { text }) => Outcome {
+                    output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
+                    artifacts: Vec::new(),
+                    note: Some(text),
                 },
                 Ok(prepared) => match self
                     .registry
@@ -933,15 +1282,70 @@ fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
     outcome
 }
 
+/// Stable pinned blocks get their own Anthropic write points. Together
+/// with system and automatic tail caching this uses at most four breakpoints.
+/// Responses gateways retain their existing wire format.
+fn pinned_item(family: agent_runtime::codec::Family, text: &str) -> Result<Vec<u8>> {
+    match family {
+        agent_runtime::codec::Family::Anthropic => Ok(serde_json::to_vec(&json!({
+            "role":"user","content":[{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]
+        }))?),
+        _ => family.user_item(text),
+    }
+}
+
+/// What a model call sends: the bot's window, or a compaction's span.
+#[derive(Clone, Copy)]
+enum Body<'a> {
+    Window,
+    Span(&'a agent_runtime::store::CompactionPlan),
+}
+
+/// The assistant text of a completion's items, in either family encoding.
+fn completion_text(items: &[Bytes]) -> String {
+    let mut text = String::new();
+    for item in items {
+        let Ok(value) = serde_json::from_slice::<Value>(item) else {
+            continue;
+        };
+        if let Some(content) = value["content"].as_array() {
+            for part in content {
+                if let Some(piece) = part["text"].as_str()
+                    && matches!(part["type"].as_str(), Some("output_text" | "text"))
+                {
+                    text.push_str(piece);
+                }
+            }
+        }
+    }
+    text
+}
+
 fn failure(error: Error) -> Outcome {
     Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
+        note: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pinned_blocks_cache_only_with_their_provider_format() {
+        use agent_runtime::codec::Family;
+        let anthropic: serde_json::Value =
+            serde_json::from_slice(&super::pinned_item(Family::Anthropic, "stable").unwrap())
+                .unwrap();
+        assert_eq!(
+            anthropic["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(
+            super::pinned_item(Family::Responses, "stable").unwrap(),
+            Family::Responses.user_item("stable").unwrap()
+        );
+    }
     use super::*;
     use serde_json::Value;
 
@@ -973,6 +1377,8 @@ mod tests {
                             tools: &[],
                             created_by: None,
                             created_by_id: None,
+                            compaction_instructions: None,
+                            compaction_model: None,
                         },
                     )?;
                     let turn = db
@@ -1053,6 +1459,9 @@ mod tests {
             background_failures: mpsc::unbounded_channel().0,
             context_bytes: 8 << 20,
             context_items: 4096,
+            note_turns: 48,
+            compact_at: 75,
+            compact_keep: 25,
             resume: false,
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),

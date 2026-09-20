@@ -46,6 +46,13 @@ RULE = (f'Workspace convention, in force for every task in this conversation fro
         f'create must end with a final line that is exactly `{MARKER}`. Acknowledge in one sentence; do not '
         f'create anything yet.')
 CONDITIONS = {'omitted': ('16384', '256'), 'retained': (str(8 << 20), '4096')}
+# The CLI's default compaction text, so the summarizer is the one `agent run` gives.
+COMPACTION = ('You are summarizing the earlier part of an agent\'s conversation so the agent can continue '
+              'with the summary in place of those turns. Any earlier summary is given first; merge it with the new turns, do not restart. '
+              'Write, in order: the goal; every rule, constraint, or preference the user stated, verbatim where wording matters; '
+              'what is done, in progress, and blocked; key decisions and why; files read or changed; open questions; next steps. '
+              'Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. '
+              'Reply with the summary only.')
 
 
 def filler(n):
@@ -105,15 +112,17 @@ def score_file(path, status, before, after):
 
 
 def run_condition(binary, provider, family, url, key_env, env, model, condition, bots, fillers, out_dir,
-                  omitted_bytes=None):
+                  omitted_bytes=None, tools='shell,read,write,edit,history', compaction=False, compact_at=None):
     context_bytes, context_items = CONDITIONS[condition]
     if condition == 'omitted' and omitted_bytes:
         context_bytes = str(omitted_bytes)
     root = Path(tempfile.mkdtemp(prefix=f'context-eval-{condition}-', dir=out_dir))
     store = root / 'state.sqlite'
-    client = Client(binary, store, url, tools='shell,read,write,edit,history', model=model, key_env=key_env,
-                    env=env, provider=provider, family=family,
-                    extra=('--context-bytes', context_bytes, '--context-items', context_items))
+    extra = ['--context-bytes', context_bytes, '--context-items', context_items]
+    if compact_at:
+        extra += ['--compact-at', str(compact_at)]
+    client = Client(binary, store, url, tools=tools, model=model, key_env=key_env,
+                    env=env, provider=provider, family=family, extra=tuple(extra))
     names = [f'{condition}-{i}' for i in range(bots)]
     results = {name: {'files': [], 'final': None, 'history_calls_final': 0, 'history_calls': 0,
                       'omitted_turns_after_final': None}
@@ -124,7 +133,8 @@ def run_condition(binary, provider, family, url, key_env, env, model, condition,
         for name in names:
             workspace = root / name
             workspace.mkdir()
-            client.request('create', bot=name, workspace=str(workspace), instructions=INSTRUCTIONS)
+            client.request('create', bot=name, workspace=str(workspace), instructions=INSTRUCTIONS,
+                           **({'compaction_instructions': COMPACTION} if compaction else {}))
         positions = window_positions(db)
         cursors = {name: 0 for name in names}
         prompts = [RULE] + [filler(n) for n in range(1, fillers + 1)] + [FINAL]
@@ -148,6 +158,14 @@ def run_condition(binary, provider, family, url, key_env, env, model, condition,
                     cursors[name] = event['cursor']
                     if event['turn'] == turn and event['event'] == 'tool_started':
                         history += event['data']['name'] == 'history'
+                        results[name]['note_calls'] = results[name].get('note_calls', 0) + (event['data']['name'] == 'note')
+                    if event['event'] == 'usage' and event['data'].get('purpose') == 'compaction':
+                        for field in ('input_tokens', 'output_tokens', 'cached_input_tokens'):
+                            key = 'compaction_' + field
+                            results[name][key] = results[name].get(key, 0) + event['data'][field]
+                    if event['event'] == 'compacted':
+                        results[name].setdefault('compactions', []).append(
+                            {'turn': index, 'covered': event['data']['covered_turns'], 'summary_bytes': event['data']['summary_bytes']})
                 results[name]['history_calls'] += history
                 if 1 <= index <= fillers:
                     results[name]['files'].append(dict(turn=index, **score_file(
@@ -196,11 +214,16 @@ def summarize(block):
             'final_honored_by_context': scores_by_context(b['final'] for b in bots if b['final']),
             'filler_honored_by_context': scores_by_context(f for b in bots for f in b['files']),
             'history_used_any_turn': f"{sum(1 for b in bots if b['history_calls'])}/{len(block['bots'])}",
+            'note_written_any_turn': f"{sum(1 for b in bots if b.get('note_calls'))}/{len(block['bots'])}",
+            'compactions': sorted(len(b.get('compactions', [])) for b in bots),
             'final_missing_file': sum(1 for h in finals if h is None),
             'history_used_in_final': f"{sum(1 for b in bots if b['history_calls_final'])}/{len(block['bots'])}",
             'omitted_turns_after_final': sorted(b['omitted_turns_after_final'] for b in bots),
             'files_honored_by_turn': {t: f'{sum(1 for h in hs if h)}/{len(hs)}' for t, hs in sorted(per_turn.items())},
             'tokens_in_out': [sum(b['input_tokens'] for b in bots), sum(b['output_tokens'] for b in bots)],
+            'compaction_tokens_in_out': [sum(b.get('compaction_input_tokens', 0) for b in bots),
+                                         sum(b.get('compaction_output_tokens', 0) for b in bots)],
+            'compaction_cached_input_tokens': sum(b.get('compaction_cached_input_tokens', 0) for b in bots),
             'wall_s': block['wall_s']}
 
 
@@ -215,6 +238,10 @@ def main():
                         help='context bytes for the omitted condition (default 16384); models whose items are '
                              'small need less for the rule to leave the window')
     parser.add_argument('--binary', type=Path, default=Path('.local/target/release/agent'))
+    parser.add_argument('--tools', default='shell,read,write,edit,history',
+                        help='the bots\' tool selection; add note to offer the carry-forward note')
+    parser.add_argument('--compaction', action='store_true', help='create bots with the CLI default compaction text')
+    parser.add_argument('--compact-at', type=int, default=None, help='daemon compaction threshold, percent of the context budget')
     args = parser.parse_args()
     if args.bots < 1 or args.fillers < 0:
         parser.error('--bots must be positive and --fillers nonnegative')
@@ -226,7 +253,8 @@ def main():
     blocks = []
     for condition in args.conditions:
         block = run_condition(args.binary.resolve(), provider, family, url, key_env, env, model, condition,
-                              args.bots, args.fillers, out_dir, args.omitted_bytes)
+                              args.bots, args.fillers, out_dir, args.omitted_bytes, args.tools,
+                              args.compaction, args.compact_at)
         blocks.append(block)
         print(json.dumps(summarize(block)), flush=True)
         args.out.write_text(json.dumps({'binary_sha256': file_hash(args.binary),

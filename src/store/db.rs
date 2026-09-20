@@ -47,6 +47,14 @@ pub struct Bot {
     /// The creator's captured identity, validated by the store. A later bot
     /// reusing the name is not mistaken for it. `None` for a root bot.
     pub created_by_id: Option<i64>,
+    /// The node of the bot's current carry-forward note, if it wrote one.
+    pub note: Option<i64>,
+    /// The node of the bot's current compaction, if any, and the client's
+    /// compaction instructions and summarizer model; without instructions
+    /// the bot never compacts.
+    pub compaction: Option<i64>,
+    pub compaction_instructions: Option<String>,
+    pub compaction_model: Option<String>,
 }
 impl Bot {
     pub fn family(&self) -> Result<Family> {
@@ -76,6 +84,10 @@ pub struct Binding<'a> {
     pub tools: &'a [String],
     pub created_by: Option<&'a str>,
     pub created_by_id: Option<i64>,
+    /// Compaction instructions and an optional summarizer model, both the
+    /// client's; with no instructions the bot never compacts.
+    pub compaction_instructions: Option<&'a str>,
+    pub compaction_model: Option<&'a str>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -168,6 +180,9 @@ pub struct Waiting {
     pub call_attempts: u32,
     #[serde(default)]
     pub call_spent_ms: u64,
+    /// Which model call to resume; ordinary calls bypass compaction once.
+    #[serde(default)]
+    pub compaction: bool,
 }
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
@@ -186,6 +201,32 @@ pub struct Window {
     pub item_bytes: i64,
     pub omitted_items: i64,
     pub omitted_turns: i64,
+    /// The bot's carry-forward note: its version node and text.
+    pub note: Option<(i64, String)>,
+    /// The bot's current compaction, if any.
+    pub compaction: Option<CompactionView>,
+}
+/// What a compaction left in place of the turns it covered.
+#[derive(Debug, Clone)]
+pub struct CompactionView {
+    pub version: i64,
+    pub summary: String,
+    /// The covered turns' user prompts, verbatim within bounds: ordinal and text.
+    pub prompts: Vec<(i64, String)>,
+    pub covered: (i64, i64),
+}
+/// What a compaction has to summarize, chosen at a turn boundary.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    /// The prompt node the verbatim tail starts at: the new context start.
+    pub cut: i64,
+    /// The nodes to summarize, oldest first.
+    pub ids: Vec<i64>,
+    pub sizes: Vec<u32>,
+    /// The covered turns' user prompts, bounded, oldest first.
+    pub prompts: Vec<(i64, String)>,
+    pub covered: (i64, i64),
+    pub previous_summary: Option<String>,
 }
 /// Where and with which model a turn runs.
 pub struct TurnContext {
@@ -236,7 +277,12 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 23;
+    pub const SCHEMA: i32 = 25;
+    /// Verbatim user prompts a compaction keeps: per-prompt text, and the
+    /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
+    /// space too, so the retained list cannot grow with conversation length.
+    pub const COMPACTION_PROMPT_BYTES: usize = 2048;
+    pub const COMPACTION_PROMPTS_BYTES: usize = 16 * 1024;
     /// Turns per retention piece: a delete or explicit prune of a large bot
     /// runs as a series of jobs this size, so other bots' work interleaves.
     /// Small, because every job of a turn in flight can land behind one
@@ -291,6 +337,15 @@ impl Database {
                 turn INTEGER, turn_seq INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS notes_previous ON notes(previous);
+            CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
+                summary TEXT NOT NULL, prompts TEXT NOT NULL,
+                covered_from INTEGER NOT NULL, covered_to INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS compactions_previous ON compactions(previous);
+            CREATE INDEX IF NOT EXISTS compactions_cut ON compactions(cut);
             CREATE TABLE IF NOT EXISTS node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO node_sequence VALUES (1,0);
@@ -306,8 +361,13 @@ impl Database {
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT,
-                created_by_id INTEGER);
+                created_by_id INTEGER,
+                note INTEGER REFERENCES notes(node),
+                compaction INTEGER REFERENCES compactions(node),
+                compaction_instructions TEXT, compaction_model TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
+            CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
+            CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
@@ -502,9 +562,13 @@ impl Database {
             id: r.get(15)?,
             created_by: r.get(16)?,
             created_by_id: r.get(17)?,
+            note: r.get(18)?,
+            compaction: r.get(19)?,
+            compaction_instructions: r.get(20)?,
+            compaction_model: r.get(21)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -598,7 +662,7 @@ impl Database {
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -611,7 +675,9 @@ impl Database {
                 binding.budget_tokens.map(|b| b as i64),
                 binding.tools.join(","),
                 binding.created_by,
-                created_by_id
+                created_by_id,
+                binding.compaction_instructions,
+                binding.compaction_model
             ],
         )?;
         // The event carries the list record's fields, so a follower can
@@ -782,6 +848,13 @@ impl Database {
             sizes.push((total - previous).clamp(0, u32::MAX as i64) as u32);
             previous = total;
         }
+        let note: Option<(i64, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT n.node,n.text FROM bots b JOIN notes n ON n.node=b.note WHERE b.name=?",
+            )?
+            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
         Ok(Some(Window {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
             ids,
@@ -789,7 +862,248 @@ impl Database {
             item_bytes: head_total - before,
             omitted_items: start_depth - 1,
             omitted_turns: turn_seq - 1,
+            note,
+            compaction: self.compaction_view(name)?,
         }))
+    }
+    fn compaction_view(&self, name: &str) -> Result<Option<CompactionView>> {
+        let row: Option<(i64, String, String, i64, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT c.node,c.summary,c.prompts,c.covered_from,c.covered_to
+                 FROM bots b JOIN compactions c ON c.node=b.compaction WHERE b.name=?",
+            )?
+            .query_row([name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .optional()?;
+        Ok(match row {
+            Some((version, summary, prompts, from, to)) => Some(CompactionView {
+                version,
+                summary,
+                prompts: serde_json::from_str(&prompts)?,
+                covered: (from, to),
+            }),
+            None => None,
+        })
+    }
+    /// Bytes the next request's window would carry: from the saved start to
+    /// the head, without building the window. One row read.
+    pub fn window_bytes(&self, name: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT COALESCE(h.total_bytes,0)-COALESCE(p.total_bytes,0)
+                 FROM bots b LEFT JOIN nodes h ON h.id=b.head
+                 LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+                 WHERE b.name=?",
+            )?
+            .query_row([name], |r| r.get(0))?)
+    }
+    /// Choose what a compaction covers: walk back from the head over the
+    /// span since the previous compaction, keep the newest whole turns that
+    /// hold at least `keep_bytes` verbatim, and summarize everything older,
+    /// back to the previous cut. Returns nothing when no whole older turn
+    /// exists to summarize.
+    pub fn compaction_plan(
+        &self,
+        name: &str,
+        keep_bytes: i64,
+        max_bytes: i64,
+        max_items: i64,
+    ) -> Result<Option<CompactionPlan>> {
+        let bot = self.inspect(name)?;
+        let Some(head) = bot.head else {
+            return Ok(None);
+        };
+        // A resumed model call must not summarize again at the same head.
+        if bot.compaction == Some(head) {
+            return Ok(None);
+        }
+        // Constant-count indexed reads reject a backlog before the recursive
+        // walk allocates rows or occupies the shared storage worker.
+        let (previous_cut, bytes, count): (i64, i64, i64) = self
+            .conn
+            .prepare_cached(
+                "SELECT COALESCE(c.cut,-1),h.total_bytes-COALESCE(p.total_bytes,0),
+                    h.depth-COALESCE(p.depth,0)
+             FROM nodes h LEFT JOIN compactions c ON c.node=?2
+             LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
+             WHERE h.id=?1",
+            )?
+            .query_row(params![head, bot.compaction], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        if bytes > max_bytes || count > max_items {
+            return fail_with(
+                "compaction_span_limit",
+                "unsummarized span exceeds the configured context budget; original history remains available",
+            );
+        }
+        // A source bot's turn records may be deleted while its nodes survive
+        // in a fork. Decode only prompt nodes, outside the metadata-only walk,
+        // and return bounded text rather than whole native items to Rust.
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq) AS (
+                SELECT id,parent,total_bytes,turn_seq FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.total_bytes,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
+                WHERE c.id IS NOT ?2)
+             SELECT c.id,c.total_bytes,COALESCE(p.total_bytes,0),c.turn_seq,
+                CASE WHEN c.turn_seq IS NOT NULL THEN
+                    (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?3)
+                     FROM nodes WHERE id=c.id) END
+             FROM chain c LEFT JOIN nodes p ON p.id=c.parent ORDER BY c.id DESC",
+        )?;
+        // Newest first: id, own total, parent's total, ordinal, prompt.
+        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>);
+        let rows: Vec<SpanRow> = statement
+            .query_map(
+                params![head, previous_cut, Self::COMPACTION_PROMPT_BYTES as i64 + 1],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let head_total = rows.first().map(|r| r.1).unwrap_or(0);
+        // The newest prompt whose tail holds keep_bytes.
+        let mut cut = None;
+        for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
+            if seq.is_some() && head_total - before >= keep_bytes {
+                cut = Some((index, *id));
+                break;
+            }
+        }
+        let Some((cut_index, cut)) = cut else {
+            return Ok(None);
+        };
+        // Everything older than the cut, back to and including the previous cut.
+        let older = &rows[cut_index + 1..];
+        if !older.iter().any(|r| r.3.is_some()) {
+            return Ok(None);
+        }
+        let mut ids = Vec::with_capacity(older.len());
+        let mut sizes = Vec::with_capacity(older.len());
+        let mut prompts = Vec::new();
+        let (mut from, mut to) = (i64::MAX, 0);
+        for (id, total, before, seq, prompt) in older.iter().rev() {
+            ids.push(*id);
+            sizes.push((total - before).clamp(0, u32::MAX as i64) as u32);
+            if let (Some(seq), Some(prompt)) = (seq, prompt) {
+                from = from.min(*seq);
+                to = to.max(*seq);
+                prompts.push((*seq, bounded_prompt(prompt, Self::COMPACTION_PROMPT_BYTES)));
+            }
+        }
+        bound_prompts(&mut prompts);
+        let previous_summary: Option<String> = match bot.compaction {
+            Some(node) => self
+                .conn
+                .prepare_cached("SELECT summary FROM compactions WHERE node=?")?
+                .query_row([node], |r| r.get(0))
+                .optional()?,
+            None => None,
+        };
+        Ok(Some(CompactionPlan {
+            cut,
+            ids,
+            sizes,
+            prompts,
+            covered: (from, to),
+            previous_summary,
+        }))
+    }
+    /// Record a compaction at the current head. The separate cut marks the
+    /// context start; branches may independently summarize the same cut.
+    /// One transaction, published like any event.
+    pub fn compact(
+        &mut self,
+        name: &str,
+        plan: &CompactionPlan,
+        summary: &str,
+        usage: Option<&Usage>,
+    ) -> Result<Value> {
+        let bot = self.inspect(name)?;
+        // A compaction stands for everything since the first: the summary
+        // merged the previous one, and the kept prompts carry over, bounded.
+        let (mut prompts, mut covered_from) = (Vec::new(), plan.covered.0);
+        if let Some(previous) = bot.compaction {
+            let (kept, from): (String, i64) = self
+                .conn
+                .prepare_cached("SELECT prompts,covered_from FROM compactions WHERE node=?")?
+                .query_row([previous], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            prompts = serde_json::from_str::<Vec<(i64, String)>>(&kept)?;
+            covered_from = from;
+        }
+        prompts.extend(plan.prompts.iter().cloned());
+        bound_prompts(&mut prompts);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to) VALUES (?,?,?,?,?,?,?)",
+            params![
+                bot.head,
+                bot.compaction,
+                plan.cut,
+                summary,
+                serde_json::to_string(&prompts)?,
+                covered_from,
+                plan.covered.1
+            ],
+        )?;
+        tx.execute(
+            "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
+            params![bot.head, plan.cut, name],
+        )?;
+        let data = json!({"version":bot.head,"cut":plan.cut,"previous":bot.compaction,"covered_turns":[covered_from, plan.covered.1],
+            "span_turns":[plan.covered.0, plan.covered.1],
+            "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
+            "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>()});
+        // Successful summaries and their accounting share one fsync/commit.
+        if let Some(turn) = bot.running_turn {
+            if let Some(usage) = usage {
+                record_usage_for(&tx, name, turn, usage, Some("compaction"))?;
+            }
+            tx.execute(
+                "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
+                [turn],
+            )?;
+        }
+        let cursor = event(&tx, name, bot.running_turn, "compacted", data.clone())?;
+        tx.commit()?;
+        Ok(entry(cursor, name, bot.running_turn, "compacted", data))
+    }
+    /// The turns a window omits, newest first, at most `limit`: each turn's
+    /// ordinal along the lineage and how its prompt began. Walks back from
+    /// the window's start over those turns' nodes only; a turn's prompt node
+    /// is the one that carries an ordinal, so the walk stops expanding at the
+    /// prompt below the oldest listed turn.
+    pub fn omitted_turns(&self, start: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,turn_seq) AS (
+                SELECT n.id,n.parent,n.turn_seq FROM nodes s JOIN nodes n ON n.id=s.parent WHERE s.id=?1
+                UNION ALL SELECT n.id,n.parent,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
+                WHERE c.turn_seq IS NULL OR c.turn_seq>?2)
+             SELECT c.turn_seq,
+                (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,400)
+                 FROM nodes WHERE id=c.id) FROM chain c
+             WHERE c.turn_seq>?2 ORDER BY c.turn_seq DESC",
+        )?;
+        let seq: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT turn_seq FROM nodes WHERE id=?")?
+            .query_row([start], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let Some(seq) = seq else {
+            return Ok(Vec::new());
+        };
+        let floor = (seq - 1 - limit as i64).max(0);
+        let rows = statement.query_map(params![start, floor], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (ordinal, prompt) = row?;
+            out.push((ordinal, first_line(&prompt, 120)));
+        }
+        Ok(out)
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
     pub fn items_by_ids(&self, ids: &[i64]) -> Result<Vec<u8>> {
@@ -1460,6 +1774,20 @@ impl Database {
         tx.commit()?;
         Ok(entry)
     }
+    /// Charge a summarizer response without adding it to the transcript.
+    pub fn compaction_usage(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
+        let bot = self.active(turn)?;
+        let tx = self.conn.transaction()?;
+        if let Some(usage) = usage {
+            record_usage_for(&tx, &bot.name, turn, usage, Some("compaction"))?;
+        }
+        tx.execute(
+            "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
+            [turn],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
         let bot = self.active(turn)?;
         let tx = self.conn.transaction()?;
@@ -1504,8 +1832,21 @@ impl Database {
             "UPDATE bots SET head=? WHERE name=?",
             params![head, bot.name],
         )?;
+        if let Some(text) = &outcome.note {
+            // The result's node is the note's version: on this lineage by
+            // construction, so a fork binds to it by position.
+            tx.execute(
+                "INSERT INTO notes(node,previous,text) VALUES (?,?,?)",
+                params![head, bot.note, text],
+            )?;
+            tx.execute(
+                "UPDATE bots SET note=? WHERE name=?",
+                params![head, bot.name],
+            )?;
+        }
         let artifacts: Vec<&str> = outcome.artifacts.iter().map(|(s, _)| *s).collect();
-        let data = json!({"call_id":call_id,"node":head,"artifacts":artifacts});
+        let data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
+            "note":outcome.note.as_ref().map(|_| head)});
         let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
         tx.commit()?;
         Ok((
@@ -1671,6 +2012,7 @@ impl Database {
             paced_since_ms: None,
             call_attempts: 0,
             call_spent_ms: 0,
+            compaction: false,
         };
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1686,6 +2028,7 @@ impl Database {
     /// Park a running turn at its model-call boundary until `resume_at_ms`,
     /// because its provider's pool is closed by a rate limit. It holds no
     /// task and no slot until then; retries stay in the turn row.
+    #[allow(clippy::too_many_arguments)]
     pub fn suspend_paced(
         &mut self,
         turn: i64,
@@ -1694,6 +2037,7 @@ impl Database {
         call_spent_ms: u64,
         retries: u64,
         paced_ms: u64,
+        compaction: bool,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -1710,6 +2054,7 @@ impl Database {
             paced_since_ms: Some(epoch_ms()),
             call_attempts,
             call_spent_ms,
+            compaction,
         };
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1995,7 +2340,7 @@ impl Database {
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2009,11 +2354,38 @@ impl Database {
                 budget_tokens.map(|b| b as i64),
                 parent.tools.join(","),
                 created_by,
-                created_by_id
+                created_by_id,
+                parent.compaction_instructions,
+                parent.compaction_model
             ],
         )?;
         if let Some(node) = checkpoint {
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
+            // The newest note version at or before the checkpoint, along
+            // the source's version chain; ids grow along a lineage.
+            let mut version = parent.note;
+            while let Some(node_id) = version.filter(|v| *v > node) {
+                version =
+                    tx.query_row("SELECT previous FROM notes WHERE node=?", [node_id], |r| {
+                        r.get(0)
+                    })?;
+            }
+            tx.execute(
+                "UPDATE bots SET note=? WHERE name=?",
+                params![version, name],
+            )?;
+            let mut version = parent.compaction;
+            while let Some(node_id) = version.filter(|v| *v > node) {
+                version = tx.query_row(
+                    "SELECT previous FROM compactions WHERE node=?",
+                    [node_id],
+                    |r| r.get(0),
+                )?;
+            }
+            tx.execute(
+                "UPDATE bots SET compaction=?1,context_start=(SELECT cut FROM compactions WHERE node=?1) WHERE name=?2",
+                params![version, name],
+            )?;
         }
         let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,
@@ -2168,7 +2540,7 @@ impl Database {
             // any piece commits. RETURNING shares the existing indexed lookup
             // with the global watermark, without another query per piece.
             let pruned: i64 = tx.query_row(
-                "UPDATE bots SET status='deleting',context_start=NULL,
+                "UPDATE bots SET status='deleting',context_start=NULL,note=NULL,compaction=NULL,
                     pruned_cursor=MAX(pruned_cursor,
                         COALESCE((SELECT MAX(id) FROM events WHERE bot=?1),0))
                  WHERE name=?1 RETURNING pruned_cursor",
@@ -2228,8 +2600,10 @@ impl Database {
                 return Ok(out);
             }
             let referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1))
-                    OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)",
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR note=?1 OR compaction=?1))
+                    OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)
+                    OR EXISTS(SELECT 1 FROM notes WHERE previous=?1)
+                    OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)",
                 params![id, name],
                 |r| r.get(0),
             )?;
@@ -2239,6 +2613,8 @@ impl Database {
             let parent: Option<i64> =
                 tx.query_row("SELECT parent FROM nodes WHERE id=?", [id], |r| r.get(0))?;
             tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
+            tx.execute("DELETE FROM notes WHERE node=?", [id])?;
+            tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
@@ -2772,7 +3148,19 @@ fn assistant_text(item: &Value) -> String {
 }
 
 fn record_usage(conn: &Connection, bot: &str, turn: i64, usage: &Usage) -> Result<Value> {
-    let data = serde_json::to_value(usage)?;
+    record_usage_for(conn, bot, turn, usage, None)
+}
+fn record_usage_for(
+    conn: &Connection,
+    bot: &str,
+    turn: i64,
+    usage: &Usage,
+    purpose: Option<&str>,
+) -> Result<Value> {
+    let mut data = serde_json::to_value(usage)?;
+    if let Some(purpose) = purpose {
+        data["purpose"] = json!(purpose);
+    }
     let cursor = event(conn, bot, Some(turn), "usage", data.clone())?;
     conn.execute(
         "UPDATE turns SET input_tokens=input_tokens+?,output_tokens=output_tokens+?,
@@ -3078,13 +3466,10 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             )?;
         }
     }
-    // 21 -> 22: who created a bot, as its creating client declared. 22 -> 23:
-    // that creator's identity then. Earlier bots have no record of either
-    // and stay unattributed.
-    for (version, column, kind) in [(22, "created_by", "TEXT"), (23, "created_by_id", "INTEGER")] {
-        if from >= version {
-            continue;
-        }
+    // Version 25 joins the independently published lineage (22/23) and
+    // compaction (22/23/24) schemas. Inspect columns once during migration
+    // so either branch retains its data and receives only the missing fields.
+    for (column, kind) in [("created_by", "TEXT"), ("created_by_id", "INTEGER")] {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name=?)",
             [column],
@@ -3095,7 +3480,101 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
+    {
+        // 21 -> 22: carry-forward notes, versioned by the node of the tool
+        // result that wrote them. Added only when missing.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='note')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                    previous INTEGER REFERENCES notes(node), text TEXT NOT NULL);
+                 ALTER TABLE bots ADD COLUMN note INTEGER REFERENCES notes(node);",
+            )?;
+        }
+    }
+
+    {
+        // 22 -> 23: compaction, versioned by the cut node, with the client's
+        // instructions and summarizer per bot. Added only when missing.
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='compaction')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                    previous INTEGER REFERENCES compactions(node), summary TEXT NOT NULL, prompts TEXT NOT NULL,
+                    covered_from INTEGER NOT NULL, covered_to INTEGER NOT NULL);
+                 ALTER TABLE bots ADD COLUMN compaction INTEGER REFERENCES compactions(node);
+                 ALTER TABLE bots ADD COLUMN compaction_instructions TEXT;
+                 ALTER TABLE bots ADD COLUMN compaction_model TEXT;",
+            )?;
+        }
+    }
+
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('compactions') WHERE name='cut')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "ALTER TABLE compactions ADD COLUMN cut INTEGER REFERENCES nodes(id);
+             UPDATE compactions SET cut=node;",
+        )?;
+    }
+
     Ok(())
+}
+/// Keep the oldest and newest excerpts within the text/metadata budget.
+/// Locate the same middle range that repeated removals would discard, then
+/// drain once: trimming a large batch moves the retained suffix only once.
+fn bound_prompts(prompts: &mut Vec<(i64, String)>) {
+    let cost = |prompt: &(i64, String)| std::mem::size_of::<(i64, String)>() + prompt.1.len();
+    let mut total: usize = prompts.iter().map(cost).sum();
+    let (mut left, mut right) = (prompts.len() / 2, prompts.len() / 2);
+    while total > Database::COMPACTION_PROMPTS_BYTES && prompts.len() - (right - left) > 2 {
+        let middle = (prompts.len() - (right - left)) / 2;
+        let removed = if middle < left {
+            left -= 1;
+            left
+        } else {
+            right += 1;
+            right - 1
+        };
+        total -= cost(&prompts[removed]);
+    }
+    prompts.drain(left..right);
+}
+
+/// A prompt kept verbatim by a compaction, cut to `limit` bytes at a
+/// character boundary with an ellipsis when anything was left out.
+fn bounded_prompt(prompt: &str, limit: usize) -> String {
+    if prompt.len() <= limit {
+        return prompt.to_owned();
+    }
+    let mut end = limit;
+    while !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &prompt[..end])
+}
+/// The first line of a prompt, cut to `limit` bytes at a character boundary,
+/// with an ellipsis when anything was left out.
+fn first_line(prompt: &str, limit: usize) -> String {
+    let line = prompt.lines().next().unwrap_or("").trim();
+    if line.len() <= limit && prompt.lines().nth(1).is_none() {
+        return line.to_owned();
+    }
+    let mut end = limit.min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", line[..end].trim_end())
 }
 /// Allocate the next bot identity inside the caller's transaction.
 fn identity(conn: &Connection) -> Result<i64> {

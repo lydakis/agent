@@ -189,6 +189,19 @@ class SocketAndCliTests(ModelFixture):
         listed = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
         self.assertEqual([b['model'] for b in listed if b['name'] == 'Env'], ['synthetic-model'])
 
+    def test_new_bots_get_the_cli_compaction_text_unless_declined(self):
+        env = dict(clean_env(), AGENT_MODEL='openai/synthetic-model')
+        for bot, extra in (('Default', ()), ('Declined', ('--no-compaction',)), ('Own', ('--compaction-instructions', 'Keep it short.'))):
+            run = subprocess.run([*self.base, 'run', '--store', str(self.store), '--provider',
+                                  f'openai=responses,{self.url}', '--tools', 'echo', '--new', '--bot', bot, *extra,
+                                  '--detach', 'hello'], env=env, capture_output=True, text=True, cwd=self.path)
+            self.assertEqual(run.returncode, 0, run.stderr)
+        with sqlite3.connect(self.store) as db:
+            rows = dict(db.execute('SELECT name, compaction_instructions FROM bots'))
+        self.assertTrue(rows['Default'].startswith('You are summarizing'))
+        self.assertIsNone(rows['Declined'])
+        self.assertEqual(rows['Own'], 'Keep it short.')
+
     def test_run_refuses_a_stale_bot_identity(self):
         env = dict(clean_env(), AGENT_MODEL='openai/synthetic-model')
         created = subprocess.run([*self.base, 'run', '--store', str(self.store), '--provider',
@@ -244,6 +257,7 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--max-processes', '3'), '--max-processes'),
                              (('--max-pending', '5'), '--max-pending'),
+                             (('--note-turns', '5'), '--note-turns'),
                              (('--retain-turns', '2'), '--retain-turns')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)

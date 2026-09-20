@@ -12,6 +12,11 @@ from bench.runtime_client import Client
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class DeliveryTests(ModelFixture):
+    def tool_output(self, client, bot, call_id):
+        events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
+        node = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]['data']['node']
+        return client.request('item', bot=bot, node=node)['result']['output']
+
     def events(self, client, bot):
         return client.request('events', bot=bot, after=0, limit=256)['result']['events']
 
@@ -299,6 +304,138 @@ class DeliveryTests(ModelFixture):
         idle = client.request('submit', bot='Bob', request_id='s2', prompt='alone', delivery='steer')['result']
         self.assertEqual(idle['status'], 'running')
         self.assertEqual(client.finished(idle['turn'])['data']['status'], 'completed')
+
+    def test_compaction_fires_at_the_threshold_and_replaces_older_turns_with_a_summary(self):
+        client = self.client('echo,history', extra=('--context-bytes', '4096', '--compact-at', '50', '--compact-keep', '25'))
+        client.request('create', bot='Bob', workspace=str(self.path), compaction_instructions='Summarize the conversation.')
+        client.request('create', bot='Plain', workspace=str(self.path))
+        prompts = [f'Task {n}: ' + f'{n}' * 500 for n in range(1, 7)]
+        turns = {}
+        for bot in ('Bob', 'Plain'):
+            for n, prompt in enumerate(prompts):
+                turn = client.request('submit', bot=bot, request_id=str(n), prompt=prompt)['result']['turn']
+                self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                turns[(bot, n)] = turn
+        compacted = [e for e in self.events(client, 'Bob') if e['event'] == 'compacted']
+        self.assertGreaterEqual(len(compacted), 1)
+        first = compacted[0]['data']
+        self.assertEqual(first['covered_turns'][0], 1)
+        self.assertGreater(first['bytes'], 0)
+        self.assertEqual([e for e in self.events(client, 'Plain') if e['event'] == 'compacted'], [])
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        # The summarizer's own call: the client's instructions, no tools, the
+        # span's items, and the request to write, whose echo became the summary.
+        summarizer = [r for r in requests if r.get('instructions') == 'Summarize the conversation.']
+        self.assertGreaterEqual(len(summarizer), 1)
+        self.assertEqual(summarizer[0]['tools'], [])
+        self.assertTrue(summarizer[0]['input'][-1]['content'][0]['text'].startswith('[compaction request]'))
+        # Bob's later requests carry the summary and the covered prompts verbatim, ahead of the window.
+        later = [r for r in requests if r.get('instructions') != 'Summarize the conversation.'
+                 and any(i.get('role') == 'user' and i['content'][0]['text'].startswith('[compaction summary')
+                         for i in r['input'])]
+        self.assertGreaterEqual(len(later), 1)
+        text = [i for i in later[-1]['input'] if i.get('role') == 'user'
+                and i['content'][0]['text'].startswith('[compaction summary')][0]['content'][0]['text']
+        self.assertIn('reply:[compaction request]', text)
+        self.assertIn('User messages from those turns, verbatim:', text)
+        self.assertIn('\n1: Task 1: 111', text)
+        bob = client.request('resume', bot='Bob')['result']
+        # Later compactions stand for everything since the first: the newest
+        # version is the bot's, and its coverage still starts at turn 1.
+        self.assertEqual(bob['compaction'], compacted[-1]['data']['version'])
+        self.assertEqual(compacted[-1]['data']['covered_turns'][0], 1)
+        self.assertEqual(bob['compaction_instructions'], 'Summarize the conversation.')
+        # The transcript is intact: history reads a covered turn; a fork before
+        # the compaction has none; a fork at the head inherits it.
+        read = client.request('submit', bot='Bob', request_id='h', prompt='history:1')['result']['turn']
+        self.assertEqual(client.finished(read)['data']['status'], 'completed')
+        self.assertIn('Task 1: 111', self.tool_output(client, 'Bob', 'history-1'))
+        page = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        early = [e['data']['checkpoint'] for e in page if e['event'] == 'turn_finished' and e['turn'] == turns[('Bob', 0)]][0]
+        client.request('fork', source='Bob', checkpoint=early, bot='Early', workspace=str(self.path))
+        self.assertIsNone(client.request('resume', bot='Early')['result']['compaction'])
+        client.request('fork', source='Bob', bot='Late', workspace=str(self.path))
+        self.assertEqual(client.request('resume', bot='Late')['result']['compaction'],
+                         client.request('resume', bot='Bob')['result']['compaction'])
+        # A summarizer of another family is refused at creation; an unknown one too.
+        self.assertEqual(client.request('create', bot='Bad', workspace=str(self.path),
+                                        compaction_instructions='x', compaction_model='nobody/model')['error'],
+                         'provider_unavailable')
+
+    def test_carry_forward_note_is_pinned_versioned_and_inherited_by_forks(self):
+        client = self.client('echo,note')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:Rule: end every file with the marker.')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        completed = [e for e in self.events(client, 'Bob') if e['event'] == 'tool_completed'][-1]
+        version = completed['data']['note']
+        self.assertEqual(version, completed['data']['node'])
+        self.assertEqual(client.request('resume', bot='Bob')['result']['note'], version)
+        self.assertEqual(json.loads(client.request('item', bot='Bob', node=version)['result']['output']),
+                         {'bytes': 37, 'cleared': False})
+        # The next request carries the note ahead of the window, before the prompt.
+        second = client.request('submit', bot='Bob', request_id='2', prompt='hello')['result']['turn']
+        self.assertEqual(client.finished(second)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+        texts = [item['content'][0]['text'] for item in request['input'] if item.get('role') == 'user']
+        self.assertEqual(texts[0], f'[carry-forward note, version {version}]\nRule: end every file with the marker.')
+        self.assertEqual(texts[-1], 'hello')
+        checkpoint = client.request('resume', bot='Bob')['result']['head']
+        # A rewrite is a new version; a fork at the earlier checkpoint keeps the old one.
+        third = client.request('submit', bot='Bob', request_id='3', prompt='note:Rule v2.')['result']['turn']
+        client.finished(third)
+        later = client.request('resume', bot='Bob')['result']['note']
+        self.assertGreater(later, version)
+        client.request('fork', source='Bob', checkpoint=checkpoint, bot='Early', workspace=str(self.path))
+        self.assertEqual(client.request('resume', bot='Early')['result']['note'], version)
+        # Empty text clears it: the next request has no pinned note.
+        cleared = client.request('submit', bot='Bob', request_id='4', prompt='note:')['result']['turn']
+        client.finished(cleared)
+        after = client.request('submit', bot='Bob', request_id='5', prompt='again')['result']['turn']
+        client.finished(after)
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+        texts = [item['content'][0]['text'] for item in request['input'] if item.get('role') == 'user']
+        self.assertFalse(any(t.startswith('[carry-forward note') for t in texts))
+        # A bot without the tool cannot call it.
+        client.request('create', bot='Plain', workspace=str(self.path), tools=['echo'])
+        refused = client.request('submit', bot='Plain', request_id='1', prompt='note:x')['result']['turn']
+        self.assertEqual(client.finished(refused)['data']['status'], 'completed')
+        self.assertEqual(json.loads(self.tool_output(client, 'Plain', 'note-1'))['error'], 'tool_not_available')
+
+    def test_context_note_lists_how_omitted_turns_began(self):
+        prompts = [f'Task {n}: ' + f'{n}' * 700 for n in range(1, 8)]
+        for note_turns, listing in (('3', True), ('0', False)):
+            with self.subTest(note_turns=note_turns):
+                client = self.client(extra=('--context-bytes', '2048', '--note-turns', note_turns))
+                client.request('create', bot=f'Bob{note_turns}', workspace=str(self.path))
+                for n, prompt in enumerate(prompts):
+                    turn = client.request('submit', bot=f'Bob{note_turns}', request_id=str(n), prompt=prompt)['result']['turn']
+                    self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+                last = None
+                while not self.model.requests.empty():
+                    last = self.model.requests.get()
+                note = last['input'][0]['content'][0]['text']
+                self.assertTrue(note.startswith('[context note] '))
+                self.assertIn('Use the history tool', note)
+                if listing:
+                    lines = note.split('\n')
+                    self.assertTrue(lines[0].endswith('How they began, newest first:'))
+                    # The three newest omitted turns, each cut to its first 120 bytes.
+                    listed = [line.split(': ', 1) for line in lines[1:4]]
+                    ordinals = [int(o) for o, _ in listed]
+                    self.assertEqual(ordinals, sorted(ordinals, reverse=True))
+                    for ordinal, opening in listed:
+                        self.assertTrue(opening.startswith(f'Task {ordinal}: {ordinal * int(ordinal)}'[:20]), opening)
+                        self.assertTrue(opening.endswith('…'))
+                    self.assertTrue(lines[4].startswith(f'Turns 1 to {ordinals[-1] - 1} are older'))
+                else:
+                    self.assertNotIn('\n', note)
+                client.request('shutdown')
+                client.close()
 
     def test_steers_beyond_the_context_budget_stay_queued_and_run_as_their_own_turns(self):
         # 4 KiB of context keeps 3 KiB for the running turn; one 1.5 KiB steer fits at

@@ -97,7 +97,8 @@ limits below 1,024 bytes or two items are raised to those minimums.
 Providers are selected explicitly with `--provider`, or implied by which of the
 well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`)
 are set. No other credential discovery happens. `--no-spawn` refuses to start a
-daemon. Default tools are `shell,read,write,edit,wait,history`.
+daemon. Default tools are `shell,read,write,edit,wait,history`; `note`, the
+carry-forward note, is in the universe and chosen per bot.
 
 If concurrent clients race to start the daemon, losing `serve` processes exit
 75 for a store/socket ownership conflict. Their clients continue polling for
@@ -301,6 +302,9 @@ bound; the operating system is then the only limit.
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
+| `--note-turns` | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
+| `--compact-at` | Percent of `--context-bytes` the window may hold before a bot with compaction instructions compacts at its next round boundary. | 75 |
+| `--compact-keep` | Percent of `--context-bytes` kept verbatim, as whole newest turns, when it does. Must be below `--compact-at`. | 25 |
 | `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -491,7 +495,7 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","created_by":"Alice","created_by_id":42}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-4-1"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
@@ -948,8 +952,17 @@ window over the shared history.
 
 When turns are omitted, the request begins with one user item:
 `[context note] N earlier turn(s) with M messages are not shown. Use the
-history tool with a turn number from 1 to N to read any of them.` The note is
-part of the request, never stored. Turn numbers are ordinals along the lineage
+history tool with a turn number from 1 to N to read any of them.` followed,
+newest first, by the ordinal and the first line (up to 120 bytes) of each
+omitted turn's prompt, at most `--note-turns` of them (default 48, 0 lists
+none), and a line naming the older turns the list left out. The list is
+data, not an instruction: it lets the model see what it is missing and
+judge for itself whether a turn is worth reading. The note is
+part of the request, never stored; it changes only when the window's start
+moves, as the request prefix already does, so it costs the prompt cache
+nothing extra. It is built on the storage reader from the omitted turns'
+prompt nodes alone, so deleting the source bot does not remove a surviving
+fork's previews. Turn numbers are ordinals along the lineage
 (`turn_seq`, stored on each turn's first item and indexed), so a fork's numbering
 continues its source's. The `history` tool returns one turn's prompt, replies,
 tool calls, and results as provider JSONL with only the top-level
@@ -1145,6 +1158,94 @@ cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
 
+### Compaction
+
+A bot created with `compaction_instructions` compacts, and one without never
+does. At a round boundary, after steers are absorbed and before the next
+model call, when the window holds `--compact-at` percent of the context
+budget, the daemon summarizes everything older than the newest whole turns
+that hold `--compact-keep` percent verbatim. The summary is one model call
+under the bot's compaction instructions, with tool calls disabled, to the bot's own
+model or the `compaction_model` the client named at creation (same family;
+another family's items cannot be replayed to it). Its request carries the
+previous summary first, if any, so the summarizer merges rather than
+restarts, then the span's items as stored, then a request to write. The
+call is paced, retried, billed against the bot's budget, and counted as a
+model round like any other; if it parks on a closed pool, the turn parks.
+Anthropic summaries retain the bot's tool definitions because the span may
+contain native tool-use/result blocks, and set `tool_choice: {"type":"none"}`.
+The runtime borrows the already encoded tool selection. Responses summaries
+continue to send an empty tool list, which that family permits with historical
+calls. Stored history is not rewritten for summarization.
+The park record identifies the unfinished call as summary or ordinary model
+work. Resumption, including after restart, continues that call. Once a summary
+exhausts its retries, parking the following ordinary call does not restart the
+summary's retry budget; a later model round may attempt compaction again.
+Successful responses, including unusable empty or oversized summaries, are
+charged durably before continuing. Usage events identify `purpose: compaction`;
+`compaction_text_delta` and `compaction_thinking_delta` are separate from answer
+streams. Budget and round limits are checked again before the normal call.
+
+The result is recorded in one transaction: the summary, the covered turns'
+user prompts verbatim (each up to 2 KiB, with a 16 KiB budget for text plus
+entry metadata, the oldest and newest kept when there are more), and the cut, the prompt node the verbatim
+tail starts at, which becomes the context start. A compaction stands for
+everything since the first: its coverage starts at turn 1 and the kept
+prompts carry over. Its version is anchored to the head at which it was generated, separately
+from the cut: forks can summarize the same cut independently. A historical
+fork inherits the newest version at or before its checkpoint and restores
+that version's context start, preserving its cached prefix. Deleting a bot
+frees only versions on its exclusive suffix. Prompt excerpts and coverage come
+from the surviving history nodes, so forks can compact after their source is deleted.
+Schema 24 adds the separate cut;
+existing versions preserve their originally recorded anchors during migration. The
+transcript is untouched; `history` reads any covered turn. The `compacted`
+event carries the version, its coverage, and the sizes.
+
+Each retained `(ordinal, String)` entry consumes its in-memory metadata size
+even when its text is empty. Planning and merging use the same budget, so
+repeated empty submissions cannot grow the prefix without bound. On 64-bit
+targets this permits at most 512 empty entries; text reduces that count.
+Trimming drains one middle range, preserving the oldest and newest excerpts
+without repeatedly shifting the retained suffix. The budget is not a claim
+about exact JSON wire size or allocator overhead.
+
+The request begins with one user item `[compaction summary, version N,
+covering turns A to B]` with the summary and verbatim prompts, the
+carry-forward note if any, the omission notice, then the window from the cut.
+Stable summary and note blocks precede the changing omission notice; Anthropic
+gets explicit cache breakpoints on these blocks, alongside the existing system
+and automatic tail breakpoints (at most four in total). The summary prefix stays
+fixed until the next compaction; rewriting a carry-forward note or moving the
+window can still invalidate the later suffix. A summarizer failure leaves the
+context view unchanged, preserves any billable usage, is reported as a live
+`compaction_failed` notification, and the turn continues with the window
+as it is; the window's own overflow handling still bounds stored items.
+Before planning, indexed byte/item accounting rejects an unsummarized backlog
+larger than the configured context budget with `compaction_span_limit`, without
+walking or loading the transcript. The complete summarizer input is byte-bounded
+including its previous summary and request marker. Oversized summaries are
+rejected above a quarter of the byte budget or 64 KiB, whichever is smaller.
+These failures leave the bot usable and original history retrievable. Automatic
+catch-up through multiple bounded historical spans is not implemented; a backlog
+that exceeds the budget needs a larger configured budget to compact in one call. The
+CLI ships a default compaction text for new bots and `--no-compaction`,
+`--compaction-instructions`, `--compaction-instructions-file`, and
+`--compaction-model` to change it. The daemon holds no such text.
+
+`note` writes or replaces the bot's carry-forward note: up to 8 KiB of text
+the runtime places ahead of the conversation window in every request, so it
+stays in view when earlier turns leave the window. Empty text removes it.
+The note is recorded in the same commit as the tool's result and versioned
+by that result's node, so it belongs to the lineage like any item: a rewrite
+is a new version, a fork inherits the version that existed at its
+checkpoint, and deleting a bot frees only the versions on its exclusive
+suffix. The window shows it as one user item, `[carry-forward note, version
+N]` followed by the text, after the summary and before the context note
+and window's items, so it changes the request prefix only when the bot rewrites it. The
+daemon never writes a note itself and never tells the model to; whether
+the tool is offered is the client's choice at creation, like any tool.
+
 `read` returns numbered lines with `offset`/`limit` paging and a 64 KiB result
 bound including paging notices (files up to 4 MiB). If the first requested line
 cannot fit the page, it returns `read_line_too_long` with the line number; use a
@@ -1188,7 +1289,43 @@ coding-tool, TLS, or real-provider performance.
 The [durable feature screen](LIFECYCLE_MEASUREMENTS.md) measures actual service
 execution, including shell descendants, independently of the text-core screen.
 Very long histories and compaction are specified in [LONG_HISTORY.md](LONG_HISTORY.md);
-stored history is now unbounded with a per-request context window, and
-compaction with summaries is not implemented.
+stored history is unbounded with a per-request context window, and versioned
+summaries compact that window as described above.
 
 CLI syntax, option scope, output, and exit conventions: [CLI.md](CLI.md).
+
+### Compaction and prompt-cache reuse
+
+Compaction replaces part of the request, so it cannot preserve cache hits for
+all of the replaced prefix. The aim is to pay that cost once per compaction,
+then reuse the new prefix while turns append. Default thresholds remain 75%
+trigger / 25% retained tail; changing them is a quality/cost decision, not a
+free speed improvement. Keeping more tail also means reaching the next trigger
+sooner. Byte percentages are runtime bounds, not estimates of model tokens.
+
+The current request order is stable tools/instructions, summary, carry-forward
+note, omission notice, and verbatim tail. Ordinary requests do not rewrite the
+summary, attach timestamps/fullness counters, or invent a new version. Forks
+restore the inherited context start. Anthropic summary and note blocks get
+explicit cache write points; system and automatic tail caching remain enabled.
+Responses gateways retain their current wire format. OpenAI's newer explicit
+cache controls need provider/model capability handling before being enabled
+across compatible endpoints.
+
+The providers require identical cached prefixes, and a reusable prefix must
+also have been written at an eligible cache boundary. See the primary
+[OpenAI caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+and [Anthropic caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+(checked 2026-09-19). Structural prefix tests establish eligibility, not actual
+provider hits: minimum sizes, expiration, routing, and model capabilities still
+matter.
+
+The summarizer currently has different instructions and disables tool calls,
+so its request must not be assumed to reuse the agent's cache. Anthropic retains
+tool definitions but changes tool choice; Responses omits tool definitions.
+A future comparison could keep
+that prefix identical and append the summarization instruction, but must prevent
+tool execution and verify model compliance and provider cache invalidation rules.
+Measure agent calls and summarizer calls separately, then total input/output,
+cache reads/writes, latency, and objective task quality. The old evaluation lacks
+successful summarizer usage and cannot establish total compaction cost.

@@ -3249,3 +3249,435 @@ the corrected evaluator before claiming a compaction improvement.
 Captures: ignored `.local/context-eval/{luna,sonnet,sonnet-8k}.json`, with
 stores under `.local/context-eval/run/`; `sonnet.json` contains the initial
 16 KiB attempt and retained control.
+
+## The legible omission note
+
+2026-09-19. Item 32, slice two. The context note now lists the omitted turns,
+newest first up to `--note-turns` (default 48): each turn's ordinal and the
+first line of its prompt cut to 120 bytes. It is data in the request, not an
+instruction, and it changes only when the window's start moves, as the
+request prefix already does. Built on the storage reader from the omitted
+turns' prompt nodes alone; the listing costs about a kilobyte per request
+at this history length, and about 7% more input tokens over the run below.
+
+The evaluation of slice one, rerun on luna with the corrected evaluator,
+eight conversations per condition, 16 KiB window in `omitted`, twelve
+fillers, scored per file by the window's state before and after the turn:
+
+| Final file honoring the rule | Baseline, bare count | Listing note |
+| --- | ---: | ---: |
+| Rule retained throughout | 8/8 | 8/8 |
+| Rule omitted before the turn | 0/6 | 7/7 |
+| Rule left during the turn | 0/2 | 1/1 |
+| Filler files, rule omitted before the turn | 0/26 | 23/23 |
+| Conversations that called `history`, any turn | 0/8 | 4/8 |
+| Conversations that called `history` in the final turn | 0/8 | 3/8 |
+| Input tokens, `omitted` condition | 364 k | 389 k |
+
+Read per conversation: four of the eight read turn 1 through `history`
+after seeing it listed as "Workspace convention, in force for every task in
+this conversation from now on: every file you create must end with a…", and
+the preview stops before the marker, so those four went and got it. The
+other four never called `history` and honored the rule anyway; their windows
+still held earlier `write` calls carrying the marker, as the baseline's did,
+where nobody honored it. The listing changed behavior in both groups: told
+that a convention exists, the model acted on the examples in view or
+fetched the text. What it does not show is a model reading history without
+being able to see there is something to read; that was the baseline.
+
+The 32-agent socket echo screen, committed tree `3a9d9113…` against the
+slice binary `1a4dcd70…`, one excluded warmup and four measured runs each:
+RSS 18.12 (18.03–18.41) versus 18.07 (17.97–18.11) MiB, CPU 0.368
+(0.358–0.376) versus 0.365 (0.352–0.375) s, p95 597.6 (593.3–606.2) versus
+592.9 (590.0–595.9) ms. Level; the ordinary path omits nothing. Captures:
+ignored `.local/context-eval/luna-corrected.json` (baseline),
+`luna-note.json`, `.local/bench/slice-prev16-socket-32/`,
+`slice-note-socket-32/`.
+
+## The carry-forward note
+
+2026-09-19. Item 32, slice three. A `note` tool lets a bot write or replace
+up to 8 KiB of text that the runtime places ahead of the window in every
+request; it is recorded in the same commit as the tool result and versioned
+by that result's node, so forks inherit the version at their checkpoint and
+deletion frees only a bot's own versions. The daemon writes nothing itself
+and says nothing about the tool; the client decides whether to offer it.
+
+Offered to luna with no instruction about it, in the same evaluation as
+slice two (eight conversations, 16 KiB window, twelve fillers, `omitted`
+condition only), on top of the listing note:
+
+| | Listing note | Listing note and `note` tool offered |
+| --- | ---: | ---: |
+| Final file honoring the rule, rule omitted before the turn | 7/7 | 8/8 |
+| Filler files, rule omitted before the turn | 23/23 | 19/19 |
+| Conversations that called `history`, any turn | 4/8 | 5/8 |
+| Conversations that wrote a note, any turn | n/a | 0/8 |
+| Input tokens | 389 k | 414 k |
+
+The outcome is the listing note's; the tool changed nothing because the
+model never used it. Eight conversations, 112 turns, no call. Its schema
+cost about 6% more input tokens. That is the survey's finding reproduced
+here: a model-managed memory offered as a bare mechanism goes unused, and
+the harnesses that rely on one instruct the model to use it. Whether an
+instruction belongs in the client's default text is a client decision, and
+this measurement is the number it should be made against; the daemon
+mechanism is in place and tested either way.
+
+The 32-agent socket echo screen, committed tree `3a9d9113…` against the
+slice binary `383c133d…`: RSS 18.34 (18.19–18.56) versus 18.35
+(18.31–18.44) MiB, CPU 0.414 (0.394–0.435) versus 0.380 (0.355–0.386) s,
+p95 750.5 (613.6–1345.0) versus 616.9 (610.0–619.9) ms. The committed
+tree's runs were the noisy ones this time; the slice binary's ranges sit
+inside its earlier ones. Not a speedup. Captures: ignored
+`.local/context-eval/luna-note-tool.json`,
+`.local/bench/slice-prev17-socket-32/`, `slice-carry-socket-32/`.
+
+## Jev data points for compaction
+
+2026-09-19. Before Jev (TypeSafe's bounded-decision model, `POST
+/v1/systemone`) goes anywhere near the compaction design, three probes
+against today's evaluation transcripts, eight luna conversations of
+thirteen turns each, run from ignored `.local/jev/`. Each request carries
+the conversation's prompts and a batch of questions; every answer is a
+probability, and the ground truth is known by construction.
+
+**Relevance: which turns are load-bearing.** Turn 1 states the rule; turns
+2 to 12 are fillers. Three phrasings of the per-turn question, twelve
+questions per request:
+
+| Question | Rule turn, min / median | Fillers, max / median | Separated by one global cut |
+| --- | ---: | ---: | ---: |
+| "Will the agent need something stated in turn N that is not in any later turn?" | 0.38 / 0.47 | 0.45 / 0.18 | 6 of 8 |
+| "Does turn N state a rule, constraint, or preference that applies to tasks after it?" | 0.99 / 0.99 | 0.18 / 0.10 | 8 of 8 |
+| Score 0–2, "how much would later tasks depend on turn N if it were forgotten?" | 1.79 / 1.82 | 0.44 / 0.20 | 8 of 8 |
+
+The first phrasing is the honest failure: asked about dependence in the
+abstract it barely separates the rule from the fillers. Asked whether a
+turn states a standing constraint, or to grade dependence on a rubric, it
+separates them cleanly in every conversation with a wide margin. The
+question has to name the judgment a person would make in a second.
+
+**Validation: did a summary keep the rule.** Two hand-written summaries of
+the same conversation, one carrying the marker sentence and one without,
+each asked two questions:
+
+| Summary | "States the exact marker line" | "Preserves every requirement of the rule turn" |
+| --- | ---: | ---: |
+| Kept | 0.97 | 0.60 |
+| Dropped | 0.04 | 0.04 |
+
+The concrete check separates cleanly; the "every requirement" check is
+right in direction but soft on the positive, so validation questions should
+name the facts to look for, one per question, not ask for a blanket verdict.
+
+**Gating: is this a stable point.** A transcript stopped with a shell call
+pending scored 0.02 on "no tool call in progress and the current task
+complete"; the same transcript after the result and reply scored 0.97.
+
+**Cost.** Median latency 0.34–0.44 s per request end to end from this
+host; 1,500–1,970 input tokens for a twelve-question relevance batch and
+420–470 for a validation or gating question; input is billed and output is
+not, so a relevance batch costs about $0.0001 and a check about $0.00003.
+Sample sizes are eight conversations and one pair of summaries; this
+establishes that the judgments are answerable, not their error rate at
+fleet scale.
+
+## Compaction
+
+2026-09-19. Item 32, slice four. A bot created with compaction instructions
+compacts at a round boundary once its window holds `--compact-at` percent
+of the context budget: one summarizer call under the client's instructions
+over everything older than the newest whole turns holding `--compact-keep`
+percent verbatim, the previous summary merged in, the covered turns' user
+prompts kept verbatim within bounds, the result versioned by the cut node
+that becomes the context start. No instructions, no compaction.
+
+The evaluation, luna, eight conversations, 16 KiB window, twelve fillers,
+`omitted` condition, with the CLI's default compaction text and
+`--compact-at 50` so compaction fires several times inside that small
+window, against the two earlier runs on the same evaluator:
+
+| | Bare count | Listing note | Listing note and compaction |
+| --- | ---: | ---: | ---: |
+| Final file honoring the rule, rule omitted before the turn | 0/6 | 7/7 | 8/8 |
+| Filler files, rule omitted before the turn | 0/26 | 23/23 | 62/62 |
+| Conversations that called `history` | 0/8 | 4/8 | 0/8 |
+| Compactions per conversation | 0 | 0 | 3 to 7 |
+| Summaries carrying the marker line, of all written | n/a | n/a | 41/41 |
+| Normal-call input tokens, excluding summarizer | 364 k | 389 k | 419 k |
+| Normal-call prompt-cache hit rate, median (range) | 0.74 (0.69–0.85) | 0.75 (0.69–0.85) | 0.68 (0.60–0.75) |
+
+With compaction the rule never leaves the request: every summary the model
+wrote restated it verbatim, as the default text asks, and the covered
+prompts carry it a second time, so nobody had to read history. The recorded 419 k input tokens and 0.68 cache-hit ratio exclude successful
+summarizer calls because the original implementation did not persist their
+usage. They describe normal calls only. Total cost, summarizer cost, and the
+combined cache-hit ratio cannot be recovered from those aggregates. The corrected
+implementation charges all summarizer responses and labels their usage; a paid
+rerun is required for a complete comparison. A larger window should compact less
+often for the same appended workload, but the rate and quality need measurement.
+
+A summary from the run, covering turns 1 to 13 in 1.6 KB, opened with the
+goal, then "User stated: 'Workspace convention, in force for every task in
+this conversation from now on: every file you create must end with a final
+line that is exactly `# reviewed: CASTOR-42`…'", then done, in progress,
+blocked, decisions, and next steps.
+
+The 32-agent socket echo screen, committed tree `3a9d9113…` against the
+slice binary `de27c706…`, one excluded warmup and four measured runs each:
+RSS 18.22 (18.02–18.28) versus 18.47 (18.39–18.53) MiB, CPU 0.360
+(0.353–0.379) versus 0.371 (0.352–0.386) s, p95 591.3 (590.5–596.0) versus
+599.4 (591.2–611.1) ms. Level within noise; that screen's bots never reach
+a threshold, so the ordinary path pays one row read per round boundary for
+a bot with compaction instructions and nothing for one without. Captures:
+ignored `.local/context-eval/luna-compaction.json`,
+`.local/bench/slice-prev18-socket-32/`, `slice-compaction-socket-32/`.
+
+Not measured: a real 8 MiB window over a long task, the summarizer's
+latency at that size, Sonnet, and whether a summary ever drops something
+that mattered, which this evaluation cannot see since the marker is also in
+the verbatim prompts.
+
+### Compaction correctness and cache-prefix follow-up
+
+2026-09-19. The review fixes charge successful summarizer usage and model
+rounds, recheck the budget before the normal call, separate summarizer deltas
+from answer deltas, and separate a version's head anchor from its coverage cut.
+Forks can compact a shared cut independently and restore an inherited window
+start. Oversized unsummarized spans are rejected by indexed accounting before
+collecting their nodes; the original transcript remains available and the bot
+continues through its bounded window. This bounds the failure path; automatic
+catch-up through multiple historical spans is still open.
+
+Summaries and notes now precede the changing omission notice. Anthropic gets
+cache breakpoints on stable pinned blocks, and synthetic tests verify unchanged
+request prefixes across ordinary turns and forks. These establish structure,
+not live provider cache hits. See [cache design](RUST_PROTOTYPE.md#compaction-and-prompt-cache-reuse).
+
+Local Darwin arm64 synthetic screen: baseline binary `7f357ec8…`, fixed binary
+`eb322f9a…`; sixteen configured bots, sixty turns each, 500-byte filler prompts,
+no tools executed. One excluded warmup and four measured samples per binary,
+with order alternated. Below-threshold bots use an 8 MiB window; compacting bots
+use 8 KiB, a 50% trigger, and a 25% tail. Both binaries complete 960 turns and
+960 provider calls below threshold; with compaction both complete 960 turns,
+912 summaries, and 1,872 provider calls. This deliberately aggressive compaction
+rate tests overhead, not a recommended production setting.
+
+Medians (ranges):
+
+| Workload / binary | Daemon CPU, s | Peak daemon RSS, MiB | Turn p95, ms |
+| --- | ---: | ---: | ---: |
+| Below threshold / baseline | 2.410 (2.400–2.429) | 17.328 (17.281–17.469) | 38.976 (37.949–39.984) |
+| Below threshold / fixed | 2.433 (2.406–2.486) | 17.289 (17.078–17.375) | 39.380 (38.980–43.420) |
+| Compacting / baseline | 3.420 (3.405–3.461) | 19.344 (19.078–19.500) | 56.271 (55.541–62.147) |
+| Compacting / fixed | 3.473 (3.434–3.491) | 19.680 (19.500–19.797) | 57.562 (56.247–58.668) |
+
+The fixed path has about 1.5% higher median CPU and 0.34 MiB more peak memory
+while compacting; latency ranges overlap. Do not claim universal performance
+parity. Successful summary accounting shares its existing commit, avoiding an
+extra fsync, and compaction instructions are cloned only when a call is due.
+A follow-up experiment caching the accounting UPDATE statements did not show a
+clear overall win: compacting median RSS increased by 0.70 MiB versus its
+control and p95 by 2.68 ms. It was removed. The earlier shorter screen also
+remains in the captures rather than being substituted for the longer result.
+
+The observer and HTTP fixture run in a separate process from the measured
+daemon. RSS is sampled every 5 ms; CPU is process user+system time from before
+creation through the last turn; latency runs from submission through receipt of
+the terminal event. Startup, teardown, provider/observer CPU, actual cache reuse,
+large-window summarizer latency, and achieved simultaneous provider streams are
+outside this measurement. No paid calls. Captures and the local driver are
+ignored `.local/compaction-perf-before-statement-reuse.json`,
+`.local/compaction-perf-short.json`, `.local/compaction-perf.json` (the rejected
+statement-cache experiment), and `.local/compaction_perf_long.py`.
+
+Validation: 103 Rust tests and 61 Python CLI/delivery/context tests passed, plus
+strict Clippy. The statement-cache experiment was separately checked with all
+55 store tests and ten compaction/evaluator tests before measurement. The earlier
+paid evaluation's totals remain incomplete until rerun with corrected accounting.
+
+## Compaction retry resumption
+
+Local synthetic screen, 2026-09-19: the park record now identifies which
+model call is unfinished. An ordinary call resumes directly after a failed
+summary, including across daemon restart, instead of resetting compaction's
+retry budget. This adds one boolean to the existing park JSON and no database
+query or commit. Regression tests exhaust 64 summary attempts, force the
+ordinary call to park, and verify exactly one ordinary call follows. A separate
+test restarts during a summary's own park and verifies that summary resumes.
+
+Matched release binaries: baseline `eb322f9add2bb245491cfa003699420f8a585f34805c419e390652e827eb8ad5`,
+candidate `77bc3b27b35770c86c406fc5f113da342fe29b2818c38d0fc0e432dc5383a371`.
+Each sample runs 16 bots through 60 turns each against the same loopback
+Responses fixture: 960 calls below threshold, or 1,872 calls including 912
+summaries with the 8 KiB window and 50% trigger. Each comparison discards one
+warmup per binary and alternates four measured samples. The compaction repeat
+reverses the initial order. Daemon CPU excludes the fixture and observer;
+RSS is sampled every 5 ms; latency runs from submission to received completion.
+Actual simultaneous provider-stream count was not measured. These are local
+synthetic screens, not live-provider or fleet-capacity claims.
+
+| Screen | CPU seconds, baseline → candidate | Peak RSS MiB, baseline → candidate | p95 ms, baseline → candidate |
+| --- | ---: | ---: | ---: |
+| Below threshold | 2.444 → 2.443 | 17.352 → 17.344 | 39.709 → 39.206 |
+| Frequent compaction | 3.482 → 3.478 | 19.961 → 19.711 | 57.808 → 59.683 |
+| Compaction repeat | 3.458 → 3.478 | 19.914 → 19.531 | 58.153 → 58.990 |
+
+Values are medians. CPU was within 0.6% and RSS was slightly lower. Compaction
+p95 medians increased by 0.8–1.9 ms, with overlapping ranges: first comparison
+57.510–59.077 versus 56.685–62.143 ms, repeat 57.792–58.901 versus
+57.255–60.305 ms. This does not establish a speedup or strict tail-latency parity.
+Raw captures and the driver are ignored local files:
+`.local/compaction-park-perf.json`, `.local/compaction-park-perf-repeat.json`,
+and `.local/compaction_park_perf.py`.
+
+## Anthropic compaction tool definitions
+
+Local synthetic screen, 2026-09-19. Anthropic compaction now borrows the bot's
+already encoded tool definitions and explicitly disables new tool calls. This
+keeps historical tool-use/result blocks valid without rebuilding schemas or
+reading storage again. Definitions add required bytes to Anthropic summary
+requests; ordinary requests and Responses summaries keep their previous fields.
+The provider serializes the tool-choice control from a small typed value without
+constructing another JSON value tree. A regression fixture checks successful
+compaction of actual tool history, retained definitions, disabled summary tool
+calls, and ordinary tool execution. No paid provider calls were used.
+
+Baseline `77bc3b27b35770c86c406fc5f113da342fe29b2818c38d0fc0e432dc5383a371`,
+candidate `d01dd8ac04616d03b1ca517ddb28aa79e986b2983adaf89f8b93ba5b7c916deb`.
+The same methodology as the retry-resumption screen above: 16 bots, 60 turns
+each, one warmup then four alternating samples per binary/profile, daemon-only
+CPU and sampled RSS, and submission-to-received-completion p95. Responses uses
+960 calls below threshold and 1,872 calls with 912 summaries in the compaction
+profile. Anthropic's matched ordinary-call profile uses 960 calls with the same
+two tool definitions on both binaries. The broken baseline cannot complete
+Anthropic compaction under the required contract, so no speedup comparison is
+made for that path.
+
+| Screen | CPU seconds, baseline → candidate | Peak RSS MiB, baseline → candidate | p95 ms, baseline → candidate |
+| --- | ---: | ---: | ---: |
+| Responses, below threshold | 2.413 → 2.426 | 17.273 → 17.367 | 39.684 → 39.055 |
+| Responses, frequent compaction | 3.508 → 3.449 | 19.453 → 19.820 | 58.353 → 59.163 |
+| Anthropic, below threshold | 1.145 → 1.172 | 16.906 → 16.812 | 10.767 → 11.232 |
+
+Medians show small mixed changes, not an established speedup or strict parity.
+CPU differences range from -1.7% to +2.4%; peak RSS differences from -0.094 to
++0.367 MiB; p95 differences from -0.629 to +0.810 ms. Anthropic p95 ranges were
+10.298–10.990 ms for baseline and 11.086–11.286 ms for candidate, so this screen
+does not establish tail-latency non-regression. These local fixture measurements
+do not establish live-provider latency or prompt-cache hit rates.
+
+Captures and drivers remain ignored locally:
+`.local/anthropic-compaction-fix-perf.json`, `.local/anthropic-ordinary-fix-perf.json`,
+`.local/anthropic_compaction_fix_perf.py`, and `.local/anthropic_ordinary_fix_perf.py`.
+Validation: 104 Rust tests, 14 focused Python compaction/evaluator/Anthropic
+tests, strict Clippy, and diff checks passed.
+
+
+## Fork prompt retrieval after source deletion
+
+Local synthetic screen, 2026-09-19. Compaction prompt excerpts and omission
+previews now read the fork-retained prompt nodes, rather than operational turn
+rows removed when the source bot is deleted. The recursive walks carry metadata
+only; SQLite decodes prompt nodes only and returns bounded excerpts. No schema,
+per-turn write, or model-request changes are needed for intact source bots.
+
+Baseline `d01dd8ac04616d03b1ca517ddb28aa79e986b2983adaf89f8b93ba5b7c916deb`,
+candidate `b2f18bb4303b57189a0d95b3fbc43519100a72ed2bd94e50e5e4c91ebbfc1b78`.
+Same local Responses fixture and measurement boundaries as above: 16 bots,
+60 turns each, 500-character filler prompts, one warmup and four alternating
+samples per binary/profile. Daemon CPU, RSS sampled every 5 ms, and
+submission-to-received-completion p95. Both binaries complete the same 960
+ordinary calls, plus 912 summary calls in the compaction profile. Source bots
+remain present for the matched performance comparison; deletion correctness is
+verified separately because the baseline fails that contract.
+
+| Screen | CPU seconds, baseline → candidate | Peak RSS MiB, baseline → candidate | p95 ms, baseline → candidate |
+| --- | ---: | ---: | ---: |
+| Below threshold | 2.418 → 2.434 | 17.227 → 17.312 | 40.643 → 40.621 |
+| Frequent compaction | 3.502 → 3.461 | 19.742 → 19.102 | 58.061 → 60.409 |
+| Frequent compaction, repeat | 3.542 → 3.498 | 19.930 → 19.312 | 60.593 → 59.845 |
+
+Compaction CPU medians fell about 1.2% and sampled peak RSS medians by
+0.62–0.64 MiB in both runs. Tail latency changed direction: +2.35 ms initially,
+then -0.75 ms on repeat, with overlapping sample ranges. This supports a small
+memory improvement on this workload, not a latency speedup or proof of strict
+non-regression for other workloads or larger prompts. No paid provider calls or
+live cache measurements were used.
+
+Validation: 105 Rust tests, 14 focused Python tests, strict Clippy, formatting,
+and diff checks passed. The new store regression covers both wire families,
+source deletion, reopening, compaction coverage/excerpts, omission previews,
+escaped/Unicode/empty prompts, and untouched native history. The original
+end-to-end failure probe now completes with coverage 1–4 and all four excerpts.
+Ignored drivers/captures: `.local/fork_prompts_fix_perf.py`,
+`.local/fork_prompts_fix_perf_repeat.py`, `.local/fork-prompts-fix-perf.json`,
+and `.local/fork-prompts-fix-perf-repeat.json`.
+
+
+## Bounded compaction prompt metadata
+
+Local synthetic screen, 2026-09-19. The retained-prompt budget now charges
+text plus each `(ordinal, String)` entry's metadata during planning and merging.
+Empty prompts therefore consume budget. On this 64-bit host, a 1,800-turn
+runtime probe retained 397 entries at turn 400, then 512 at turns 800, 1,200,
+and 1,800, rather than accumulating every omitted prompt. Serialized prompt
+lists were 3,466, 4,501, 4,699, and 4,757 bytes respectively; ordinal digit
+counts explain the small growth after entry count plateaus. The budget is not
+an exact wire-size cap. Full original history remains retrievable.
+Trimming locates the middle interval and drains it once, replacing repeated
+suffix shifts with linear work. No schema change or additional store writes.
+
+Baseline `b2f18bb4303b57189a0d95b3fbc43519100a72ed2bd94e50e5e4c91ebbfc1b78`,
+candidate `6e9bb4d82dfabf663016d7374b9dbb9686b57b8ee03247861ab1237d4adf5105`.
+Matched screen: 16 bots × 60 turns, 100-character filler plus the turn label,
+one warmup then four alternating samples per binary/profile. Daemon-only CPU,
+RSS sampled every 5 ms, and submission-to-received-completion p95. Context is
+8 MiB below threshold or 4 KiB with compaction at 50%. Both builds retain all
+the same prompts on this workload; comparing a smaller retained prefix against
+a larger one would not establish equivalent-workload efficiency. The driver
+asserts equal normalized provider-request multisets, ignoring request arrival
+order and generated compaction version numbers. Both builds make 960 ordinary
+calls, plus 448 summaries in the compaction profile.
+
+| Screen | CPU seconds, baseline → candidate | Peak RSS MiB, baseline → candidate | p95 ms, baseline → candidate |
+| --- | ---: | ---: | ---: |
+| Below threshold | 1.643 → 1.648 | 16.133 → 16.156 | 24.315 → 24.242 |
+| Frequent compaction | 2.138 → 2.136 | 17.414 → 17.578 | 38.774 → 39.724 |
+
+CPU medians differed by less than 0.4%; compaction peak RSS rose 0.164 MiB and
+p95 rose 0.950 ms. This screen does not establish an overall speedup or strict
+tail-latency non-regression. The verified improvements are bounded retained
+metadata and linear trimming, without reducing content in the matched screen.
+No paid calls or live-cache claims. Validation: 106 Rust tests, 14 focused
+Python tests, strict Clippy, formatting, and diff checks passed. The new store
+regression exercises repeated planning/merging past the bound, retained oldest
+and newest excerpts, coverage, and original-history access.
+
+Ignored artifacts: `.local/prompt_metadata_fix_probe.py`,
+`.local/prompt_metadata_fix_perf.py`, `.local/prompt-metadata-fix-perf.json`,
+and `.local/prompt-metadata-fix-perf.log`.
+
+## Compaction cut foreign-key index
+
+Local synthetic SQLite screen, 2026-09-19. The query-plan audit exposed a
+`SCAN compactions` during node deletion because `compactions.cut` lacked an
+index. `compactions_cut` now supplies the foreign-key lookup, including on
+existing stores when opened. The audit also verifies that dropping this index
+restores the failure.
+
+Five alternating baseline/candidate samples used SQLite 3.47.1, the current
+schema, foreign keys enabled, 20,200 independent nodes, and 20,000 compaction
+records in an in-memory database. The only schema difference was this index.
+Median time for deleting 200 unreferenced nodes fell from 234.688 ms to
+1.126 ms. Inserting the 20,000 compactions rose from 44.336 ms to 55.102 ms;
+database page growth rose from 548,864 to 778,240 bytes. This establishes the
+lookup improvement and its write/storage tradeoff, not whole-runtime speedup
+or a disk-durability latency claim.
+
+Final validation: 106 Rust tests passed; the Python suite ran 188 tests with
+four skips and no failures. Strict Clippy, formatting, and diff checks passed.
+The schema-23 migration fixture removes the new index before simulating the
+old table layout. Ignored artifacts: `.local/compaction_cut_index_perf.py`
+and `.local/compaction-cut-index-perf.json`.
