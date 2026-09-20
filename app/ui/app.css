@@ -4,7 +4,8 @@
   --t-bg:#171a24; --t-panel:#1c202b; --t-raised:#232837; --t-line:#2e3444; --t-ink:#d6d9e3; --t-dim:#7b8194; --t-faint:#4a5062;
   --amber:#e5b567; --amber-ink:#1a1408;
   --run:#7fc47a; --wait:#e5b567; --pace:#c78ad6; --fail:#e07b7b; --idle:#5d6478; --user:#8fb8e8;
-  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  /* The machine's own monospace, as a terminal would use; nothing is fetched to draw the page. */
+  --mono:ui-monospace,"SF Mono",Menlo,"IBM Plex Mono","DejaVu Sans Mono",monospace;
 }
 html,body{height:100%;margin:0;background:var(--t-bg);color:var(--t-ink);font-family:var(--mono);font-size:13px;line-height:20px}
 *{box-sizing:border-box}

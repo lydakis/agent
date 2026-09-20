@@ -6,7 +6,6 @@ window.Daemon = (() => {
   const tauri = window.__TAURI__;
   if (tauri) {
     const { invoke } = tauri.core;
-    const { listen } = tauri.event;
     const log = (m) => invoke('log', { message: String(m) }).catch(() => {});
     window.addEventListener('error', (e) => log(`error: ${e.message} @${e.filename}:${e.lineno}`));
     window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason?.message ?? e.reason}`));
@@ -16,16 +15,16 @@ window.Daemon = (() => {
       setup: () => invoke('setup'),
       policy: () => invoke('policy'),
       attach: (after) => invoke('attach', { after }),
-      stream: () => invoke('stream'),
+      pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
-      onEvent: (cb) => listen('daemon', (e) => cb(e.payload)),
       close: () => tauri.window.getCurrentWindow().close(),
     };
   }
 
   // ---------- demo daemon ----------
-  const S = { bots: new Map(), nodes: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, listeners: [], timers: new Set() };
-  const emit = (event) => { if (event.durable !== false) event.cursor = ++S.cursor; for (const cb of S.listeners) cb(event); };
+  const S = { bots: new Map(), nodes: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set() };
+  // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
+  const emit = (event) => { if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
@@ -182,10 +181,15 @@ window.Daemon = (() => {
         setTimeout(() => reply('main', 'ship the login fix; split the work and wait for it'), 900);
       }
       setTimeout(() => emit({ event: 'follow_live', durable: false, cursor: S.cursor }), 0);
-      return { bots: [...S.bots.values()].map((b) => ({ ...b })) };
+      return { session: ++S.session };
+    },
+    pull: async () => {
+      if (!S.queue.length) await new Promise((resolve) => { S.waiter = resolve; });
+      return { events: S.queue.splice(0, 256), closed: false };
     },
     request: async (op, params = {}) => {
       switch (op) {
+        case 'bots': return { bots: [...S.bots.values()].map((b) => ({ ...b })), next_after: null };
         case 'item': { const item = S.nodes.get(params.node); if (!item) throw new Error('item_not_in_bot_history'); return item; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null); return { ...S.bots.get(params.bot) }; }
@@ -195,7 +199,6 @@ window.Daemon = (() => {
         default: throw new Error(`unsupported_in_demo:${op}`);
       }
     },
-    onEvent: (cb) => { S.listeners.push(cb); return () => { S.listeners = S.listeners.filter((x) => x !== cb); }; },
     close: () => { for (const t of S.timers) clearTimeout(t); },
   };
 })();

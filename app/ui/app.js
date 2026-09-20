@@ -62,7 +62,8 @@ const pushNode = addItem;
 const glyphOf = (status) => GLYPH[status] || '✘';
 const labelOf = (status) => LABEL[status] || 'failed';
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
-const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+// Safe in text and inside a quoted attribute alike: names and call ids come from providers and land in both.
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 function toast(text, ms = 2200) { S.ui.toast = text; render(); setTimeout(() => { if (S.ui.toast === text) { S.ui.toast = null; render(); } }, ms); }
 
 // ---------- bots ----------
@@ -133,9 +134,13 @@ function callSummary(name, args) {
 // ---------- events ----------
 const FLEET_EVENTS = new Set(['created', 'forked', 'accepted', 'queued', 'turn_waiting', 'turn_paced', 'turn_resumed', 'turn_finished', 'deleted']);
 const SHAPE_EVENTS = new Set(['created', 'forked', 'deleted']);
+const NAMELESS = new Set(['created', 'forked', 'deleted', 'pruned', 'follow_live', 'follow_lagged']);
 async function onEvent(ev) {
   const kind = ev.event, name = ev.bot ?? '', turn = ev.turn ?? null, data = ev.data ?? {};
   if (typeof ev.cursor === 'number') S.cursor = Math.max(S.cursor, ev.cursor);
+  // The replay runs while the snapshot pages: a bot an event names before its record arrives gets a
+  // seat now, so the event's state is kept; the record fills in what events do not carry.
+  if (name && name !== '*' && !NAMELESS.has(kind) && !S.bots.has(name)) { S.bots.set(name, { name, id: null, parent: null, parentId: null, waitingOn: [], turnStarted: 0, elapsed: 0, status: 'idle', runningTurn: null, model: '?', workspace: null }); S.shapeGen += 1; }
   switch (kind) {
     case 'follow_live': {
       S.live = true;
@@ -145,7 +150,6 @@ async function onEvent(ev) {
     }
     // Attaching queues its own load on the chain this handler runs in; done here it would wait on itself.
     case 'follow_lagged': S.attached = false; S.live = false; toast('event stream lagged; attaching again'); setTimeout(() => { if (!S.attached) attach(); }, 0); return true;
-    case 'closed': S.attached = false; S.live = false; showDetached('the daemon closed the session'); return true;
     case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; t.text += ev.text ?? ''; break; }
     case 'thinking_delta': { const t = transcript(name); t.streamingTurn = turn; if (!t.thinkingSince) t.thinkingSince = Date.now(); t.thinking += ev.text ?? ''; break; }
     case 'created': case 'forked': {
@@ -322,36 +326,60 @@ let chain = Promise.resolve();
 function enqueue(job) { chain = chain.then(job, job); return chain; }
 
 // ---------- lifecycle ----------
-let unlisten = null;
+// Events are pulled from the core a batch at a time and applied before the next pull, so the pipeline
+// from the daemon to the screen is bounded end to end: the transport's queue, then one batch here.
+async function pump(session) {
+  for (;;) {
+    let batch;
+    try { batch = await Daemon.pull(session); } catch (e) { if (S.session === session) lost(String(e?.message ?? e)); return; }
+    if (S.session !== session) return;
+    for (const ev of batch.events ?? []) await enqueue(() => handle(ev, session));
+    if (batch.closed) { if (S.session === session) lost('the daemon closed the session'); return; }
+  }
+}
+async function handle(ev, session) {
+  const terminal = await onEvent(ev);
+  if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
+  if (ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = session;
+  // During replay nothing is fetched: a load per node-producing event would serialize a long history
+  // into one request each. The first load runs once follow_live arrives.
+  if (!terminal) { if (S.live) await loadVisible(); render(); }
+}
+function lost(reason) { S.attached = false; S.live = false; showDetached(reason); }
+// A record from the snapshot. A bot this session's events already touched keeps the state those events
+// built and takes only what events do not carry; any other is seated from the record whole.
+function seat(record, session) {
+  const b = bot(record.name);
+  const conflict = b && b.id != null && record.id != null && b.id !== record.id;
+  if (!b || b.touched !== session || conflict) { upsert(record); return; }
+  if (record.id != null) b.id = record.id;
+  b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  b.workspace = record.workspace ?? null;
+  if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
+}
 async function attach() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    if (!unlisten) unlisten = await Daemon.onEvent((ev) => enqueue(async () => {
-      // An event from a session this page already left behind is noise. Sessions count up, and the
-      // one being attached forwards its replay before its number is installed, so only older is stale.
-      if (ev.session !== undefined && S.session !== undefined && ev.session < S.session) return;
-      const terminal = await onEvent(ev);
-      if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
-      if (ev.session !== undefined && ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = ev.session;
-      // During replay nothing is fetched: a load per node-producing event would serialize a long history
-      // into one request each. The first load runs once follow_live arrives.
-      if (!terminal) { if (S.live) await loadVisible(); render(); }
-    }));
-    const result = await Daemon.attach(S.cursor);
-    if (result.session !== undefined) S.session = result.session;
-    // The snapshot is authoritative: a bot deleted while this page had no session is gone from it and
-    // its live-only `deleted` notice cannot be replayed; anything newer arrives on the subscription.
-    const listed = new Set((result.bots ?? []).map((r) => r.name));
-    for (const record of result.bots ?? []) upsert(record);
-    // A bot this session's own events already mentioned was born after the listing, not deleted.
-    for (const [name, b] of [...S.bots]) if (!listed.has(name) && !(b.touched >= result.session)) { S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null; }
+    const { session } = await Daemon.attach(S.cursor);
+    S.session = session;
+    pump(session);
+    // The snapshot, a page at a time, applied as it arrives while the replay flows.
+    const listed = new Set(); let after = null;
+    for (;;) {
+      const page = await Daemon.request('bots', { after, limit: 256 });
+      if (S.session !== session) return false;
+      for (const record of page.bots ?? []) { listed.add(record.name); seat(record, session); }
+      if (!page.next_after) break;
+      after = page.next_after;
+    }
+    // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
+    // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
+    for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null; }
     S.attached = true;
     restore();
     // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
     if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
     S.botsGen += 1; S.shapeGen += 1;
-    // Only now do the session's events flow: every one of them is newer than the snapshot just applied.
-    if (Daemon.stream) await Daemon.stream();
     await enqueue(loadVisible);
     $('detached').classList.remove('on');
     render();

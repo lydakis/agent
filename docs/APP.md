@@ -40,7 +40,7 @@ nothing polled.
 
 ```
 app/
-  src-tauri/     Rust core: five commands, one event
+  src-tauri/     Rust core: six commands, no events
   ui/            the page: index.html, app.css, app.js, daemon.js
   playground.py  an offline daemon with a synthetic model, for mechanics
 client/          agent-client: the socket protocol and the client policy
@@ -48,13 +48,12 @@ client/          agent-client: the socket protocol and the client policy
 
 - **Rust core** ([app/src-tauri/src/main.rs](../app/src-tauri/src/main.rs)) is a
   transport. `setup` returns the socket, model and workspace defaults;
-  `policy` composes the client policy for the workspace; `attach` connects,
-  follows `*` from the page's cursor and lists every bot while the replay
-  gathers; `stream`, called once the page has applied that snapshot, forwards
-  the replay and then every live notification to the window as a `daemon`
-  event stamped with its session; `request` relays any protocol op. State
-  and protocol logic live in the page, exactly as they did in the prototype,
-  so the design and the mechanics iterate in one place.
+  `policy` composes the client policy for the workspace; `attach` connects
+  and follows `*` from the page's cursor; `pull` hands the page the next
+  batch of that session's notifications, at most 256, when it asks;
+  `request` relays any protocol op. State and protocol logic live in the
+  page, exactly as they did in the prototype, so the design and the
+  mechanics iterate in one place.
 - **The page** is the prototype's HTML and CSS with the fake daemon swapped
   for events: bots and transcripts built from events, lineage from the
   daemon's `created_by`, cards for peers and background commands, thoughts
@@ -76,12 +75,15 @@ AGENT_MODEL=anthropic/claude-sonnet-4-5 .local/target/release/agent-app \
 ```
 
 Arguments and environment are the CLI's: `--socket`, `--store`, `--model`,
-`--workspace`, `AGENT_SOCKET`, `AGENT_STORE`, `AGENT_MODEL`. Closing the
-window is detaching; the daemon and its bots continue. The page remembers the
-bot on screen, the open peek, the rail and the folds per socket and workspace
-in the webview's local storage, and restores them on the next start. If the
-daemon is unreachable or closes the session, the page shows why and retries
-every two seconds.
+`--workspace`, `AGENT_SOCKET`, `AGENT_STORE`, `AGENT_MODEL`, and a store's
+socket is resolved the way the CLI and the daemon resolve it (the shared
+client crate's rendezvous), so a deep store path meets the same short socket.
+The page draws with the machine's own monospace face and fetches nothing.
+Closing the window is detaching; the daemon and its bots continue. The page
+remembers the bot on screen, the open peek, the rail and the folds per socket
+and workspace in the webview's local storage, and restores them on the next
+start. If the daemon is unreachable or closes the session, the page shows why
+and retries every two seconds.
 
 Keys are the concept's: `^k` switch, `^b` rail, `^p` peek, `^t` thoughts,
 `^o` output, `Esc` close then interrupt, `↑` `↓` on an empty prompt to move
@@ -102,9 +104,15 @@ not by the history or the fleet:
 - **Attach** replays events from the page's cursor, which on a first start is
   the beginning of the daemon's retained log. That log is bounded by the
   daemon's retention (`--retain-turns`, `prune`), and a `pruned` notice marks
-  the gap; the snapshot is paged (256 bots a request) while the replay
-  gathers, and applied before any of the replay, so nothing the replay says
-  is overwritten by an older record.
+  the gap. Nothing is staged on the way: the page pulls the replay a batch
+  at a time and applies each before the next, so the transport's 4,096-event
+  queue is the only buffer between the daemon and the screen, and a page
+  slower than the fleet is told it lagged and attaches again from its
+  cursor. The snapshot is paged (256 bots a request) while the replay flows;
+  a bot the replay already spoke of keeps the state those events built and
+  takes only the record's static fields, a bot an event names before its
+  record arrives gets a seat at once, and a listed bot nothing mentioned is
+  seated from its record.
 - **Transcripts** keep a window of 1,200 decoded items around whichever end
   the reader is at; bodies outside it fold back into their history nodes, and
   a scroll toward them loads the next batch of 400. A run of unloaded nodes
@@ -130,7 +138,9 @@ not by the history or the fleet:
   known name with a new id starts from nothing. A lagged stream (the core's
   4,096-event queue filled) closes the transport, fails every request made
   after that at once, and the page attaches again from its cursor, from
-  outside the event chain so the attach cannot wait on itself.
+  outside the event chain so the attach cannot wait on itself. A new attach
+  lets the previous session's socket go first, so a pull still waiting on it
+  comes back closed rather than holding the new session up.
 
 ## Verified
 

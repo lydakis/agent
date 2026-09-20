@@ -154,14 +154,30 @@ pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
     }
     dirs.push(workspace.join(".agent").join("skills"));
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        // A directory that is not there holds no skills; one that cannot be
+        // read holds skills nobody sees, which is a failure, not an absence.
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Failure::Unreadable {
+                    path: dir,
+                    reason: error.to_string(),
+                });
+            }
         };
-        let mut names: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "md") && p.is_file())
-            .collect();
+        let mut names = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|error| Failure::Unreadable {
+                    path: dir.clone(),
+                    reason: error.to_string(),
+                })?
+                .path();
+            if path.extension().is_some_and(|x| x == "md") && path.is_file() {
+                names.push(path);
+            }
+        }
         names.sort();
         for path in names {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {

@@ -3,6 +3,7 @@
 //! Shared by the terminal client and the desktop app; nothing here depends
 //! on the runtime crate.
 pub mod policy;
+pub mod socket;
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
@@ -153,6 +154,13 @@ impl Client {
             }),
             receiver,
         ))
+    }
+
+    /// Let the daemon go: the write half shuts down, the daemon sees the end
+    /// of the stream and closes its side, the reader ends, and whoever is
+    /// waiting on the notifications sees them close.
+    pub async fn close(&self) {
+        let _ = self.writer.lock().await.shutdown().await;
     }
 
     pub async fn request(&self, op: &str, mut params: Value) -> Result<Value> {

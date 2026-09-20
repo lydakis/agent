@@ -7,7 +7,7 @@
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{Manager, State};
 use tokio::sync::Mutex;
 
 struct Config {
@@ -19,23 +19,22 @@ struct Config {
 struct Shared {
     config: Config,
     client: Mutex<Option<Arc<Client>>>,
-    /// Counts attachments; every forwarded event carries its session so the
-    /// page can ignore the tail of one it has already left behind.
+    /// Counts attachments; a pull names the session it reads for, so a
+    /// batch from a session the page has left is never mistaken for new.
     session: std::sync::atomic::AtomicU64,
-    /// An attachment whose events have not started flowing: the page asks
-    /// for them once it has applied the snapshot, so nothing the replay
-    /// says is overwritten by an older record.
-    pending: Mutex<Option<Pending>>,
+    /// The attached session's notifications. `pull` takes the receiver out
+    /// while it waits and puts it back, so an attach never waits on a pull.
+    events: Mutex<Option<(u64, tokio::sync::mpsc::Receiver<Value>)>>,
 }
 
-struct Pending {
-    session: u64,
-    events: tokio::sync::mpsc::Receiver<Value>,
-    backlog: Vec<Value>,
-}
+/// Notifications handed to the page per pull. Small enough that the page
+/// applies a batch and asks again before the transport's queue matters.
+const PULL: usize = 256;
 
-/// Socket selection matches the CLI: --socket, then AGENT_SOCKET,
-/// then the socket adjacent to --store, AGENT_STORE, or ~/.agent/state.sqlite.
+/// Socket selection matches the CLI: --socket, then AGENT_SOCKET, then the
+/// daemon's rendezvous for --store, AGENT_STORE, or ~/.agent/state.sqlite,
+/// resolved by the shared client crate so a deep store path finds the same
+/// short socket the daemon listens on.
 fn config() -> Result<Config, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut socket, mut store, mut model, mut workspace) = (None, None, None, None);
@@ -76,10 +75,7 @@ fn config() -> Result<Config, String> {
                             .map(|home| PathBuf::from(home).join(".agent/state.sqlite"))
                     })
                     .ok_or("no store path; pass --socket or --store")?;
-                let canonical = std::fs::canonicalize(&store).unwrap_or(store);
-                let mut adjacent = canonical.into_os_string();
-                adjacent.push(".sock");
-                PathBuf::from(adjacent)
+                agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?
             }
         },
     };
@@ -135,94 +131,62 @@ fn policy(state: State<'_, Shared>) -> Value {
     }
 }
 
-/// Connect, follow `*` from the page's cursor, and list every bot. The
-/// replay gathered meanwhile waits for `stream`: the page applies the
-/// snapshot first, then asks for the events, which are all newer than it.
+/// Connect and follow `*` from the page's cursor. The page then pages the
+/// snapshot itself through `request` while it pulls the replay, so nothing
+/// is staged here: the transport's bounded queue is the only buffer.
 #[tauri::command]
 async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
-    let (client, mut events) = Client::connect(&state.config.socket)
+    // Let the previous session go first: its socket closes, its reader ends,
+    // and a pull still waiting on it comes back closed.
+    if let Some(old) = state.client.lock().await.take() {
+        old.close().await;
+    }
+    let (client, events) = Client::connect(&state.config.socket)
         .await
         .map_err(|e| e.to_string())?;
     let session = state
         .session
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         + 1;
-    // Subscribe before the snapshot: deletions are live-only notices, so
-    // nothing can fall between listing and following.
     client
         .request("follow", json!({"bot": "*", "after": after}))
         .await
         .map_err(|e| e.to_string())?;
-    // Page the snapshot on a task while this loop drains the replay the
-    // subscription is already sending; unread, a large replay would fill
-    // the client queue under the very request that lists the bots.
-    let pager = {
-        let client = client.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut bots = Vec::new();
-            let mut cursor: Option<String> = None;
-            loop {
-                let page = client
-                    .request("bots", json!({"after": cursor, "limit": 256}))
-                    .await
-                    .map_err(|e| e.to_string())?;
-                bots.extend(page["bots"].as_array().cloned().unwrap_or_default());
-                match page["next_after"].as_str() {
-                    Some(next) => cursor = Some(next.to_owned()),
-                    None => break,
-                }
-            }
-            Ok::<Vec<Value>, String>(bots)
-        })
-    };
-    tokio::pin!(pager);
-    let mut backlog: Vec<Value> = Vec::new();
-    let bots = loop {
-        tokio::select! {
-            paged = &mut pager => break paged.map_err(|e| e.to_string())??,
-            event = events.recv() => match event {
-                Some(event) => backlog.push(event),
-                None => return Err("daemon_disconnected".into()),
-            },
-        }
-    };
     *state.client.lock().await = Some(client);
-    *state.pending.lock().await = Some(Pending {
-        session,
-        events,
-        backlog,
-    });
-    Ok(json!({"bots": bots, "session": session}))
+    *state.events.lock().await = Some((session, events));
+    Ok(json!({"session": session}))
 }
 
-/// Forward the attached session's events to the window as `daemon` events:
-/// the replay gathered during `attach`, then live. A closed session is
-/// reported the same way, as `{"event":"closed"}`.
+/// The next batch of a session's notifications: waits for one, then takes
+/// what else has already arrived, up to PULL. The page asks again once it
+/// has applied them, so the pipeline from the daemon to the screen is
+/// bounded end to end. `closed` is the daemon gone, or the session let go.
 #[tauri::command]
-async fn stream(app: AppHandle, state: State<'_, Shared>) -> Result<(), String> {
-    let Pending {
-        session,
-        mut events,
-        backlog,
-    } = state.pending.lock().await.take().ok_or("not attached")?;
-    tauri::async_runtime::spawn(async move {
-        let stamp = |mut event: Value| {
-            event["session"] = json!(session);
-            event
-        };
-        for event in backlog {
-            if app.emit("daemon", stamp(event)).is_err() {
-                return;
-            }
+async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
+    let closed = json!({"events": [], "closed": true});
+    let taken = state
+        .events
+        .lock()
+        .await
+        .take_if(|(current, _)| *current == session);
+    let Some((_, mut events)) = taken else {
+        return Ok(closed);
+    };
+    let Some(first) = events.recv().await else {
+        return Ok(closed);
+    };
+    let mut batch = vec![first];
+    while batch.len() < PULL {
+        match events.try_recv() {
+            Ok(event) => batch.push(event),
+            Err(_) => break,
         }
-        while let Some(event) = events.recv().await {
-            if app.emit("daemon", stamp(event)).is_err() {
-                break;
-            }
-        }
-        let _ = app.emit("daemon", json!({"event": "closed", "session": session}));
-    });
-    Ok(())
+    }
+    let mut slot = state.events.lock().await;
+    if slot.is_none() {
+        *slot = Some((session, events));
+    }
+    Ok(json!({"events": batch, "closed": false}))
 }
 
 /// Page diagnostics land on stderr, where a terminal can see them.
@@ -251,10 +215,10 @@ fn main() {
             config,
             client: Mutex::new(None),
             session: std::sync::atomic::AtomicU64::new(0),
-            pending: Mutex::new(None),
+            events: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
-            setup, policy, attach, stream, request, log
+            setup, policy, attach, pull, request, log
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");
