@@ -3897,3 +3897,96 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
     }
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn batched_history_items_validate_the_branch_and_bound_payloads() {
+    let mut db = db();
+    db.create("source", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "source",
+            "r1",
+            "prompt",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(
+        turn,
+        vec![
+            assistant(&"x".repeat(512 * 1024)),
+            assistant("small"),
+            assistant("last"),
+        ],
+        &[],
+        None,
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    db.fork("source", "branch", Fork::default()).unwrap();
+    let refs = db.history_nodes("branch", None, 400, None, false).unwrap();
+    let ids: Vec<i64> = refs["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    let batch = db.history_items("branch", &ids).unwrap();
+    for row in batch["items"].as_array().unwrap() {
+        assert_eq!(
+            row["item"],
+            db.item("branch", row["node"].as_i64().unwrap()).unwrap()
+        );
+    }
+    assert_eq!(batch["items"].as_array().unwrap().len(), ids.len());
+    assert!(serde_json::to_vec(&batch).unwrap().len() < 1024 * 1024);
+    assert!(db.history_items("branch", &[]).is_err());
+    assert!(db.history_items("branch", &[ids[0]; 401]).is_err());
+    assert!(db.history_items("branch", &[ids[0], ids[0]]).is_err());
+    let other = db
+        .begin(
+            "source",
+            "r2",
+            "other branch",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(
+        other,
+        vec![
+            assistant(&"y".repeat(512 * 1024)),
+            assistant(&"z".repeat(512 * 1024)),
+        ],
+        &[],
+        None,
+    )
+    .unwrap();
+    db.finish(other, None).unwrap();
+    let refs = db.history_nodes("source", None, 400, None, false).unwrap();
+    let other_ids: Vec<i64> = refs["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    assert!(db.history_items("branch", &[ids[0], other_ids[0]]).is_err());
+    let batch = db.history_items("source", &other_ids).unwrap();
+    assert_eq!(
+        batch["items"].as_array().unwrap().len(),
+        1,
+        "stop before the second large item"
+    );
+    db.delete_bot("source").unwrap();
+    assert_eq!(
+        db.history_items("branch", &ids).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        ids.len()
+    );
+}

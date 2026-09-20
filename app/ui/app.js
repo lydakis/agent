@@ -25,6 +25,7 @@ const bot = (name) => S.bots.get(name);
 const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
 function count(t, it, d) {
+  t.bytes = Math.max(0, (t.bytes || 0) + d * (it.bytes || 0));
   if (it.kind === 'node' || it.kind === 'tool_stub') t.nodes = Math.max(0, t.nodes + d);
   else if (it.kind === 'thought') t.thoughts = Math.max(0, t.thoughts + d);
   else if (it.kind === 'out' && it.text.split('\n', 3).length > 2) t.longOut = Math.max(0, t.longOut + d);
@@ -32,8 +33,9 @@ function count(t, it, d) {
 }
 const addItem = (t, it) => {
   if (it.kind === 'peer' && t.peers.includes(it.who)) return;
+  if (it.kind === 'note') it.bytes = it.text.length * 2;
   count(t, it, 1); t.items.push(it);
-  if (t.items.length % LAZY_ITEMS === 0) evict(t);
+  if (t.items.length % LAZY_ITEMS === 0 || t.bytes > DECODE_BYTES) evict(t);
   if (it.kind === 'peer' && t.peers.length > PEER_WINDOW * 2) {
     const keep = new Set(t.peers.slice(-PEER_WINDOW));
     let removed = 0;
@@ -69,6 +71,7 @@ function evict(t) {
     for (let i = lo; i < hi; i++) { bytes += t.items[i].bytes || 0; if (bytes > DECODE_BYTES) { hi = i; break; } }
   }
   const source = t.items; const result = [];
+  let earlierNotes = 0, laterNotes = 0;
   const nodeOf = (it) => it.kind === 'node' ? it.node : it.from;
   const folded = new Set();
   for (let i = 0; i < source.length; i++) if (i < lo || i >= hi) { const node = nodeOf(source[i]); if (node != null) folded.add(node); }
@@ -81,7 +84,10 @@ function evict(t) {
   for (let i = 0; i < source.length;) {
     const it = source[i], node = nodeOf(it); let end = i + 1;
     if (node != null) while (end < source.length && nodeOf(source[end]) === node) end++;
-    if (node != null && (folded.has(node) || end > hi)) {
+    if (it.kind === 'note_gap' || (it.kind === 'note' && node == null && (i < lo || i >= hi))) {
+      count(t, it, -1);
+      if (i >= hi) laterNotes += it.total ?? 1; else earlierNotes += it.total ?? 1;
+    } else if (node != null && (folded.has(node) || end > hi)) {
       for (let j = i; j < end; j++) count(t, source[j], -1);
       append({kind:'history', next:node, min:node, loaded:true, forward:i >= hi});
     } else if (it.kind === 'history') {
@@ -91,10 +97,42 @@ function evict(t) {
     } else for (let j = i; j < end; j++) append(source[j]);
     i = end;
   }
-  t.items = result; t.history = result.find((it) => it.kind === 'history') ?? null; t.gen += 1;
+  if (earlierNotes) result.unshift({kind:'note_gap',total:earlierNotes});
+  if (laterNotes) result.push({kind:'note_gap',total:laterNotes,later:true});
+  t.items = result; normalizeRanges(t); t.gen += 1;
 }
-// Every bare node goes through here so the count stays right; loads skip a transcript at zero.
-const pushNode = addItem;
+// Ranges may straddle peer cards when one provider node holds several calls.
+// Union overlapping intervals globally, retaining only the first placeholder.
+function normalizeRanges(t) {
+  const ranges = t.items.filter(it => it.kind === 'history').sort((a,b) => (a.min ?? 0) - (b.min ?? 0));
+  const removed = new Set(); let previous = null;
+  const high = r => r.next - (r.exclusive ? 1 : 0);
+  for (const r of ranges) {
+    if (previous && (r.min ?? 0) <= high(previous)) {
+      if (high(r) > high(previous)) { previous.next = r.next; previous.exclusive = r.exclusive; }
+      previous.seed ||= r.seed;
+      removed.add(r);
+    } else previous = r;
+  }
+  if (removed.size) t.items = t.items.filter(it => !removed.has(it));
+  t.history = t.items.find(it => it.kind === 'history') ?? null;
+  t.seed = t.items.find(it => it.kind === 'history' && it.seed) ?? null;
+}
+function pushNode(t, it) {
+  // Snapshot history and replay can arrive in either order. Replay owns its
+  // visible suffix; the snapshot marker points strictly before its first node.
+  if (t.seed && it.node <= t.seed.next) { t.seed.next = it.node; t.seed.exclusive = true; }
+  if (t.items.some(x => (x.kind === 'node' ? x.node : x.from) === it.node)) return;
+  addItem(t, it);
+}
+function seedHistory(record) {
+  if (typeof record.head !== 'number') return;
+  const t = transcript(record.name); if (t.seeded) return; t.seeded = true;
+  const ids = t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null);
+  const first = ids.length ? Math.min(...ids) : null;
+  t.seed = {kind:'history',next:first ?? record.head,exclusive:first != null,seed:true};
+  t.items.unshift(t.seed); normalizeRanges(t); t.gen += 1;
+}
 const glyphOf = (status) => GLYPH[status] || '✘';
 const labelOf = (status) => LABEL[status] || 'failed';
 const fmt = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`; };
@@ -107,7 +145,7 @@ function upsert(record) {
   if (!record?.name) return;
   // Same name, different identity: everything known about the old bot belongs to the old bot.
   const known = bot(record.name);
-  if (known && known.id != null && record.id != null && known.id !== record.id) { S.bots.delete(record.name); S.transcripts.delete(record.name); }
+  if (known && known.id != null && record.id != null && known.id !== record.id) { forgetBot(record.name); }
   const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
   if (record.id != null) b.id = record.id;
   if (!known || known !== b) S.shapeGen += 1;
@@ -118,10 +156,17 @@ function upsert(record) {
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
+  seedHistory(record);
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
 function creatorOf(b) { const p = b.parent && b.parentId != null ? S.bots.get(b.parent) : null; return p && p.id === b.parentId ? p : null; }
+function forgetBot(name) {
+  const parent = bot(name) && creatorOf(bot(name));
+  const t = parent && S.transcripts.get(parent.name);
+  if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
+  S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null;
+}
 async function refreshBot(name) { try { upsert(await Daemon.request('resume', { bot: name })); } catch (_) {} }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
@@ -271,22 +316,19 @@ async function onEvent(ev) {
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
-      if (t.streamingTurn === turn) { if (t.text) addItem(t, { kind: 'text', text: t.text, turn }); t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; t.streamGen += 1; }
+      if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
     }
     case 'deleted': {
       if (S.snapshot) S.deleted.add(name);
-      const parent = bot(name) && creatorOf(bot(name));
-      const t = parent && S.transcripts.get(parent.name);
-      if (t) { t.items = t.items.filter((it) => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter((who) => who !== name); t.gen += 1; }
-      S.bots.delete(name); S.transcripts.delete(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; if (S.ui.peek === name) S.ui.peek = null; break;
+      forgetBot(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; break;
     }
     case 'pruned': {
       // A `follow *` replay reports a retention gap with bot "*": a notice about the store, not a transcript.
-      if (name === '*') toast(`events before cursor ${ev.before ?? 0} were pruned; older history is gone`, 5000);
-      else addItem(transcript(name), { kind: 'note', text: 'earlier history pruned', turn: null });
+      if (name === '*') toast(`activity events before cursor ${ev.before ?? 0} were pruned; durable history is still available`, 5000);
+      else addItem(transcript(name), { kind: 'note', text: 'earlier activity events pruned; durable history remains available', turn: null });
       break;
     }
     default: break;
@@ -314,16 +356,15 @@ function applyWaitOrProc(name, item, call, node) {
       consumed = true;
       const existing = t.items.find((it) => it.kind === 'proc' && it.handle === value.handle);
       if (existing) { if (call.summary) existing.cmd = call.summary; t.gen += 1; }
-      else addProc(t, { kind: 'proc', from: node, callId: call.callId, handle: value.handle, cmd: call.summary ?? value.handle, done: null, open: false, turn: call.turn ?? null });
+      else addProc(t, { kind: 'proc', from: node, callId: call.callId, handle: value.handle, cmd: call.summary ?? value.handle, done: null, turn: call.turn ?? null });
     }
   } else if (value.results) {
-    let complete = true;
     for (const [handle, result] of Object.entries(value.results)) {
-      if (!handle.startsWith('proc:') || !result || typeof result !== 'object' || result.pending) { complete = false; continue; }
+      if (!handle.startsWith('proc:') || !result || typeof result !== 'object' || result.pending) continue;
       // History is fetched newest first, sometimes in separate batches. Keep the terminal card
       // even before its start is decoded; that start fills in its command without clearing done.
       let it = t.items.find((entry) => entry.kind === 'proc' && entry.handle === handle);
-      if (!it) { it = { kind: 'proc', from: node, callId: call.callId, handle, cmd: handle, done: null, open: false, turn: call.turn ?? null }; addProc(t, it); }
+      if (!it) { it = { kind: 'proc', from: node, callId: call.callId, handle, cmd: handle, done: null, turn: call.turn ?? null }; addProc(t, it); }
       consumed = true;
       if (it.resultNode != null && node != null && it.resultNode > node) continue;
       it.resultNode = node;
@@ -335,7 +376,8 @@ function applyWaitOrProc(name, item, call, node) {
       else if (result.success === false) it.done = 'failed';
       else it.done = tailOf(out);
     }
-    consumed &&= complete;
+    // Keep the ordinary result row: it preserves stdout, stderr and errors.
+    consumed = false;
   }
   return consumed;
 }
@@ -370,12 +412,13 @@ async function loadInherited(name, older) {
   try { page = await Daemon.request('history_nodes', { bot: name, from: marker.next, min_node: marker.min ?? null, oldest_first: !!marker.forward, limit: LAZY_ITEMS }); }
   catch (e) { if (S.transcripts.get(name) === t) toast(`history: ${e?.message ?? e}`); return; }
   if (S.transcripts.get(name) !== t || S.session !== session) return;
-  const nodes = page.nodes.slice().reverse().map((n) => ({ kind: 'node', node: n.node, turn: n.turn ?? null }));
+  const present = new Set(t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null));
+  const nodes = page.nodes.slice().reverse().filter(n => !(marker.exclusive && n.node === marker.next) && !present.has(n.node)).map((n) => ({ kind: 'node', node: n.node, turn: n.turn ?? null }));
   for (const it of nodes) count(t, it, 1);
   let replacement;
   if (marker.forward) replacement = [...nodes, ...(page.next_newer == null ? [] : [{...marker, min: page.next_newer, loaded: true}])];
-  else replacement = [...(page.next_from == null ? [] : [{...marker, next: page.next_from, loaded: true}]), ...nodes];
-  t.items.splice(at, 1, ...replacement); t.history = t.items.find((it) => it.kind === 'history') ?? null; t.gen += 1;
+  else replacement = [...(page.next_from == null ? [] : [{...marker, next: page.next_from, exclusive:false, loaded: true}]), ...nodes];
+  t.items.splice(at, 1, ...replacement); normalizeRanges(t); t.gen += 1;
 }
 async function load(name, older = false) {
   await loadInherited(name, older);
@@ -394,18 +437,23 @@ async function loadBatch(name) {
   for (let i = hi - 1; i >= lo && pending.length < LAZY_ITEMS; i--) if (t.items[i].kind === 'node' || t.items[i].kind === 'tool_stub') pending.push([i, t.items[i]]);
   if (!pending.length) return false;
   let progressed = false, bytes = 0;
+  const ids = [...new Set(pending.filter(([,it]) => it.kind === 'node').map(([,it]) => it.node))];
+  let fetched = new Map(), failure = null;
+  if (ids.length) {
+    try { const page = await Daemon.request('history_items', {bot:name,nodes:ids}); fetched = new Map(page.items.map(row => [row.node,row.item])); }
+    catch (e) { failure = String(e?.message ?? e); }
+  }
   const knownCalls = new Set(t.items.filter((it) => it.kind === 'tool' || it.kind === 'tool_stub').map((it) => JSON.stringify([it.turn, it.callId])));
   for (const [, it] of pending) {
     const index = t.items.indexOf(it); if (index < 0) continue;
-    const r = it.kind === 'tool_stub' ? {stub:true} : await Daemon.request('item', {bot:name,node:it.node}).then((ok)=>({ok}), (e)=>({err:String(e?.message ?? e)}));
+    if (it.kind !== 'tool_stub' && !failure && !fetched.has(it.node)) continue;
+    const r = it.kind === 'tool_stub' ? {stub:true} : failure ? {err:failure} : {ok:fetched.get(it.node)};
     if (S.transcripts.get(name) !== t) return false;
     if (r.stub) { count(t, it, -1); it.kind = 'tool'; t.gen += 1; progressed = true; continue; }
     // A lost session is not the item's fault: the node stays and the next attach fetches it. Anything else is final.
     if (r.err && /daemon_disconnected|detached|^io\b/.test(r.err)) break;
     progressed = true;
-    let es = r.ok ? entries(r.ok) : [{ kind: 'note', text: `node ${it.node}: ${r.err}` }];
-
-
+    const es = r.ok ? entries(r.ok) : [{ kind: 'note', text: `node ${it.node}: ${r.err}` }];
     const rep = [];
     for (const e of es) {
       if (e.kind === 'tool' && it.turn != null && knownCalls.has(JSON.stringify([it.turn, e.callId]))) {
@@ -485,6 +533,7 @@ function seat(record, session) {
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
+  seedHistory(record);
 }
 let attaching = null, retryTimer = null;
 function retryAttach(delay = 2000) {
@@ -519,7 +568,7 @@ async function attachOnce() {
     }
     // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
     // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
-    for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null; }
+    for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
     S.snapshot = false; S.deleted.clear();
     S.attached = true;
     restore();
@@ -617,6 +666,7 @@ function itemHTML(it) {
     case 'tool': { const el = it.started ? `<span class="el">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}"${it.started ? ` data-started="${it.started}"` : ''}>▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
     case 'out': { const rows = it.text.split('\n').filter((l) => l.trim()); const shown = !S.ui.output && rows.length > 2 ? rows.slice(0, 2) : rows; return `<div class="line out">${esc(shown.join('\n'))}${shown.length < rows.length ? ` <span class="more">+${rows.length - shown.length} lines</span>` : ''}</div>`; }
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
+    case 'note_gap': return `<div class="line note">${it.total} ${it.later ? 'later' : 'earlier'} activity notes summarized · durable messages remain available</div>`;
     case 'peer_gap': return `<div class="line note">${it.total} earlier peers · use ^k to find a bot</div>`;
     case 'peer': { const c = peerCard(it.who); return c ? cardHTML(c) : ''; }
     case 'proc': { const status = it.done === null ? 'running' : 'idle'; const last = it.done === null ? it.handle : (it.done || 'done'); return cardHTML({ attr: `data-proc="${esc(it.handle)}"`, status, name: `$ ${it.cmd}`, last, elapsed: '', sel: false }); }
@@ -643,7 +693,7 @@ function itemsHTML(t, from = 0) {
 }
 const tails = new WeakMap();
 function renderTail(el, name, t) {
-  const kind = t.thinking ? 'thinking' : t.text ? 'text' : '';
+  const kind = t.text ? 'text' : t.thinking ? 'thinking' : '';
   const value = kind ? t[kind] : '';
   let state = tails.get(el);
   const running = bot(name)?.status === 'running';
@@ -736,7 +786,7 @@ $('bots').addEventListener('scroll', () => {
 });
 function botRowHTML(n, sel) {
   const b = n.b;
-  const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => h.replace(/^turn:/, '').split('/')[0]).join(' ')}</div>` : '';
+  const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => esc(h.replace(/^turn:/, '').split('/')[0])).join(' ')}</div>` : '';
   return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="n">${esc(b.name)}</span></div>${w}`;
 }
 function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
@@ -849,10 +899,9 @@ document.addEventListener('keydown', async (e) => {
 document.addEventListener('click', async (e) => {
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
-  const row = e.target.closest('[data-bot]'); const peek = e.target.closest('[data-peek]'); const proc = e.target.closest('[data-proc]');
+  const row = e.target.closest('[data-bot]'); const peek = e.target.closest('[data-peek]');
   if (row) await switchTo(row.dataset.bot);
   else if (peek) { S.ui.peek = S.ui.peek === peek.dataset.peek ? null : peek.dataset.peek; await enqueue(loadVisible); render(); save(); }
-  else if (proc) { const t = S.transcripts.get(S.selected); const it = t?.items.find((i) => i.kind === 'proc' && i.handle === proc.dataset.proc); if (it) { it.open = !it.open; render(); } }
   if (!e.target.closest('input')) $('input').focus();
 });
 

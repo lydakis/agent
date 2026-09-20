@@ -527,6 +527,14 @@ Membership validation walks the lineage, as `item` does. Both operations run
 on the read worker in a consistent snapshot, avoiding the serialized writer.
 The fork can read its shared prefix after its source is deleted.
 
+`history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
+against that bot's lineage with one ancestry walk and returns a prefix as
+`items: [{node: ID, item: VALUE}, ...]` in request order. The reply targets
+768 KiB; one larger item may be returned alone if it fits the 1 MiB frame limit.
+Callers request the remaining IDs in their next batch. IDs outside the lineage
+fail the whole request without returning bodies. Like `history_nodes`, this
+runs on the reader connection in a consistent snapshot.
+
 ## Fleet controllers
 
 A program driving thousands of bots needs three things a single-bot client

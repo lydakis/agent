@@ -146,16 +146,32 @@ pub fn agents_files(workspace: &Path) -> Vec<PathBuf> {
 
 /// Skill files: `<workspace>/.agent/skills/*.md` after `~/.agent/skills/*.md`,
 /// by name, the workspace's winning on a clash.
-pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
-    let mut found: Vec<Skill> = Vec::new();
-    let mut dirs = Vec::new();
+const SKILLS_HEADER: &str =
+    "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n";
+
+fn skill_row(skill: &Skill) -> String {
+    format!(
+        "\n- {}: {} ({})",
+        skill.name,
+        skill.summary,
+        skill.path.display()
+    )
+}
+
+fn skills(workspace: &Path, budget: usize) -> Result<Vec<Skill>, Failure> {
+    // Visit the winning directory first, so a later directory can only add
+    // entries. A budget failure can never be undone by an override.
+    let mut dirs = vec![workspace.join(".agent/skills")];
     if let Some(h) = home() {
-        dirs.push(h.join(".agent").join("skills"));
+        dirs.push(h.join(".agent/skills"));
     }
-    dirs.push(workspace.join(".agent").join("skills"));
+    skills_from(dirs, budget)
+}
+
+fn skills_from(dirs: Vec<PathBuf>, budget: usize) -> Result<Vec<Skill>, Failure> {
+    let mut found = std::collections::BTreeMap::<String, Skill>::new();
+    let mut used = 0usize;
     for dir in dirs {
-        // A directory that is not there holds no skills; one that cannot be
-        // read holds skills nobody sees, which is a failure, not an absence.
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -166,7 +182,8 @@ pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
                 });
             }
         };
-        let mut names = Vec::new();
+        // Do not collect directory contents: the index must fit before any
+        // more paths or file heads are read. Final ordering is bounded above.
         for entry in entries {
             let path = entry
                 .map_err(|error| Failure::Unreadable {
@@ -174,18 +191,29 @@ pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
                     reason: error.to_string(),
                 })?
                 .path();
-            if path.extension().is_some_and(|x| x == "md") && path.is_file() {
-                names.push(path);
+            if !path.extension().is_some_and(|x| x == "md") || !path.is_file() {
+                continue;
             }
-        }
-        names.sort();
-        for path in names {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
                 continue;
             };
-            // Only the head is read; a character cut at its end is not an
-            // error, bytes that are not text anywhere before it are.
-            let mut bytes = read_head(&path, SKILL_HEAD)?;
+            if found.contains_key(&name) {
+                continue;
+            }
+            let mut skill = Skill {
+                name,
+                path,
+                summary: String::new(),
+            };
+            let too_long = |size| Failure::TooLong {
+                path: skill.path.clone(),
+                total: MAX_INSTRUCTIONS.saturating_sub(budget) + size,
+            };
+            let minimum = used + skill_row(&skill).len();
+            if minimum > budget {
+                return Err(too_long(minimum));
+            }
+            let mut bytes = read_head(&skill.path, SKILL_HEAD)?;
             bytes.truncate(SKILL_HEAD);
             let text = match String::from_utf8(bytes) {
                 Ok(text) => text,
@@ -195,29 +223,25 @@ pub fn skills(workspace: &Path) -> Result<Vec<Skill>, Failure> {
                 }
                 Err(error) => {
                     return Err(Failure::Unreadable {
-                        path,
+                        path: skill.path,
                         reason: error.utf8_error().to_string(),
                     });
                 }
             };
-            let summary = text
+            skill.summary = text
                 .lines()
                 .map(|l| l.trim().trim_start_matches('#').trim())
                 .find(|l| !l.is_empty())
-                .map(|l| l.chars().take(160).collect::<String>())
+                .map(|l| l.chars().take(160).collect())
                 .unwrap_or_default();
-            found.retain(|s| s.name != name);
-            found.push(Skill {
-                name,
-                path,
-                summary,
-            });
+            used += skill_row(&skill).len();
+            if used > budget {
+                return Err(too_long(used));
+            }
+            found.insert(skill.name.clone(), skill);
         }
     }
-    // No count cap: the byte bound on the whole text is the only limit, and
-    // it fails loudly rather than dropping the alphabetically later skills.
-    found.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(found)
+    Ok(found.into_values().collect())
 }
 
 /// The full text for a new bot in `workspace`. Fails rather than truncates
@@ -255,18 +279,14 @@ pub fn instructions(workspace: &Path) -> Result<Instructions, Failure> {
             bytes: body.len(),
         });
     }
-    let skills = skills(workspace)?;
+    let skills = skills(
+        workspace,
+        MAX_INSTRUCTIONS.saturating_sub(text.len() + SKILLS_HEADER.len()),
+    )?;
     if !skills.is_empty() {
-        let mut block = String::from(
-            "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n",
-        );
+        let mut block = String::from(SKILLS_HEADER);
         for skill in &skills {
-            block.push_str(&format!(
-                "\n- {}: {} ({})",
-                skill.name,
-                skill.summary,
-                skill.path.display()
-            ));
+            block.push_str(&skill_row(skill));
         }
         if text.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
@@ -373,6 +393,41 @@ mod tests {
             matches!(&error, Failure::Unreadable { path, .. } if *path == root.join("AGENTS.md"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skill_budget_fails_before_reading_an_entry_that_cannot_fit() {
+        let root = temp("skill-budget");
+        // Invalid UTF-8 would give instructions_unreadable if the file were read.
+        std::fs::write(root.join("cannot-fit.md"), [0xff]).unwrap();
+        assert_eq!(
+            skills_from(vec![root.clone()], 1).unwrap_err().code(),
+            "instructions_limit"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skill_index_bounds_large_directories_and_preserves_override_order() {
+        let root = temp("skill-index");
+        let local = root.join("local");
+        let global = root.join("global");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(local.join("same.md"), "# Local").unwrap();
+        std::fs::write(global.join("same.md"), [0xff]).unwrap();
+        let result = skills_from(vec![local.clone(), global], MAX_INSTRUCTIONS).unwrap();
+        assert_eq!(result[0].summary, "Local");
+        for i in 0..1000 {
+            std::fs::write(local.join(format!("skill-{i:04}.md")), "x".repeat(160)).unwrap();
+        }
+        assert_eq!(
+            skills_from(vec![local], MAX_INSTRUCTIONS)
+                .unwrap_err()
+                .code(),
+            "instructions_limit"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

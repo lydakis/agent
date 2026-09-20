@@ -2450,6 +2450,53 @@ impl Database {
             json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),"next_newer":next_newer}),
         )
     }
+    /// Fetch a byte-bounded batch after one ancestry walk for all requested IDs.
+    pub fn history_items(&self, name: &str, wanted: &[i64]) -> Result<Value> {
+        use std::collections::HashSet;
+        if wanted.is_empty() || wanted.len() > 400 {
+            return fail("invalid_history_limit");
+        }
+        let unique: HashSet<i64> = wanted.iter().copied().collect();
+        if unique.len() != wanted.len() {
+            return fail("duplicate_history_node");
+        }
+        let snapshot = self.conn.unchecked_transaction()?;
+        let head = self.inspect(name)?.head;
+        let floor = *wanted.iter().min().unwrap();
+        let ids = serde_json::to_string(wanted)?;
+        let found: HashSet<i64> = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
+             ) SELECT id FROM chain WHERE id IN (SELECT value FROM json_each(?3))"
+        )?.query_map(params![head,floor,ids], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if found != unique {
+            return fail("item_not_in_bot_history");
+        }
+        let mut items = Vec::new();
+        let mut bytes = 0;
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        for &node in wanted {
+            let raw: Vec<u8> = query.query_row([node], |r| r.get(0))?;
+            let item: Value = serde_json::from_slice(&raw)?;
+            let entry = json!({"node":node,"item":item});
+            let size = serde_json::to_vec(&entry)?.len();
+            // Leave room for the protocol envelope. One large valid item can
+            // exceed the batch target but never the transport's frame limit.
+            if size > crate::output::MAX_EVENT - 1024 {
+                return fail("item_too_large");
+            }
+            if !items.is_empty() && bytes + size > 768 * 1024 {
+                break;
+            }
+            bytes += size;
+            items.push(entry);
+        }
+        snapshot.commit()?;
+        Ok(json!({"items":items}))
+    }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
         let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;

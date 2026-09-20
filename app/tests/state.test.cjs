@@ -12,8 +12,20 @@ function page(daemon = {}) {
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
   });
+  const transport = {...daemon, request:async(op,params)=> {
+    if(op!=='history_items') return daemon.request(op,params);
+    if(daemon.batch) return daemon.batch(params);
+    const items=[];let bytes=0;
+    for(const node of params.nodes) {
+      const item=await daemon.request('item',{bot:params.bot,node});
+      const size=JSON.stringify(item).length;
+      if(items.length && bytes+size>768*1024)break;
+      items.push({node,item});bytes+=size;
+    }
+    return {items};
+  }};
   const context = vm.createContext({
-    Daemon: daemon, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
+    Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, addEventListener() {},
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
     window: { addEventListener() {} }, localStorage: { getItem() { return null; } },
@@ -21,7 +33,7 @@ function page(daemon = {}) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { S, transcript, upsert, onEvent, handle, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, seat, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
+    'globalThis.app = { S, transcript, upsert, onEvent, handle, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -272,4 +284,78 @@ test('process-heavy history folds cards into recoverable result ranges', async (
   const floor=t.items.find(it=>it.kind==='history').next;
   t.anchor='top';await p.load('Bob',true);
   assert.ok(t.items.some(it=>it.kind==='proc' && it.from<=floor), 'scroll restores folded process cards');
+});
+
+
+test('waiting rail handles are escaped as text', () => {
+  const p=page();p.upsert({name:'Bob',id:1});const b=p.S.bots.get('Bob');
+  b.waitingOn=['turn:<img src=x onerror=alert(1)>/1'];
+  const html=p.botRowHTML({b,depth:0,prefix:''},false);
+  assert.ok(!html.includes('<img'));assert.match(html,/&lt;img/);
+});
+
+test('event-only notes are bounded with an explicit summary', async () => {
+  const p=page();
+  for(let i=0;i<10000;i++) {
+    await p.onEvent({event:i%2?'queued':'turn_finished',bot:'Bob',turn:i,data:{status:'failed',error:'synthetic failure'}});
+  }
+  const t=p.transcript('Bob');p.evict(t);
+  assert.ok(t.items.length<=1602);assert.match(p.itemsHTML(t),/activity notes/);
+});
+
+test('disjoint rows from one node produce no overlapping history ranges', () => {
+  const p=page(),t=p.transcript('Bob');
+  t.items=[{kind:'text',from:1,text:'one'},{kind:'peer',who:'child'},{kind:'tool',from:1,callId:'call'},...Array.from({length:2000},(_,i)=>({kind:'node',node:i+2}))];t.nodes=2000;
+  p.evict(t);
+  const ranges=t.items.filter(it=>it.kind==='history').sort((a,b)=>a.min-b.min);
+  for(let i=1;i<ranges.length;i++) assert.ok(ranges[i-1].next<ranges[i].min);
+});
+
+test('pruned replay can load the retained snapshot lineage without duplicate nodes', async () => {
+  const p=page(historyDaemon());p.S.session=1;p.S.snapshot=true;
+  p.seat({name:'Bob',id:1,provider:'test',head:10},1);
+  await p.onEvent({event:'message',bot:'Bob',turn:5,data:{node:9}});
+  await p.onEvent({event:'message',bot:'Bob',turn:5,data:{node:10}});
+  await p.load('Bob'); const t=p.transcript('Bob');t.anchor='top';await p.load('Bob',true);
+  assert.match(p.itemsHTML(t),/message 1</);
+  const rendered=t.items.filter(it=>it.kind==='text').map(it=>it.from);
+  assert.equal(new Set(rendered).size,rendered.length);assert.equal(rendered.length,10);
+});
+
+test('completed process results retain stdout and stderr in ordinary output', async () => {
+  const output=JSON.stringify({results:{'proc:1':{exit_code:0,stdout:'first line\nlast line',stderr:'important diagnostic'}}});
+  const p=page({request:async()=>({type:'function_call_output',call_id:'wait',output})});const t=p.transcript('Bob');
+  await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{name:'wait',call_id:'wait',arguments:'{"handles":["proc:1"]}'}});
+  await p.onEvent({event:'tool_completed',bot:'Bob',turn:1,data:{call_id:'wait',node:1}});
+  await p.loadBatch('Bob');p.S.ui.output=true;
+  const html=p.itemsHTML(t);assert.match(html,/first line/);assert.match(html,/important diagnostic/);
+});
+
+test('snapshot deletion removes creator cards before a name is reused', async () => {
+  const p=page({setup:async()=>({}),attach:async()=>({session:2}),pull:()=>new Promise(()=>{}),request:async()=>({bots:[{name:'parent',id:1}],next_after:null})});
+  p.upsert({name:'parent',id:1});
+  await p.onEvent({event:'created',bot:'child',data:{id:2,provider:'test',created_by:'parent',created_by_id:1}});
+  await p.attach();
+  await p.onEvent({event:'created',bot:'child',data:{id:3,provider:'test'}});
+  assert.equal(p.transcript('parent').peers.includes('child'),false);
+  assert.equal(p.transcript('parent').items.some(it=>it.kind==='peer'&&it.who==='child'),false);
+});
+
+test('answer deltas follow thinking immediately and failed partial text stays ephemeral', async () => {
+  const p=page(),t=p.transcript('Bob');const el={dataset:{},children:[],replaceChildren(...nodes){this.children=nodes;}};
+  await p.onEvent({event:'thinking_delta',bot:'Bob',turn:1,text:'thinking'});
+  p.renderTail(el,'Bob',t);
+  await p.onEvent({event:'text_delta',bot:'Bob',turn:1,text:'answer'});
+  p.renderTail(el,'Bob',t);assert.equal(el.children[0].children[0].data,'answer');
+  await p.onEvent({event:'turn_finished',bot:'Bob',turn:1,data:{status:'interrupted'}});
+  assert.equal(t.text,'');assert.equal(t.items.some(it=>it.kind==='text'&&it.text==='answer'),false);
+});
+
+
+test('history window sends one batch request and leaves byte-limited remainder loadable', async () => {
+  let batches=0;
+  const p=page({batch:async({nodes})=>{batches++;return {items:nodes.slice(0,2).map(node=>({node,item:{role:'user',content:`node ${node}`}}))};}});
+  for(let node=1;node<=4;node++) await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node}});
+  await p.loadBatch('Bob');assert.equal(batches,1);assert.equal(p.transcript('Bob').nodes,2);
+  await p.loadBatch('Bob');assert.equal(batches,2);assert.equal(p.transcript('Bob').nodes,0);
 });

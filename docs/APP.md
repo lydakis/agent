@@ -119,10 +119,16 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
   Eviction folds whole durable nodes, tool rows and process cards into ranges
   with only endpoint IDs, rather than retaining an object for every old node.
   Scrolling loads at most 400 references in either direction, including a fork's
-  inherited history after its source is deleted. Item bodies are fetched one at
-  a time; a load stops at the byte budget instead of collecting 400 large replies.
-  Turn identities survive pagination. Specialized process cards consume only
-  recognized output; unsuccessful tool results remain visible. Counters for
+  inherited history after its source is deleted. Snapshot heads seed older
+  lineage even when activity events were pruned. Overlapping ranges are unioned,
+  so one node cannot be decoded twice around interleaved peer cards. Bodies are
+  fetched with `history_items`: one ancestry validation per requested batch,
+  a 768 KiB reply target, and at most one larger item within the frame limit.
+  Turn identities survive pagination. Completed process results keep their
+  ordinary output row, including stdout and stderr; cards show only a summary.
+  Event-only activity notes outside the window collapse to an explicit count.
+  Thinking yields to answer text as soon as answer deltas arrive, and partial
+  streams are discarded at turn end unless a durable message was committed. Counters for
   thoughts, long outputs and peers are updated with the items. Peer cards compact
   from 601 to the newest 300 with a count of earlier peers; older bots remain
   reachable through the switcher. Both creation and fork events insert creator
@@ -191,3 +197,8 @@ windowing, CSS control-character escaping, creation-event validation, concurrent
 submission IDs, and fork-history paging.
 `cargo test --workspace` includes the silent-listener readiness deadline and
 fork workspace parity between durable records, live events, and replay.
+
+A synthetic local debug-build probe with a 100,000-node in-memory history read
+the same 400 older items in three matched runs: individual ancestry checks took
+33.8–34.1 seconds; `history_items` took 87–88 ms. The returned items were identical.
+This measures the ancestry-walk reduction, not an end-to-end fleet capacity claim.

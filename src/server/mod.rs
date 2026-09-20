@@ -121,6 +121,10 @@ enum Command {
         #[serde(default)]
         oldest_first: bool,
     },
+    HistoryItems {
+        bot: String,
+        nodes: Vec<i64>,
+    },
     Item {
         bot: String,
         node: i64,
@@ -448,7 +452,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_process_budget(limits.processes);
     let hub = Hub::default();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -1192,6 +1196,11 @@ impl Service {
                     .read("history_nodes", move |db| {
                         db.history_nodes(&bot, from, limit.unwrap_or(400), min_node, oldest_first)
                     })
+                    .await
+            }
+            Command::HistoryItems { bot, nodes } => {
+                store
+                    .read("history_items", move |db| db.history_items(&bot, &nodes))
                     .await
             }
             Command::Item { bot, node } => store.read("item", move |db| db.item(&bot, node)).await,
