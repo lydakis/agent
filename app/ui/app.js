@@ -246,7 +246,7 @@ async function onEvent(ev) {
       if (parent) addItem(transcript(parent.name), { kind: 'peer', who: name, turn: parent.runningTurn ?? null });
       if (kind === 'forked') {
         const t = transcript(name);
-        if (typeof data.checkpoint === 'number') { t.history = { kind: 'history', next: data.checkpoint }; addItem(t, t.history); }
+        if (typeof data.checkpoint === 'number') { t.history = { kind: 'history', next: data.checkpoint }; addItem(t, t.history); normalizeRanges(t); }
         addItem(t, { kind: 'note', text: `forked from ${data.source ?? '?'}`, turn: null });
       }
       break;
@@ -267,8 +267,8 @@ async function onEvent(ev) {
       const t = transcript(name);
       t.callNode = data.node;
       if (t.streamingTurn === turn) {
-        if (t.thinking) { addItem(t, { kind: 'thought', from: data.node, text: t.thinking, secs: t.thinkingSince ? Math.round((Date.now() - t.thinkingSince) / 1000) : 0, turn }); t.thinking = ''; t.thinkingSince = 0; }
-        t.text = ''; t.streamGen += 1;
+        // The committed node is the sole transcript source, including thinking.
+        t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamGen += 1;
       }
       if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn });
       break;
@@ -335,7 +335,9 @@ async function onEvent(ev) {
   }
 }
 async function loadWaitOrProc(name, node, call) {
+  const t = S.transcripts.get(name), session = S.session;
   let item; try { item = await Daemon.request('item', { bot: name, node }); } catch (_) { return false; }
+  if (S.session !== session || S.transcripts.get(name) !== t) return false;
   return applyWaitOrProc(name, item, call, node);
 }
 // Decode a background start (a proc handle) or a wait result into the cards; also reached by a retried load.
@@ -436,6 +438,7 @@ async function loadBatch(name) {
   const pending = [];
   for (let i = hi - 1; i >= lo && pending.length < LAZY_ITEMS; i--) if (t.items[i].kind === 'node' || t.items[i].kind === 'tool_stub') pending.push([i, t.items[i]]);
   if (!pending.length) return false;
+  const session = S.session;
   let progressed = false, bytes = 0;
   const ids = [...new Set(pending.filter(([,it]) => it.kind === 'node').map(([,it]) => it.node))];
   let fetched = new Map(), failure = null;
@@ -448,7 +451,7 @@ async function loadBatch(name) {
     const index = t.items.indexOf(it); if (index < 0) continue;
     if (it.kind !== 'tool_stub' && !failure && !fetched.has(it.node)) continue;
     const r = it.kind === 'tool_stub' ? {stub:true} : failure ? {err:failure} : {ok:fetched.get(it.node)};
-    if (S.transcripts.get(name) !== t) return false;
+    if (S.transcripts.get(name) !== t || S.session !== session) return false;
     if (r.stub) { count(t, it, -1); it.kind = 'tool'; t.gen += 1; progressed = true; continue; }
     // A lost session is not the item's fault: the node stays and the next attach fetches it. Anything else is final.
     if (r.err && /daemon_disconnected|detached|^io\b/.test(r.err)) break;
@@ -506,21 +509,35 @@ async function pump(session) {
     let batch;
     try { batch = await Daemon.pull(session); } catch (e) { if (S.session === session) lost(String(e?.message ?? e)); return; }
     if (S.session !== session) return;
-    try { for (const ev of batch.events ?? []) await enqueue(() => handle(ev, session)); }
+    try { await enqueue(async () => {
+      for (const ev of batch.events ?? []) {
+        await handle(ev, session, false);
+        if (S.session !== session) return;
+      }
+      // One load and fleet rebuild per bounded pull, including replay bursts.
+      if (S.live) await loadVisible();
+      if (S.session === session) render();
+    }); }
     catch (e) { if (S.session === session) lost(String(e?.message ?? e)); return; }
     if (batch.closed) { if (S.session === session) lost('the daemon closed the session'); return; }
   }
 }
-async function handle(ev, session) {
+async function handle(ev, session, paint = true) {
   if (S.session !== session) return;
   const terminal = await onEvent(ev);
+  if (S.session !== session) return;
   if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
   if (ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = session;
   // During replay nothing is fetched: a load per node-producing event would serialize a long history
   // into one request each. The first load runs once follow_live arrives.
-  if (!terminal) { if (S.live) await loadVisible(); render(); }
+  if (!terminal && paint) { if (S.live) await loadVisible(); render(); }
 }
-function lost(reason) { S.session = null; S.attached = false; S.live = false; showDetached(reason); }
+function lost(reason) {
+  S.session = null; S.attached = false; S.live = false;
+  // Live deltas have no replay cursor. Reconnect rebuilds from durable nodes.
+  for (const t of S.transcripts.values()) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; t.streamGen += 1; }
+  showDetached(reason);
+}
 // A record from the snapshot. A bot this session's events already touched keeps the state those events
 // built and takes only what events do not carry; any other is seated from the record whole.
 function seat(record, session) {

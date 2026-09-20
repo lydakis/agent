@@ -191,6 +191,7 @@ pub struct TurnContext {
     pub model_rounds: usize,
     pub bot: String,
     pub created_by: Option<String>,
+    pub created_by_id: Option<i64>,
     pub workspace: String,
     pub model: String,
 }
@@ -1516,6 +1517,7 @@ impl Database {
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
             created_by: bot.created_by,
+            created_by_id: bot.created_by_id,
             bot: bot.name,
         })
     }

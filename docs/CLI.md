@@ -11,7 +11,11 @@ a store or connecting to a daemon.
 Inside a bot's shell tool, `AGENT_BOT` names that bot and the client records
 it as the creator of anything it creates or forks (`created_by`, with the
 creator's identity as `created_by_id`);
-`AGENT_PARENT` names the running bot's own creator when it has one.
+`AGENT_PARENT` and `AGENT_PARENT_ID` identify the running bot's recorded creator
+when its identity was known at creation. Address that creator with
+`run --detach --bot "$AGENT_PARENT" --bot-id "$AGENT_PARENT_ID" -- TASK`.
+The ID stays pinned after deletion, so a replacement with the same name rejects
+the call instead of receiving the work.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 `follow --bot NAME` replays and follows the selected current turn to its end;

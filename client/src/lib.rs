@@ -124,7 +124,7 @@ impl Client {
             Some(line) => serde_json::from_str::<Value>(&line)?,
             None => return Err(Error::new("daemon_disconnected")),
         };
-        if ready["event"] != "ready" {
+        if ready["event"] != "ready" || ready["protocol"].as_u64() != Some(3) {
             return Err(Error::new("daemon_protocol_mismatch"));
         }
         let pending: Pending = Arc::default();

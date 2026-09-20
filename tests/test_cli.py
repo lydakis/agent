@@ -483,7 +483,7 @@ class SocketAndCliTests(ModelFixture):
         # Alice's own shell sees who created her (AGENT_PARENT) and her own
         # name (AGENT_BOT); her record names Bob as her creator.
         nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
-                  '\'shell:printf "$AGENT_PARENT/$AGENT_BOT" > lineage\'')
+                  '\'shell:printf "$AGENT_PARENT/$AGENT_PARENT_ID/$AGENT_BOT" > lineage\'')
 
         bob = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', f'shell:{nested}')
         # Bob's shell tool ran the client, which created Alice on the same daemon.
@@ -501,7 +501,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
         by_name = {b['name']: b for b in listing}
         self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['id'])
-        self.assertEqual((self.path / 'lineage').read_text(), 'Bob/Alice')
+        self.assertEqual((self.path / 'lineage').read_text(), f"Bob/{by_name['Bob']['id']}/Alice")
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]
         self.assertEqual([e['event'] for e in events][:2], ['created', 'accepted'])
@@ -529,6 +529,20 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(kinds[-1], 'turn_finished')
         self.assertEqual(seen[-1]['turn'], json.loads(live.stdout.read().splitlines()[-1])['turn'])
         live.stdout.close()
+        # The stored parent identity remains pinned even after the name is reused.
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        self.assertIn('result', control.request('delete', bot='Bob'))
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'replacement')
+        replacement = control.request('resume', bot='Bob')['result']
+        self.assertNotEqual(replacement['id'], by_name['Bob']['id'])
+        route = ('"$AGENT_BIN" run --detach --bot "$AGENT_PARENT" '
+                 '--bot-id "$AGENT_PARENT_ID" -- should-not-deliver > route.out 2> route.err; '
+                 'printf "%s" "$?" > route.status')
+        self.agent('run', *self.again, '--bot', 'Alice', f'shell:{route}')
+        self.assertEqual((self.path / 'route.status').read_text(), '1')
+        self.assertIn('bot_not_found', (self.path / 'route.err').read_text())
+        self.assertEqual(control.request('resume', bot='Bob')['result']['head'], replacement['head'])
 
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',

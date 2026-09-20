@@ -202,3 +202,14 @@ A synthetic local debug-build probe with a 100,000-node in-memory history read
 the same 400 older items in three matched runs: individual ancestry checks took
 33.8–34.1 seconds; `history_items` took 87–88 ms. The returned items were identical.
 This measures the ancestry-walk reduction, not an end-to-end fleet capacity claim.
+
+Pulled event batches apply in order, with one visible-history load and render
+per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
+while retaining the 300-row rail window. The shared client rejects a ready
+handshake unless its protocol is exactly 3.
+
+The lifecycle regression suite compares committed thinking/answer transcripts
+between live delivery and replay, reconciles fork snapshot/replay ordering,
+and rejects late process/history replies from a replaced session or bot.
+Disconnect drops non-durable stream buffers; committed nodes remain the source
+of transcript content.

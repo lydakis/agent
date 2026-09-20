@@ -33,7 +33,7 @@ function page(daemon = {}) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { S, transcript, upsert, onEvent, handle, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
+    'globalThis.app = { S, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -358,4 +358,67 @@ test('history window sends one batch request and leaves byte-limited remainder l
   for(let node=1;node<=4;node++) await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node}});
   await p.loadBatch('Bob');assert.equal(batches,1);assert.equal(p.transcript('Bob').nodes,2);
   await p.loadBatch('Bob');assert.equal(batches,2);assert.equal(p.transcript('Bob').nodes,0);
+});
+
+
+test('creation bursts render the bounded rail once per pulled batch', async () => {
+  let pulls=0, writes=0;
+  const p=page({pull:async()=> {
+    if(pulls===40) { p.S.session=null; return {events:[]}; }
+    const start=pulls++*250;
+    return {events:Array.from({length:250},(_,i)=>({event:'created',bot:`bot${start+i}`,data:{id:start+i+1,provider:'test'}}))};
+  }});
+  p.S.session=1; p.S.live=true; p.S.ui.rail=true;
+  const rail=p.elements.get('bots');let html='';
+  Object.defineProperty(rail,'innerHTML',{get:()=>html,set:value=>{html=value;writes++;}});
+  await p.pump(1);
+  assert.equal(p.S.bots.size,10000);
+  assert.ok(writes<=40, `fleet rail rebuilt ${writes} times for 40 batches`);
+  assert.equal((html.match(/data-bot=/g)||[]).length,300);
+  assert.match(html,/9700 below/);
+});
+
+test('committed thinking and answer nodes match live, replay, and reconnect transcripts', async () => {
+  const item={role:'assistant',content:[{type:'thinking',thinking:'durable thought'},{type:'text',text:'durable answer'}]};
+  const make=()=>{const p=page({request:async()=>item});p.upsert({name:'Bob',id:1});return p;};
+  const live=make(),replay=make();
+  await live.onEvent({event:'thinking_delta',bot:'Bob',turn:1,text:'durable thought'});
+  await live.onEvent({event:'text_delta',bot:'Bob',turn:1,text:'durable answer'});
+  for(const p of [live,replay]) {
+    await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}});
+    await p.loadBatch('Bob');
+    await p.onEvent({event:'turn_finished',bot:'Bob',turn:1,data:{status:'completed'}});
+    assert.match(p.itemsHTML(p.transcript('Bob')), /durable answer/);
+  }
+  assert.equal(live.itemsHTML(live.transcript('Bob')),replay.itemsHTML(replay.transcript('Bob')));
+  await live.onEvent({event:'text_delta',bot:'Bob',turn:2,text:'not committed'});
+  live.lost('disconnected');
+  assert.equal(live.transcript('Bob').text,'');
+});
+
+test('fork snapshot and replay converge on one inherited range in either order', async () => {
+  for(const snapshotFirst of [true,false]) {
+    const p=page(historyDaemon());p.S.session=1;
+    const record={name:'branch',id:2,provider:'test',head:10};
+    const event={event:'forked',bot:'branch',data:{id:2,provider:'test',source:'source',checkpoint:10}};
+    if(snapshotFirst)p.seat(record,1);
+    await p.onEvent(event);
+    if(!snapshotFirst)p.seat(record,1);
+    assert.equal(p.transcript('branch').items.filter(it=>it.kind==='history').length,1);
+    await p.load('branch');
+    const ids=p.transcript('branch').items.filter(it=>it.from!=null).map(it=>it.from);
+    assert.equal(new Set(ids).size,10);
+    assert.equal(ids.length,10);
+  }
+});
+
+test('a pending process result cannot mutate a reused bot name after reconnect', async () => {
+  const reply=deferred();const p=page({request:async()=>reply.promise});p.S.session=1;p.S.live=true;
+  p.upsert({name:'Bob',id:1});
+  await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'c',name:'shell',arguments:'{"background":true}'}});
+  const completing=p.handle({event:'tool_completed',bot:'Bob',turn:1,data:{node:1,call_id:'c'}},1);
+  await settle();p.lost('disconnected');p.S.session=2;p.upsert({name:'Bob',id:2});
+  reply.resolve({output:'{"handle":"proc:1"}'});await completing;
+  assert.equal(p.transcript('Bob').items.length,0);
+  assert.notEqual(p.S.bots.get('Bob').touched,1);
 });

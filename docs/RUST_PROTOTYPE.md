@@ -639,8 +639,10 @@ within the 1 MiB response bound.
 
 `created_by` on `create` and `fork` is the client's declaration of which bot
 it acts for; the CLI fills it from `AGENT_BOT`, which the daemon sets in every
-shell tool's environment along with `AGENT_PARENT`, the running bot's own
-creator when it has one. The store resolves the name to the creator's
+shell tool's environment along with `AGENT_PARENT` and `AGENT_PARENT_ID`, the
+running bot's recorded creator when its identity is known. The client preamble
+uses both with `run --bot NAME --bot-id ID`, so a later replacement cannot
+receive a stale child-to-parent submission. The store resolves the name to the creator's
 identity at that moment and keeps it as `created_by_id` (`null` when no bot
 held the name), so a later bot reusing the name is not mistaken for the
 creator. The record, the `created` and `forked` events, and `bots` pages
