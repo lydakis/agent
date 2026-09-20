@@ -22,7 +22,7 @@ const S = {
 };
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
-const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
+const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
 // Counters kept in step with the items, so the key bar never scans the history.
 function count(t, it, d) {
   t.bytes = Math.max(0, (t.bytes || 0) + d * (it.bytes || 0));
@@ -57,6 +57,7 @@ function decodeAt(t, at, entries) {
 }
 // Every history union compares the last included node, not the raw cursor:
 // snapshot cursors can be exclusive, while evicted nodes are inclusive.
+const firstDecoded = t => t.items.findIndex(it => !['node','tool_stub','history','peer_gap','note_gap'].includes(it.kind));
 const historyEnd = r => r.next - (r.exclusive ? 1 : 0);
 function mergeHistoryRange(target, source) {
   if (historyEnd(source) > historyEnd(target)) {
@@ -76,7 +77,7 @@ function evict(t) {
     lo = Math.max(0, len - WINDOW);
     for (let i = len - 1; i >= lo; i--) { bytes += t.items[i].bytes || 0; if (bytes > DECODE_BYTES) { lo = i + 1; break; } }
   } else {
-    lo = Math.max(0, t.items.findIndex((it) => !['node','tool_stub','history','peer_gap'].includes(it.kind)));
+    lo = Math.max(0, firstDecoded(t));
     hi = Math.min(len, lo + WINDOW);
     for (let i = lo; i < hi; i++) { bytes += t.items[i].bytes || 0; if (bytes > DECODE_BYTES) { hi = i; break; } }
   }
@@ -191,7 +192,6 @@ function forgetBot(name) {
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
   S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null;
 }
-async function refreshBot(name) { try { upsert(await Daemon.request('resume', { bot: name })); } catch (_) {} }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
 // Only the agent CLI's detached run yields the handle JSON a peer card already shows.
@@ -257,7 +257,7 @@ async function onEvent(ev) {
     }
     // Attaching queues its own load on the chain this handler runs in; done here it would wait on itself.
     case 'follow_lagged': lost('event stream lagged; attaching again'); retryAttach(0); return true;
-    case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; t.text += ev.text ?? ''; break; }
+    case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; if (t.thinkingSince) { t.thinkingMs += Date.now() - t.thinkingSince; t.thinkingSince = 0; } t.text += ev.text ?? ''; break; }
     case 'thinking_delta': { const t = transcript(name); t.streamingTurn = turn; if (!t.thinkingSince) t.thinkingSince = Date.now(); t.thinking += ev.text ?? ''; break; }
     case 'created': case 'forked': {
       // The event carries the record's list fields, so a burst of creations costs no request each. A
@@ -290,11 +290,12 @@ async function onEvent(ev) {
     case 'message': {
       const t = transcript(name);
       t.callNode = data.node;
+      const thinkingSecs = t.streamingTurn === turn && (t.thinkingSince || t.thinkingMs) ? (t.thinkingMs + (t.thinkingSince ? Date.now() - t.thinkingSince : 0)) / 1000 : null;
       if (t.streamingTurn === turn) {
         // The committed node is the sole transcript source, including thinking.
-        t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamGen += 1;
+        t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamGen += 1;
       }
-      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn });
+      if (typeof data.node === 'number') pushNode(t, { kind: 'node', node: data.node, turn, thinkingSecs });
       break;
     }
     case 'tool_started': {
@@ -340,7 +341,7 @@ async function onEvent(ev) {
       // A steer absorbed into a running turn finishes as its own turn while that turn goes on.
       if (b && (b.runningTurn === null || b.runningTurn === turn)) { b.runningTurn = null; b.waitingOn = []; if (b.turnStarted) b.elapsed = Date.now() - b.turnStarted; b.turnStarted = 0; b.status = status === 'completed' || status === 'steered' ? 'idle' : status; }
       const t = transcript(name);
-      if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; t.streamGen += 1; }
+      if (t.streamingTurn === turn) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
       if (status !== 'completed' && status !== 'steered') addItem(t, { kind: 'note', text: data.error ? `${status}: ${data.error}${data.detail ? ': ' + data.detail : ''}` : status, turn });
       // A background command may outlive its turn; only a wait result says how it ended.
       break;
@@ -417,14 +418,14 @@ function entries(item) {
   const shell = (o) => { let v; try { v = JSON.parse(o); } catch (_) { return o; } if (!v || typeof v !== 'object' || !('stdout' in v)) return o; let s = (v.stdout ?? '').trimEnd(); if (v.stderr?.trim()) s += (s ? '\n' : '') + 'stderr: ' + v.stderr.trimEnd(); if (v.exit_code) s += (s ? '\n' : '') + `exit ${v.exit_code}`; return s || '(no output)'; };
   if (item.type === 'function_call_output') return [{ kind: 'out', callId: item.call_id, raw: item.output ?? '', text: shell(item.output ?? '') }];
   if (item.type === 'function_call') return [storedTool(item.name, item.call_id, item.arguments)];
-  if (item.type === 'reasoning') { const s = text(item.summary, ['summary_text']); if (s) out.push({ kind: 'thought', text: s, secs: 0 }); return out; }
+  if (item.type === 'reasoning') { const s = text(item.summary, ['summary_text']); if (s) out.push({ kind: 'thought', text: s, secs: null }); return out; }
   if (item.role === 'user') {
     if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push({ kind: 'out', callId: p.tool_use_id, raw: text(p.content, ['text']), text: shell(text(p.content, ['text'])) }); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
     else out.push({ kind: 'user', text: text(item.content, ['text']) });
   } else if (item.role === 'assistant' && Array.isArray(item.content)) {
     for (const p of item.content) {
       if (p.type === 'tool_use') out.push(storedTool(p.name, p.id, JSON.stringify(p.input)));
-      else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: 0 });
+      else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: null });
       else if ((p.type === 'text' || p.type === 'output_text') && p.text) {
         const previous = out.at(-1);
         if (previous?.kind === 'text') previous.text += p.text; else out.push({kind:'text',text:p.text});
@@ -437,7 +438,7 @@ async function loadInherited(name, older) {
   const t = S.transcripts.get(name); if (!t) return;
   const ranges = t.items.filter((it) => it.kind === 'history');
   if (!ranges.length) return;
-  const first = t.items.findIndex((it) => !['node','tool_stub','history','peer_gap'].includes(it.kind));
+  const first = firstDecoded(t);
   const marker = older ? ranges.find((r) => t.items.indexOf(r) <= Math.max(first, 0)) : ranges.findLast((r) => !r.loaded || (r.forward && t.anchor === 'end'));
   if (!marker || (!older && !marker.forward && !marker.seed && t.items.length > WINDOW)) return;
   const at = t.items.indexOf(marker), session = S.session;
@@ -465,7 +466,7 @@ async function loadBatch(name) {
   // oldest decoded item, so the reader's next screen fills and nothing folded at the far end is fetched.
   let lo = 0, hi = t.items.length;
   if (t.anchor === 'end') lo = Math.max(0, hi - WINDOW);
-  else { const first = t.items.findIndex((it) => it.kind !== 'node' && it.kind !== 'tool_stub' && it.kind !== 'history'); if (first > 0) hi = first; }
+  else { const first = firstDecoded(t); if (first > 0) hi = first; }
   const pending = [];
   for (let i = hi - 1; i >= lo && pending.length < LAZY_ITEMS; i--) if (t.items[i].kind === 'node' || t.items[i].kind === 'tool_stub') pending.push([i, t.items[i]]);
   if (!pending.length) return false;
@@ -474,14 +475,15 @@ async function loadBatch(name) {
   const ids = [...new Set(pending.filter(([,it]) => it.kind === 'node').map(([,it]) => it.node))];
   let fetched = new Map(), failure = null;
   if (ids.length) {
-    try { const page = await Daemon.request('history_items', {bot:name,nodes:ids}); fetched = new Map(page.items.map(row => [row.node,row.item])); }
+    try { const page = await Daemon.request('history_items', {bot:name,nodes:ids}); fetched = new Map(page.items.map(row => [row.node,row])); }
     catch (e) { failure = String(e?.message ?? e); }
   }
   const knownCalls = new Set(t.items.filter((it) => it.kind === 'tool' || it.kind === 'tool_stub').map((it) => JSON.stringify([it.turn, it.callId])));
   for (const [, it] of pending) {
     const index = t.items.indexOf(it); if (index < 0) continue;
     if (it.kind !== 'tool_stub' && !failure && !fetched.has(it.node)) continue;
-    const r = it.kind === 'tool_stub' ? {stub:true} : failure ? {err:failure} : {ok:fetched.get(it.node)};
+    const row = fetched.get(it.node);
+    const r = it.kind === 'tool_stub' ? {stub:true} : failure ? {err:failure} : row.error ? {err:row.error} : {ok:row.item};
     if (S.transcripts.get(name) !== t || S.session !== session) return false;
     if (r.stub) { count(t, it, -1); it.kind = 'tool'; t.gen += 1; progressed = true; continue; }
     // A lost session is not the item's fault: the node stays and the next attach fetches it. Anything else is final.
@@ -489,7 +491,9 @@ async function loadBatch(name) {
     progressed = true;
     const es = r.ok ? entries(r.ok) : [{ kind: 'note', text: `node ${it.node}: ${r.err}` }];
     const rep = [];
+    let thinkingSecs = it.thinkingSecs;
     for (const e of es) {
+      if (e.kind === 'thought' && thinkingSecs != null) { e.secs = thinkingSecs; thinkingSecs = null; }
       if (e.kind === 'tool' && it.turn != null && knownCalls.has(JSON.stringify([it.turn, e.callId]))) {
         const live = t.items.find(row => (row.kind === 'tool' || row.kind === 'tool_stub') && row.turn === it.turn && row.callId === e.callId);
         if (live) {
@@ -528,9 +532,9 @@ async function loadVisible() {
   for (const who of peers().slice(-12)) if (who !== S.selected && who !== S.ui.peek) await load(who);
 }
 
-// Events and loads run one at a time, in arrival order, like the terminal
-// client's loop. Overlapping handlers would mark tools done before the
-// creator lookup and splice the same transcript twice.
+// All transcript mutations, including snapshot pages and creation replies,
+// share the event/load queue. A snapshot must not replace ranges underneath
+// a pending history read, and an old reply must not mutate a new session.
 let chain = Promise.resolve();
 function enqueue(job) { chain = chain.then(job, job); return chain; }
 
@@ -568,7 +572,7 @@ async function handle(ev, session, paint = true) {
 function lost(reason) {
   S.session = null; S.attached = false; S.live = false;
   // Live deltas have no replay cursor. Reconnect rebuilds from durable nodes.
-  for (const t of S.transcripts.values()) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.streamingTurn = null; t.streamGen += 1; }
+  for (const t of S.transcripts.values()) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
   showDetached(reason);
 }
 // A record from the snapshot. A bot this session's events already touched keeps the state those events
@@ -612,26 +616,34 @@ async function attachOnce() {
     for (;;) {
       const page = await Daemon.request('bots', { after, limit: 256 });
       if (S.session !== session) return false;
-      for (const record of page.bots ?? []) { listed.add(record.name); seat(record, session); }
+      await enqueue(() => {
+        if (S.session !== session) return;
+        for (const record of page.bots ?? []) { listed.add(record.name); seat(record, session); }
+      });
+      if (S.session !== session) return false;
       if (!page.next_after) break;
       after = page.next_after;
     }
-    // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
-    // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
-    for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
-    // Resolve lineage only after all pages are seated: a child can sort before
-    // its parent, and retention may have removed both creation events.
-    for (const b of S.bots.values()) {
-      const parent = creatorOf(b);
-      if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
-    }
-    S.snapshot = false; S.deleted.clear();
-    S.attached = true;
-    restore();
-    // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
-    if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
-    S.botsGen += 1; S.shapeGen += 1;
-    await enqueue(loadVisible);
+    await enqueue(async () => {
+      if (S.session !== session) return;
+      // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
+      // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
+      for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
+      // Resolve lineage only after all pages are seated: a child can sort before
+      // its parent, and retention may have removed both creation events.
+      for (const b of S.bots.values()) {
+        const parent = creatorOf(b);
+        if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
+      }
+      S.snapshot = false; S.deleted.clear();
+      S.attached = true;
+      restore();
+      // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
+      if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
+      S.botsGen += 1; S.shapeGen += 1;
+      await loadVisible();
+      if (S.session !== session) return false;
+    });
     if (S.session !== session) return false;
     $('detached').classList.remove('on');
     render();
@@ -718,7 +730,7 @@ function itemHTML(it) {
   switch (it.kind) {
     case 'user': return `<div class="line user">› ${esc(it.text)}</div>`;
     case 'text': return markdown(it.text);
-    case 'thought': return S.ui.thoughts ? `<div class="line think">${esc(it.text)}</div>` : `<div class="line think folded">thought ${fmt((it.secs || 0) * 1000)}</div>`;
+    case 'thought': return S.ui.thoughts ? `<div class="line think">${esc(it.text)}</div>` : `<div class="line think folded">thought${it.secs == null ? '' : ' ' + fmt(it.secs * 1000)}</div>`;
     case 'tool': { const el = it.started ? `<span class="el">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}"${it.started ? ` data-started="${it.started}"` : ''}>▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
     case 'out': { const rows = it.text.split('\n').filter((l) => l.trim()); const shown = !S.ui.output && rows.length > 2 ? rows.slice(0, 2) : rows; return `<div class="line out">${esc(shown.join('\n'))}${shown.length < rows.length ? ` <span class="more">+${rows.length - shown.length} lines</span>` : ''}</div>`; }
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
@@ -921,13 +933,17 @@ async function submit(text) {
     const m = model || S.config?.model; if (!m) throw new Error('model_required: NAME PROVIDER/MODEL, or set AGENT_MODEL');
     // Composed now, so an AGENTS.md edited since the window opened reaches this bot.
     const policy = await Daemon.policy();
-    await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: policy.instructions, tools: S.config.tools });
-    await refreshBot(name); await switchTo(name); toast(`created ${name} · ${policy.note}`); return;
+    const session = S.session;
+    const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+    await enqueue(() => { if (S.session === session) seat(record, session); });
+    await switchTo(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(); return; }
   const b = bot(S.selected); if (!b) throw new Error('no bot selected; /new NAME creates one');
+  // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
+  if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
-  await Daemon.request('submit', { bot: b.name, bot_id: b.id ?? undefined, request_id: `app-${crypto.randomUUID()}`, prompt: text, workspace: b.workspace ?? S.config.workspace, delivery: b.status === 'idle' ? 'reject' : 'queue' });
+  await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, workspace: b.workspace ?? S.config.workspace, delivery: b.status === 'idle' ? 'reject' : 'queue' });
 }
 async function interrupt() { const b = bot(S.selected); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
 function detach() { save(); Daemon.close(); }

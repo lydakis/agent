@@ -6,7 +6,7 @@ pub mod policy;
 pub mod socket;
 
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, os::fd::AsRawFd, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
@@ -18,6 +18,7 @@ pub struct Error {
     pub code: String,
     pub detail: Option<String>,
 }
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.detail {
@@ -58,7 +59,37 @@ impl From<serde_json::Error> for Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+// No await occurs while this lock is held. Synchronous removal makes dropping
+// a request release its registration immediately, without a cleanup task.
+type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
+struct PendingRequest<'a> {
+    pending: &'a Pending,
+    id: u64,
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+// Dropping write_all may leave a partial JSONL frame on the socket. Shut down
+// both halves before releasing the writer lock, so nobody appends a new frame
+// to that prefix and the reader releases other pending requests.
+struct FrameWrite<'a> {
+    fd: std::os::fd::RawFd,
+    closed: &'a std::sync::atomic::AtomicBool,
+    complete: bool,
+}
+impl Drop for FrameWrite<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            // SAFETY: request holds the client and writer lock until after this
+            // guard drops, so fd still names this socket. shutdown does not close fd.
+            unsafe { libc::shutdown(self.fd, libc::SHUT_RDWR) };
+        }
+    }
+}
 
 /// Notifications queued ahead of the UI before the session is let go.
 /// Larger than any replay page, so a normal attach never trips it.
@@ -141,7 +172,7 @@ impl Client {
                 };
                 match message.get("id").and_then(Value::as_u64) {
                     Some(id) => {
-                        if let Some(sender) = routed.lock().await.remove(&id) {
+                        if let Some(sender) = routed.lock().unwrap().remove(&id) {
                             let _ = sender.send(message);
                         }
                     }
@@ -175,7 +206,7 @@ impl Client {
             // request registers under, so none slips between. A lag is
             // announced after the queue drains, then the receiver closes.
             {
-                let mut waiting = routed.lock().await;
+                let mut waiting = routed.lock().unwrap();
                 gone.store(true, std::sync::atomic::Ordering::SeqCst);
                 waiting.clear();
             }
@@ -210,20 +241,30 @@ impl Client {
         params["op"] = json!(op);
         let (sender, receiver) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.pending.lock().unwrap();
             if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(Error::new("daemon_disconnected"));
             }
             pending.insert(id, sender);
         }
+        let _registration = PendingRequest {
+            pending: &self.pending,
+            id,
+        };
         let mut line = serde_json::to_vec(&params)?;
         line.push(b'\n');
         {
             let mut writer = self.writer.lock().await;
-            if let Err(error) = writer.write_all(&line).await {
-                self.pending.lock().await.remove(&id);
-                return Err(error.into());
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::new("daemon_disconnected"));
             }
+            let mut frame = FrameWrite {
+                fd: writer.as_ref().as_raw_fd(),
+                closed: &self.closed,
+                complete: false,
+            };
+            writer.write_all(&line).await?;
+            frame.complete = true;
         }
         let message = receiver
             .await
@@ -235,5 +276,72 @@ impl Client {
             }),
             None => Ok(message["result"].clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn canceled_waits_release_pending_requests_without_closing_the_session() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let (_, write) = stream.into_split();
+        let client = Arc::new(Client {
+            writer: Mutex::new(write),
+            pending: Arc::default(),
+            next: std::sync::atomic::AtomicU64::new(0),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let mut lines = BufReader::new(peer).lines();
+        for _ in 0..20 {
+            let request = tokio::spawn({
+                let client = client.clone();
+                async move {
+                    client
+                        .request("wait", json!({"handles":["turn:Bob:1"]}))
+                        .await
+                }
+            });
+            lines.next_line().await.unwrap().unwrap();
+            request.abort();
+            let _ = request.await;
+            assert!(client.pending.lock().unwrap().is_empty());
+            assert!(!client.closed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_a_partial_frame_disconnects_instead_of_corrupting_the_next_request() {
+        use tokio::io::AsyncReadExt;
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (_, write) = stream.into_split();
+        let client = Arc::new(Client {
+            writer: Mutex::new(write),
+            pending: Arc::default(),
+            next: std::sync::atomic::AtomicU64::new(0),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .request("submit", json!({"prompt":"x".repeat(4*1024*1024)}))
+                    .await
+            }
+        });
+        peer.read_u8().await.unwrap(); // The request exceeds the socket buffer and is still writing.
+        request.abort();
+        let _ = request.await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), client.request("bots", json!({}))).await;
+        assert_eq!(
+            result
+                .expect("a partial frame must close the session")
+                .unwrap_err()
+                .code,
+            "daemon_disconnected"
+        );
+        assert!(client.pending.lock().unwrap().is_empty());
     }
 }

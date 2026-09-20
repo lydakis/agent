@@ -2867,18 +2867,26 @@ impl Database {
         }
         let mut items = Vec::new();
         let mut bytes = 0;
+        let maximum = crate::output::MAX_EVENT - 1024;
+        // Check the encoded blob length in SQLite before allocating it. An
+        // unrenderable item gets its own error; adjacent items remain readable.
         let mut query = self
             .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+            .prepare_cached("SELECT item FROM nodes WHERE id=? AND length(item)<=?")?;
         for &node in wanted {
-            let raw: Vec<u8> = query.query_row([node], |r| r.get(0))?;
-            let item: Value = serde_json::from_slice(&raw)?;
-            let entry = json!({"node":node,"item":item});
-            let size = serde_json::to_vec(&entry)?.len();
-            // Leave room for the protocol envelope. One large valid item can
-            // exceed the batch target but never the transport's frame limit.
-            if size > crate::output::MAX_EVENT - 1024 {
-                return fail("item_too_large");
+            let raw: Option<Vec<u8>> = query
+                .query_row(params![node, maximum as i64], |r| r.get(0))
+                .optional()?;
+            let mut entry = match raw {
+                Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
+                None => json!({"node":node,"error":"item_too_large"}),
+            };
+            let mut size = serde_json::to_vec(&entry)?.len();
+            // Leave room for the protocol envelope, including extra escaping
+            // or wrapper bytes beyond the stored representation.
+            if size > maximum {
+                entry = json!({"node":node,"error":"item_too_large"});
+                size = serde_json::to_vec(&entry)?.len();
             }
             if !items.is_empty() && bytes + size > 768 * 1024 {
                 break;

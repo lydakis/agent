@@ -29,6 +29,15 @@ To contact that creator, run \
 \"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \
 the identity check refuses a deleted creator or a replacement with the same name.";
 
+/// What human-facing clients tell a new bot's summarizer at compaction. The daemon has
+/// no such text; a bot created without any never compacts.
+pub const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "You are summarizing the earlier part of an agent's conversation so the agent can continue \
+with the summary in place of those turns. Any earlier summary is given first; merge it with the new turns, do not restart. \
+Write, in order: the goal; every rule, constraint, or preference the user stated, verbatim where wording matters; \
+what is done, in progress, and blocked; key decisions and why; files read or changed; open questions; next steps. \
+Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. \
+Reply with the summary only.";
+
 /// One instruction file that went into the text, for the client to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {

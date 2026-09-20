@@ -4,8 +4,11 @@
 //! events, and relays requests. Nothing else lives here.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod session;
+
 use agent_client::Client;
 use serde_json::{Value, json};
+use session::SessionSlot;
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
@@ -24,7 +27,7 @@ struct Shared {
     session: std::sync::atomic::AtomicU64,
     /// The attached session's notifications. `pull` takes the receiver out
     /// while it waits and puts it back, so an attach never waits on a pull.
-    events: Mutex<Option<(u64, agent_client::Events)>>,
+    events: Mutex<SessionSlot<agent_client::Events>>,
 }
 
 /// Notifications handed to the page per pull. Small enough that the page
@@ -151,6 +154,7 @@ fn policy(state: State<'_, Shared>) -> Value {
     match agent_client::policy::instructions(workspace) {
         Ok(composed) => json!({
             "instructions": composed.text,
+            "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
             "note": format!(
                 "preamble + {} AGENTS.md + {} skills",
                 composed.sources.len(),
@@ -159,6 +163,7 @@ fn policy(state: State<'_, Shared>) -> Value {
         }),
         Err(error) => json!({
             "instructions": agent_client::policy::PREAMBLE,
+            "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
             "note": format!("preamble only: {error}"),
         }),
     }
@@ -186,7 +191,7 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
         .await
         .map_err(|e| e.to_string())?;
     *state.client.lock().await = Some(client);
-    *state.events.lock().await = Some((session, events));
+    state.events.lock().await.replace(session, events);
     Ok(json!({"session": session}))
 }
 
@@ -197,12 +202,8 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
 #[tauri::command]
 async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
     let closed = json!({"events": [], "closed": true});
-    let taken = state
-        .events
-        .lock()
-        .await
-        .take_if(|(current, _)| *current == session);
-    let Some((_, mut events)) = taken else {
+    let taken = state.events.lock().await.take(session);
+    let Some(mut events) = taken else {
         return Ok(closed);
     };
     let Some(first) = events.recv().await else {
@@ -219,10 +220,7 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
             Err(_) => break,
         }
     }
-    let mut slot = state.events.lock().await;
-    if slot.is_none() {
-        *slot = Some((session, events));
-    }
+    state.events.lock().await.restore(session, events);
     Ok(json!({"events": batch, "closed": false}))
 }
 
@@ -252,7 +250,7 @@ fn main() {
             config,
             client: Mutex::new(None),
             session: std::sync::atomic::AtomicU64::new(0),
-            events: Mutex::new(None),
+            events: Mutex::new(SessionSlot::default()),
         })
         .invoke_handler(tauri::generate_handler![
             setup, policy, attach, pull, request, log

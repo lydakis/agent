@@ -3,8 +3,9 @@
 `agent-app` is the Thread design as a window: the prototype's page, rendered by
 the system webview, with a Rust core that speaks the daemon's socket protocol.
 It exists because the design as drawn needs pixels, and a terminal's cell grid
-cannot give it rounded cards, sub-cell spacing, or shadows. The daemon is
-unchanged and never knows which client is attached.
+cannot give it rounded cards, sub-cell spacing, or shadows. The daemon exposes
+bounded history reads and creator identities; it does not
+need to know which client is attached.
 
 Started 2026-09-19. A terminal client (`agent-tui`, ratatui) came first the
 same day and reached the limit of its grid; it was removed once the app
@@ -57,8 +58,9 @@ client/          agent-client: the socket protocol and the client policy
 - **The page** is the prototype's HTML and CSS with the fake daemon swapped
   for events: bots and transcripts built from events, lineage from the
   daemon's `created_by`, cards for peers and background commands, thoughts
-  folded to their duration, lazy item loads for whatever is on screen. Events
-  and loads are processed one at a time, in arrival order.
+  folded to their duration, lazy item loads for whatever is on screen. Events,
+  snapshot reconciliation, creation replies, and history loads share one
+  mutation queue, so a pending read cannot splice over a newer snapshot.
 - **Demo mode.** In a plain browser there is no Rust core, so `daemon.js`
   becomes a simulated daemon that emits the same protocol shapes and answers
   `item`, `submit`, `create`, `interrupt`. The scenario plays on load: main
@@ -124,7 +126,9 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
   so one node cannot be decoded twice around interleaved peer cards. Bodies are
   fetched with `history_items`: one ancestry validation per requested batch,
   a 768 KiB reply target, and at most one larger item within the frame limit.
-  Turn identities survive pagination. Completed process results keep their
+  An item exceeding the transport limit returns an item-specific error, while
+  the rest of the batch stays readable. Turn identities survive pagination.
+  Completed process results keep their
   ordinary output row, including stdout and stderr; cards show only a summary.
   Event-only activity notes outside the window collapse to an explicit count.
   Thinking yields to answer text as soon as answer deltas arrive, and partial
@@ -150,13 +154,17 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
   `created_by_id`: a bot links under its creator only while the bot holding
   that name is the identity that created it.
 - **Sessions** count up; an event from an older session is dropped, a
-  submission carries the bot id on screen, and a bot that reappears under a
-  known name with a new id starts from nothing. A lagged stream (the core's
+  submission waits for a known bot id and carries that identity. A bot that
+  reappears under a known name with a new id starts from nothing. A lagged stream (the core's
   event count or 8 MiB byte budget filled) closes the transport, fails every request made
   after that at once, and the page attaches again from its cursor, from
   outside the event chain so the attach cannot wait on itself. A new attach
   lets the previous session's socket go first, so a pull still waiting on it
-  comes back closed rather than holding the new session up.
+  comes back closed rather than holding the new session up. A borrowed event
+  receiver retains its session owner and cannot be returned to a replacement
+  attachment, even while that attachment has its own pull pending. Canceled
+  requests release their pending registration immediately. Cancellation during
+  a partial socket write closes the session before another request can write.
 
 ## Verified
 
@@ -180,7 +188,10 @@ schema 22, with the creator's identity since 23) or the `created` event; a bot
 without a creator, or whose creator's name has since changed hands, is a root.
 
 `/new` gives a bot the shared client policy ([CLIENT.md](CLIENT.md)); the
-create notice says what went in.
+create notice says what went in. It also supplies the same default compaction
+instructions as the CLI, so app-created bots can summarize older context.
+Completed thoughts retain locally observed thinking time; historical thoughts
+without a recorded duration show no invented time.
 
 ## Next
 
@@ -194,7 +205,9 @@ Run `node --test app/tests/state.test.cjs` for malformed tool arguments,
 reconnect serialization, historical process results across batches, whole-node
 eviction, a 10,000-peer fan-out, incremental text/thinking rendering, tool-row
 windowing, CSS control-character escaping, creation-event validation, concurrent
-submission IDs, and fork-history paging.
+submission IDs, fork-history paging, snapshot/history ordering, history paging
+past activity summaries, pinned submission identities, oversized-item isolation,
+compaction policy propagation, and completed thought timing.
 `cargo test --workspace` includes the silent-listener readiness deadline and
 fork workspace parity between durable records, live events, and replay.
 

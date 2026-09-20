@@ -14,14 +14,7 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
-/// What the CLI tells a new bot's summarizer at compaction. The daemon has
-/// no such text; a bot created without any never compacts.
-const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "You are summarizing the earlier part of an agent's conversation so the agent can continue \
-with the summary in place of those turns. Any earlier summary is given first; merge it with the new turns, do not restart. \
-Write, in order: the goal; every rule, constraint, or preference the user stated, verbatim where wording matters; \
-what is done, in progress, and blocked; key decisions and why; files read or changed; open questions; next steps. \
-Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. \
-Reply with the summary only.";
+use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 /// What a new bot is told when the caller gives no instructions: the
 /// harness preamble every client shares. `--agents` layers AGENTS.md files
 /// and skills on top; a program that wants that asks for it.

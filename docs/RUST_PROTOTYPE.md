@@ -535,8 +535,9 @@ The fork can read its shared prefix after its source is deleted.
 against that bot's lineage with one ancestry walk and returns a prefix as
 `items: [{node: ID, item: VALUE}, ...]` in request order. The reply targets
 768 KiB; one larger item may be returned alone if it fits the 1 MiB frame limit.
-Callers request the remaining IDs in their next batch. IDs outside the lineage
-fail the whole request without returning bodies. Like `history_nodes`, this
+An item exceeding that limit returns `{node: ID, error: "item_too_large"}`;
+other items remain readable. Callers request remaining IDs in their next batch.
+IDs outside the lineage fail the whole request without returning bodies. Like `history_nodes`, this
 runs on the reader connection in a consistent snapshot.
 
 ## Fleet controllers

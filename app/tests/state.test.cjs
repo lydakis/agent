@@ -33,7 +33,7 @@ function page(daemon = {}) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -515,5 +515,71 @@ test('low-byte replay evicts as soon as the count allowance is exceeded', async 
   for(let node=1;node<=5000;node++) {
     await p.onEvent({event:'message',bot:'Bob',turn:node,data:{node}});
     assert.ok(p.transcript('Bob').items.length<=1600,`count bound at node ${node}`);
+  }
+});
+
+test('snapshot reconciliation cannot splice over an in-flight history page', async () => {
+  const snapshot=deferred(), history=deferred();let firstPull=true,firstHistory=true;
+  const base=historyDaemon();
+  const p=page({setup:async()=>({}),attach:async()=>({session:2}),
+    pull:()=>{if(firstPull){firstPull=false;return Promise.resolve({events:[{event:'follow_live'}]});}return new Promise(()=>{});},
+    request:async(op,q)=>{
+      if(op==='bots')return snapshot.promise;
+      if(op==='history_nodes'&&firstHistory){firstHistory=false;return history.promise;}
+      return base.request(op,q);
+    }});
+  p.setRender(() => {}); // This probe isolates async state ordering, not DOM layout.
+  p.S.session=1;p.upsert({name:'Bob',id:1,head:2});p.S.selected='Bob';p.lost('offline');
+  const attaching=p.attach();await settle();assert.equal(firstHistory,false);
+  snapshot.resolve({bots:[{name:'Bob',id:1,head:10}],next_after:null});await settle();
+  history.resolve({nodes:[{node:2,turn:1},{node:1,turn:1}],next_from:null});await attaching;
+  const ids=p.transcript('Bob').items.filter(it=>it.from!=null).map(it=>it.from);
+  assert.deepEqual(Array.from(ids).sort((a,b)=>a-b),Array.from({length:10},(_,i)=>i+1));
+});
+
+test('submissions wait for a known bot identity instead of sending an unpinned name', async () => {
+  const sent=[];const p=page({request:async(op,q)=>{sent.push([op,q]);}});
+  p.S.session=1;p.S.config={workspace:'/synthetic'};
+  await p.onEvent({event:'text_delta',bot:'Bob',turn:1,text:'working'});p.S.selected='Bob';
+  await assert.rejects(p.submit('next'),/identity/);assert.equal(sent.length,0);
+  p.seat({name:'Bob',id:7},1);await p.submit('next');assert.equal(sent[0][1].bot_id,7);
+});
+
+test('an oversized item shows one error while neighboring history still decodes', async () => {
+  const p=page({batch:async({nodes})=>({items:nodes.map(node=>node===2?{node,error:'item_too_large'}:{node,item:{role:'user',content:`message ${node}`}})})});
+  for(const node of [1,2,3])await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node}});
+  await p.load('Bob');const items=p.transcript('Bob').items;
+  assert.deepEqual(Array.from(items.filter(it=>it.kind==='user').map(it=>it.text)),['message 1','message 3']);
+  assert.equal(items.filter(it=>it.kind==='note'&&it.text.includes('item_too_large')).length,1);
+});
+
+test('activity summaries do not block paging the evicted durable prefix', async () => {
+  const requests=[],p=page(historyDaemon(requests));p.S.session=1;
+  const t=p.transcript('Bob');
+  t.items=Array.from({length:1800},(_,i)=>i%3===0?{kind:'note',text:'activity'}:{kind:'user',text:`message ${i}`,from:i});
+  p.evict(t);assert.equal(t.items[0].kind,'note_gap');
+  t.anchor='top';await p.load('Bob',true);
+  assert.ok(requests.length>0);
+  assert.ok(t.items.some(it=>it.from!=null&&it.from<600));
+});
+
+test('app creation carries shared compaction policy and seats its response', async () => {
+  let created;
+  const p=page({policy:async()=>({instructions:'agent policy',compaction_instructions:'summary policy',note:'test'}),
+    request:async(op,q)=>{assert.equal(op,'create');created=q;return{name:q.bot,id:7,head:null};}});
+  p.setRender(()=>{});p.S.session=1;p.S.config={workspace:'/synthetic',tools:[]};
+  await p.submit('/new Bob test/model');
+  assert.equal(created.compaction_instructions,'summary policy');assert.equal(p.S.bots.get('Bob').id,7);
+});
+
+test('completed Responses and Anthropic thoughts retain observed thinking duration', async () => {
+  for(const item of [{type:'reasoning',summary:[{type:'summary_text',text:'reason'}]},
+    {role:'assistant',content:[{type:'thinking',thinking:'reason'},{type:'text',text:'answer'}]}]) {
+    const p=page({request:async()=>item});p.S.session=1;p.S.live=true;
+    let now=1000;vm.runInContext('Date.now = () => clock()',p.context);p.context.clock=()=>now;
+    await p.onEvent({event:'thinking_delta',bot:'Bob',turn:1,text:'reason'});
+    now=8000;await p.onEvent({event:'text_delta',bot:'Bob',turn:1,text:'answer'});
+    now=15000;await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}});
+    await p.load('Bob');assert.equal(p.transcript('Bob').items.find(it=>it.kind==='thought').secs,7);
   }
 });

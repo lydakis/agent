@@ -4759,3 +4759,55 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[test]
+fn oversized_history_items_do_not_hide_the_rest_of_the_batch() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "prompt",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(
+        turn,
+        vec![
+            assistant("before"),
+            assistant(&"x".repeat(2 * 1024 * 1024)),
+            assistant("after"),
+        ],
+        &[],
+        None,
+    )
+    .unwrap();
+    db.finish(turn, None).unwrap();
+    let refs = db.history_nodes("Bob", None, 400, None, false).unwrap();
+    let ids: Vec<i64> = refs["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["node"].as_i64().unwrap())
+        .collect();
+    let batch = db.history_items("Bob", &ids).unwrap();
+    let rows = batch["items"].as_array().unwrap();
+    assert_eq!(rows.len(), ids.len());
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["error"] == "item_too_large")
+            .count(),
+        1
+    );
+    for row in rows.iter().filter(|r| r["error"].is_null()) {
+        assert_eq!(
+            row["item"],
+            db.item("Bob", row["node"].as_i64().unwrap()).unwrap()
+        );
+    }
+    assert!(serde_json::to_vec(&batch).unwrap().len() < 768 * 1024);
+}
