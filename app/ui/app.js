@@ -127,9 +127,25 @@ function pushNode(t, it) {
 }
 function seedHistory(record) {
   if (typeof record.head !== 'number') return;
-  const t = transcript(record.name); if (t.seeded) return; t.seeded = true;
+  const t = transcript(record.name);
+  if (t.seeded) {
+    if (t.seedSession === S.session) return;
+    t.seedSession = S.session;
+    if (record.head <= t.seedHead) return;
+    // Replay can omit any retained-event prefix after a disconnect. Rebuild
+    // the covered cache from lineage rather than guessing which nodes are missing.
+    // Keep peer/activity rows and nodes committed after this snapshot's head.
+    t.items = t.items.flatMap(it => {
+      if (it.kind === 'history') return it.next - (it.exclusive ? 1 : 0) > record.head ? [{...it,min:Math.max(it.min ?? 0,record.head + 1),seed:false}] : [];
+      const node = it.kind === 'node' ? it.node : it.from;
+      return node == null || node > record.head ? [it] : [];
+    });
+    t.nodes = t.thoughts = t.longOut = t.bytes = 0;
+    for (const it of t.items) count(t, it, 1);
+  }
+  t.seeded = true; t.seedSession = S.session; t.seedHead = record.head;
   const ids = t.items.map(it => it.kind === 'node' ? it.node : it.from).filter(id => id != null);
-  const first = ids.length ? Math.min(...ids) : null;
+  const first = ids.length && Math.min(...ids) <= record.head ? Math.min(...ids) : null;
   t.seed = {kind:'history',next:first ?? record.head,exclusive:first != null,seed:true};
   t.items.unshift(t.seed); normalizeRanges(t); t.gen += 1;
 }
@@ -259,7 +275,7 @@ async function onEvent(ev) {
     case 'queued': {
       // `ready` waits for a daemon-wide slot with nothing else running on the bot; `queued` sits behind its own turn.
       const b = bot(name); const behindOwn = !!b && (b.runningTurn !== null || isActive(b.status));
-      if (b && !behindOwn) b.status = data.status ?? 'queued';
+      if (b && !behindOwn) { b.status = data.status ?? 'queued'; b.runningTurn = turn; }
       addItem(transcript(name), { kind: 'note', text: behindOwn ? 'queued behind the running turn' : 'queued for a slot', turn });
       break;
     }
@@ -398,7 +414,14 @@ function entries(item) {
     if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push({ kind: 'out', callId: p.tool_use_id, raw: text(p.content, ['text']), text: shell(text(p.content, ['text'])) }); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
     else out.push({ kind: 'user', text: text(item.content, ['text']) });
   } else if (item.role === 'assistant' && Array.isArray(item.content)) {
-    let t = ''; for (const p of item.content) { if (p.type === 'tool_use') out.push(storedTool(p.name, p.id, JSON.stringify(p.input))); else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: 0 }); else if (p.type === 'text' || p.type === 'output_text') t += p.text ?? ''; } if (t) out.push({ kind: 'text', text: t });
+    for (const p of item.content) {
+      if (p.type === 'tool_use') out.push(storedTool(p.name, p.id, JSON.stringify(p.input)));
+      else if (p.type === 'thinking' && p.thinking) out.push({ kind: 'thought', text: p.thinking, secs: 0 });
+      else if ((p.type === 'text' || p.type === 'output_text') && p.text) {
+        const previous = out.at(-1);
+        if (previous?.kind === 'text') previous.text += p.text; else out.push({kind:'text',text:p.text});
+      }
+    }
   }
   return out;
 }
@@ -408,7 +431,7 @@ async function loadInherited(name, older) {
   if (!ranges.length) return;
   const first = t.items.findIndex((it) => !['node','tool_stub','history','peer_gap'].includes(it.kind));
   const marker = older ? ranges.find((r) => t.items.indexOf(r) <= Math.max(first, 0)) : ranges.findLast((r) => !r.loaded || (r.forward && t.anchor === 'end'));
-  if (!marker || (!older && !marker.forward && t.items.length > WINDOW)) return;
+  if (!marker || (!older && !marker.forward && !marker.seed && t.items.length > WINDOW)) return;
   const at = t.items.indexOf(marker), session = S.session;
   let page;
   try { page = await Daemon.request('history_nodes', { bot: name, from: marker.next, min_node: marker.min ?? null, oldest_first: !!marker.forward, limit: LAZY_ITEMS }); }
@@ -460,11 +483,13 @@ async function loadBatch(name) {
     const rep = [];
     for (const e of es) {
       if (e.kind === 'tool' && it.turn != null && knownCalls.has(JSON.stringify([it.turn, e.callId]))) {
-        const live = t.items.find((row) => row.kind === 'tool' && row.turn === it.turn && row.callId === e.callId);
-        if (live) { live.summary = e.summary; live.background = e.background; live.spawns = e.spawns; live.from = it.node; }
-        continue;
+        const live = t.items.find(row => (row.kind === 'tool' || row.kind === 'tool_stub') && row.turn === it.turn && row.callId === e.callId);
+        if (live) {
+          // Preserve live timing, but the committed block owns its position.
+          Object.assign(e, {started:live.started,took:live.took,done:live.done});
+          count(t, live, -1); t.items.splice(t.items.indexOf(live), 1);
+        }
       }
-      if (e.kind === 'thought') { const prev = t.items[index - 1]; if (prev && prev.kind === 'thought' && prev.turn === it.turn && rep.length === 0) { prev.text = e.text; continue; } }
       rep.push({ ...e, callId: e.callId ?? it.callId, turn: it.turn });
     }
     const size = r.ok ? JSON.stringify(r.ok).length * 2 : 0;
@@ -586,6 +611,12 @@ async function attachOnce() {
     // Gone from the store while this page had no session: its live-only `deleted` notice cannot be
     // replayed. A bot this session's events mentioned was born after its page was listed, not deleted.
     for (const [name, b] of [...S.bots]) if (!listed.has(name) && b.touched !== session) { forgetBot(name); }
+    // Resolve lineage only after all pages are seated: a child can sort before
+    // its parent, and retention may have removed both creation events.
+    for (const b of S.bots.values()) {
+      const parent = creatorOf(b);
+      if (parent) addItem(transcript(parent.name), {kind:'peer',who:b.name,turn:null});
+    }
     S.snapshot = false; S.deleted.clear();
     S.attached = true;
     restore();
@@ -769,17 +800,19 @@ function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyp
 // rebuilt when the fleet's shape changes (a bot created, forked or deleted); a status change patches
 // the bot's own row. A fleet of thousands costs a screenful of rows, not a row each per event.
 const RAIL_ROWS = 300;
-const rail = { shapeGen: -1, rows: [], index: new Map(), start: 0, end: 0, key: '' };
+const rail = { shapeGen: -1, selected: null, rows: [], index: new Map(), start: 0, end: 0, key: '' };
 function railRows() {
   if (rail.shapeGen !== S.shapeGen) { rail.rows = tree(); rail.index = new Map(rail.rows.map((n, i) => [n.b.name, i])); rail.shapeGen = S.shapeGen; rail.key = ''; }
   return rail.rows;
 }
 function renderRail() {
+  const recenter = rail.shapeGen !== S.shapeGen || rail.selected !== S.selected;
   const rows = railRows(); const el = $('bots');
   const sel = rail.index.get(S.selected) ?? 0;
   const key = `${S.shapeGen}|${S.selected}|${rail.start}|${rail.end}`;
   if (rail.key !== key) {
-    if (sel < rail.start || sel >= rail.end || rail.key === '') { rail.start = Math.max(0, sel - RAIL_ROWS / 2); rail.end = Math.min(rows.length, rail.start + RAIL_ROWS); }
+    if (recenter) { rail.start = Math.max(0, sel - RAIL_ROWS / 2); rail.end = Math.min(rows.length, rail.start + RAIL_ROWS); }
+    rail.selected = S.selected;
     rail.key = `${S.shapeGen}|${S.selected}|${rail.start}|${rail.end}`;
     const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
     const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
@@ -796,10 +829,18 @@ function patchRailRow(name) {
   old.outerHTML = botRowHTML(rail.rows[i], name === S.selected);
 }
 $('bots').addEventListener('scroll', () => {
-  const el = $('bots'); const rows = rail.rows; let moved = false;
+  const el = $('bots'); const rows = rail.rows, previousStart = rail.start; let moved = false;
   if (el.scrollTop < 100 && rail.start > 0) { rail.start = Math.max(0, rail.start - RAIL_ROWS / 2); moved = true; }
-  if (el.scrollHeight - el.scrollTop - el.clientHeight < 100 && rail.end < rows.length) { rail.end = Math.min(rows.length, rail.end + RAIL_ROWS / 2); moved = true; }
-  if (moved) { const before = el.scrollHeight; rail.key = ''; renderRail(); if (el.scrollTop < 100) el.scrollTop += el.scrollHeight - before; }
+  else if (el.scrollHeight - el.scrollTop - el.clientHeight < 100 && rail.end < rows.length) { rail.start = Math.min(Math.max(0, rows.length - RAIL_ROWS), rail.start + RAIL_ROWS / 2); moved = true; }
+  if (moved) {
+    rail.end = Math.min(rows.length, rail.start + RAIL_ROWS);
+    const name = rows[Math.max(previousStart, rail.start)]?.b.name;
+    const selector = `.botrow[data-bot="${cssEsc(name)}"]`;
+    const before = el.querySelector(selector)?.offsetTop, top = el.scrollTop;
+    rail.key = ''; renderRail();
+    const after = el.querySelector(selector)?.offsetTop;
+    if (before != null && after != null) el.scrollTop = top + after - before;
+  }
 });
 function botRowHTML(n, sel) {
   const b = n.b;

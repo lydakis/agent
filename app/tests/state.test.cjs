@@ -10,7 +10,7 @@ function page(daemon = {}) {
   const element = () => ({
     children: [], replaceChildren(...nodes) { this.children = nodes; }, dataset: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-    addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
+    listeners: {}, addEventListener(type,fn) { this.listeners[type]=fn; }, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
   });
   const transport = {...daemon, request:async(op,params)=> {
     if(op!=='history_items') return daemon.request(op,params);
@@ -33,7 +33,7 @@ function page(daemon = {}) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { S, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
+    'globalThis.app = { S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -421,4 +421,79 @@ test('a pending process result cannot mutate a reused bot name after reconnect',
   reply.resolve({output:'{"handle":"proc:1"}'});await completing;
   assert.equal(p.transcript('Bob').items.length,0);
   assert.notEqual(p.S.bots.get('Bob').touched,1);
+});
+
+
+test('reconnect after pruning reloads the full lineage in either snapshot/replay order', async () => {
+  for(const snapshotFirst of [true,false]) {
+    const requests=[],p=page(historyDaemon(requests));p.S.session=1;
+    p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
+    p.lost('offline');p.S.session=2;
+    const seat=()=>p.seat({name:'Bob',id:1,head:10},2);
+    if(snapshotFirst)seat();
+    await p.onEvent({event:'pruned',bot:'Bob'});
+    for(const node of [9,10])await p.onEvent({event:'message',bot:'Bob',turn:5,data:{node}});
+    if(!snapshotFirst)seat();
+    await p.load('Bob');p.transcript('Bob').anchor='top';await p.load('Bob',true);
+    const ids=p.transcript('Bob').items.filter(it=>it.from!=null).map(it=>it.from);
+    assert.deepEqual(Array.from(ids).sort((a,b)=>a-b),Array.from({length:10},(_,i)=>i+1));
+    assert.equal(new Set(ids).size,ids.length);
+    const loads=requests.length;p.seat({name:'Bob',id:1,head:10},2);await p.load('Bob');
+    assert.equal(requests.length,loads,'same-session snapshots do not reload covered history');
+  }
+});
+
+test('rail scrolling moves a bounded window both ways independently of selection', () => {
+  const p=page();p.S.ui.rail=true;
+  for(let i=0;i<1000;i++)p.upsert({name:`bot${i}`,id:i+1});
+  p.S.selected='bot0';p.renderRail();const el=p.elements.get('bots');
+  el.scrollHeight=1000;el.clientHeight=100;
+  for(let i=0;i<6;i++){el.scrollTop=900;el.listeners.scroll();assert.ok((el.innerHTML.match(/data-bot=/g)||[]).length<=300);}
+  assert.match(el.innerHTML,/data-bot="bot999"/);
+  assert.equal(p.S.selected,'bot0');
+  for(let i=0;i<6;i++){el.scrollTop=0;el.listeners.scroll();}
+  assert.match(el.innerHTML,/data-bot="bot0"/);
+  p.S.selected='bot900';p.renderRail();assert.match(el.innerHTML,/data-bot="bot900"/);
+});
+
+
+test('a delayed reconnect snapshot preserves newer folded replay ranges', async () => {
+  const p=page(historyDaemon());p.S.session=1;p.upsert({name:'Bob',id:1,head:2});await p.load('Bob');
+  p.lost('offline');p.S.session=2;
+  for(let node=9;node<=6000;node++)await p.onEvent({event:'message',bot:'Bob',turn:node,data:{node}});
+  p.seat({name:'Bob',id:1,head:10},2);
+  const t=p.transcript('Bob');
+  const covered=node=>t.items.some(it=>it.node===node||it.from===node||it.kind==='history'&&(it.min??0)<=node&&node<=(it.next-(it.exclusive?1:0)));
+  for(let node=1;node<=6000;node++)assert.ok(covered(node),`lost node ${node}`);
+  p.evict(t);
+  assert.ok(t.items.length<=1605,'recovery retains bounded metadata');
+});
+
+
+test('snapshot-only lineage restores bounded peer cards regardless of page order', async () => {
+  const p=page({setup:async()=>({}),attach:async()=>({session:1}),pull:()=>new Promise(()=>{}),request:async(op,q)=> {
+    assert.equal(op,'bots');return q.after ? {bots:[{name:'parent',id:1,provider:'test'}]} : {bots:Array.from({length:1000},(_,i)=>({name:`child${i}`,id:i+2,provider:'test',created_by:'parent',created_by_id:1})),next_after:'children'};
+  }});
+  await p.attach();const t=p.transcript('parent');
+  assert.ok(t.peers.includes('child999'));assert.ok(t.peers.length<=600);
+  assert.equal(t.items.filter(it=>it.kind==='peer').length,t.peers.length);
+});
+
+test('Anthropic block order is identical in live and replayed tool transcripts', async () => {
+  const item={role:'assistant',content:[{type:'text',text:'before'},{type:'tool_use',name:'read',id:'c',input:{path:'x'}},{type:'text',text:'after'}]};
+  for(const live of [false,true]) {
+    const p=page({request:async()=>item});
+    await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}});
+    if(live)await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{call_id:'c',name:'read',arguments:'{"path":"x"}'}});
+    await p.loadBatch('Bob');const rows=p.transcript('Bob').items;
+    assert.deepEqual(Array.from(rows,it=>it.kind),['text','tool','text']);
+    assert.equal(rows[0].text,'before');assert.equal(rows[2].text,'after');
+  }
+});
+
+test('ready work is interruptible while later queued work preserves the active turn', async () => {
+  const calls=[];const p=page({request:async(op,q)=>{calls.push([op,q]);}});p.upsert({name:'Bob',id:1});p.S.selected='Bob';
+  await p.onEvent({event:'queued',bot:'Bob',turn:7,data:{status:'ready'}});
+  await p.onEvent({event:'queued',bot:'Bob',turn:8,data:{status:'queued'}});
+  await p.interrupt();assert.equal(calls.length,1);assert.equal(calls[0][1].turn,7);
 });

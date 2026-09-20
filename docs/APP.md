@@ -213,3 +213,15 @@ between live delivery and replay, reconciles fork snapshot/replay ordering,
 and rejects late process/history replies from a replaced session or bot.
 Disconnect drops non-durable stream buffers; committed nodes remain the source
 of transcript content.
+
+On reconnect, an advanced snapshot head invalidates the older decoded history
+cache and reseeds it from durable lineage. This recovers messages whose activity
+events were pruned while disconnected; newer replay nodes and ranges are kept.
+The rail slides a fixed 300-row window in either direction and anchors an
+overlapping row to preserve scroll position. Only selection or fleet-shape
+changes recenter it.
+
+Snapshot lineage also restores peer cards after creation events are pruned,
+including children listed before their parents. Anthropic content blocks keep
+their stored order in both live and replayed transcripts. Ready submissions
+retain their turn ID so Escape can cancel work waiting for a runtime slot.
