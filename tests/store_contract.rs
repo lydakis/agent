@@ -1153,21 +1153,46 @@ fn fork_lineage_pages_are_bounded_and_survive_source_deletion() {
         .unwrap();
     db.finish(later, None).unwrap();
     let unrelated = db.inspect("source").unwrap().head.unwrap();
-    assert!(db.history_nodes("branch", Some(unrelated), 1).is_err());
-    assert!(db.history_nodes("branch", None, 0).is_err());
-    assert!(db.history_nodes("branch", None, 401).is_err());
+    assert!(
+        db.history_nodes("branch", Some(unrelated), 1, None, false)
+            .is_err()
+    );
+    assert!(db.history_nodes("branch", None, 0, None, false).is_err());
+    assert!(db.history_nodes("branch", None, 401, None, false).is_err());
     db.delete_bot("source").unwrap();
-    let first = db.history_nodes("branch", Some(checkpoint), 1).unwrap();
+    let first = db
+        .history_nodes("branch", Some(checkpoint), 1, None, false)
+        .unwrap();
     assert_eq!(first["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(first["nodes"][0]["node"], checkpoint);
+    assert_eq!(first["nodes"][0]["turn"], turn);
     let older = first["next_from"].as_i64().unwrap();
-    let second = db.history_nodes("branch", Some(older), 1).unwrap();
+    let forward = db
+        .history_nodes("branch", Some(checkpoint), 1, Some(older), true)
+        .unwrap();
+    assert_eq!(forward["nodes"][0]["node"], older);
+    assert_eq!(forward["nodes"][0]["turn"], turn);
+    let forward = db
+        .history_nodes(
+            "branch",
+            Some(checkpoint),
+            1,
+            forward["next_newer"].as_i64(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(forward["nodes"][0]["node"], checkpoint);
+    assert!(forward["next_newer"].is_null());
+    let second = db
+        .history_nodes("branch", Some(older), 1, None, false)
+        .unwrap();
     assert_eq!(second["nodes"][0]["node"], older);
+    assert_eq!(second["nodes"][0]["turn"], turn);
     assert!(second["next_from"].is_null());
     assert_eq!(db.item("branch", older).unwrap()["role"], "user");
     db.create("empty", None, binding()).unwrap();
     assert_eq!(
-        db.history_nodes("empty", None, 10).unwrap()["nodes"],
+        db.history_nodes("empty", None, 10, None, false).unwrap()["nodes"],
         json!([])
     );
 }
@@ -3534,4 +3559,68 @@ fn stale_prune_piece_preserves_replacement_records() {
         assert_eq!(stored(&mut db, "Bob"), history);
     }
     assert!(db.prune("Bob", 1).unwrap()["events"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn lineage_pages_preserve_turns_and_visit_every_node_in_both_directions() {
+    let mut db = db();
+    db.create("source", Some("/synthetic"), binding()).unwrap();
+    let mut expected = Vec::new();
+    for i in 0..6 {
+        let turn = db
+            .begin(
+                "source",
+                &format!("r{i}"),
+                "prompt",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let user = db.inspect("source").unwrap().head.unwrap();
+        db.append(turn, vec![assistant("answer")], &[], None)
+            .unwrap();
+        let reply = db.inspect("source").unwrap().head.unwrap();
+        db.finish(turn, None).unwrap();
+        expected.extend([(user, turn), (reply, turn)]);
+    }
+    db.fork("source", "branch", Fork::default()).unwrap();
+    db.delete_bot("source").unwrap();
+    let mut backward = Vec::new();
+    let mut from = None;
+    loop {
+        let page = db.history_nodes("branch", from, 3, None, false).unwrap();
+        backward.extend(
+            page["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| (n["node"].as_i64().unwrap(), n["turn"].as_i64().unwrap())),
+        );
+        from = page["next_from"].as_i64();
+        if from.is_none() {
+            break;
+        }
+    }
+    backward.reverse();
+    assert_eq!(backward, expected);
+    let mut forward = Vec::new();
+    let mut min = None;
+    loop {
+        let page = db.history_nodes("branch", None, 3, min, true).unwrap();
+        forward.extend(
+            page["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .map(|n| (n["node"].as_i64().unwrap(), n["turn"].as_i64().unwrap())),
+        );
+        min = page["next_newer"].as_i64();
+        if min.is_none() {
+            break;
+        }
+    }
+    assert_eq!(forward, expected);
 }

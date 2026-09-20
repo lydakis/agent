@@ -10,7 +10,7 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedWriteHalf},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
 };
 
 #[derive(Debug, Clone)]
@@ -63,6 +63,29 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 /// Notifications queued ahead of the UI before the session is let go.
 /// Larger than any replay page, so a normal attach never trips it.
 const QUEUE: usize = 4096;
+const QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+struct Notification {
+    encoded: String,
+    _bytes: Option<OwnedSemaphorePermit>,
+}
+
+/// Encoded notifications share an 8 MiB budget, released as callers drain them.
+/// Keeping the wire representation also bounds allocations for nested JSON.
+pub struct Events(mpsc::Receiver<Notification>);
+impl Events {
+    pub async fn recv(&mut self) -> Option<Value> {
+        self.0
+            .recv()
+            .await
+            .map(|event| serde_json::from_str(&event.encoded).expect("validated notification"))
+    }
+    pub fn try_recv(&mut self) -> std::result::Result<Value, mpsc::error::TryRecvError> {
+        self.0
+            .try_recv()
+            .map(|event| serde_json::from_str(&event.encoded).expect("validated notification"))
+    }
+}
 
 pub struct Client {
     writer: Mutex<OwnedWriteHalf>,
@@ -84,7 +107,7 @@ impl Client {
     /// cannot grow it without limit. When it fills, the reader does what the
     /// daemon does to a lagging follower: it drops the session and tells the
     /// UI `follow_lagged`, and the UI attaches again from its cursor.
-    pub async fn connect(socket: &Path) -> Result<(Arc<Self>, mpsc::Receiver<Value>)> {
+    pub async fn connect(socket: &Path) -> Result<(Arc<Self>, Events)> {
         let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
             .await
             .map_err(|_| Error::new("daemon_connect_timeout"))?
@@ -107,6 +130,7 @@ impl Client {
         let pending: Pending = Arc::default();
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
+        let budget = Arc::new(Semaphore::new(QUEUE_BYTES));
         let routed = pending.clone();
         let gone = closed.clone();
         tokio::spawn(async move {
@@ -121,14 +145,28 @@ impl Client {
                             let _ = sender.send(message);
                         }
                     }
-                    None => match events.try_send(message) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                    None => {
+                        let Ok(size) = u32::try_from(line.len()) else {
                             lagged = true;
                             break;
+                        };
+                        let Ok(bytes) = budget.clone().try_acquire_many_owned(size) else {
+                            lagged = true;
+                            break;
+                        };
+                        drop(message);
+                        match events.try_send(Notification {
+                            encoded: line,
+                            _bytes: Some(bytes),
+                        }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                lagged = true;
+                                break;
+                            }
                         }
-                    },
+                    }
                 }
             }
             // The socket is gone, or we let go of it: every request still
@@ -144,7 +182,7 @@ impl Client {
             drop(lines);
             if lagged {
                 let _ = events
-                    .send(json!({"event": "follow_lagged", "durable": false, "reason": "client_lagged"}))
+                    .send(Notification { encoded: json!({"event": "follow_lagged", "durable": false, "reason": "client_lagged"}).to_string(), _bytes: None })
                     .await;
             }
         });
@@ -155,7 +193,7 @@ impl Client {
                 next: std::sync::atomic::AtomicU64::new(0),
                 closed,
             }),
-            receiver,
+            Events(receiver),
         ))
     }
 

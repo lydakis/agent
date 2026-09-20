@@ -24,7 +24,7 @@ struct Shared {
     session: std::sync::atomic::AtomicU64,
     /// The attached session's notifications. `pull` takes the receiver out
     /// while it waits and puts it back, so an attach never waits on a pull.
-    events: Mutex<Option<(u64, tokio::sync::mpsc::Receiver<Value>)>>,
+    events: Mutex<Option<(u64, agent_client::Events)>>,
 }
 
 /// Notifications handed to the page per pull. Small enough that the page
@@ -175,10 +175,14 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
     let Some(first) = events.recv().await else {
         return Ok(closed);
     };
+    let mut bytes = first.to_string().len();
     let mut batch = vec![first];
-    while batch.len() < PULL {
+    while batch.len() < PULL && bytes < 1024 * 1024 {
         match events.try_recv() {
-            Ok(event) => batch.push(event),
+            Ok(event) => {
+                bytes += event.to_string().len();
+                batch.push(event);
+            }
             Err(_) => break,
         }
     }

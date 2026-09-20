@@ -513,10 +513,16 @@ own path from the turn. Example requests:
 
 `history_nodes` lists immutable node references in a bot's lineage, newest first,
 including inherited fork history. `from` is an inclusive node ID and defaults to
-the current head. The response contains `nodes: [{node: ID}, ...]` and
+the current head. The response contains `nodes: [{node: ID, turn: TURN_ID}, ...]` and
 `next_from`, the next older node or null at the root. `limit` defaults to 400
 and must be 1 through 400. Bodies are fetched through `item`; pagination does
-not copy bodies. Membership validation walks the lineage, as `item` does.
+not copy bodies. `min_node` optionally bounds the oldest included ID.
+`oldest_first: true` selects the oldest page within that range while still
+returning its nodes newest first; `next_newer` is the inclusive minimum ID for
+the next forward page, or null. This lets clients retain only range endpoints.
+Turn IDs are inherited from each node's nearest turn-start ancestor.
+Membership validation walks the lineage, as `item` does. Both operations run
+on the read worker in a consistent snapshot, avoiding the serialized writer.
 The fork can read its shared prefix after its source is deleted.
 
 ## Fleet controllers

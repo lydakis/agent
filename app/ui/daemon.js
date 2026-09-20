@@ -22,9 +22,9 @@ window.Daemon = (() => {
   }
 
   // ---------- demo daemon ----------
-  const S = { bots: new Map(), nodes: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set() };
+  const S = { bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set() };
   // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
-  const emit = (event) => { if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
+  const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
@@ -190,6 +190,14 @@ window.Daemon = (() => {
     request: async (op, params = {}) => {
       switch (op) {
         case 'bots': return { bots: [...S.bots.values()].map((b) => ({ ...b })), next_after: null };
+        case 'history_nodes': {
+          const all = (S.lineages.get(params.bot) ?? []).filter(n => n.node <= (params.from ?? Infinity) && n.node >= (params.min_node ?? 0));
+          const limit = params.limit ?? 400;
+          const page = params.oldest_first ? all.slice(0,limit) : all.slice(-limit);
+          const next_from = all.findLast(n=>n.node < (page[0]?.node ?? 0))?.node ?? null;
+          const next_newer = all.find(n=>n.node > (page.at(-1)?.node ?? Infinity))?.node ?? null;
+          return {nodes:page.slice().reverse(),next_from,next_newer};
+        }
         case 'item': { const item = S.nodes.get(params.node); if (!item) throw new Error('item_not_in_bot_history'); return item; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null); return { ...S.bots.get(params.bot) }; }

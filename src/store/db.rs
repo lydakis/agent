@@ -2290,32 +2290,87 @@ impl Database {
     }
     /// Page immutable lineage metadata newest first, including a fork's shared prefix.
     /// `from` is inclusive; `next_from` is the parent to pass for the next page.
-    pub fn history_nodes(&self, name: &str, from: Option<i64>, limit: usize) -> Result<Value> {
+    pub fn history_nodes(
+        &self,
+        name: &str,
+        from: Option<i64>,
+        limit: usize,
+        min_node: Option<i64>,
+        oldest_first: bool,
+    ) -> Result<Value> {
         if !(1..=400).contains(&limit) {
             return fail("invalid_history_limit");
         }
+        let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;
         let mut next = from.or(head);
+        let range_head = next;
+        let floor = min_node.unwrap_or(0);
         if let Some(wanted) = from
             && !self.in_lineage(head, wanted)?
         {
             return fail("item_not_in_bot_history");
         }
+        if oldest_first {
+            // Node IDs increase along every lineage, including forks. Find the
+            // first bounded page after the visible window on the read worker.
+            let ids = self.conn.prepare_cached(
+                "WITH RECURSIVE chain(id,parent) AS (
+                    SELECT id,parent FROM nodes WHERE id=?1 AND id>=?2
+                    UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
+                 ) SELECT id FROM chain ORDER BY id LIMIT ?3"
+            )?.query_map(params![next, floor, limit as i64], |r| r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            next = ids.last().copied();
+        }
         let mut nodes = Vec::with_capacity(limit);
         let mut statement = self
             .conn
-            .prepare_cached("SELECT parent FROM nodes WHERE id=?")?;
-        while let Some(id) = next {
-            let parent: Option<i64> = statement.query_row([id], |r| r.get(0))?;
-            nodes.push(json!({"node":id}));
+            .prepare_cached("SELECT parent,turn FROM nodes WHERE id=?")?;
+        let mut unassigned = 0;
+        while let Some(id) = next.filter(|id| *id >= floor) {
+            let (parent, turn): (Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            nodes.push(json!({"node":id,"turn":null}));
+            if let Some(turn) = turn {
+                for node in &mut nodes[unassigned..] {
+                    node["turn"] = json!(turn);
+                }
+                unassigned = nodes.len();
+            }
             next = parent;
             if nodes.len() == limit {
                 break;
             }
         }
-        Ok(json!({"nodes":nodes,"next_from":next}))
+        // Only turn-start nodes carry a turn. Complete a page ending mid-turn by
+        // finding its nearest start, including retained nodes of a deleted source.
+        let mut ancestor = next;
+        while unassigned < nodes.len() {
+            let Some(id) = ancestor else {
+                break;
+            };
+            let (parent, turn): (Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if let Some(turn) = turn {
+                for node in &mut nodes[unassigned..] {
+                    node["turn"] = json!(turn);
+                }
+                break;
+            }
+            ancestor = parent;
+        }
+        let next_newer = nodes
+            .first()
+            .and_then(|n| n["node"].as_i64())
+            .filter(|id| Some(*id) != range_head)
+            .map(|id| id + 1);
+        snapshot.commit()?;
+        Ok(
+            json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),"next_newer":next_newer}),
+        )
     }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
+        let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;
         if !self.in_lineage(head, wanted)? {
             return fail("item_not_in_bot_history");
@@ -2323,6 +2378,7 @@ impl Database {
         let item: Vec<u8> =
             self.conn
                 .query_row("SELECT item FROM nodes WHERE id=?", [wanted], |r| r.get(0))?;
+        snapshot.commit()?;
         Ok(serde_json::from_slice(&item)?)
     }
     /// A bot's turns in id order, paged by `after`, with accounting a program

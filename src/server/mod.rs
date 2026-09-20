@@ -117,6 +117,9 @@ enum Command {
         bot: String,
         from: Option<i64>,
         limit: Option<usize>,
+        min_node: Option<i64>,
+        #[serde(default)]
+        oldest_first: bool,
     },
     Item {
         bot: String,
@@ -1155,14 +1158,20 @@ impl Service {
                     .op("events", move |db| db.events(&bot, after, limit))
                     .await
             }
-            Command::HistoryNodes { bot, from, limit } => {
+            Command::HistoryNodes {
+                bot,
+                from,
+                limit,
+                min_node,
+                oldest_first,
+            } => {
                 store
-                    .op("history_nodes", move |db| {
-                        db.history_nodes(&bot, from, limit.unwrap_or(400))
+                    .read("history_nodes", move |db| {
+                        db.history_nodes(&bot, from, limit.unwrap_or(400), min_node, oldest_first)
                     })
                     .await
             }
-            Command::Item { bot, node } => store.op("item", move |db| db.item(&bot, node)).await,
+            Command::Item { bot, node } => store.read("item", move |db| db.item(&bot, node)).await,
             Command::Artifact {
                 bot,
                 turn,

@@ -99,33 +99,34 @@ instead.
 
 ## What it costs, and where the bounds are
 
-Every path that runs per event or per draw is bounded by what is on screen,
-not by the history or the fleet:
+The UI bounds payload buffering, history decoding, and rendered fleet rows:
 
 - **Attach** replays events from the page's cursor, which on a first start is
   the beginning of the daemon's retained log. That log is bounded by the
   daemon's retention (`--retain-turns`, `prune`), and a `pruned` notice marks
   the gap. Nothing is staged on the way: the page pulls the replay a batch
-  at a time and applies each before the next, so the transport's 4,096-event
-  queue is the only buffer between the daemon and the screen, and a page
+  at a time and applies each before the next, so the transport's 4,096-event / 8 MiB encoded
+  queue is the buffer between the daemon and the screen, and pulls also stop at 1 MiB (plus one event). A page
   slower than the fleet is told it lagged and attaches again from its
   cursor. The snapshot is paged (256 bots a request) while the replay flows;
   a bot the replay already spoke of keeps the state those events built and
   takes only the record's static fields, a bot an event names before its
   record arrives gets a seat at once, and a listed bot nothing mentioned is
-  seated from its record.
-- **Transcripts** keep a window of 1,200 decoded items around whichever end
-  the reader is at; bodies outside it fold back into their history nodes, and
-  a scroll toward them loads the next batch of 400. A run of unloaded nodes
-  renders as one placeholder row, so unloaded history costs one element per
-  gap. Event-derived tool rows fold into compact summaries and reappear on
-  scroll; their original argument previews are discarded after folding. A fork
-  pages its inherited node references from the fork checkpoint using
-  `history_nodes`, then decodes only the requested window, even when its source
-  was deleted. Counters (thoughts, long outputs, peers) are kept in step with the
-  items, so the key bar reads them. Peer cards compact from 601 to the newest
-  300 with a count of earlier peers; older bots remain reachable through the
-  switcher. Deleted peers leave the parent transcript.
+  seated from its record. Session tombstones keep late snapshot pages from
+  restoring a deleted identity; touched identities take precedence over stale records.
+- **Transcripts** keep at most 1,200 decoded entries and an 8 MiB serialized JSON budget
+  (measured as UTF-16 strings) around the reader's window (up to 400 entries of count hysteresis).
+  Eviction folds whole durable nodes, tool rows and process cards into ranges
+  with only endpoint IDs, rather than retaining an object for every old node.
+  Scrolling loads at most 400 references in either direction, including a fork's
+  inherited history after its source is deleted. Item bodies are fetched one at
+  a time; a load stops at the byte budget instead of collecting 400 large replies.
+  Turn identities survive pagination. Specialized process cards consume only
+  recognized output; unsuccessful tool results remain visible. Counters for
+  thoughts, long outputs and peers are updated with the items. Peer cards compact
+  from 601 to the newest 300 with a count of earlier peers; older bots remain
+  reachable through the switcher. Both creation and fork events insert creator
+  peer cards, and deletion removes them.
 - **Rendering** rebuilds the window's HTML only on a structural change (a
   load, a fold, another bot). Items appended since the last render are added
   on their own; a tool finishing or a process ending replaces its own line; a
@@ -145,7 +146,7 @@ not by the history or the fleet:
 - **Sessions** count up; an event from an older session is dropped, a
   submission carries the bot id on screen, and a bot that reappears under a
   known name with a new id starts from nothing. A lagged stream (the core's
-  4,096-event queue filled) closes the transport, fails every request made
+  event count or 8 MiB byte budget filled) closes the transport, fails every request made
   after that at once, and the page attaches again from its cursor, from
   outside the event chain so the attach cannot wait on itself. A new attach
   lets the previous session's socket go first, so a pull still waiting on it
