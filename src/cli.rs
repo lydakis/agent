@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -178,6 +178,28 @@ fn print_flags(flags: &str) {
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
             "--context-bytes" => ("N", "Maximum model context bytes"),
             "--context-items" => ("N", "Maximum model context items"),
+            "--note-turns" => ("N", "Omitted turns the context note lists; 0 lists none"),
+            "--compact-at" => (
+                "PERCENT",
+                "Compact when the window holds this share of the context budget",
+            ),
+            "--compact-keep" => (
+                "PERCENT",
+                "Share of the context budget kept verbatim at compaction",
+            ),
+            "--compaction-instructions" => (
+                "TEXT",
+                "A new bot's summarizer instructions; default: the built-in text",
+            ),
+            "--compaction-instructions-file" => (
+                "FILE",
+                "Read a new bot's summarizer instructions from a file",
+            ),
+            "--compaction-model" => (
+                "PROVIDER/MODEL",
+                "A new bot's summarizer; default: its own model",
+            ),
+            "--no-compaction" => ("", "Create the bot without compaction"),
             "--retain-turns" => ("N", "Automatically retain N turns' operational records"),
             _ => unreachable!("flag missing help"),
         };
@@ -235,7 +257,13 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         out.push(flag.to_owned());
         if matches!(
             flag,
-            "--pretty" | "--no-spawn" | "--new" | "--detach" | "--all" | "--any"
+            "--pretty"
+                | "--no-spawn"
+                | "--new"
+                | "--detach"
+                | "--all"
+                | "--any"
+                | "--no-compaction"
         ) {
             if inline.is_some() {
                 return fail_with("usage", format!("{flag} takes no value"));

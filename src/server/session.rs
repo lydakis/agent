@@ -8,6 +8,9 @@ use tokio::{
     sync::mpsc,
 };
 
+// A request is handed over once, by value, through a channel; the parsed
+// command's size is not worth an allocation per message.
+#[allow(clippy::large_enum_variant)]
 pub enum Inbound {
     Open(u64, Output),
     Request(u64, Result<Request>),

@@ -34,6 +34,25 @@ class Model(http.server.BaseHTTPRequestHandler):
                     gate.wait(timeout=5)
             if hasattr(self.server, 'expected_authorization'):
                 self.server.auth_checks.append(self.headers.get('Authorization') == self.server.expected_authorization)
+            if getattr(self.server, 'reject_compaction', False) and request.get('instructions') == 'Summarize.':
+                body = b'{"error":{"message":"synthetic compaction refusal"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
+            if request.get('instructions') == 'Summarize.' and getattr(self.server, 'compaction_refusals', 0):
+                self.server.compaction_refusals -= 1
+                body = b'{"error":{"message":"synthetic compaction rate limit"}}'
+                self.send_response(429)
+                self.send_header('Content-Length', str(len(body)))
+                # Exhaust retries quickly, then force the ordinary call to park.
+                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             assert self.path == '/v1/responses'
             assert request['model'] == 'synthetic-model'
             user = [i for i in request['input'] if i.get('role') == 'user'][-1]['content'][0]['text']
@@ -104,6 +123,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'bg-1',
                            'arguments': json.dumps({'command': command,
                                'timeout_ms': getattr(self.server, 'background_timeout_ms', 5000), 'background': True})}]
+            elif user.startswith('note:') and last.get('type') != 'function_call_output':
+                text = ''
+                output = [{'type': 'function_call', 'name': 'note', 'call_id': 'note-1',
+                           'arguments': json.dumps({'text': user[5:]})}]
             elif user.startswith('readart:'):
                 text = ''
                 reference, _, rest = user[8:].partition(' ')
@@ -165,6 +188,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                            'content': [{'type': 'output_text', 'text': text}]}]
             if getattr(self.server, 'history_reasoning', None):
                 output.insert(0, self.server.history_reasoning)
+            if getattr(self.server, 'empty_compaction', False) and request.get('instructions') == 'Summarize.':
+                text, output = '', []
             events = [{'type': 'response.created', 'response': {'id': 'response_test'}}]
             if text:
                 events.append({'type': 'response.output_text.delta', 'delta': text})
@@ -240,6 +265,20 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == {'type': 'ephemeral'}
             assert request['cache_control'] == {'type': 'ephemeral'}
+            summary = request.get('system', [{}])[0].get('text') == 'Summarize.'
+            history_uses_tools = any(b['type'] in ('tool_use', 'tool_result')
+                                     for m in request['messages'] for b in m['content'])
+            if (history_uses_tools and not request.get('tools')) or (
+                    summary and request.get('tools') and request.get('tool_choice') != {'type': 'none'}):
+                body = b'{"error":{"message":"tool history needs definitions; summarization must disable tool calls"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
+            if not summary:
+                assert 'tool_choice' not in request
             assert [t['name'] for t in request['tools']] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
@@ -349,6 +388,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
 
 class ModelFixture(unittest.TestCase):
+    handler = Model
+
     def setUp(self):
         root = Path(__file__).resolve().parent.parent
         self.temp = tempfile.TemporaryDirectory(dir=root / '.local')
@@ -356,7 +397,7 @@ class ModelFixture(unittest.TestCase):
         self.path = Path(self.temp.name)
         class Server(http.server.ThreadingHTTPServer):
             request_queue_size = 128
-        self.model = Server(('127.0.0.1', 0), Model)
+        self.model = Server(('127.0.0.1', 0), self.handler)
         self.model.requests = queue.Queue()
         self.model.daemon_threads = True
         self.worker = threading.Thread(target=self.model.serve_forever, daemon=True)

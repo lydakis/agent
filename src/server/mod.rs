@@ -51,6 +51,10 @@ enum Command {
         budget_tokens: Option<u64>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
+        /// Compaction instructions and an optional summarizer model, both
+        /// the client's; without instructions the bot never compacts.
+        compaction_instructions: Option<String>,
+        compaction_model: Option<String>,
     },
     Resume {
         bot: String,
@@ -236,6 +240,13 @@ pub struct Configuration {
     /// history itself is unbounded. Defaults 8 MiB and 4,096 items.
     pub context_bytes: Option<usize>,
     pub context_items: Option<usize>,
+    /// Omitted turns the context note lists, newest first; zero lists none.
+    /// Default 48.
+    pub note_turns: Option<usize>,
+    /// Compaction threshold and verbatim tail as percentages of the context
+    /// budget; defaults 75 and 25.
+    pub compact_at: Option<usize>,
+    pub compact_keep: Option<usize>,
     /// Prune every bot to this many turns' records after each of its turns
     /// finishes; none by default.
     pub retain_turns: Option<usize>,
@@ -253,6 +264,11 @@ pub struct Limits {
     pub connections: usize,
     pub context_bytes: usize,
     pub context_items: usize,
+    pub note_turns: usize,
+    /// Compaction fires at a round boundary once the window holds this
+    /// percentage of `context_bytes`, keeping `compact_keep` percent verbatim.
+    pub compact_at: usize,
+    pub compact_keep: usize,
 }
 pub const MIN_CONTEXT_BYTES: usize = 1024;
 pub const MIN_CONTEXT_ITEMS: usize = 2;
@@ -277,6 +293,9 @@ impl Limits {
                 .unwrap_or(8 * 1024 * 1024)
                 .max(MIN_CONTEXT_BYTES),
             context_items: config.context_items.unwrap_or(4096).max(MIN_CONTEXT_ITEMS),
+            note_turns: config.note_turns.unwrap_or(48),
+            compact_at: config.compact_at.unwrap_or(75),
+            compact_keep: config.compact_keep.unwrap_or(25),
         }
     }
 }
@@ -441,6 +460,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
+            "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
             "retain_turns":config.retain_turns},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
@@ -823,6 +843,9 @@ impl Service {
             background_failures: self.background_failures.clone(),
             context_bytes: self.limits.context_bytes,
             context_items: self.limits.context_items,
+            note_turns: self.limits.note_turns,
+            compact_at: self.limits.compact_at,
+            compact_keep: self.limits.compact_keep,
             resume,
             steers,
             tokens: self.tokens.clone(),
@@ -884,6 +907,8 @@ impl Service {
                 reasoning,
                 budget_tokens,
                 tools,
+                compaction_instructions,
+                compaction_model,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
@@ -910,6 +935,24 @@ impl Service {
                 }
                 let tools = tools.ok_or(Error::new("tools_required"))?;
                 self.registry.validate(&tools)?;
+                if compaction_instructions
+                    .as_ref()
+                    .is_some_and(|text| text.len() > 64 * 1024)
+                {
+                    return fail("instructions_limit");
+                }
+                // The summarizer must speak the bot's family: its items are
+                // stored in that encoding and go to the summarizer as they are.
+                if let Some(reference) = &compaction_model {
+                    let (summarizer, _) = split_model(reference)?;
+                    let known = self
+                        .providers
+                        .get(summarizer)
+                        .ok_or(Error::with("provider_unavailable", summarizer))?;
+                    if known.family() != family {
+                        return fail_with("provider_family_mismatch", reference.clone());
+                    }
+                }
                 let (provider, model) = (provider.to_owned(), model.to_owned());
                 let (created, event) = store
                     .op("create", move |db| {
@@ -924,6 +967,8 @@ impl Service {
                                 reasoning: reasoning.as_deref(),
                                 budget_tokens,
                                 tools: &tools,
+                                compaction_instructions: compaction_instructions.as_deref(),
+                                compaction_model: compaction_model.as_deref(),
                             },
                         )
                     })
@@ -1452,6 +1497,8 @@ mod tests {
                         reasoning: None,
                         budget_tokens: None,
                         tools: &[],
+                        compaction_instructions: None,
+                        compaction_model: None,
                     },
                 )?;
                 let turn = db
@@ -1496,6 +1543,9 @@ mod tests {
                 connections: 11,
                 context_bytes: 8 << 20,
                 context_items: 4096,
+                note_turns: 48,
+                compact_at: 75,
+                compact_keep: 25,
             },
             retain_turns: None,
             sessions: 0,
@@ -1628,6 +1678,8 @@ mod tests {
             reasoning: None,
             budget_tokens: None,
             tools: &[],
+            compaction_instructions: None,
+            compaction_model: None,
         };
         let turn = store
             .op("create", move |db| {
@@ -1672,6 +1724,9 @@ mod tests {
                 connections: 11,
                 context_bytes: 8 << 20,
                 context_items: 4096,
+                note_turns: 48,
+                compact_at: 75,
+                compact_keep: 25,
             },
             retain_turns: None,
             sessions: 0,

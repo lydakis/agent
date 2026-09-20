@@ -14,6 +14,14 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
+/// What the CLI tells a new bot's summarizer at compaction. The daemon has
+/// no such text; a bot created without any never compacts.
+const DEFAULT_COMPACTION_INSTRUCTIONS: &str = "You are summarizing the earlier part of an agent's conversation so the agent can continue \
+with the summary in place of those turns. Any earlier summary is given first; merge it with the new turns, do not restart. \
+Write, in order: the goal; every rule, constraint, or preference the user stated, verbatim where wording matters; \
+what is done, in progress, and blocked; key decisions and why; files read or changed; open questions; next steps. \
+Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. \
+Reply with the summary only.";
 /// What a new bot is told when the caller gives no instructions. The
 /// daemon has no such text; the bot keeps whatever it was created with.
 const DEFAULT_INSTRUCTIONS: &str = "You are a software engineering agent working in the current workspace. \
@@ -55,6 +63,10 @@ struct Options {
     checkpoint: Option<i64>,
     request_id: Option<String>,
     bot_id: Option<i64>,
+    /// A new bot's compaction instructions: the default text, a caller's
+    /// own, or none with --no-compaction.
+    compaction_instructions: Option<String>,
+    compaction_model: Option<String>,
     after: i64,
     pretty: bool,
     new: bool,
@@ -93,6 +105,8 @@ fn parse(args: &[String]) -> Result<Options> {
         checkpoint: None,
         request_id: None,
         bot_id: None,
+        compaction_instructions: Some(DEFAULT_COMPACTION_INSTRUCTIONS.to_owned()),
+        compaction_model: None,
         after: 0,
         pretty: false,
         new: false,
@@ -116,6 +130,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--pretty" => options.pretty = true,
             "--no-spawn" => options.no_spawn = true,
             "--new" => options.new = true,
+            "--no-compaction" => options.compaction_instructions = None,
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
@@ -145,6 +160,16 @@ fn parse(args: &[String]) -> Result<Options> {
                                 Error::with("usage", format!("cannot read {value}"))
                             })?)
                     }
+                    "--compaction-instructions" => {
+                        options.compaction_instructions = Some(value).filter(|v| !v.is_empty())
+                    }
+                    "--compaction-instructions-file" => {
+                        options.compaction_instructions =
+                            Some(std::fs::read_to_string(&value).map_err(|_| {
+                                Error::with("usage", format!("cannot read {value}"))
+                            })?)
+                    }
+                    "--compaction-model" => options.compaction_model = Some(value),
                     "--reasoning" => options.reasoning = Some(value),
                     "--workspace" => options.workspace = Some(value.into()),
                     "--bot" => options.bot = Some(value),
@@ -183,6 +208,9 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--idle-exit"
                     | "--context-bytes"
                     | "--context-items"
+                    | "--note-turns"
+                    | "--compact-at"
+                    | "--compact-keep"
                     | "--retain-turns" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
@@ -411,6 +439,9 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--idle-exit" => "idle_exit_seconds",
             "--context-bytes" => "context_bytes",
             "--context-items" => "context_items",
+            "--note-turns" => "note_turns",
+            "--compact-at" => "compact_at",
+            "--compact-keep" => "compact_keep",
             "--retain-turns" => "retain_turns",
             _ => continue,
         };
@@ -640,7 +671,9 @@ fn run(options: &Options) -> Result<i32> {
             json!({"bot":bot,"workspace":workspace,"model":model,
                 "instructions":instructions,"reasoning":options.reasoning,
                 "budget_tokens":options.budget_tokens,
-                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>()}),
+                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>(),
+                "compaction_instructions":options.compaction_instructions,
+                "compaction_model":options.compaction_model}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
