@@ -3172,3 +3172,80 @@ and the Python suite. New coverage: counters through submission, ready,
 absorption, cancellation, start, duplicate, and restart; both bounds
 refusing and the running path never refused; the flags on `ready`, `stats`,
 and the attach mismatch check.
+
+## Context quality before compaction
+
+2026-09-19. Item 32, slice one: an exploratory screen before compaction.
+`bench.context_eval` runs one conversation per bot against a real model with
+copies of the CLI's default instructions and the
+`shell,read,write,edit,history` tools. Turn 1 states a workspace rule: every
+created file must end with `# reviewed: CASTOR-42`. Twelve filler tasks each
+create an `item_N.txt` file and report its byte count; a final task creates
+`summary.txt` with a count. The `omitted` condition uses a small context
+window; `retained` uses the 8 MiB default as a control.
+
+Luna (`gpt-5.6-luna`) ran eight conversations per condition, with a 16 KiB
+window in `omitted`. Sonnet (`claude-sonnet-5`) ran three with an 8 KiB
+window, after an initial 16 KiB attempt never omitted the rule. Input usage
+was about 0.8 M tokens on luna and 0.9 M on Sonnet including that initial
+attempt and its retained control. The table below includes only luna's two
+conditions and Sonnet's 8 KiB condition: 19 conversations, 266 turns.
+
+| | Luna, retained | Luna, omitted | Sonnet, omitted |
+| --- | ---: | ---: | ---: |
+| Window had dropped the rule by the end of the final turn | 0/8 | 8/8 | 3/3 |
+| Filler files honoring the rule, tasks 1–6 | 48/48 | 48/48 | 12/18 |
+| Filler files honoring the rule, tasks 7–12 | 48/48 | 32/48 | 12/18 |
+| Final file honoring the rule | 8/8 | 3/8 | 0/3 |
+| Conversations that called `history`, any turn | 0/8 | 0/8 | 0/3 |
+
+These are raw outcome counts, not verified scores for acting without the
+rule. The original evaluator recorded `context_start` only after the final
+turn. A turn can see the rule when issuing a file-writing tool call and
+lose it on the next request after the tool result. Its final window alone
+cannot establish what the model saw at the action boundary.
+
+The zero history-call counts were checked against all stored `tool_started`
+events in these captures. The original evaluator inspected only the first
+256 events for final-turn calls; these captures have fewer than 256 events
+per bot, but longer conversations could silently lose calls from its score.
+The stores confirm no history calls in the 266 displayed-cohort turns.
+
+Five luna conversations ended with their window starting at turn 4 and
+honored every filler; three honored the final file. Three ended with starts
+at turns 9 or 10 and missed later fillers. Copying visible examples is a
+possible explanation, not an established cause: previous tool calls and
+workspace files can carry the marker, including during the final task.
+This screen does not isolate retrieval from those other sources.
+
+Sonnet's first 8 KiB conversation wrote all thirteen files into the home
+directory despite the shell starting in its workspace. Those files were
+removed by hand. Its files score as missing, so each six-task half includes
+six missing files; the other two conversations honored every filler but
+neither honored the final file. The final 0/3 includes one missing file.
+
+The corrected evaluator reads scalar window positions while bots are idle,
+before and after each turn. A successful turn with the rule already omitted
+before submission is `omitted`; one retaining it through completion is
+`retained`. A turn crossing that boundary is `transition`, and failed turns
+are `unknown`. Neither group contributes to the stable-context scores.
+This conservative classification does not identify the exact action request
+within a transitional turn. Per-file records preserve both positions and
+summaries separate the four groups. All-turn history counts scan bounded
+event pages incrementally from each bot's last cursor, and usage sums all
+turn pages. Captures now include binary and evaluator hashes.
+
+No Rust runtime code changed. Scalar window snapshots bracket turns outside
+active model/tool execution, with the prior snapshot reused as the next
+turn's starting position. Event scans visit each record once;
+usage scans stream one page at a time. This is a quality screen, not a
+runtime-performance benchmark. Five regression tests pass, including a
+synthetic end-to-end reproduction of a rule visible at the action request
+but omitted after its tool result, followed by a stable omitted turn.
+
+The corrected evaluator has not been rerun against paid providers. Keep the
+old captures as exploratory evidence; collect stable-context scores with
+the corrected evaluator before claiming a compaction improvement.
+Captures: ignored `.local/context-eval/{luna,sonnet,sonnet-8k}.json`, with
+stores under `.local/context-eval/run/`; `sonnet.json` contains the initial
+16 KiB attempt and retained control.

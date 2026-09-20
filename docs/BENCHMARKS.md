@@ -526,3 +526,26 @@ resident pages among processes; private bytes are USS. Unsupported, denied, or
 racing reads produce null rather than zero or a partial total. RSS remains
 available independently. These counters require more observer work and are off
 by default. Do not compare timing directly across different sampling modes.
+
+## Context-quality evaluation
+
+This opt-in paid screen checks a workspace rule across long conversations.
+It reports file outcomes separately for turns with the rule retained, omitted,
+or crossing the window boundary, plus unknown results for failed turns.
+It counts history calls across all event pages and includes complete usage.
+The window snapshots bracket each turn; they do not locate the action within
+a transitional turn. Visible examples and workspace files remain possible
+sources of the rule. This is not a CPU, memory, or latency benchmark.
+
+```sh
+(set -a; . ./.env.local; set +a; .local/venv/bin/python -m bench.context_eval --model openai/gpt-5.6-luna --out .local/context-eval/luna.json)
+```
+
+Synthetic regression checks require no paid calls:
+
+```sh
+AGENT_TEST_RUNTIME=1 .local/venv/bin/python -m unittest tests.test_context_eval
+```
+
+The runtime test requires the release binary and local loopback access.
+See [the exploratory results and their limits](DAEMON_MEASUREMENTS.md#context-quality-before-compaction).

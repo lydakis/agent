@@ -463,11 +463,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     rows, and the bound exists for an honest admission answer, not memory.
     Performance follow-up: the [alternating comparison](DAEMON_MEASUREMENTS.md#alternating-follow-up)
     leaves a small CPU cost unresolved; do not call this performance-neutral.
-32. Compaction, the context work, in three slices. First, the evaluation
-    from item 15 run on the daemon as it is: a constraint stated early,
-    enough work after it to push it out of the window, and a later decision
-    that depends on it; the score is whether the agent retrieves it through
-    the `history` tool and acts on it. That is the baseline. Second, the
+32. Compaction, the context work, in three slices. First, an exploratory
+    [evaluation](DAEMON_MEASUREMENTS.md#context-quality-before-compaction)
+    from item 15 has run: luna honored the final file rule in 8/8 retained
+    conversations and 3/8 small-window conversations; Sonnet honored 0/3,
+    including one missing file. No history calls occurred in the 266 turns
+    of those cohorts. These captures record omission after the final turn,
+    not what the model saw before acting. The corrected evaluator separates
+    retained, omitted, transitional, and failed turns, with complete event
+    and usage paging. Its synthetic regression checks pass; a paid rerun
+    establishing stable-context scores remains before a compaction comparison.
+    Visible examples are a possible influence, not a demonstrated cause.
+    Second, the
     mechanism: a versioned context view that summarizes older turns, with
     history untouched, forks bound to the view valid at their checkpoint,
     and the window reading the view; the daemon supplies no policy, so a
