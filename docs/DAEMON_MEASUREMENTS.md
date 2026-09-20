@@ -2931,3 +2931,321 @@ As in earlier probes, wall time includes the light batch and is not pure
 deletion-completion latency. The overlapping ranges suggest comparable
 typical performance, not a proven speedup; lifecycle RSS and latency were
 slightly higher. Captures: ignored `.local/bench/retention-stdio-fix/`.
+
+## Absorption against context capacity
+
+2026-09-19. A round boundary now absorbs queued steers only while the
+running turn's own items plus each encoded steer stay within three quarters
+of the context budget, the target the window keeps; the rest stay queued
+and start as their own turns. Before, a burst of large steers could push the
+running turn past its context and fail it with `context_limit`. The
+regression test runs a 4 KiB context with three 1.5 KiB steers queued
+during a shell call: one is absorbed, two complete as their own turns, and
+the running turn completes.
+
+Initial cost: one turn-usage walk over the running turn's own nodes per absorb
+call, and each candidate steer is encoded before it is chosen instead of
+after. The parked-steer screen (48 workers, ten two-round turns each, with
+and without one bot holding a queued steer, ignored
+`.local/steer-hint/bench.py`), committed tree `055257d3…` versus the slice
+binary `4ffd9922…`, medians of three runs each:
+
+| | Daemon CPU, plain / parked | Wall, plain / parked | Store jobs |
+| --- | ---: | ---: | ---: |
+| Before | 1.186 / 1.125 s | 1.09 / 1.08 s | 6,521 / 6,515 |
+| After | 1.080 / 1.047 s | 0.90 / 0.86 s | 6,510 / 6,524 |
+
+The 32-agent socket echo screen, same two binaries back to back, one
+excluded warmup and four measured runs each: RSS 18.24 (18.14–18.45)
+versus 18.25 (18.19–18.34) MiB, CPU 0.333 (0.301–0.361) versus 0.339
+(0.330–0.356) s, p95 597.0 (588.9–612.1) versus 590.4 (584.1–595.8) ms.
+Level within noise; the ordinary path never absorbs. Captures: ignored
+`.local/bench/slice-prev14-socket-32/`, `slice-absorb-socket-32/`,
+`.local/steer-hint/absorb-{before,after}.json`. The steer screen's after
+numbers are lower, but its runs are short and noisy. Its timed workload leaves
+the steer parked, so these measurements establish neither the cost of active
+absorption nor a speedup. The active follow-up below measures that path.
+
+Validation: 94 Rust tests, strict Clippy, formatting, the query-plan audit,
+and the Python suite.
+
+### Active-steering follow-up
+
+2026-09-19, macOS 27 arm64 on AC power, Rust 1.98.0, locked offline release
+builds. Baseline is commit `3652b7f`, binary SHA-256 `83dc1d9b…`; candidate is
+that tree plus the absorption-budget changes above, binary `57cdc685…`.
+The tracked `bench.active_steering` screen uses the same observer and synthetic
+provider for both binaries. Each shape excludes one complete warmup per binary,
+then runs two before/after/after/before blocks, four samples per binary.
+
+Eight active bots each receive 40 strict steers at each of 20 gated model
+boundaries: 6,400 absorbed steers, 168 model calls, and 320 absorption jobs per
+run. Every steer resolves into its original turn, and every provider request
+matches the complete expected history. Call counts, history hashes, and request
+bytes match across binaries. The one-item response shape sends 21,812,512
+request bytes per run; the 48-item shape sends 29,793,032. Before its final
+response, the growing turn holds 1,761 items, exercising longer metadata walks
+without exceeding the default context. No overload deferral is compared.
+
+Medians, with minimum–maximum ranges in parentheses:
+
+| Metric | One item: before | One item: after | 48 items: before | 48 items: after |
+| --- | ---: | ---: | ---: | ---: |
+| Daemon CPU, s | 1.644 (1.635–1.657) | 1.709 (1.682–1.744) | 1.960 (1.944–1.989) | 2.085 (2.064–2.110) |
+| Sampled daemon peak RSS, MiB | 18.99 (18.81–19.36) | 19.07 (19.03–19.16) | 19.59 (19.50–19.77) | 19.57 (19.44–19.67) |
+| Wall time, s | 2.416 (2.268–2.905) | 2.480 (2.360–2.864) | 2.670 (2.623–2.768) | 2.905 (2.756–3.217) |
+| Boundary p50, ms | 20.77 (19.64–21.71) | 23.40 (22.66–24.60) | 27.07 (25.95–28.49) | 32.15 (31.62–33.30) |
+| Boundary p95, ms | 34.06 (29.08–68.77) | 36.05 (33.52–53.19) | 41.17 (41.01–46.27) | 56.20 (50.25–81.11) |
+| Absorption worker time, ms | 332 (301–399) | 382 (365–456) | 304.5 (296–313) | 426.5 (408–447) |
+
+The candidate costs more under active steering: median daemon CPU rises 3.9%
+and 6.4%, respectively, with non-overlapping observed CPU ranges. Memory is
+essentially unchanged. The growing-turn shape's absorption worker time rises
+40%, consistent with the added current-turn metadata walk on each batch.
+This supports targeting that walk next; it is not an instruction-level profile
+or proof that the walk explains every timing difference. The correctness fix
+has a measurable cost, so performance neutrality is not established.
+
+Boundary latency includes response delivery, append, absorption, context
+construction, and receiving/decoding the next request in the Python fixture.
+Wall time additionally includes sequential submissions and validation. Storage
+execution counters include SQLite work and are reported in whole milliseconds;
+they are wall time on the worker, not CPU. RSS is sampled every 5 ms. Provider
+and observer CPU/memory are excluded. Runs are short, cache state is uncontrolled,
+and tail latency is noisy; this is a matched synthetic workload, not a real
+provider or active-capacity result. Raw captures, full binary hashes, operation
+counters, and excluded warmups: ignored `.local/bench/active-steering/result.json`.
+
+### Indexed turn accounting
+
+2026-09-19. Replace the recursive `turn_usage` walk with indexed lookups of the
+turn's first node, its parent, and the bot's current head. Subtract cumulative
+bytes and depths to count the current turn. A partial unique `nodes(turn)` index
+contains only turn-start nodes. Accounting work no longer grows with the
+current turn's length, and the history tool uses the same query. There are no
+cached counters to reconcile after forks or restart. The existing budget,
+queue order, and encoded-item accounting are unchanged.
+
+The index adds disk space and maintenance for one entry per started turn.
+Opening an existing store builds it once by scanning nodes; that first-open
+cost on a large existing store is not measured here. Subsequent opens reuse
+the index. No transcript data or logical schema fields change.
+
+Repeat the active-steering contract above on the same host and toolchain,
+again with a full warmup per binary and two ABBA blocks per shape. Baseline
+remains the pre-budget `83dc1d9b…` binary; indexed candidate is `c29fef24…`.
+All runs match the expected 6,400 absorbed steers, 168 provider calls, 320
+absorption jobs, complete histories, and request bytes.
+
+Medians (minimum–maximum):
+
+| Metric | One item: baseline | One item: indexed | 48 items: baseline | 48 items: indexed |
+| --- | ---: | ---: | ---: | ---: |
+| Daemon CPU, s | 1.694 (1.660–1.766) | 1.740 (1.650–1.761) | 1.971 (1.956–2.072) | 1.983 (1.936–2.097) |
+| Sampled daemon peak RSS, MiB | 18.86 (18.67–19.00) | 18.88 (18.86–19.11) | 19.53 (19.45–19.95) | 19.37 (19.33–19.64) |
+| Wall time, s | 2.307 (2.208–2.832) | 2.374 (2.268–2.530) | 2.777 (2.667–2.928) | 2.662 (2.600–3.135) |
+| Boundary p95, ms | 27.17 (26.64–40.24) | 27.91 (25.40–42.34) | 42.29 (38.84–91.80) | 39.98 (39.07–53.05) |
+| Absorption worker time, ms | 306 (303–357) | 308 (298–322) | 313.5 (299–419) | 300.5 (294–311) |
+
+The previous large absorption regression is absent in this follow-up. Median
+CPU remains 2.7% higher for one-item responses and 0.6% higher for 48-item
+responses, with overlapping observed ranges; these short runs support near-
+baseline performance, not a universal non-regression guarantee or a speedup.
+The prior unindexed and current indexed measurements are separate campaigns;
+do not treat their ratio as a matched optimization speedup. All boundaries and
+limitations of the active-steering screen still apply. Captures:
+ignored `.local/bench/active-steering-indexed/result.json`.
+
+Ordinary-path check: the 32-bot socket echo lifecycle screen, baseline/indexed/
+indexed/baseline batches, each with one excluded warmup and two measured runs
+(four samples per binary). All runs complete 96 turns, achieve 32 overlapping
+provider requests, preserve restart/replay/forks, and have no quality warnings.
+Median target RSS is 18.22 (18.02–18.23) versus 18.11 (17.97–18.23) MiB;
+observed target CPU is 0.298 (0.279–0.323) versus 0.290 (0.287–0.313) s;
+turn p95 is 586.95 (586.07–589.01) versus 588.14 (586.89–590.27) ms.
+Restart readiness is slightly slower: 16.87 (16.13–17.67) versus
+18.95 (17.75–20.12) ms. This check includes ordinary turn-start index maintenance
+and reopening an already indexed store; it does not measure first-open index
+construction on a large store. Captures: ignored
+`.local/bench/steering-index-lifecycle-*/result.json`.
+
+Validation: 95 Rust tests, 18 delivery/active-steering Python tests, two
+query-plan tests, strict Clippy, formatting, and diff checks pass. Coverage
+includes absorbed UTF-8 content, prior-turn exclusion, fork isolation, stale
+turns, old-store migration, and rejecting a plan that scans nodes after the
+new index is removed.
+
+## Pending-submission bounds
+
+2026-09-19. `--max-pending` and `--max-pending-bytes` bound submissions
+waiting to start, daemon-wide, with `pending_limit` answered before anything
+is written. Two designs were measured; the first was dropped.
+
+**Store triggers.** The first version kept a `pending` row exact with four
+SQLite triggers on the turns table, so admission and `stats` read one row.
+Every status change of every turn paid a trigger evaluation, and the
+ordinary path showed it: on the 32-agent socket echo screen daemon CPU went
+from 0.310 (0.304–0.331) to 0.334 (0.314–0.353) s, and on the
+ten-thousand-bot fleet screen the burst went from 1,154 to 957 turns per
+second with creation from 2,567 to 2,238 bots per second, one run each.
+Rejected before commit.
+
+**Worker-kept counters.** The candidate keeps the count and prompt
+bytes in the storage worker's memory, updated at the four transitions that
+move a turn into or out of the waiting set (submission, start, absorption,
+cancellation), and recounted from the rows at open after recovery through
+the partial status indexes. Nothing is read or written on the store for it;
+a submission that would wait reads two integers when a bound is set and
+nothing when none is. Baseline binary `61c0b77d…` against the slice binary,
+same host, external power:
+
+| Screen | Before | After |
+| --- | ---: | ---: |
+| 32-agent socket echo, CPU s, two pairs | 0.310 (0.304–0.331), 0.304 (0.302–0.309) | 0.330 (0.309–0.356), 0.320 (0.298–0.339) |
+| 32-agent socket echo, RSS MiB | 18.17, 17.99 | 18.36, 18.28 |
+| 32-agent socket echo, p95 ms | 588.6, 592.6 | 601.2, 593.9 |
+| Fleet burst, turns/s, two runs | 1,154, 1,090 | 1,048, 1,086 |
+| Fleet create, bots/s | 2,567, 2,433 | 2,257, 2,535 |
+| 480-turn steer screen, CPU s, ABAB | 1.092, 1.080 | 1.063, 1.100 |
+
+The 32-agent CPU medians are higher in both pairs with overlapping ranges.
+Host noise is one possible explanation, but these measurements do not identify
+the cause or establish performance neutrality. Other workloads cannot rule out
+a cost in this one. Treat the repeated difference as unresolved until a
+controlled follow-up or profiling explains it.
+Captures: ignored `.local/bench/slice-prev15*-socket-32/`,
+`slice-pending*-socket-32/`, `fleet-prev15*/`, `fleet-pending*/`,
+`.local/steer-hint/pending-*.json`.
+
+### Alternating follow-up
+
+2026-09-19. Rebuilt baseline `b01c241` and compared it with the current
+uncommitted pending-bounds candidate on the same macOS arm64 host, on AC
+power, with no concurrent builds or tests. Both used the release profile,
+the same lockfile and benchmark observer, socket transport, the echo tool,
+FULL durability, and unbounded pending admission. Binary SHA-256:
+
+- Baseline: `c29fef2444fc62ef07f9bd60d1567ee4c3e7ea5a59167b2a800befcac6e71613`.
+- Candidate: `5962f9ce85581237ccbb8ae211ed27e4d28ba490c34bed0c7d4b00895da27b1e`.
+- Observer source digest: `a392e822ad89fe435a024367e13ffd7654fe680b05d650b9c687b4a38ebaa86f`.
+
+Each shape had one warmup per binary, followed by two baseline/candidate/
+candidate/baseline blocks: four measured runs per binary. Both shapes used
+32 bots, 20 chunks of 256 bytes with 25 ms chunk delay, and 4,096-byte
+history fixtures; the longer shape used twelve turns per bot instead of
+three. All twenty runs passed the lifecycle, replay, duplicate and
+historical-fork checks and achieved 32 concurrent provider requests.
+Request counts, tool-result counts, and request/response body bytes matched
+exactly between binaries within each shape: 192 requests and 96 tool
+results for three turns; 768 requests and 384 tool results for twelve.
+
+Medians (min–max), retaining every measured run:
+
+| Shape and metric | Baseline | Candidate |
+| --- | ---: | ---: |
+| Three turns/bot, observed target CPU s | 0.303 (0.295–0.334) | 0.306 (0.289–0.386) |
+| Three turns/bot, peak RSS MiB | 18.20 (18.11–18.22) | 18.10 (16.98–18.38) |
+| Three turns/bot, p95 turn ms | 589.9 (586.4–744.2) | 588.7 (586.3–605.2) |
+| Twelve turns/bot, observed target CPU s | 1.280 (1.107–1.550) | 1.203 (1.091–1.336) |
+| Twelve turns/bot, peak RSS MiB | 19.77 (19.53–19.97) | 19.45 (19.41–19.48) |
+| Twelve turns/bot, p95 turn ms | 602.4 (589.5–635.0) | 598.3 (590.4–622.1) |
+
+One twelve-turn baseline run raised `sampler exceeded 10% of wall time`.
+It remains in the table and capture. Excluding only that flagged sample
+changes the baseline CPU median to 1.195 s, leaving the candidate 0.7%
+higher; the three-turn candidate median is 1.0% higher. Thus the apparent
+longer-run CPU improvement is sensitive to an observer warning. CPU is
+sampled process lifetime, not an exact accounting through process exit.
+The smaller differences and overlapping ranges do not establish either
+a regression or a speedup, and do not explain the earlier increases.
+No runtime optimization was retained from this follow-up. A small CPU cost
+remains unresolved; these results do not support claiming performance
+neutrality or attributing the earlier gap to host noise.
+
+Capture: ignored `.local/bench/pending-controlled/result.json`, with
+per-run samples alongside it. The driver stopped on the observer warning;
+that completed result was retained and the three remaining scheduled runs
+were completed without rerunning or replacing any sample.
+
+Validation: 96 Rust tests, strict Clippy, formatting, the query-plan audit,
+and the Python suite. New coverage: counters through submission, ready,
+absorption, cancellation, start, duplicate, and restart; both bounds
+refusing and the running path never refused; the flags on `ready`, `stats`,
+and the attach mismatch check.
+
+## Context quality before compaction
+
+2026-09-19. Item 32, slice one: an exploratory screen before compaction.
+`bench.context_eval` runs one conversation per bot against a real model with
+copies of the CLI's default instructions and the
+`shell,read,write,edit,history` tools. Turn 1 states a workspace rule: every
+created file must end with `# reviewed: CASTOR-42`. Twelve filler tasks each
+create an `item_N.txt` file and report its byte count; a final task creates
+`summary.txt` with a count. The `omitted` condition uses a small context
+window; `retained` uses the 8 MiB default as a control.
+
+Luna (`gpt-5.6-luna`) ran eight conversations per condition, with a 16 KiB
+window in `omitted`. Sonnet (`claude-sonnet-5`) ran three with an 8 KiB
+window, after an initial 16 KiB attempt never omitted the rule. Input usage
+was about 0.8 M tokens on luna and 0.9 M on Sonnet including that initial
+attempt and its retained control. The table below includes only luna's two
+conditions and Sonnet's 8 KiB condition: 19 conversations, 266 turns.
+
+| | Luna, retained | Luna, omitted | Sonnet, omitted |
+| --- | ---: | ---: | ---: |
+| Window had dropped the rule by the end of the final turn | 0/8 | 8/8 | 3/3 |
+| Filler files honoring the rule, tasks 1–6 | 48/48 | 48/48 | 12/18 |
+| Filler files honoring the rule, tasks 7–12 | 48/48 | 32/48 | 12/18 |
+| Final file honoring the rule | 8/8 | 3/8 | 0/3 |
+| Conversations that called `history`, any turn | 0/8 | 0/8 | 0/3 |
+
+These are raw outcome counts, not verified scores for acting without the
+rule. The original evaluator recorded `context_start` only after the final
+turn. A turn can see the rule when issuing a file-writing tool call and
+lose it on the next request after the tool result. Its final window alone
+cannot establish what the model saw at the action boundary.
+
+The zero history-call counts were checked against all stored `tool_started`
+events in these captures. The original evaluator inspected only the first
+256 events for final-turn calls; these captures have fewer than 256 events
+per bot, but longer conversations could silently lose calls from its score.
+The stores confirm no history calls in the 266 displayed-cohort turns.
+
+Five luna conversations ended with their window starting at turn 4 and
+honored every filler; three honored the final file. Three ended with starts
+at turns 9 or 10 and missed later fillers. Copying visible examples is a
+possible explanation, not an established cause: previous tool calls and
+workspace files can carry the marker, including during the final task.
+This screen does not isolate retrieval from those other sources.
+
+Sonnet's first 8 KiB conversation wrote all thirteen files into the home
+directory despite the shell starting in its workspace. Those files were
+removed by hand. Its files score as missing, so each six-task half includes
+six missing files; the other two conversations honored every filler but
+neither honored the final file. The final 0/3 includes one missing file.
+
+The corrected evaluator reads scalar window positions while bots are idle,
+before and after each turn. A successful turn with the rule already omitted
+before submission is `omitted`; one retaining it through completion is
+`retained`. A turn crossing that boundary is `transition`, and failed turns
+are `unknown`. Neither group contributes to the stable-context scores.
+This conservative classification does not identify the exact action request
+within a transitional turn. Per-file records preserve both positions and
+summaries separate the four groups. All-turn history counts scan bounded
+event pages incrementally from each bot's last cursor, and usage sums all
+turn pages. Captures now include binary and evaluator hashes.
+
+No Rust runtime code changed. Scalar window snapshots bracket turns outside
+active model/tool execution, with the prior snapshot reused as the next
+turn's starting position. Event scans visit each record once;
+usage scans stream one page at a time. This is a quality screen, not a
+runtime-performance benchmark. Five regression tests pass, including a
+synthetic end-to-end reproduction of a rule visible at the action request
+but omitted after its tool result, followed by a stable omitted turn.
+
+The corrected evaluator has not been rerun against paid providers. Keep the
+old captures as exploratory evidence; collect stable-context scores with
+the corrected evaluator before claiming a compaction improvement.
+Captures: ignored `.local/context-eval/{luna,sonnet,sonnet-8k}.json`, with
+stores under `.local/context-eval/run/`; `sonnet.json` contains the initial
+16 KiB attempt and retained control.

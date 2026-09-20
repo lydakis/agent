@@ -401,8 +401,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     already queued when the pool closes. The unfinished call's attempts and
     retry-time budget persist across parks and restarts; cumulative turn
     retries stay separate and count only dispatched retries. No second scheduler.
-    Still open from the item: pending submissions want their own count and
-    byte bound, separate from the active-turn bound.
+    The pending-submission bound followed as item 31.
 25. Done: pacing inputs per provider. The pool key is the family's
     (dated snapshots share their alias's pool); the estimate is a cost with
     input and output shares, paced per dimension the provider publishes
@@ -411,11 +410,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     reported limits and 429s supply pacing feedback. No hidden cold-start cap.
     No model registry: a shared quota the provider does not name is still
     corrected by every response's headers.
-26. Absorption against context capacity. A boundary drains the whole
-    steer snapshot in storage batches, so the absorbed total can exceed
-    what the next request carries; the same is true of any turn whose own
-    items outgrow the window. Budget the boundary against encoded context,
-    leaving excess steers queued, as part of the compaction work.
+26. Done: absorption against context capacity. A boundary takes steers only
+    while the running turn's own items plus each encoded steer stay within
+    the window's three-quarter target of the context budget; the rest stay
+    queued and start as their own turns when the line moves, so a burst of
+    large steers can no longer make the running turn fail with
+    `context_limit`. A turn whose own tool outputs outgrow the window is
+    still bounded only by the 64 KiB preview and the round limit; that
+    belongs with compaction (items 15 and the context work).
+    The [active-steering follow-up](DAEMON_MEASUREMENTS.md#active-steering-follow-up)
+    found 3.9–6.4% higher daemon CPU with flat memory and increasing absorption
+    cost as the current turn grows. [Indexed accounting](DAEMON_MEASUREMENTS.md#indexed-turn-accounting)
+    now replaces those walks with fixed-count indexed lookups. The matched
+    follow-up returns absorption time near the pre-budget baseline, with
+    overlapping CPU and memory ranges; small CPU differences remain, so this
+    is not a universal non-regression claim.
 27. Done: storage counters by operation. Every store job is labeled by
     the method it performs, and `stats` reports per operation the count,
     queued and ran totals, the slowest run, and two fourteen-bucket
@@ -443,6 +452,38 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     so a long history's window is no longer read on the thread every other
     bot's commit waits for. Only byte-returning reads move; decisions stay
     on the worker.
+31. Done: pending-submission bounds. `--max-pending` and
+    `--max-pending-bytes` bound submissions waiting to start, daemon-wide,
+    answering `pending_limit` before anything is written; the storage worker
+    keeps the count and prompt bytes at each transition and recounts them at
+    open, so admission and `stats` cost the store nothing. A first version
+    used store triggers and cost 8% daemon CPU on the 32-agent screen and
+    17% burst throughput on the ten-thousand-bot screen, so it was replaced
+    before commit. Unbounded by default: waiting work is durable
+    rows, and the bound exists for an honest admission answer, not memory.
+    Performance follow-up: the [alternating comparison](DAEMON_MEASUREMENTS.md#alternating-follow-up)
+    leaves a small CPU cost unresolved; do not call this performance-neutral.
+32. Compaction, the context work, in three slices. First, an exploratory
+    [evaluation](DAEMON_MEASUREMENTS.md#context-quality-before-compaction)
+    from item 15 has run: luna honored the final file rule in 8/8 retained
+    conversations and 3/8 small-window conversations; Sonnet honored 0/3,
+    including one missing file. No history calls occurred in the 266 turns
+    of those cohorts. These captures record omission after the final turn,
+    not what the model saw before acting. The corrected evaluator separates
+    retained, omitted, transitional, and failed turns, with complete event
+    and usage paging. Its synthetic regression checks pass; a paid rerun
+    establishing stable-context scores remains before a compaction comparison.
+    Visible examples are a possible influence, not a demonstrated cause.
+    Second, the
+    mechanism: a versioned context view that summarizes older turns, with
+    history untouched, forks bound to the view valid at their checkpoint,
+    and the window reading the view; the daemon supplies no policy, so a
+    client names the summarizer model and the threshold, and with neither
+    set nothing compacts. Third, its performance: what a compaction costs on
+    the storage thread and the reader, what rewriting the prefix does to the
+    prompt-cache hit rate, and the evaluation rerun on the compacted daemon.
+    Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
+    socket-protocol client already covers the human way in.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

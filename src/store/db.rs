@@ -196,6 +196,13 @@ pub struct TurnContext {
 }
 pub struct Database {
     conn: Connection,
+    /// Bounds on submissions waiting to start, turns and prompt bytes; zero
+    /// is unbounded. Daemon configuration, set once after open.
+    pending_limits: (usize, usize),
+    /// Queued and ready turns and their prompt bytes. Counted from the rows
+    /// at open and kept by the one writer at each transition, so admission
+    /// and `stats` cost nothing on the store.
+    pending: (i64, i64),
     /// Outcomes of turns ended by the current job, published after its
     /// events. Captured inside the job, so retention in the same job
     /// cannot remove what a waiter is owed.
@@ -240,6 +247,8 @@ impl Database {
         conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-2048;")?;
         Ok(Self {
             conn,
+            pending_limits: (0, 0),
+            pending: (0, 0),
             outcomes: Vec::new(),
         })
     }
@@ -278,6 +287,7 @@ impl Database {
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO node_sequence VALUES (1,0);
@@ -355,6 +365,8 @@ impl Database {
         )?;
         let mut db = Self {
             conn,
+            pending_limits: (0, 0),
+            pending: (0, 0),
             outcomes: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
@@ -387,6 +399,17 @@ impl Database {
                 GROUP BY t.bot)",
             [],
         )?;
+        // One pass over the waiting rows, through their partial indexes.
+        for statement in [
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='queued'",
+            "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='ready'",
+        ] {
+            let (turns, bytes): (i64, i64) = db
+                .conn
+                .query_row(statement, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            db.pending.0 += turns;
+            db.pending.1 += bytes;
+        }
         Ok(db)
     }
     /// The newest committed event id: the publication watermark at open.
@@ -773,19 +796,15 @@ impl Database {
         Ok(out)
     }
     /// Bytes and items in the active turn alone. Older turns can be removed
-    /// from the context window; the current turn cannot. Walk metadata only.
+    /// from the context window; the current turn cannot. The indexed first
+    /// node and head supply cumulative totals without walking the turn.
     pub fn turn_usage(&self, name: &str, turn: i64) -> Result<(Family, usize, usize)> {
         let row: Option<(String, i64, i64)> = self
             .conn
             .prepare_cached(
-                "WITH RECURSIVE chain(id,parent,turn) AS (
-                SELECT n.id,n.parent,n.turn FROM bots b JOIN nodes n ON n.id=b.head
-                WHERE b.name=?1 AND b.running_turn=?2
-                UNION ALL SELECT n.id,n.parent,n.turn FROM nodes n JOIN chain c ON n.id=c.parent
-                WHERE c.turn IS NULL)
-             SELECT b.family,h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0)
-             FROM chain c JOIN bots b ON b.name=?1 JOIN nodes h ON h.id=b.head
-             LEFT JOIN nodes p ON p.id=c.parent WHERE c.turn=?2",
+                "SELECT b.family,h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0)
+             FROM bots b JOIN nodes h ON h.id=b.head JOIN nodes s ON s.turn=?2
+             LEFT JOIN nodes p ON p.id=s.parent WHERE b.name=?1 AND b.running_turn=?2",
             )?
             .query_row(params![name, turn], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -920,6 +939,18 @@ impl Database {
 
     /// Reconcile duplicates first, then validate the effective provider using
     /// the bot already loaded for admission, before any durable mutation.
+    /// Bounds for submissions waiting to start; zero is unbounded.
+    pub fn set_pending_limits(&mut self, turns: usize, bytes: usize) {
+        self.pending_limits = (turns, bytes);
+    }
+    /// Queued and ready turns and their prompt bytes.
+    pub fn pending(&self) -> Result<(i64, i64)> {
+        Ok(self.pending)
+    }
+    fn pending_left(&mut self, prompt_bytes: usize) {
+        self.pending.0 -= 1;
+        self.pending.1 -= prompt_bytes as i64;
+    }
     /// The identity currently holding `name`. A submission that carries the
     /// identity it was first made against is refused once the name belongs to
     /// another bot, so a late retry never becomes fresh work on a namesake.
@@ -1054,6 +1085,28 @@ impl Database {
         } else {
             "ready"
         };
+        // Work that would wait counts against the pending bounds; a refusal
+        // writes nothing, like the active-turn bound.
+        if status != "running" {
+            let (limit_turns, limit_bytes) = self.pending_limits;
+            if limit_turns > 0 || limit_bytes > 0 {
+                let (turns, bytes) = self.pending()?;
+                if limit_turns > 0 && turns >= limit_turns as i64 {
+                    return fail_with(
+                        "pending_limit",
+                        format!("{turns} submissions are waiting; the bound is {limit_turns}"),
+                    );
+                }
+                if limit_bytes > 0 && bytes + prompt.len() as i64 > limit_bytes as i64 {
+                    return fail_with(
+                        "pending_limit",
+                        format!(
+                            "{bytes} prompt bytes are waiting; this one would pass the bound of {limit_bytes}"
+                        ),
+                    );
+                }
+            }
+        }
         let tx = self.conn.transaction()?;
         // A deleted bot must never make an old turn handle refer to new work.
         let turn: i64 = tx
@@ -1087,6 +1140,10 @@ impl Database {
         };
         let cursor = event(&tx, name, Some(turn), kind, data.clone())?;
         tx.commit()?;
+        if status != "running" {
+            self.pending.0 += 1;
+            self.pending.1 += prompt.len() as i64;
+        }
         Ok(Started {
             turn,
             fresh: true,
@@ -1157,6 +1214,7 @@ impl Database {
         let data = json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
         tx.commit()?;
+        self.pending_left(prompt.len());
         let steers = self.steers_waiting(&name)?;
         Ok((entry(cursor, &name, Some(turn), "accepted", data), steers))
     }
@@ -1187,11 +1245,13 @@ impl Database {
     /// End a turn that never started. A ready turn's place goes to the bot's
     /// next queued one.
     pub fn end_queued(&mut self, turn: i64, error: &Error) -> Result<(Vec<Value>, Value)> {
-        let (name, status): (String, String) = self
+        let (name, status, prompt_bytes): (String, String, i64) = self
             .conn
-            .query_row("SELECT bot,status FROM turns WHERE id=?", [turn], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT bot,status,length(CAST(prompt AS BLOB)) FROM turns WHERE id=?",
+                [turn],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()?
             .ok_or(Error::new("turn_not_found"))?;
         if !matches!(status.as_str(), "queued" | "ready") {
@@ -1213,6 +1273,7 @@ impl Database {
         let data = json!({"status":ended,"checkpoint":Value::Null,"error":error.code,"detail":error.detail});
         let cursor = event(&tx, &name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
+        self.pending_left(prompt_bytes as usize);
         let outcome = self
             .turn_outcome(&name, turn)?
             .ok_or_else(|| Error::new("stale_turn"))?;
@@ -1225,7 +1286,13 @@ impl Database {
     /// Deliver a bounded prefix of queued steers into the running turn.
     /// Stop at an incompatible explicit override; it and later steers stay
     /// queued, so a later message cannot overtake the deferred steer.
-    pub fn absorb(&mut self, turn: i64, through: Option<i64>) -> Result<Absorbed> {
+    pub fn absorb(
+        &mut self,
+        turn: i64,
+        through: Option<i64>,
+        context_bytes: usize,
+        context_items: usize,
+    ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
             Some(id) => Some(id),
@@ -1236,8 +1303,16 @@ impl Database {
         let Some(through) = through else {
             return Ok(Absorbed::default());
         };
-        let mut steers: Vec<(i64, String)> = Vec::new();
+        // Absorbed steers join the running turn's own items, which the window
+        // must carry whole. Budget them against the same three-quarter target
+        // the window keeps, less what the turn already holds; what does not
+        // fit stays queued and starts as its own turn when the line moves.
+        let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
+        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes);
+        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items);
+        let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
         let mut more = false;
+        let mut capped = false;
         {
             // The partial index skips ordinary queued work. Read at most one
             // candidate beyond the byte budget, without copying its prompt.
@@ -1265,22 +1340,27 @@ impl Database {
                     break;
                 }
                 bytes += size;
-                steers.push((row.get(0)?, row.get(1)?));
+                let item = family.user_item(&row.get::<_, String>(1)?)?;
+                if item.len() > room_bytes || room_items == 0 {
+                    capped = true;
+                    break;
+                }
+                room_bytes -= item.len();
+                room_items -= 1;
+                steers.push((row.get(0)?, item, size));
             }
         }
         let mut absorbed = Absorbed::default();
         if steers.is_empty() {
             return Ok(absorbed);
         }
-        if more || steers.len() == STEER_BATCH_ITEMS {
+        if !capped && (more || steers.len() == STEER_BATCH_ITEMS) {
             absorbed.next_through = Some(through);
         }
-        let family = bot.family()?;
         let tx = self.conn.transaction()?;
         let mut head = bot.head;
         let mut steered = Vec::with_capacity(steers.len());
-        for (steer, prompt) in steers {
-            let item = family.user_item(&prompt)?;
+        for (steer, item, size) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             tx.execute(
@@ -1298,14 +1378,15 @@ impl Database {
             absorbed
                 .entries
                 .push(entry(cursor, &bot.name, Some(turn), "steered", data));
-            steered.push(steer);
+            steered.push((steer, size));
         }
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
             params![head, bot.name],
         )?;
         tx.commit()?;
-        for steer in steered {
+        for (steer, size) in steered {
+            self.pending_left(size);
             let outcome = self
                 .turn_outcome(&bot.name, steer)?
                 .ok_or_else(|| Error::new("stale_turn"))?;
@@ -2400,12 +2481,7 @@ impl Database {
                 .query_row("SELECT COUNT(*) FROM turns WHERE status='paced'", [], |r| {
                     r.get(0)
                 })?;
-        let queued: i64 = self.conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM turns WHERE status='queued')
-                  + (SELECT COUNT(*) FROM turns WHERE status='ready')",
-            [],
-            |r| r.get(0),
-        )?;
+        let (queued, _) = self.pending()?;
         Ok((waiting, self.running_processes()?, queued, paced))
     }
     pub fn note_pacing(&mut self, turn: i64, retries: u64, paced_ms: u64) -> Result<()> {

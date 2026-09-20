@@ -212,6 +212,38 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(first)['data']['status'], 'completed')
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
 
+    def test_pending_bounds_refuse_waiting_work_and_report_in_stats(self):
+        client = self.client(extra=('--max-pending', '2', '--max-pending-bytes', '64'))
+        for bot in ('Bob', 'Ann'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        first = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']['turn']
+        for n in ('2', '3'):
+            self.assertEqual(client.request('submit', bot='Bob', request_id=n, prompt='x' * 20,
+                                            delivery='queue')['result']['status'], 'queued')
+        refused = client.request('submit', bot='Bob', request_id='4', prompt='x', delivery='queue')
+
+        self.assertEqual(refused['error'], 'pending_limit')
+        self.assertIn('bound is 2', refused['detail'])
+        stats = client.request('stats')['result']
+        self.assertEqual((stats['queued_turns'], stats['pending_bytes'], stats['pending_limit'],
+                          stats['pending_bytes_limit']), (2, 40, 2, 64))
+        # Work that starts at once never counts; a steer that would wait does.
+        self.assertEqual(client.request('submit', bot='Ann', request_id='a', prompt='hi')['result']['status'], 'running')
+        self.assertEqual(client.request('submit', bot='Bob', request_id='s', prompt='steer', delivery='steer')['error'],
+                         'pending_limit')
+        for turn in (first,):
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # Once the line drains, the bytes bound is the next thing in the way.
+        client.request('wait', handles=[f'turn:Bob/{first + 1}', f'turn:Bob/{first + 2}'], timeout_ms=10000)
+        self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
+        blocker = client.request('submit', bot='Bob', request_id='5', prompt='slow')['result']['turn']
+        big = client.request('submit', bot='Bob', request_id='6', prompt='y' * 65, delivery='queue')
+        self.assertEqual(big['error'], 'pending_limit')
+        self.assertIn('bound of 64', big['detail'])
+        self.assertEqual(client.request('submit', bot='Bob', request_id='6', prompt='y' * 64,
+                                        delivery='queue')['result']['status'], 'queued')
+        client.finished(blocker)
+
     def test_queued_turns_run_in_order_after_the_busy_turn(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
@@ -267,6 +299,21 @@ class DeliveryTests(ModelFixture):
         idle = client.request('submit', bot='Bob', request_id='s2', prompt='alone', delivery='steer')['result']
         self.assertEqual(idle['status'], 'running')
         self.assertEqual(client.finished(idle['turn'])['data']['status'], 'completed')
+
+    def test_steers_beyond_the_context_budget_stay_queued_and_run_as_their_own_turns(self):
+        # 4 KiB of context keeps 3 KiB for the running turn; one 1.5 KiB steer fits at
+        # its boundary, the other two would have pushed the turn past its budget.
+        client = self.client('echo,shell', extra=('--context-bytes', '4096'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)
+        steers = [client.request('submit', bot='Bob', request_id=f's{n}', prompt=f'{n}' * 1500,
+                                 delivery='steer')['result']['turn'] for n in range(3)]
+        self.assertEqual(client.finished(first)['data']['status'], 'completed')
+        outcomes = [client.finished(turn)['data'] for turn in steers]
+        self.assertEqual([o['status'] for o in outcomes], ['steered', 'completed', 'completed'])
+        self.assertEqual(outcomes[0]['into'], first)
+        self.assertEqual(client.request('result', bot='Bob', turn=steers[2])['result']['text'], 'reply:' + '2' * 1500)
 
     def test_a_steer_that_misses_the_last_boundary_becomes_the_next_turn(self):
         client = self.client()

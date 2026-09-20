@@ -435,13 +435,13 @@ impl Turn {
         if !self.steers.swap(false, Relaxed) {
             return Ok(false);
         }
-        let turn = self.turn;
+        let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
         let mut through = None;
         let mut steered = false;
         loop {
             let absorbed = self
                 .store
-                .op("absorb", move |db| db.absorb(turn, through))
+                .op("absorb", move |db| db.absorb(turn, through, bytes, items))
                 .await?;
             through = absorbed.next_through;
             steered |= !absorbed.outcomes.is_empty();

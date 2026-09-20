@@ -173,6 +173,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--max-processes"
                     | "--max-active"
                     | "--max-connecting"
+                    | "--max-pending"
+                    | "--max-pending-bytes"
                     | "--max-output-tokens"
                     | "--idle-exit"
                     | "--context-bytes"
@@ -399,6 +401,8 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-processes" => "processes",
             "--max-active" => "active",
             "--max-connecting" => "connecting",
+            "--max-pending" => "pending",
+            "--max-pending-bytes" => "pending_bytes",
             "--max-output-tokens" => "output_tokens",
             "--idle-exit" => "idle_exit_seconds",
             "--context-bytes" => "context_bytes",

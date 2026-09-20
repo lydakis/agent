@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --idle-exit --context-bytes --context-items --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -176,6 +176,8 @@ fn print_flags(flags: &str) {
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
+            "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
+            "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
             "--max-output-tokens" => ("N", "Output token cap per model call"),
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
             "--context-bytes" => ("N", "Maximum model context bytes"),
