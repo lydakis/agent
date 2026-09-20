@@ -40,6 +40,13 @@ pub struct Bot {
     pub reasoning: Option<String>,
     /// The tools this bot may call, chosen at creation and kept with it.
     pub tools: Vec<String>,
+    /// The bot whose client created or forked this one, as that client
+    /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
+    /// this is lineage for people, not authority.
+    pub created_by: Option<String>,
+    /// The creator's captured identity, validated by the store. A later bot
+    /// reusing the name is not mistaken for it. `None` for a root bot.
+    pub created_by_id: Option<i64>,
     /// The node of the bot's current carry-forward note, if it wrote one.
     pub note: Option<i64>,
     /// The node of the bot's current compaction, if any, and the client's
@@ -54,6 +61,18 @@ impl Bot {
         Family::parse(&self.family).ok_or(Error::new("store_family_unsupported"))
     }
 }
+/// What a fork may choose for itself; everything else comes from the source.
+#[derive(Default, Clone, Copy)]
+pub struct Fork<'a> {
+    /// A node id from the source's history; `None` is its current head.
+    pub checkpoint: Option<i64>,
+    pub workspace: Option<&'a str>,
+    pub budget_tokens: Option<u64>,
+    /// Replaces the source's instructions for the new bot only.
+    pub instructions: Option<&'a str>,
+    pub created_by: Option<&'a str>,
+    pub created_by_id: Option<i64>,
+}
 /// Provider binding chosen at creation; immutable for the bot's lifetime.
 pub struct Binding<'a> {
     pub provider: &'a str,
@@ -63,6 +82,8 @@ pub struct Binding<'a> {
     pub reasoning: Option<&'a str>,
     pub budget_tokens: Option<u64>,
     pub tools: &'a [String],
+    pub created_by: Option<&'a str>,
+    pub created_by_id: Option<i64>,
     /// Compaction instructions and an optional summarizer model, both the
     /// client's; with no instructions the bot never compacts.
     pub compaction_instructions: Option<&'a str>,
@@ -211,6 +232,9 @@ pub struct CompactionPlan {
 pub struct TurnContext {
     pub model_rounds: usize,
     pub bot: String,
+    pub bot_id: i64,
+    pub created_by: Option<String>,
+    pub created_by_id: Option<i64>,
     pub workspace: String,
     pub model: String,
 }
@@ -253,7 +277,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 24;
+    pub const SCHEMA: i32 = 25;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -336,6 +360,8 @@ impl Database {
                 tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history',
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT,
+                created_by_id INTEGER,
                 note INTEGER REFERENCES notes(node),
                 compaction INTEGER REFERENCES compactions(node),
                 compaction_instructions TEXT, compaction_model TEXT);
@@ -534,13 +560,37 @@ impl Database {
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
             id: r.get(15)?,
-            note: r.get(16)?,
-            compaction: r.get(17)?,
-            compaction_instructions: r.get(18)?,
-            compaction_model: r.get(19)?,
+            created_by: r.get(16)?,
+            created_by_id: r.get(17)?,
+            note: r.get(18)?,
+            compaction: r.get(19)?,
+            compaction_instructions: r.get(20)?,
+            compaction_model: r.get(21)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,note,compaction,compaction_instructions,compaction_model";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model";
+    /// Validate the caller's captured identity in the same transaction that
+    /// creates the child. Never resolve a stale shell's name to a new bot.
+    fn creator_id(
+        conn: &Connection,
+        creator: Option<&str>,
+        expected: Option<i64>,
+    ) -> Result<Option<i64>> {
+        match (creator, expected) {
+            (None, None) => Ok(None),
+            (Some(creator), Some(id)) => {
+                let found = conn
+                    .query_row(
+                        "SELECT id FROM bots WHERE name=? AND id=? AND status!='deleting'",
+                        params![creator, id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                found.map(Some).ok_or(Error::new("creator_not_found"))
+            }
+            _ => fail("creator_identity_required"),
+        }
+    }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -558,7 +608,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -575,7 +625,9 @@ impl Database {
                 "budget_tokens":r.get::<_, Option<i64>>(9)?,"tokens_used":r.get::<_, i64>(10)?,
                 "tools":split_tools(&r.get::<_, String>(11)?),
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
-                "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?)});
+                "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
+                "created_by":r.get::<_, Option<String>>(15)?,
+                "created_by_id":r.get::<_, Option<i64>>(16)?});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -608,8 +660,9 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
+        let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,compaction_instructions,compaction_model) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -621,11 +674,17 @@ impl Database {
                 binding.reasoning,
                 binding.budget_tokens.map(|b| b as i64),
                 binding.tools.join(","),
+                binding.created_by,
+                created_by_id,
                 binding.compaction_instructions,
                 binding.compaction_model
             ],
         )?;
-        let data = json!({"id":id,"model":format!("{}/{}", binding.provider, binding.model)});
+        // The event carries the list record's fields, so a follower can
+        // seat a new bot without a request per creation.
+        let data = json!({"id":id,"provider":binding.provider,"model":binding.model,
+            "workspace":workspace,"status":"idle","running_turn":null,
+            "created_by":binding.created_by,"created_by_id":created_by_id});
         let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
         Ok((
@@ -1810,7 +1869,10 @@ impl Database {
                 .or(bot.workspace)
                 .ok_or(Error::new("workspace_required"))?,
             model: model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model)),
+            created_by: bot.created_by,
+            created_by_id: bot.created_by_id,
             bot: bot.name,
+            bot_id: bot.id,
         })
     }
     fn active(&self, turn: i64) -> Result<Bot> {
@@ -2237,15 +2299,19 @@ impl Database {
     /// Branch a new bot from any message in the source's history. Without a
     /// node, the source's current head is used and the source must be idle,
     /// since a live head is still moving. The point must leave no tool call
-    /// unanswered; the source itself is never changed.
-    pub fn fork(
-        &mut self,
-        source: &str,
-        node: Option<i64>,
-        name: &str,
-        workspace: Option<&str>,
-        budget_tokens: Option<u64>,
-    ) -> Result<(Bot, Value)> {
+    /// unanswered; the source itself is never changed. The fork keeps the
+    /// source's binding; `instructions` replaces the source's text for the
+    /// new bot only, so a changed AGENTS.md reaches a fresh bot while every
+    /// existing one stays immutable.
+    pub fn fork(&mut self, source: &str, name: &str, fork: Fork<'_>) -> Result<(Bot, Value)> {
+        let Fork {
+            checkpoint: node,
+            workspace,
+            budget_tokens,
+            instructions,
+            created_by,
+            created_by_id,
+        } = fork;
         let parent = self.inspect(source)?;
         let checkpoint = match node {
             Some(node) => {
@@ -2272,8 +2338,9 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
+        let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,compaction_instructions,compaction_model) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2282,10 +2349,12 @@ impl Database {
                 parent.provider,
                 parent.family,
                 parent.model,
-                parent.instructions,
+                instructions.unwrap_or(&parent.instructions),
                 parent.reasoning,
                 budget_tokens.map(|b| b as i64),
                 parent.tools.join(","),
+                created_by,
+                created_by_id,
                 parent.compaction_instructions,
                 parent.compaction_model
             ],
@@ -2318,7 +2387,10 @@ impl Database {
                 params![version, name],
             )?;
         }
-        let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint});
+        let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
+            "provider":parent.provider,"model":parent.model,
+            "workspace":workspace,"status":"idle","running_turn":null,
+            "created_by":created_by,"created_by_id":created_by_id});
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
         Ok((
@@ -2689,7 +2761,144 @@ impl Database {
         };
         Ok(json!({"events":events,"pruned_cursor":pruned,"next_after":next_after}))
     }
+    /// Page immutable lineage metadata newest first, including a fork's shared prefix.
+    /// `from` is inclusive; `next_from` is the parent to pass for the next page.
+    pub fn history_nodes(
+        &self,
+        name: &str,
+        from: Option<i64>,
+        limit: usize,
+        min_node: Option<i64>,
+        oldest_first: bool,
+    ) -> Result<Value> {
+        if !(1..=400).contains(&limit) {
+            return fail("invalid_history_limit");
+        }
+        let snapshot = self.conn.unchecked_transaction()?;
+        let head = self.inspect(name)?.head;
+        let mut next = from.or(head);
+        let range_head = next;
+        let floor = min_node.unwrap_or(0);
+        if let Some(wanted) = from
+            && !self.in_lineage(head, wanted)?
+        {
+            return fail("item_not_in_bot_history");
+        }
+        if oldest_first {
+            // Node IDs increase along every lineage, including forks. Find the
+            // first bounded page after the visible window on the read worker.
+            let ids = self.conn.prepare_cached(
+                "WITH RECURSIVE chain(id,parent) AS (
+                    SELECT id,parent FROM nodes WHERE id=?1 AND id>=?2
+                    UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
+                 ) SELECT id FROM chain ORDER BY id LIMIT ?3"
+            )?.query_map(params![next, floor, limit as i64], |r| r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            next = ids.last().copied();
+        }
+        let mut nodes = Vec::with_capacity(limit);
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT parent,turn FROM nodes WHERE id=?")?;
+        let mut unassigned = 0;
+        while let Some(id) = next.filter(|id| *id >= floor) {
+            let (parent, turn): (Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            nodes.push(json!({"node":id,"turn":null}));
+            if let Some(turn) = turn {
+                for node in &mut nodes[unassigned..] {
+                    node["turn"] = json!(turn);
+                }
+                unassigned = nodes.len();
+            }
+            next = parent;
+            if nodes.len() == limit {
+                break;
+            }
+        }
+        // Only turn-start nodes carry a turn. Complete a page ending mid-turn by
+        // finding its nearest start, including retained nodes of a deleted source.
+        let mut ancestor = next;
+        while unassigned < nodes.len() {
+            let Some(id) = ancestor else {
+                break;
+            };
+            let (parent, turn): (Option<i64>, Option<i64>) =
+                statement.query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if let Some(turn) = turn {
+                for node in &mut nodes[unassigned..] {
+                    node["turn"] = json!(turn);
+                }
+                break;
+            }
+            ancestor = parent;
+        }
+        let next_newer = nodes
+            .first()
+            .and_then(|n| n["node"].as_i64())
+            .filter(|id| Some(*id) != range_head)
+            .map(|id| id + 1);
+        snapshot.commit()?;
+        Ok(
+            json!({"nodes":nodes,"next_from":next.filter(|id| *id >= floor),"next_newer":next_newer}),
+        )
+    }
+    /// Fetch a byte-bounded batch after one ancestry walk for all requested IDs.
+    pub fn history_items(&self, name: &str, wanted: &[i64]) -> Result<Value> {
+        use std::collections::HashSet;
+        if wanted.is_empty() || wanted.len() > 400 {
+            return fail("invalid_history_limit");
+        }
+        let unique: HashSet<i64> = wanted.iter().copied().collect();
+        if unique.len() != wanted.len() {
+            return fail("duplicate_history_node");
+        }
+        let snapshot = self.conn.unchecked_transaction()?;
+        let head = self.inspect(name)?.head;
+        let floor = *wanted.iter().min().unwrap();
+        let ids = serde_json::to_string(wanted)?;
+        let found: HashSet<i64> = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent) AS (
+                SELECT id,parent FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent FROM nodes n JOIN chain c ON n.id=c.parent WHERE n.id>=?2
+             ) SELECT id FROM chain WHERE id IN (SELECT value FROM json_each(?3))"
+        )?.query_map(params![head,floor,ids], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        if found != unique {
+            return fail("item_not_in_bot_history");
+        }
+        let mut items = Vec::new();
+        let mut bytes = 0;
+        let maximum = crate::output::MAX_EVENT - 1024;
+        // Check the encoded blob length in SQLite before allocating it. An
+        // unrenderable item gets its own error; adjacent items remain readable.
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=? AND length(item)<=?")?;
+        for &node in wanted {
+            let raw: Option<Vec<u8>> = query
+                .query_row(params![node, maximum as i64], |r| r.get(0))
+                .optional()?;
+            let mut entry = match raw {
+                Some(raw) => json!({"node":node,"item":serde_json::from_slice::<Value>(&raw)?}),
+                None => json!({"node":node,"error":"item_too_large"}),
+            };
+            let mut size = serde_json::to_vec(&entry)?.len();
+            // Leave room for the protocol envelope, including extra escaping
+            // or wrapper bytes beyond the stored representation.
+            if size > maximum {
+                entry = json!({"node":node,"error":"item_too_large"});
+                size = serde_json::to_vec(&entry)?.len();
+            }
+            if !items.is_empty() && bytes + size > 768 * 1024 {
+                break;
+            }
+            bytes += size;
+            items.push(entry);
+        }
+        snapshot.commit()?;
+        Ok(json!({"items":items}))
+    }
     pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
+        let snapshot = self.conn.unchecked_transaction()?;
         let head = self.inspect(name)?.head;
         if !self.in_lineage(head, wanted)? {
             return fail("item_not_in_bot_history");
@@ -2697,6 +2906,7 @@ impl Database {
         let item: Vec<u8> =
             self.conn
                 .query_row("SELECT item FROM nodes WHERE id=?", [wanted], |r| r.get(0))?;
+        snapshot.commit()?;
         Ok(serde_json::from_slice(&item)?)
     }
     /// A bot's turns in id order, paged by `after`, with accounting a program
@@ -3264,8 +3474,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             )?;
         }
     }
+    // Version 25 joins the independently published lineage (22/23) and
+    // compaction (22/23/24) schemas. Inspect columns once during migration
+    // so either branch retains its data and receives only the missing fields.
+    for (column, kind) in [("created_by", "TEXT"), ("created_by_id", "INTEGER")] {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name=?)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE bots ADD COLUMN {column} {kind};"))?;
+        }
+    }
 
-    if from < 22 {
+    {
         // 21 -> 22: carry-forward notes, versioned by the node of the tool
         // result that wrote them. Added only when missing.
         let present: bool = conn.query_row(
@@ -3282,7 +3505,7 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
-    if from < 23 {
+    {
         // 22 -> 23: compaction, versioned by the cut node, with the client's
         // instructions and summarizer per bot. Added only when missing.
         let present: bool = conn.query_row(
@@ -3302,13 +3525,11 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         }
     }
 
-    if from < 24
-        && !conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('compactions') WHERE name='cut')",
-            [],
-            |r| r.get::<_, bool>(0),
-        )?
-    {
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('compactions') WHERE name='cut')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
         conn.execute_batch(
             "ALTER TABLE compactions ADD COLUMN cut INTEGER REFERENCES nodes(id);
              UPDATE compactions SET cut=node;",

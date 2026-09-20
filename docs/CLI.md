@@ -8,6 +8,15 @@ Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
 `-h` also works. Help writes to stdout and exits successfully without opening
 a store or connecting to a daemon.
 
+Inside a bot's shell tool, `AGENT_BOT` and `AGENT_BOT_ID` identify that bot.
+The client sends both as `created_by` and `created_by_id` when creating or
+forking a child. The store rejects missing or stale creator identities before
+creating the child, including after a daemon restart or name reuse;
+`AGENT_PARENT` and `AGENT_PARENT_ID` identify the running bot's recorded creator
+when its identity was known at creation. Address that creator with
+`run --detach --bot "$AGENT_PARENT" --bot-id "$AGENT_PARENT_ID" -- TASK`.
+The ID stays pinned after deletion, so a replacement with the same name rejects
+the call instead of receiving the work.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
 `follow --bot NAME` replays and follows the selected current turn to its end;
@@ -36,7 +45,13 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   turn stays queued and runs separately with those choices.
 - Unknown flags, flags belonging to another command, unexpected operands,
   and repeated singleton flags are usage errors. `--provider` is repeatable.
-- `--instructions` and `--instructions-file` are mutually exclusive.
+- `--instructions` and `--instructions-file` are mutually exclusive. On
+  `fork` they replace the source's instructions for the new bot only.
+  `--agents` composes the shared client policy instead: the harness preamble,
+  every AGENTS.md from the workspace up to the root plus `~/.agent/AGENTS.md`,
+  and an index of `.agent/skills/*.md` files ([CLIENT.md](CLIENT.md)). It is
+  opt-in on the CLI, the default in the app, and exclusive with
+  `--instructions`.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit` is

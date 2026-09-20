@@ -495,16 +495,17 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"..."}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-4-1"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"resume","bot":"Bob"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
 {"id":6,"op":"item","bot":"Bob","node":2}
+{"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":7,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1"}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
-{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative"}
+{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","instructions":"Replaces the source's text for the fork only"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":10,"op":"unfollow","bot":"Bob"}
 {"id":11,"op":"bots","after":null,"limit":64}
@@ -515,6 +516,29 @@ own path from the turn. Example requests:
 {"id":18,"op":"stats"}
 {"id":12,"op":"shutdown"}
 ```
+
+`history_nodes` lists immutable node references in a bot's lineage, newest first,
+including inherited fork history. `from` is an inclusive node ID and defaults to
+the current head. The response contains `nodes: [{node: ID, turn: TURN_ID}, ...]` and
+`next_from`, the next older node or null at the root. `limit` defaults to 400
+and must be 1 through 400. Bodies are fetched through `item`; pagination does
+not copy bodies. `min_node` optionally bounds the oldest included ID.
+`oldest_first: true` selects the oldest page within that range while still
+returning its nodes newest first; `next_newer` is the inclusive minimum ID for
+the next forward page, or null. This lets clients retain only range endpoints.
+Turn IDs are inherited from each node's nearest turn-start ancestor.
+Membership validation walks the lineage, as `item` does. Both operations run
+on the read worker in a consistent snapshot, avoiding the serialized writer.
+The fork can read its shared prefix after its source is deleted.
+
+`history_items` accepts `bot` and 1–400 distinct `nodes`. It validates all IDs
+against that bot's lineage with one ancestry walk and returns a prefix as
+`items: [{node: ID, item: VALUE}, ...]` in request order. The reply targets
+768 KiB; one larger item may be returned alone if it fits the 1 MiB frame limit.
+An item exceeding that limit returns `{node: ID, error: "item_too_large"}`;
+other items remain readable. Callers request remaining IDs in their next batch.
+IDs outside the lineage fail the whole request without returning bodies. Like `history_nodes`, this
+runs on the reader connection in a consistent snapshot.
 
 ## Fleet controllers
 
@@ -618,7 +642,21 @@ it may return `response_size_limit`, in which case use pages. Offset and limit
 require a stream. This keeps even escaped, multi-stream artifacts retrievable
 within the 1 MiB response bound.
 
-Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
+`created_by` and `created_by_id` on `create` and `fork` declare the bot
+on whose behalf the client acts. Supply both or neither. The CLI captures them
+from `AGENT_BOT` and `AGENT_BOT_ID`, exported in every shell tool environment.
+The store validates the pair in the child creation transaction and rejects a
+missing, deleted, deleting, or replaced creator, so a surviving shell cannot
+attribute a new child to a replacement bot after restart. The daemon also sets
+`AGENT_PARENT` and `AGENT_PARENT_ID` to the running bot's recorded creator.
+The client preamble uses both with `run --bot NAME --bot-id ID`, preventing
+stale child-to-parent submissions after name reuse. The record, the `created` and `forked` events, and `bots` pages
+carry both; the two events also carry the record's list fields (`id`,
+`provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
+seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and
+clients, never authority. A fork keeps the source's binding and instructions
+unless `instructions` replaces the text for the new bot; the source is never
+changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
 from any message in the source's history: `checkpoint` names a node id (every

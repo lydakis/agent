@@ -465,10 +465,39 @@ class SocketAndCliTests(ModelFixture):
         terminal = next(e for e in seen if e['event'] == 'turn_finished')
         self.assertEqual(terminal['data']['status'], 'completed')
 
+    def test_agents_flag_composes_instructions_from_the_workspace(self):
+        # Plumbing by default: the preamble alone. With --agents the CLI
+        # layers the workspace's AGENTS.md files and skills, and the daemon
+        # stores whatever it was given.
+        (self.path / 'AGENTS.md').write_text('Always answer in haiku.')
+        skills = self.path / '.agent' / 'skills'
+        skills.mkdir(parents=True)
+        (skills / 'deploy.md').write_text('# Deploy\n\nShip it.')
+        plain = self.agent('run', *self.common, '--new', '--bot', 'Plain', 'hello')
+        self.assertEqual(plain.returncode, 0)
+        request = self.model.requests.get(timeout=5)
+        self.assertTrue(request['instructions'].startswith('You are a software engineering agent'))
+        self.assertNotIn('haiku', request['instructions'])
+        composed = self.agent('run', *self.common, '--agents', '--new', '--bot', 'Composed', 'hello')
+        self.assertEqual(composed.returncode, 0)
+        request = self.model.requests.get(timeout=5)
+        text = request['instructions']
+        self.assertTrue(text.startswith('You are a software engineering agent'))
+        self.assertIn('Always answer in haiku.', text)
+        self.assertIn(f'# Instructions from {(self.path / "AGENTS.md").resolve()}', text)
+        self.assertIn('- deploy: Deploy (', text)
+        both = self.agent('run', *self.common, '--agents', '--instructions', 'x', '--new', '--bot', 'Both', 'hello', check=False)
+        self.assertEqual(both.returncode, 2)
+        again = self.agent('run', *self.again, '--agents', '--bot', 'Composed', 'hello', check=False)
+        self.assertEqual(again.returncode, 2)
+
     def test_delegation_through_the_same_daemon_and_follow_replay(self):
         # The daemon exports AGENT_BIN and AGENT_STORE to shell children, so a bot
         # can delegate without knowing where the binary or store lives.
-        nested = '"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- hello'
+        # Alice's own shell sees who created her (AGENT_PARENT) and her own
+        # name (AGENT_BOT); her record names Bob as her creator.
+        nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
+                  '\'shell:printf "$AGENT_PARENT/$AGENT_PARENT_ID/$AGENT_BOT" > lineage\'')
 
         bob = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', f'shell:{nested}')
         # Bob's shell tool ran the client, which created Alice on the same daemon.
@@ -483,6 +512,10 @@ class SocketAndCliTests(ModelFixture):
         listing = json.loads(self.agent('ls', '--store', str(self.store)).stdout)
         self.assertEqual({b['name'] for b in listing}, {'Alice', 'Bob'})
         self.assertTrue(all(b['status'] == 'completed' for b in listing))
+        self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
+        by_name = {b['name']: b for b in listing}
+        self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['id'])
+        self.assertEqual((self.path / 'lineage').read_text(), f"Bob/{by_name['Bob']['id']}/Alice")
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]
         self.assertEqual([e['event'] for e in events][:2], ['created', 'accepted'])
@@ -510,6 +543,56 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(kinds[-1], 'turn_finished')
         self.assertEqual(seen[-1]['turn'], json.loads(live.stdout.read().splitlines()[-1])['turn'])
         live.stdout.close()
+        # The stored parent identity remains pinned even after the name is reused.
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        self.assertIn('result', control.request('delete', bot='Bob'))
+        self.agent('run', *self.common, '--new', '--bot', 'Bob', 'replacement')
+        replacement = control.request('resume', bot='Bob')['result']
+        self.assertNotEqual(replacement['id'], by_name['Bob']['id'])
+        route = ('"$AGENT_BIN" run --detach --bot "$AGENT_PARENT" '
+                 '--bot-id "$AGENT_PARENT_ID" -- should-not-deliver > route.out 2> route.err; '
+                 'printf "%s" "$?" > route.status')
+        self.agent('run', *self.again, '--bot', 'Alice', f'shell:{route}')
+        self.assertEqual((self.path / 'route.status').read_text(), '1')
+        self.assertIn('bot_not_found', (self.path / 'route.err').read_text())
+        self.assertEqual(control.request('resume', bot='Bob')['result']['head'], replacement['head'])
+
+    def test_creator_identity_is_required_and_survives_daemon_restart(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Creator',
+                   'shell:printf "%s" "$AGENT_BOT_ID" > own-id')
+        creator = json.loads(self.agent('ls', '--store', str(self.store)).stdout)[0]
+        self.assertEqual((self.path / 'own-id').read_text(), str(creator['id']))
+        # A surviving shell retains this environment even across daemon replacement.
+        shell_env = dict(clean_env(), AGENT_BOT='Creator', AGENT_BOT_ID=str(creator['id']))
+        self.shutdown()
+        self.agent('run', *self.again, '--bot', 'Creator', 'after restart')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        self.assertIn('result', control.request('delete', bot='Creator'))
+        self.agent('run', *self.common, '--new', '--bot', 'Creator', 'replacement')
+        replacement = control.request('resume', bot='Creator')['result']
+        for operation in ('create', 'fork'):
+            args = (['run', *self.common, '--new', '--bot', 'Child', 'hello']
+                    if operation == 'create' else
+                    ['fork', '--store', str(self.store), '--source', 'Creator', '--bot', 'Child'])
+            for identity in (str(creator['id']), None, str(replacement['id'])):
+                env = dict(shell_env)
+                if identity is None:
+                    env.pop('AGENT_BOT_ID')
+                else:
+                    env['AGENT_BOT_ID'] = identity
+                result = subprocess.run([*self.base, *args], env=env, cwd=self.path,
+                                        capture_output=True, text=True, timeout=15)
+                if identity == str(replacement['id']):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    child = control.request('resume', bot='Child')['result']
+                    self.assertEqual(child['created_by_id'], replacement['id'])
+                    self.assertIn('result', control.request('delete', bot='Child'))
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn('result', control.request('resume', bot='Child'))
+        self.assertEqual(control.request('resume', bot='Creator')['result']['head'], replacement['head'])
 
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',

@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Binding, Bot, Delivery, Publication, Store, TurnOptions},
+    store::{Binding, Bot, Delivery, Fork, Publication, Store, TurnOptions},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -51,6 +51,9 @@ enum Command {
         budget_tokens: Option<u64>,
         /// The tools this bot may call, from the daemon's registered set.
         tools: Option<Vec<String>>,
+        /// The bot on whose behalf the client creates this one, if any.
+        created_by: Option<String>,
+        created_by_id: Option<i64>,
         /// Compaction instructions and an optional summarizer model, both
         /// the client's; without instructions the bot never compacts.
         compaction_instructions: Option<String>,
@@ -66,6 +69,10 @@ enum Command {
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
+        /// Replace the source's instructions for the fork; the source keeps its own.
+        instructions: Option<String>,
+        created_by: Option<String>,
+        created_by_id: Option<i64>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -111,6 +118,18 @@ enum Command {
         bot: String,
         after: i64,
         limit: usize,
+    },
+    HistoryNodes {
+        bot: String,
+        from: Option<i64>,
+        limit: Option<usize>,
+        min_node: Option<i64>,
+        #[serde(default)]
+        oldest_first: bool,
+    },
+    HistoryItems {
+        bot: String,
+        nodes: Vec<i64>,
     },
     Item {
         bot: String,
@@ -454,7 +473,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_process_budget(limits.processes);
     let hub = Hub::default();
     let ready = json!({"event":"ready","protocol":3,
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -907,6 +926,8 @@ impl Service {
                 reasoning,
                 budget_tokens,
                 tools,
+                created_by,
+                created_by_id,
                 compaction_instructions,
                 compaction_model,
             } => {
@@ -914,6 +935,9 @@ impl Service {
                     return fail("invalid_budget");
                 }
                 name(&bot)?;
+                if let Some(creator) = &created_by {
+                    name(creator)?;
+                }
                 let path = path.as_deref().map(workspace).transpose()?;
                 // The daemon supplies no agent behavior: who creates a bot
                 // says what it runs and what it is told, and the bot keeps both.
@@ -967,6 +991,8 @@ impl Service {
                                 reasoning: reasoning.as_deref(),
                                 budget_tokens,
                                 tools: &tools,
+                                created_by: created_by.as_deref(),
+                                created_by_id,
                                 compaction_instructions: compaction_instructions.as_deref(),
                                 compaction_model: compaction_model.as_deref(),
                             },
@@ -1171,15 +1197,35 @@ impl Service {
                 bot,
                 workspace: path,
                 budget_tokens,
+                instructions,
+                created_by,
+                created_by_id,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
                 name(&bot)?;
+                if let Some(creator) = &created_by {
+                    name(creator)?;
+                }
+                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
+                    return fail("instructions_limit");
+                }
                 let path = path.as_deref().map(workspace).transpose()?;
                 let (created, event) = store
                     .op("fork", move |db| {
-                        db.fork(&source, checkpoint, &bot, path.as_deref(), budget_tokens)
+                        db.fork(
+                            &source,
+                            &bot,
+                            Fork {
+                                checkpoint,
+                                workspace: path.as_deref(),
+                                budget_tokens,
+                                instructions: instructions.as_deref(),
+                                created_by: created_by.as_deref(),
+                                created_by_id,
+                            },
+                        )
                     })
                     .await?;
                 let _ = event;
@@ -1190,7 +1236,25 @@ impl Service {
                     .op("events", move |db| db.events(&bot, after, limit))
                     .await
             }
-            Command::Item { bot, node } => store.op("item", move |db| db.item(&bot, node)).await,
+            Command::HistoryNodes {
+                bot,
+                from,
+                limit,
+                min_node,
+                oldest_first,
+            } => {
+                store
+                    .read("history_nodes", move |db| {
+                        db.history_nodes(&bot, from, limit.unwrap_or(400), min_node, oldest_first)
+                    })
+                    .await
+            }
+            Command::HistoryItems { bot, nodes } => {
+                store
+                    .read("history_items", move |db| db.history_items(&bot, &nodes))
+                    .await
+            }
+            Command::Item { bot, node } => store.read("item", move |db| db.item(&bot, node)).await,
             Command::Artifact {
                 bot,
                 turn,
@@ -1497,6 +1561,8 @@ mod tests {
                         reasoning: None,
                         budget_tokens: None,
                         tools: &[],
+                        created_by: None,
+                        created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
                     },
@@ -1678,6 +1744,8 @@ mod tests {
             reasoning: None,
             budget_tokens: None,
             tools: &[],
+            created_by: None,
+            created_by_id: None,
             compaction_instructions: None,
             compaction_model: None,
         };

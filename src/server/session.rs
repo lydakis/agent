@@ -8,8 +8,8 @@ use tokio::{
     sync::mpsc,
 };
 
-// A request is handed over once, by value, through a channel; the parsed
-// command's size is not worth an allocation per message.
+// Keep requests inline in the 64-slot input queue instead of allocating a
+// box for every request. Open/Closed messages are infrequent control traffic.
 #[allow(clippy::large_enum_variant)]
 pub enum Inbound {
     Open(u64, Output),

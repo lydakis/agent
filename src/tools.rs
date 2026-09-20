@@ -877,6 +877,10 @@ async fn shell(
     for credential in registry.credentials.iter() {
         process.env_remove(&credential.name);
     }
+    // A set AGENT_PARENT names this bot's creator and nothing else; a root
+    // bot must not pass on one the daemon itself was started with.
+    process.env_remove("AGENT_PARENT");
+    process.env_remove("AGENT_PARENT_ID");
     for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
     }

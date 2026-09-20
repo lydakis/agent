@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 mod db;
 pub use db::{
-    Absorbed, Binding, Bot, CompactionPlan, CompactionView, Database, Delivery, Publication,
+    Absorbed, Binding, Bot, CompactionPlan, CompactionView, Database, Delivery, Fork, Publication,
     Started, TurnContext, TurnOptions, Waiting, Window, cache_hit,
 };
 
