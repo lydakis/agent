@@ -545,8 +545,21 @@ fn composed_instructions(options: &Options, workspace: &str) -> Result<String> {
 
 /// Inside a bot's shell tool the daemon names the bot; a client run there
 /// declares that bot as the creator of anything it creates or forks.
-fn created_by() -> Option<String> {
-    std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty())
+fn created_by() -> Result<(Option<String>, Option<i64>)> {
+    let name = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
+    let id = std::env::var("AGENT_BOT_ID").ok();
+    match (name, id) {
+        (None, None) => Ok((None, None)),
+        (Some(name), Some(id)) => {
+            let id = id
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or(Error::new("creator_identity_required"))?;
+            Ok((Some(name), Some(id)))
+        }
+        _ => fail("creator_identity_required"),
+    }
 }
 
 fn unique(prefix: &str) -> String {
@@ -654,13 +667,14 @@ fn run(options: &Options) -> Result<i32> {
                 "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
             ))?;
         let instructions = composed_instructions(options, &workspace)?;
+        let (created_by, created_by_id) = created_by()?;
         connection.request(
             "create",
             json!({"bot":bot,"workspace":workspace,"model":model,
                 "instructions":instructions,"reasoning":options.reasoning,
                 "budget_tokens":options.budget_tokens,
                 "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>(),
-                "created_by":created_by()}),
+                "created_by":created_by,"created_by_id":created_by_id}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
@@ -745,13 +759,14 @@ fn fork(options: &Options) -> Result<i32> {
     let checkpoint = options.checkpoint;
     let mut connection = Connection::connect(&options.socket)?;
     // A fork inherits only the conversation; its turns name their own workspace.
+    let (created_by, created_by_id) = created_by()?;
     let result = connection.request(
         "fork",
         json!({"source":source,"checkpoint":checkpoint,"bot":bot,
             "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
             "budget_tokens":options.budget_tokens,
             "instructions":if options.agents { Some(composed_instructions(options, &workspace(options)?)?) } else { options.instructions.clone() },
-            "created_by":created_by()}),
+            "created_by":created_by,"created_by_id":created_by_id}),
     )?;
     print_json(&result, options.pretty)?;
     Ok(0)

@@ -328,6 +328,7 @@ impl Turn {
         let mut environment = vec![
             ("AGENT_MODEL".to_owned(), context.model.clone()),
             ("AGENT_BOT".to_owned(), context.bot.clone()),
+            ("AGENT_BOT_ID".to_owned(), context.bot_id.to_string()),
         ];
         if let (Some(parent), Some(id)) = (&context.created_by, context.created_by_id) {
             environment.push(("AGENT_PARENT".to_owned(), parent.clone()));
@@ -971,6 +972,7 @@ mod tests {
                             budget_tokens: None,
                             tools: &[],
                             created_by: None,
+                            created_by_id: None,
                         },
                     )?;
                     let turn = db

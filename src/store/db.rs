@@ -44,9 +44,8 @@ pub struct Bot {
     /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
     /// this is lineage for people, not authority.
     pub created_by: Option<String>,
-    /// That creator's identity at the time, resolved by the store, so a
-    /// later bot reusing the name is not mistaken for it. `None` when the
-    /// declared creator did not exist.
+    /// The creator's captured identity, validated by the store. A later bot
+    /// reusing the name is not mistaken for it. `None` for a root bot.
     pub created_by_id: Option<i64>,
 }
 impl Bot {
@@ -64,6 +63,7 @@ pub struct Fork<'a> {
     /// Replaces the source's instructions for the new bot only.
     pub instructions: Option<&'a str>,
     pub created_by: Option<&'a str>,
+    pub created_by_id: Option<i64>,
 }
 /// Provider binding chosen at creation; immutable for the bot's lifetime.
 pub struct Binding<'a> {
@@ -75,6 +75,7 @@ pub struct Binding<'a> {
     pub budget_tokens: Option<u64>,
     pub tools: &'a [String],
     pub created_by: Option<&'a str>,
+    pub created_by_id: Option<i64>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -190,6 +191,7 @@ pub struct Window {
 pub struct TurnContext {
     pub model_rounds: usize,
     pub bot: String,
+    pub bot_id: i64,
     pub created_by: Option<String>,
     pub created_by_id: Option<i64>,
     pub workspace: String,
@@ -503,17 +505,27 @@ impl Database {
         })
     }
     const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id";
-    /// The identity behind a declared creator's name now; a name nobody
-    /// holds resolves to nothing rather than to whoever holds it later.
-    fn creator_id(conn: &Connection, creator: Option<&str>) -> Result<Option<i64>> {
-        let Some(creator) = creator else {
-            return Ok(None);
-        };
-        Ok(conn
-            .query_row("SELECT id FROM bots WHERE name=?", [creator], |r| {
-                r.get::<_, i64>(0)
-            })
-            .optional()?)
+    /// Validate the caller's captured identity in the same transaction that
+    /// creates the child. Never resolve a stale shell's name to a new bot.
+    fn creator_id(
+        conn: &Connection,
+        creator: Option<&str>,
+        expected: Option<i64>,
+    ) -> Result<Option<i64>> {
+        match (creator, expected) {
+            (None, None) => Ok(None),
+            (Some(creator), Some(id)) => {
+                let found = conn
+                    .query_row(
+                        "SELECT id FROM bots WHERE name=? AND id=? AND status!='deleting'",
+                        params![creator, id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                found.map(Some).ok_or(Error::new("creator_not_found"))
+            }
+            _ => fail("creator_identity_required"),
+        }
     }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
@@ -584,7 +596,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
-        let created_by_id = Self::creator_id(&tx, binding.created_by)?;
+        let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
             params![
@@ -1519,6 +1531,7 @@ impl Database {
             created_by: bot.created_by,
             created_by_id: bot.created_by_id,
             bot: bot.name,
+            bot_id: bot.id,
         })
     }
     fn active(&self, turn: i64) -> Result<Bot> {
@@ -1952,6 +1965,7 @@ impl Database {
             budget_tokens,
             instructions,
             created_by,
+            created_by_id,
         } = fork;
         let parent = self.inspect(source)?;
         let checkpoint = match node {
@@ -1979,7 +1993,7 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
-        let created_by_id = Self::creator_id(&tx, created_by)?;
+        let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
             "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
             params![

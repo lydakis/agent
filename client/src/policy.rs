@@ -24,7 +24,7 @@ Collect results with the wait tool on that handle; it returns the peer's status 
 Long commands can run with shell background=true and be collected the same way. \
 Blocking run/follow inside a shell tool is rejected. \
 Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an agent from an earlier point in its history. \
-$AGENT_BOT is your name; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
+$AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
 To contact that creator, run \
 \"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \
 the identity check refuses a deleted creator or a replacement with the same name.";

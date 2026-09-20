@@ -8,6 +8,9 @@ use tokio::{
     sync::mpsc,
 };
 
+// Keep requests inline in the 64-slot input queue instead of allocating a
+// box for every request. Open/Closed messages are infrequent control traffic.
+#[allow(clippy::large_enum_variant)]
 pub enum Inbound {
     Open(u64, Output),
     Request(u64, Result<Request>),

@@ -491,7 +491,7 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","created_by":"Alice"}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","created_by":"Alice","created_by_id":42}
 {"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-4-1"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
@@ -637,15 +637,15 @@ it may return `response_size_limit`, in which case use pages. Offset and limit
 require a stream. This keeps even escaped, multi-stream artifacts retrievable
 within the 1 MiB response bound.
 
-`created_by` on `create` and `fork` is the client's declaration of which bot
-it acts for; the CLI fills it from `AGENT_BOT`, which the daemon sets in every
-shell tool's environment along with `AGENT_PARENT` and `AGENT_PARENT_ID`, the
-running bot's recorded creator when its identity is known. The client preamble
-uses both with `run --bot NAME --bot-id ID`, so a later replacement cannot
-receive a stale child-to-parent submission. The store resolves the name to the creator's
-identity at that moment and keeps it as `created_by_id` (`null` when no bot
-held the name), so a later bot reusing the name is not mistaken for the
-creator. The record, the `created` and `forked` events, and `bots` pages
+`created_by` and `created_by_id` on `create` and `fork` declare the bot
+on whose behalf the client acts. Supply both or neither. The CLI captures them
+from `AGENT_BOT` and `AGENT_BOT_ID`, exported in every shell tool environment.
+The store validates the pair in the child creation transaction and rejects a
+missing, deleted, deleting, or replaced creator, so a surviving shell cannot
+attribute a new child to a replacement bot after restart. The daemon also sets
+`AGENT_PARENT` and `AGENT_PARENT_ID` to the running bot's recorded creator.
+The client preamble uses both with `run --bot NAME --bot-id ID`, preventing
+stale child-to-parent submissions after name reuse. The record, the `created` and `forked` events, and `bots` pages
 carry both; the two events also carry the record's list fields (`id`,
 `provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
 seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and

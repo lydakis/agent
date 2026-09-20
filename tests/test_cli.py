@@ -544,6 +544,42 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('bot_not_found', (self.path / 'route.err').read_text())
         self.assertEqual(control.request('resume', bot='Bob')['result']['head'], replacement['head'])
 
+    def test_creator_identity_is_required_and_survives_daemon_restart(self):
+        self.agent('run', *self.common, '--new', '--bot', 'Creator',
+                   'shell:printf "%s" "$AGENT_BOT_ID" > own-id')
+        creator = json.loads(self.agent('ls', '--store', str(self.store)).stdout)[0]
+        self.assertEqual((self.path / 'own-id').read_text(), str(creator['id']))
+        # A surviving shell retains this environment even across daemon replacement.
+        shell_env = dict(clean_env(), AGENT_BOT='Creator', AGENT_BOT_ID=str(creator['id']))
+        self.shutdown()
+        self.agent('run', *self.again, '--bot', 'Creator', 'after restart')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        self.assertIn('result', control.request('delete', bot='Creator'))
+        self.agent('run', *self.common, '--new', '--bot', 'Creator', 'replacement')
+        replacement = control.request('resume', bot='Creator')['result']
+        for operation in ('create', 'fork'):
+            args = (['run', *self.common, '--new', '--bot', 'Child', 'hello']
+                    if operation == 'create' else
+                    ['fork', '--store', str(self.store), '--source', 'Creator', '--bot', 'Child'])
+            for identity in (str(creator['id']), None, str(replacement['id'])):
+                env = dict(shell_env)
+                if identity is None:
+                    env.pop('AGENT_BOT_ID')
+                else:
+                    env['AGENT_BOT_ID'] = identity
+                result = subprocess.run([*self.base, *args], env=env, cwd=self.path,
+                                        capture_output=True, text=True, timeout=15)
+                if identity == str(replacement['id']):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    child = control.request('resume', bot='Child')['result']
+                    self.assertEqual(child['created_by_id'], replacement['id'])
+                    self.assertIn('result', control.request('delete', bot='Child'))
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn('result', control.request('resume', bot='Child'))
+        self.assertEqual(control.request('resume', bot='Creator')['result']['head'], replacement['head'])
+
     def test_large_shell_output_is_previewed_and_retained_as_an_artifact(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob',
                          'shell:head -c 1048576 /dev/zero | tr "\\0" y')

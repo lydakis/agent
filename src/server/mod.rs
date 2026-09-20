@@ -53,6 +53,7 @@ enum Command {
         tools: Option<Vec<String>>,
         /// The bot on whose behalf the client creates this one, if any.
         created_by: Option<String>,
+        created_by_id: Option<i64>,
     },
     Resume {
         bot: String,
@@ -67,6 +68,7 @@ enum Command {
         /// Replace the source's instructions for the fork; the source keeps its own.
         instructions: Option<String>,
         created_by: Option<String>,
+        created_by_id: Option<i64>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -902,6 +904,7 @@ impl Service {
                 budget_tokens,
                 tools,
                 created_by,
+                created_by_id,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
@@ -946,6 +949,7 @@ impl Service {
                                 budget_tokens,
                                 tools: &tools,
                                 created_by: created_by.as_deref(),
+                                created_by_id,
                             },
                         )
                     })
@@ -1150,6 +1154,7 @@ impl Service {
                 budget_tokens,
                 instructions,
                 created_by,
+                created_by_id,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
@@ -1173,6 +1178,7 @@ impl Service {
                                 budget_tokens,
                                 instructions: instructions.as_deref(),
                                 created_by: created_by.as_deref(),
+                                created_by_id,
                             },
                         )
                     })
@@ -1511,6 +1517,7 @@ mod tests {
                         budget_tokens: None,
                         tools: &[],
                         created_by: None,
+                        created_by_id: None,
                     },
                 )?;
                 let turn = db
@@ -1688,6 +1695,7 @@ mod tests {
             budget_tokens: None,
             tools: &[],
             created_by: None,
+            created_by_id: None,
         };
         let turn = store
             .op("create", move |db| {

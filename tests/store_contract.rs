@@ -33,6 +33,7 @@ fn binding() -> Binding<'static> {
         budget_tokens: None,
         tools: &[],
         created_by: None,
+        created_by_id: None,
     }
 }
 /// Every stored item of a bot, through the same window the runtime streams.
@@ -1094,11 +1095,57 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
 }
 
 #[test]
+fn creation_and_fork_reject_incomplete_deleted_and_reused_creator_identities() {
+    let mut db = db();
+    let (creator, _) = db.create("Creator", Some("/synthetic"), binding()).unwrap();
+    db.create("Source", Some("/synthetic"), binding()).unwrap();
+    for reused in [false, true] {
+        db.delete_bot("Creator").unwrap();
+        if reused {
+            db.create("Creator", Some("/synthetic"), binding()).unwrap();
+        }
+        for (name, id, code) in [
+            (Some("Creator"), Some(creator.id), "creator_not_found"),
+            (Some("Creator"), None, "creator_identity_required"),
+            (None, Some(creator.id), "creator_identity_required"),
+        ] {
+            let before = db.list(None, 64).unwrap();
+            let mut b = binding();
+            b.created_by = name;
+            b.created_by_id = id;
+            assert_eq!(
+                db.create("Child", Some("/synthetic"), b).unwrap_err().code,
+                code
+            );
+            assert_eq!(
+                db.fork(
+                    "Source",
+                    "Child",
+                    Fork {
+                        created_by: name,
+                        created_by_id: id,
+                        ..Fork::default()
+                    }
+                )
+                .unwrap_err()
+                .code,
+                code
+            );
+            assert_eq!(db.list(None, 64).unwrap(), before);
+        }
+        if !reused {
+            db.create("Creator", Some("/synthetic"), binding()).unwrap();
+        }
+    }
+}
+
+#[test]
 fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
     let mut db = db();
     let (first_a, _) = db.create("A", Some("/synthetic"), binding()).unwrap();
     let mut by_a = binding();
     by_a.created_by = Some("A");
+    by_a.created_by_id = Some(first_a.id);
     let (b, _) = db.create("B", Some("/synthetic"), by_a).unwrap();
     assert_eq!(b.created_by_id, Some(first_a.id));
     db.delete_bot("A").unwrap();
@@ -1224,13 +1271,14 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
     let mut db = db();
     let mut created = binding();
     created.instructions = "first text";
+    let (parent, _) = db.create("Parent", Some("/synthetic"), binding()).unwrap();
     created.created_by = Some("Parent");
+    created.created_by_id = Some(parent.id);
     let (bot, event) = db.create("Bob", Some("/synthetic"), created).unwrap();
     assert_eq!(bot.created_by.as_deref(), Some("Parent"));
     assert_eq!(event["data"]["created_by"], "Parent");
-    // A declared creator nobody holds resolves to no identity; the event
-    // carries the record's fields so a follower needs no request per bot.
-    assert_eq!(bot.created_by_id, None);
+    // The event carries the validated creator identity.
+    assert_eq!(bot.created_by_id, Some(parent.id));
     assert_eq!(event["data"]["status"], "idle");
     assert_eq!(event["data"]["provider"], "openai");
     assert_eq!(event["data"]["workspace"], "/synthetic");
@@ -1241,6 +1289,7 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
             "same",
             Fork {
                 created_by: Some("Bob"),
+                created_by_id: Some(bot.id),
                 ..Fork::default()
             },
         )
@@ -1279,6 +1328,7 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
         listed,
         vec![
             ("Bob", Some("Parent")),
+            ("Parent", None),
             ("changed", None),
             ("same", Some("Bob"))
         ]

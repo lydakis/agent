@@ -8,9 +8,10 @@ Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
 `-h` also works. Help writes to stdout and exits successfully without opening
 a store or connecting to a daemon.
 
-Inside a bot's shell tool, `AGENT_BOT` names that bot and the client records
-it as the creator of anything it creates or forks (`created_by`, with the
-creator's identity as `created_by_id`);
+Inside a bot's shell tool, `AGENT_BOT` and `AGENT_BOT_ID` identify that bot.
+The client sends both as `created_by` and `created_by_id` when creating or
+forking a child. The store rejects missing or stale creator identities before
+creating the child, including after a daemon restart or name reuse;
 `AGENT_PARENT` and `AGENT_PARENT_ID` identify the running bot's recorded creator
 when its identity was known at creation. Address that creator with
 `run --detach --bot "$AGENT_PARENT" --bot-id "$AGENT_PARENT_ID" -- TASK`.
