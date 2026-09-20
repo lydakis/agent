@@ -497,3 +497,23 @@ test('ready work is interruptible while later queued work preserves the active t
   await p.onEvent({event:'queued',bot:'Bob',turn:8,data:{status:'queued'}});
   await p.interrupt();assert.equal(calls.length,1);assert.equal(calls[0][1].turn,7);
 });
+
+test('snapshot-first replay preserves every durable node across eviction boundaries', async () => {
+  const p=page(historyDaemon());p.S.session=1;p.upsert({name:'Bob',id:1,head:6000});
+  const t=p.transcript('Bob');
+  for(let node=1;node<=6000;node++)await p.onEvent({event:'message',bot:'Bob',turn:node,data:{node}});
+  const covered=new Set();
+  for(const it of t.items) {
+    if(it.kind==='history')for(let node=Math.max(1,it.min??0);node<=it.next-(it.exclusive?1:0);node++)covered.add(node);
+    else if(it.node!=null||it.from!=null)covered.add(it.node??it.from);
+  }
+  assert.deepEqual([...covered].sort((a,b)=>a-b),Array.from({length:6000},(_,i)=>i+1));
+});
+
+test('low-byte replay evicts as soon as the count allowance is exceeded', async () => {
+  const p=page();
+  for(let node=1;node<=5000;node++) {
+    await p.onEvent({event:'message',bot:'Bob',turn:node,data:{node}});
+    assert.ok(p.transcript('Bob').items.length<=1600,`count bound at node ${node}`);
+  }
+});

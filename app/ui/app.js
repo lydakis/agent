@@ -35,7 +35,7 @@ const addItem = (t, it) => {
   if (it.kind === 'peer' && t.peers.includes(it.who)) return;
   if (it.kind === 'note') it.bytes = it.text.length * 2;
   count(t, it, 1); t.items.push(it);
-  if (t.items.length % LAZY_ITEMS === 0 || t.bytes > DECODE_BYTES) evict(t);
+  if (t.items.length > WINDOW + LAZY_ITEMS || t.bytes > DECODE_BYTES) evict(t);
   if (it.kind === 'peer' && t.peers.length > PEER_WINDOW * 2) {
     const keep = new Set(t.peers.slice(-PEER_WINDOW));
     let removed = 0;
@@ -54,6 +54,16 @@ function decodeAt(t, at, entries) {
   for (const e of entries) { e.from = bare.node; e.fromCall = bare.callId; count(t, e, 1); }
   t.items.splice(at, 1, ...entries);
   t.gen += 1;
+}
+// Every history union compares the last included node, not the raw cursor:
+// snapshot cursors can be exclusive, while evicted nodes are inclusive.
+const historyEnd = r => r.next - (r.exclusive ? 1 : 0);
+function mergeHistoryRange(target, source) {
+  if (historyEnd(source) > historyEnd(target)) {
+    target.next = source.next; target.exclusive = source.exclusive;
+  }
+  target.min = target.min == null || source.min == null ? undefined : Math.min(target.min, source.min);
+  target.seed ||= source.seed;
 }
 // Fold decoded bodies outside the window back into their nodes. Whole nodes only: a run split by the
 // boundary folds entirely, so a later decode cannot sit next to its own remainder.
@@ -78,7 +88,7 @@ function evict(t) {
   const append = (it) => {
     const prev = result[result.length - 1];
     if (it.kind === 'history' && prev?.kind === 'history' && !!it.forward === !!prev.forward) {
-      prev.next = Math.max(prev.next, it.next); prev.min = Math.min(prev.min ?? 0, it.min ?? 0);
+      mergeHistoryRange(prev, it);
     } else result.push(it);
   };
   for (let i = 0; i < source.length;) {
@@ -106,11 +116,9 @@ function evict(t) {
 function normalizeRanges(t) {
   const ranges = t.items.filter(it => it.kind === 'history').sort((a,b) => (a.min ?? 0) - (b.min ?? 0));
   const removed = new Set(); let previous = null;
-  const high = r => r.next - (r.exclusive ? 1 : 0);
   for (const r of ranges) {
-    if (previous && (r.min ?? 0) <= high(previous)) {
-      if (high(r) > high(previous)) { previous.next = r.next; previous.exclusive = r.exclusive; }
-      previous.seed ||= r.seed;
+    if (previous && (r.min ?? 0) <= historyEnd(previous)) {
+      mergeHistoryRange(previous, r);
       removed.add(r);
     } else previous = r;
   }
@@ -136,7 +144,7 @@ function seedHistory(record) {
     // the covered cache from lineage rather than guessing which nodes are missing.
     // Keep peer/activity rows and nodes committed after this snapshot's head.
     t.items = t.items.flatMap(it => {
-      if (it.kind === 'history') return it.next - (it.exclusive ? 1 : 0) > record.head ? [{...it,min:Math.max(it.min ?? 0,record.head + 1),seed:false}] : [];
+      if (it.kind === 'history') return historyEnd(it) > record.head ? [{...it,min:Math.max(it.min ?? 0,record.head + 1),seed:false}] : [];
       const node = it.kind === 'node' ? it.node : it.from;
       return node == null || node > record.head ? [it] : [];
     });

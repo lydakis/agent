@@ -79,23 +79,56 @@ fn config() -> Result<Config, String> {
             }
         },
     };
-    // The daemon wants an existing absolute workspace; resolve what was given
-    // the same way the default is resolved.
-    let workspace = match workspace {
-        Some(dir) => std::fs::canonicalize(&dir)
-            .map_err(|e| format!("--workspace {dir}: {e}"))?
-            .to_string_lossy()
-            .into_owned(),
-        None => std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .to_string_lossy()
-            .into_owned(),
-    };
+    let workspace = workspace_path(&match workspace {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir().map_err(|e| e.to_string())?,
+    })?;
     Ok(Config {
         socket,
         model: model.or_else(|| std::env::var("AGENT_MODEL").ok()),
         workspace,
     })
+}
+
+/// Resolve the default once at startup. The protocol requires an existing
+/// absolute UTF-8 directory; lossy conversion could name a different path.
+fn workspace_path(path: &std::path::Path) -> Result<String, String> {
+    path.to_str().ok_or("--workspace must be valid UTF-8")?;
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("--workspace {}: {e}", path.display()))?;
+    if !path.is_dir() {
+        return Err("--workspace must be a directory".into());
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "--workspace must be valid UTF-8".into())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::workspace_path;
+
+    #[test]
+    fn workspace_defaults_require_an_existing_utf8_directory() {
+        let root = std::env::temp_dir().join(format!("agent-app-workspace-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(
+            workspace_path(&root).unwrap(),
+            root.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert!(workspace_path(&file).unwrap_err().contains("directory"));
+        assert!(workspace_path(&root.join("missing")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let invalid = root.join(std::ffi::OsString::from_vec(vec![0xff]));
+            assert!(workspace_path(&invalid).unwrap_err().contains("UTF-8"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// What the page needs to create bots and to say where it is.
