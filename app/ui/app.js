@@ -12,9 +12,10 @@ const WINDOW = 3 * LAZY_ITEMS;
 
 const S = {
   bots: new Map(), transcripts: new Map(), selected: '', cursor: 0, live: false, attached: false, autoSelect: true,
-  // Bumped whenever a bot is added, removed or changes status, so the rail and the activity check
-  // rebuild once per change instead of scanning the fleet on every event.
-  botsGen: 0,
+  // Bumped whenever a bot is added, removed or changes status (botsGen), and when one is added or
+  // removed (shapeGen), so the activity check and the rail's tree rebuild once per change instead of
+  // scanning the fleet on every event.
+  botsGen: 0, shapeGen: 0,
   config: null, ui: { rail: false, peek: null, picker: false, pickerSel: 0, help: false, thoughts: false, output: false, toast: null },
 };
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
@@ -72,14 +73,18 @@ function upsert(record) {
   if (known && known.id != null && record.id != null && known.id !== record.id) { S.bots.delete(record.name); S.transcripts.delete(record.name); }
   const b = bot(record.name) || { name: record.name, id: null, parent: null, waitingOn: [], turnStarted: 0, elapsed: 0 };
   if (record.id != null) b.id = record.id;
+  if (!known || known !== b) S.shapeGen += 1;
   S.botsGen += 1;
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   b.workspace = record.workspace ?? null;
-  if (record.created_by) b.parent = record.created_by;
+  if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
 }
+// The creator, when the bot holding that name now is the identity that did the creating. A later
+// bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
+function creatorOf(b) { const p = b.parent && b.parentId != null ? S.bots.get(b.parent) : null; return p && p.id === b.parentId ? p : null; }
 async function refreshBot(name) { try { upsert(await Daemon.request('resume', { bot: name })); } catch (_) {} }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
@@ -98,14 +103,13 @@ function tree() {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
   const children = new Map();
-  for (const b of S.bots.values()) { const key = b.parent && S.bots.has(b.parent) ? b.parent : null; if (!children.has(key)) children.set(key, []); children.get(key).push(b); }
+  for (const b of S.bots.values()) { const key = creatorOf(b)?.name ?? null; if (!children.has(key)) children.set(key, []); children.get(key).push(b); }
   const out = []; const seen = new Set(); const stack = [];
   const pushKids = (parent, depth, cont) => {
     const kids = (children.get(parent) ?? []).filter((b) => !seen.has(b.name));
     for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth, i === kids.length - 1, cont]);
   };
-  pushKids(null, 0, '');
-  for (;;) {
+  const walk = () => {
     while (stack.length) {
       const [b, depth, last, cont] = stack.pop();
       if (seen.has(b.name)) continue; seen.add(b.name);
@@ -114,11 +118,10 @@ function tree() {
       // The continuation stops growing past a few levels: a chain of thousands must not cost thousands per row.
       pushKids(b.name, depth + 1, depth === 0 ? '' : depth > 6 ? cont : cont + (last ? '  ' : '│ '));
     }
-    // A creator cycle (delete and recreate) reaches nothing from the roots; root it so nothing is hidden.
-    const orphan = [...S.bots.values()].find((b) => !seen.has(b.name));
-    if (!orphan) break;
-    stack.push([orphan, 0, true, '']);
-  }
+  };
+  pushKids(null, 0, ''); walk();
+  // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
+  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '']); walk(); }
   return out;
 }
 function callSummary(name, args) {
@@ -129,6 +132,7 @@ function callSummary(name, args) {
 
 // ---------- events ----------
 const FLEET_EVENTS = new Set(['created', 'forked', 'accepted', 'queued', 'turn_waiting', 'turn_paced', 'turn_resumed', 'turn_finished', 'deleted']);
+const SHAPE_EVENTS = new Set(['created', 'forked', 'deleted']);
 async function onEvent(ev) {
   const kind = ev.event, name = ev.bot ?? '', turn = ev.turn ?? null, data = ev.data ?? {};
   if (typeof ev.cursor === 'number') S.cursor = Math.max(S.cursor, ev.cursor);
@@ -139,18 +143,19 @@ async function onEvent(ev) {
       S.autoSelect = false;
       break;
     }
-    case 'follow_lagged': S.attached = false; toast('event stream lagged; attaching again'); await attach(); return true;
+    // Attaching queues its own load on the chain this handler runs in; done here it would wait on itself.
+    case 'follow_lagged': S.attached = false; S.live = false; toast('event stream lagged; attaching again'); setTimeout(() => { if (!S.attached) attach(); }, 0); return true;
     case 'closed': S.attached = false; S.live = false; showDetached('the daemon closed the session'); return true;
     case 'text_delta': { const t = transcript(name); t.streamingTurn = turn; t.text += ev.text ?? ''; break; }
     case 'thinking_delta': { const t = transcript(name); t.streamingTurn = turn; if (!t.thinkingSince) t.thinkingSince = Date.now(); t.thinking += ev.text ?? ''; break; }
     case 'created': case 'forked': {
-      // The snapshot already holds every bot that existed at attach; only a bot born after it needs a fetch.
-      if (!S.bots.has(name)) await refreshBot(name);
-      if (data.created_by && bot(name)) bot(name).parent = data.created_by;
+      // The event carries the record's list fields, so a burst of creations costs no request each. A
+      // bot the snapshot already holds keeps its record; the event says the same thing.
+      if (!S.bots.has(name)) { if (data.provider !== undefined) upsert({ name, ...data }); else await refreshBot(name); }
       if (kind === 'created') {
-        // Lineage comes from the daemon's record or the event, never from guessing at shell text.
-        const parent = bot(name)?.parent;
-        if (parent && bot(name) && S.bots.has(parent)) { bot(name).parent = parent; addItem(transcript(parent), { kind: 'peer', who: name, turn: bot(parent)?.runningTurn ?? null }); }
+        // Lineage is the store's: the creator's identity, never a guess at shell text.
+        const parent = bot(name) && creatorOf(bot(name));
+        if (parent) addItem(transcript(parent.name), { kind: 'peer', who: name, turn: parent.runningTurn ?? null });
       } else addItem(transcript(name), { kind: 'note', text: `forked from ${data.source ?? '?'}`, turn: null });
       break;
     }
@@ -326,7 +331,7 @@ async function attach() {
       // one being attached forwards its replay before its number is installed, so only older is stale.
       if (ev.session !== undefined && S.session !== undefined && ev.session < S.session) return;
       const terminal = await onEvent(ev);
-      if (FLEET_EVENTS.has(ev.event)) S.botsGen += 1;
+      if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
       if (ev.session !== undefined && ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = ev.session;
       // During replay nothing is fetched: a load per node-producing event would serialize a long history
       // into one request each. The first load runs once follow_live arrives.
@@ -344,7 +349,7 @@ async function attach() {
     restore();
     // A selection deleted while detached had no `deleted` event to replay; show a surviving bot.
     if (!S.bots.has(S.selected)) { const first = tree()[0]; S.selected = first ? first.b.name : ''; }
-    S.botsGen += 1;
+    S.botsGen += 1; S.shapeGen += 1;
     // Only now do the session's events flow: every one of them is newer than the snapshot just applied.
     if (Daemon.stream) await Daemon.stream();
     await enqueue(loadVisible);
@@ -439,15 +444,24 @@ function itemHTML(it) {
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
     case 'peer': { const c = peerCard(it.who); return c ? cardHTML(c) : ''; }
     case 'proc': { const status = it.done === null ? 'running' : 'idle'; const last = it.done === null ? it.handle : (it.done || 'done'); return cardHTML({ attr: `data-proc="${esc(it.handle)}"`, status, name: `$ ${it.cmd}`, last, elapsed: '', sel: false }); }
-    case 'node': return `<div class="line pending">…</div>`;
+    case 'node': return '';
     default: return '';
   }
 }
-// The items from `from` on; a blank line separates turns, judged against the nearest earlier item with one.
+// The items from `from` on; a blank line separates turns, judged against the nearest earlier item with
+// one. A run of bare nodes is one placeholder row, so unloaded history costs one element per gap.
 function itemsHTML(t, from = 0) {
-  let h = ''; let lastTurn = null;
+  let h = ''; let lastTurn = null; let gap = 0;
   for (let i = from - 1; i >= 0; i--) if (t.items[i].turn != null) { lastTurn = t.items[i].turn; break; }
-  for (let i = from; i < t.items.length; i++) { const it = t.items[i]; if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += '<div class="line"></div>'; lastTurn = it.turn; } h += itemHTML(it); }
+  const flush = () => { if (gap) { h += `<div class="line pending">… ${gap} earlier</div>`; gap = 0; } };
+  for (let i = from; i < t.items.length; i++) {
+    const it = t.items[i];
+    if (it.kind === 'node') { gap += 1; continue; }
+    flush();
+    if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += '<div class="line"></div>'; lastTurn = it.turn; }
+    h += itemHTML(it);
+  }
+  flush();
   return h;
 }
 function tailHTML(name, t) {
@@ -494,6 +508,42 @@ for (const [id, who] of [['log', () => S.selected], ['peek', () => S.ui.peek]]) 
   });
 }
 function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><b>${esc(b.name)}</b><span>${labelOf(b.status)}</span>${closable ? '<span class="x">Esc closes</span>' : ''}`; }
+// The rail shows a window of rows around the selection; scrolling to an edge extends it. The tree is
+// rebuilt when the fleet's shape changes (a bot created, forked or deleted); a status change patches
+// the bot's own row. A fleet of thousands costs a screenful of rows, not a row each per event.
+const RAIL_ROWS = 300;
+const rail = { shapeGen: -1, rows: [], index: new Map(), start: 0, end: 0, key: '' };
+function railRows() {
+  if (rail.shapeGen !== S.shapeGen) { rail.rows = tree(); rail.index = new Map(rail.rows.map((n, i) => [n.b.name, i])); rail.shapeGen = S.shapeGen; rail.key = ''; }
+  return rail.rows;
+}
+function renderRail() {
+  const rows = railRows(); const el = $('bots');
+  const sel = rail.index.get(S.selected) ?? 0;
+  const key = `${S.shapeGen}|${S.selected}|${rail.start}|${rail.end}`;
+  if (rail.key !== key) {
+    if (sel < rail.start || sel >= rail.end || rail.key === '') { rail.start = Math.max(0, sel - RAIL_ROWS / 2); rail.end = Math.min(rows.length, rail.start + RAIL_ROWS); }
+    rail.key = `${S.shapeGen}|${S.selected}|${rail.start}|${rail.end}`;
+    const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
+    const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
+    el.innerHTML = above + rows.slice(rail.start, rail.end).map((n) => botRowHTML(n, n.b.name === S.selected)).join('') + below;
+    el.dataset.key = rail.key;
+  }
+}
+// A bot's row, replaced in place when its status changes; nothing if it is outside the window.
+function patchRailRow(name) {
+  if (!S.ui.rail) return;
+  const i = rail.index.get(name); if (i === undefined || i < rail.start || i >= rail.end) return;
+  const el = $('bots'); const old = el.querySelector(`.botrow[data-bot="${cssEsc(name)}"]`); if (!old) return;
+  if (old.nextElementSibling?.classList.contains('w')) old.nextElementSibling.remove();
+  old.outerHTML = botRowHTML(rail.rows[i], name === S.selected);
+}
+$('bots').addEventListener('scroll', () => {
+  const el = $('bots'); const rows = rail.rows; let moved = false;
+  if (el.scrollTop < 100 && rail.start > 0) { rail.start = Math.max(0, rail.start - RAIL_ROWS / 2); moved = true; }
+  if (el.scrollHeight - el.scrollTop - el.clientHeight < 100 && rail.end < rows.length) { rail.end = Math.min(rows.length, rail.end + RAIL_ROWS / 2); moved = true; }
+  if (moved) { const before = el.scrollHeight; rail.key = ''; renderRail(); if (el.scrollTop < 100) el.scrollTop += el.scrollHeight - before; }
+});
 function botRowHTML(n, sel) {
   const b = n.b;
   const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => h.replace(/^turn:/, '').split('/')[0]).join(' ')}</div>` : '';
@@ -521,7 +571,7 @@ function render() {
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('peek', !!S.ui.peek && S.bots.has(S.ui.peek));
   $('title').innerHTML = b ? titleHTML(b) : '<span>no bots · /new NAME creates one</span>';
   if (b) renderTranscript($('log'), b.name); else $('log').innerHTML = '';
-  if (S.ui.rail) { const key = `${S.botsGen}|${S.selected}`; if ($('bots').dataset.key !== key) { $('bots').innerHTML = tree().map((n) => botRowHTML(n, n.b.name === S.selected)).join(''); $('bots').dataset.key = key; } }
+  if (S.ui.rail) renderRail();
   if (S.ui.peek && bot(S.ui.peek)) { $('peektitle').innerHTML = titleHTML(bot(S.ui.peek), true); renderTranscript($('peek'), S.ui.peek); }
   $('who').textContent = b ? `${b.name} ›` : '›';
   $('input').placeholder = b ? (b.status === 'idle' ? '' : `${b.name} is ${labelOf(b.status)}; your message queues`) : '/new NAME [PROVIDER/MODEL]';
@@ -547,7 +597,7 @@ function renderPicker() {
   $('pickerlist').innerHTML = (rows.length ? rows.map((r, idx) => {
     const n = r.b.name; const hit = r.i >= 0 ? `${esc(n.slice(0, r.i))}<span class="hit">${esc(n.slice(r.i, r.i + q.length))}</span>${esc(n.slice(r.i + q.length))}` : esc(n);
     const state = r.b.status === 'idle' ? '' : labelOf(r.b.status);
-    const hint = q ? [r.b.parent ? `↳ ${r.b.parent}` : '', state].filter(Boolean).join(' · ') : state;
+    const hint = q ? [creatorOf(r.b) ? `↳ ${r.b.parent}` : '', state].filter(Boolean).join(' · ') : state;
     return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }

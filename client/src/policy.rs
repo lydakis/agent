@@ -23,6 +23,7 @@ Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. 
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \
 Long commands can run with shell background=true and be collected the same way. \
 Blocking run/follow inside a shell tool is rejected. \
+Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an agent from an earlier point in its history. \
 $AGENT_BOT is your name; $AGENT_PARENT, when set, names the agent that created you.";
 
 /// One instruction file that went into the text, for the client to show.

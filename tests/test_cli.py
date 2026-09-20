@@ -498,6 +498,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual({b['name'] for b in listing}, {'Alice', 'Bob'})
         self.assertTrue(all(b['status'] == 'completed' for b in listing))
         self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
+        by_name = {b['name']: b for b in listing}
+        self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['id'])
         self.assertEqual((self.path / 'lineage').read_text(), 'Bob/Alice')
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]

@@ -9,7 +9,8 @@ Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
 a store or connecting to a daemon.
 
 Inside a bot's shell tool, `AGENT_BOT` names that bot and the client records
-it as the creator of anything it creates or forks (`created_by`);
+it as the creator of anything it creates or forks (`created_by`, with the
+creator's identity as `created_by_id`);
 `AGENT_PARENT` names the running bot's own creator when it has one.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.

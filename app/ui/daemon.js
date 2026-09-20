@@ -24,7 +24,7 @@ window.Daemon = (() => {
   }
 
   // ---------- demo daemon ----------
-  const S = { bots: new Map(), nodes: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, cursor: 0, listeners: [], timers: new Set() };
+  const S = { bots: new Map(), nodes: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, listeners: [], timers: new Set() };
   const emit = (event) => { if (event.durable !== false) event.cursor = ++S.cursor; for (const cb of S.listeners) cb(event); };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
@@ -32,9 +32,10 @@ window.Daemon = (() => {
 
   async function create(name, model, createdBy = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
-    const b = { ...record(name, model), created_by: createdBy, turns: 0, interrupted: false };
+    // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
+    const b = { ...record(name, model), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false };
     S.bots.set(name, b);
-    emit({ event: 'created', bot: name, turn: null, data: { model, created_by: createdBy } });
+    emit({ event: 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id } });
     return b;
   }
   async function stream(name, turn, text, pace = 40) {

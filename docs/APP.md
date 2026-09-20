@@ -107,18 +107,30 @@ not by the history or the fleet:
   is overwritten by an older record.
 - **Transcripts** keep a window of 1,200 decoded items around whichever end
   the reader is at; bodies outside it fold back into their history nodes, and
-  a scroll toward them loads the next batch of 400. Counters (thoughts, long
-  outputs, peers) are kept in step with the items, so the key bar reads them.
+  a scroll toward them loads the next batch of 400. A run of unloaded nodes
+  renders as one placeholder row, so unloaded history costs one element per
+  gap. Counters (thoughts, long outputs, peers) are kept in step with the
+  items, so the key bar reads them.
 - **Rendering** rebuilds the window's HTML only on a structural change (a
   load, a fold, another bot). Items appended since the last render are added
   on their own; a tool finishing or a process ending replaces its own line; a
   streamed delta touches only the tail; the once-a-second clock refreshes the
-  elapsed spans and peer cards in place. The rail is rebuilt once per change
-  to the fleet, the picker shows at most 200 rows, and the activity check
-  behind the clock is cached per fleet change.
+  elapsed spans and peer cards in place. The rail shows a window of 300 rows
+  around the selection, extended by scrolling to an edge; its tree is rebuilt
+  when the fleet's shape changes (a bot created, forked or deleted) and a
+  status change replaces that bot's own row. The picker shows at most 200
+  rows, and the activity check behind the clock is cached per fleet change.
+- **Creation** costs no request: the `created` and `forked` events carry the
+  record's list fields, so a burst of ten thousand bots is ten thousand
+  events, not ten thousand `resume` round trips. Lineage is the store's
+  `created_by_id`: a bot links under its creator only while the bot holding
+  that name is the identity that created it.
 - **Sessions** count up; an event from an older session is dropped, a
   submission carries the bot id on screen, and a bot that reappears under a
-  known name with a new id starts from nothing.
+  known name with a new id starts from nothing. A lagged stream (the core's
+  4,096-event queue filled) closes the transport, fails every request made
+  after that at once, and the page attaches again from its cursor, from
+  outside the event chain so the attach cannot wait on itself.
 
 ## Verified
 
@@ -138,7 +150,8 @@ bundle, so it could not be screenshotted here), a real provider, and macOS
 packaging, which needs `bundle.active` and real icons.
 
 The tree uses the daemon's `created_by` (bots created from a shell tool since
-schema 22) or the `created` event; a bot without a creator is a root.
+schema 22, with the creator's identity since 23) or the `created` event; a bot
+without a creator, or whose creator's name has since changed hands, is a root.
 
 `/new` gives a bot the shared client policy ([CLIENT.md](CLIENT.md)); the
 create notice says what went in.

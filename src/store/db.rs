@@ -44,6 +44,10 @@ pub struct Bot {
     /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
     /// this is lineage for people, not authority.
     pub created_by: Option<String>,
+    /// That creator's identity at the time, resolved by the store, so a
+    /// later bot reusing the name is not mistaken for it. `None` when the
+    /// declared creator did not exist.
+    pub created_by_id: Option<i64>,
 }
 impl Bot {
     pub fn family(&self) -> Result<Family> {
@@ -222,7 +226,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 22;
+    pub const SCHEMA: i32 = 23;
     /// Turns per retention piece: a delete or explicit prune of a large bot
     /// runs as a series of jobs this size, so other bots' work interleaves.
     /// Small, because every job of a turn in flight can land behind one
@@ -288,7 +292,8 @@ impl Database {
                 tools TEXT NOT NULL DEFAULT 'shell,read,write,edit,wait,history',
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                created_by TEXT);
+                created_by TEXT,
+                created_by_id INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
@@ -470,9 +475,22 @@ impl Database {
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
             id: r.get(15)?,
             created_by: r.get(16)?,
+            created_by_id: r.get(17)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id";
+    /// The identity behind a declared creator's name now; a name nobody
+    /// holds resolves to nothing rather than to whoever holds it later.
+    fn creator_id(conn: &Connection, creator: Option<&str>) -> Result<Option<i64>> {
+        let Some(creator) = creator else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row("SELECT id FROM bots WHERE name=?", [creator], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?)
+    }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -490,7 +508,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -508,7 +526,8 @@ impl Database {
                 "tools":split_tools(&r.get::<_, String>(11)?),
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
                 "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
-                "created_by":r.get::<_, Option<String>>(15)?});
+                "created_by":r.get::<_, Option<String>>(15)?,
+                "created_by_id":r.get::<_, Option<i64>>(16)?});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -541,8 +560,9 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
+        let created_by_id = Self::creator_id(&tx, binding.created_by)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
             params![
                 name,
                 id,
@@ -554,11 +574,15 @@ impl Database {
                 binding.reasoning,
                 binding.budget_tokens.map(|b| b as i64),
                 binding.tools.join(","),
-                binding.created_by
+                binding.created_by,
+                created_by_id
             ],
         )?;
-        let data = json!({"id":id,"model":format!("{}/{}", binding.provider, binding.model),
-            "created_by":binding.created_by});
+        // The event carries the list record's fields, so a follower can
+        // seat a new bot without a request per creation.
+        let data = json!({"id":id,"provider":binding.provider,"model":binding.model,
+            "workspace":workspace,"status":"idle","running_turn":null,
+            "created_by":binding.created_by,"created_by_id":created_by_id});
         let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
         Ok((
@@ -1872,8 +1896,9 @@ impl Database {
         }
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
+        let created_by_id = Self::creator_id(&tx, created_by)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?)",
             params![
                 name,
                 id,
@@ -1886,14 +1911,17 @@ impl Database {
                 parent.reasoning,
                 budget_tokens.map(|b| b as i64),
                 parent.tools.join(","),
-                created_by
+                created_by,
+                created_by_id
             ],
         )?;
         if let Some(node) = checkpoint {
             tx.execute("INSERT INTO checkpoints VALUES (?,?)", params![name, node])?;
         }
         let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
-            "created_by":created_by});
+            "provider":parent.provider,"model":parent.model,
+            "workspace":workspace.or(parent.workspace.as_deref()),"status":"idle","running_turn":null,
+            "created_by":created_by,"created_by_id":created_by_id});
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
         Ok((
@@ -2828,16 +2856,20 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             )?;
         }
     }
-    if from < 22 {
-        // 21 -> 22: who created a bot, as its creating client declared.
-        // Earlier bots have no record of it and stay unattributed.
+    // 21 -> 22: who created a bot, as its creating client declared. 22 -> 23:
+    // that creator's identity then. Earlier bots have no record of either
+    // and stay unattributed.
+    for (version, column, kind) in [(22, "created_by", "TEXT"), (23, "created_by_id", "INTEGER")] {
+        if from >= version {
+            continue;
+        }
         let present: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='created_by')",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name=?)",
+            [column],
             |r| r.get(0),
         )?;
         if !present {
-            conn.execute_batch("ALTER TABLE bots ADD COLUMN created_by TEXT;")?;
+            conn.execute_batch(&format!("ALTER TABLE bots ADD COLUMN {column} {kind};"))?;
         }
     }
 

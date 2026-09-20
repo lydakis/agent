@@ -51,6 +51,7 @@ pre.code .lang{position:absolute;right:10px;top:4px;color:var(--t-faint);font-si
 @keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(.7)}}
 .botrow{padding:2px 10px;cursor:pointer;display:flex;gap:1ch;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-left:2px solid transparent}
 .botrow.sel{background:var(--t-raised);border-left-color:var(--amber)}
+.botrow.more{color:var(--t-dim);cursor:default}
 .botrow .n{flex:1;overflow:hidden;text-overflow:ellipsis}
 .botrow .w{color:var(--wait);opacity:.8;padding-left:3ch;font-size:12px}
 .tree{color:var(--t-faint);white-space:pre}

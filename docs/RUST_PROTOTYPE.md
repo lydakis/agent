@@ -614,8 +614,13 @@ within the 1 MiB response bound.
 `created_by` on `create` and `fork` is the client's declaration of which bot
 it acts for; the CLI fills it from `AGENT_BOT`, which the daemon sets in every
 shell tool's environment along with `AGENT_PARENT`, the running bot's own
-creator when it has one. The record, the `created` and `forked` events, and
-`bots` pages carry it. Bots remain peers: the field is lineage for people and
+creator when it has one. The store resolves the name to the creator's
+identity at that moment and keeps it as `created_by_id` (`null` when no bot
+held the name), so a later bot reusing the name is not mistaken for the
+creator. The record, the `created` and `forked` events, and `bots` pages
+carry both; the two events also carry the record's list fields (`id`,
+`provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
+seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and
 clients, never authority. A fork keeps the source's binding and instructions
 unless `instructions` replaces the text for the new bot; the source is never
 changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint

@@ -67,6 +67,9 @@ pub struct Client {
     writer: Mutex<OwnedWriteHalf>,
     pending: Pending,
     next: std::sync::atomic::AtomicU64,
+    /// Set by the reader on its way out. A request made after it can still
+    /// be written, but nothing would ever answer; it fails here instead.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Client {
@@ -98,8 +101,10 @@ impl Client {
             return Err(Error::new("daemon_protocol_mismatch"));
         }
         let pending: Pending = Arc::default();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (events, receiver) = mpsc::channel(QUEUE);
         let routed = pending.clone();
+        let gone = closed.clone();
         tokio::spawn(async move {
             let mut lagged = false;
             while let Ok(Some(line)) = lines.next_line().await {
@@ -123,9 +128,15 @@ impl Client {
                 }
             }
             // The socket is gone, or we let go of it: every request still
-            // waiting fails with `daemon_disconnected` now. A lag is
+            // waiting fails with `daemon_disconnected` now, and every later
+            // one fails as it is made. The flag is set under the lock a
+            // request registers under, so none slips between. A lag is
             // announced after the queue drains, then the receiver closes.
-            routed.lock().await.clear();
+            {
+                let mut waiting = routed.lock().await;
+                gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                waiting.clear();
+            }
             drop(lines);
             if lagged {
                 let _ = events
@@ -138,6 +149,7 @@ impl Client {
                 writer: Mutex::new(write),
                 pending,
                 next: std::sync::atomic::AtomicU64::new(0),
+                closed,
             }),
             receiver,
         ))
@@ -148,7 +160,13 @@ impl Client {
         params["id"] = json!(id);
         params["op"] = json!(op);
         let (sender, receiver) = oneshot::channel();
-        self.pending.lock().await.insert(id, sender);
+        {
+            let mut pending = self.pending.lock().await;
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::new("daemon_disconnected"));
+            }
+            pending.insert(id, sender);
+        }
         let mut line = serde_json::to_vec(&params)?;
         line.push(b'\n');
         {

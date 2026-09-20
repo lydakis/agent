@@ -1094,6 +1094,31 @@ fn stores_carry_a_schema_version_and_migrate_older_ones_forward() {
 }
 
 #[test]
+fn lineage_pins_the_creator_identity_so_a_reused_name_is_a_stranger() {
+    let mut db = db();
+    let (first_a, _) = db.create("A", Some("/synthetic"), binding()).unwrap();
+    let mut by_a = binding();
+    by_a.created_by = Some("A");
+    let (b, _) = db.create("B", Some("/synthetic"), by_a).unwrap();
+    assert_eq!(b.created_by_id, Some(first_a.id));
+    db.delete_bot("A").unwrap();
+    let (second_a, _) = db.create("A", Some("/synthetic"), binding()).unwrap();
+    assert_ne!(second_a.id, first_a.id);
+    let b = db.inspect("B").unwrap();
+    assert_eq!(b.created_by.as_deref(), Some("A"));
+    assert_eq!(
+        b.created_by_id,
+        Some(first_a.id),
+        "B still names the A that made it"
+    );
+    let page = db.list(None, 64).unwrap();
+    let listed = page["bots"].as_array().unwrap();
+    let b_row = listed.iter().find(|r| r["name"] == "B").unwrap();
+    assert_eq!(b_row["created_by_id"], first_a.id);
+    assert_ne!(b_row["created_by_id"], second_a.id);
+}
+
+#[test]
 fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
     let mut db = db();
     let mut created = binding();
@@ -1102,6 +1127,12 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
     let (bot, event) = db.create("Bob", Some("/synthetic"), created).unwrap();
     assert_eq!(bot.created_by.as_deref(), Some("Parent"));
     assert_eq!(event["data"]["created_by"], "Parent");
+    // A declared creator nobody holds resolves to no identity; the event
+    // carries the record's fields so a follower needs no request per bot.
+    assert_eq!(bot.created_by_id, None);
+    assert_eq!(event["data"]["status"], "idle");
+    assert_eq!(event["data"]["provider"], "openai");
+    assert_eq!(event["data"]["workspace"], "/synthetic");
     // A fork without an override keeps the source's text and names its own creator.
     let (same, _) = db
         .fork(
@@ -1115,6 +1146,11 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
         .unwrap();
     assert_eq!(same.instructions, "first text");
     assert_eq!(same.created_by.as_deref(), Some("Bob"));
+    assert_eq!(
+        same.created_by_id,
+        Some(bot.id),
+        "the creator's identity, not its name"
+    );
     // With an override the fork gets the new text; the source is untouched.
     let (changed, forked) = db
         .fork(
