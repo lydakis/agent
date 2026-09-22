@@ -1303,6 +1303,34 @@ mod tests {
         }
     }
 
+    /// Bedrock serves both wire families this runtime already speaks, on two
+    /// endpoints with independent quotas, so each is an ordinary provider
+    /// binding: a base URL and the family's own key header. Nothing about the
+    /// four routes needs its own encoder.
+    #[test]
+    fn bedrock_routes_are_ordinary_base_urls_for_the_families_we_speak() {
+        let transport = Transport::new(64, 1).unwrap();
+        let route = |family, base: String| {
+            Provider::new(transport.clone(), family, &base, None)
+                .unwrap()
+                .url
+                .to_string()
+        };
+        for host in [
+            "https://bedrock-mantle.us-east-1.api.aws",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+        ] {
+            assert_eq!(
+                route(Family::Anthropic, format!("{host}/anthropic/v1")),
+                format!("{host}/anthropic/v1/messages")
+            );
+            assert_eq!(
+                route(Family::Responses, format!("{host}/openai/v1")),
+                format!("{host}/openai/v1/responses")
+            );
+        }
+    }
+
     #[test]
     fn leases_take_the_least_loaded_connection_and_release_on_drop() {
         let transport = Transport::new(64, 3).unwrap();

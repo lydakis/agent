@@ -1604,6 +1604,21 @@ mod tests {
                 Some("GW_KEY".into())
             )
         );
+        // Bedrock's URL carries the region and the endpoint, so it has no
+        // useful named default; both of its endpoints bind through the
+        // generic form, and their quotas are separate pools by construction.
+        assert_eq!(
+            spec(
+                "mantle=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,\
+                 AWS_BEARER_TOKEN_BEDROCK"
+            ),
+            (
+                "mantle".into(),
+                "anthropic",
+                "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1".into(),
+                Some("AWS_BEARER_TOKEN_BEDROCK".into())
+            )
+        );
         assert!(ProviderSpec::parse("custom").is_err());
         assert!(ProviderSpec::parse("openai=chat").is_err());
     }
