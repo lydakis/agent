@@ -12,6 +12,11 @@ METRICS = {"wall_seconds": ("wall_seconds",),
            "connections_used": ("provider", "connections_used")}
 
 
+# Model fixtures that validate the same synthetic conversation semantics.
+MODEL_PROTOCOLS = {'responses', 'gateway', 'anthropic_messages'}
+EXPLORATORY_ONLY = ('provider_protocol', 'rss_limit_mib', 'process_limit')
+
+
 def comparison_runs(result):
     runs = [run for run in result["runs"] if not run.get("warmup")]
     if not runs or any(run["status"] != "ok" for run in result["runs"]):
@@ -37,13 +42,22 @@ def compare(base, candidate, *, exploratory=False):
     compatibility_gaps = []
     if base["compatibility"] != candidate["compatibility"]:
         a, b = dict(base['compatibility']), dict(candidate['compatibility'])
-        protocols = {a.pop('provider_protocol', None), b.pop('provider_protocol', None)}
-        # Same semantic fixture, different native wire protocols. This exception
-        # never relaxes host/workload/observer matching or permits a ranking.
-        if not exploratory or a != b or protocols != {'responses', 'gateway'}:
+        differing = {key for key in EXPLORATORY_ONLY if a.pop(key, None) != b.pop(key, None)}
+        protocols = {base['compatibility'].get('provider_protocol'),
+                     candidate['compatibility'].get('provider_protocol')}
+        # Same semantic fixture, different native wire protocols or per-engine
+        # sampled guards. This never relaxes host/workload/observer matching
+        # or permits a ranking.
+        if not exploratory or a != b or not protocols <= MODEL_PROTOCOLS:
             raise ValueError("workload, host, observer, or sampling settings differ")
-        compatibility_gaps.append('provider_protocol differs: Responses SSE versus Gateway SSE; '
-                                  'serialization, catalog work, and wire bytes are not equivalent')
+        if 'provider_protocol' in differing:
+            compatibility_gaps.append(
+                'provider_protocol differs: ' + ' versus '.join(sorted(protocols))
+                + '; serialization, side requests, and wire bytes are not equivalent')
+        if differing - {'provider_protocol'}:
+            compatibility_gaps.append(
+                'sampled guard limits differ (' + ', '.join(sorted(differing - {'provider_protocol'}))
+                + '); they bound runaway targets and failed runs are never compared')
     left, right = comparison_runs(base), comparison_runs(candidate)
     gaps = differences(base, candidate) + compatibility_gaps
     if gaps and not exploratory:

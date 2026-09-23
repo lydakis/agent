@@ -161,16 +161,17 @@ def run_once(command, config, options, directory, index):
                "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
         if protocol != "binary":
             state = (directory / f"state-{index}").resolve()
-            for name in ("home", "codex", "workspace"):
+            for name in ("home", "codex", "claude", "workspace"):
                 (state / name).mkdir(parents=True)
             env = {**clean_env(), "HOME": str(state / "home"),
                    "CODEX_HOME": str(state / "codex"),
+                   "CLAUDE_CONFIG_DIR": str(state / "claude"),
                    "AGENT_BENCH_STATE": str(state),
                    "AGENT_BENCH_WORKSPACE": str(state / "workspace"),
                    "AGENT_BENCH_PORT": str(port),
                    "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
-            if getattr(options, "codex_executable", None):
-                env["AGENT_BENCH_CODEX"] = options.codex_executable
+            if getattr(options, "executable", None):
+                env["AGENT_BENCH_EXECUTABLE"] = options.executable
         if getattr(options, "driver", None) == "daemon":
             # The real service surface: the daemon is the target, the observer
             # drives its stdio protocol and translates its events.

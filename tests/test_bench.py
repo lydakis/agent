@@ -178,6 +178,22 @@ class ReportTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 compare(base, changed, exploratory=True)
 
+    def test_messages_protocol_and_per_agent_guards_are_exploratory_gaps(self):
+        base, claude = self.result(), self.result('claude-code')
+        base['compatibility'].update(provider_protocol='responses', rss_limit_mib=512, process_limit=16)
+        claude['compatibility'].update(provider_protocol='anthropic_messages',
+                                       rss_limit_mib=16384, process_limit=512)
+        with self.assertRaises(ValueError):
+            compare(base, claude)
+        report = compare(base, claude, exploratory=True)
+        self.assertTrue(any('anthropic_messages versus responses' in gap for gap in report['feature_gaps']))
+        self.assertTrue(any('guard limits' in gap for gap in report['feature_gaps']))
+        self.assertNotIn('change_percent', report['metrics']['peak_target_rss_bytes'])
+        same = deepcopy(claude)
+        same['compatibility']['rss_limit_mib'] = 512
+        with self.assertRaises(ValueError):  # Guards differ: never a ranked comparison.
+            compare(claude, same)
+
 
 
 
