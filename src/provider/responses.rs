@@ -1,6 +1,6 @@
 //! OpenAI Responses streaming subset: text and reasoning-summary deltas, then
 //! a validated terminal `response.completed` payload.
-use super::{Completion, Delta, MAX_OUTPUT, ToolCall, Usage, detail_of};
+use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -26,7 +26,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn frame(&mut self, frame: &[u8]) -> Result<Option<Delta>> {
+    pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
         let event: Event<'_> = serde_json::from_slice(frame)?;
         if self.completion.is_some() {
             return fail("event_after_completion");
@@ -38,7 +38,7 @@ impl State {
                     return fail("output_limit");
                 }
                 self.text.push_str(&part);
-                Ok(Some(Delta::Text(part.into_owned())))
+                Ok(Frame::Delta(Delta::Text(part.into_owned())))
             }
             "response.reasoning_summary_text.delta" => {
                 let part = event.delta.ok_or(Error::new("missing_text_delta"))?;
@@ -46,7 +46,7 @@ impl State {
                 if self.text.len() + self.thinking > MAX_OUTPUT {
                     return fail("output_limit");
                 }
-                Ok(Some(Delta::Thinking(part.into_owned())))
+                Ok(Frame::Delta(Delta::Thinking(part.into_owned())))
             }
             "response.completed" => {
                 let raw = event.response.ok_or(Error::new("missing_response"))?;
@@ -55,7 +55,7 @@ impl State {
                     &self.text,
                     &mut self.usage,
                 )?);
-                Ok(None)
+                Ok(Frame::Quiet)
             }
             "error" | "response.failed" | "response.incomplete" => {
                 let value: Value = serde_json::from_slice(frame).unwrap_or(Value::Null);
@@ -93,7 +93,7 @@ impl State {
             }
             // Metadata and tool argument deltas are represented by the
             // validated terminal output. Unknown final item kinds fail.
-            _ => Ok(None),
+            _ => Ok(Frame::Quiet),
         }
     }
     pub fn usage(&self) -> Option<Usage> {
@@ -206,7 +206,7 @@ mod tests {
         let delta = state
             .frame(br#"{"type":"response.reasoning_summary_text.delta","delta":"hmm"}"#)
             .unwrap();
-        assert!(matches!(delta, Some(Delta::Thinking(t)) if t == "hmm"));
+        assert!(matches!(delta, Frame::Delta(Delta::Thinking(t)) if t == "hmm"));
         state
             .frame(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
             .unwrap();
