@@ -513,6 +513,45 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
+34. Tool calls that do not hold up the model. Prompted by Unreal Agent
+    (`github.com/unreallabsai/unreal-agent` at `b7c9bf1`, read 2026-09-23),
+    a Go harness benchmarked against the same Codex and Pi baselines.
+    Source facts: every shell call starts at once as a background
+    operation; until it finishes the model sees a fixed "still running"
+    tool result; the finished result replaces that placeholder if no
+    request has carried it yet, and is otherwise appended as a second
+    `function_call_output` for the same call id. Results that land
+    together share one model call, a 1 s grace after each response lets
+    quick calls finish before the next call, user input arriving while
+    calls run starts a model call at once, and a heartbeat wakes the model
+    after ten minutes of nothing but running calls. Its post claims up to
+    40% lower cost than Codex at equal or better pass rates; that is their
+    documentation claim, and it mixes this with a 1.4 KB preamble, three
+    tools, and no subagents without attributing the saving. Here, by
+    contrast, a response's calls run one at a time, a background shell's
+    result reaches the model only through a `wait` call, which costs a
+    model round, and a steer waits until every call in the round is done.
+    Two slices, each measured against the current loop:
+    - Run the independent calls of one response concurrently, within the
+      process bound, recording results in call order. A `wait` among
+      them, cancellation, and restart mid-batch need defined behavior.
+    - Deliver finished background results without `wait`: the call's
+      tool result stays the handle (the real result for both families),
+      and the finished output arrives at the next boundary as an item
+      naming the call. The Responses shape above is not portable:
+      Anthropic Messages, and so Bedrock, requires each `tool_use` to be
+      answered once, in the next user message. A turn whose model stops
+      while its background calls run parks without a slot until one
+      finishes or a steer arrives, rather than ending. A fork at a
+      checkpoint where a call was still running inherits neither the late
+      result nor a rerun of the process; compaction that covers the call
+      before its result arrives must leave the late item legible.
+    Measure with the synthetic provider and tool fixtures: model rounds,
+    billed and cached input tokens, wall time, and daemon CPU and memory
+    per active bot, on tasks with several independent commands of mixed
+    duration, with and without a preamble sentence asking the model to
+    issue independent calls together, since the gain depends on the model
+    doing so. Then a small real-provider check under a stated spend cap.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
