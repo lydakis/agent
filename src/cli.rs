@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -179,13 +179,17 @@ fn print_flags(flags: &str) {
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
             "--max-output-tokens" => ("N", "Output token cap per model call"),
+            "--stall-timeout" => (
+                "SECONDS",
+                "Retry a provider stream with no content this long; default 120",
+            ),
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
             "--context-bytes" => ("N", "Maximum model context bytes"),
             "--context-items" => ("N", "Maximum model context items"),
             "--note-turns" => ("N", "Omitted turns the context note lists; 0 lists none"),
             "--compact-at" => (
                 "PERCENT",
-                "Compact when the window holds this share of the context budget",
+                "Compact when the turns since the last summary hold this share of the context budget",
             ),
             "--compact-keep" => (
                 "PERCENT",
@@ -294,12 +298,14 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--retain-turns"
                     | "--keep-turns"
                     | "--max-output-tokens"
+                    | "--stall-timeout"
                     | "--budget-tokens"
                     | "--turn"
                     | "--checkpoint"
             ) {
                 let max = match flag {
                     "--max-output-tokens" => u32::MAX as u64,
+                    "--stall-timeout" => 86_400,
                     "--turn" | "--checkpoint" | "--budget-tokens" => i64::MAX as u64,
                     _ => usize::MAX as u64,
                 };

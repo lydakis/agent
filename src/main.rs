@@ -85,6 +85,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_pending_bytes = None;
     let mut max_output_tokens = None;
     let mut idle_exit = None;
+    let mut stall_timeout = None;
     let mut context_bytes = None;
     let mut context_items = None;
     let mut note_turns = None;
@@ -161,6 +162,18 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     Error::with("usage", "--retain-turns needs a positive integer"),
                 )?)
             }
+            "--stall-timeout" => {
+                stall_timeout = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| (1..=86_400).contains(n))
+                        .ok_or(Error::with(
+                            "usage",
+                            "--stall-timeout needs seconds from 1 to 86400",
+                        ))?,
+                )
+            }
             "--idle-exit" => {
                 let seconds: u64 = value
                     .parse()
@@ -186,6 +199,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_pending,
         max_pending_bytes,
         max_output_tokens,
+        stall_timeout,
         idle_exit,
         context_bytes,
         context_items,

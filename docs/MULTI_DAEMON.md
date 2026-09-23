@@ -3,9 +3,10 @@
 A roadmap for four ideas George raised on 2026-09-20. None of it is built.
 Each section says what the code does today, what would have to change, the
 main risks, and an order of work. Source references are to `612ae1d` and were
-read on 2026-09-23. Claims about the code are verified at that revision;
-everything under "would change" and "order" is a proposal, and anything
-unmeasured says so.
+read on 2026-09-23, except the export notes in section 4, which cite
+`8ebbc44`. Claims about the code are verified at those revisions; everything
+under "would change" and "order" is a proposal, and anything unmeasured says
+so.
 
 The four ideas, in the order this document recommends building them:
 
@@ -429,10 +430,29 @@ carrying it over.
    submission stays idempotent at the target), tool intents, completed
    process results, artifacts, and note and compaction versions. Events
    only if the caller asks, since cursors will not survive anyway.
+   Since schema 26 (`8ebbc44`), two of those rows cannot be copied as raw
+   columns. Export has to read them the way the store itself does:
+   - **Artifacts.** `artifacts.data` may be a block-compressed blob, and
+     `raw_bytes` records the decoded length, with 0 meaning stored raw
+     (`src/store/artifact.rs:1-5`, `src/store/db.rs:468`). Export reads each
+     one through `artifact::read` (`src/store/artifact.rs:59`), as the
+     protocol's `artifact` read does (`src/store/db.rs:3335`), so the bundle
+     never depends on the source's encoding. Import writes it back with
+     `artifact::put`, and the target encodes under its own rules.
+   - **Turn prompts.** A prompt of 4 KiB or more is stored once, as the
+     user item node. The turn row keeps an empty `prompt` and points at that
+     node through `prompt_node` (`src/store/db.rs:15`, set at
+     `src/store/db.rs:3425-3428` for started turns and
+     `src/store/db.rs:1912-1913` for absorbed steers). Export resolves
+     `prompt_node` to the prompt text, the way the idempotency check does
+     (`src/store/db.rs:1557-1561`). Copied raw, a retried submission at the
+     target would compare against an empty prompt and fail
+     `idempotency_conflict`.
 3. **Renumbering at import.** Node, turn, bot, process, and event ids are
    per-store sequences, so import allocates fresh ones and rewrites every
    reference: parents, head, context start, note and compaction chains,
-   cuts, and checkpoints. Two ids cannot simply be rewritten:
+   cuts, checkpoints, and each turn's `prompt_node`. Two ids cannot simply
+   be rewritten:
    - Transcript text already holds turn ids in `TURN/CALL_ID/STREAM`
      artifact references and in `turn:` and `proc:` handles. History is never
      rewritten (AGENTS.md), so import has to keep an alias from the origin

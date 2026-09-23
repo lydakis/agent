@@ -1,3 +1,4 @@
+use super::artifact;
 use crate::{
     Error, Result,
     codec::Family,
@@ -9,6 +10,9 @@ use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+
+// Sharing tiny prompts adds an index entry without avoiding an overflow page.
+const PROMPT_SHARE_BYTES: usize = 4096;
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
@@ -227,6 +231,67 @@ pub struct CompactionPlan {
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
     pub previous_summary: Option<String>,
+    /// A bounded step through a backlog larger than the budget: the span
+    /// ends where the next step starts, not at the verbatim tail.
+    pub catch_up: bool,
+}
+impl CompactionPlan {
+    /// The summarizer request around the span's items: the previous summary
+    /// to merge, if any, with its separating comma, and the request to
+    /// write, with its leading comma.
+    pub fn frame(family: Family, previous_summary: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut head = Vec::new();
+        if let Some(previous) = previous_summary {
+            head = family.user_item(&format!(
+                "[previous summary, to merge with the turns below]\n{previous}"
+            ))?;
+            head.push(b',');
+        }
+        let mut tail = family.user_item(
+            "[compaction request] Write the summary of the conversation above now, following your instructions.",
+        )?;
+        tail.insert(0, b',');
+        Ok((head, tail))
+    }
+}
+/// Where compaction planning stands: a plan, or a backlog larger than the
+/// budget to walk first.
+#[derive(Debug)]
+pub enum Planning {
+    Plan(CompactionPlan),
+    CatchUp(CatchUp),
+}
+/// Oldest node, depth, own total, ordinal, child on the lineage and its
+/// ordinal, and the bounded prompt text inside the budget.
+type CatchUpRow = (
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+/// A catch-up walk from the head back to the previous cut. Only the rows
+/// that start inside the budget are kept, so its memory is bounded by the
+/// budget however long the backlog is.
+#[derive(Debug)]
+pub struct CatchUp {
+    head: i64,
+    previous_cut: i64,
+    /// The head's bytes, and the bytes and depth before the previous cut.
+    totals: (i64, i64, i64),
+    /// Verbatim tail bytes, and the byte and item budget.
+    bounds: (i64, i64, i64),
+    /// Where the next piece starts, and the child it continues from.
+    next: Option<(i64, Option<i64>, Option<i64>)>,
+    /// Rows inside the budget, in no particular order.
+    rows: Vec<CatchUpRow>,
+}
+impl CatchUp {
+    pub fn done(&self) -> bool {
+        self.next.is_none()
+    }
 }
 /// Where and with which model a turn runs.
 pub struct TurnContext {
@@ -277,7 +342,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 25;
+    pub const SCHEMA: i32 = 26;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -376,6 +441,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
+                prompt_node INTEGER REFERENCES nodes(id),
                 workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
@@ -384,6 +450,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
+            CREATE INDEX IF NOT EXISTS turns_prompt_node ON turns(prompt_node) WHERE prompt_node IS NOT NULL;
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
             CREATE INDEX IF NOT EXISTS retained_turns_bot ON retained_turns(bot,turn);
@@ -398,7 +465,8 @@ impl Database {
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                stream TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(turn,call_id,stream));
+                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -887,15 +955,18 @@ impl Database {
             None => None,
         })
     }
-    /// Bytes the next request's window would carry: from the saved start to
-    /// the head, without building the window. One row read.
-    pub fn window_bytes(&self, name: &str) -> Result<i64> {
+    /// Bytes not yet covered by a summary: from the current compaction's cut,
+    /// or the root, to the head. Equals the window's bytes until the window
+    /// moves past the cut, which only an oversized backlog makes it do.
+    /// One row read.
+    pub fn unsummarized_bytes(&self, name: &str) -> Result<i64> {
         Ok(self
             .conn
             .prepare_cached(
                 "SELECT COALESCE(h.total_bytes,0)-COALESCE(p.total_bytes,0)
                  FROM bots b LEFT JOIN nodes h ON h.id=b.head
-                 LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+                 LEFT JOIN compactions c ON c.node=b.compaction
+                 LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
                  WHERE b.name=?",
             )?
             .query_row([name], |r| r.get(0))?)
@@ -904,14 +975,16 @@ impl Database {
     /// span since the previous compaction, keep the newest whole turns that
     /// hold at least `keep_bytes` verbatim, and summarize everything older,
     /// back to the previous cut. Returns nothing when no whole older turn
-    /// exists to summarize.
+    /// exists to summarize. A span larger than the budget is caught up
+    /// oldest first instead: this returns the walk to take in pieces with
+    /// `catch_up_piece`, and `catch_up_plan` chooses from it.
     pub fn compaction_plan(
         &self,
         name: &str,
         keep_bytes: i64,
         max_bytes: i64,
         max_items: i64,
-    ) -> Result<Option<CompactionPlan>> {
+    ) -> Result<Option<Planning>> {
         let bot = self.inspect(name)?;
         let Some(head) = bot.head else {
             return Ok(None);
@@ -920,25 +993,30 @@ impl Database {
         if bot.compaction == Some(head) {
             return Ok(None);
         }
-        // Constant-count indexed reads reject a backlog before the recursive
-        // walk allocates rows or occupies the shared storage worker.
-        let (previous_cut, bytes, count): (i64, i64, i64) = self
+        // Constant-count indexed reads size the span before any walk:
+        // previous cut, head's totals, and the totals before the cut.
+        type Span = (i64, i64, i64, i64, i64);
+        let (previous_cut, head_total, head_depth, before, depth_before): Span = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(c.cut,-1),h.total_bytes-COALESCE(p.total_bytes,0),
-                    h.depth-COALESCE(p.depth,0)
-             FROM nodes h LEFT JOIN compactions c ON c.node=?2
-             LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
-             WHERE h.id=?1",
+                "SELECT COALESCE(c.cut,-1),h.total_bytes,h.depth,
+                        COALESCE(p.total_bytes,0),COALESCE(p.depth,0)
+                 FROM nodes h LEFT JOIN compactions c ON c.node=?2
+                 LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
+                 WHERE h.id=?1",
             )?
             .query_row(params![head, bot.compaction], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
-        if bytes > max_bytes || count > max_items {
-            return fail_with(
-                "compaction_span_limit",
-                "unsummarized span exceeds the configured context budget; original history remains available",
-            );
+        if head_total - before > max_bytes || head_depth - depth_before > max_items {
+            return Ok(Some(Planning::CatchUp(CatchUp {
+                head,
+                previous_cut,
+                totals: (head_total, before, depth_before),
+                bounds: (keep_bytes, max_bytes, max_items),
+                next: Some((head, None, None)),
+                rows: Vec::new(),
+            })));
         }
         // A source bot's turn records may be deleted while its nodes survive
         // in a fork. Decode only prompt nodes, outside the metadata-only walk,
@@ -962,7 +1040,6 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
-        let head_total = rows.first().map(|r| r.1).unwrap_or(0);
         // The newest prompt whose tail holds keep_bytes.
         let mut cut = None;
         for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
@@ -979,36 +1056,171 @@ impl Database {
         if !older.iter().any(|r| r.3.is_some()) {
             return Ok(None);
         }
-        let mut ids = Vec::with_capacity(older.len());
-        let mut sizes = Vec::with_capacity(older.len());
-        let mut prompts = Vec::new();
-        let (mut from, mut to) = (i64::MAX, 0);
-        for (id, total, before, seq, prompt) in older.iter().rev() {
-            ids.push(*id);
-            sizes.push((total - before).clamp(0, u32::MAX as i64) as u32);
-            if let (Some(seq), Some(prompt)) = (seq, prompt) {
-                from = from.min(*seq);
-                to = to.max(*seq);
-                prompts.push((*seq, bounded_prompt(prompt, Self::COMPACTION_PROMPT_BYTES)));
+        let span = older
+            .iter()
+            .rev()
+            .map(|(id, total, before, seq, prompt)| (*id, total - before, *seq, prompt.as_deref()));
+        let previous_summary = self.previous_summary(&bot)?;
+        Ok(Some(Planning::Plan(Self::span_plan(
+            cut,
+            span,
+            previous_summary,
+            false,
+        ))))
+    }
+    /// One piece of a catch-up walk: at most `limit` nodes further back
+    /// along the head's lineage toward the previous cut, reading node
+    /// metadata only and decoding prompts only inside the budget. Separate
+    /// pieces let other reads run between them.
+    pub fn catch_up_piece(&self, walk: &mut CatchUp, limit: i64) -> Result<()> {
+        let Some((from, child, child_seq)) = walk.next else {
+            return Ok(());
+        };
+        let (_, before, depth_before) = walk.totals;
+        let (_, max_bytes, max_items) = walk.bounds;
+        // Each row carries its child on the lineage, so cutting at a prompt
+        // child needs no parent lookup: the span ends at this row. Only rows
+        // inside the budget and the piece's oldest row leave SQLite.
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k) AS (
+                SELECT id,parent,depth,total_bytes,turn_seq,?3,?4,1 FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.turn_seq,c.id,c.turn_seq,c.k+1
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
+             SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
+                CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes<=?7 AND c.depth<=?8 THEN
+                    (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
+                     FROM nodes WHERE id=c.id) END
+             FROM chain c WHERE (c.total_bytes<=?7 AND c.depth<=?8)
+                OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL",
+        )?;
+        let (max_total, max_depth) = (
+            before.saturating_add(max_bytes),
+            depth_before.saturating_add(max_items),
+        );
+        let mut rows = statement.query(params![
+            from,
+            walk.previous_cut,
+            child,
+            child_seq,
+            limit.max(1),
+            Self::COMPACTION_PROMPT_BYTES as i64 + 1,
+            max_total,
+            max_depth
+        ])?;
+        let mut last: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
+        while let Some(r) = rows.next()? {
+            let (id, parent, depth, total, seq): (i64, Option<i64>, i64, i64, Option<i64>) =
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+            if total <= max_total && depth <= max_depth {
+                walk.rows
+                    .push((id, depth, total, seq, r.get(5)?, r.get(6)?, r.get(7)?));
+            }
+            if last.is_none_or(|(_, oldest, _, _)| depth < oldest) {
+                last = Some((id, depth, parent, seq));
             }
         }
-        bound_prompts(&mut prompts);
-        let previous_summary: Option<String> = match bot.compaction {
+        walk.next = match last {
+            Some((id, _, Some(parent), seq)) if id != walk.previous_cut => {
+                Some((parent, Some(id), seq))
+            }
+            _ => None,
+        };
+        Ok(())
+    }
+    /// Choose a finished catch-up walk's step: the longest run of whole
+    /// turns from the previous cut whose summarizer request, previous
+    /// summary included, fits the budget, cut at the next prompt.
+    pub fn catch_up_plan(&self, name: &str, walk: CatchUp) -> Result<Option<CompactionPlan>> {
+        let bot = self.inspect(name)?;
+        if walk.next.is_some() || bot.head != Some(walk.head) {
+            return fail("compaction_walk_incomplete");
+        }
+        let CatchUp {
+            totals: (head_total, before, depth_before),
+            bounds: (keep_bytes, max_bytes, max_items),
+            mut rows,
+            ..
+        } = walk;
+        // Oldest first.
+        rows.sort_unstable_by_key(|row| row.1);
+        // The request carries the previous summary and the request to write
+        // besides the span, and a comma between the span's items.
+        let previous_summary = self.previous_summary(&bot)?;
+        let (head_frame, tail_frame) =
+            CompactionPlan::frame(bot.family()?, previous_summary.as_deref())?;
+        let span_bytes = max_bytes - (head_frame.len() + tail_frame.len()) as i64 + 1;
+        let span_items = max_items - 1 - previous_summary.is_some() as i64;
+        // The span ending at row i is cut at its child, which must start a
+        // turn, leave keep_bytes verbatim, and follow at least one prompt.
+        let mut prompted = false;
+        let mut end = None;
+        for (index, (_, depth, total, seq, _, child_seq, _)) in rows.iter().enumerate() {
+            prompted |= seq.is_some();
+            let items = depth - depth_before;
+            if items > span_items || total - before + items > span_bytes {
+                break;
+            }
+            if prompted && child_seq.is_some() && head_total - total >= keep_bytes {
+                end = Some(index);
+            }
+        }
+        let Some(end) = end else {
+            return fail_with(
+                "compaction_span_limit",
+                "the oldest unsummarized turn exceeds the context budget; original history remains available",
+            );
+        };
+        // The cut is the prompt that follows the span on the head's lineage.
+        let cut = rows[end].4.ok_or(Error::new("storage_error"))?;
+        let mut previous = before;
+        let span = rows[..=end]
+            .iter()
+            .map(|(id, _, total, seq, _, _, prompt)| {
+                let size = total - previous;
+                previous = *total;
+                (*id, size, *seq, prompt.as_deref())
+            });
+        Ok(Some(Self::span_plan(cut, span, previous_summary, true)))
+    }
+    fn previous_summary(&self, bot: &Bot) -> Result<Option<String>> {
+        Ok(match bot.compaction {
             Some(node) => self
                 .conn
                 .prepare_cached("SELECT summary FROM compactions WHERE node=?")?
                 .query_row([node], |r| r.get(0))
                 .optional()?,
             None => None,
-        };
-        Ok(Some(CompactionPlan {
+        })
+    }
+    /// A plan from the span's nodes, oldest first: id, own size, ordinal,
+    /// and the prompt's bounded text for prompt nodes.
+    fn span_plan<'a>(
+        cut: i64,
+        span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>)>,
+        previous_summary: Option<String>,
+        catch_up: bool,
+    ) -> CompactionPlan {
+        let (mut ids, mut sizes, mut prompts) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut from, mut to) = (i64::MAX, 0);
+        for (id, size, seq, prompt) in span {
+            ids.push(id);
+            sizes.push(size.clamp(0, u32::MAX as i64) as u32);
+            if let (Some(seq), Some(prompt)) = (seq, prompt) {
+                from = from.min(seq);
+                to = to.max(seq);
+                prompts.push((seq, bounded_prompt(prompt, Self::COMPACTION_PROMPT_BYTES)));
+            }
+        }
+        bound_prompts(&mut prompts);
+        CompactionPlan {
             cut,
             ids,
             sizes,
             prompts,
             covered: (from, to),
             previous_summary,
-        }))
+            catch_up,
+        }
     }
     /// Record a compaction at the current head. The separate cut marks the
     /// context start; branches may independently summarize the same cut.
@@ -1054,7 +1266,8 @@ impl Database {
         let data = json!({"version":bot.head,"cut":plan.cut,"previous":bot.compaction,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
-            "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>()});
+            "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
+            "catch_up":plan.catch_up});
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
             if let Some(usage) = usage {
@@ -1319,10 +1532,11 @@ impl Database {
         if deleting {
             return fail_with("bot_not_found", format!("{name} is being deleted"));
         }
-        let prior: Option<(i64, String, String, TurnOptions)> = self
+        let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn FROM turns WHERE bot=? AND request_id=?",
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node
+                 FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
                     Ok((
@@ -1332,15 +1546,20 @@ impl Database {
                         TurnOptions {
                             workspace: r.get(3)?,
                             model: r.get(4)?,
-                            delivery: Delivery::parse(&r.get::<_, String>(5)?)
-                                .unwrap_or_default(),
+                            delivery: Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
                             expected_turn: r.get(6)?,
                         },
+                        r.get(7)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((turn, saved, status, saved_options)) = prior {
+        if let Some((turn, mut saved, status, saved_options, prompt_node)) = prior {
+            if let Some(node) = prompt_node {
+                saved = self.conn.prepare_cached(
+                    "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
+                )?.query_row([node], |r| r.get(0))?;
+            }
             if saved != prompt || saved_options != *options {
                 return fail("idempotency_conflict");
             }
@@ -1690,10 +1909,15 @@ impl Database {
         for (steer, item, size) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
-            tx.execute(
-                "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
-                params![epoch_ms(), steer],
-            )?;
+            if size >= PROMPT_SHARE_BYTES {
+                tx.execute("UPDATE turns SET status='steered',finished_ms=?,prompt='',prompt_node=? WHERE id=?",
+                    params![epoch_ms(), id, steer])?;
+            } else {
+                tx.execute(
+                    "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
+                    params![epoch_ms(), steer],
+                )?;
+            }
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
                 "error":Value::Null,"detail":Value::Null});
             let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
@@ -1822,10 +2046,7 @@ impl Database {
             return fail("invalid_tool_state");
         }
         for (stream, data) in &outcome.artifacts {
-            tx.execute(
-                "INSERT INTO artifacts VALUES (?,?,?,?)",
-                params![turn, call_id, stream, data],
-            )?;
+            artifact::put(&tx, turn, call_id, stream, data)?;
         }
         let head = node(&tx, bot.head, &item)?;
         tx.execute(
@@ -2206,10 +2427,7 @@ impl Database {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
             for (stream, data) in artifacts {
-                tx.execute(
-                    "INSERT INTO artifacts VALUES (?,?,?,?)",
-                    params![turn, call_id, stream, data],
-                )?;
+                artifact::put(&tx, turn, &call_id, stream, data)?;
             }
         }
         tx.commit()?;
@@ -2946,9 +3164,12 @@ impl Database {
         let mut statement = self.conn.prepare(
             "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,b.provider||'/'||b.model),t.input_tokens,t.output_tokens,
-                    t.model_rounds,t.started_ms,t.finished_ms,substr(t.prompt,1,200),length(t.prompt),
+                    t.model_rounds,t.started_ms,t.finished_ms,
+                    substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
+                    length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
                     t.retries,t.paced_ms,t.delivery,t.cached_input_tokens
-             FROM turns t JOIN bots b ON b.name=t.bot WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
+             FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
+             WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
         let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
         let mut turns = Vec::new();
@@ -3067,15 +3288,8 @@ impl Database {
             return fail("invalid_tool_arguments");
         }
         self.authorize_artifact(name, turn, call_id)?;
-        let data: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT data FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
-                params![turn, call_id, stream],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(data) = data else {
+        let Some((_, data)) = artifact::read(&self.conn, turn, call_id, stream, 0, usize::MAX)?
+        else {
             return self.missing_artifact(turn);
         };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
@@ -3084,13 +3298,15 @@ impl Database {
         self.authorize_artifact(name, turn, call_id)?;
         let mut statement = self
             .conn
-            .prepare("SELECT stream,data FROM artifacts WHERE turn=? AND call_id=?")?;
+            .prepare("SELECT stream FROM artifacts WHERE turn=? AND call_id=?")?;
         let mut rows = statement.query(params![turn, call_id])?;
         let mut streams = serde_json::Map::new();
         while let Some(row) = rows.next()? {
-            let data: Vec<u8> = row.get(1)?;
+            let stream: String = row.get(0)?;
+            let (_, data) = artifact::read(&self.conn, turn, call_id, &stream, 0, usize::MAX)?
+                .ok_or_else(|| Error::new("storage_error"))?;
             streams.insert(
-                row.get::<_, String>(0)?,
+                stream,
                 Value::String(String::from_utf8_lossy(&data).into_owned()),
             );
         }
@@ -3115,17 +3331,11 @@ impl Database {
             return fail("invalid_artifact_page");
         }
         self.authorize_artifact(name, turn, call_id)?;
-        let row: Option<(i64, Vec<u8>)> = self.conn.query_row(
-            "SELECT length(data),substr(data,?,?) FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
-            params![offset as i64 + 1, limit as i64, turn, call_id, stream],
-            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let Some((total, bytes)) = row else {
+        let Some((total, bytes)) =
+            artifact::read(&self.conn, turn, call_id, stream, offset, limit)?
+        else {
             return self.missing_artifact(turn);
         };
-        let total = u64::try_from(total).map_err(|_| Error::new("storage_error"))?;
-        if offset > total {
-            return fail("invalid_artifact_page");
-        }
         let text = match std::str::from_utf8(&bytes) {
             Ok(text) => text,
             Err(error) if error.error_len().is_none() => {
@@ -3212,10 +3422,17 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 fn start_locked(tx: &Connection, bot: &Bot, turn: i64, prompt: &str) -> Result<Option<i64>> {
     let item = bot.family()?.user_item(prompt)?;
     let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
-    tx.execute(
-        "UPDATE turns SET status='running',started_ms=? WHERE id=?",
-        params![epoch_ms(), turn],
-    )?;
+    if prompt.len() >= PROMPT_SHARE_BYTES {
+        tx.execute(
+            "UPDATE turns SET status='running',started_ms=?,prompt='',prompt_node=? WHERE id=?",
+            params![epoch_ms(), head, turn],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE turns SET status='running',started_ms=? WHERE id=?",
+            params![epoch_ms(), turn],
+        )?;
+    }
     tx.execute(
         "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
         params![head, turn, bot.name],
@@ -3536,6 +3753,34 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // 25 -> 26: share a started turn's prompt with its immutable user node.
+    // Pending/cancelled-before-start turns still own inline text. Older steers
+    // without an indexed prompt node retain their exact inline copy as well.
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='prompt_node')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
+            ALTER TABLE turns ADD COLUMN prompt_node INTEGER REFERENCES nodes(id);
+            UPDATE turns SET prompt_node=(SELECT n.id FROM nodes n WHERE n.turn=turns.id
+                AND json_extract(CAST(n.item AS TEXT),'$.role')='user'
+                AND json_extract(CAST(n.item AS TEXT),'$.content[0].text')=turns.prompt)
+                WHERE length(CAST(prompt AS BLOB))>=4096;
+            UPDATE turns SET prompt='' WHERE prompt_node IS NOT NULL;",
+        )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name='raw_bytes')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // Existing BLOBs stay raw. New large artifacts may use bounded LZ4 blocks.
+        conn.execute_batch(
+            "ALTER TABLE artifacts ADD COLUMN raw_bytes INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 /// Keep the oldest and newest excerpts within the text/metadata budget.

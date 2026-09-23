@@ -34,6 +34,7 @@ class QueryPlanTests(unittest.TestCase):
         # Use the current runtime's schema and statements, not simplified copies.
         for index, table in [(None, None), ('checkpoints_head', 'checkpoints'),
                              ('compactions_cut', 'compactions'),
+                             ('turns_prompt_node', 'turns'),
                              ('nodes_turn', 's'),
                              ('processes_turn', 'processes'),
                              ('turns_running', 'turns'), ('turns_waiting', 'turns'),

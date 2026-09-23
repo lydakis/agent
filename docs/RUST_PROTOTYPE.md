@@ -299,6 +299,7 @@ bound; the operating system is then the only limit.
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
+| `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
@@ -397,7 +398,12 @@ current models reject budgets and older ones require them. Reasoning summaries a
 `thinking_delta` events; Anthropic thinking blocks and signatures are stored in
 the assistant item so tool-using turns continue correctly. Usage is recorded as a
 durable `usage` event per model call. HTTP requests have a 10 second connect
-timeout and a 120 second idle read timeout, and no total deadline. Provider error
+timeout and a 120 second idle read timeout, and no total deadline. The read
+timeout restarts on any byte, so a provider that sends only keepalives (Anthropic
+`ping` events or SSE comments) would hold a turn indefinitely. An established
+stream therefore also fails with `provider_stream_stalled` when no content frame
+arrives within `--stall-timeout` (120 seconds by default); keepalives never renew
+that bound, and time spent publishing deltas to followers does not count against it. Provider error
 bodies are reduced to a bounded `detail` string; codes never contain URLs or keys.
 Live provider behavior has been exercised only through synthetic endpoints in
 tests; see [NEXT.md](NEXT.md).
@@ -792,6 +798,24 @@ that store and use a new store path. Usage events are streamed through their
 turn index, without loading the transcript. Schema 21 copies existing bot row IDs
 in one pass, preserving creation order and gaps from deletion, and starts the
 identity sequence above the highest assigned ID (zero for an empty store).
+Schema 26 shares started prompts of at least 4 KiB with their immutable user
+node; queued prompts remain inline until start, and small prompts stay inline
+to avoid reference/index overhead. Idempotency and turn listings resolve the
+same original text. Absorbed steers share their own user node. Migration shares
+exact indexed matches; older steers without that mapping keep their inline
+text. The prompt-node foreign key has a partial index for deletion checks.
+
+New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
+use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
+directory and independent 16 KiB blocks. A 4 KiB sample and a 12.5% saving
+threshold leave incompressible output raw; tiny artifacts stay raw too.
+Byte paging decodes only intersecting blocks, and all existing authorization,
+retention, UTF-8, and fork rules still apply. Native transcript JSON and provider
+request prefixes do not change. Existing artifacts migrate as raw BLOBs, without
+a startup recompression pass. Freed SQLite pages can be reused; this migration
+does not vacuum or promise to shrink an existing database file. See
+[storage measurements](STORAGE_GROWTH.md).
+
 The migration is the only code that
 knows an earlier format. The store records no daemon-wide provider set or
 toolset; each bot retains its tools, and its provider is checked by family
@@ -912,7 +936,7 @@ still pause its pool.
 
 A model call has no side effects, so a failed one is retried by rebuilding
 the request from the store: within 5 minutes, up to 8 attempts for capacity
-(5xx) or transport failures and up to 64 for refusals for pace, which the pool
+(5xx), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
 spaces and which are not the request's fault; never for a response the model
 could not finish (`provider_incomplete`) or a client error. The providers'
 reset headers are only how long a full refill takes; the pool learns the level
@@ -1163,7 +1187,7 @@ usable; history tells the model to inspect current state before retrying.
 
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
-model call, when the window holds `--compact-at` percent of the context
+model call, when the turns since the last summary hold `--compact-at` percent of the context
 budget, the daemon summarizes everything older than the newest whole turns
 that hold `--compact-keep` percent verbatim. The summary is one model call
 under the bot's compaction instructions, with tool calls disabled, to the bot's own
@@ -1222,14 +1246,26 @@ window can still invalidate the later suffix. A summarizer failure leaves the
 context view unchanged, preserves any billable usage, is reported as a live
 `compaction_failed` notification, and the turn continues with the window
 as it is; the window's own overflow handling still bounds stored items.
-Before planning, indexed byte/item accounting rejects an unsummarized backlog
-larger than the configured context budget with `compaction_span_limit`, without
-walking or loading the transcript. The complete summarizer input is byte-bounded
-including its previous summary and request marker. Oversized summaries are
-rejected above a quarter of the byte budget or 64 KiB, whichever is smaller.
-These failures leave the bot usable and original history retrievable. Automatic
-catch-up through multiple bounded historical spans is not implemented; a backlog
-that exceeds the budget needs a larger configured budget to compact in one call. The
+Planning runs on the reader connection: nodes are immutable and only the
+running turn moves its bot's head, so the reader's snapshot plans what the
+worker would. Indexed byte/item accounting sizes the unsummarized span first,
+without walking the transcript. A span larger than the context budget, left
+by failed summaries or a round that outgrew the budget, is caught up oldest
+first. Each round boundary summarizes the longest run of whole turns from
+the previous cut whose summarizer request fits the budget, including the
+previous summary and the request marker. The cut moves to the next prompt,
+and the window keeps omitting what is still behind it until the steps
+reach the tail. The `compacted` event says `catch_up`. Finding the oldest
+turns means walking the lineage back from the head, since nodes only point
+to their parents and forks give a node several children. That walk reads
+metadata in pieces of 1,024 nodes, so other bots' reads interleave with it,
+and only rows inside the budget leave SQLite. A turn larger than the whole
+budget cannot be summarized and answers `compaction_span_limit`. Catch-up
+converges while a step covers more than one round adds. The complete
+summarizer input is byte-bounded including its previous summary and request
+marker. Oversized summaries are rejected above a quarter of the byte budget
+or 64 KiB, whichever is smaller. These failures leave the bot usable and
+original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and
 `--compaction-model` to change it. The daemon holds no such text.

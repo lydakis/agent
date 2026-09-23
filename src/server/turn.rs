@@ -42,6 +42,9 @@ const MAX_ATTEMPTS: u32 = 8;
 const MAX_PACED_ATTEMPTS: u32 = 64;
 use agent_runtime::provider::pace::MIN_PARK;
 const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+/// Nodes per piece of a compaction catch-up walk: a few milliseconds of
+/// metadata reads, after which other bots' reads may run.
+const CATCH_UP_PIECE_NODES: i64 = 1024;
 /// Read-ahead while a body streams: a batch stops at either bound, so the
 /// memory held per in-flight request is a number, not a function of item
 /// sizes. An item larger than the byte bound travels alone.
@@ -371,10 +374,12 @@ impl Turn {
         })
     }
 
-    /// Compaction at a round boundary: once the window holds `compact_at`
-    /// percent of the budget, summarize everything older than the newest
-    /// `compact_keep` percent with the client's instructions and summarizer,
-    /// and record the result as the new context start. A failed summary
+    /// Compaction at a round boundary: once the turns since the last summary
+    /// hold `compact_at` percent of the budget, summarize everything older
+    /// than the newest `compact_keep` percent with the client's instructions
+    /// and summarizer, and record the result as the new context start. A
+    /// backlog larger than the budget is summarized oldest first, one bounded
+    /// span per round boundary, until it fits. A failed summary
     /// leaves the context view unchanged and is reported live; the turn goes on
     /// with the window as it is. Returns a park time if the summarizer's
     /// call parked the turn.
@@ -392,23 +397,18 @@ impl Turn {
         let bot = self.bot.clone();
         let bytes = self
             .store
-            .op("window_bytes", move |db| db.window_bytes(&bot))
+            .op("unsummarized_bytes", move |db| db.unsummarized_bytes(&bot))
             .await?;
         if (bytes as usize) < self.context_bytes / 100 * self.compact_at {
             return Ok(None);
         }
-        let (bot, keep) = (
-            self.bot.clone(),
-            (self.context_bytes / 100 * self.compact_keep) as i64,
-        );
+        let keep = (self.context_bytes / 100 * self.compact_keep) as i64;
         let (max_bytes, max_items) = (self.context_bytes as i64, self.context_items as i64);
-        let plan = match self
-            .store
-            .op("compaction_plan", move |db| {
-                db.compaction_plan(&bot, keep, max_bytes, max_items)
-            })
-            .await
-        {
+        // Nodes are immutable and only this turn moves the bot's head, so
+        // the reader's snapshot plans what the worker would. A catch-up walk
+        // over a long backlog goes in pieces, so neither other bots' commits
+        // nor their context reads wait behind all of it.
+        let plan = match self.plan_compaction(keep, max_bytes, max_items).await {
             Ok(Some(plan)) => plan,
             Ok(None) => return Ok(None),
             Err(error) if error.code == "compaction_span_limit" => {
@@ -518,6 +518,40 @@ impl Turn {
         Ok(None)
     }
 
+    async fn plan_compaction(
+        &self,
+        keep: i64,
+        max_bytes: i64,
+        max_items: i64,
+    ) -> Result<Option<agent_runtime::store::CompactionPlan>> {
+        use agent_runtime::store::Planning;
+        let bot = self.bot.clone();
+        let planning = self
+            .store
+            .read("compaction_plan", move |db| {
+                db.compaction_plan(&bot, keep, max_bytes, max_items)
+            })
+            .await?;
+        let mut walk = match planning {
+            None => return Ok(None),
+            Some(Planning::Plan(plan)) => return Ok(Some(plan)),
+            Some(Planning::CatchUp(walk)) => walk,
+        };
+        while !walk.done() {
+            walk = self
+                .store
+                .read("catch_up_piece", move |db| {
+                    db.catch_up_piece(&mut walk, CATCH_UP_PIECE_NODES)?;
+                    Ok(walk)
+                })
+                .await?;
+        }
+        let bot = self.bot.clone();
+        self.store
+            .read("catch_up_plan", move |db| db.catch_up_plan(&bot, walk))
+            .await
+    }
+
     async fn compaction_failed(&self, turn: i64, error: &Error) -> Result<()> {
         self.hub
             .live(
@@ -536,17 +570,8 @@ impl Turn {
             .store
             .op("inspect", move |db| db.inspect(&bot)?.family())
             .await?;
-        let mut head = Vec::new();
-        if let Some(previous) = &plan.previous_summary {
-            head = family.user_item(&format!(
-                "[previous summary, to merge with the turns below]\n{previous}"
-            ))?;
-            head.push(b',');
-        }
-        let mut tail = family.user_item(
-            "[compaction request] Write the summary of the conversation above now, following your instructions.",
-        )?;
-        tail.insert(0, b',');
+        let (head, tail) =
+            agent_runtime::store::CompactionPlan::frame(family, plan.previous_summary.as_deref())?;
         let total = head.len()
             + plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
             + plan.ids.len().saturating_sub(1)
@@ -1243,6 +1268,7 @@ fn retryable(code: &str) -> bool {
             | "provider_http_504"
             | "provider_http_529"
             | "provider_stream_failed"
+            | "provider_stream_stalled"
             | "truncated_sse_frame"
             | "provider_admission_timeout"
     ) || code.starts_with("provider_connection_")

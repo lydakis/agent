@@ -3448,7 +3448,8 @@ Forks can compact a shared cut independently and restore an inherited window
 start. Oversized unsummarized spans are rejected by indexed accounting before
 collecting their nodes; the original transcript remains available and the bot
 continues through its bounded window. This bounds the failure path; automatic
-catch-up through multiple historical spans is still open.
+catch-up through multiple historical spans followed in
+[backlog catch-up](#compaction-backlog-catch-up).
 
 Summaries and notes now precede the changing omission notice. Anthropic gets
 cache breakpoints on stable pinned blocks, and synthetic tests verify unchanged
@@ -3681,3 +3682,209 @@ four skips and no failures. Strict Clippy, formatting, and diff checks passed.
 The schema-23 migration fixture removes the new index before simulating the
 old table layout. Ignored artifacts: `.local/compaction_cut_index_perf.py`
 and `.local/compaction-cut-index-perf.json`.
+
+## Compaction backlog catch-up
+
+2026-09-23, base `612ae1d`. Closes the open catch-up note from
+[the correctness follow-up](#compaction-correctness-and-cache-prefix-follow-up).
+A backlog larger than the context budget used to answer
+`compaction_span_limit` at every round boundary while the window moved on
+without a summary. That happened after repeated summary failures, or when
+one round outgrew the budget. Now each boundary summarizes the oldest whole
+turns not yet covered, as many as the summarizer's request fits, merging the
+previous summary. Coverage stays contiguous from turn 1, and ordinary
+compaction takes over once the rest fits. Compaction is due when the turns
+since the last summary reach `--compact-at`, not the window. The two numbers
+only differ when the window has moved past the cut, which is exactly the
+backlog case. A turn larger than the whole budget still answers
+`compaction_span_limit`.
+
+Behavior evidence. Two store tests fail on `612ae1d` (`compaction_span_limit`
+where a plan was expected) and pass here. A 100-turn backlog under a
+1,024-byte budget is summarized in contiguous steps that each fit the budget,
+then compacts normally. Item bounds, a turn larger than the budget, and plans
+identical for walk pieces of 1, 7, 16 and 4,096 nodes are also covered.
+Daemon test: summaries fail for 12 turns of a 4 KiB window, then succeed.
+The backlog is caught up in five steps of three turns each, and the
+following compactions are ordinary. A first version sized each step at half
+the budget. It never converged there, because one step covered one turn
+while each turn added one, so steps now fill the summarizer's budget.
+Catch-up converges while a step covers more than one round adds.
+
+Finding the oldest turns needs a walk back from the head, because nodes only
+point to their parents and forks give a node several children. The
+alternative, an ancestor index, would add a column and a write to every node
+append and a migration of the largest table, to speed a path that runs only
+after failures, so it was declined. The walk reads metadata only, runs on the
+reader connection (nodes are immutable and only the running turn moves its
+head), returns to Rust only the rows inside the budget, and goes in pieces of
+1,024 nodes so other bots' context reads interleave with it.
+
+Walk timing, local Linux amd64 container, release build, one file-backed
+store with 1 KiB prompts and 1 KiB replies, budget 8 MiB and 4,096 items,
+one excluded warmup and six measured walks per row:
+
+| Backlog nodes | Pieces | Whole walk, ms, median (range) | Longest single piece, ms, median |
+| ---: | ---: | ---: | ---: |
+| 400,000 | 1 | 571.5 (546.5–601.4) | 569.1 |
+| 400,000 | 391 of 1,024 | 567.5 (558.1–620.7) | 3.5 |
+
+On a 100,000-node store, pieces of 1,024, 2,048, 4,096 and 8,192 nodes took
+155.8, 157.5, 150.4 and 158.6 ms in total, with longest pieces of 3.6, 7.0,
+10.3 and 17.4 ms. Splitting costs no measurable total time, and the longest
+hold on the shared reader falls from the whole walk to a few milliseconds.
+The walk repeats at every catch-up step, so a backlog of B nodes under a
+budget of I items costs about B/I walks. Each of those steps also makes a
+summarizer call over a full budget, which this screen does not include.
+
+Common path, the matched screen from [compaction](#compaction): 16 bots x 60
+turns, 500-byte prompts, the synthetic Responses model, one excluded warmup
+and four samples per binary with alternating order. Baseline binary
+`640ec11f…` (`612ae1d`), candidate `05850e2d…`. Both did identical work:
+960 turns, with 960 provider calls below threshold and 1,248 (288 summaries)
+compacting. Medians (ranges):
+
+| Workload / binary | Daemon CPU, s | Peak daemon RSS, MiB | Turn p95, ms |
+| --- | ---: | ---: | ---: |
+| Below threshold, 8 MiB / baseline | 2.855 (2.79–2.91) | 20.553 (20.445–20.699) | 59.7 (58.7–60.9) |
+| Below threshold, 8 MiB / candidate | 2.850 (2.71–2.93) | 20.588 (20.402–20.703) | 59.3 (58.3–61.4) |
+| Compacting, 8 KiB at 50%, keep 25% / baseline | 3.380 (3.05–3.49) | 20.881 (20.805–20.930) | 107.1 (103.8–107.7) |
+| Compacting, 8 KiB at 50%, keep 25% / candidate | 3.275 (3.18–3.57) | 20.875 (20.812–20.977) | 105.1 (104.0–107.9) |
+
+Every range overlaps, so this shows no measurable cost on the common path.
+It is not a speedup claim. This screen never builds a backlog, so it doesn't
+exercise the catch-up walk.
+
+Not measured: catch-up with a real summarizer, including its latency and the
+quality of a summary merged over many steps; the paid rerun of the luna cost
+figures with summarizer usage included, which this environment could not run
+because it has no provider keys; and a real 8 MiB window over a long task.
+
+Validation, after merging `eab002b`: 116 Rust tests, 192 Python tests (four
+skipped), strict Clippy and formatting. Ignored artifacts: `.local/compaction-catch-up/walk_timing.rs`,
+`walk400-matched.txt`, `screen.py`, `screen.json`, `binaries.txt`.
+
+## Mixed-workload soak
+
+Local synthetic soak, 2026-09-20, sixty minutes, `bench/soak.py`, binary
+`908d7f79` built from bb6bc51, before the client-policy merge (612ae1d);
+a three-minute smoke of the same workload on the merged binary `3692da8d`
+is recorded at the end. One daemon on the socket transport with `--max-active 256
+--context-bytes 524288 --compact-at 50 --compact-keep 25 --retain-turns 12`,
+192 bots in seven roles: 32 long histories compacting on the small window,
+32 noisy shells overflowing into artifacts, 32 background-command bursts, 16
+parents parked on 16 children, 16 bots whose provider fails once per turn,
+and 48 plain bots. A running turn was interrupted every 30 seconds, a
+historical fork was created every 60 seconds and deleted after its turns.
+One shared connection followed all bots; eight additional fast followers
+watched long-history bots and four nominally slow followers watched noisy
+bots. The slow-reader delay was not implemented in that driver, so this run
+does not establish slow-consumer backpressure coverage. A sampler read
+`stats` every five seconds (706 samples).
+
+Counts: 224,063 turns submitted, 223,975 completed, 88 interrupted, none
+failed, 338,013 provider requests, 11,095 retries from the injected
+failures, 1,771 compactions, 59 forks created and deleted, no refusals or reported
+turn errors. The eviction counter was never updated and supplies no evidence
+about disconnections. Median throughput was 62.8
+turns per second (the pace, not a limit), minimum 15.0 around the restart.
+Turn latency p50 184 ms, p95 3,005 ms, maximum 5,218 ms; the tail belongs
+to the roles that wait on a child shell or back off after a failed request.
+Interrupt-to-cancel p50 3 ms, maximum 60 ms across 88 interrupts. The original
+replay checker reported zero mismatches, but accepted missing
+prefixes and even empty follower streams; that result does not establish
+stream equality. Nothing was left unfinished after the drain, and the
+SIGKILL restart with 16 turns in flight
+answered `ready` after 0.92 s with those 16 turns marked interrupted and the
+other 176 bots completed. The 88 interrupts are the 30-second schedule's
+hits: the driver interrupted a running turn when it found one, and with
+the synthetic provider answering in milliseconds it sometimes found none.
+The driver now submits a five-second turn to an idle bot in that case and
+counts attempts, so later runs interrupt on every tick; a one-minute check
+on the merged binary landed 2 of 2 with cancellation at 1 ms.
+
+Memory and handles were flat: daemon RSS median 36.55 MiB in the first ten
+minutes and 36.77 MiB in the last ten, maximum 40.02 MiB; three threads
+throughout; file descriptors median 81 then 63, maximum 127; at most 37
+descendant processes at once with 59.6 MiB between them, none left at the
+end; the WAL stayed under 8.8 MiB. Compactions accrued linearly, about 30
+per 50 seconds from the third minute on, so the long bots kept cycling
+through the window instead of stalling.
+
+The store is the finding. It grew from 13.7 MiB to 1,316 MiB, 21.7 MiB per
+minute at this pace, with retention holding operational records to 2,320
+retained-turn rows, 203 artifacts, and 16 thousand events. The growth is
+history: 649,976 nodes, of which tool outputs (`function_call_output`) hold
+588 MiB, model messages 133 MiB, prompts 121 MiB, and tool calls 12 MiB.
+History is what forks and the history tool read, so retention does not
+touch it, and compaction adds summaries without removing what they cover.
+A fleet running noisy tools for hours therefore pays store growth
+proportional to raw tool output, which is the case for item 34's elision
+and for a later decision on whether covered history should ever be
+tombstoned. The storage threads were busy: 10.88 million store jobs, 3,019
+per second at 0.31 ms each, with the writer and reader together running jobs
+for about one second per wall second and a mean queue depth of 1.7 (sampled
+median 1.79 queued seconds per second, maximum 4.1). These counters combine
+two independently running storage threads. They do not establish writer
+utilization or proximity to saturation. Per-thread execution and queue
+measurements are still needed before using this result to justify moving
+context planning or claiming a capacity limit.
+
+Three-minute smoke on the merged binary `3692da8d`, same roles and flags:
+12,196 turns, none failed, 576 retries, 46 compactions, 2 forks, zero
+reported follower mismatches under the same incomplete checker, turn p50
+112 ms and p95 1,536 ms, RSS median 36.35 MiB
+and maximum 38.95 MiB, store 13.7 to 170 MiB, restart with 16 held turns
+ready after 0.057 s. The reported turn outcomes stayed successful; the
+sixty-minute numbers above were not rerun on it.
+
+Not measured here: real model behavior under this workload, provider-side
+latency (the synthetic provider answers at once), and the disk cost of a
+store beyond 1.3 GiB. The second half of item 16, a real repository task on
+a controlled model, is folded into item 36. Result file:
+`.local/bench/soak-60/result.json`; the 1.3 GiB store is not kept.
+
+
+### Soak observer corrections
+
+The 2026-09-22 driver uses a private temporary socket directory, throttles
+four noisy-bot followers to at most 256 bytes every 50 ms, and records bytes
+read and observed EOF/reset before the intentional restart. Disconnects are
+not attributed to eviction without a server-side reason; buffered data can
+delay observing EOF. Local cleanup is excluded from the count.
+
+Eight fast followers spool durable events to temporary files. After drain,
+replay is read through all pages and the observer waits for its endpoint,
+then compares every event after the retention watermark, including payload,
+order, and multiplicity. Empty or incomplete streams fail. The main control
+and event connections do not retain duplicate durable histories in memory;
+the slow followers retain no event payloads. All observer sockets, temporary
+journals, the provider server, and the socket directory are closed on exit.
+These changes affect the Python observer, not daemon implementation. The
+older hour-long results above have not been rerun with the corrected driver.
+
+Corrected three-minute functional smoke on the unchanged `3692da8d` binary:
+12,185 turns, 12,179 completed and six deliberately interrupted, zero failed,
+576 retries, 48 compactions, and two forks created and deleted. Complete
+retained-stream comparisons found zero mismatches, and nothing remained after
+drain. All 16 held turns recovered as interrupted; startup took 0.022 s.
+Each slow follower read about 24 KB; none disconnected during observation.
+This verifies the observer paths, not eviction under sustained backpressure.
+Daemon RSS was 38.44 MiB median and 42.81 MiB maximum; turn p50 was 109 ms
+and p95 3,004 ms. This is not an alternating, matched performance comparison
+with the older observer and does not establish a speedup or strict latency
+parity. The implementation improvement is removing retained payload copies
+from observer RAM while preserving exact verification via temporary files.
+Capture: `.local/bench/soak-observer-fix-20260922/result.json`.
+Validation: 35 focused soak, lifecycle, daemon, and wait tests passed, along
+with Python compilation and diff checks. The replay regressions reject
+missing prefixes, gaps, duplicate events, and changed payloads across pages;
+socket tests cover delayed delivery, throttling, EOF, and local cleanup.
+
+The soak latency figures above start after submission acknowledgement, excluding
+time waiting for admission and its commit. `soak_v3` starts timing before sending
+the submission and records that boundary explicitly. A local probe with a 200 ms
+temporary store write lock exposed the difference: 240 ms end-to-end versus
+29 ms reported by the old observer. The historical latency figures have not
+been rerun with this correction; the separate storage comparison drivers already
+time from before submission.

@@ -1,4 +1,4 @@
-"""EXPLAIN QUERY PLAN for every statement literal in src/store/db.rs.
+"""EXPLAIN QUERY PLAN for runtime statement literals in the store modules.
 
 Run from the repository root against a store at the current schema (open it
 once with the current binary to migrate a copy). Flags full scans on growing
@@ -45,7 +45,8 @@ def main():
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
-    source = (Path(__file__).resolve().parent.parent / 'src/store/db.rs').read_text()
+    root = Path(__file__).resolve().parent.parent
+    source = '\n'.join((root / name).read_text().split('#[cfg(test)]', 1)[0] for name in ('src/store/db.rs', 'src/store/artifact.rs'))
     # One-time migrations may read a whole table by design; audit the runtime
     # paths. Every `fn migrate*` is one, including the backfills it calls.
     while '\nfn migrate' in source:

@@ -272,13 +272,15 @@ class SocketAndCliTests(ModelFixture):
                          'completed')
 
     def test_normalized_daemon_limits_match_on_startup_and_attach(self):
-        flags = ['--idle-exit', '0', '--context-bytes', '512', '--context-items', '1']
+        flags = ['--idle-exit', '0', '--context-bytes', '512', '--context-items', '1', '--stall-timeout', '30']
         self.agent('run', *self.common, *flags, '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
         self.agent('run', *self.again, '--context-bytes', '1024', '--context-items', '2',
                    '--bot', 'Bob', 'effective')
         refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
+        refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '120', check=False)
+        self.assertIn('--stall-timeout: requested 120 but daemon has 30', refused.stderr)
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
@@ -296,6 +298,8 @@ class SocketAndCliTests(ModelFixture):
             ('wait', '--any=true', 'proc:1'),
             ('run', '--bot', 'Bob', '--bot', 'Alice', 'hi'),
             ('run', '--max-output-tokens', '0', 'hi'),
+            ('run', '--stall-timeout', '0', 'hi'),
+            ('run', '--stall-timeout', '86401', 'hi'),
             ('serve', '--context-items', '0'),
             ('follow', '--after=-1', '--all'),
         ]
@@ -451,6 +455,7 @@ class SocketAndCliTests(ModelFixture):
             sock.connect(str(self.socket))
             ready = json.loads(sock.makefile('r').readline())
         self.assertTrue({'processes', 'active', 'connecting', 'connections', 'output_tokens', 'idle_exit_seconds'} <= set(ready['limits']))
+        self.assertEqual(ready['limits']['stall_timeout_seconds'], 120)
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
         self.assertIn('wait', ready['capabilities'])
 

@@ -171,9 +171,36 @@ class CompactionTests(ModelFixture):
         summaries = [r for r in self.requests() if r['instructions'] == 'Summarize.']
         self.assertTrue(summaries)
         self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) <= 4098 for r in summaries))
-        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_span_limit'
-                            for m in client.saved))
+        # Once the backlog outgrows the budget, each attempt is a catch-up
+        # step over the oldest turns, still within the budget.
+        self.assertTrue(summaries[-1]['input'][0]['content'][0]['text'].startswith('0: '))
         self.assertEqual(len(client.request('turns', bot='Bob', after=0, limit=64)['result']['turns']), 24)
+
+    def test_a_backlog_is_caught_up_oldest_first_once_summaries_succeed(self):
+        self.model.reject_compaction = True
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        for n in range(12):
+            self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 500)
+        self.model.reject_compaction = False
+        for n in range(12, 24):
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 500)['data']['status'], 'completed')
+        compacted, after = [], 0
+        while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
+            compacted += [e['data'] for e in page if e['event'] == 'compacted']
+            after = page[-1]['cursor']
+        steps = [c for c in compacted if c['catch_up']]
+        self.assertGreater(len(steps), 1)
+        # Steps are contiguous from the first turn, each within the budget,
+        # and ordinary compaction takes over once caught up.
+        self.assertEqual(compacted[0]['span_turns'][0], 1)
+        for earlier, later in zip(compacted, compacted[1:]):
+            self.assertEqual(later['span_turns'][0], earlier['span_turns'][1] + 1)
+        self.assertTrue(all(c['bytes'] <= 4096 for c in steps))
+        self.assertTrue(all(c['covered_turns'][0] == 1 for c in compacted))
+        self.assertEqual([c['catch_up'] for c in compacted],
+                         [True] * len(steps) + [False] * (len(compacted) - len(steps)))
+        self.assertFalse(compacted[-1]['catch_up'])
 
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
