@@ -513,6 +513,68 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
+34. Tool calls that do not hold up the model. Prompted by Unreal Agent
+    ([source](https://github.com/unreallabsai/unreal-agent/tree/b7c9bf1c5c2fa4127255c07727a7c8413e23944a)
+    at `b7c9bf1c5c2fa4127255c07727a7c8413e23944a`, read 2026-09-23; its
+    [announcement](https://unreallabs.ai/blog/unreal-agent/), 2026-09-22),
+    a Go harness benchmarked against the same Codex and Pi baselines.
+    Source facts: every shell call starts at once as a background
+    operation; until it finishes the model sees a fixed "still running"
+    tool result; the finished result replaces that placeholder if no
+    request has carried it yet, and is otherwise appended as a second
+    `function_call_output` for the same call id
+    ([`builder.go`](https://github.com/unreallabsai/unreal-agent/blob/b7c9bf1c5c2fa4127255c07727a7c8413e23944a/harness/contextbuilder/builder.go)).
+    Results that land together share one model call, a 1 s grace after
+    each response lets quick calls finish before the next call, user input
+    arriving while calls run starts a model call at once, and a heartbeat
+    wakes the model after ten minutes of nothing but running calls
+    ([`loop.go`](https://github.com/unreallabsai/unreal-agent/blob/b7c9bf1c5c2fa4127255c07727a7c8413e23944a/harness/coordinator/loop.go),
+    [`preamble.md`](https://github.com/unreallabsai/unreal-agent/blob/b7c9bf1c5c2fa4127255c07727a7c8413e23944a/harness/contextbuilder/prompts/preamble.md)).
+    Its post claims up to 40% lower cost than Codex at equal or better
+    pass rates; that is their documentation claim, and it mixes this with
+    a 1.4 KB preamble, three tools, and no subagents without attributing
+    the saving. Here, by contrast, a response's calls run one at a time, a
+    background shell's result reaches the model only through a `wait`
+    call, which costs a model round, and a steer waits until every call in
+    the round is done. Two slices, each measured against the current loop:
+    - Overlap the calls of one response that the runtime can show are
+      independent: reads, and writes or edits to distinct paths. Tool calls
+      carry no dependency metadata and a shell command's effects are
+      unknown, so shell calls and anything touching a path an earlier call
+      in the response touches stay in call order; the model already opts a
+      shell into overlap with `background=true`. Results are recorded in
+      call order. Today only shells take a process slot, and a read
+      allocates up to the 4 MiB file limit, so overlap needs a bound over
+      every tool, not only the process bound. A `wait` among the calls,
+      cancellation, and restart mid-batch need defined behavior.
+    - Deliver finished background results without `wait`: the call's
+      tool result stays the handle (the real result for both families),
+      and the finished output arrives at the next boundary as an item
+      naming the call. The Responses shape above is not portable:
+      Anthropic Messages, and so Bedrock, requires each `tool_use` to be
+      answered once, in the next user message. A turn whose model stops
+      while its background calls run parks without a slot until one
+      finishes or a steer arrives, rather than ending. A fork at a
+      checkpoint where a call was still running inherits neither the late
+      result nor a rerun of the process. That needs enforcement, not only
+      transcript placement: `proc:N` resolves by process id store-wide and
+      a finished result can be waited on again, so a fork can already
+      `wait` on a handle in its inherited history and receive its source's
+      result. Scope process handles to the bot that started them, and
+      answer an inherited one as unavailable. Compaction that covers the
+      call before its result arrives must leave the late item legible.
+    Measure with the synthetic provider and tool fixtures: model rounds,
+    billed input, cached input, and output tokens, wall time, and daemon
+    CPU and memory, on tasks with several independent commands of mixed
+    duration, with and without a preamble sentence asking the model to
+    issue independent calls together, since the gain depends on the model
+    doing so. Ramp active bots against the shared bounds and report p95 and
+    p99 turn and model-boundary latency and per-bot fairness, since one
+    turn holding several slots can speed itself up by delaying others. A
+    run counts only if it completes the same calls with the same tool
+    results, filesystem effects, and final answer as the current loop;
+    anything else fails the comparison rather than ranking as cheaper.
+    Then a small real-provider check under a stated spend cap.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
