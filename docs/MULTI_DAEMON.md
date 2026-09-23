@@ -3,8 +3,9 @@
 A roadmap for four ideas George raised on 2026-09-20. None of it is built.
 Each section says what the code does today, what would have to change, the
 main risks, and an order of work. Source references are to `612ae1d` and were
-read on 2026-09-23, except the export notes in section 4, which cite
-`8ebbc44`. Claims about the code are verified at those revisions; everything
+read on 2026-09-23, except references marked `8ebbc44`, which were added
+after main moved to schema 26 and after the first review. Claims about the
+code are verified at those revisions; everything
 under "would change" and "order" is a proposal, and anything unmeasured says
 so.
 
@@ -13,7 +14,7 @@ The four ideas, in the order this document recommends building them:
 1. [Watch a bot without disturbing it](#1-watch-a-bot-without-disturbing-it),
    including a summary drawn from its transcript.
 2. [One daemon per workspace or project](#2-one-daemon-per-workspace-or-project),
-   for isolation.
+   for failure isolation.
 3. [One client over several daemons](#3-one-client-over-several-daemons),
    across machines.
 4. [Move a bot to a daemon on another machine](#4-move-a-bot-to-another-daemon).
@@ -168,10 +169,12 @@ source's rows unchanged.
    anyway. With it, "fork at the current node with no tools, ask it to
    summarize" becomes a safe recipe for a model-written summary on demand.
    The caller deletes the fork afterwards.
-6. **Read-only sessions, once another principal needs them.** A socket
-   session that refuses every mutating operation, for example a second
-   socket or a flag at connect. Defer this until someone other than the
-   store's owner observes. Today every client is the same uid.
+6. **Read-only access, once another principal needs it.** A second socket
+   that serves only the observe set, with its own file permissions, so the
+   operating system decides who may connect to which. A flag the client
+   chooses at connect is not a boundary: the same principal can reconnect
+   without it and use the full-access socket. Defer this until someone other
+   than the store's owner observes. Today every client is the same uid.
 
 ### Risks
 
@@ -196,7 +199,7 @@ source's rows unchanged.
    mixed-workload screens (NEXT items 16 and 18).
 4. `fork` with a tool selection, and the summary-fork recipe, with the
    cache-hit ratio measured.
-5. Read-only sessions, only when a second principal appears.
+5. A read-only socket, only when a second principal appears.
 
 ## 2. One daemon per workspace or project
 
@@ -223,17 +226,25 @@ account of what the isolation buys.
 
 ### What separate daemons do and do not isolate
 
-They do isolate failure and resources. Each daemon has its own storage
+They isolate daemon-local failures. Each daemon has its own storage
 worker, so a 693 ms deletion stall like the one measured in NEXT item 3
 stops only its own store. Each has its own `--max-active`, process and
 pending bounds, retention, WAL, and crash.
+
+They do not isolate the host. Every daemon runs under the same operating
+system limits, and each gets its own process allowance, so one workspace's
+shell or model workload can still exhaust CPU, memory, process ids, or file
+descriptors and raise tail latency for the others. Resource isolation
+belongs to caller-supplied cgroups, containers, or equivalent host
+controls.
 
 They do not isolate security. Every daemon runs as the same user with
 full-access tools. `read`, `write`, and `edit` resolve a path by
 `workspace.join(path)` (`src/tools.rs:816-818`), and an absolute path
 replaces the workspace entirely, so a bot in project A can edit project B.
 Process sandboxing is explicitly kept out of the queue (NEXT, end of the
-queue). Per-workspace daemons are a failure domain, not a sandbox.
+queue). Per-workspace daemons are a daemon-local fault boundary, not a
+sandbox and not a resource boundary.
 
 They also give up what one daemon shares, which is most of this project's
 performance thesis:
@@ -285,8 +296,8 @@ performance thesis:
   the store and WAL mid-write. The convention has to include ignoring
   `.agent/*.sqlite*`. A copied store is also a second store with the same
   identity (section 4's risks).
-- Calling this "isolation" invites the security reading. The docs have to
-  say failure domain every time.
+- Calling this "isolation" invites the security and resource readings.
+  The docs have to say daemon-local fault boundary every time.
 - Many small daemons each learn pacing from nothing and each keep their own
   connection pools, so the fleet numbers in [LIVE_FLEET.md](LIVE_FLEET.md),
   all measured through one daemon, no longer describe the system.
@@ -364,9 +375,12 @@ rendezvous directory must be the user's own and mode `0700`
   daemon's user. Forward to a socket in a `0700` directory, never to a TCP
   port.
 - Stale forwarded socket files, and a forward that drops mid-`wait`. The
-  client already reports `daemon_unavailable` and re-attaches from its
-  cursor. A merged view has to do that per daemon, without blanking the
-  others.
+  shared client fails every pending request with `daemon_disconnected`
+  (at `8ebbc44`: `client/src/lib.rs:203-210`), and the CLI exits. Only the
+  app's follow re-attaches, from its event cursor, and a cursor cannot
+  resume a lost request. The handles are still valid, so a multi-daemon
+  client has to reconnect and re-issue its `wait` per endpoint, without
+  blanking the other daemons.
 - Name collisions across daemons. `bob` on two daemons is two bots, and any
   merged listing has to show which is which.
 
@@ -405,7 +419,10 @@ Some of a bot cannot move, by construction:
   (`src/tools.rs:851-895`).
 - **Background processes.** They are children of this daemon. A restart
   reports them `process_lost`, meaning supervision ended and the process may
-  still be running (NEXT item 11).
+  still be running (NEXT item 11). An idle bot can own one: `shell` with
+  `background` returns its `proc:` handle at once, and the command outlives
+  the turn. Deletion checks for running processes separately from the bot's
+  status for this reason (at `8ebbc44`: `src/store/db.rs:2734-2746`).
 - **The workspace.** It is an absolute, canonicalized path that must exist
   on this host (`src/server/mod.rs:333-341`), and the model has seen those
   paths in its transcript.
@@ -428,8 +445,24 @@ carrying it over.
    (nodes are shared with the source's other forks, so they are copied, not
    moved), the bot row, turns with their request ids (so a retried
    submission stays idempotent at the target), tool intents, completed
-   process results, artifacts, and note and compaction versions. Events
-   only if the caller asks, since cursors will not survive anyway.
+   process results, artifacts, and note and compaction versions. Two kinds
+   of records are part of the store's contract, so the bundle cannot treat
+   them as optional:
+   - **Outcome events.** A finished turn's result is rebuilt from its
+     `turn_finished` event and its last `message` event, and
+     `turn_result_pruned` is the answer when they are missing (at `8ebbc44`:
+     `src/store/db.rs:2343-2380`). An artifact read is authorized through
+     the `tool_completed` event that names the output's node
+     (`src/store/db.rs:3206-3222`). The bundle carries these events for every
+     turn it carries, under new cursors. The rest of the replay log is
+     optional, since followers' cursors do not survive anyway.
+   - **Retained-turn ownership.** `prune` and bounded deletion find a bot's
+     operational records through `retained_turns` (at `8ebbc44`:
+     `src/store/db.rs:454`, read at `src/store/db.rs:2777` and
+     `src/store/db.rs:2927`). Import writes a row for every imported turn
+     whose records it carries. Without them, pruning never frees imported
+     records, and deletion removes turn rows that artifacts and processes
+     still reference.
    Since schema 26 (`8ebbc44`), two of those rows cannot be copied as raw
    columns. Export has to read them the way the store itself does:
    - **Artifacts.** `artifacts.data` may be a block-compressed blob, and
@@ -454,44 +487,71 @@ carrying it over.
    cuts, checkpoints, and each turn's `prompt_node`. Two ids cannot simply
    be rewritten:
    - Transcript text already holds turn ids in `TURN/CALL_ID/STREAM`
-     artifact references and in `turn:` and `proc:` handles. History is never
-     rewritten (AGENTS.md), so import has to keep an alias from the origin
-     turn and process ids to the new ones, which `read` and `wait` consult
-     for an imported bot. Otherwise those references fail with an honest
-     `artifact_not_found`. Choose between the two explicitly; don't discover
-     it in testing.
+     artifact references and in `turn:` and `proc:` handles, and history is
+     never rewritten (AGENTS.md). An artifact reference is read by the bot
+     that holds it and authorized against that bot's lineage, so an origin
+     turn id that collides with a target turn fails explicitly rather than
+     returning another bot's output. An alias from origin ids to
+     new ones would keep such references readable.
+   - Handles are different. `proc:N` names no bot, the client `wait`
+     operation takes no bot (at `8ebbc44`: `src/server/mod.rs:157-163`), and
+     a process result is looked up by id alone (`src/store/db.rs:2444`). An
+     origin `proc:` handle that collides with a target process would
+     resolve to that unrelated process, and an alias "for an imported bot"
+     has no bot to select it by. Handles need a store-qualified form before
+     imported transcripts can carry them. Until then, import refuses a bot
+     whose transcript holds handles, and names them.
    - Turn ordinals, which the `history` tool uses, are per lineage and
      survive unchanged.
-4. **Import checks before accepting.** The target must have a provider of
-   that name and family, which is checked today only at admission
-   (`src/server/mod.rs:725-746`), every tool in the bot's selection, and a
-   free name (`bot_exists` otherwise, or import under a new name). A
-   missing piece fails the import with an explicit error. It never fails at
-   the first turn.
-5. **The first slice is a cross-store fork.** Importing a copy under a new
-   identity, with the source untouched, is already well defined: it is a
-   fork whose history happens to live in another store. That delivers
-   "continue this conversation on that machine from this checkpoint" before
-   any move semantics exist.
-6. **Then a real move, with an explicit state at each step.** The source
-   marks the bot `moving` and refuses work, the way `deleting` does
-   (`src/store/db.rs:418`). The target imports, idempotently by origin
-   identity. The source then becomes a tombstone that answers `bot_moved`
-   with the destination store's identity. A later submission is answered
-   with that, never `bot_not_found` or a fresh bot. If the import fails, the
-   source clears `moving`. A crash between steps leaves at most a `moving`
-   source and an imported copy, a visible state that re-running the move
-   resolves. Never two active copies.
+4. **Import checks the local configuration before accepting.** The target
+   must have a provider of that name and family, which is checked today only
+   at admission (`src/server/mod.rs:725-746`), every tool in the bot's
+   selection, and a free name (`bot_exists` otherwise, or import under a new
+   name). A missing piece fails the import with an explicit error. These
+   checks cannot prove the endpoint serves the stored model or accepts the
+   stored reasoning state; only a call can. The first turn after import
+   therefore keeps an explicit failure path: a provider error ends that
+   turn as it would anywhere, and nothing falls back to a fresh bot.
+   Export refuses while any of the bot's processes is still running, the
+   same check deletion makes. A bot with a live background command is
+   drained or cancelled, and its process durably resolved, first.
+5. **The first slice is a cross-store fork of a root bot.** Importing a
+   copy under a new identity, with the source untouched, is a fork whose
+   history happens to live in another store. That delivers "continue this
+   conversation on that machine from this checkpoint" before any move
+   semantics exist. It is well defined only for a bot whose whole lineage
+   is its own turns. A fork's inherited nodes and outputs belong to turns
+   owned by its source bot (`turns.bot`), so copying only the fork's own
+   turns loses inherited outputs, and copying the producer turns means
+   deciding who owns them at the target, which changes turn listings and
+   idempotency. Until that representation is decided, import refuses a bot
+   with fork ancestry and says so.
+6. **Then a real move, bound to one destination.** The move names its
+   destination store identity before export. The source marks the bot
+   `moving` and refuses work, the way `deleting` does
+   (`src/store/db.rs:418`), and records the destination and a move nonce.
+   The bundle carries both. A target imports only a bundle that names its
+   own identity, idempotently by nonce, so a caller that loses an import
+   response and retries against another machine is refused there. The
+   target's receipt, carried back by the caller, turns the source into a
+   tombstone that answers `bot_moved` with the destination's identity. A
+   later submission is answered with that, never `bot_not_found` or a fresh
+   bot. Cancelling a move clears `moving` only while no receipt exists. A
+   crash between steps leaves a `moving` source and at most one imported
+   copy, at the named destination, and re-running the move resolves it.
+   This holds against mistakes, not against a caller who edits a bundle:
+   every caller is already the store's full-access user.
 7. **Draining a running bot.** A `drain` stops the bot at its next round
    boundary: the model call in flight finishes, its tool calls finish and
    commit, and the turn parks instead of starting the next round. Round
    boundaries already exist for steers and compaction. This adds a reason to
    park there, and nothing is cancelled or run twice.
-8. **Parked turns that wait on handles.** A handle into the same store
-   resolves only if the whole subtree moves together, a parent with the
-   children it waits on. Otherwise import refuses with the handles named.
-   Paced turns move freely, since their pacing state is per daemon and is
-   relearned.
+8. **Parked turns that wait on handles.** Once handles are
+   store-qualified, a parked turn's handle into its own store still
+   resolves at the target only if the whole subtree moves together, a
+   parent with the children it waits on. Otherwise import refuses with the
+   handles named. Paced turns move freely, since their pacing state is per
+   daemon and is relearned.
 
 ### Risks
 
@@ -515,9 +575,10 @@ carrying it over.
   `AGENT_PARENT`. This is the same cross-daemon lineage question as section
   3.
 - **Copies of stores.** Two stores with the same identity, one copied from
-  the other, would make "import idempotently by origin" collide. Store
-  identity therefore needs a way to be reissued when a store is copied, or
-  the origin key has to include something a copy does not share.
+  the other, would both accept a bundle bound to that identity, which
+  breaks the one-destination rule. Store identity therefore needs a way to
+  be reissued when a store is copied, or the destination key has to include
+  something a copy does not share.
 - **Size and sensitivity.** Histories of 100k items are measured
   ([DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#long-history)), so export
   runs in bounded pieces like retention does (NEXT item 29). A bundle holds
@@ -527,15 +588,21 @@ carrying it over.
 ### Order
 
 1. Store identity.
-2. Export of an idle bot and import as a new identity: the cross-store fork.
-   Behavior tests: the imported bot's next turn sees the same context as a
-   local fork at the same node, retained artifacts and history reads work
-   after renumbering, and a missing provider or tool fails the import.
-3. The alias-or-refuse decision for ids in transcript text, with a test that
-   reads an artifact reference written before the move.
-4. Move with `moving` and tombstone states, and `bot_moved` answers.
-5. Drain to a round boundary for a running bot.
-6. Moving a parent together with the children it waits on.
+2. Export of an idle root bot with no running processes, and import as a
+   new identity: the cross-store fork. Behavior tests: the imported bot's
+   next turn sees the same context as a local fork at the same node,
+   `result` and artifact reads answer for imported turns, prune and delete
+   work on imported records, and a missing provider or tool, fork ancestry,
+   a handle in the transcript, or a running process each fail the export
+   or import explicitly.
+3. The alias decision for artifact references, with a test that reads one
+   written before the move, and store-qualified handles so that bots that
+   delegate can move.
+4. A representation for fork ancestry, so forks can be imported.
+5. Move bound to one destination, with `moving` and tombstone states and
+   `bot_moved` answers.
+6. Drain to a round boundary for a running bot.
+7. Moving a parent together with the children it waits on.
 
 ## Combined order
 
@@ -560,9 +627,10 @@ the caller's job.
 
 ## Open questions
 
-- Should imported ids in transcript text resolve through an alias, or fail
-  honestly? The alias keeps old tool results readable after a move. Failing
-  keeps the store free of a translation layer.
+- Should artifact references in an imported transcript resolve through an
+  alias, or fail honestly? The alias keeps old tool results readable after a
+  move. Failing keeps the store free of a translation layer. Handles are not
+  part of this choice: they need a store-qualified form either way.
 - Should per-workspace daemons become a default for the app, or stay an
   opt-in for failure isolation? The one-versus-N screen should come first.
 - Does a model-written summary belong to the observer (a tool-less fork it
