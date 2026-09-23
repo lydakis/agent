@@ -3448,7 +3448,8 @@ Forks can compact a shared cut independently and restore an inherited window
 start. Oversized unsummarized spans are rejected by indexed accounting before
 collecting their nodes; the original transcript remains available and the bot
 continues through its bounded window. This bounds the failure path; automatic
-catch-up through multiple historical spans is still open.
+catch-up through multiple historical spans followed in
+[backlog catch-up](#compaction-backlog-catch-up).
 
 Summaries and notes now precede the changing omission notice. Anthropic gets
 cache breakpoints on stable pinned blocks, and synthetic tests verify unchanged
@@ -3681,3 +3682,84 @@ four skips and no failures. Strict Clippy, formatting, and diff checks passed.
 The schema-23 migration fixture removes the new index before simulating the
 old table layout. Ignored artifacts: `.local/compaction_cut_index_perf.py`
 and `.local/compaction-cut-index-perf.json`.
+
+## Compaction backlog catch-up
+
+2026-09-23, base `612ae1d`. Closes the open catch-up note from
+[the correctness follow-up](#compaction-correctness-and-cache-prefix-follow-up).
+A backlog larger than the context budget used to answer
+`compaction_span_limit` at every round boundary while the window moved on
+without a summary. That happened after repeated summary failures, or when
+one round outgrew the budget. Now each boundary summarizes the oldest whole
+turns not yet covered, as many as the summarizer's request fits, merging the
+previous summary. Coverage stays contiguous from turn 1, and ordinary
+compaction takes over once the rest fits. Compaction is due when the turns
+since the last summary reach `--compact-at`, not the window. The two numbers
+only differ when the window has moved past the cut, which is exactly the
+backlog case. A turn larger than the whole budget still answers
+`compaction_span_limit`.
+
+Behavior evidence. Two store tests fail on `612ae1d` (`compaction_span_limit`
+where a plan was expected) and pass here. A 100-turn backlog under a
+1,024-byte budget is summarized in contiguous steps that each fit the budget,
+then compacts normally. Item bounds, a turn larger than the budget, and plans
+identical for walk pieces of 1, 7, 16 and 4,096 nodes are also covered.
+Daemon test: summaries fail for 12 turns of a 4 KiB window, then succeed.
+The backlog is caught up in five steps of three turns each, and the
+following compactions are ordinary. A first version sized each step at half
+the budget. It never converged there, because one step covered one turn
+while each turn added one, so steps now fill the summarizer's budget.
+Catch-up converges while a step covers more than one round adds.
+
+Finding the oldest turns needs a walk back from the head, because nodes only
+point to their parents and forks give a node several children. The
+alternative, an ancestor index, would add a column and a write to every node
+append and a migration of the largest table, to speed a path that runs only
+after failures, so it was declined. The walk reads metadata only, runs on the
+reader connection (nodes are immutable and only the running turn moves its
+head), returns to Rust only the rows inside the budget, and goes in pieces of
+1,024 nodes so other bots' context reads interleave with it.
+
+Walk timing, local Linux amd64 container, release build, one file-backed
+store with 1 KiB prompts and 1 KiB replies, budget 8 MiB and 4,096 items,
+one excluded warmup and six measured walks per row:
+
+| Backlog nodes | Pieces | Whole walk, ms, median (range) | Longest single piece, ms, median |
+| ---: | ---: | ---: | ---: |
+| 400,000 | 1 | 571.5 (546.5–601.4) | 569.1 |
+| 400,000 | 391 of 1,024 | 567.5 (558.1–620.7) | 3.5 |
+
+On a 100,000-node store, pieces of 1,024, 2,048, 4,096 and 8,192 nodes took
+155.8, 157.5, 150.4 and 158.6 ms in total, with longest pieces of 3.6, 7.0,
+10.3 and 17.4 ms. Splitting costs no measurable total time, and the longest
+hold on the shared reader falls from the whole walk to a few milliseconds.
+The walk repeats at every catch-up step, so a backlog of B nodes under a
+budget of I items costs about B/I walks. Each of those steps also makes a
+summarizer call over a full budget, which this screen does not include.
+
+Common path, the matched screen from [compaction](#compaction): 16 bots x 60
+turns, 500-byte prompts, the synthetic Responses model, one excluded warmup
+and four samples per binary with alternating order. Baseline binary
+`640ec11f…` (`612ae1d`), candidate `05850e2d…`. Both did identical work:
+960 turns, with 960 provider calls below threshold and 1,248 (288 summaries)
+compacting. Medians (ranges):
+
+| Workload / binary | Daemon CPU, s | Peak daemon RSS, MiB | Turn p95, ms |
+| --- | ---: | ---: | ---: |
+| Below threshold, 8 MiB / baseline | 2.855 (2.79–2.91) | 20.553 (20.445–20.699) | 59.7 (58.7–60.9) |
+| Below threshold, 8 MiB / candidate | 2.850 (2.71–2.93) | 20.588 (20.402–20.703) | 59.3 (58.3–61.4) |
+| Compacting, 8 KiB at 50%, keep 25% / baseline | 3.380 (3.05–3.49) | 20.881 (20.805–20.930) | 107.1 (103.8–107.7) |
+| Compacting, 8 KiB at 50%, keep 25% / candidate | 3.275 (3.18–3.57) | 20.875 (20.812–20.977) | 105.1 (104.0–107.9) |
+
+Every range overlaps, so this shows no measurable cost on the common path.
+It is not a speedup claim. This screen never builds a backlog, so it doesn't
+exercise the catch-up walk.
+
+Not measured: catch-up with a real summarizer, including its latency and the
+quality of a summary merged over many steps; the paid rerun of the luna cost
+figures with summarizer usage included, which this environment could not run
+because it has no provider keys; and a real 8 MiB window over a long task.
+
+Validation: 115 Rust tests, 191 Python tests (four skipped), strict Clippy and
+formatting. Ignored artifacts: `.local/compaction-catch-up/walk_timing.rs`,
+`walk400-matched.txt`, `screen.py`, `screen.json`, `binaries.txt`.
