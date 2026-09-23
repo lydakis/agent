@@ -287,8 +287,9 @@ pub struct Limits {
     pub context_bytes: usize,
     pub context_items: usize,
     pub note_turns: usize,
-    /// Compaction fires at a round boundary once the window holds this
-    /// percentage of `context_bytes`, keeping `compact_keep` percent verbatim.
+    /// Compaction fires at a round boundary once the turns since the last
+    /// summary hold this percentage of `context_bytes`, keeping
+    /// `compact_keep` percent verbatim.
     pub compact_at: usize,
     pub compact_keep: usize,
 }

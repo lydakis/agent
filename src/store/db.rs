@@ -227,6 +227,67 @@ pub struct CompactionPlan {
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
     pub previous_summary: Option<String>,
+    /// A bounded step through a backlog larger than the budget: the span
+    /// ends where the next step starts, not at the verbatim tail.
+    pub catch_up: bool,
+}
+impl CompactionPlan {
+    /// The summarizer request around the span's items: the previous summary
+    /// to merge, if any, with its separating comma, and the request to
+    /// write, with its leading comma.
+    pub fn frame(family: Family, previous_summary: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut head = Vec::new();
+        if let Some(previous) = previous_summary {
+            head = family.user_item(&format!(
+                "[previous summary, to merge with the turns below]\n{previous}"
+            ))?;
+            head.push(b',');
+        }
+        let mut tail = family.user_item(
+            "[compaction request] Write the summary of the conversation above now, following your instructions.",
+        )?;
+        tail.insert(0, b',');
+        Ok((head, tail))
+    }
+}
+/// Where compaction planning stands: a plan, or a backlog larger than the
+/// budget to walk first.
+#[derive(Debug)]
+pub enum Planning {
+    Plan(CompactionPlan),
+    CatchUp(CatchUp),
+}
+/// Oldest node, depth, own total, ordinal, child on the lineage and its
+/// ordinal, and the bounded prompt text inside the budget.
+type CatchUpRow = (
+    i64,
+    i64,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+/// A catch-up walk from the head back to the previous cut. Only the rows
+/// that start inside the budget are kept, so its memory is bounded by the
+/// budget however long the backlog is.
+#[derive(Debug)]
+pub struct CatchUp {
+    head: i64,
+    previous_cut: i64,
+    /// The head's bytes, and the bytes and depth before the previous cut.
+    totals: (i64, i64, i64),
+    /// Verbatim tail bytes, and the byte and item budget.
+    bounds: (i64, i64, i64),
+    /// Where the next piece starts, and the child it continues from.
+    next: Option<(i64, Option<i64>, Option<i64>)>,
+    /// Rows inside the budget, in no particular order.
+    rows: Vec<CatchUpRow>,
+}
+impl CatchUp {
+    pub fn done(&self) -> bool {
+        self.next.is_none()
+    }
 }
 /// Where and with which model a turn runs.
 pub struct TurnContext {
@@ -887,15 +948,18 @@ impl Database {
             None => None,
         })
     }
-    /// Bytes the next request's window would carry: from the saved start to
-    /// the head, without building the window. One row read.
-    pub fn window_bytes(&self, name: &str) -> Result<i64> {
+    /// Bytes not yet covered by a summary: from the current compaction's cut,
+    /// or the root, to the head. Equals the window's bytes until the window
+    /// moves past the cut, which only an oversized backlog makes it do.
+    /// One row read.
+    pub fn unsummarized_bytes(&self, name: &str) -> Result<i64> {
         Ok(self
             .conn
             .prepare_cached(
                 "SELECT COALESCE(h.total_bytes,0)-COALESCE(p.total_bytes,0)
                  FROM bots b LEFT JOIN nodes h ON h.id=b.head
-                 LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+                 LEFT JOIN compactions c ON c.node=b.compaction
+                 LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
                  WHERE b.name=?",
             )?
             .query_row([name], |r| r.get(0))?)
@@ -904,14 +968,16 @@ impl Database {
     /// span since the previous compaction, keep the newest whole turns that
     /// hold at least `keep_bytes` verbatim, and summarize everything older,
     /// back to the previous cut. Returns nothing when no whole older turn
-    /// exists to summarize.
+    /// exists to summarize. A span larger than the budget is caught up
+    /// oldest first instead: this returns the walk to take in pieces with
+    /// `catch_up_piece`, and `catch_up_plan` chooses from it.
     pub fn compaction_plan(
         &self,
         name: &str,
         keep_bytes: i64,
         max_bytes: i64,
         max_items: i64,
-    ) -> Result<Option<CompactionPlan>> {
+    ) -> Result<Option<Planning>> {
         let bot = self.inspect(name)?;
         let Some(head) = bot.head else {
             return Ok(None);
@@ -920,25 +986,30 @@ impl Database {
         if bot.compaction == Some(head) {
             return Ok(None);
         }
-        // Constant-count indexed reads reject a backlog before the recursive
-        // walk allocates rows or occupies the shared storage worker.
-        let (previous_cut, bytes, count): (i64, i64, i64) = self
+        // Constant-count indexed reads size the span before any walk:
+        // previous cut, head's totals, and the totals before the cut.
+        type Span = (i64, i64, i64, i64, i64);
+        let (previous_cut, head_total, head_depth, before, depth_before): Span = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(c.cut,-1),h.total_bytes-COALESCE(p.total_bytes,0),
-                    h.depth-COALESCE(p.depth,0)
-             FROM nodes h LEFT JOIN compactions c ON c.node=?2
-             LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
-             WHERE h.id=?1",
+                "SELECT COALESCE(c.cut,-1),h.total_bytes,h.depth,
+                        COALESCE(p.total_bytes,0),COALESCE(p.depth,0)
+                 FROM nodes h LEFT JOIN compactions c ON c.node=?2
+                 LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
+                 WHERE h.id=?1",
             )?
             .query_row(params![head, bot.compaction], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
-        if bytes > max_bytes || count > max_items {
-            return fail_with(
-                "compaction_span_limit",
-                "unsummarized span exceeds the configured context budget; original history remains available",
-            );
+        if head_total - before > max_bytes || head_depth - depth_before > max_items {
+            return Ok(Some(Planning::CatchUp(CatchUp {
+                head,
+                previous_cut,
+                totals: (head_total, before, depth_before),
+                bounds: (keep_bytes, max_bytes, max_items),
+                next: Some((head, None, None)),
+                rows: Vec::new(),
+            })));
         }
         // A source bot's turn records may be deleted while its nodes survive
         // in a fork. Decode only prompt nodes, outside the metadata-only walk,
@@ -962,7 +1033,6 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
-        let head_total = rows.first().map(|r| r.1).unwrap_or(0);
         // The newest prompt whose tail holds keep_bytes.
         let mut cut = None;
         for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
@@ -979,36 +1049,171 @@ impl Database {
         if !older.iter().any(|r| r.3.is_some()) {
             return Ok(None);
         }
-        let mut ids = Vec::with_capacity(older.len());
-        let mut sizes = Vec::with_capacity(older.len());
-        let mut prompts = Vec::new();
-        let (mut from, mut to) = (i64::MAX, 0);
-        for (id, total, before, seq, prompt) in older.iter().rev() {
-            ids.push(*id);
-            sizes.push((total - before).clamp(0, u32::MAX as i64) as u32);
-            if let (Some(seq), Some(prompt)) = (seq, prompt) {
-                from = from.min(*seq);
-                to = to.max(*seq);
-                prompts.push((*seq, bounded_prompt(prompt, Self::COMPACTION_PROMPT_BYTES)));
+        let span = older
+            .iter()
+            .rev()
+            .map(|(id, total, before, seq, prompt)| (*id, total - before, *seq, prompt.as_deref()));
+        let previous_summary = self.previous_summary(&bot)?;
+        Ok(Some(Planning::Plan(Self::span_plan(
+            cut,
+            span,
+            previous_summary,
+            false,
+        ))))
+    }
+    /// One piece of a catch-up walk: at most `limit` nodes further back
+    /// along the head's lineage toward the previous cut, reading node
+    /// metadata only and decoding prompts only inside the budget. Separate
+    /// pieces let other reads run between them.
+    pub fn catch_up_piece(&self, walk: &mut CatchUp, limit: i64) -> Result<()> {
+        let Some((from, child, child_seq)) = walk.next else {
+            return Ok(());
+        };
+        let (_, before, depth_before) = walk.totals;
+        let (_, max_bytes, max_items) = walk.bounds;
+        // Each row carries its child on the lineage, so cutting at a prompt
+        // child needs no parent lookup: the span ends at this row. Only rows
+        // inside the budget and the piece's oldest row leave SQLite.
+        let mut statement = self.conn.prepare_cached(
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k) AS (
+                SELECT id,parent,depth,total_bytes,turn_seq,?3,?4,1 FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.turn_seq,c.id,c.turn_seq,c.k+1
+                FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
+             SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
+                CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes<=?7 AND c.depth<=?8 THEN
+                    (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
+                     FROM nodes WHERE id=c.id) END
+             FROM chain c WHERE (c.total_bytes<=?7 AND c.depth<=?8)
+                OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL",
+        )?;
+        let (max_total, max_depth) = (
+            before.saturating_add(max_bytes),
+            depth_before.saturating_add(max_items),
+        );
+        let mut rows = statement.query(params![
+            from,
+            walk.previous_cut,
+            child,
+            child_seq,
+            limit.max(1),
+            Self::COMPACTION_PROMPT_BYTES as i64 + 1,
+            max_total,
+            max_depth
+        ])?;
+        let mut last: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
+        while let Some(r) = rows.next()? {
+            let (id, parent, depth, total, seq): (i64, Option<i64>, i64, i64, Option<i64>) =
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+            if total <= max_total && depth <= max_depth {
+                walk.rows
+                    .push((id, depth, total, seq, r.get(5)?, r.get(6)?, r.get(7)?));
+            }
+            if last.is_none_or(|(_, oldest, _, _)| depth < oldest) {
+                last = Some((id, depth, parent, seq));
             }
         }
-        bound_prompts(&mut prompts);
-        let previous_summary: Option<String> = match bot.compaction {
+        walk.next = match last {
+            Some((id, _, Some(parent), seq)) if id != walk.previous_cut => {
+                Some((parent, Some(id), seq))
+            }
+            _ => None,
+        };
+        Ok(())
+    }
+    /// Choose a finished catch-up walk's step: the longest run of whole
+    /// turns from the previous cut whose summarizer request, previous
+    /// summary included, fits the budget, cut at the next prompt.
+    pub fn catch_up_plan(&self, name: &str, walk: CatchUp) -> Result<Option<CompactionPlan>> {
+        let bot = self.inspect(name)?;
+        if walk.next.is_some() || bot.head != Some(walk.head) {
+            return fail("compaction_walk_incomplete");
+        }
+        let CatchUp {
+            totals: (head_total, before, depth_before),
+            bounds: (keep_bytes, max_bytes, max_items),
+            mut rows,
+            ..
+        } = walk;
+        // Oldest first.
+        rows.sort_unstable_by_key(|row| row.1);
+        // The request carries the previous summary and the request to write
+        // besides the span, and a comma between the span's items.
+        let previous_summary = self.previous_summary(&bot)?;
+        let (head_frame, tail_frame) =
+            CompactionPlan::frame(bot.family()?, previous_summary.as_deref())?;
+        let span_bytes = max_bytes - (head_frame.len() + tail_frame.len()) as i64 + 1;
+        let span_items = max_items - 1 - previous_summary.is_some() as i64;
+        // The span ending at row i is cut at its child, which must start a
+        // turn, leave keep_bytes verbatim, and follow at least one prompt.
+        let mut prompted = false;
+        let mut end = None;
+        for (index, (_, depth, total, seq, _, child_seq, _)) in rows.iter().enumerate() {
+            prompted |= seq.is_some();
+            let items = depth - depth_before;
+            if items > span_items || total - before + items > span_bytes {
+                break;
+            }
+            if prompted && child_seq.is_some() && head_total - total >= keep_bytes {
+                end = Some(index);
+            }
+        }
+        let Some(end) = end else {
+            return fail_with(
+                "compaction_span_limit",
+                "the oldest unsummarized turn exceeds the context budget; original history remains available",
+            );
+        };
+        // The cut is the prompt that follows the span on the head's lineage.
+        let cut = rows[end].4.ok_or(Error::new("storage_error"))?;
+        let mut previous = before;
+        let span = rows[..=end]
+            .iter()
+            .map(|(id, _, total, seq, _, _, prompt)| {
+                let size = total - previous;
+                previous = *total;
+                (*id, size, *seq, prompt.as_deref())
+            });
+        Ok(Some(Self::span_plan(cut, span, previous_summary, true)))
+    }
+    fn previous_summary(&self, bot: &Bot) -> Result<Option<String>> {
+        Ok(match bot.compaction {
             Some(node) => self
                 .conn
                 .prepare_cached("SELECT summary FROM compactions WHERE node=?")?
                 .query_row([node], |r| r.get(0))
                 .optional()?,
             None => None,
-        };
-        Ok(Some(CompactionPlan {
+        })
+    }
+    /// A plan from the span's nodes, oldest first: id, own size, ordinal,
+    /// and the prompt's bounded text for prompt nodes.
+    fn span_plan<'a>(
+        cut: i64,
+        span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>)>,
+        previous_summary: Option<String>,
+        catch_up: bool,
+    ) -> CompactionPlan {
+        let (mut ids, mut sizes, mut prompts) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut from, mut to) = (i64::MAX, 0);
+        for (id, size, seq, prompt) in span {
+            ids.push(id);
+            sizes.push(size.clamp(0, u32::MAX as i64) as u32);
+            if let (Some(seq), Some(prompt)) = (seq, prompt) {
+                from = from.min(seq);
+                to = to.max(seq);
+                prompts.push((seq, bounded_prompt(prompt, Self::COMPACTION_PROMPT_BYTES)));
+            }
+        }
+        bound_prompts(&mut prompts);
+        CompactionPlan {
             cut,
             ids,
             sizes,
             prompts,
             covered: (from, to),
             previous_summary,
-        }))
+            catch_up,
+        }
     }
     /// Record a compaction at the current head. The separate cut marks the
     /// context start; branches may independently summarize the same cut.
@@ -1054,7 +1259,8 @@ impl Database {
         let data = json!({"version":bot.head,"cut":plan.cut,"previous":bot.compaction,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
-            "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>()});
+            "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
+            "catch_up":plan.catch_up});
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
             if let Some(usage) = usage {

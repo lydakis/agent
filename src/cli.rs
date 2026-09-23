@@ -189,7 +189,7 @@ fn print_flags(flags: &str) {
             "--note-turns" => ("N", "Omitted turns the context note lists; 0 lists none"),
             "--compact-at" => (
                 "PERCENT",
-                "Compact when the window holds this share of the context budget",
+                "Compact when the turns since the last summary hold this share of the context budget",
             ),
             "--compact-keep" => (
                 "PERCENT",

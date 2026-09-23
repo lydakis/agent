@@ -492,8 +492,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       the listing already changed behavior, and a per-request status line
       would cost prompt-cache prefix stability.
     - Slice four, done: [compaction](DAEMON_MEASUREMENTS.md#compaction).
-      Harness-triggered at `--compact-at` percent of the context budget, at a
-      round boundary: one summarizer call under the client's compaction
+      Harness-triggered once the turns since the last summary hold
+      `--compact-at` percent of the context budget, at a round boundary: one summarizer call under the client's compaction
       instructions, the bot's own model or a client-named one of the same
       family, over everything older than a verbatim tail, the covered turns'
       user prompts kept verbatim within bounds, versioned at the head with a
@@ -501,10 +501,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       instructions, no compaction; the CLI ships a default text. On the
       evaluation the rule never left the request and 41 of 41 summaries
       restated it. The original cost and cache figures excluded summarizer
-      usage; rerun with corrected accounting before claiming total cost.
+      usage; rerun with corrected accounting before claiming total cost
+      (needs provider keys; still open).
       Stable summaries now precede changing omission notices and forks restore
-      their inherited context start. Oversized unsummarized backlogs are rejected
-      before a history walk; automatic catch-up in bounded spans remains open. Jev was not used: its probes showed it answers the
+      their inherited context start. A backlog larger than the budget is
+      [caught up oldest first](DAEMON_MEASUREMENTS.md#compaction-backlog-catch-up),
+      one summary per round boundary, each filling the summarizer's budget;
+      the walk that finds the oldest turns runs on the reader in 1,024-node
+      pieces, and an ancestor index was declined because every append would
+      pay for it. Jev was not used: its probes showed it answers the
       judgments, but not that it beats the static rule of keeping user
       prompts verbatim, and the daemon knows structurally when a boundary
       is stable. If Jev has a place it is in permission automation, which

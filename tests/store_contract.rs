@@ -2,7 +2,7 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, Database, Delivery, Fork, TurnOptions},
+    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, TurnOptions},
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -36,6 +36,25 @@ fn binding() -> Binding<'static> {
         created_by_id: None,
         compaction_instructions: None,
         compaction_model: None,
+    }
+}
+/// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
+fn compaction_plan(
+    db: &Database,
+    name: &str,
+    keep: i64,
+    max_bytes: i64,
+    max_items: i64,
+) -> Result<Option<CompactionPlan>> {
+    match db.compaction_plan(name, keep, max_bytes, max_items)? {
+        None => Ok(None),
+        Some(Planning::Plan(plan)) => Ok(Some(plan)),
+        Some(Planning::CatchUp(mut walk)) => {
+            while !walk.done() {
+                db.catch_up_piece(&mut walk, 16)?;
+            }
+            db.catch_up_plan(name, walk)
+        }
     }
 }
 /// Every stored item of a bot, through the same window the runtime streams.
@@ -4259,7 +4278,7 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                     .turn;
                 db.finish(turn, None).unwrap();
             }
-            let plan = db.compaction_plan("Bob", 1, 4096, 256).unwrap().unwrap();
+            let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
             assert_eq!(plan.covered, (1, 3));
             expected = prompts[..3]
                 .iter()
@@ -4283,7 +4302,9 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
         }
         {
             let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-            let plan = db.compaction_plan("Alice", 1, 4096, 256).unwrap().unwrap();
+            let plan = compaction_plan(&db, "Alice", 1, 4096, 256)
+                .unwrap()
+                .unwrap();
             assert_eq!(plan.covered, (1, 3));
             assert_eq!(plan.prompts, expected);
             assert_eq!(
@@ -4339,8 +4360,7 @@ fn compaction_prompt_metadata_stays_bounded_across_planning_and_merging() {
         if (n + 1) % 600 != 0 {
             continue;
         }
-        let plan = db
-            .compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+        let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
             .unwrap()
             .unwrap();
         let cost = |prompts: &[(i64, String)]| {
@@ -4394,12 +4414,11 @@ fn compaction_summarizes_older_turns_keeps_prompts_and_versions_bind_forks() {
     for n in 4..=6 {
         converse(&mut db, "Bob", n);
     }
-    let before = db.window_bytes("Bob").unwrap();
+    let before = db.unsummarized_bytes("Bob").unwrap();
     assert!(before > 0);
     // Keep at least one byte verbatim: the cut lands at the newest turn's
     // prompt, and everything older is the span.
-    let plan = db
-        .compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+    let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
         .unwrap()
         .unwrap();
     assert_eq!(plan.covered, (1, 5));
@@ -4428,10 +4447,10 @@ fn compaction_summarizes_older_turns_keeps_prompts_and_versions_bind_forks() {
         (checkpoint_before, "summary one", (1, 5))
     );
     assert_eq!(view.prompts.len(), 5);
-    assert!(db.window_bytes("Bob").unwrap() < before);
+    assert!(db.unsummarized_bytes("Bob").unwrap() < before);
     // Nothing older than the cut is left: no second compaction yet.
     assert!(
-        db.compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+        compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
             .unwrap()
             .is_none()
     );
@@ -4440,8 +4459,7 @@ fn compaction_summarizes_older_turns_keeps_prompts_and_versions_bind_forks() {
         converse(&mut db, "Bob", n);
     }
     let second_version = db.inspect("Bob").unwrap().head.unwrap();
-    let second = db
-        .compaction_plan("Bob", 1, i64::MAX, i64::MAX)
+    let second = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
         .unwrap()
         .unwrap();
     assert_eq!(second.covered, (6, 8));
@@ -4548,9 +4566,10 @@ fn independent_branches_can_compact_the_same_cut_without_rewriting_each_other() 
     .unwrap();
     converse(&mut db, "Bob", 6);
     converse(&mut db, "Alice", 7);
-    let p = db.compaction_plan("Bob", 250, 4096, 256).unwrap().unwrap();
-    let q = db
-        .compaction_plan("Alice", 250, 4096, 256)
+    let p = compaction_plan(&db, "Bob", 250, 4096, 256)
+        .unwrap()
+        .unwrap();
+    let q = compaction_plan(&db, "Alice", 250, 4096, 256)
         .unwrap()
         .unwrap();
     assert_eq!(p.cut, q.cut);
@@ -4601,21 +4620,123 @@ fn independent_branches_can_compact_the_same_cut_without_rewriting_each_other() 
 }
 
 #[test]
-fn compaction_planning_rejects_oversized_spans_before_collecting_history() {
+fn oversized_backlogs_are_summarized_oldest_first_in_bounded_spans() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
     for n in 1..=100 {
         converse(&mut db, "Bob", n);
     }
+    let total = db.unsummarized_bytes("Bob").unwrap();
+    let (max_bytes, max_items) = (1024, 4096);
+    assert!(total > max_bytes);
+    // Each step covers the oldest whole turns not yet summarized whose
+    // summarizer request fits the budget, and one round later the next step
+    // takes over from its cut.
+    let (mut covered_to, mut steps) = (0, 0);
+    loop {
+        let plan = compaction_plan(&db, "Bob", 1, max_bytes, max_items)
+            .unwrap()
+            .unwrap();
+        let bytes: i64 = plan.sizes.iter().map(|s| *s as i64).sum();
+        if db.unsummarized_bytes("Bob").unwrap() <= max_bytes {
+            // Caught up: the ordinary plan keeps its verbatim tail.
+            let event = db.compact("Bob", &plan, "summary", None).unwrap();
+            assert_eq!(event["data"]["catch_up"], false);
+            assert_eq!(plan.covered.0, covered_to + 1);
+            break;
+        }
+        let request = bytes + plan.ids.len() as i64 + 256;
+        assert!(
+            request <= max_bytes,
+            "step {steps} summarized {bytes} bytes"
+        );
+        assert!(
+            bytes > max_bytes / 2,
+            "step {steps} summarized only {bytes} bytes"
+        );
+        assert_eq!(plan.covered.0, covered_to + 1);
+        assert_eq!(
+            plan.prompts.first().unwrap().1,
+            format!("p{}", covered_to + 1)
+        );
+        let event = db
+            .compact("Bob", &plan, &format!("summary {steps}"), None)
+            .unwrap();
+        assert_eq!(event["data"]["catch_up"], true);
+        assert_eq!(event["data"]["covered_turns"], json!([1, plan.covered.1]));
+        covered_to = plan.covered.1;
+        steps += 1;
+        assert!(steps < 64, "catch-up does not converge");
+        // Later summaries merge the earlier ones.
+        converse(&mut db, "Bob", 100 + steps);
+        assert_eq!(
+            compaction_plan(&db, "Bob", 1, max_bytes, max_items)
+                .unwrap()
+                .unwrap()
+                .previous_summary,
+            Some(format!("summary {}", steps - 1))
+        );
+    }
+    assert!(steps > 1);
+    // The view covers every turn since the first; the transcript is intact.
+    let view = db
+        .window("Bob", max_bytes, max_items)
+        .unwrap()
+        .unwrap()
+        .compaction
+        .unwrap();
+    assert_eq!(view.covered.0, 1);
     assert_eq!(
-        db.compaction_plan("Bob", 1, 1024, 4096).unwrap_err().code,
+        db.window("Bob", i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap()
+            .ids
+            .len() as i64
+            + 2 * (view.covered.1),
+        2 * (100 + steps as i64)
+    );
+    assert_eq!(db.history_read("Bob", 1, 0, 65536).unwrap()["items"], 2);
+}
+
+#[test]
+fn catch_up_is_bounded_by_items_and_rejects_a_turn_larger_than_the_budget() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=100 {
+        converse(&mut db, "Bob", n);
+    }
+    // Items: two per turn, and the request to write takes one of 16.
+    let plan = compaction_plan(&db, "Bob", 1, i64::MAX, 16)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.covered, (1, 7));
+    assert_eq!(plan.ids.len(), 14);
+    // The walk's pieces do not change the plan, whatever their size.
+    for piece in [1, 7, 4096] {
+        let Some(Planning::CatchUp(mut walk)) = db.compaction_plan("Bob", 1, i64::MAX, 16).unwrap()
+        else {
+            panic!("expected a catch-up walk");
+        };
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, piece).unwrap();
+        }
+        let split = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        assert_eq!(
+            (split.cut, &split.ids, &split.sizes, &split.prompts),
+            (plan.cut, &plan.ids, &plan.sizes, &plan.prompts)
+        );
+    }
+    // No whole turn fits: nothing is planned, nothing moves.
+    assert_eq!(
+        compaction_plan(&db, "Bob", 1, 16, 4096).unwrap_err().code,
         "compaction_span_limit"
     );
     assert_eq!(
-        db.compaction_plan("Bob", 1, i64::MAX, 16).unwrap_err().code,
+        compaction_plan(&db, "Bob", 1, i64::MAX, 1)
+            .unwrap_err()
+            .code,
         "compaction_span_limit"
     );
-    // Rejection does not move the window or erase history.
     assert!(db.inspect("Bob").unwrap().compaction.is_none());
     assert_eq!(
         db.window("Bob", i64::MAX, i64::MAX)
@@ -4641,7 +4762,7 @@ fn compaction_cut_migrates_without_replacing_the_recorded_summary() {
         for n in 1..=3 {
             converse(&mut db, "Bob", n);
         }
-        let plan = db.compaction_plan("Bob", 1, 4096, 256).unwrap().unwrap();
+        let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
         cut = plan.cut;
         version = db.inspect("Bob").unwrap().head.unwrap();
         db.compact("Bob", &plan, "retained summary", None).unwrap();
@@ -4661,7 +4782,7 @@ fn compaction_cut_migrates_without_replacing_the_recorded_summary() {
         assert_eq!(w.ids[0], cut);
         assert_eq!(w.compaction.unwrap().summary, "retained summary");
         converse(&mut db, "Bob", 4);
-        let plan = db.compaction_plan("Bob", 1, 4096, 256).unwrap().unwrap();
+        let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
         db.compact("Bob", &plan, "new summary", None).unwrap();
         assert!(db.inspect("Bob").unwrap().compaction.unwrap() > version);
         db.delete_bot("Bob").unwrap();

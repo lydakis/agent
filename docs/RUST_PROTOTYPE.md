@@ -1169,7 +1169,7 @@ usable; history tells the model to inspect current state before retrying.
 
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
-model call, when the window holds `--compact-at` percent of the context
+model call, when the turns since the last summary hold `--compact-at` percent of the context
 budget, the daemon summarizes everything older than the newest whole turns
 that hold `--compact-keep` percent verbatim. The summary is one model call
 under the bot's compaction instructions, with tool calls disabled, to the bot's own
@@ -1228,14 +1228,26 @@ window can still invalidate the later suffix. A summarizer failure leaves the
 context view unchanged, preserves any billable usage, is reported as a live
 `compaction_failed` notification, and the turn continues with the window
 as it is; the window's own overflow handling still bounds stored items.
-Before planning, indexed byte/item accounting rejects an unsummarized backlog
-larger than the configured context budget with `compaction_span_limit`, without
-walking or loading the transcript. The complete summarizer input is byte-bounded
-including its previous summary and request marker. Oversized summaries are
-rejected above a quarter of the byte budget or 64 KiB, whichever is smaller.
-These failures leave the bot usable and original history retrievable. Automatic
-catch-up through multiple bounded historical spans is not implemented; a backlog
-that exceeds the budget needs a larger configured budget to compact in one call. The
+Planning runs on the reader connection: nodes are immutable and only the
+running turn moves its bot's head, so the reader's snapshot plans what the
+worker would. Indexed byte/item accounting sizes the unsummarized span first,
+without walking the transcript. A span larger than the context budget, left
+by failed summaries or a round that outgrew the budget, is caught up oldest
+first. Each round boundary summarizes the longest run of whole turns from
+the previous cut whose summarizer request fits the budget, including the
+previous summary and the request marker. The cut moves to the next prompt,
+and the window keeps omitting what is still behind it until the steps
+reach the tail. The `compacted` event says `catch_up`. Finding the oldest
+turns means walking the lineage back from the head, since nodes only point
+to their parents and forks give a node several children. That walk reads
+metadata in pieces of 1,024 nodes, so other bots' reads interleave with it,
+and only rows inside the budget leave SQLite. A turn larger than the whole
+budget cannot be summarized and answers `compaction_span_limit`. Catch-up
+converges while a step covers more than one round adds. The complete
+summarizer input is byte-bounded including its previous summary and request
+marker. Oversized summaries are rejected above a quarter of the byte budget
+or 64 KiB, whichever is smaller. These failures leave the bot usable and
+original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and
 `--compaction-model` to change it. The daemon holds no such text.
