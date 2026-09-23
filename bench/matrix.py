@@ -8,11 +8,23 @@ import sys
 
 from .report import compare
 
+# Sampled-RSS guard per target tree, in MiB. opencode's one Bun server exceeds
+# 512 MiB with a single agent (about 0.8 GiB at c1 and 1.0 GiB at c32-h65536,
+# observed 2026-09-23). compare() requires identical limits, so every engine in
+# a matrix runs under the largest guard among the selected engines.
+RSS_GUARD_MIB = {'opencode': 2048}
+DEFAULT_RSS_GUARD_MIB = 512
+PROCESS_GUARD = 16
+
+
+def rss_guard(engines):
+    return max(RSS_GUARD_MIB.get(engine, DEFAULT_RSS_GUARD_MIB) for engine in engines)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--engines", nargs='+', choices=('pi', 'codex', 'rust', 'fx'),
+    parser.add_argument("--engines", nargs='+', choices=('pi', 'codex', 'rust', 'fx', 'opencode'),
                         default=['pi', 'codex', 'rust'])
     args = parser.parse_args()
     print('Exploratory cross-engine screen: unequal feature footprints; no efficiency ranking.', flush=True)
@@ -23,6 +35,9 @@ def main():
     if Path.cwd() != root or not output.is_relative_to(root / '.local'):
         parser.error('run from the repository root with a new output under .local')
     output.mkdir(parents=True, exist_ok=False)
+    guard = rss_guard(args.engines)
+    if guard != DEFAULT_RSS_GUARD_MIB:
+        print(f'RSS guard raised to {guard} MiB per tree for every engine in this matrix.', flush=True)
     results = []
     # Freeze the screening conditions before interpreting results. These are
     # exploration bounds, not a claim that 32 agents meets product capacity.
@@ -40,7 +55,7 @@ def main():
                        '--out', str(output / f'{name}-{engine}'),
                        '--workload', str(workload_path), '--repeat', '3', '--warmup', '1',
                        '--timeout', '30', '--interval', '.1', '--discovery-interval', '.5',
-                       '--rss-limit-mib', '512', '--process-limit', '16']
+                       '--rss-limit-mib', str(guard), '--process-limit', str(PROCESS_GUARD)]
             code = subprocess.call(command)
             if code:
                 print('Matrix stopped on a failed case; partial captures retained.', file=sys.stderr)

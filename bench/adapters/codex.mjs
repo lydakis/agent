@@ -36,7 +36,7 @@ let child;
 try {
   const args = ['app-server'];
   for (const [key, value] of Object.entries(settings)) args.push('-c', `${key}=${toml(value)}`);
-  child = spawn(process.env.AGENT_BENCH_CODEX, args, {
+  child = spawn(process.env.AGENT_BENCH_EXECUTABLE, args, {
     cwd: process.env.AGENT_BENCH_WORKSPACE, stdio: ['pipe', 'pipe', 'ignore'],
   });
   let nextId = 0;

@@ -7,6 +7,7 @@ import platform
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from .profiles import profile
 
 
@@ -86,7 +87,41 @@ def engine_target(engine, root, binary=None):
         metadata["codex_sha256"] = file_hash(executable)
         metadata["codex_version"] = subprocess.check_output([str(executable), "--version"],
             env=clean_env(), text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+    elif engine == "opencode":
+        executable = opencode_executable(root)
+        metadata.update(opencode_sha256=file_hash(executable), opencode_package=executable.parent.parent.name,
+                        opencode_release_source_revision=OPENCODE_SOURCE_REVISION,
+                        durability="sqlite_wal_synchronous_normal")
+        # Private empty HOME: the version probe must not read personal configuration.
+        with tempfile.TemporaryDirectory(dir=root / ".local") as home:
+            metadata["opencode_version"] = subprocess.check_output(
+                [str(executable), "--version"], env={**clean_env(), "HOME": home},
+                cwd=home, text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        if metadata["opencode_version"] != OPENCODE_VERSION:
+            raise ValueError("opencode native version differs from benchmark pin")
     return command, metadata, str(executable) if executable else None
+
+
+# Tag v1.18.32 at github.com/anomalyco/opencode (formerly sst/opencode).
+OPENCODE_VERSION = "1.18.32"
+OPENCODE_SOURCE_REVISION = "545f51d26cc39a907d2867492d498d9607ea5fa4"
+
+
+def opencode_executable(root):
+    """The pinned npm release's native binary, not its launcher."""
+    modules = root / ".local/opencode/node_modules"
+    launcher = modules / "opencode-ai/package.json"
+    if not launcher.exists() or json.loads(launcher.read_text())["version"] != OPENCODE_VERSION:
+        raise ValueError(f"install opencode-ai@{OPENCODE_VERSION} under .local/opencode first")
+    arch = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "AMD64": "x64"}.get(platform.machine())
+    system = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
+    # The default (glibc, AVX2) build only; baseline and musl variants fail explicitly.
+    package = modules / f"opencode-{system}-{arch}"
+    executable = package / "bin/opencode"
+    if (not (package / "package.json").exists() or not executable.exists()
+            or json.loads((package / "package.json").read_text())["version"] != OPENCODE_VERSION):
+        raise ValueError("pinned opencode native executable unavailable on this platform")
+    return executable
 
 
 def validate_responses_workload(config):

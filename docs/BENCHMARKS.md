@@ -90,7 +90,8 @@ It is a fixed screening experiment: 1, 8, and 32 agents; 4 KiB and
 turn, spaced 25 ms apart. Histories grow across turns. It runs engines sequentially,
 alternates their order across cases, and takes three measured fresh-process runs
 after one excluded run for each engine/case. Each run has a 30-second timeout,
-512 MiB sampled RSS guard per tree, and 16-process guard. Counters are sampled
+512 MiB sampled RSS guard per tree (2048 MiB for every engine when opencode is
+selected; see below), and 16-process guard. Counters are sampled
 every 100 ms and trees discovered every 500 ms. A failed run stops the matrix. Cross-engine output is exploratory and omits
 percentage rankings because the loaded capabilities and execution boundaries differ.
 
@@ -187,6 +188,121 @@ The release-source reference identifies the upstream tag, not a reproducible
 build attestation for the downloaded npm artifact.
 
 See [FX measurements](FX_MEASUREMENTS.md) for observations and contribution ideas.
+
+## opencode adapter
+
+Added 2026-09-23. The pinned release is npm `opencode-ai` **1.18.32**, whose
+upstream tag `v1.18.32` is commit `545f51d26cc39a907d2867492d498d9607ea5fa4`
+in github.com/anomalyco/opencode (formerly sst/opencode). The native
+`opencode-linux-x64` executable from that release had SHA-256
+`513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080` when installed
+on 2026-09-23. It is installed privately under the ignored `.local`, not in the
+adapter lockfile:
+
+```sh
+npm install --prefix .local/opencode --ignore-scripts opencode-ai@1.18.32
+AGENT_BENCH_TEST_OPENCODE=1 .local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --engine opencode --out .local/bench/opencode
+.local/venv/bin/python -m bench.matrix --engines rust pi codex opencode --out .local/bench/opencode-matrix
+```
+
+The runner measures the platform package's native binary
+(`opencode-<os>-<arch>/bin/opencode`), not the npm launcher. It checks the
+package versions and `--version` output against the pin and records the binary
+hash. Only the default glibc/AVX2 build is accepted; baseline and musl variants
+fail explicitly. The upstream tag identifies the source, not a reproducible build
+of the npm artifact.
+
+**Arrangement.** `bench/adapters/opencode.mjs` starts one `opencode serve --pure`
+on loopback with a random per-run basic-auth password. It creates one session
+per agent over the documented HTTP API and subscribes once to the server's
+`/event` SSE stream. Each turn is one `POST /session/:id/message` naming a
+benchmark agent. Text deltas come from `message.part.delta` events on that
+stream and are checked against the returned message. The turn must finish
+with `stop`, no error, no tool part, and exactly the scripted text. Any
+session error or retry status fails the run. The adapter uses Node's built-in
+`fetch`; there is no SDK dependency. **Node and the opencode server are both
+charged to the target**, as are opencode's short-lived `git` helpers. Validated
+runs peaked at two to four target processes. No `opencode run` process per agent
+is used.
+
+**Provider and wire format.** A custom provider uses opencode's bundled
+`@ai-sdk/openai` package with `baseURL` pointed at the fixture, so requests go to
+the unchanged Responses fixture at `/v1/responses`. There is no Chat Completions
+path. opencode sends `store: false`, a `prompt_cache_key` equal to the session
+ID, `max_output_tokens`, and the full prior conversation. The fixture validates
+that conversation on every request, as for the other engines.
+
+**Private state and what is disabled.** The adapter keeps the runner's private
+HOME and adds private XDG config, data, cache, and state folders. It writes its
+config file inside the capture, passed via `OPENCODE_CONFIG`. Project config and
+`.claude` prompt/skill discovery are disabled. The following are also off:
+
+- autoupdate, sharing, snapshots, LSP, and formatters;
+- MCP servers (none are configured) and plugins (`--pure`, default plugins off);
+- external skills, the embedded web UI, and the file watcher;
+- the models.dev catalog fetch;
+- auto-compaction and pruning (in config and by flag).
+
+opencode exports OpenTelemetry only when OTLP environment variables are set, and
+the runner's environment allowlist excludes them. The benchmark agent replaces
+opencode's provider system prompt with the shared instruction. Its permission
+`"*": "deny"` removes every tool schema from the request. Disabled does not
+prove unallocated.
+
+**Side requests.** Sessions are created with explicit titles, and opencode only
+generates a title for sessions with a default title. Validated runs therefore
+made no title or summary model call. The provider counted exactly
+agents × turns requests, all benchmark turns. An unexpected extra model request
+would fail the fixture's transcript check, failing the run rather than being
+hidden. strace on 2026-09-23 found one non-model side request that no setting
+disables. Every instance boot starts a background npm install of
+`@opencode-ai/plugin` into the global config folder, which contacts the public
+registry. The adapter seeds the package manifest that an earlier install would
+leave, so opencode skips the install. The package itself is absent and is not
+loaded under `--pure`. With the manifest in place, the only sockets were loopback
+connections to the server and the fixture.
+
+**Known differences from the other engines.**
+
+- *Durability:* opencode writes sessions, messages, and parts to its own SQLite
+  database (WAL, `synchronous=NORMAL`) in the private data folder. The profile
+  records `sqlite_wal_synchronous_normal`. This is neither Pi/Codex/FX's
+  ephemeral state nor Rust's FULL durability. The undocumented in-memory
+  database flag is not used.
+- *Project:* opencode walks up to the nearest `.git`, adopts that repository as
+  its project, and writes a project-id file into its git folder. Captures live
+  inside this repository, so the adapter first runs `git init` on the private
+  workspace. opencode then runs about eighteen `git` probe processes at boot.
+  Other adapters' handling of the enclosing repository was not checked here.
+- *System context:* opencode appends its environment block to the shared
+  instruction. The block covers the model ID, the absolute workspace path, git
+  status, platform, and date. Request bytes therefore vary slightly with the
+  capture path length.
+- *Lazy boot:* `ready` is emitted after server start, event subscription, and
+  session creation. The first prompt still triggers opencode's deferred
+  instance initialization, about 1.5 to 2 s on the validation host. That time
+  falls inside first-turn latency.
+- *Event fan-in:* one global SSE stream carries every session's events,
+  including part and status updates the adapter ignores.
+- *Retries:* opencode's session retry with backoff is available. The adapter
+  fails on any retry status, and the fixture rejects repeated turns.
+- *Memory guard:* the single Bun server exceeds the matrix's 512 MiB guard even
+  with one agent. `bench.matrix` therefore raises the guard to 2048 MiB for
+  every engine in a matrix that includes opencode, because `compare` requires
+  identical limits. The 16-process guard is unchanged. The guard is a safety
+  stop, not a measured quantity.
+
+Sanity check on the 4-core, 16 GiB development VM (2026-09-23, not a quiet
+machine; exploratory, no ranking). These figures are descriptive only:
+
+| Workload | Runs | Sampled peak target RSS | Observed target CPU |
+| --- | --- | --- | --- |
+| `smoke.json` (4 agents, 4 KiB) | 3 measured | 605–679 MiB | 7.0–7.3 s |
+| c32-h65536 | 3 measured | 920–973 MiB | 14.5–15.4 s |
+
+All of these runs completed every turn, reached full provider concurrency, and
+had no invalid requests.
 
 ## Live fleet check
 
