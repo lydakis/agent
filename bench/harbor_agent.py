@@ -115,7 +115,7 @@ class Agent(BaseInstalledAgent):
             raise FileNotFoundError(
                 f'{self._binary} is missing; build it with '
                 'cargo build --release --locked --target x86_64-unknown-linux-musl')
-        # The shell tool runs bash; minimal images (Alpine) lack it.
+        # Harbor's exec and the run command below need bash; minimal images (Alpine) lack it.
         needed = ('bash',)
         has_roots = ' || '.join(f'[ -s {path} ]' for path in self.CA_BUNDLES)
         if (await environment.exec(command=has_roots, user='root')).return_code != 0:
