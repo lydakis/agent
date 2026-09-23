@@ -15,10 +15,10 @@ agent run --pretty --new --bot lead -- "Fix the failing test, and have a helper 
 ```
 
 <p align="center">
-  <img src="docs/demo/demo.gif" width="800" alt="The lead bot starts a docs bot with agent run --detach, runs the tests, fixes a rounding bug, collects the helper's finding with wait, and summarizes. agent ls then lists both bots.">
+  <img src="docs/demo/demo.gif" width="800" alt="The lead bot starts a docs bot with agent run --detach, runs the tests, collects the helper's finding with wait, fixes a rounding bug, and summarizes. agent ls then lists both bots.">
 </p>
 
-<p align="center"><sub><code>lead</code> hands the README check to a second bot, fixes the bug itself, then collects the helper's answer.
+<p align="center"><sub><code>lead</code> hands the README check to a second bot, runs the tests, collects the helper's answer, then fixes the bug.
 The model's words are scripted for this recording; the daemon, the bots, and every tool call are real.
 <a href="docs/demo/">Record it yourself</a>.</sub></p>
 
@@ -137,7 +137,8 @@ independently.
 Output is JSON by default: `run` and `follow` stream one event per line (text,
 thinking, tool calls and results, usage, state changes), and the other commands
 print one JSON value or nothing. Exit codes are stable: 0 success, 1 failed or
-incomplete, 2 invalid usage. The [CLI contract](docs/CLI.md) has the details.
+incomplete, 2 invalid usage, and 75 when `agent serve` finds another daemon
+already owns the store. The [CLI contract](docs/CLI.md) has the details.
 
 Programs that want a persistent connection can speak the daemon's JSONL socket
 protocol directly; [`client/`](client) is a Rust client for it. See the
@@ -159,8 +160,10 @@ through one API key at the provider's own rate with no failures
 show a lightweight runtime, not coding-agent capacity at that scale.
 
 The [performance tools](docs/BENCHMARKS.md) run Agent, Pi, and Codex against the
-same synthetic provider so their costs can be compared, and
-[docs/](docs) holds the design record and measurements behind every decision.
+same synthetic provider. Their features differ (Agent keeps a durable store; the
+baselines run ephemeral), so cross-engine numbers are exploratory observations,
+not rankings. [docs/](docs) holds the design record and measurements behind
+every decision.
 
 ## Status
 

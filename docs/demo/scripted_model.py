@@ -6,6 +6,8 @@ delegate) run for real against the files in `tally/`. Each bot's script is
 chosen by its latest prompt and advanced by the tool results it has received.
 
     python3 scripted_model.py PORT
+
+Port 0 picks a free port. The bound port is printed on the first line.
 """
 import http.server
 import json
@@ -22,17 +24,19 @@ def call(name, **arguments):
 
 
 # Each step is (text, tool call or None). The last step of a script has no call.
+# `lead` waits for the helper before it edits tally.py, since both work in the
+# same directory and the helper must see the file unfixed.
 SCRIPTS = {
     'Fix the failing test': [
         ("I'll have a helper check the README while I run the tests.", call('shell', command=DELEGATE)),
         ('', call('shell', command=TESTS)),
-        ('`int()` truncates 28.999… to 28 cents. Rounding instead:',
+        ("Before I change the code, I'll hear from the helper:", call('wait', handles='HANDLE')),
+        ('Both point at `int()`, which truncates 28.999… to 28 cents. Rounding instead:',
          call('edit', path='tally.py', old='int(p * 100)', new='round(p * 100)')),
         ('', call('shell', command=TESTS)),
-        ('Tests pass. Collecting the helper:', call('wait', handles='HANDLE')),
         ('Fixed: `total()` truncated each price to whole cents instead of rounding '
-         '(tally.py:3). All 3 tests pass, and the docs helper independently traced the '
-         "README's example to the same bug, so the README needs no change.", None),
+         '(tally.py:3). All 3 tests pass. The helper confirmed the README already describes '
+         'rounding, so only the code changed.', None),
     ],
     'Check that README.md matches': [
         ('', call('shell', command='python3 -c "from tally import total; print(total([0.29, 0.1]))"')),
@@ -93,4 +97,6 @@ class Model(http.server.BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Model).serve_forever()
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Model)
+    print(server.server_port, flush=True)
+    server.serve_forever()

@@ -25,5 +25,6 @@ AGENT_DEMO_LIVE=1 AGENT_MODEL=anthropic/claude-sonnet-5 ANTHROPIC_API_KEY=... \
   vhs docs/demo/demo.tape
 ```
 
-`setup.sh` runs hidden before recording starts: it copies `tally/` to
-`/tmp/tally` and uses a throwaway store in `/tmp/agent-demo`.
+`setup.sh` runs hidden before recording starts: it copies `tally/` and a
+throwaway store into a new temporary directory, which the tape removes when
+it finishes.
