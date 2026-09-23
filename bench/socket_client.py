@@ -20,7 +20,8 @@ class Connection:
     receive = Client.receive
     finished = Client.finished
 
-    def __init__(self, path):
+    def __init__(self, path, *, retain_durable=True):
+        self.retain_durable = retain_durable
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.connect(str(path))
         self.reader = self.socket.makefile('r')
@@ -31,11 +32,7 @@ class Connection:
             try:
                 for line in self.reader:
                     event = json.loads(line)
-                    if 'cursor' in event and event.get('event') != 'follow_live':
-                        self.durable.append(event.copy())
-                    if event.get('event') == 'turn_finished':
-                        event['_received_at'] = time.monotonic()
-                    self.queue.put(event)
+                    self.record(event)
             except (OSError, ValueError):
                 pass
             finally:
@@ -48,6 +45,13 @@ class Connection:
         except Exception:
             self.close()
             raise
+
+    def record(self, event):
+        if self.retain_durable and 'cursor' in event and event.get('event') != 'follow_live':
+            self.durable.append(event.copy())
+        if event.get('event') == 'turn_finished':
+            event['_received_at'] = time.monotonic()
+        self.queue.put(event)
 
     def request(self, op, **params):
         if op == 'create':

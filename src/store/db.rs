@@ -1,3 +1,4 @@
+use super::artifact;
 use crate::{
     Error, Result,
     codec::Family,
@@ -9,6 +10,9 @@ use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+
+// Sharing tiny prompts adds an index entry without avoiding an overflow page.
+const PROMPT_SHARE_BYTES: usize = 4096;
 
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
@@ -338,7 +342,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 25;
+    pub const SCHEMA: i32 = 26;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -437,6 +441,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
+                prompt_node INTEGER REFERENCES nodes(id),
                 workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
@@ -445,6 +450,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
+            CREATE INDEX IF NOT EXISTS turns_prompt_node ON turns(prompt_node) WHERE prompt_node IS NOT NULL;
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
             CREATE INDEX IF NOT EXISTS retained_turns_bot ON retained_turns(bot,turn);
@@ -459,7 +465,8 @@ impl Database {
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
-                stream TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(turn,call_id,stream));
+                stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(turn,call_id,stream));
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, bot TEXT NOT NULL REFERENCES bots(name),
                 turn INTEGER, kind TEXT NOT NULL, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS event_retention(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -1525,10 +1532,11 @@ impl Database {
         if deleting {
             return fail_with("bot_not_found", format!("{name} is being deleted"));
         }
-        let prior: Option<(i64, String, String, TurnOptions)> = self
+        let prior: Option<(i64, String, String, TurnOptions, Option<i64>)> = self
             .conn
             .query_row(
-                "SELECT id,prompt,status,workspace,model,delivery,expected_turn FROM turns WHERE bot=? AND request_id=?",
+                "SELECT id,prompt,status,workspace,model,delivery,expected_turn,prompt_node
+                 FROM turns WHERE bot=? AND request_id=?",
                 params![name, request_id],
                 |r| {
                     Ok((
@@ -1538,15 +1546,20 @@ impl Database {
                         TurnOptions {
                             workspace: r.get(3)?,
                             model: r.get(4)?,
-                            delivery: Delivery::parse(&r.get::<_, String>(5)?)
-                                .unwrap_or_default(),
+                            delivery: Delivery::parse(&r.get::<_, String>(5)?).unwrap_or_default(),
                             expected_turn: r.get(6)?,
                         },
+                        r.get(7)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((turn, saved, status, saved_options)) = prior {
+        if let Some((turn, mut saved, status, saved_options, prompt_node)) = prior {
+            if let Some(node) = prompt_node {
+                saved = self.conn.prepare_cached(
+                    "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
+                )?.query_row([node], |r| r.get(0))?;
+            }
             if saved != prompt || saved_options != *options {
                 return fail("idempotency_conflict");
             }
@@ -1896,10 +1909,15 @@ impl Database {
         for (steer, item, size) in steers {
             let id = node(&tx, head, &item)?;
             head = Some(id);
-            tx.execute(
-                "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
-                params![epoch_ms(), steer],
-            )?;
+            if size >= PROMPT_SHARE_BYTES {
+                tx.execute("UPDATE turns SET status='steered',finished_ms=?,prompt='',prompt_node=? WHERE id=?",
+                    params![epoch_ms(), id, steer])?;
+            } else {
+                tx.execute(
+                    "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
+                    params![epoch_ms(), steer],
+                )?;
+            }
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
                 "error":Value::Null,"detail":Value::Null});
             let cursor = event(&tx, &bot.name, Some(steer), "turn_finished", data.clone())?;
@@ -2028,10 +2046,7 @@ impl Database {
             return fail("invalid_tool_state");
         }
         for (stream, data) in &outcome.artifacts {
-            tx.execute(
-                "INSERT INTO artifacts VALUES (?,?,?,?)",
-                params![turn, call_id, stream, data],
-            )?;
+            artifact::put(&tx, turn, call_id, stream, data)?;
         }
         let head = node(&tx, bot.head, &item)?;
         tx.execute(
@@ -2412,10 +2427,7 @@ impl Database {
                     Ok((r.get(0)?, r.get(1)?))
                 })?;
             for (stream, data) in artifacts {
-                tx.execute(
-                    "INSERT INTO artifacts VALUES (?,?,?,?)",
-                    params![turn, call_id, stream, data],
-                )?;
+                artifact::put(&tx, turn, &call_id, stream, data)?;
             }
         }
         tx.commit()?;
@@ -3152,9 +3164,12 @@ impl Database {
         let mut statement = self.conn.prepare(
             "SELECT t.id,t.request_id,t.status,COALESCE(t.workspace,b.workspace),
                     COALESCE(t.model,b.provider||'/'||b.model),t.input_tokens,t.output_tokens,
-                    t.model_rounds,t.started_ms,t.finished_ms,substr(t.prompt,1,200),length(t.prompt),
+                    t.model_rounds,t.started_ms,t.finished_ms,
+                    substr(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END,1,200),
+                    length(CASE WHEN t.prompt_node IS NULL THEN t.prompt ELSE json_extract(CAST(n.item AS TEXT),'$.content[0].text') END),
                     t.retries,t.paced_ms,t.delivery,t.cached_input_tokens
-             FROM turns t JOIN bots b ON b.name=t.bot WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
+             FROM turns t JOIN bots b ON b.name=t.bot LEFT JOIN nodes n ON n.id=t.prompt_node
+             WHERE t.bot=? AND t.id>? ORDER BY t.id LIMIT ?",
         )?;
         let mut rows = statement.query(params![name, after, (limit + 1) as i64])?;
         let mut turns = Vec::new();
@@ -3273,15 +3288,8 @@ impl Database {
             return fail("invalid_tool_arguments");
         }
         self.authorize_artifact(name, turn, call_id)?;
-        let data: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT data FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
-                params![turn, call_id, stream],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(data) = data else {
+        let Some((_, data)) = artifact::read(&self.conn, turn, call_id, stream, 0, usize::MAX)?
+        else {
             return self.missing_artifact(turn);
         };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
@@ -3290,13 +3298,15 @@ impl Database {
         self.authorize_artifact(name, turn, call_id)?;
         let mut statement = self
             .conn
-            .prepare("SELECT stream,data FROM artifacts WHERE turn=? AND call_id=?")?;
+            .prepare("SELECT stream FROM artifacts WHERE turn=? AND call_id=?")?;
         let mut rows = statement.query(params![turn, call_id])?;
         let mut streams = serde_json::Map::new();
         while let Some(row) = rows.next()? {
-            let data: Vec<u8> = row.get(1)?;
+            let stream: String = row.get(0)?;
+            let (_, data) = artifact::read(&self.conn, turn, call_id, &stream, 0, usize::MAX)?
+                .ok_or_else(|| Error::new("storage_error"))?;
             streams.insert(
-                row.get::<_, String>(0)?,
+                stream,
                 Value::String(String::from_utf8_lossy(&data).into_owned()),
             );
         }
@@ -3321,17 +3331,11 @@ impl Database {
             return fail("invalid_artifact_page");
         }
         self.authorize_artifact(name, turn, call_id)?;
-        let row: Option<(i64, Vec<u8>)> = self.conn.query_row(
-            "SELECT length(data),substr(data,?,?) FROM artifacts WHERE turn=? AND call_id=? AND stream=?",
-            params![offset as i64 + 1, limit as i64, turn, call_id, stream],
-            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let Some((total, bytes)) = row else {
+        let Some((total, bytes)) =
+            artifact::read(&self.conn, turn, call_id, stream, offset, limit)?
+        else {
             return self.missing_artifact(turn);
         };
-        let total = u64::try_from(total).map_err(|_| Error::new("storage_error"))?;
-        if offset > total {
-            return fail("invalid_artifact_page");
-        }
         let text = match std::str::from_utf8(&bytes) {
             Ok(text) => text,
             Err(error) if error.error_len().is_none() => {
@@ -3418,10 +3422,17 @@ fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Valu
 fn start_locked(tx: &Connection, bot: &Bot, turn: i64, prompt: &str) -> Result<Option<i64>> {
     let item = bot.family()?.user_item(prompt)?;
     let head = node_with_turn(tx, bot.head, &item, Some(turn))?;
-    tx.execute(
-        "UPDATE turns SET status='running',started_ms=? WHERE id=?",
-        params![epoch_ms(), turn],
-    )?;
+    if prompt.len() >= PROMPT_SHARE_BYTES {
+        tx.execute(
+            "UPDATE turns SET status='running',started_ms=?,prompt='',prompt_node=? WHERE id=?",
+            params![epoch_ms(), head, turn],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE turns SET status='running',started_ms=? WHERE id=?",
+            params![epoch_ms(), turn],
+        )?;
+    }
     tx.execute(
         "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
         params![head, turn, bot.name],
@@ -3742,6 +3753,34 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
 
+    // 25 -> 26: share a started turn's prompt with its immutable user node.
+    // Pending/cancelled-before-start turns still own inline text. Older steers
+    // without an indexed prompt node retain their exact inline copy as well.
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='prompt_node')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
+            ALTER TABLE turns ADD COLUMN prompt_node INTEGER REFERENCES nodes(id);
+            UPDATE turns SET prompt_node=(SELECT n.id FROM nodes n WHERE n.turn=turns.id
+                AND json_extract(CAST(n.item AS TEXT),'$.role')='user'
+                AND json_extract(CAST(n.item AS TEXT),'$.content[0].text')=turns.prompt)
+                WHERE length(CAST(prompt AS BLOB))>=4096;
+            UPDATE turns SET prompt='' WHERE prompt_node IS NOT NULL;",
+        )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name='raw_bytes')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // Existing BLOBs stay raw. New large artifacts may use bounded LZ4 blocks.
+        conn.execute_batch(
+            "ALTER TABLE artifacts ADD COLUMN raw_bytes INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 /// Keep the oldest and newest excerpts within the text/metadata budget.

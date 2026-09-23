@@ -798,6 +798,24 @@ that store and use a new store path. Usage events are streamed through their
 turn index, without loading the transcript. Schema 21 copies existing bot row IDs
 in one pass, preserving creation order and gaps from deletion, and starts the
 identity sequence above the highest assigned ID (zero for an empty store).
+Schema 26 shares started prompts of at least 4 KiB with their immutable user
+node; queued prompts remain inline until start, and small prompts stay inline
+to avoid reference/index overhead. Idempotency and turn listings resolve the
+same original text. Absorbed steers share their own user node. Migration shares
+exact indexed matches; older steers without that mapping keep their inline
+text. The prompt-node foreign key has a partial index for deletion checks.
+
+New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
+use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
+directory and independent 16 KiB blocks. A 4 KiB sample and a 12.5% saving
+threshold leave incompressible output raw; tiny artifacts stay raw too.
+Byte paging decodes only intersecting blocks, and all existing authorization,
+retention, UTF-8, and fork rules still apply. Native transcript JSON and provider
+request prefixes do not change. Existing artifacts migrate as raw BLOBs, without
+a startup recompression pass. Freed SQLite pages can be reused; this migration
+does not vacuum or promise to shrink an existing database file. See
+[storage measurements](STORAGE_GROWTH.md).
+
 The migration is the only code that
 knows an earlier format. The store records no daemon-wide provider set or
 toolset; each bot retains its tools, and its provider is checked by family

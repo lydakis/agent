@@ -93,6 +93,7 @@ Agent does not provide a sandbox.
 - [Initial measurements](docs/MEASUREMENTS.md): Pi/Codex resource costs through
   32 simultaneous streams and the provisional reuse decision.
 
-Next: compaction with summaries, the remaining per-turn growth now that
-retention bounds records and deletes idle bots. Keep matched regression
-workloads as tools and durable lifecycle behavior expand.
+Context compaction bounds requests while original history continues to grow.
+Large-artifact compression and shared prompt storage reduce physical storage
+without discarding history; see [storage measurements](docs/STORAGE_GROWTH.md).
+Keep matched regression workloads as tools and durable lifecycle behavior expand.

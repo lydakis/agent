@@ -47,16 +47,39 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if user.startswith('flaky:'):
+            # One transport failure per prompt, then success: the retry path.
+            with self.server.lock:
+                seen = self.server.flaky_seen
+                first = user not in seen
+                seen.add(user)
+            if first:
+                body = json.dumps({'error': {'message': 'try later'}}).encode()
+                self.send_response(503)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
         held = user.startswith('hold:')
         delay = float(user[6:]) / 1000 if user.startswith('delay:') else 0
         if user.startswith('shell:') and last.get('type') != 'function_call_output':
             text, output = '', [{'type': 'function_call', 'name': 'shell', 'call_id': 'sh-1',
                                  'arguments': json.dumps({'command': user[6:], 'timeout_ms': 5000})}]
+        elif user.startswith('bgwait:') and last.get('type') != 'function_call_output':
+            # Start a background command, then park on its handle next round.
+            text, output = '', [{'type': 'function_call', 'name': 'shell', 'call_id': 'bg-1',
+                                 'arguments': json.dumps({'command': user[7:], 'timeout_ms': 30000, 'background': True})}]
+        elif user.startswith('bgwait:') and last.get('call_id') == 'bg-1':
+            handle = json.loads(last['output'])['handle']
+            text, output = '', [{'type': 'function_call', 'name': 'wait', 'call_id': 'w-1',
+                                 'arguments': json.dumps({'handles': [handle]})}]
         elif user.startswith('wait:') and last.get('type') != 'function_call_output':
             text, output = '', [{'type': 'function_call', 'name': 'wait', 'call_id': 'w-1',
                                  'arguments': json.dumps({'handles': user[5:].split(',')})}]
         else:
-            text = 'done'
+            # `text:N` replies with N bytes, so histories grow from both sides.
+            text = 'x' * int(user[5:].split()[0]) if user.startswith('text:') else 'done'
             output = [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]
         events = [{'type': 'response.created', 'response': {'id': 'r'}},
                   *([{'type': 'response.output_text.delta', 'delta': text}] if text else []),
@@ -96,5 +119,6 @@ def start():
     server = Server(('127.0.0.1', 0), Model)
     server.requests, server.request_bytes = 0, 0
     server.release = threading.Event()
+    server.lock, server.flaky_seen = threading.Lock(), set()
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, f'http://127.0.0.1:{server.server_port}/v1'

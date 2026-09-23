@@ -489,6 +489,119 @@ not a matched regression comparison or a capacity claim. The temporary store
 is removed afterwards unless `--keep` is given. `--bots` must be at least 32.
 See [the results and limitations](DAEMON_MEASUREMENTS.md#store-scale).
 
+## Mixed-workload soak
+
+```sh
+.local/venv/bin/python -m bench.soak --minutes 60 --out .local/bench/soak-60
+```
+
+One daemon on the socket transport and the synthetic provider, no spend, with
+192 bots in seven roles running at once for the whole run: long histories
+compacting on a small window, shell output overflowing into artifacts,
+background-command bursts, parents parked on children, one-time provider
+failures, historical forks run and deleted, slow socket followers, and a
+running turn interrupted every 30 seconds (a slow turn is submitted for it
+when nothing interruptible is running), with retention pruning every bot as
+it goes. Every five seconds it samples daemon RSS, threads, file
+descriptors, descendant processes and their memory, store and WAL size, the
+store's queue and run time, active, waiting, paced, and queued turns,
+background work, and provider pools. It counts turns by outcome, compactions,
+forks, deletes, retries, cancellation latency, and observed slow-follower
+EOF/resets before restart. Four noisy-bot followers read at most 256 bytes
+every 50 ms; eight long-history followers spool durable events to temporary
+files. The observer does not infer eviction from a disconnect, and buffered
+data can delay observing EOF. At the end it drains, pages through replay,
+waits for the fast followers to reach its endpoint, compares the complete
+retained interval, then kills the daemon with turns in flight and restarts
+it on the same store. The
+result records the binary hash, roles, counts, latency percentiles, the
+restart outcome, and every sample. In `soak_v3`, turn latency runs from before
+sending `submit` through receipt of the terminal event, including acknowledgement
+delay. Earlier captures started after acknowledgement and are not directly
+comparable. Turn latency includes roles that wait on
+a child shell or retry a failed request, so it is not a provider-only
+number; the provider does not validate conversation content, and the
+workload is paced, so throughput is the pace, not a capacity claim. See
+[the results](DAEMON_MEASUREMENTS.md#mixed-workload-soak).
+
+## Storage attribution and codec screen
+
+These are synthetic, local storage experiments with no paid calls. Keep stores,
+corpora, and captures under `.local/`. Profile a stopped store or consistent
+snapshot; the profiler does not checkpoint, vacuum, or alter its source.
+Outputs must be new paths. `dbstat` attribution is optional when the installed
+Python SQLite lacks that module; payload accounting remains available.
+The corpus exporter appends `.json` to its complete output filename for the
+report (for example, `varied.sqlite.json`) and refuses existing corpus or
+report paths before creating either output.
+
+```sh
+.local/venv/bin/python -m bench.storage_profile \
+  --store .local/bench/soak-60/state.sqlite --out .local/storage/profile.json
+.local/venv/bin/python -m bench.storage_growth \
+  --turns 64 256 1024 --out .local/storage/growth
+```
+
+The growth probe stops at each boundary, profiles, then resumes the same
+sixteen identities with four-turn retention. It is not a latency soak.
+The isolated codec crate does not add a daemon dependency or modify its schema:
+
+```sh
+CARGO_TARGET_DIR=.local/target/storage-codec cargo build --release --locked --manifest-path bench/storage_codec/Cargo.toml
+for profile in repeated varied entropy; do
+  .local/venv/bin/python -m bench.storage_corpus \
+    --profile "$profile" --out ".local/storage/$profile.sqlite"
+  .local/target/storage-codec/release/storage-codec-screen \
+    --corpus ".local/storage/$profile.sqlite" \
+    --out ".local/storage/$profile-results" --repeats 5
+done
+```
+
+Add `--codec lz4` to compare LZ4 instead of zlib in the isolated screen.
+For a synthetic store containing raw artifacts, replace `--profile` with
+`--store PATH` to export its node, inline prompt, and artifact bytes into a
+separate corpus. The exporter rejects compressed artifacts instead of silently
+benchmarking their encoded representation; use decoded protocol output for
+that corpus. The profiler supports both formats and distinguishes logical
+artifact bytes from `stored_artifact_bytes`.
+The native screen verifies every byte after reopening for both raw and
+compressed storage. It reports repeated write CPU/wall time, final checkpoint
+time, disk bytes, and identical bounded partial reads; it deletes its temporary
+trial databases after verification. This does not test daemon lifecycle,
+forks, production migration, or turn latency. See [results and measurement
+boundaries](STORAGE_GROWTH.md) before interpreting compression savings.
+
+Focused checks:
+
+```sh
+.local/venv/bin/python -m unittest tests.test_storage_profile
+cargo test --locked --manifest-path bench/storage_codec/Cargo.toml
+cargo clippy --locked --manifest-path bench/storage_codec/Cargo.toml --all-targets -- -D warnings
+```
+
+Matched runtime screens:
+
+```sh
+.local/venv/bin/python -m bench.storage_compare \
+  --before PATH_TO_BASELINE --after PATH_TO_CANDIDATE --out .local/storage/lifecycle
+.local/venv/bin/python -m bench.storage_artifacts \
+  --before PATH_TO_BASELINE --after PATH_TO_CANDIDATE --out .local/storage/artifacts
+```
+
+The lifecycle comparison alternates one warmup pair and five measured pairs at
+256-byte and 64-KiB history prompts, reusing exact provider-history validation,
+resume/replay, duplicate submission, and historical forks. The artifact screen
+alternates one warmup and three measured pairs per shape: varied diagnostics
+and seeded random bytes encoded as ASCII. Eight shell bots produce 1 MiB per
+turn while eight ordinary text bots run, for sixteen rounds with four-turn
+retention. It measures daemon CPU (excluding shell/provider/observer CPU), RSS
+every 10 ms, separate shell/text turn latency, and 128 late-offset 4 KiB artifact
+pages including protocol overhead. It reconstructs eight full artifacts,
+compares exact transcript hashes per bot, stops for storage attribution, and
+checks inherited artifact reads after restart and fork. The two binaries use
+the same fixture bytes and durability. OS caches are uncontrolled, and these
+bounded screens do not establish sustained capacity or real-task compression.
+
 ## Active steering
 
 ```sh

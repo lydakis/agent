@@ -8,6 +8,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+mod artifact;
 mod db;
 pub use db::{
     Absorbed, Binding, Bot, CatchUp, CompactionPlan, CompactionView, Database, Delivery, Fork,

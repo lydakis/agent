@@ -1,0 +1,23 @@
+[package]
+name = "storage-codec-screen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# An isolated experiment: no daemon dependency or store-format changes.
+[workspace]
+
+[[bin]]
+name = "storage-codec-screen"
+path = "../storage_codec.rs"
+
+[dependencies]
+libc = "0.2"
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+miniz_oxide = "=0.8.9"
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

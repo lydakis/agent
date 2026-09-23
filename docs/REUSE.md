@@ -38,6 +38,14 @@ bounded candidate review alone.
 
 ## Measurement tools
 
+The [storage experiments](STORAGE_GROWTH.md) reuse SQLite's `dbstat` for page
+attribution. miniz_oxide 0.8.9 stays in the isolated benchmark; its partial-read
+cost ruled out blanket compression. The runtime reuses lz4_flex 0.14.0 for
+large artifacts only, with bounded independent blocks in one BLOB. Transcript
+JSON remains unchanged. The component screen and matched daemon measurements
+separate codec costs from lifecycle costs. No custom compressor or replacement
+database is proposed.
+
 Primary documentation checked 2026-09-07. These are capability assessments,
 not comparative performance measurements of the tools themselves.
 

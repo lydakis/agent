@@ -138,7 +138,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    `--retain-turns N` applies prune after every turn; see
    [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#retention) and the measured growth in
    [LIVE_FLEET.md](LIVE_FLEET.md#retention-under-sustained-load). What still
-   grows per turn is the transcript itself, which is compaction's job. Next at
+   grows per turn is the original transcript. Context compaction does not
+   shrink that stored history; lossless storage work is item 38. Next at
    scale: hours rather than minutes.
 2. Done: stored history is unbounded; each request carries a
    [context window](RUST_PROTOTYPE.md#long-history-and-context-windows) of
@@ -315,19 +316,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    after compaction lands, since compaction changes what the model sees.
    Summaries stay versioned context views, never replacements of history, and
    historical forks bind to the view valid at their checkpoint.
-16. A mixed-workload soak, replacing the single-purpose slow-follower and
-   parked-agent screens. Synthetic provider, no spend: large contexts, noisy
-   shell output that overflows into artifacts, background-command bursts,
-   parked parents waiting on children, slow socket followers, historical
-   forks, and injected provider failures, all at once for an hour. Measure
-   actual provider streams separately from active turns, storage-queue wait
-   and execution time, cancellation latency, pending background work, and
-   descendant-process resources, not only daemon RSS. Alongside it, a small
-   set of real repository tasks with objective tests on a controlled model
-   and starting state: completion, tokens, wall time, and recovery behavior,
-   so the results say something about the harness and not the model. Idle
-   exit, schema versioning, budgets, turn listings, `result`, and
-   model-facing artifact reads are implemented and belong in that soak.
+16. The [mixed-workload soak](DAEMON_MEASUREMENTS.md#mixed-workload-soak)
+    ran sixty minutes with 192 bots in seven roles on the synthetic
+    provider: 224 thousand turns, 1,771 compactions, interrupts, forks, and
+    injected failures, no failed turns, flat daemon memory (36.6 to 36.8
+    MiB), and a SIGKILL restart with 16 turns in flight. The original slow
+    followers did not throttle and its replay check could accept missing
+    events. Both observers are corrected; repeat the long run before
+    claiming backpressure coverage or stream equality. The store grew
+    21.7 MiB per minute, predominantly history retained by design. Combined
+    reader/writer execution time does not establish writer saturation;
+    measure them separately before claiming a capacity limit. The other
+    half, real repository tasks with objective tests, is now item 36.
 17. Provider interface: decide whether cross-family handoff (thinking rendered
     as text, tool history preserved) is worth a translation step, then freeze
     the adapter contract.
@@ -518,7 +518,75 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
-34. Tool calls that do not hold up the model. Prompted by Unreal Agent
+33. Budget the effective request. The compaction trigger reads the raw
+    unsummarized span (`unsummarized_bytes`) against a percentage of `--context-bytes`; it
+    excludes the summary, the kept prompts, the carry-forward note, and the
+    omission listing, and ignores `--context-items`. Trigger on the
+    effective request, whichever of bytes and items is nearest exhaustion,
+    reserve room for output, give the summarizer a size target, and record
+    per compaction how much headroom it bought; a compaction whose view is
+    not smaller than what it replaced is a failure to report, not a
+    success. Tests: thousands of small items exhausting the item budget
+    below the byte trigger; a large pinned prefix leaving little tail room.
+    (From Astra Pro's compaction review.)
+34. Compaction inside a running turn. Cuts land only at submitted-turn
+    starts and the window must hold the whole current turn, so one long
+    autonomous task with many tool rounds in a single turn still reaches
+    `context_limit`. First, deterministic tool-result elision: in the
+    request view replace older bulk tool outputs with a short stub naming
+    the call, the size, and how to read it back, never touching the store
+    and never splitting a call from its result; the observation-masking
+    result in the survey makes this the baseline to beat. Then a cut at any
+    completed tool exchange within the turn, the turn's prompt kept
+    verbatim, the turn still running for everyone outside. (From Astra
+    Pro's compaction review.)
+35. Thinking-prefix compatibility. Anthropic binds preserved thinking to
+    the request prefix on newer accounts; a compaction rewrites that prefix
+    and the summarizer replays native items under other instructions. Read
+    the current contract, test both paths on the Anthropic family with
+    prefix enforcement, and either drop invalidated thinking with the loss
+    reported or use the documented handling, before Fable is offered
+    compaction. Benchmark a provider-native compactor behind the versioned
+    view while there. (From Astra Pro's compaction review.)
+36. The evaluation that challenges the summary, and the soak's second
+    half in one: a single substantial repository task on luna that crosses
+    several compactions, with facts that live only in tool results (a
+    discovered restriction, a failed approach and why, a measured number,
+    an operation with an unknown outcome) and a requirement that a later
+    instruction supersedes. Branch from identical checkpoints into full
+    context, omission listing, elision, and summarization with the same
+    tail, plus prompt-excerpts-only. Score next actions and final tests,
+    repeated investigations, replayed side effects, and failures right
+    after a compaction; record the context-view version with each model
+    call; measure total input and output, cache reads and writes, and
+    summarizer latency per correctly completed task. Compare a few
+    threshold policies on it before changing the 75/25 defaults. (From
+    Astra Pro's compaction review, and the remainder of item 16.)
+37. Context construction cost, measured before built. Each request
+    rebuilds the pinned blocks and reruns the omitted-turns walk although
+    the prefix is stable between compactions; an enabled bot pays a
+    separate `unsummarized_bytes` read before `window`, and planning reads
+    the bot again. Planning now runs on the reader, with catch-up walks
+    yielding every 1,024 nodes. Measure
+    the walk on long tool-heavy histories and ordinary-turn latency during
+    simultaneous compactions with the operation histograms; only then a
+    bounded cache of encoded prefix pieces keyed by family, summary
+    version, note version, window start, and listing size, and one context-plan
+    operation. (From Astra Pro's
+    compaction review.)
+
+38. Lossless storage efficiency: [targeted artifact compression and shared
+    large prompts](STORAGE_GROWTH.md#targeted-runtime-follow-up) are implemented
+    and measured with schema 26. The 1,024-turn growth probe falls from 79.23
+    to 45.68 MiB with identical node payloads. Varied-output daemon CPU and
+    text-turn tails improve; ordinary lifecycle tails are essentially flat,
+    with small median/RSS costs recorded explicitly. Transcript nodes stay raw.
+    Next investigate cold-history storage, then repeat the corrected hour-long
+    soak with periodic table attribution. Preserve exact history, historical
+    forks, recovery, and bounded paging; stored transcript growth is separate
+    from model context compaction.
+
+39. Tool calls that do not hold up the model. Prompted by Unreal Agent
     ([source](https://github.com/unreallabsai/unreal-agent/tree/b7c9bf1c5c2fa4127255c07727a7c8413e23944a)
     at `b7c9bf1c5c2fa4127255c07727a7c8413e23944a`, read 2026-09-23; its
     [announcement](https://unreallabs.ai/blog/unreal-agent/), 2026-09-22),
