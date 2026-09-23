@@ -1268,6 +1268,7 @@ fn retryable(code: &str) -> bool {
             | "provider_http_504"
             | "provider_http_529"
             | "provider_stream_failed"
+            | "provider_stream_stalled"
             | "truncated_sse_frame"
             | "provider_admission_timeout"
     ) || code.starts_with("provider_connection_")

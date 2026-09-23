@@ -299,6 +299,7 @@ bound; the operating system is then the only limit.
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
+| `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
@@ -397,7 +398,12 @@ current models reject budgets and older ones require them. Reasoning summaries a
 `thinking_delta` events; Anthropic thinking blocks and signatures are stored in
 the assistant item so tool-using turns continue correctly. Usage is recorded as a
 durable `usage` event per model call. HTTP requests have a 10 second connect
-timeout and a 120 second idle read timeout, and no total deadline. Provider error
+timeout and a 120 second idle read timeout, and no total deadline. The read
+timeout restarts on any byte, so a provider that sends only keepalives (Anthropic
+`ping` events or SSE comments) would hold a turn indefinitely. An established
+stream therefore also fails with `provider_stream_stalled` when no content frame
+arrives within `--stall-timeout` (120 seconds by default); keepalives never renew
+that bound, and time spent publishing deltas to followers does not count against it. Provider error
 bodies are reduced to a bounded `detail` string; codes never contain URLs or keys.
 Live provider behavior has been exercised only through synthetic endpoints in
 tests; see [NEXT.md](NEXT.md).
@@ -912,7 +918,7 @@ still pause its pool.
 
 A model call has no side effects, so a failed one is retried by rebuilding
 the request from the store: within 5 minutes, up to 8 attempts for capacity
-(5xx) or transport failures and up to 64 for refusals for pace, which the pool
+(5xx), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
 spaces and which are not the request's fault; never for a response the model
 could not finish (`provider_incomplete`) or a client error. The providers'
 reset headers are only how long a full refill takes; the pool learns the level
