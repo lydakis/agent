@@ -39,15 +39,18 @@ That puts `agent` in `~/.cargo/bin`. The desktop app has its own build; see
 
 ## Quickstart
 
-Give Agent a provider key and a default model:
+Set the key for any provider you use, and pick a default model as
+`PROVIDER/MODEL`:
 
 ```sh
-export ANTHROPIC_API_KEY=...
-export AGENT_MODEL=anthropic/claude-sonnet-5
+export OPENAI_API_KEY=...       # models named openai/MODEL
+export ANTHROPIC_API_KEY=...    # anthropic/MODEL
+export OPENROUTER_API_KEY=...   # openrouter/VENDOR/MODEL
+export AGENT_MODEL=anthropic/claude-opus-5-5
 ```
 
-`OPENAI_API_KEY` and `OPENROUTER_API_KEY` work the same way, with models named
-`openai/MODEL` or `openrouter/MODEL`. Other OpenAI Responses-compatible gateways
+Each bot keeps the model it was created with, so bots on different providers
+can run side by side in one daemon. Other OpenAI Responses-compatible gateways
 can be added with `--provider`; see [providers and models](docs/RUST_PROTOTYPE.md#providers-and-models).
 
 From your project directory, start a bot:

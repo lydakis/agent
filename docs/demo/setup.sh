@@ -4,7 +4,7 @@
 #
 # By default the model is scripted_model.py and no API key is needed. For a
 # recording with a real model, set AGENT_DEMO_LIVE=1, AGENT_MODEL, and that
-# provider's key, e.g. AGENT_MODEL=anthropic/claude-sonnet-5 with
+# provider's key, e.g. AGENT_MODEL=anthropic/claude-opus-5-5 with
 # ANTHROPIC_API_KEY; `agent run` then starts the daemon itself.
 demo=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$demo/../.." && pwd)

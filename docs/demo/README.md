@@ -21,7 +21,7 @@ that provider's key. The model decides what to do, so the recording will differ
 from the scripted one and may not delegate at all.
 
 ```sh
-AGENT_DEMO_LIVE=1 AGENT_MODEL=anthropic/claude-sonnet-5 ANTHROPIC_API_KEY=... \
+AGENT_DEMO_LIVE=1 AGENT_MODEL=anthropic/claude-opus-5-5 ANTHROPIC_API_KEY=... \
   vhs docs/demo/demo.tape
 ```
 
