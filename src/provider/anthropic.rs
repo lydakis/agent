@@ -1,7 +1,7 @@
 //! Anthropic Messages streaming: the assistant message is reconstructed from
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
-use super::{Completion, Delta, MAX_OUTPUT, ToolCall, Usage, detail_of};
+use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -44,7 +44,7 @@ impl State {
             .and_then(|i| self.blocks.get_mut(i as usize))
             .ok_or(Error::new("invalid_content_index"))
     }
-    pub fn frame(&mut self, frame: &[u8]) -> Result<Option<Delta>> {
+    pub fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
         let event: Value = serde_json::from_slice(frame)?;
         if self.done {
             return fail("event_after_completion");
@@ -61,7 +61,7 @@ impl State {
                     usage["input_tokens"].as_u64().unwrap_or(0) + read + created;
                 self.usage.cached_input_tokens = read;
                 self.saw_usage = true;
-                Ok(None)
+                Ok(Frame::Quiet)
             }
             Some("content_block_start") => {
                 if event["index"].as_u64() != Some(self.blocks.len() as u64) {
@@ -94,7 +94,7 @@ impl State {
                     },
                     _ => return fail("unsupported_content"),
                 });
-                Ok(None)
+                Ok(Frame::Quiet)
             }
             Some("content_block_delta") => {
                 let delta = &event["delta"];
@@ -110,25 +110,25 @@ impl State {
                     "thinking_delta" => text("thinking")?,
                     "input_json_delta" => text("partial_json")?,
                     "signature_delta" => text("signature")?,
-                    _ => return Ok(None),
+                    _ => return Ok(Frame::Quiet),
                 };
                 self.account(part.len())?;
                 match (kind.as_str(), self.block(&event["index"])?) {
                     ("text_delta", Block::Text(text)) => {
                         text.push_str(&part);
-                        Ok(Some(Delta::Text(part)))
+                        Ok(Frame::Delta(Delta::Text(part)))
                     }
                     ("thinking_delta", Block::Thinking { thinking, .. }) => {
                         thinking.push_str(&part);
-                        Ok(Some(Delta::Thinking(part)))
+                        Ok(Frame::Delta(Delta::Thinking(part)))
                     }
                     ("signature_delta", Block::Thinking { signature, .. }) => {
                         signature.push_str(&part);
-                        Ok(None)
+                        Ok(Frame::Quiet)
                     }
                     ("input_json_delta", Block::ToolUse { input, .. }) => {
                         input.push_str(&part);
-                        Ok(None)
+                        Ok(Frame::Quiet)
                     }
                     _ => fail("invalid_content"),
                 }
@@ -140,17 +140,19 @@ impl State {
                 if let Some(output) = event["usage"]["output_tokens"].as_u64() {
                     self.usage.output_tokens = output;
                 }
-                Ok(None)
+                Ok(Frame::Quiet)
             }
             Some("message_stop") => {
                 self.done = true;
-                Ok(None)
+                Ok(Frame::Quiet)
             }
             Some("error") => match detail_of(&event) {
                 Some(detail) => fail_with("provider_error", detail),
                 None => fail("provider_error"),
             },
-            _ => Ok(None), // ping, content_block_stop, unknown metadata
+            // Sent to hold an idle stream open; it is not progress.
+            Some("ping") => Ok(Frame::Keepalive),
+            _ => Ok(Frame::Quiet), // content_block_stop, unknown metadata
         }
     }
     pub fn usage(&self) -> Option<Usage> {
@@ -219,7 +221,7 @@ mod tests {
     fn feed(state: &mut State, frames: &[&str]) -> Vec<String> {
         let mut deltas = Vec::new();
         for frame in frames {
-            if let Some(delta) = state.frame(frame.as_bytes()).unwrap() {
+            if let Frame::Delta(delta) = state.frame(frame.as_bytes()).unwrap() {
                 deltas.push(match delta {
                     Delta::Text(t) => format!("text:{t}"),
                     Delta::Thinking(t) => format!("think:{t}"),

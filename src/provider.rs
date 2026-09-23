@@ -26,6 +26,10 @@ const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
 /// turns one reset connection takes with it.
 pub const STREAMS_PER_CONNECTION: usize = 64;
 
+/// Default bound on time between content frames of an established stream.
+/// Keepalives do not count: a provider that only pings is stalled.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
 /// connection per host; a request takes the least-loaded shard and holds it
@@ -114,12 +118,23 @@ pub struct Provider {
     url: reqwest::Url,
     key: Option<String>,
     max_output_tokens: Option<u32>,
+    stall_timeout: Duration,
 }
 
 #[derive(Debug)]
 pub enum Delta {
     Text(String),
     Thinking(String),
+}
+/// What one decoded SSE frame carried.
+#[derive(Debug)]
+enum Frame {
+    /// Text or thinking to publish as it streams.
+    Delta(Delta),
+    /// Progress with nothing to publish.
+    Quiet,
+    /// Only holds the connection open, so it does not renew the stall bound.
+    Keepalive,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
@@ -171,7 +186,7 @@ enum Parser {
     Anthropic(anthropic::State),
 }
 impl Parser {
-    fn frame(&mut self, frame: &[u8]) -> Result<Option<Delta>> {
+    fn frame(&mut self, frame: &[u8]) -> Result<Frame> {
         match self {
             Parser::Responses(state) => state.frame(frame),
             Parser::Anthropic(state) => state.frame(frame),
@@ -220,6 +235,7 @@ impl Provider {
             url,
             key,
             max_output_tokens: None,
+            stall_timeout: STALL_TIMEOUT,
         })
     }
     /// Model pool levels behind this provider, for `stats`.
@@ -243,6 +259,16 @@ impl Provider {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
+        Ok(self)
+    }
+
+    /// Bound the time an established stream may go without a content frame:
+    /// more than zero, at most a day.
+    pub fn with_stall_timeout(mut self, bound: Duration) -> Result<Self> {
+        if bound.is_zero() || bound > Duration::from_secs(86_400) {
+            return fail("invalid_stall_timeout");
+        }
+        self.stall_timeout = bound;
         Ok(self)
     }
 
@@ -486,12 +512,22 @@ impl Provider {
         };
         let result = async {
             let mut total = 0usize;
-            while let Some(chunk) = stream.next().await {
+            // Only a content frame renews the stall deadline. The client's
+            // read timeout restarts on any byte, so pings alone never trip it.
+            let stall = tokio::time::sleep(self.stall_timeout);
+            tokio::pin!(stall);
+            loop {
+                let chunk = tokio::select! {
+                    chunk = stream.next() => chunk,
+                    () = &mut stall => return fail("provider_stream_stalled"),
+                };
+                let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
                 total += chunk.len();
                 if total > 16 * 1024 * 1024 {
                     return fail("provider_response_limit");
                 }
+                let mut progressed = false;
                 for byte in chunk {
                     let Some(frame) = decoder.byte(byte)? else {
                         continue;
@@ -499,9 +535,18 @@ impl Provider {
                     if frame == b"[DONE]" {
                         continue;
                     }
-                    if let Some(part) = parser.frame(&frame)? {
-                        delta(part).await?;
+                    match parser.frame(&frame)? {
+                        Frame::Keepalive => continue,
+                        Frame::Delta(part) => delta(part).await?,
+                        Frame::Quiet => {}
                     }
+                    progressed = true;
+                }
+                // Renewed after publishing, so a slow consumer is not a stall.
+                if progressed {
+                    stall
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + self.stall_timeout);
                 }
             }
             if !decoder.is_empty() {
@@ -807,6 +852,90 @@ mod tests {
         drop(d);
         assert_eq!(transport.loads(), vec![0, 0, 0]);
         assert_eq!(Transport::new(0, 0).unwrap().connections(), 1);
+    }
+
+    /// Serve one SSE response: text deltas `gap` apart with a ping and a
+    /// comment keepalive between them, then only keepalives, forever.
+    async fn pinging(deltas: usize, gap: Duration) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let frame = |data: &str| format!("data: {data}\n\n");
+            let mut out = String::from(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            );
+            out += &frame(r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#);
+            out += &frame(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            );
+            let keepalive = frame(r#"{"type":"ping"}"#) + ": keepalive\n\n";
+            for n in 0.. {
+                if n < deltas {
+                    out += &frame(&format!(
+                        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{n}"}}}}"#
+                    ));
+                }
+                out += &keepalive;
+                if socket.write_all(out.as_bytes()).await.is_err() {
+                    return;
+                }
+                out.clear();
+                tokio::time::sleep(gap / 4).await;
+                if socket.write_all(keepalive.as_bytes()).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(gap * 3 / 4).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_only_pings_stalls_after_its_last_content() {
+        let gap = Duration::from_millis(100);
+        let bound = Duration::from_millis(300);
+        let url = pinging(6, gap).await;
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
+            .unwrap()
+            .with_stall_timeout(bound)
+            .unwrap();
+        let tools = none();
+        let mut text = String::new();
+        let started = tokio::time::Instant::now();
+        let call = provider.complete(
+            Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                items: Items::empty(),
+            },
+            |delta| {
+                if let Delta::Text(part) = delta {
+                    text.push_str(&part);
+                }
+                async { Ok(()) }
+            },
+        );
+        // Keepalives arrive well inside the bound, so only the guard can end
+        // this call; the client's read timeout never fires.
+        let error = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("the stall guard ends a stream that only pings")
+            .unwrap_err();
+        assert_eq!(error.code, "provider_stream_stalled");
+        // Content kept the stream alive past the bound; pings did not.
+        assert_eq!(text, "012345");
+        assert!(started.elapsed() >= gap * 5 + bound);
+        assert!(
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
+                .unwrap()
+                .with_stall_timeout(Duration::ZERO)
+                .is_err()
+        );
     }
 
     #[test]

@@ -252,6 +252,9 @@ pub struct Configuration {
     pub max_pending_bytes: Option<usize>,
     /// Generated tokens per Responses call, including reasoning; none by default.
     pub max_output_tokens: Option<u32>,
+    /// Seconds an established provider stream may go without a content
+    /// frame before the attempt fails and is retried; default 120.
+    pub stall_timeout: Option<u64>,
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
@@ -407,6 +410,9 @@ pub(crate) async fn publish(
 pub async fn run(config: Configuration) -> Result<()> {
     let limits = Limits::resolve(&config);
     let transport = Transport::new(limits.connecting, limits.connections)?;
+    let stall_timeout = config
+        .stall_timeout
+        .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let mut credentials = Vec::new();
@@ -429,6 +435,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         {
             provider = provider.with_max_output_tokens(cap)?;
         }
+        let provider = provider.with_stall_timeout(stall_timeout)?;
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
@@ -478,6 +485,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
+            "stall_timeout_seconds":stall_timeout.as_secs(),
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
             "retain_turns":config.retain_turns},
