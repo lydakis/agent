@@ -3760,6 +3760,6 @@ quality of a summary merged over many steps; the paid rerun of the luna cost
 figures with summarizer usage included, which this environment could not run
 because it has no provider keys; and a real 8 MiB window over a long task.
 
-Validation: 115 Rust tests, 191 Python tests (four skipped), strict Clippy and
-formatting. Ignored artifacts: `.local/compaction-catch-up/walk_timing.rs`,
+Validation, after merging `eab002b`: 116 Rust tests, 192 Python tests (four
+skipped), strict Clippy and formatting. Ignored artifacts: `.local/compaction-catch-up/walk_timing.rs`,
 `walk400-matched.txt`, `screen.py`, `screen.json`, `binaries.txt`.
