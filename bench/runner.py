@@ -4,9 +4,11 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -107,7 +109,7 @@ def run_once(command, config, options, directory, index):
     protocol = getattr(options, "protocol", "binary")
     # src/output.rs MAX_EVENT includes the newline; adapter events are smaller.
     event_limit = 1024 * 1024 - 1 if getattr(options, "driver", None) == "daemon" else 65536
-    driver = writer = None
+    driver = writer = workspace = None
     outgoing = None
 
     def write_requests():
@@ -161,13 +163,17 @@ def run_once(command, config, options, directory, index):
                "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
         if protocol != "binary":
             state = (directory / f"state-{index}").resolve()
-            for name in ("home", "codex", "claude", "workspace"):
+            for name in ("home", "codex", "claude"):
                 (state / name).mkdir(parents=True)
+            # The workspace lives outside this repository: engines that probe
+            # git from their working directory would otherwise walk up into
+            # the checkout and charge its status and history to the target.
+            workspace = Path(tempfile.mkdtemp(prefix="agent-bench-workspace-"))
             env = {**clean_env(), "HOME": str(state / "home"),
                    "CODEX_HOME": str(state / "codex"),
                    "CLAUDE_CONFIG_DIR": str(state / "claude"),
                    "AGENT_BENCH_STATE": str(state),
-                   "AGENT_BENCH_WORKSPACE": str(state / "workspace"),
+                   "AGENT_BENCH_WORKSPACE": str(workspace),
                    "AGENT_BENCH_PORT": str(port),
                    "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
             if getattr(options, "engine_executable", None):
@@ -175,7 +181,7 @@ def run_once(command, config, options, directory, index):
         if getattr(options, "driver", None) == "daemon":
             # The real service surface: the daemon is the target, the observer
             # drives its stdio protocol and translates its events.
-            driver = DaemonDriver(config, state / "workspace")
+            driver = DaemonDriver(config, workspace)
             command = [*command, "--store", str(state / "state.sqlite"),
                        "--provider", f"openai=responses,http://127.0.0.1:{port}/v1"]
         start = time.monotonic()
@@ -270,6 +276,8 @@ def run_once(command, config, options, directory, index):
             except (OSError, psutil.Error, subprocess.SubprocessError) as error:
                 status = "cleanup_failed"
                 detail = type(error).__name__
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
         if stats_path.exists():
             provider_stats = json.loads(stats_path.read_text())
     if status == "ok":

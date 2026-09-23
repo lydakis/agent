@@ -256,8 +256,8 @@ class EngineIntegrationTests(unittest.TestCase):
             self.assertGreaterEqual(result['target']['processes'], 5)
             self.assertEqual(result['provider']['preconnect_requests'], 4)
         elif engine == 'codex':
-            # Adapter plus app-server; on Linux the app-server also starts
-            # short-lived helpers (5 sampled on 2026-09-23), on macOS it did not.
+            # Adapter plus app-server; the app-server may also start a
+            # short-lived git probe in its workspace.
             self.assertGreaterEqual(result['target']['processes'], 2)
         else:
             self.assertEqual(result['target']['processes'], 1)
