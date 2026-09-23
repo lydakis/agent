@@ -36,6 +36,17 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual(env['AGENT_STORE'], '/tmp/agent-harbor/state.sqlite')
         self.assertIn(f'--provider {spec} ', command)
 
+    def test_a_chatgpt_model_signs_in_with_the_codex_login(self):
+        with tempfile.TemporaryDirectory() as logs:
+            auth = Path(logs, 'auth.json')
+            agent = Agent(logs_dir=Path(logs), model_name='chatgpt/m', codex_auth=str(auth))
+            command, env = agent._command('task'), agent._env()
+        self.assertEqual(agent._codex_auth, auth)
+        self.assertIn('--model chatgpt/m --provider chatgpt --', command)
+        self.assertEqual(env['CODEX_HOME'], '/installed-agent/codex')
+        with tempfile.TemporaryDirectory() as logs:
+            self.assertNotIn('CODEX_HOME', self.agent(logs)._env())
+
     def test_tokens_come_from_daemon_totals(self):
         with tempfile.TemporaryDirectory() as logs:
             Path(logs, 'stats.json').write_text(json.dumps({'tokens': {

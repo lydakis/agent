@@ -117,6 +117,8 @@ pub struct Provider {
     family: Family,
     url: reqwest::Url,
     key: Option<String>,
+    /// ChatGPT workspace for a ChatGPT-login key, sent as `ChatGPT-Account-ID`.
+    account: Option<String>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
 }
@@ -234,6 +236,7 @@ impl Provider {
             family,
             url,
             key,
+            account: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
         })
@@ -259,6 +262,15 @@ impl Provider {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
+        Ok(self)
+    }
+
+    /// Name the ChatGPT workspace a ChatGPT-login access token acts for.
+    pub fn with_account(mut self, account: String) -> Result<Self> {
+        if self.family != Family::Responses || account.is_empty() {
+            return fail("invalid_provider_account");
+        }
+        self.account = Some(account);
         Ok(self)
     }
 
@@ -458,6 +470,9 @@ impl Provider {
             }
             (Family::Responses, None) => http,
         };
+        if let Some(account) = &self.account {
+            http = http.header("chatgpt-account-id", account);
+        }
         reservation.dispatch();
         report.dispatched = true;
         let response = match http.send().await {

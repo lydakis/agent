@@ -38,6 +38,7 @@ from harbor.models.trial.paths import EnvironmentPaths
 REPOSITORY = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = REPOSITORY / '.local/target/x86_64-unknown-linux-musl/release/agent'
 REMOTE_BINARY = '/installed-agent/agent'
+REMOTE_CODEX_HOME = '/installed-agent/codex'
 # SQLite stays on the container's own disk: the log directory is a host mount.
 REMOTE_STORE = '/tmp/agent-harbor'
 BOT = 'task'
@@ -52,6 +53,8 @@ class Agent(BaseInstalledAgent):
       provider     extra `--provider` spec, or a list of them, for gateways
                    such as Bedrock; the spec's KEY_ENV is forwarded
       reasoning    `--reasoning` level
+      codex_auth   for chatgpt/MODEL: Codex's ChatGPT login to copy into the
+                   container (default: $CODEX_HOME/auth.json, else ~/.codex/auth.json)
       max_output_tokens, stall_timeout, context_bytes, compact_at: daemon limits
     """
 
@@ -88,13 +91,19 @@ class Agent(BaseInstalledAgent):
 
     def __init__(self, *args: Any, binary: str | None = None,
                  provider: str | list[str] | None = None, reasoning: str | None = None,
-                 **kwargs: Any) -> None:
+                 codex_auth: str | None = None, **kwargs: Any) -> None:
         limits = {key: kwargs.pop(key) for key in list(kwargs) if key in self._LIMITS}
         super().__init__(*args, **kwargs)
         self._binary = Path(binary or os.environ.get('AGENT_HARBOR_BINARY') or DEFAULT_BINARY)
         self._providers = [provider] if isinstance(provider, str) else list(provider or [])
         self._reasoning = reasoning
         self._limits = limits
+        # A chatgpt/ model signs in with the ChatGPT login Codex saved.
+        self._chatgpt = (self.model_name or '').startswith('chatgpt/')
+        if self._chatgpt and not any(p.partition('=')[0] == 'chatgpt' for p in self._providers):
+            self._providers.append('chatgpt')
+        codex_home = os.environ.get('CODEX_HOME') or Path.home() / '.codex'
+        self._codex_auth = Path(codex_auth or Path(codex_home) / 'auth.json')
 
     @staticmethod
     @override
@@ -115,6 +124,9 @@ class Agent(BaseInstalledAgent):
             raise FileNotFoundError(
                 f'{self._binary} is missing; build it with '
                 'cargo build --release --locked --target x86_64-unknown-linux-musl')
+        if self._chatgpt and not self._codex_auth.is_file():
+            raise FileNotFoundError(
+                f'{self._codex_auth} is missing; sign in with `codex login` first')
         # Harbor's exec and the run command below need bash; minimal images (Alpine) lack it.
         needed = ('bash',)
         has_roots = ' || '.join(f'[ -s {path} ]' for path in self.CA_BUNDLES)
@@ -127,6 +139,11 @@ class Agent(BaseInstalledAgent):
             environment,
             command=f'chmod 755 {REMOTE_BINARY} && ln -sf {REMOTE_BINARY} /usr/local/bin/agent',
         )
+        if self._chatgpt:
+            remote = f'{REMOTE_CODEX_HOME}/auth.json'
+            await self.exec_as_root(environment, command=f'mkdir -p -m 755 {REMOTE_CODEX_HOME}')
+            await self._upload_agent_owned_file(environment, self._codex_auth, remote)
+            await self.exec_as_root(environment, command=f'chmod 600 {remote}')
 
     def _command(self, instruction: str) -> str:
         if not self.model_name:
@@ -155,6 +172,8 @@ class Agent(BaseInstalledAgent):
     def _env(self) -> dict[str, str]:
         env = {**self.resolve_env_vars(), **self.model_connection.env,
                'AGENT_STORE': f'{REMOTE_STORE}/state.sqlite'}
+        if self._chatgpt:
+            env['CODEX_HOME'] = REMOTE_CODEX_HOME
         for spec in self._providers:
             fields = spec.partition('=')[2].split(',')
             if len(fields) >= 3 and (value := self._get_env(fields[2])):

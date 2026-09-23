@@ -488,7 +488,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     if options.providers.is_empty() {
         return fail_with(
             "usage",
-            "no provider: pass --provider (anthropic, openai, openrouter, or NAME=FAMILY,URL,KEY_ENV) or export a provider key",
+            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, or NAME=FAMILY,URL,KEY_ENV) or export a provider key",
         );
     }
     if let Some(parent) = options.store.parent() {

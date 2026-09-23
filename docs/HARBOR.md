@@ -99,8 +99,25 @@ PYTHONPATH=. harbor run -d terminal-bench/terminal-bench-2-1 -a bench.harbor_age
 harbor run -d terminal-bench/terminal-bench-2-1 -a strands -m anthropic/claude-fable-5 -n 8
 ```
 
+To run on a ChatGPT plan instead of an API key, sign in with `codex login` and
+name the model `chatgpt/MODEL`, using the id Codex's `/model` picker shows. The
+adapter copies Codex's `auth.json` into each task container, readable only by the
+agent user, and adds `--provider chatgpt`. The token is not refreshed during a
+run, so run any `codex` command just before starting. Plan usage windows cap how
+many tasks one run can finish, and whether a ChatGPT plan may drive a harness
+other than Codex is a question for OpenAI's terms. Harbor's own Codex adapter
+takes the same login with `CODEX_FORCE_AUTH_JSON=1`, so the Codex baseline can
+run on the plan too.
+
+```sh
+PYTHONPATH=. harbor run -d terminal-bench/terminal-bench-2-1 -a bench.harbor_agent:Agent \
+  -m chatgpt/MODEL -n 2 -l 5
+CODEX_FORCE_AUTH_JSON=1 harbor run -d terminal-bench/terminal-bench-2-1 -a codex -m MODEL -n 2 -l 5
+```
+
 Pass `--ak KEY=VALUE` for adapter options: `reasoning`, `max_output_tokens`,
-`stall_timeout`, `context_bytes`, `compact_at`, `binary` (another build), and
+`stall_timeout`, `context_bytes`, `compact_at`, `binary` (another build),
+`codex_auth` (another `auth.json` for `chatgpt/` models), and
 `provider` (a `--provider` spec for a gateway such as Bedrock, whose named key
 variable is forwarded from the host). Keep job outputs under the ignored
 `.local/` directory, because trial logs contain full transcripts.
@@ -118,6 +135,8 @@ variable is forwarded from the host). Keep job outputs under the ignored
   full transcript.
 - **Proxied sandboxes.** The provider client is built with `no_proxy()`, so an
   environment whose only egress is an HTTPS proxy cannot reach the provider.
+- **ChatGPT-plan cost.** A `chatgpt/` run bills the plan, not tokens; the
+  reported cost is what the same tokens would cost on the API.
 - **Prompting.** The bot uses the `--agents` composed instructions, the same as
   the app, with no benchmark-specific prompting. Vendor numbers above may include
   tuned prompts.
