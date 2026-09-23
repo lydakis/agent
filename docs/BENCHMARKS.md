@@ -91,7 +91,9 @@ turn, spaced 25 ms apart. Histories grow across turns. It runs engines sequentia
 alternates their order across cases, and takes three measured fresh-process runs
 after one excluded run for each engine/case. Each run has a 30-second timeout,
 512 MiB sampled RSS guard per tree (2048 MiB for every engine when opencode is
-selected; see below), and 16-process guard. Counters are sampled
+selected; see below), and 16-process guard. Claude Code runs one native process
+per agent, so its guards are that RSS guard and 16 processes per agent (see
+[Claude Code adapter](#claude-code-adapter)). Counters are sampled
 every 100 ms and trees discovered every 500 ms. A failed run stops the matrix. Cross-engine output is exploratory and omits
 percentage rankings because the loaded capabilities and execution boundaries differ.
 
@@ -119,14 +121,15 @@ This is comparable conversation work, not complete feature parity or default CLI
 performance. Full access is configured inside the caller's existing permissions.
 
 Engine subprocesses get a small environment allowlist and fresh private HOME,
-CODEX_HOME, and workspace folders under the ignored capture. Personal credentials,
+CODEX_HOME, CLAUDE_CONFIG_DIR, and workspace folders under the ignored capture
+(Claude Code's workspace is outside the repository; see below). Personal credentials,
 proxies, Node injection options, and user configuration are not forwarded. Native
 synthetic state may remain in these folders. Raw target output remains suppressed;
 adapter failures record only static diagnostic categories. Binary custom commands
 retain the separate caller-environment behavior described above.
 
-Provenance records Node version/hash, Pi versions/lock hash or Codex version/native
-binary hash, and a fingerprint of benchmark Python, adapter sources, and lockfiles.
+Provenance records Node version/hash, Pi versions/lock hash or Codex or Claude Code
+version/native binary hash, and a fingerprint of benchmark Python, adapter sources, and lockfiles.
 Rust records its version, release binary SHA-256, and Cargo.lock SHA-256. The
 Rust engine has no benchmark entry point: the runner starts `agent serve` on a
 fresh store bound to the synthetic provider and drives its stdio JSONL protocol
@@ -303,6 +306,120 @@ machine; exploratory, no ranking). These figures are descriptive only:
 
 All of these runs completed every turn, reached full provider concurrency, and
 had no invalid requests.
+
+## Claude Code adapter
+
+Added 2026-09-23. Claude Code is pinned to **2.1.267** (the npm `stable` dist-tag
+that day) and installed under the ignored `.local`, not in the tracked lockfile:
+
+```sh
+npm install --prefix .local/claude-code --save-exact @anthropic-ai/claude-code@2.1.267
+AGENT_BENCH_TEST_CLAUDE_CODE=1 .local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --engine claude-code --out .local/bench/claude-code
+.local/venv/bin/python -m bench.matrix --engines rust claude-code --out .local/bench/claude-code-matrix
+```
+
+The runner measures the platform package's native executable
+(`@anthropic-ai/claude-code-<platform>/claude`, a Bun-compiled binary), never the
+wrapper package or an npm launcher. It fails if the wrapper or native package
+version differs from the pin, or if more than one native package is present.
+Provenance records the native binary SHA-256, `claude --version`, the platform
+package name, the `.local/claude-code/package-lock.json` SHA-256, and Node's
+version/hash. On linux-x64 the pinned binary's SHA-256 was
+`0399c793ff571d5946ef923d80b4f330d05ac4b6842a6b0775468f5d389403c0`.
+
+**Arrangement.** Claude Code's normal deployment is one CLI process per session;
+the Agent SDK also spawns one CLI process per query. The adapter
+(`bench/adapters/claude-code.mjs`) therefore starts one long-lived `claude`
+process per agent and drives it over the SDK's stdio protocol:
+`-p --input-format stream-json --output-format stream-json --verbose
+--include-partial-messages`. Readiness is every process answering the SDK
+`initialize` control request. All of an agent's turns go to its own process and
+session, so the process retains and resends history itself. Turns complete on a
+successful `result` with `end_turn`; text comes from `text_delta` stream events.
+Any tool, permission, subagent or non-text event fails the run. The Node adapter,
+every CLI process, and their short-lived children are charged to the target.
+This is the cost of the tested deployment arrangement, not a per-agent
+allocation count or a shared-process design Claude Code does not offer.
+
+**What is disabled.** Each process runs with `--bare` (no hooks, LSP, plugin
+sync, auto-memory, background prefetches, keychain reads, or CLAUDE.md
+discovery), `--tools ""`, `--strict-mcp-config`, `--no-session-persistence`,
+`--permission-prompts none`, `--model bench-model`, and `--system-prompt` set to
+the shared benchmark instruction. The environment is the runner's allowlist plus
+fresh private `HOME` and `CLAUDE_CONFIG_DIR` folders in the capture, a synthetic
+`ANTHROPIC_API_KEY`, and `ANTHROPIC_BASE_URL` pointing at the fixture. The CLI
+finds the enclosing repository from its working directory with its own file walk
+(not stopped by `GIT_CEILING_DIRECTORIES`) and then runs `git status` and
+`git log` there; since captures live inside this repository, every process runs
+in one empty directory under the system temporary folder, removed at exit.
+These documented variables are
+set: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY`,
+`DISABLE_ERROR_REPORTING`, `DISABLE_UPDATES`, `DISABLE_AUTO_COMPACT`,
+`CLAUDE_CODE_MAX_RETRIES=0`, and `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK`
+(names checked against the [environment variable
+reference](https://code.claude.com/docs/en/env-vars) on 2026-09-23). Disabled
+features are not proven unallocated. Machine-wide managed settings
+(`/etc/claude-code/managed-settings.json` on Linux) still apply by design; the
+validation host had none.
+
+**Fixture.** `--protocol anthropic_messages` accepts `POST /v1/messages` (with
+or without `?beta=true`) and streams `message_start`, `content_block_start`,
+`content_block_delta`/`text_delta`, `content_block_stop`, `message_delta` with
+`end_turn`, and `message_stop`. `bench/anthropic.py` converts the request to the
+shared Responses `Transcript`, which rejects retries, missing or cross-agent
+history, and overlapping turns exactly as for the other engines. Tool
+definitions, tool-use/result, thinking, and image blocks are rejected. Output
+text and per-delta delays are identical to the Responses and Gateway fixtures.
+
+**Side requests.** Traced with `strace` against a logging endpoint on
+2026-09-23. Without the switches above, the CLI made per-turn title-generation
+model calls, connected to external HTTPS hosts, and ran IDE-detection (`ps`),
+`rg`, and git probes. With them, every remaining request is:
+
+- One `HEAD /api/hello` per process: a connection warm-up the CLI fires when no
+  proxy is configured. The fixture answers `200` with an empty body and counts it
+  in `preconnect_requests`. It is excluded from `requests`/`completed_requests`
+  but its connection is included in `connections_used`, so Claude Code uses about
+  two connections per agent.
+- Three short-lived `git` processes per CLI process at startup (remote and
+  settings-tracking probes), which find no repository in the empty workspace.
+  They remain in the target tree and its CPU. Inside a repository the CLI ran
+  seven per process, including `status` and `log`.
+
+No external connection and no read of the enclosing repository was observed
+with these settings. Any other request fails
+the run as an invalid fixture request rather than being answered silently.
+
+**Known differences from the other engines.**
+
+- One OS process per agent (plus the Node adapter). Pi, Rust and FX use one
+  process; Codex uses two. Sampled RSS sums per-process pages, so shared binary
+  pages are counted once per process; this is neither PSS nor private memory.
+- Native request context remains: a billing-header system block and an SDK
+  identity line precede the benchmark instruction; the first user message
+  carries a date reminder block before the synthetic prompt. The fixture ignores
+  this native context, as it does for Codex. Requests also carry
+  `thinking: adaptive`, an effort level, context-management edits, and Claude Code
+  beta headers; the fixture never returns thinking.
+- `bench-model` is unknown to the CLI (it logs `unrecognized_model` to the
+  suppressed stderr); model-specific context and capability defaults apply.
+- Anthropic Messages framing and terminal events differ from Responses and
+  Gateway, so request/response body bytes are not equivalent.
+  `bench compare --exploratory` permits this protocol difference and lists it.
+- The CLI writes `.claude.json` and backups under its private config folder; no
+  transcript is persisted.
+- Guards scale per agent: `bench.matrix` passes `512 x agents` MiB and
+  `16 x agents` processes for Claude Code. Sampled peaks on 2026-09-23 reached
+  40 to 58 target processes at 32 agents, counting git probes, and roughly 200 MiB
+  RSS per CLI process, far above the shared-process guard. Compatibility
+  records therefore differ in `rss_limit_mib` and `process_limit`; exploratory
+  comparisons list that as a gap, and matched comparisons reject it.
+- Startup is concurrent process launch: at 32 agents on a 4-CPU host, `ready`
+  took several seconds and the host CPU was saturated during launch. Readiness,
+  first-chunk and turn timings include that contention. In one excluded warmup
+  on that host only 30 of 32 streams overlapped at the provider; a measured run
+  like that makes `compare`, and so the matrix, fail closed.
 
 ## Live fleet check
 

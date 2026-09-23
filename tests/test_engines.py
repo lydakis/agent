@@ -1,4 +1,4 @@
-"""Optional real-engine checks, each gated by its own AGENT_BENCH_TEST_* variable."""
+"""Optional real-engine checks: AGENT_BENCH_TEST_ENGINES=1 enables Pi, Codex and Rust; other engines have their own AGENT_BENCH_TEST_* variable."""
 
 import json
 import os
@@ -12,8 +12,8 @@ import unittest
 
 from bench.config import workload
 from bench.runner import run_once
-from bench.matrix import rss_guard
-from bench.targets import clean_env, engine_target, opencode_executable, validate_responses_workload
+from bench.matrix import guards, rss_guard
+from bench.targets import clean_env, engine_protocol, engine_target, opencode_executable, validate_responses_workload
 
 
 # A stand-in for `opencode serve`: the HTTP routes and events the adapter uses.
@@ -165,6 +165,61 @@ sys.exit(7)
         self.assertEqual(rss_guard(['pi', 'codex', 'rust']), 512)
         self.assertEqual(rss_guard(['rust', 'opencode']), 2048)
 
+    def run_fake_claude(self, mode):
+        root = Path(__file__).resolve().parent.parent
+        config = workload(root / 'bench/workloads/smoke.json')
+        config.update(concurrency=2, turns=2, chunks=2, chunk_bytes=4)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            backend = path / 'fake-claude'
+            # Speaks the stream-json subset the adapter relies on.
+            backend.write_text(f'#!{sys.executable}\n' + '''
+import json, os, sys
+mode = os.environ['FAKE_MODE']
+assert 'AGENT_BENCH_WORKLOAD' not in os.environ and os.environ['ANTHROPIC_BASE_URL']
+def send(m): print(json.dumps(m), flush=True)
+for line in sys.stdin:
+    m = json.loads(line)
+    if m['type'] == 'control_request':
+        send({'type': 'control_response', 'response': {
+            'subtype': 'success', 'request_id': m['request_id'], 'response': {}}})
+        continue
+    send({'type': 'system', 'subtype': 'init', 'session_id': 's', 'tools': []})
+    kind = 'tool_use' if mode == 'tool' else 'text'
+    send({'type': 'stream_event', 'parent_tool_use_id': None, 'event': {
+        'type': 'content_block_start', 'index': 0, 'content_block': {'type': kind}}})
+    for _ in range(2):
+        send({'type': 'stream_event', 'parent_tool_use_id': None, 'event': {
+            'type': 'content_block_delta', 'index': 0,
+            'delta': {'type': 'text_delta', 'text': 'xxxx'}}})
+    send({'type': 'result', 'subtype': 'success', 'is_error': False,
+          'stop_reason': 'end_turn', 'session_id': 's'})
+sys.exit(7 if mode == 'exit' else 0)
+''')
+            backend.chmod(0o700)
+            env = {**clean_env(), 'AGENT_BENCH_PORT': '1', 'AGENT_BENCH_WORKLOAD': json.dumps(config),
+                   'AGENT_BENCH_EXECUTABLE': str(backend), 'AGENT_BENCH_STATE': directory,
+                   'AGENT_BENCH_WORKSPACE': directory, 'FAKE_MODE': mode}
+            completed = subprocess.run(['node', str(root / 'bench/adapters/claude-code.mjs')],
+                                       env=env, capture_output=True, text=True, timeout=10)
+        return completed.returncode, [json.loads(line) for line in completed.stdout.splitlines()]
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for the adapter check')
+    def test_claude_code_adapter_drives_one_process_per_agent_and_rejects_tools(self):
+        code, events = self.run_fake_claude('ok')
+        self.assertEqual(code, 0)
+        self.assertEqual(events[0], {'event': 'ready'})
+        self.assertEqual(sum(e['event'] == 'turn_end' for e in events), 4)
+        self.assertEqual(sum(e['event'] == 'chunk' for e in events), 8)
+        for mode in ('tool', 'exit'):
+            with self.subTest(mode=mode):
+                self.assertNotEqual(self.run_fake_claude(mode)[0], 0)
+
+    def test_process_per_agent_engines_get_per_agent_guards(self):
+        self.assertEqual(guards('codex', 32), (512, 16))
+        self.assertEqual(guards('claude-code', 1), (512, 16))
+        self.assertEqual(guards('claude-code', 32), (512 * 32, 16 * 32))
+
 
 @unittest.skipUnless(os.environ.get('AGENT_BENCH_TEST_ENGINES') == '1',
                      'set AGENT_BENCH_TEST_ENGINES=1 with pinned Pi and Codex installed')
@@ -173,10 +228,11 @@ class EngineIntegrationTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         command, metadata, executable = engine_target(engine, root)
         config = workload(root / 'bench/workloads/smoke.json')
+        rss_limit, process_limit = guards(engine, config['concurrency'], rss_guard([engine]))
         options = SimpleNamespace(timeout=20, interval=.1, discovery_interval=.25,
-                                  rss_limit_mib=rss_guard([engine]), process_limit=16,
-                                  protocol='gateway' if engine == 'fx' else 'responses',
-                                  engine_executable=executable)
+                                  rss_limit_mib=rss_limit, process_limit=process_limit,
+                                  protocol=engine_protocol(engine), engine_executable=executable,
+                                  driver='daemon' if engine == 'rust' else None)
         # All native state is synthetic; no personal configuration is passed.
         with tempfile.TemporaryDirectory(dir=root / '.local') as directory:
             path = Path(directory)
@@ -195,8 +251,17 @@ class EngineIntegrationTests(unittest.TestCase):
             self.assertEqual(metadata['durability'], 'sqlite_wal_synchronous_normal')
             self.assertEqual(metadata['opencode_version'], '1.18.32')
             return
-        self.assertEqual(result['target']['processes'], 2 if engine == 'codex' else 1)
-        self.assertEqual(metadata['durability'], 'ephemeral')
+        if engine == 'claude-code':
+            # Adapter plus one CLI per agent; short git probes may also be sampled.
+            self.assertGreaterEqual(result['target']['processes'], 5)
+            self.assertEqual(result['provider']['preconnect_requests'], 4)
+        elif engine == 'codex':
+            # Adapter plus app-server; on Linux the app-server also starts
+            # short-lived helpers (5 sampled on 2026-09-23), on macOS it did not.
+            self.assertGreaterEqual(result['target']['processes'], 2)
+        else:
+            self.assertEqual(result['target']['processes'], 1)
+        self.assertEqual(metadata['durability'], 'sqlite_full' if engine == 'rust' else 'ephemeral')
         if engine == 'fx':
             self.assertEqual(result['provider']['catalog_requests'], 4)
             self.assertEqual(metadata['backend'], 'native')
@@ -224,3 +289,10 @@ class FxIntegrationTests(unittest.TestCase):
 class OpencodeIntegrationTests(unittest.TestCase):
     def test_shared_opencode_server_with_real_responses_transport(self):
         EngineIntegrationTests.check_engine(self, 'opencode')
+
+
+@unittest.skipUnless(os.environ.get('AGENT_BENCH_TEST_CLAUDE_CODE') == '1',
+                     'set AGENT_BENCH_TEST_CLAUDE_CODE=1 with pinned Claude Code under .local')
+class ClaudeCodeIntegrationTests(unittest.TestCase):
+    def test_claude_code_process_per_agent_with_real_messages_transport(self):
+        EngineIntegrationTests.check_engine(self, 'claude-code')

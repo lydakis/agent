@@ -84,6 +84,21 @@ probes are residual costs that cannot be switched off. Results are exploratory
 only. See the [opencode adapter](BENCHMARKS.md#opencode-adapter) for every
 known difference.
 
+## Claude Code process-per-agent comparison
+
+The 2026-09-23 adapter drives pinned Claude Code 2.1.267 as one native CLI
+process per agent over its stream-json protocol, with the Node adapter and every
+CLI process charged to the target. It speaks Anthropic Messages SSE to the
+fixture, which validates the same conversation through the shared transcript
+ledger. Bare mode, no tools, no session persistence, and disabled optional
+traffic narrow what is loaded; they do not make its native context, per-process
+runtime, connection warm-up, or git probes equivalent to the other engines.
+
+Exploratory comparisons permit any pair of the Responses, Gateway and Messages
+fixture protocols, and the matrix's per-agent RSS/process guards for this
+engine; each difference is listed as a gap. Matched comparisons still require
+identical protocol and guards. See [the adapter notes](BENCHMARKS.md#claude-code-adapter).
+
 ## How to attribute feature cost
 
 1. Use the same binary/runtime configuration with one optional feature changed,

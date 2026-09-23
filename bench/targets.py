@@ -16,6 +16,15 @@ def file_hash(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+CLAUDE_CODE_VERSION = '2.1.267'
+# Native wire protocol each engine speaks to the synthetic provider.
+PROTOCOLS = {'fx': 'gateway', 'claude-code': 'anthropic_messages'}
+
+
+def engine_protocol(engine):
+    return PROTOCOLS.get(engine, 'responses')
+
+
 def clean_env():
     # Do not inherit API credentials, proxies, Node injection, or tracing config.
     return {key: os.environ[key] for key in ("PATH", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT")
@@ -79,8 +88,10 @@ def engine_target(engine, root, binary=None):
         executable = Path(executable).resolve()
         if executable.suffix == ".js":
             # npm packaging: measure the native server directly, no npm launcher.
+            # Nested (older npm) or flat (sibling platform package) layouts.
             candidates = list(executable.parent.parent.glob(
-                "node_modules/@openai/codex-*/vendor/*/bin/codex"))
+                "node_modules/@openai/codex-*/vendor/*/bin/codex")) or list(
+                executable.parent.parent.parent.glob("codex-*/vendor/*/bin/codex"))
             if len(candidates) != 1:
                 raise ValueError("cannot unambiguously locate the native Codex executable")
             executable = candidates[0]
@@ -99,6 +110,28 @@ def engine_target(engine, root, binary=None):
                 cwd=home, text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
         if metadata["opencode_version"] != OPENCODE_VERSION:
             raise ValueError("opencode native version differs from benchmark pin")
+    elif engine == "claude-code":
+        # Pinned npm install under .local; measure the platform package's native
+        # executable directly, never the wrapper package's launcher.
+        modules = root / ".local/claude-code/node_modules/@anthropic-ai"
+        wrapper = modules / "claude-code/package.json"
+        if not wrapper.exists():
+            raise ValueError("install the pinned Claude Code package under .local/claude-code first")
+        if json.loads(wrapper.read_text())["version"] != CLAUDE_CODE_VERSION:
+            raise ValueError("Claude Code installed version differs from benchmark pin")
+        candidates = [path / "claude" for path in modules.glob("claude-code-*")
+                      if (path / "claude").is_file()
+                      and json.loads((path / "package.json").read_text())["version"] == CLAUDE_CODE_VERSION]
+        if len(candidates) != 1:
+            raise ValueError("cannot unambiguously locate the native Claude Code executable")
+        executable = candidates[0].resolve()
+        metadata["claude_code_package"] = executable.parent.name
+        metadata["claude_code_sha256"] = file_hash(executable)
+        metadata["claude_code_lock_sha256"] = file_hash(root / ".local/claude-code/package-lock.json")
+        metadata["claude_code_version"] = subprocess.check_output([str(executable), "--version"],
+            env=clean_env(), text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        if not metadata["claude_code_version"].startswith(CLAUDE_CODE_VERSION + " "):
+            raise ValueError("Claude Code executable version differs from benchmark pin")
     return command, metadata, str(executable) if executable else None
 
 
