@@ -169,8 +169,8 @@ def run_once(command, config, options, directory, index):
                    "AGENT_BENCH_WORKSPACE": str(state / "workspace"),
                    "AGENT_BENCH_PORT": str(port),
                    "AGENT_BENCH_WORKLOAD": json.dumps(config, sort_keys=True)}
-            if getattr(options, "codex_executable", None):
-                env["AGENT_BENCH_CODEX"] = options.codex_executable
+            if getattr(options, "engine_executable", None):
+                env["AGENT_BENCH_EXECUTABLE"] = options.engine_executable
         if getattr(options, "driver", None) == "daemon":
             # The real service surface: the daemon is the target, the observer
             # drives its stdio protocol and translates its events.

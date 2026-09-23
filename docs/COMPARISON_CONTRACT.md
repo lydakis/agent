@@ -72,6 +72,18 @@ pair is allowed only in exploratory comparisons, with the difference listed;
 all remaining compatibility fields must still match. No percentage ranking is
 produced. See [FX measurements](FX_MEASUREMENTS.md).
 
+## opencode server comparison
+
+The 2026-09-23 adapter drives one pinned native `opencode serve` (1.18.32) with
+one session per agent over its HTTP API and event stream. Node and the server
+are charged to the target. It uses the same Responses fixture, with no tool
+schemas and no title request. opencode's SQLite session store is still written
+(WAL, `synchronous=NORMAL`), so its durability profile matches no other engine.
+Its environment system block, lazy first-prompt initialization, and git project
+probes are residual costs that cannot be switched off. Results are exploratory
+only. See the [opencode adapter](BENCHMARKS.md#opencode-adapter) for every
+known difference.
+
 ## How to attribute feature cost
 
 1. Use the same binary/runtime configuration with one optional feature changed,

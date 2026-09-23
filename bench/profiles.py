@@ -14,6 +14,10 @@ def profile(engine):
         'codex': ['node_rpc_adapter', 'native_app_server', 'native_session_services',
                   'ephemeral_threads', 'native_schema_and_context_overhead',
                   'disabled_optional_features_not_proven_unallocated'],
+        'opencode': ['node_http_sse_adapter', 'native_bun_opencode_server', 'one_session_per_agent',
+                     'sqlite_session_store', 'ai_sdk_openai_responses_provider',
+                     'native_system_prompt_and_environment_context', 'permission_deny_all_no_tool_schemas',
+                     'disabled_optional_features_not_proven_unallocated'],
         'fixture': ['python_binary_transport_calibration_client'],
         'fx': ['node_runtime', 'native_libfx_addon', 'thread_per_agent',
                'acp_bridge_and_host_fetch', 'in_memory_conversations', 'no_tools_registered'],
@@ -24,6 +28,9 @@ def profile(engine):
         common = {'scenario': 'binary_transport_calibration_v1', 'durability': 'none'}
     if engine == 'rust':
         common = {**common, 'durability': 'sqlite_full', 'consumer': 'observer_driven_stdio_protocol'}
+    if engine == 'opencode':
+        common = {**common, 'durability': 'sqlite_wal_synchronous_normal',
+                  'retries': 'native_retry_available_but_rejected_by_fixture'}
     if engine == 'fx':
         common = {**common, 'provider': 'loopback_http1_gateway_sse',
                   'retries': 'one_pre_output_transport_retry_available_but_rejected_by_fixture'}
