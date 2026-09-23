@@ -649,6 +649,36 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     anything else fails the comparison rather than ranking as cheaper.
     Then a small real-provider check under a stated spend cap.
 
+40. Two request-cost levers from the same Unreal Agent reading, each a
+    measurement before a change.
+    - A per-bot `prompt_cache_key` on the Responses family. The request
+      built in `Provider::prefix` (`src/provider.rs`) sends no key, and
+      every bot made by the CLI starts with the same preamble and usually
+      the same tools, so a fleet shares one request prefix. Unreal sends
+      the key on OpenAI and Codex. OpenAI's caching guide says requests
+      are routed by the prefix combined with the key, and that past
+      roughly 15 requests a minute for one combination some overflow to
+      machines without the cache; that is their documentation, not
+      verified here. The [cache-hit screen](DAEMON_MEASUREMENTS.md#cache-hit-accounting)
+      ran one conversation, so it cannot show a fleet effect. Screen many
+      concurrent bots on the shared prefix above that rate, with and
+      without a key derived from the bot's identity, reading
+      `cached_input_tokens` per bot. The Anthropic family caches through
+      explicit breakpoints and is unaffected; whether Bedrock's Responses
+      endpoints honor the key is unknown. Needs a paid run under a stated
+      cap.
+    - A smaller shell output preview. `PREVIEW_BYTES` (`src/tools.rs`) is
+      64 KiB per stream, so one call can put about 128 KiB of stdout and
+      stderr into every later request until compaction, while the full
+      output is already retained as artifacts the model can `read`.
+      Unreal returns 40,000 characters of head and tail by default and
+      lets the model ask for more per call. First record the
+      distribution of shell output sizes on the bench tasks, then compare
+      smaller combined budgets across both streams on billed input
+      tokens and on how often the model reads the retained output back,
+      since each read costs a round. As in item 39, a budget counts only
+      if the task outcome matches the current one.
+
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
 
