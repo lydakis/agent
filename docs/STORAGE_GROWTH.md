@@ -203,6 +203,14 @@ the remaining copies are small shell prompts. Artifact logical bytes stay
 data are preserved. The original transcript remains the long-term growth
 source; cold-history storage and a corrected hour-long soak remain follow-ups.
 
+The per-slice regression screen, 32 agents on the socket transport in echo
+mode with all built-in tool schemas, two alternating pairs of three measured
+runs each, `69bd0dd` (binary `d333e1d4`) against the final tree (`218a3729`):
+peak RSS 18.39 and 18.34 MiB baseline against 18.05 and 17.94 candidate,
+daemon CPU 0.351 and 0.343 s against 0.337 and 0.339 s, turn p95 593.0 and
+588.4 ms against 593.7 and 588.9 ms. Medians are within each other's ranges;
+this shows no measurable cost on the common path, not a speedup.
+
 Validation: 118 Rust tests, 66 focused Python tests, strict runtime Clippy,
 formatting, and the SQL plan audit pass. New regressions exercise Unicode/NUL
 prompts, idempotency, queue/steer/restart, deletion with a surviving fork,

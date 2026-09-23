@@ -438,8 +438,14 @@ daemon RSS separately from its descendant tree, and tree thread counts.
 
 ```sh
 .local/venv/bin/python -m bench.lifecycle --transport socket --agents 32 \
-  --mode shell --tools echo,shell,read,write,edit --out .local/bench/socket-32
+  --mode echo --tools echo,shell,read,write,edit --out .local/bench/socket-32
 ```
+
+This is the per-slice regression screen, and it runs in echo mode: shell
+mode at 32 agents puts a shell and its child under the daemon for every
+turn, 65 processes at once, which exceeds the observer's 48-process limit
+and fails the run before the turns complete. Use `--agents 8` for shell
+mode, or `--mode echo` at 32.
 
 The observer/controller and provider are separate from the charged native
 process plus its descendants. Sampling is every 200 ms, including recursive child
