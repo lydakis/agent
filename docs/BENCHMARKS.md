@@ -90,7 +90,10 @@ It is a fixed screening experiment: 1, 8, and 32 agents; 4 KiB and
 turn, spaced 25 ms apart. Histories grow across turns. It runs engines sequentially,
 alternates their order across cases, and takes three measured fresh-process runs
 after one excluded run for each engine/case. Each run has a 30-second timeout,
-512 MiB sampled RSS guard per tree, and 16-process guard. Counters are sampled
+512 MiB sampled RSS guard per tree (2048 MiB for every engine when opencode is
+selected; see below), and 16-process guard. Claude Code runs one native process
+per agent, so its guards are that RSS guard and 16 processes per agent (see
+[Claude Code adapter](#claude-code-adapter)). Counters are sampled
 every 100 ms and trees discovered every 500 ms. A failed run stops the matrix. Cross-engine output is exploratory and omits
 percentage rankings because the loaded capabilities and execution boundaries differ.
 
@@ -118,14 +121,15 @@ This is comparable conversation work, not complete feature parity or default CLI
 performance. Full access is configured inside the caller's existing permissions.
 
 Engine subprocesses get a small environment allowlist and fresh private HOME,
-CODEX_HOME, and workspace folders under the ignored capture. Personal credentials,
+CODEX_HOME, CLAUDE_CONFIG_DIR, and workspace folders under the ignored capture
+(Claude Code's workspace is outside the repository; see below). Personal credentials,
 proxies, Node injection options, and user configuration are not forwarded. Native
 synthetic state may remain in these folders. Raw target output remains suppressed;
 adapter failures record only static diagnostic categories. Binary custom commands
 retain the separate caller-environment behavior described above.
 
-Provenance records Node version/hash, Pi versions/lock hash or Codex version/native
-binary hash, and a fingerprint of benchmark Python, adapter sources, and lockfiles.
+Provenance records Node version/hash, Pi versions/lock hash or Codex or Claude Code
+version/native binary hash, and a fingerprint of benchmark Python, adapter sources, and lockfiles.
 Rust records its version, release binary SHA-256, and Cargo.lock SHA-256. The
 Rust engine has no benchmark entry point: the runner starts `agent serve` on a
 fresh store bound to the synthetic provider and drives its stdio JSONL protocol
@@ -187,6 +191,238 @@ The release-source reference identifies the upstream tag, not a reproducible
 build attestation for the downloaded npm artifact.
 
 See [FX measurements](FX_MEASUREMENTS.md) for observations and contribution ideas.
+
+The [five-harness screen](HARNESS_MEASUREMENTS.md) runs this matrix across
+Agent, Pi, Codex, opencode, and Claude Code on one Linux host.
+
+## opencode adapter
+
+Added 2026-09-23. The pinned release is npm `opencode-ai` **1.18.32**, whose
+upstream tag `v1.18.32` is commit `545f51d26cc39a907d2867492d498d9607ea5fa4`
+in github.com/anomalyco/opencode (formerly sst/opencode). The native
+`opencode-linux-x64` executable from that release had SHA-256
+`513f500a1a5ea1dc7d865547ac87b32a8936334e8d5abd5b3ff585c45a170080` when installed
+on 2026-09-23. It is installed privately under the ignored `.local`, not in the
+adapter lockfile:
+
+```sh
+npm install --prefix .local/opencode --ignore-scripts opencode-ai@1.18.32
+AGENT_BENCH_TEST_OPENCODE=1 .local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --engine opencode --out .local/bench/opencode
+.local/venv/bin/python -m bench.matrix --engines rust pi codex opencode --out .local/bench/opencode-matrix
+```
+
+The runner measures the platform package's native binary
+(`opencode-<os>-<arch>/bin/opencode`), not the npm launcher. It checks the
+package versions and `--version` output against the pin and records the binary
+hash. Only the default glibc/AVX2 build is accepted; baseline and musl variants
+fail explicitly. The upstream tag identifies the source, not a reproducible build
+of the npm artifact.
+
+**Arrangement.** `bench/adapters/opencode.mjs` starts one `opencode serve --pure`
+on loopback with a random per-run basic-auth password. It creates one session
+per agent over the documented HTTP API and subscribes once to the server's
+`/event` SSE stream. Each turn is one `POST /session/:id/message` naming a
+benchmark agent. Text deltas come from `message.part.delta` events on that
+stream and are checked against the returned message. The turn must finish
+with `stop`, no error, no tool part, and exactly the scripted text. Any
+session error or retry status fails the run. The adapter uses Node's built-in
+`fetch`; there is no SDK dependency. **Node and the opencode server are both
+charged to the target**, as are opencode's short-lived `git` helpers. Validated
+runs peaked at two to four target processes. No `opencode run` process per agent
+is used.
+
+**Provider and wire format.** A custom provider uses opencode's bundled
+`@ai-sdk/openai` package with `baseURL` pointed at the fixture, so requests go to
+the unchanged Responses fixture at `/v1/responses`. There is no Chat Completions
+path. opencode sends `store: false`, a `prompt_cache_key` equal to the session
+ID, `max_output_tokens`, and the full prior conversation. The fixture validates
+that conversation on every request, as for the other engines.
+
+**Private state and what is disabled.** The adapter keeps the runner's private
+HOME and adds private XDG config, data, cache, and state folders. It writes its
+config file inside the capture, passed via `OPENCODE_CONFIG`. Project config and
+`.claude` prompt/skill discovery are disabled. The following are also off:
+
+- autoupdate, sharing, snapshots, LSP, and formatters;
+- MCP servers (none are configured) and plugins (`--pure`, default plugins off);
+- external skills, the embedded web UI, and the file watcher;
+- the models.dev catalog fetch;
+- auto-compaction and pruning (in config and by flag).
+
+opencode exports OpenTelemetry only when OTLP environment variables are set, and
+the runner's environment allowlist excludes them. The benchmark agent replaces
+opencode's provider system prompt with the shared instruction. Its permission
+`"*": "deny"` removes every tool schema from the request. Disabled does not
+prove unallocated.
+
+**Side requests.** Sessions are created with explicit titles, and opencode only
+generates a title for sessions with a default title. Validated runs therefore
+made no title or summary model call. The provider counted exactly
+agents × turns requests, all benchmark turns. An unexpected extra model request
+would fail the fixture's transcript check, failing the run rather than being
+hidden. strace on 2026-09-23 found one non-model side request that no setting
+disables. Every instance boot starts a background npm install of
+`@opencode-ai/plugin` into the global config folder, which contacts the public
+registry. The adapter seeds the package manifest that an earlier install would
+leave, so opencode skips the install. The package itself is absent and is not
+loaded under `--pure`. With the manifest in place, the only sockets were loopback
+connections to the server and the fixture.
+
+**Known differences from the other engines.**
+
+- *Durability:* opencode writes sessions, messages, and parts to its own SQLite
+  database (WAL, `synchronous=NORMAL`) in the private data folder. The profile
+  records `sqlite_wal_synchronous_normal`. This is neither Pi/Codex/FX's
+  ephemeral state nor Rust's FULL durability. The undocumented in-memory
+  database flag is not used.
+- *Project:* opencode walks up to the nearest `.git`, adopts that repository as
+  its project, and writes a project-id file into its git folder. Captures live
+  inside this repository, so the adapter first runs `git init` on the private
+  workspace. opencode then runs about eighteen `git` probe processes at boot.
+  Other adapters' handling of the enclosing repository was not checked here.
+- *System context:* opencode appends its environment block to the shared
+  instruction. The block covers the model ID, the absolute workspace path, git
+  status, platform, and date. Request bytes therefore vary slightly with the
+  capture path length.
+- *Lazy boot:* `ready` is emitted after server start, event subscription, and
+  session creation. The first prompt still triggers opencode's deferred
+  instance initialization, about 1.5 to 2 s on the validation host. That time
+  falls inside first-turn latency.
+- *Event fan-in:* one global SSE stream carries every session's events,
+  including part and status updates the adapter ignores.
+- *Retries:* opencode's session retry with backoff is available. The adapter
+  fails on any retry status, and the fixture rejects repeated turns.
+- *Memory guard:* the single Bun server exceeds the matrix's 512 MiB guard even
+  with one agent. `bench.matrix` therefore raises the guard to 2048 MiB for
+  every engine in a matrix that includes opencode, because `compare` requires
+  identical limits. The 16-process guard is unchanged. The guard is a safety
+  stop, not a measured quantity.
+
+Sanity check on the 4-core, 16 GiB development VM (2026-09-23, not a quiet
+machine; exploratory, no ranking). These figures are descriptive only:
+
+| Workload | Runs | Sampled peak target RSS | Observed target CPU |
+| --- | --- | --- | --- |
+| `smoke.json` (4 agents, 4 KiB) | 3 measured | 605–679 MiB | 7.0–7.3 s |
+| c32-h65536 | 3 measured | 920–973 MiB | 14.5–15.4 s |
+
+All of these runs completed every turn, reached full provider concurrency, and
+had no invalid requests.
+
+## Claude Code adapter
+
+Added 2026-09-23. Claude Code is pinned to **2.1.267** (the npm `stable` dist-tag
+that day) and installed under the ignored `.local`, not in the tracked lockfile:
+
+```sh
+npm install --prefix .local/claude-code --save-exact @anthropic-ai/claude-code@2.1.267
+AGENT_BENCH_TEST_CLAUDE_CODE=1 .local/venv/bin/python -m unittest discover -s tests -v
+.local/venv/bin/python -m bench run --engine claude-code --out .local/bench/claude-code
+.local/venv/bin/python -m bench.matrix --engines rust claude-code --out .local/bench/claude-code-matrix
+```
+
+The runner measures the platform package's native executable
+(`@anthropic-ai/claude-code-<platform>/claude`, a Bun-compiled binary), never the
+wrapper package or an npm launcher. It fails if the wrapper or native package
+version differs from the pin, or if more than one native package is present.
+Provenance records the native binary SHA-256, `claude --version`, the platform
+package name, the `.local/claude-code/package-lock.json` SHA-256, and Node's
+version/hash. On linux-x64 the pinned binary's SHA-256 was
+`0399c793ff571d5946ef923d80b4f330d05ac4b6842a6b0775468f5d389403c0`.
+
+**Arrangement.** Claude Code's normal deployment is one CLI process per session;
+the Agent SDK also spawns one CLI process per query. The adapter
+(`bench/adapters/claude-code.mjs`) therefore starts one long-lived `claude`
+process per agent and drives it over the SDK's stdio protocol:
+`-p --input-format stream-json --output-format stream-json --verbose
+--include-partial-messages`. Readiness is every process answering the SDK
+`initialize` control request. All of an agent's turns go to its own process and
+session, so the process retains and resends history itself. Turns complete on a
+successful `result` with `end_turn`; text comes from `text_delta` stream events.
+Any tool, permission, subagent or non-text event fails the run. The Node adapter,
+every CLI process, and their short-lived children are charged to the target.
+This is the cost of the tested deployment arrangement, not a per-agent
+allocation count or a shared-process design Claude Code does not offer.
+
+**What is disabled.** Each process runs with `--bare` (no hooks, LSP, plugin
+sync, auto-memory, background prefetches, keychain reads, or CLAUDE.md
+discovery), `--tools ""`, `--strict-mcp-config`, `--no-session-persistence`,
+`--permission-prompts none`, `--model bench-model`, and `--system-prompt` set to
+the shared benchmark instruction. The environment is the runner's allowlist plus
+fresh private `HOME` and `CLAUDE_CONFIG_DIR` folders in the capture, a synthetic
+`ANTHROPIC_API_KEY`, and `ANTHROPIC_BASE_URL` pointing at the fixture. The CLI
+finds the enclosing repository from its working directory with its own file walk
+(not stopped by `GIT_CEILING_DIRECTORIES`) and then runs `git status` and
+`git log` there; since captures live inside this repository, every process runs
+in one empty directory under the system temporary folder, removed at exit.
+These documented variables are
+set: `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY`,
+`DISABLE_ERROR_REPORTING`, `DISABLE_UPDATES`, `DISABLE_AUTO_COMPACT`,
+`CLAUDE_CODE_MAX_RETRIES=0`, and `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK`
+(names checked against the [environment variable
+reference](https://code.claude.com/docs/en/env-vars) on 2026-09-23). Disabled
+features are not proven unallocated. Machine-wide managed settings
+(`/etc/claude-code/managed-settings.json` on Linux) still apply by design; the
+validation host had none.
+
+**Fixture.** `--protocol anthropic_messages` accepts `POST /v1/messages` (with
+or without `?beta=true`) and streams `message_start`, `content_block_start`,
+`content_block_delta`/`text_delta`, `content_block_stop`, `message_delta` with
+`end_turn`, and `message_stop`. `bench/anthropic.py` converts the request to the
+shared Responses `Transcript`, which rejects retries, missing or cross-agent
+history, and overlapping turns exactly as for the other engines. Tool
+definitions, tool-use/result, thinking, and image blocks are rejected. Output
+text and per-delta delays are identical to the Responses and Gateway fixtures.
+
+**Side requests.** Traced with `strace` against a logging endpoint on
+2026-09-23. Without the switches above, the CLI made per-turn title-generation
+model calls, connected to external HTTPS hosts, and ran IDE-detection (`ps`),
+`rg`, and git probes. With them, every remaining request is:
+
+- One `HEAD /api/hello` per process: a connection warm-up the CLI fires when no
+  proxy is configured. The fixture answers `200` with an empty body and counts it
+  in `preconnect_requests`. It is excluded from `requests`/`completed_requests`
+  but its connection is included in `connections_used`, so Claude Code uses about
+  two connections per agent.
+- Three short-lived `git` processes per CLI process at startup (remote and
+  settings-tracking probes), which find no repository in the empty workspace.
+  They remain in the target tree and its CPU. Inside a repository the CLI ran
+  seven per process, including `status` and `log`.
+
+No external connection and no read of the enclosing repository was observed
+with these settings. Any other request fails
+the run as an invalid fixture request rather than being answered silently.
+
+**Known differences from the other engines.**
+
+- One OS process per agent (plus the Node adapter). Pi, Rust and FX use one
+  process; Codex uses two. Sampled RSS sums per-process pages, so shared binary
+  pages are counted once per process; this is neither PSS nor private memory.
+- Native request context remains: a billing-header system block and an SDK
+  identity line precede the benchmark instruction; the first user message
+  carries a date reminder block before the synthetic prompt. The fixture ignores
+  this native context, as it does for Codex. Requests also carry
+  `thinking: adaptive`, an effort level, context-management edits, and Claude Code
+  beta headers; the fixture never returns thinking.
+- `bench-model` is unknown to the CLI (it logs `unrecognized_model` to the
+  suppressed stderr); model-specific context and capability defaults apply.
+- Anthropic Messages framing and terminal events differ from Responses and
+  Gateway, so request/response body bytes are not equivalent.
+  `bench compare --exploratory` permits this protocol difference and lists it.
+- The CLI writes `.claude.json` and backups under its private config folder; no
+  transcript is persisted.
+- Guards scale per agent: `bench.matrix` passes `512 x agents` MiB and
+  `16 x agents` processes for Claude Code. Sampled peaks on 2026-09-23 reached
+  40 to 58 target processes at 32 agents, counting git probes, and roughly 200 MiB
+  RSS per CLI process, far above the shared-process guard. Compatibility
+  records therefore differ in `rss_limit_mib` and `process_limit`; exploratory
+  comparisons list that as a gap, and matched comparisons reject it.
+- Startup is concurrent process launch: at 32 agents on a 4-CPU host, `ready`
+  took several seconds and the host CPU was saturated during launch. Readiness,
+  first-chunk and turn timings include that contention. In one excluded warmup
+  on that host only 30 of 32 streams overlapped at the provider; a measured run
+  like that makes `compare`, and so the matrix, fail closed.
 
 ## Live fleet check
 

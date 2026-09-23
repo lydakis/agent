@@ -1,4 +1,4 @@
-"""Loopback binary fixture and a deliberately narrow Responses SSE fixture."""
+"""Loopback binary fixture and deliberately narrow model SSE fixtures."""
 
 import argparse
 import asyncio
@@ -8,7 +8,7 @@ import signal
 
 from .config import workload
 from .responses import Frames, Transcript
-from . import gateway
+from . import anthropic, gateway
 
 
 async def headers(reader):
@@ -29,6 +29,9 @@ async def serve(config, stats_path, protocol="binary"):
              "output_text_bytes": 0, "invalid_requests": 0}
     if protocol == 'gateway':
         stats.update(catalog_requests=0, catalog_response_body_bytes=0)
+    if protocol == 'anthropic_messages':
+        # Connection warm-up requests, not inference; counted, never hidden.
+        stats.update(preconnect_requests=0)
     transcript = Transcript(config)
     active = 0
     handlers = set()
@@ -57,9 +60,21 @@ async def serve(config, stats_path, protocol="binary"):
                         stats['connections_used'] += 1
                         counted_connection = True
                     continue
-                route = {'binary': '/stream', 'responses': '/v1/responses',
-                         'gateway': '/v1/gateway'}[protocol]
-                if line != f"POST {route} HTTP/1.1" or "transfer-encoding" in fields:
+                if protocol == 'anthropic_messages' and line == anthropic.PRECONNECT:
+                    if 'transfer-encoding' in fields or int(fields.get('content-length', 0)) != 0:
+                        raise ValueError('unexpected preconnect body')
+                    writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n')
+                    await writer.drain()
+                    stats['preconnect_requests'] += 1
+                    if not counted_connection:
+                        stats['connections_used'] += 1
+                        counted_connection = True
+                    continue
+                routes = {'binary': ('/stream',), 'responses': ('/v1/responses',),
+                          'gateway': ('/v1/gateway',),
+                          'anthropic_messages': anthropic.ROUTES}[protocol]
+                if (line not in [f"POST {route} HTTP/1.1" for route in routes]
+                        or "transfer-encoding" in fields):
                     raise ValueError("unsupported fixture request")
                 size = int(fields["content-length"])
                 limit = config["history_bytes"] + 128 if protocol == "binary" else 16 * 1024 * 1024
@@ -69,6 +84,8 @@ async def serve(config, stats_path, protocol="binary"):
                 request = json.loads(body)
                 if protocol == 'gateway':
                     agent, turn = transcript.accept(gateway.normalize(request, fields))
+                elif protocol == 'anthropic_messages':
+                    agent, turn = transcript.accept(anthropic.normalize(request))
                 elif protocol == "responses":
                     agent, turn = transcript.accept(request)
                 elif request != {"history": "x" * config["history_bytes"]}:
@@ -91,6 +108,8 @@ async def serve(config, stats_path, protocol="binary"):
                     writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
                                  b"Content-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")
                     source = (gateway.Frames(config) if protocol == 'gateway'
+                              else anthropic.Frames(config, agent, turn)
+                              if protocol == 'anthropic_messages'
                               else Frames(config, agent, turn))
                     frames = ((delay, (("" if protocol == 'gateway' else "event: " + event["type"] + "\n") + "data: " +
                                json.dumps(event, separators=(",", ":")) + "\n\n").encode())
@@ -151,6 +170,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--workload", required=True)
     parser.add_argument("--stats", required=True)
-    parser.add_argument("--protocol", choices=("binary", "responses", "gateway"), default="binary")
+    parser.add_argument("--protocol", choices=("binary", "responses", "gateway", "anthropic_messages"), default="binary")
     args = parser.parse_args()
     asyncio.run(serve(workload(args.workload), args.stats, args.protocol))

@@ -8,11 +8,38 @@ import sys
 
 from .report import compare
 
+# Sampled-RSS guard per target tree, in MiB. opencode's one Bun server exceeds
+# 512 MiB with a single agent (about 0.8 GiB at c1 and 1.0 GiB at c32-h65536,
+# observed 2026-09-23). compare() requires identical limits, so every engine in
+# a matrix runs under the largest guard among the selected engines.
+RSS_GUARD_MIB = {'opencode': 2048}
+DEFAULT_RSS_GUARD_MIB = 512
+PROCESS_GUARD = 16
+
+
+def rss_guard(engines):
+    return max(RSS_GUARD_MIB.get(engine, DEFAULT_RSS_GUARD_MIB) for engine in engines)
+
+
+# Engines whose normal deployment is one native process per agent session.
+PROCESS_PER_AGENT = {'claude-code'}
+
+
+def guards(engine, concurrency, rss_mib=DEFAULT_RSS_GUARD_MIB):
+    """Sampled RSS (MiB) and process-count guards for one target tree.
+
+    The 512 MiB / 16-process guard bounds a shared-process target. A
+    process-per-agent engine gets the same guard per agent process tree,
+    so the guard scales with concurrency instead of failing by construction.
+    """
+    scale = concurrency if engine in PROCESS_PER_AGENT else 1
+    return rss_mib * scale, PROCESS_GUARD * scale
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--engines", nargs='+', choices=('pi', 'codex', 'rust', 'fx'),
+    parser.add_argument("--engines", nargs='+', choices=('pi', 'codex', 'rust', 'fx', 'opencode', 'claude-code'),
                         default=['pi', 'codex', 'rust'])
     args = parser.parse_args()
     print('Exploratory cross-engine screen: unequal feature footprints; no efficiency ranking.', flush=True)
@@ -23,6 +50,9 @@ def main():
     if Path.cwd() != root or not output.is_relative_to(root / '.local'):
         parser.error('run from the repository root with a new output under .local')
     output.mkdir(parents=True, exist_ok=False)
+    guard = rss_guard(args.engines)
+    if guard != DEFAULT_RSS_GUARD_MIB:
+        print(f'RSS guard raised to {guard} MiB per tree for every engine in this matrix.', flush=True)
     results = []
     # Freeze the screening conditions before interpreting results. These are
     # exploration bounds, not a claim that 32 agents meets product capacity.
@@ -36,11 +66,12 @@ def main():
         # Alternate order across cases. Targets never run concurrently.
         for engine in (args.engines if index % 2 == 0 else list(reversed(args.engines))):
             print(f'{name}: {engine}', flush=True)
+            rss_limit, process_limit = guards(engine, concurrency, guard)
             command = [sys.executable, '-m', 'bench', 'run', '--engine', engine,
                        '--out', str(output / f'{name}-{engine}'),
                        '--workload', str(workload_path), '--repeat', '3', '--warmup', '1',
                        '--timeout', '30', '--interval', '.1', '--discovery-interval', '.5',
-                       '--rss-limit-mib', '512', '--process-limit', '16']
+                       '--rss-limit-mib', str(rss_limit), '--process-limit', str(process_limit)]
             code = subprocess.call(command)
             if code:
                 print('Matrix stopped on a failed case; partial captures retained.', file=sys.stderr)
