@@ -192,6 +192,9 @@ build attestation for the downloaded npm artifact.
 
 See [FX measurements](FX_MEASUREMENTS.md) for observations and contribution ideas.
 
+The [five-harness screen](HARNESS_MEASUREMENTS.md) runs this matrix across
+Agent, Pi, Codex, opencode, and Claude Code on one Linux host.
+
 ## opencode adapter
 
 Added 2026-09-23. The pinned release is npm `opencode-ai` **1.18.32**, whose

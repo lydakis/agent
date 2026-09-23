@@ -162,11 +162,29 @@ through one API key at the provider's own rate with no failures
 ([live fleet check](docs/LIVE_FLEET.md)). Those were short-context turns: they
 show a lightweight runtime, not coding-agent capacity at that scale.
 
-The [performance tools](docs/BENCHMARKS.md) run Agent, Pi, and Codex against the
-same synthetic provider. Their features differ (Agent keeps a durable store; the
-baselines run ephemeral), so cross-engine numbers are exploratory observations,
-not rankings. [docs/](docs) holds the design record and measurements behind
-every decision.
+The same synthetic conversation work through five harnesses, 32 agents at once,
+each doing three turns that add 64 KiB of text and stream back 5 KiB
+([full screen](docs/HARNESS_MEASUREMENTS.md), 2026-09-23, 4-vCPU Linux VM,
+medians of three runs):
+
+| Harness | Peak memory | CPU time | Turn p99 |
+| --- | ---: | ---: | ---: |
+| Agent | 22 MiB | 0.6 s | 0.62 s |
+| Pi 0.85.1 | 164 MiB | 1.3 s | 0.70 s |
+| Codex 0.153.1 | 244 MiB | 24.9 s | 5.9 s* |
+| opencode 1.18.32 | 927 MiB | 14.4 s | 3.3 s |
+| Claude Code 2.1.267 | 6,494 MiB | 23.8 s | 1.8 s |
+
+Read this as an exploratory screen, not a ranking. The harnesses do different
+amounts of work: Agent commits every turn to SQLite, opencode keeps its own
+store, and the others hold conversations in memory; no tools were called.
+Claude Code runs one process per agent, and its memory is summed across those
+processes. Turn time includes 0.5 s of scripted streaming.
+\* Codex reached only 10 to 18 of the 32 concurrent streams on this machine.
+
+The [performance tools](docs/BENCHMARKS.md) reproduce these runs against the
+same synthetic provider, and [docs/](docs) holds the design record and
+measurements behind every decision.
 
 ## Status
 
