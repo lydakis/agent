@@ -513,6 +513,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
+33. Several daemons, moving bots, and watching them: a
+    [roadmap](MULTI_DAEMON.md) for watching a bot without disturbing it
+    (including a transcript summary), a daemon per workspace, one client over
+    several daemons, and moving a bot to another machine. Nothing is built.
+    All four share one first step, a store identity announced in `ready`,
+    because every id the daemon hands out today is per store. The roadmap
+    orders them by how much new semantics each needs, starting with a read
+    of the compaction summary and a client-side digest. Moving a bot starts
+    as a cross-store fork before any move semantics. Placement, file copying,
+    and network transport stay with callers and SSH, as the README's scope
+    says.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

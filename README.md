@@ -75,6 +75,7 @@ Agent does not provide a sandbox.
 - [Runtime investigation](docs/RUNTIMES.md): evidence, alternatives, and gaps.
 - [Prime Intellect investigation](docs/PRIME_INTELLECT.md): Prime Agent, long-history design, and evaluation-tool reuse.
 - [Next decisions](docs/NEXT.md): remaining implementation and measurement work.
+- [Several daemons](docs/MULTI_DAEMON.md): roadmap for watching bots without disturbing them, per-workspace daemons, one client over several daemons, and moving a bot between machines.
 - [Rust prototype](docs/RUST_PROTOTYPE.md): build, protocol, storage, and limits.
 - [Client policy](docs/CLIENT.md): what human-facing clients tell a new bot, the preamble, AGENTS.md discovery and skills, shared by the CLI (`--agents`) and the app.
 - [Desktop client](docs/APP.md): `agent-app`, the Thread design in a Tauri window over the daemon's socket protocol, with a demo mode for design work and an offline playground, and why ACP and a binary framing were not adopted for the client path.
