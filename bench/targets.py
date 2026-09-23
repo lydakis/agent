@@ -7,12 +7,22 @@ import platform
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from .profiles import profile
 
 
 def file_hash(path):
     with Path(path).open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+CLAUDE_CODE_VERSION = '2.1.267'
+# Native wire protocol each engine speaks to the synthetic provider.
+PROTOCOLS = {'fx': 'gateway', 'claude-code': 'anthropic_messages'}
+
+
+def engine_protocol(engine):
+    return PROTOCOLS.get(engine, 'responses')
 
 
 def clean_env():
@@ -78,15 +88,73 @@ def engine_target(engine, root, binary=None):
         executable = Path(executable).resolve()
         if executable.suffix == ".js":
             # npm packaging: measure the native server directly, no npm launcher.
+            # Nested (older npm) or flat (sibling platform package) layouts.
             candidates = list(executable.parent.parent.glob(
-                "node_modules/@openai/codex-*/vendor/*/bin/codex"))
+                "node_modules/@openai/codex-*/vendor/*/bin/codex")) or list(
+                executable.parent.parent.parent.glob("codex-*/vendor/*/bin/codex"))
             if len(candidates) != 1:
                 raise ValueError("cannot unambiguously locate the native Codex executable")
             executable = candidates[0]
         metadata["codex_sha256"] = file_hash(executable)
         metadata["codex_version"] = subprocess.check_output([str(executable), "--version"],
             env=clean_env(), text=True, stderr=subprocess.DEVNULL, timeout=5).strip()
+    elif engine == "opencode":
+        executable = opencode_executable(root)
+        metadata.update(opencode_sha256=file_hash(executable), opencode_package=executable.parent.parent.name,
+                        opencode_release_source_revision=OPENCODE_SOURCE_REVISION,
+                        durability="sqlite_wal_synchronous_normal")
+        # Private empty HOME: the version probe must not read personal configuration.
+        with tempfile.TemporaryDirectory(dir=root / ".local") as home:
+            metadata["opencode_version"] = subprocess.check_output(
+                [str(executable), "--version"], env={**clean_env(), "HOME": home},
+                cwd=home, text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        if metadata["opencode_version"] != OPENCODE_VERSION:
+            raise ValueError("opencode native version differs from benchmark pin")
+    elif engine == "claude-code":
+        # Pinned npm install under .local; measure the platform package's native
+        # executable directly, never the wrapper package's launcher.
+        modules = root / ".local/claude-code/node_modules/@anthropic-ai"
+        wrapper = modules / "claude-code/package.json"
+        if not wrapper.exists():
+            raise ValueError("install the pinned Claude Code package under .local/claude-code first")
+        if json.loads(wrapper.read_text())["version"] != CLAUDE_CODE_VERSION:
+            raise ValueError("Claude Code installed version differs from benchmark pin")
+        candidates = [path / "claude" for path in modules.glob("claude-code-*")
+                      if (path / "claude").is_file()
+                      and json.loads((path / "package.json").read_text())["version"] == CLAUDE_CODE_VERSION]
+        if len(candidates) != 1:
+            raise ValueError("cannot unambiguously locate the native Claude Code executable")
+        executable = candidates[0].resolve()
+        metadata["claude_code_package"] = executable.parent.name
+        metadata["claude_code_sha256"] = file_hash(executable)
+        metadata["claude_code_lock_sha256"] = file_hash(root / ".local/claude-code/package-lock.json")
+        metadata["claude_code_version"] = subprocess.check_output([str(executable), "--version"],
+            env=clean_env(), text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+        if not metadata["claude_code_version"].startswith(CLAUDE_CODE_VERSION + " "):
+            raise ValueError("Claude Code executable version differs from benchmark pin")
     return command, metadata, str(executable) if executable else None
+
+
+# Tag v1.18.32 at github.com/anomalyco/opencode (formerly sst/opencode).
+OPENCODE_VERSION = "1.18.32"
+OPENCODE_SOURCE_REVISION = "545f51d26cc39a907d2867492d498d9607ea5fa4"
+
+
+def opencode_executable(root):
+    """The pinned npm release's native binary, not its launcher."""
+    modules = root / ".local/opencode/node_modules"
+    launcher = modules / "opencode-ai/package.json"
+    if not launcher.exists() or json.loads(launcher.read_text())["version"] != OPENCODE_VERSION:
+        raise ValueError(f"install opencode-ai@{OPENCODE_VERSION} under .local/opencode first")
+    arch = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "AMD64": "x64"}.get(platform.machine())
+    system = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
+    # The default (glibc, AVX2) build only; baseline and musl variants fail explicitly.
+    package = modules / f"opencode-{system}-{arch}"
+    executable = package / "bin/opencode"
+    if (not (package / "package.json").exists() or not executable.exists()
+            or json.loads((package / "package.json").read_text())["version"] != OPENCODE_VERSION):
+        raise ValueError("pinned opencode native executable unavailable on this platform")
+    return executable
 
 
 def validate_responses_workload(config):
