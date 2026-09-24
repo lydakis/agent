@@ -76,14 +76,18 @@ either of two checks fails. The store file's device and inode must match
 the pair recorded last time, which catches a copy or a move across
 filesystems. The instance id must also match a copy kept outside the
 database, in a sidecar file next to the store (like the existing
-`.owner-lock`), which catches a backup restored in place: that keeps
-device and inode but brings back an older instance id than the sidecar
-holds. A restart or a rename in place keeps the instance. Anything that must
+`.owner-lock`), which catches a restore of a backup taken under an
+earlier instance. A restart or a rename in place keeps the instance.
+Neither check catches a backup taken under the current instance and
+written back over the same file: device, inode, and id all still match.
+So a restore must replace the store file rather than overwrite it, which
+gives it a new inode and a new instance; an `agent restore` helper that
+writes beside the store and renames over it makes that the easy path, and
+overwriting a live store's file in place is unsupported. Anything that must
 name exactly one store, such as a client's state key or a move's
 destination, uses the instance id. A block-level clone of a whole disk or
-machine, or a restore that also brings back the sidecar, keeps both and
-is not detected; that is out of scope
-and stated as such.
+machine keeps device, inode, and sidecar and is not detected either; both
+exceptions are out of scope and stated as such.
 
 ## 1. Watch a bot without disturbing it
 
@@ -505,7 +509,12 @@ carrying it over.
    (nodes are shared with the source's other forks, so they are copied, not
    moved), the bot row, turns with their request ids (so a retried
    submission stays idempotent at the target), tool intents, completed
-   process results, artifacts, and note and compaction versions. Two kinds
+   process results, artifacts, note and compaction versions, and the
+   `checkpoints` rows. Those rows are where `validate_fork_point` stops
+   walking back (at `e1d413f`: `src/store/db.rs:2718-2742`), so without
+   them a fork at an older imported completion would re-walk the whole
+   transcript before it. Import remaps each row's head to the new node
+   id. Two kinds
    of records are part of the store's contract, so the bundle cannot treat
    them as optional:
    - **Outcome events.** A finished turn's result is rebuilt from its
@@ -761,13 +770,15 @@ carrying it over.
 ### Order
 
 1. Store identity, lineage and instance. Behavior tests: a restart keeps
-   the instance, and a copied store file and a backup restored in place
-   each announce a new one.
+   the instance, and a copied store file, a restore through the helper,
+   and a restore of a backup from an earlier instance each announce a new
+   one.
 2. Export of an idle root bot with no running processes, and import as a
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
-   `result` and artifact reads answer for imported turns, with the
-   checkpoint and steer ids in `result` rewritten to target ids, prune and delete
+   `result` answers for imported turns, with the checkpoint and steer ids
+   rewritten to target ids, a fork from an older imported completion stops
+   at its imported checkpoint, prune and delete
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
    of it, one-bot or `follow *`, replays the `imported` event and no false
@@ -778,9 +789,15 @@ carrying it over.
    each fail the export or import explicitly.
 3. The alias decision for artifact references, with a test that reads one
    written before the move, and store-qualified handles, so that bots with
-   truncated tool output or delegation can move.
+   retained tool output or delegation can move. Until this step, the
+   first slice refuses every bot with a retained artifact, because a
+   tool result always names its retained streams as `TURN/CALL_ID/STREAM`
+   in the stored item (`src/server/turn.rs:1423-1440`).
 4. A representation for fork ancestry, so forks can be imported.
-5. Move bound to one destination instance, with `moving` and tombstone
+5. Drain to a round boundary for a running bot, with the durable
+   `drained` status. Behavior tests: a drained turn stays parked across a
+   restart, and undraining it on the same store returns it to `ready`.
+6. Move bound to one destination instance, with `moving` and tombstone
    states and `bot_moved` answers. Behavior tests: a copy of the
    destination refuses the bundle, and after export a cancel without the
    destination's refusal is refused. A drained turn stays parked across a
@@ -791,7 +808,6 @@ carrying it over.
    renamed destination bot, and a follower attached before the move
    receives the `bot_moved` event. A paced turn resumes at the target with a
    fresh per-call retry budget.
-6. Drain to a round boundary for a running bot.
 7. Moving a parent together with the children it waits on.
 
 ## Combined order
@@ -807,7 +823,7 @@ carrying it over.
 | `fork` with a tool selection | watching, move | protocol |
 | One-versus-N daemon screen | per-workspace | bench |
 | Export and import as a cross-store fork | move | store, protocol |
-| Move semantics, then drain | move | store, turn loop |
+| Drain, then move semantics | move | turn loop, store |
 
 Not planned here: a network listener in the daemon, daemon-to-daemon
 connections, starting daemons on other machines, copying workspaces, or
