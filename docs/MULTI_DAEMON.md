@@ -215,6 +215,12 @@ source's rows unchanged.
    validated the way `create` validates it. Heterogeneous forks want this
    anyway. With it, "fork at the current node with no tools, ask it to
    summarize" becomes a safe recipe for a model-written summary on demand.
+   "No tools" must mean no calls, not no definitions: the Messages family
+   needs the definitions for historical tool blocks, which is why
+   compaction keeps the bot's encoded selection and sets `tool_choice` to
+   none (at `e1d413f`: `src/server/turn.rs:469-473`). An empty selection
+   does the same: it keeps the inherited schemas in the request and
+   forbids new calls.
    The caller deletes the fork afterwards.
 6. **Read-only access, once another principal needs it.** A second socket
    that serves only the observe set, with its own file permissions, so the
@@ -240,10 +246,13 @@ source's rows unchanged.
 
 ### Order
 
-1. The `summary` read, plus the observe capability.
-2. The client digest in the CLI (JSON), then in the app.
-3. The observer reader, then replay pages on it, measured on the
-   slow-follower and mixed-workload screens (NEXT items 16 and 18).
+1. The observer reader with bounded, non-blocking admission, then replay
+   pages and the rest of the observe set on it, measured on the
+   slow-follower and mixed-workload screens (NEXT items 16 and 18). It
+   comes first because the reads below would otherwise use the two paths
+   that already disturb bots, the context reader and the worker.
+2. The `summary` read on it, plus the observe capability.
+3. The client digest in the CLI (JSON), then in the app.
 4. `fork` with a tool selection, and the summary-fork recipe, with the
    cache-hit ratio measured.
 5. A read-only socket, only when a second principal appears.
@@ -509,17 +518,18 @@ carrying it over.
      optional, since followers' cursors do not survive anyway. The bot
      row's `pruned_cursor` is in the source's cursor space, and
      `event_page` compares every request against it (at `e1d413f`:
-     `src/store/db.rs:2921-2939`), so import does not copy it. It sets it
-     in the target's space: to the last imported cursor when the bundle
-     omits any of the bot's events, so a follower is told the replay is
-     partial, and to 0 only when the bundle carries the whole log. That
-     covers one-bot follows only: `follow *` checks the store-wide
-     watermark in `event_retention` (`src/store/db.rs:2927-2933`), and
-     raising that for one import would report false gaps for every other
-     bot. So import also writes an `imported` event for the bot, before
-     its imported events, naming the source lineage and instance and
-     whether the bundle omitted events. Fleet followers see the gap in
-     band, where they already read everything else.
+     `src/store/db.rs:2921-2939`), so import does not copy it. Nor does it
+     use that watermark for the omitted history: a watermark above
+     retained events makes every replay page before it report
+     `pruned_before`, and a client resuming from it would skip the
+     imported outcome events. The watermark stays 0, since the bot has no
+     target events before its import, and the gap goes in band instead.
+     Import writes an `imported` event for the bot, before its imported
+     events, naming the source lineage and instance and whether the
+     bundle omitted events. One-bot and `follow *` followers both replay
+     it, and the store-wide watermark in `event_retention`
+     (`src/store/db.rs:2927-2933`) stays untouched, so no other bot sees a
+     false gap.
    - **Retained-turn ownership.** `prune` and bounded deletion find a bot's
      operational records through `retained_turns` (at `8ebbc44`:
      `src/store/db.rs:454`, read at `src/store/db.rs:2777` and
@@ -642,7 +652,12 @@ carrying it over.
    and the imported bot's name and id. The name matters because import may
    use a new name to avoid a collision, and retrying the old name at the
    destination could reach a different bot. A later submission is answered
-   with that, never `bot_not_found` or a fresh bot. Before a bundle has been written, cancelling just clears `moving`.
+   with that, never `bot_not_found` or a fresh bot. Followers attached
+   before the receipt learn it too: tombstoning writes a durable
+   `bot_moved` event with the same destination details, which live
+   followers receive and later replays show. Deletion today only sends a
+   live, non-durable `deleted` notice (`src/server/mod.rs:1119`), which a
+   follower that reconnects would miss. Before a bundle has been written, cancelling just clears `moving`.
    After that, the source cannot tell a lost receipt from an import that
    never happened, since no daemon talks to another. So cancelling then
    needs the destination's refusal: the caller asks the named destination
@@ -755,8 +770,8 @@ carrying it over.
    checkpoint and steer ids in `result` rewritten to target ids, prune and delete
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
-   of it, one-bot or `follow *`, reports a gap only where the bundle
-   omitted events, a
+   of it, one-bot or `follow *`, replays the `imported` event and no false
+   `pruned_before`, a
    submission and a prune racing a paged export yield exactly the cut, and
    a missing provider, compaction provider, or tool, fork ancestry, a
    handle or artifact reference in the transcript, or a running process
@@ -773,7 +788,8 @@ carrying it over.
    under its mapped workspace and checked model, and a move whose bot is
    awaited by a source parent is refused. A client `wait` registered
    before the move is answered with `bot_moved`, and `bot_moved` names a
-   renamed destination bot. A paced turn resumes at the target with a
+   renamed destination bot, and a follower attached before the move
+   receives the `bot_moved` event. A paced turn resumes at the target with a
    fresh per-call retry budget.
 6. Drain to a round boundary for a running bot.
 7. Moving a parent together with the children it waits on.
@@ -783,11 +799,11 @@ carrying it over.
 | Step | Serves | Changes |
 | --- | --- | --- |
 | Store identity in `ready` | all four | store, `ready` |
+| Observer reader and the observe set on it, measured | watching | daemon |
 | `summary` read, observe capability | watching | store read, protocol |
 | Client digest (CLI, then app) | watching | client only |
 | Client store discovery | per-workspace | client only |
 | `--daemon` endpoint list, then app view | several daemons | client only |
-| Observer reader and replay pages on it, measured | watching | daemon |
 | `fork` with a tool selection | watching, move | protocol |
 | One-versus-N daemon screen | per-workspace | bench |
 | Export and import as a cross-store fork | move | store, protocol |
