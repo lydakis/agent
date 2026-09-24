@@ -434,16 +434,20 @@ impl Failure {
         if value["type"] != "error" {
             return failure;
         }
-        // An `error` event ends the request before any output.
+        // An `error` event ends the request before any output. Its code is
+        // nested under `error` or, as the stream parser also accepts, at the
+        // top level.
         failure.refused = true;
-        let quota = [&value["error"]["code"], &value["error"]["type"]]
-            .iter()
-            .any(|field| field.as_str() == Some("insufficient_quota"));
+        let code = value["error"]["code"]
+            .as_str()
+            .or_else(|| value["code"].as_str());
+        let quota = code == Some("insufficient_quota")
+            || value["error"]["type"].as_str() == Some("insufficient_quota");
         if quota {
             failure.error.code = "provider_quota_exhausted".into();
             return failure;
         }
-        match value["error"]["code"].as_str() {
+        match code {
             Some("previous_response_not_found") => {
                 failure.error = Error::new("provider_previous_response_not_found");
                 return failure;
@@ -555,6 +559,13 @@ mod tests {
         );
         assert_eq!(missing.error.code, "provider_previous_response_not_found");
         assert!(!missing.dead);
+        for top in [
+            r#"{"type":"error","code":"previous_response_not_found","message":"Previous response with id 'resp_1' not found."}"#,
+            r#"{"type":"error","code":"websocket_connection_limit_reached","message":"Reconnect."}"#,
+        ] {
+            let failure = Failure::event(Error::new("provider_incomplete"), top);
+            assert_ne!(failure.error.code, "provider_incomplete", "{top}");
+        }
         let expired = Failure::event(
             Error::new("provider_incomplete"),
             r#"{"type":"error","status":400,"error":{"code":"websocket_connection_limit_reached"}}"#,
