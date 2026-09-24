@@ -168,8 +168,14 @@ source's rows unchanged.
    reader: that one thread also streams context into model requests, so
    moving replay there only moves the stall from commits to request
    construction. They go to a second read-only connection that serves
-   observers alone (replay pages, `events`, `history_*`, `item`, and the
-   `summary` read), while the context reader keeps serving turns. SQLite in
+   observers alone, while the context reader keeps serving turns. It takes
+   every read in the observe set: replay pages, `events`, `history_*`,
+   `item`, the `summary` read, and also `bots`, `turns`, `result`, and
+   `artifact`, which run on the worker today (at `e1d413f`:
+   `src/server/mod.rs:1066-1071`, `1168-1179`, `1254-1260`, `1325-1346`). Leaving those
+   there would keep digests and retained-output reads queued ahead of fleet
+   commits. `wait` stays on the worker, since it decides against the write
+   that completes a handle. SQLite in
    WAL mode lets both read concurrently. The observer reader has a bounded
    queue and each connection keeps at most one page in flight, so many
    observers slow each other, not the watched bots. The acceptance check is
@@ -472,7 +478,13 @@ carrying it over.
      the `tool_completed` event that names the output's node
      (`src/store/db.rs:3206-3222`). The bundle carries these events for every
      turn it carries, under new cursors. The rest of the replay log is
-     optional, since followers' cursors do not survive anyway.
+     optional, since followers' cursors do not survive anyway. The bot
+     row's `pruned_cursor` is in the source's cursor space, and
+     `event_page` compares every request against it (at `e1d413f`:
+     `src/store/db.rs:2921-2939`), so import does not copy it. It sets it
+     in the target's space: to the last imported cursor when the bundle
+     omits any of the bot's events, so a follower is told the replay is
+     partial, and to 0 only when the bundle carries the whole log.
    - **Retained-turn ownership.** `prune` and bounded deletion find a bot's
      operational records through `retained_turns` (at `8ebbc44`:
      `src/store/db.rs:454`, read at `src/store/db.rs:2777` and
@@ -582,8 +594,14 @@ carrying it over.
    store-qualified, a parked turn's handle into its own store still
    resolves at the target only if the whole subtree moves together, a
    parent with the children it waits on. Otherwise import refuses with the
-   handles named. Paced turns move freely, since their pacing state is per
-   daemon and is relearned.
+   handles named. Deadlines in a parked turn are absolute times on the
+   source's clock (at `e1d413f`: `src/store/db.rs:2510-2545`), and a
+   restarted daemon puts a paced turn's deadline straight into its pacing
+   heap (`src/server/mod.rs:593-598`, `633-635`). So import does not copy
+   them. A paced turn is requeued at the target as due now, and the
+   destination provider's gate decides when it runs; its retry and
+   attempt counts carry over. A `wait` deadline moves as the time that
+   remained at export.
 
 ### Risks
 
@@ -638,7 +656,8 @@ carrying it over.
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
    `result` and artifact reads answer for imported turns, prune and delete
-   work on imported records, the imported bot has no creator, a
+   work on imported records, the imported bot has no creator, a follow
+   of it reports a gap only where the bundle omitted events, a
    submission and a prune racing a paged export yield exactly the cut, and
    a missing provider, compaction provider, or tool, fork ancestry, a
    handle in the transcript, or a running process each fail the export or
