@@ -30,6 +30,8 @@ pub struct State {
     item_bytes: usize,
     completion: Option<Completion>,
     usage: Option<Usage>,
+    /// The completed response's id, for a socket's `previous_response_id`.
+    id: Option<String>,
 }
 
 impl State {
@@ -73,6 +75,7 @@ impl State {
                     streamed,
                     &self.text,
                     &mut self.usage,
+                    &mut self.id,
                 )?);
                 Ok(Frame::Quiet)
             }
@@ -118,6 +121,13 @@ impl State {
     pub fn usage(&self) -> Option<Usage> {
         self.usage.clone()
     }
+    /// The terminal event arrived; a socket reads no further for this call.
+    pub fn done(&self) -> bool {
+        self.completion.is_some()
+    }
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
     pub fn finish(self) -> Result<Completion> {
         self.completion.ok_or(Error::new("missing_completion"))
     }
@@ -125,7 +135,7 @@ impl State {
 
 #[cfg(test)]
 fn parse_completion(raw: &RawValue, streamed: &str) -> Result<Completion> {
-    parse_completion_with_usage(raw, Vec::new(), streamed, &mut None)
+    parse_completion_with_usage(raw, Vec::new(), streamed, &mut None, &mut None)
 }
 
 fn parse_completion_with_usage(
@@ -133,9 +143,12 @@ fn parse_completion_with_usage(
     streamed_items: Vec<Bytes>,
     streamed: &str,
     reported: &mut Option<Usage>,
+    id: &mut Option<String>,
 ) -> Result<Completion> {
     #[derive(Deserialize)]
     struct Response<'a> {
+        #[serde(default, borrow)]
+        id: Option<Cow<'a, str>>,
         status: &'a str,
         #[serde(borrow)]
         output: Vec<&'a RawValue>,
@@ -143,6 +156,7 @@ fn parse_completion_with_usage(
     }
     let response: Response<'_> = serde_json::from_str(raw.get())?;
     *reported = response.usage.as_ref().map(parse_usage);
+    *id = response.id.map(Cow::into_owned);
     if response.status != "completed" {
         return fail("provider_incomplete");
     }

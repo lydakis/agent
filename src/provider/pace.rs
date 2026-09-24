@@ -340,6 +340,12 @@ impl Pace {
         // It parks and releases the gate; queued callers then observe the block.
         self.changed.notify_one();
     }
+    /// Learn the allowance from headers that precede every call they could
+    /// count, such as a WebSocket upgrade's. Outstanding reservations stay
+    /// reserved and are settled by their own usage.
+    pub fn seed(&self, headers: &reqwest::header::HeaderMap, family: super::Family) {
+        self.learn(headers, family, [0; DIMS], 0);
+    }
     /// Learn the allowance from a response's rate-limit headers, per
     /// dimension the provider publishes. Returns which token dimensions
     /// accounted for and released this estimate. Request reservations are
@@ -994,6 +1000,28 @@ mod tests {
         );
         call.settle(10);
         assert_eq!(pace.snapshot().3, 760.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seeded_headers_leave_the_call_in_flight_to_its_usage() {
+        let pace = Pace::default();
+        let family = crate::codec::Family::Responses;
+        let call = sent(&pace, 100).await.unwrap();
+        // An upgrade response reports the balance before this call was sent.
+        pace.seed(
+            &headers(&[
+                ("x-ratelimit-limit-requests", "10"),
+                ("x-ratelimit-remaining-requests", "10"),
+                ("x-ratelimit-limit-tokens", "1000"),
+                ("x-ratelimit-remaining-tokens", "1000"),
+            ]),
+            family,
+        );
+        assert_eq!(pace.snapshot().1, 9.0);
+        assert_eq!(pace.snapshot().3, 900.0);
+        call.settle(300);
+        assert_eq!(pace.snapshot().1, 9.0);
+        assert_eq!(pace.snapshot().3, 700.0);
     }
 
     #[tokio::test(start_paused = true)]

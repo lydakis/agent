@@ -263,6 +263,7 @@ class SocketAndCliTests(ModelFixture):
         # A stated value the daemon does not serve fails before any submission.
         for flags, named in ((('--provider', 'openai=responses,http://127.0.0.1:1/v1'), '--provider openai'),
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
+                             (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
                              (('--max-pending', '5'), '--max-pending'),
                              (('--note-turns', '5'), '--note-turns'),
