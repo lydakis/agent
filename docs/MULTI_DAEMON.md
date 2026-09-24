@@ -97,7 +97,7 @@ These operations write nothing:
 | `events`, `follow` (one bot or `*`) | Durable event log, then live deltas | worker for replay pages; hub for live |
 | `history_nodes`, `history_items`, `item` | The transcript itself | storage reader |
 | `artifact` | Full retained tool output | storage worker |
-| `stats` | Daemon-wide live state | service loop |
+| `stats` | Daemon-wide live state | service loop, plus a storage-worker count (at `e1d413f`: `src/server/mod.rs:1188-1194`) |
 
 (`src/server/mod.rs:87-172`; routing at `src/server/mod.rs:1005-1280`.)
 
@@ -177,9 +177,11 @@ source's rows unchanged.
    construction. They go to a second read-only connection that serves
    observers alone, while the context reader keeps serving turns. It takes
    every read in the observe set: replay pages, `events`, `history_*`,
-   `item`, the `summary` read, and also `bots`, `turns`, `result`, and
-   `artifact`, which run on the worker today (at `e1d413f`:
-   `src/server/mod.rs:1066-1071`, `1168-1179`, `1254-1260`, `1325-1346`). Leaving those
+   `item`, the `summary` read, and also `bots`, `turns`, `result`,
+   `artifact`, and the store counts behind `stats`, which run on the
+   worker today (at `e1d413f`:
+   `src/server/mod.rs:1066-1071`, `1168-1179`, `1188-1194`, `1254-1260`,
+   `1325-1346`). Leaving those
    there would keep digests and retained-output reads queued ahead of fleet
    commits. `wait` stays on the worker, since it decides against the write
    that completes a handle. SQLite in
@@ -498,7 +500,14 @@ carrying it over.
      `src/store/db.rs:2921-2939`), so import does not copy it. It sets it
      in the target's space: to the last imported cursor when the bundle
      omits any of the bot's events, so a follower is told the replay is
-     partial, and to 0 only when the bundle carries the whole log.
+     partial, and to 0 only when the bundle carries the whole log. That
+     covers one-bot follows only: `follow *` checks the store-wide
+     watermark in `event_retention` (`src/store/db.rs:2927-2933`), and
+     raising that for one import would report false gaps for every other
+     bot. So import also writes an `imported` event for the bot, before
+     its imported events, naming the source lineage and instance and
+     whether the bundle omitted events. Fleet followers see the gap in
+     band, where they already read everything else.
    - **Retained-turn ownership.** `prune` and bounded deletion find a bot's
      operational records through `retained_turns` (at `8ebbc44`:
      `src/store/db.rs:454`, read at `src/store/db.rs:2777` and
@@ -608,9 +617,11 @@ carrying it over.
    own identity, idempotently by nonce, so a caller that loses an import
    response and retries against another machine is refused there. The
    target's receipt, carried back by the caller, turns the source into a
-   tombstone that answers `bot_moved` with the destination's identity. A
-   later submission is answered with that, never `bot_not_found` or a fresh
-   bot. Before a bundle has been written, cancelling just clears `moving`.
+   tombstone that answers `bot_moved` with the destination's instance id
+   and the imported bot's name and id. The name matters because import may
+   use a new name to avoid a collision, and retrying the old name at the
+   destination could reach a different bot. A later submission is answered
+   with that, never `bot_not_found` or a fresh bot. Before a bundle has been written, cancelling just clears `moving`.
    After that, the source cannot tell a lost receipt from an import that
    never happened, since no daemon talks to another. So cancelling then
    needs the destination's refusal: the caller asks the named destination
@@ -645,10 +656,11 @@ carrying it over.
    `src/server/handles.rs:106`, `144-150`). A source parent parked on a
    moving child's unfinished turn would never see it finish. So a move
    refuses while any source turn waits on one of the moving bot's turns,
-   naming the waiters, unless they move together. Any waiter that attaches
-   after that, such as a client `wait`, is answered with an explicit
-   `bot_moved` outcome when the source becomes a tombstone, never left
-   waiting.
+   naming the waiters, unless they move together. Client `wait`s are not
+   turns and are not refused. When the source becomes a tombstone, every
+   waiter still registered on the moved bot's turns, whether it attached
+   before the move or during it, is answered with the same `bot_moved`
+   outcome, never left waiting.
 
 ### Risks
 
@@ -708,7 +720,8 @@ carrying it over.
    `result` and artifact reads answer for imported turns, prune and delete
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
-   of it reports a gap only where the bundle omitted events, a
+   of it, one-bot or `follow *`, reports a gap only where the bundle
+   omitted events, a
    submission and a prune racing a paged export yield exactly the cut, and
    a missing provider, compaction provider, or tool, fork ancestry, a
    handle in the transcript, or a running process each fail the export or
@@ -722,7 +735,9 @@ carrying it over.
    destination refuses the bundle, and after export a cancel without the
    destination's refusal is refused. A drained turn resumes at the target
    under its mapped workspace and checked model, and a move whose bot is
-   awaited by a source parent is refused.
+   awaited by a source parent is refused. A client `wait` registered
+   before the move is answered with `bot_moved`, and `bot_moved` names a
+   renamed destination bot.
 6. Drain to a round boundary for a running bot.
 7. Moving a parent together with the children it waits on.
 
