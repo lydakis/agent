@@ -59,6 +59,7 @@ impl Transport {
                 // No total deadline: long generations are legitimate. Idle
                 // reads are bounded so a stalled stream cannot hold a turn.
                 let client = reqwest::Client::builder()
+                    .user_agent(concat!("agent-runtime/", env!("CARGO_PKG_VERSION")))
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
@@ -458,6 +459,7 @@ impl Provider {
             .post(self.url.clone())
             .header("content-type", "application/json")
             .header("content-length", len)
+            .header("accept", "text/event-stream")
             .body(body);
         http = match (self.family, &self.key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
@@ -511,13 +513,29 @@ impl Provider {
             });
         }
         reservation.learn(response.headers(), self.family);
-        if response
+        let content_type = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if content_type
+            .as_deref()
             .is_none_or(|v| v.split(';').next() != Some("text/event-stream"))
         {
-            return fail("provider_expected_sse");
+            // Name what came instead, and the message it carried when the
+            // body is a short error, so a gateway's refusal is diagnosable.
+            let body = error_body(response).await.and_then(|body| body.detail);
+            let detail = [
+                Some(format!(
+                    "content-type {}",
+                    content_type.as_deref().unwrap_or("none")
+                )),
+                body,
+            ];
+            return Err(Error::with(
+                "provider_expected_sse",
+                detail.into_iter().flatten().collect::<Vec<_>>().join(": "),
+            ));
         }
         let mut stream = response.bytes_stream();
         let mut decoder = Decoder::default();
@@ -1001,8 +1019,45 @@ mod tests {
             head.contains("\r\nchatgpt-account-id: synthetic-account\r\n"),
             "{head}"
         );
+        assert!(head.contains("\r\naccept: text/event-stream\r\n"), "{head}");
+        assert!(head.contains("\r\nuser-agent: agent-runtime/"), "{head}");
         let anthropic = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None);
         assert!(anthropic.unwrap().with_account("w".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_success_without_a_stream_names_what_came_instead() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let body = r#"{"detail":"x","error":{"message":"Unsupported client"}}"#;
+            let _ = socket
+                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_expected_sse");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("content-type application/json: Unsupported client")
+        );
     }
 
     #[test]
