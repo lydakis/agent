@@ -82,7 +82,7 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid and a log file of its output are returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Use detach for a server or service that must keep running, and stop it yourself with kill.",
+                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
                 "background":{"type":"boolean"},"detach":{"type":"boolean"}},
@@ -941,10 +941,11 @@ fn sh(
     process
 }
 
-/// Start a command in a new session with its output appended to a log file,
-/// for a service that must outlive the turn and the daemon. No process slot,
-/// group kill, or handle applies to it; tokio reaps it if it exits while the
-/// daemon runs.
+/// Start a command in a new session for a service that must outlive the
+/// turn and the daemon. Its output is discarded: a log the daemon wrote would
+/// bypass credential redaction, so a command that wants one redirects itself.
+/// No process slot, group kill, or handle applies to it; tokio reaps it if it
+/// exits while the daemon runs.
 #[cfg(unix)]
 fn detach(
     command: &str,
@@ -952,19 +953,12 @@ fn detach(
     registry: &Registry,
     environment: &[(String, String)],
 ) -> Result<Outcome> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let log = std::env::temp_dir().join(format!(
-        "agent-detached-{}-{}.log",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let file = std::fs::File::create(&log)?;
+    use std::process::Stdio;
     let mut process = sh(command, workspace, registry, environment);
     process
-        .stdin(std::process::Stdio::null())
-        .stdout(file.try_clone()?)
-        .stderr(file);
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     // SAFETY: setsid is async-signal-safe and touches no parent state.
     unsafe {
         process.pre_exec(|| {
@@ -976,7 +970,7 @@ fn detach(
     }
     let pid = process.spawn()?.id();
     Ok(Outcome::text(
-        json!({"detached":true,"pid":pid,"log":log}).to_string(),
+        json!({"detached":true,"pid":pid}).to_string(),
     ))
 }
 
@@ -1050,14 +1044,17 @@ async fn shell(
         Err(_) => {
             // What the group wrote before it was killed is still in the pipes.
             // A process that left the group may hold them open, so the drain
-            // is bounded too.
-            let _ = tokio::time::timeout(Duration::from_millis(100), async {
+            // is bounded too. Overflowing the output limit still fails the tool.
+            if let Ok(Err(error)) = tokio::time::timeout(Duration::from_millis(100), async {
                 tokio::try_join!(
                     bounded_read(&mut stdout, &mut out),
                     bounded_read(&mut stderr, &mut err)
                 )
             })
-            .await;
+            .await
+            {
+                return Err(error);
+            }
             Ok((out, err, Exit::TimedOut))
         }
     }

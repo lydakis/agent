@@ -179,8 +179,9 @@ pub(crate) fn context_prefix(
 /// models bind each thinking block to the exact conversation before it and
 /// reject a replayed block whose earlier history changed, so blocks written
 /// before the request's leading context last changed are sent without it.
-/// `None` when the item is not an assistant message with thinking, or has
-/// nothing else to keep (an empty message is invalid). Deterministic: the
+/// `None` when the item is not an assistant message with thinking; empty
+/// when thinking is all it holds, since an empty message is invalid and the
+/// item is then left out of the request. Deterministic: the
 /// store records the bytes this removes when the item is written, so a
 /// request knows its length before reading it.
 pub fn without_thinking(item: &[u8]) -> Option<Vec<u8>> {
@@ -211,8 +212,11 @@ pub fn without_thinking(item: &[u8]) -> Option<Vec<u8>> {
                 .is_ok_and(|b| matches!(b.kind, "thinking" | "redacted_thinking"))
         })
         .collect();
-    if kept.is_empty() || kept.len() == message.content.len() {
+    if kept.len() == message.content.len() {
         return None;
+    }
+    if kept.is_empty() {
+        return Some(Vec::new());
     }
     let mut out = Vec::with_capacity(item.len());
     out.extend_from_slice(b"{\"content\":[");
@@ -226,9 +230,14 @@ pub fn without_thinking(item: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Bytes `without_thinking` removes from an item, recorded when it is stored.
+/// Bytes a request saves when it sends an item without thinking, recorded
+/// when the item is stored. A left-out item also takes its comma separator.
 pub fn thinking_bytes(item: &[u8]) -> usize {
-    without_thinking(item).map_or(0, |kept| item.len() - kept.len())
+    match without_thinking(item) {
+        None => 0,
+        Some(kept) if kept.is_empty() => item.len() + 1,
+        Some(kept) => item.len() - kept.len(),
+    }
 }
 
 /// Stable pinned blocks retain their own Anthropic cache breakpoints.
@@ -246,7 +255,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thinking_is_removed_only_from_assistant_items_that_keep_something() {
+    fn thinking_is_removed_only_from_assistant_items() {
         let item = br#"{"content":[{"type":"thinking","thinking":"plan","signature":"s"},{"type":"redacted_thinking","data":"x"},{"type":"tool_use","id":"t","name":"echo","input":{"text":"thinking\""}}],"role":"assistant"}"#;
         let kept = without_thinking(item).unwrap();
         assert_eq!(
@@ -254,9 +263,10 @@ mod tests {
             br#"{"content":[{"type":"tool_use","id":"t","name":"echo","input":{"text":"thinking\""}}],"role":"assistant"}"#
         );
         assert_eq!(thinking_bytes(item), item.len() - kept.len());
-        // Only thinking: removing it would leave an invalid empty message.
+        // Only thinking: the item is left out, with its separator.
         let alone = br#"{"content":[{"type":"thinking","thinking":"a","signature":"s"}],"role":"assistant"}"#;
-        assert_eq!(without_thinking(alone), None);
+        assert_eq!(without_thinking(alone), Some(Vec::new()));
+        assert_eq!(thinking_bytes(alone), alone.len() + 1);
         // A user item that mentions thinking is left alone, as is one without it.
         let user = br#"{"content":[{"type":"text","text":"\"thinking\""}],"role":"user"}"#;
         assert_eq!(thinking_bytes(user), 0);

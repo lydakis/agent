@@ -332,7 +332,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 stop = 'end_turn'
             else:
                 user = last['content'][0]['text']
-                if user.startswith('tool:'):
+                if user == 'think-only':
+                    stop = 'end_turn'
+                elif user.startswith('tool:'):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
                     stop = 'tool_use'
                 else:

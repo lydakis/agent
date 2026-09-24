@@ -97,6 +97,35 @@ fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
     out
 }
 
+/// Stored items read batch by batch and joined by commas. A batch can come
+/// back empty when every item in it held only replayed thinking, so the
+/// separator goes only between batches that carry something.
+fn item_chunks(
+    store: Store,
+    chunks: Vec<Vec<i64>>,
+    floor: i64,
+) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    let mut started = false;
+    stream::iter(chunks)
+        .then(move |chunk| {
+            let store = store.clone();
+            async move {
+                store
+                    .read("items_by_ids", move |db| db.items_by_ids(&chunk, floor))
+                    .await
+                    .map_err(|error| std::io::Error::other(error.code))
+            }
+        })
+        .map(move |bytes| {
+            let mut bytes = bytes?;
+            if started && !bytes.is_empty() {
+                bytes.insert(0, b',');
+            }
+            started |= !bytes.is_empty();
+            Ok(Bytes::from(bytes))
+        })
+}
+
 /// The Responses prompt-cache key for a bot's calls: the store id of the bot
 /// whose cache it shares (its own, or a fork's source) under a nonce drawn
 /// once per daemon, so bots of different stores (every Harbor
@@ -457,27 +486,15 @@ impl Turn {
             .filter(|(id, _)| **id < floor)
             .map(|(_, &bytes)| bytes as usize)
             .sum();
-        let total = prefix.len()
+        let total = (prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
-            + ids.len().saturating_sub(1)
-            - stripped;
-        let store = self.store.clone();
-        let chunks = batches(ids, sizes);
-        let body = stream::iter([Ok(prefix)]).chain(
-            stream::iter(chunks.into_iter().enumerate()).then(move |(index, chunk)| {
-                let store = store.clone();
-                async move {
-                    let mut bytes = store
-                        .read("items_by_ids", move |db| db.items_by_ids(&chunk, floor))
-                        .await
-                        .map_err(|error| std::io::Error::other(error.code))?;
-                    if index != 0 {
-                        bytes.insert(0, b',');
-                    }
-                    Ok(Bytes::from(bytes))
-                }
-            }),
-        );
+            + ids.len().saturating_sub(1))
+        .saturating_sub(stripped);
+        let body = stream::iter([Ok(prefix)]).chain(item_chunks(
+            self.store.clone(),
+            batches(ids, sizes),
+            floor,
+        ));
         Items {
             bytes: total,
             stream: body.boxed(),
@@ -749,25 +766,13 @@ impl Turn {
         } else {
             0
         };
-        let total = total - stripped;
-        let store = self.store.clone();
-        let batches = batches(&plan.ids, &plan.sizes);
+        let total = total.saturating_sub(stripped);
         let body = stream::iter([Ok(Bytes::from(head))])
-            .chain(
-                stream::iter(batches.into_iter().enumerate()).then(move |(index, chunk)| {
-                    let store = store.clone();
-                    async move {
-                        let mut bytes = store
-                            .read("items_by_ids", move |db| db.items_by_ids(&chunk, i64::MAX))
-                            .await
-                            .map_err(|error| std::io::Error::other(error.code))?;
-                        if index != 0 {
-                            bytes.insert(0, b',');
-                        }
-                        Ok(Bytes::from(bytes))
-                    }
-                }),
-            )
+            .chain(item_chunks(
+                self.store.clone(),
+                batches(&plan.ids, &plan.sizes),
+                i64::MAX,
+            ))
             .chain(stream::iter([Ok(Bytes::from(tail))]));
         Ok(Items {
             bytes: total,

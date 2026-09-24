@@ -297,7 +297,7 @@ async fn read_distinguishes_long_lines_from_eof_and_keeps_pages_bounded() {
 }
 
 #[tokio::test]
-async fn detached_commands_run_in_their_own_session_and_log_their_output() {
+async fn detached_commands_run_in_their_own_session_and_write_only_where_told() {
     let tools = Registry::new("echo,shell").unwrap();
     assert!(
         tools
@@ -307,27 +307,24 @@ async fn detached_commands_run_in_their_own_session_and_log_their_output() {
             )
             .is_err()
     );
+    let dir = std::env::temp_dir().join(format!("agent-detach-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let prepared = tools
         .prepare(
             "shell",
-            &json!({"command":"echo up; exec sleep 30","detach":true}).to_string(),
+            &json!({"command":"echo lost; echo up > up.log; exec sleep 30","detach":true})
+                .to_string(),
         )
         .unwrap();
-    let output: Value = serde_json::from_str(
-        &tools
-            .execute(prepared, &std::env::temp_dir(), &[])
-            .await
-            .unwrap()
-            .output,
-    )
-    .unwrap();
+    let output: Value =
+        serde_json::from_str(&tools.execute(prepared, &dir, &[]).await.unwrap().output).unwrap();
+    assert_eq!(output.as_object().unwrap().len(), 2);
     let pid = output["pid"].as_i64().unwrap() as i32;
-    let log = std::path::PathBuf::from(output["log"].as_str().unwrap());
     // Its own session, so no group kill of the calling command reaches it.
     assert_eq!(unsafe { libc::getsid(pid) }, pid);
     let mut logged = String::new();
     for _ in 0..100 {
-        logged = std::fs::read_to_string(&log).unwrap();
+        logged = std::fs::read_to_string(dir.join("up.log")).unwrap_or_default();
         if !logged.is_empty() {
             break;
         }
@@ -338,5 +335,5 @@ async fn detached_commands_run_in_their_own_session_and_log_their_output() {
     unsafe {
         libc::kill(pid, libc::SIGKILL);
     }
-    std::fs::remove_file(log).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -1534,25 +1534,28 @@ impl Database {
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
     /// Items joined by commas; those with ids below `floor` go without
-    /// their thinking blocks.
+    /// their thinking blocks, and one that held only thinking is left out.
     pub fn items_by_ids(&self, ids: &[i64], floor: i64) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
             .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
         let mut out = Vec::new();
-        for (index, id) in ids.iter().enumerate() {
-            if index != 0 {
-                out.push(b',');
-            }
+        for id in ids {
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
-                match (*id < floor && r.get::<_, i64>(1)? > 0)
+                let item = match (*id < floor && r.get::<_, i64>(1)? > 0)
                     .then(|| super::without_thinking(item))
                     .flatten()
                 {
-                    Some(kept) => out.extend_from_slice(&kept),
-                    None => out.extend_from_slice(item),
+                    // Thinking was all it held: left out.
+                    Some(kept) if kept.is_empty() => return Ok(()),
+                    Some(kept) => std::borrow::Cow::Owned(kept),
+                    None => std::borrow::Cow::Borrowed(item),
+                };
+                if !out.is_empty() {
+                    out.push(b',');
                 }
+                out.extend_from_slice(&item);
                 Ok(())
             })?;
         }

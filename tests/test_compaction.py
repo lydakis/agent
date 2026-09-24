@@ -506,6 +506,21 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertTrue(all(self.thinking(m) for m in alice['messages'] if m['role'] == 'assistant'))
         self.assertFalse(any(self.thinking(m) for m in carol['messages']))
 
+    def test_an_answer_of_only_thinking_is_left_out_once_its_context_changes(self):
+        client = self.anthropic(('--context-bytes', '65536'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        self.turn(client, 'Bob', 0, 'think-only')
+        self.turn(client, 'Bob', 1, 'after')
+        bob = self.requests()[-1]
+        # Under unchanged context the answer goes back as it was written.
+        self.assertEqual([self.thinking(m) for m in bob['messages']], [0, 1, 0])
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
+        self.turn(client, 'Carol', 'c', 'other')
+        carol = self.requests()[0]
+        self.assertEqual(self.model.binding_errors, [])
+        self.assertFalse(any(self.thinking(m) for m in carol['messages']))
+        self.assertEqual([m['role'] for m in carol['messages']], ['user', 'user', 'assistant', 'user'])
+
     def test_thinking_the_provider_drops_is_reported_live(self):
         client = self.anthropic(())
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
