@@ -223,9 +223,19 @@ transport changed.
 
 `prompt_cache_key` lets OpenAI route requests with the same prefix to the same
 cache. The Harbor benchmark thread found that only 21% of this runtime's input
-hit OpenAI's prompt cache on a Terminal-Bench run against 94% for Codex, which
-sends its session id as the key, and is adding a per-bot key in its own
-change. The socket request is built from the same request fields as the HTTP
-body, so it carries the key once that lands. Both arms of the screen must
-send it: a cache hit-rate gap alone could explain much of the latency
-difference, and it would be credited to the wrong change.
+hit OpenAI's prompt cache on a Terminal-Bench run against 94% for Codex, and
+added a per-bot key in its own change (PR #12). That change reports two
+further facts: the key alone raised the hit rate only to 35% on the ChatGPT
+backend, and, per Codex's source as that thread read it, the ChatGPT backend
+takes cache affinity from a `session-id` request header, so PR #12 sends the
+key in that header too.
+
+On the socket, `prompt_cache_key` needs no work: the create event is built
+from the same request fields as the HTTP body, so it carries the key once
+PR #12 lands. The header does: a socket has one set of request headers, the
+upgrade's. Because each bot has its own connection, the bot's key can be sent
+as `session-id` on the upgrade, and every call on the connection carries it.
+That is wired when PR #12 is on main, since the key comes from that change.
+The screen must not run before both arms send the same key and header: a
+cache hit-rate gap alone could explain much of the latency difference, and it
+would be credited to the wrong change.
