@@ -513,23 +513,24 @@ impl Provider {
             });
         }
         reservation.learn(response.headers(), self.family);
+        let status = response.status().as_u16();
         let content_type = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        if content_type
+        // The ChatGPT Codex endpoint streams without naming a content type, so
+        // only a named non-stream type is refused; an unnamed body is decoded
+        // and fails as a truncated or incomplete stream if it is not one.
+        if let Some(content_type) = content_type
             .as_deref()
-            .is_none_or(|v| v.split(';').next() != Some("text/event-stream"))
+            .filter(|v| v.split(';').next() != Some("text/event-stream"))
         {
             // Name what came instead, and the message it carried when the
             // body is a short error, so a gateway's refusal is diagnosable.
             let body = error_body(response).await.and_then(|body| body.detail);
             let detail = [
-                Some(format!(
-                    "content-type {}",
-                    content_type.as_deref().unwrap_or("none")
-                )),
+                Some(format!("HTTP {status}, content-type {content_type}")),
                 body,
             ];
             return Err(Error::with(
@@ -1056,8 +1057,51 @@ mod tests {
         assert_eq!(error.code, "provider_expected_sse");
         assert_eq!(
             error.detail.as_deref(),
-            Some("content-type application/json: Unsupported client")
+            Some("HTTP 200, content-type application/json: Unsupported client")
         );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_names_no_content_type_is_still_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let body = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],",
+                "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+            );
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let completion = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(completion.items.len(), 1);
     }
 
     #[test]
