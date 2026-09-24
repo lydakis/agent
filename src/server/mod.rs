@@ -1093,6 +1093,7 @@ impl Service {
                     .op("inspect", move |db| Ok(db.inspect(&name)?.id))
                     .await?;
                 let (store, hub, output) = (store.clone(), self.hub.clone(), output.clone());
+                let providers = self.providers.clone();
                 self.retention.spawn(async move {
                     let result = async {
                         let mut deleted = json!({"turns":0,"events":0,"nodes":0});
@@ -1116,6 +1117,11 @@ impl Service {
                             if piece["done"] == true {
                                 break;
                             }
+                        }
+                        // Its connections go with it, and a later bot of the
+                        // same name starts on a fresh one.
+                        for provider in providers.values() {
+                            provider.forget(&bot);
                         }
                         // Followers learn the bot is gone; nothing durable remains to replay.
                         hub.live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))

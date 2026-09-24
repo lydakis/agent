@@ -139,7 +139,8 @@ a client attaching to a daemon compares it like the family and URL, and
 - One connection per bot, opened on its first call and kept between calls
   (`src/provider/socket.rs`). A task holding only a weak reference closes
   connections idle for 60 s or older than 55 minutes, checking every 5 s, and
-  a call never starts on one past that age. Lanes
+  a call never starts on one past that age. Deleting a bot closes its
+  connection at once. Lanes
   (`stream_id`) are not used: the guide does not show how events on a shared
   connection name their lane, Codex does not use them, and this thread has no
   key to find out. So a fleet holds one TLS connection per active bot rather
@@ -155,7 +156,10 @@ a client attaching to a daemon compares it like the family and URL, and
 - `previous_response_not_found` resends the full input on the same
   connection inside the same call, so it is not a retry. The refused
   continuation settles at zero, and the resend takes its own pacing
-  reservation, since the provider counts both as requests. A failure in the
+  reservation, since the provider counts both as requests. Any other
+  `error` event made no response, so the connection still holds the
+  previous one and the retry continues from it; every other failure sends
+  the next call in full. A failure in the
   middle of a response closes the connection, since its remaining events
   would reach the next call. `websocket_connection_limit_reached` becomes
   the retryable `provider_socket_expired`.
@@ -191,6 +195,9 @@ every continuation, a full resend with no retry after the server forgets a
 response, and the open-socket count. With continuation disabled it fails. A
 second test refuses the first upgrade with a 429 and `Retry-After: 1` and
 checks the turn waits it out; without the pacing it retries at once and fails.
+A third refuses a continuation with a 429 event and checks that the retry
+continues from the same response, and that deleting the bot closes its
+connection.
 
 ## Measurement plan
 

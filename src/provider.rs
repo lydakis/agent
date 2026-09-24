@@ -283,6 +283,13 @@ impl Provider {
         Ok(self)
     }
 
+    /// The bot was deleted; close its connection.
+    pub fn forget(&self, bot: &str) {
+        if let Some(sockets) = &self.sockets {
+            sockets.forget(bot);
+        }
+    }
+
     /// The bot recorded the response it was just given as these node ids.
     /// Its next window can then continue from that response.
     pub fn recorded(&self, bot: &str, ids: &[i64]) {
@@ -773,6 +780,7 @@ impl Provider {
                         previous: None,
                         skip: 0,
                     };
+                    session.completed(None, key, ids);
                     parser = responses::State::default();
                     // The refused continuation ran no inference, but it was
                     // a request, so the full send is paced as another. It
@@ -799,7 +807,7 @@ impl Provider {
                     reservation.learn(headers, self.family);
                 }
                 limit(pace, &failure);
-                session.completed(None, key, ids);
+                session.failed(&failure);
                 keep &= !failure.dead;
                 // A refusal ran no inference; anything else may have.
                 if failure.refused && report.usage.is_none() {

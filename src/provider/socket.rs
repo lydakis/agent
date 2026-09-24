@@ -138,6 +138,12 @@ impl Sockets {
         drop(closed);
     }
 
+    /// Close a deleted bot's connection now rather than at the next sweep.
+    pub(super) fn forget(&self, bot: &str) {
+        let closed = self.by_bot.lock().unwrap().remove(bot);
+        drop(closed);
+    }
+
     /// Take a bot's connection for one call, unless it is near the age limit.
     pub(super) fn take(&self, bot: &str) -> Option<Session> {
         let session = self.by_bot.lock().unwrap().remove(bot)?;
@@ -275,8 +281,21 @@ impl Sockets {
 impl Session {
     /// Continue from the previous response when this request has the same
     /// fields and context head and its window extends what the server saw.
-    pub(super) fn plan(&mut self, key: u64, ids: Option<&[i64]>) -> Plan {
-        plan(self.last.take(), key, ids)
+    pub(super) fn plan(&self, key: u64, ids: Option<&[i64]>) -> Plan {
+        plan(self.last.as_ref(), key, ids)
+    }
+
+    /// A failed call leaves nothing to continue from, unless the provider
+    /// refused it outright for another reason than a lost response: no
+    /// response was made, so the connection still holds the previous one and
+    /// a retry can continue from it.
+    pub(super) fn failed(&mut self, failure: &Failure) {
+        if !failure.refused
+            || failure.dead
+            || failure.error.code == "provider_previous_response_not_found"
+        {
+            self.last = None;
+        }
     }
 
     /// Remember a completed response. A request without window ids (a
@@ -469,13 +488,13 @@ impl Failure {
     }
 }
 
-fn plan(last: Option<Last>, key: u64, ids: Option<&[i64]>) -> Plan {
+fn plan(last: Option<&Last>, key: u64, ids: Option<&[i64]>) -> Plan {
     match (last, ids) {
         (Some(last), Some(ids))
             if last.armed && last.key == key && ids.starts_with(&last.baseline) =>
         {
             Plan {
-                previous: Some(last.response),
+                previous: Some(last.response.clone()),
                 skip: last.baseline.len(),
             }
         }
@@ -508,7 +527,7 @@ mod tests {
                 armed,
             })
         };
-        let continued = plan(last(true), 7, Some(&[1, 2, 3, 4]));
+        let continued = plan(last(true).as_ref(), 7, Some(&[1, 2, 3, 4]));
         assert_eq!(
             (continued.previous.as_deref(), continued.skip),
             (Some("resp_1"), 3)
@@ -523,7 +542,7 @@ mod tests {
             (last(true), 7, None),
             (None, 7, Some(&[1, 2, 3, 4][..])),
         ] {
-            let full = plan(last, key, ids);
+            let full = plan(last.as_ref(), key, ids);
             assert_eq!((full.previous, full.skip), (None, 0));
         }
     }

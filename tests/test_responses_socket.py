@@ -82,6 +82,10 @@ class Socket(socketserver.BaseRequestHandler):
                     self.server.requests.append((connection, body))
                     number = len(self.server.requests)
                     forget = number in self.server.forget
+                if number in self.server.limited:
+                    self.send({'type': 'error', 'status': 429, 'headers': {'retry-after': '0'}, 'error': {
+                        'type': 'requests', 'code': 'rate_limit_exceeded', 'message': 'Slow down.'}})
+                    continue
                 if forget and body.get('previous_response_id'):
                     self.send({'type': 'error', 'status': 400, 'error': {
                         'type': 'invalid_request_error', 'code': 'previous_response_not_found',
@@ -102,11 +106,11 @@ class Socket(socketserver.BaseRequestHandler):
             pass
 
 
-def serve(test, forget=(), refuse=0):
+def serve(test, forget=(), refuse=0, limited=()):
     server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Socket)
     server.daemon_threads = True
     server.lock, server.connections, server.requests = threading.Lock(), [], []
-    server.forget, server.refuse = set(forget), refuse
+    server.forget, server.refuse, server.limited = set(forget), refuse, set(limited)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     test.addCleanup(server.server_close)
     test.addCleanup(server.shutdown)
@@ -131,6 +135,26 @@ class ResponsesSocketTests(unittest.TestCase):
             # The pool stayed closed for the upgrade's retry-after.
             self.assertGreaterEqual(time.monotonic() - started, 0.9)
             self.assertEqual(len(server.connections), 1)
+
+    def test_a_rate_limited_continuation_is_retried_as_a_continuation(self):
+        root = Path(__file__).resolve().parent.parent
+        # The second request, the tool result, is refused for pace.
+        server = serve(self, limited={2})
+        with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
+            client = Client(root/'.local/target/release/agent', Path(directory)/'agent.db',
+                            f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws')
+            self.addCleanup(client.close)
+            client.request('create', bot='Bob', workspace=directory)
+            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            bodies = [body for _, body in server.requests]
+            # The refusal made no response, so the retry still continues.
+            self.assertEqual([b.get('previous_response_id') for b in bodies], [None, 'resp_1', 'resp_1'])
+            self.assertEqual(bodies[2]['input'], bodies[1]['input'])
+            self.assertEqual(len(server.connections), 1)
+            # Deleting the bot closes its connection.
+            client.request('delete', bot='Bob')
+            self.assertEqual(client.request('stats')['result']['providers']['openai']['sockets'], 0)
 
     def test_a_bot_continues_on_its_connection_and_resends_in_full_when_the_server_forgot(self):
         root = Path(__file__).resolve().parent.parent
