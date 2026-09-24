@@ -63,8 +63,10 @@ class Socket(socketserver.BaseRequestHandler):
                                  b'Content-Length: 0\r\n\r\n')
             return
         accept = base64.b64encode(hashlib.sha1(headers['sec-websocket-key'].encode() + GUID).digest())
+        # A small request allowance, so the test can count paced requests.
         self.request.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
-                             b'Connection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+                             b'Connection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n'
+                             b'x-ratelimit-limit-requests: 6\r\nx-ratelimit-remaining-requests: 6\r\n\r\n')
         with self.server.lock:
             self.server.connections.append(headers)
             connection = len(self.server.connections) - 1
@@ -166,6 +168,10 @@ class ResponsesSocketTests(unittest.TestCase):
             # The idle connection is kept for Bob's next call and counted.
             stats = client.request('stats')['result']
             self.assertEqual(stats['providers']['openai']['sockets'], 1)
+            # All five requests, the refused continuation and its full resend
+            # included, were paced against the allowance of six.
+            (pool,) = stats['providers']['openai']['pools'].values()
+            self.assertEqual(pool['requests_available'], 1)
             turns = client.request('turns', bot='Bob')['result']['turns']
             self.assertEqual([t['retries'] for t in turns], [0, 0])
 

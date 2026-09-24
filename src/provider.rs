@@ -749,18 +749,11 @@ impl Provider {
                 (Some(_), Some(tail)) => tail(plan.skip),
                 _ => items.take().expect("the full input is sent at most once"),
             };
-            let text = match create(&prefix, plan.previous.as_deref(), input).await {
-                Ok(text) => text,
-                Err(error) if !report.dispatched => return Err(error),
-                Err(error) => {
-                    reservation.settle(0);
-                    return Err(error);
-                }
-            };
-            if !report.dispatched {
-                reservation.dispatch();
-                report.dispatched = true;
-            }
+            // Each send holds its own undispatched reservation, refunded if
+            // the input cannot be assembled.
+            let text = create(&prefix, plan.previous.as_deref(), input).await?;
+            reservation.dispatch();
+            report.dispatched = true;
             match session
                 .exchange(
                     text,
@@ -781,15 +774,14 @@ impl Provider {
                         skip: 0,
                     };
                     parser = responses::State::default();
-                    // The refusal was the first frame and released the
-                    // permit; the full send awaits a first frame again.
-                    match self.admit().await {
-                        Ok(permit) => admission = Some(permit),
-                        Err(error) => {
-                            reservation.settle(0);
-                            return Err(error);
-                        }
-                    }
+                    // The refused continuation ran no inference, but it was
+                    // a request, so the full send is paced as another. It
+                    // awaits a first event under a fresh startup permit.
+                    reservation.settle(0);
+                    let paced = report.paced_ms;
+                    reservation = pace.acquire_reported(estimate, report).await?;
+                    report.paced_ms += paced;
+                    admission = Some(self.admit().await?);
                 }
                 outcome => break outcome,
             }

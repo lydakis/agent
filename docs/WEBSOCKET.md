@@ -153,7 +153,9 @@ a client attaching to a daemon compares it like the family and URL, and
   not accept is never continued from. The input is then the window's
   remaining items with `previous_response_id`.
 - `previous_response_not_found` resends the full input on the same
-  connection inside the same call, so it is not a retry. A failure in the
+  connection inside the same call, so it is not a retry. The refused
+  continuation settles at zero, and the resend takes its own pacing
+  reservation, since the provider counts both as requests. A failure in the
   middle of a response closes the connection, since its remaining events
   would reach the next call. `websocket_connection_limit_reached` becomes
   the retryable `provider_socket_expired`.
