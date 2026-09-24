@@ -655,6 +655,20 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     anything else fails the comparison rather than ranking as cheaper.
     Then a small real-provider check under a stated spend cap.
 
+40. Responses over WebSocket, measured before kept. OpenAI's WebSocket mode
+    keeps the latest response per lane in a connection-local cache, so a
+    `store: false` call can send `previous_response_id` and only the new
+    items; Codex uses it by default for API keys and the ChatGPT login.
+    OpenAI reports about 40% faster loops of 20 or more tool calls, which is
+    their claim, not ours. Build a transport for the `openai` and `chatgpt`
+    presets that leases a lane per active turn, sends a delta only when the
+    request extends the previous one exactly, and sends the full input on
+    every other case, including `previous_response_not_found`; the store
+    stays the only history. Then run the matched HTTP versus WebSocket screen
+    in [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap.
+    Open: rate limits have no per-call headers on the socket, and whether a
+    connect failure falls back to HTTP.
+
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
 
