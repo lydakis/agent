@@ -4,8 +4,9 @@ A roadmap for four ideas George raised on 2026-09-20. None of it is built.
 Each section says what the code does today, what would have to change, the
 main risks, and an order of work. Source references are to `612ae1d` and were
 read on 2026-09-23, except references marked `8ebbc44`, which were added
-after main moved to schema 26 and after the first review. Claims about the
-code are verified at those revisions; everything
+after main moved to schema 26 and after the first review, and references
+marked `e1d413f`, which were added on 2026-09-24 after the second review.
+Claims about the code are verified at those revisions; everything
 under "would change" and "order" is a proposal, and anything unmeasured says
 so.
 
@@ -159,11 +160,22 @@ source's rows unchanged.
    text: running turn, tool calls in flight, last output lines, tokens. It
    uses JSON by default and a rendered view under `--pretty`, like every
    other command. This is client policy, not daemon mechanism (NEXT item 20).
-4. **Replay pages off the worker.** Move every replay page except the last
-   onto the reader. Keep the final "empty page, switch to live" step as a
-   worker job, since that is what guarantees no committed event falls between
-   replay and live (`src/server/hub.rs:139-141`). Measure it with the
-   per-operation histograms (NEXT item 27) before and after.
+4. **Replay pages off the worker, onto an observer reader.** Move every
+   replay page except the last off the worker. Keep the final "empty page,
+   switch to live" step as a worker job, since that is what guarantees no
+   committed event falls between replay and live
+   (`src/server/hub.rs:139-141`). The pages must not go to the existing
+   reader: that one thread also streams context into model requests, so
+   moving replay there only moves the stall from commits to request
+   construction. They go to a second read-only connection that serves
+   observers alone (replay pages, `events`, `history_*`, `item`, and the
+   `summary` read), while the context reader keeps serving turns. SQLite in
+   WAL mode lets both read concurrently. The observer reader has a bounded
+   queue and each connection keeps at most one page in flight, so many
+   observers slow each other, not the watched bots. The acceptance check is
+   the context reader's queue-time percentiles (the per-operation
+   histograms, NEXT item 27), unchanged with N observers replaying long
+   logs against the same fleet without them.
 5. **A tool selection on `fork`.** An optional `tools` list, empty allowed,
    validated the way `create` validates it. Heterogeneous forks want this
    anyway. With it, "fork at the current node with no tools, ask it to
@@ -195,8 +207,8 @@ source's rows unchanged.
 
 1. The `summary` read, plus the observe capability.
 2. The client digest in the CLI (JSON), then in the app.
-3. Replay pages on the reader, measured on the slow-follower and
-   mixed-workload screens (NEXT items 16 and 18).
+3. The observer reader, then replay pages on it, measured on the
+   slow-follower and mixed-workload screens (NEXT items 16 and 18).
 4. `fork` with a tool selection, and the summary-fork recipe, with the
    cache-hit ratio measured.
 5. A read-only socket, only when a second principal appears.
@@ -343,8 +355,13 @@ rendezvous directory must be the user's own and mode `0700`
 
 1. **Store identity in `ready`** (the shared first step). The app stores
    per-view state per socket and workspace ([APP.md](APP.md), "Closing the
-   window is detaching"). A forwarded socket's path is arbitrary, so that
-   key has to become the store identity.
+   window is detaching"). A forwarded socket's path is arbitrary, so the
+   path alone cannot be the key. Neither can the identity alone, since a
+   copied store keeps its source's identity (see "Copies of stores" in
+   section 4) and two divergent copies would share cursors and bot state.
+   The client keys state by endpoint name and store identity together, and
+   refuses an endpoint list in which two endpoints announce the same
+   identity, naming both, until one store's identity is reissued.
 2. **A client-side endpoint list.** A small file mapping names to socket
    paths, local or forwarded: `--daemon NAME` on the CLI, and a daemon
    switcher or a merged fleet view in the app with one `follow *` per
@@ -512,6 +529,12 @@ carrying it over.
    stored reasoning state; only a call can. The first turn after import
    therefore keeps an explicit failure path: a provider error ends that
    turn as it would anywhere, and nothing falls back to a fresh bot.
+   The same checks apply to the bot's `compaction_model` when it names a
+   different provider: `create` requires that provider and its family
+   (at `e1d413f`: `src/server/mod.rs:1031-1040`), and `compact_if_due`
+   looks it up again on its own (`src/server/turn.rs:451-466`), so an
+   unchecked import would succeed and then fail every due compaction with
+   `provider_unavailable`.
    Export refuses while any of the bot's processes is still running, the
    same check deletion makes. A bot with a live background command is
    drained or cancelled, and its process durably resolved, first.
@@ -525,7 +548,16 @@ carrying it over.
    turns loses inherited outputs, and copying the producer turns means
    deciding who owns them at the target, which changes turn listings and
    idempotency. Until that representation is decided, import refuses a bot
-   with fork ancestry and says so.
+   with fork ancestry and says so. The creator does not travel either: a
+   local fork records whoever forked it as its creator, validated in the
+   target's transaction (at `e1d413f`: `src/store/db.rs:2781-2816`), not
+   the source's creator. Import does the same. Copying `created_by` and
+   `created_by_id` would export the source's creator as `AGENT_PARENT` on
+   every turn (`src/server/turn.rs:695-698`), and the imported bot's reply
+   to its parent (`client/src/policy.rs:27-29`) would reach no bot, or be
+   refused by the identity check against a same-named one
+   (`src/store/db.rs:642-661`). An import from the CLI is therefore a root
+   bot, and the import result names the creator it dropped.
 6. **Then a real move, bound to one destination.** The move names its
    destination store identity before export. The source marks the bot
    `moving` and refuses work, the way `deleting` does
@@ -573,7 +605,7 @@ carrying it over.
   target cannot validate it (`src/store/db.rs:574-592`). The moved bot's
   children that stayed behind can no longer reach it through
   `AGENT_PARENT`. This is the same cross-daemon lineage question as section
-  3.
+  3. Until it is answered, import drops the source's creator (item 5).
 - **Copies of stores.** Two stores with the same identity, one copied from
   the other, would both accept a bundle bound to that identity, which
   breaks the one-destination rule. Store identity therefore needs a way to
@@ -581,7 +613,21 @@ carrying it over.
   something a copy does not share.
 - **Size and sensitivity.** Histories of 100k items are measured
   ([DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#long-history)), so export
-  runs in bounded pieces like retention does (NEXT item 29). A bundle holds
+  runs in bounded pieces like retention does (NEXT item 29).
+- **A consistent export.** The first slice leaves the source live, so a
+  submission or a prune can land between pieces, and a bundle could pair a
+  head from before it with records from after it. Export therefore starts
+  with one worker transaction that captures a cut: the head node, the bot
+  row, and the highest turn and event ids. Every piece reads only records
+  at or under the cut, so later turns are simply absent. Nodes are
+  immutable and notes and compactions are keyed by node (at `e1d413f`:
+  `src/store/db.rs:412-420`), so the head fixes those too.
+  Records under the cut must also stay: while the export runs, prune and
+  deletion skip that bot's records, a fence held in the daemon for the
+  export's lifetime and released when it finishes or its connection drops.
+  One long read transaction would also give a snapshot, but it pins the
+  WAL and holds back checkpoints for every bot for as long as the export
+  runs. A bundle holds
   transcripts and tool output, so it belongs in the ignored local directory,
   never in the repository.
 
@@ -592,9 +638,11 @@ carrying it over.
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
    `result` and artifact reads answer for imported turns, prune and delete
-   work on imported records, and a missing provider or tool, fork ancestry,
-   a handle in the transcript, or a running process each fail the export
-   or import explicitly.
+   work on imported records, the imported bot has no creator, a
+   submission and a prune racing a paged export yield exactly the cut, and
+   a missing provider, compaction provider, or tool, fork ancestry, a
+   handle in the transcript, or a running process each fail the export or
+   import explicitly.
 3. The alias decision for artifact references, with a test that reads one
    written before the move, and store-qualified handles so that bots that
    delegate can move.
@@ -613,7 +661,7 @@ carrying it over.
 | Client digest (CLI, then app) | watching | client only |
 | Client store discovery | per-workspace | client only |
 | `--daemon` endpoint list, then app view | several daemons | client only |
-| Replay pages on the reader, measured | watching | daemon |
+| Observer reader and replay pages on it, measured | watching | daemon |
 | `fork` with a tool selection | watching, move | protocol |
 | One-versus-N daemon screen | per-workspace | bench |
 | Export and import as a cross-store fork | move | store, protocol |
