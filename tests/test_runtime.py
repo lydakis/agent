@@ -271,7 +271,8 @@ def thinking_binding(request, before):
 class AnthropicModel(http.server.BaseHTTPRequestHandler):
     """Synthetic Anthropic Messages endpoint: thinking, text, tool_use, tool_result.
     With `bind_thinking` set on the server, signatures bind to the conversation
-    before them and a replayed block whose context changed is refused."""
+    before them and a replayed block whose context changed is refused, as the
+    strict check does; `report_drops` makes it report dropped blocks instead."""
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *_):
@@ -284,6 +285,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/messages'
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
+            assert self.headers.get('anthropic-beta') == 'thinking-binding-controls-2026-08-01'
+            if 'thinking' in request:
+                assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             assert request['model'] == 'synthetic-claude' and request['stream'] and request['max_tokens'] > 0
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == {'type': 'ephemeral'}
@@ -334,7 +338,11 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
-            events = [('message_start', {'message': {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}})]
+            start = {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}
+            if getattr(self.server, 'report_drops', 0):
+                start['input_transformations'] = [{'type': 'thinking_dropped', 'message_index': 1, 'block_index': 0}
+                                                  for _ in range(self.server.report_drops)]
+            events = [('message_start', {'message': start})]
             for index, block in enumerate(blocks):
                 start = {**block, 'thinking': ''} if block['type'] == 'thinking' else (
                     {**block, 'text': ''} if block['type'] == 'text' else {**block, 'input': {}})
@@ -394,7 +402,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(usage), 2)
         self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
-        self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized'})
+        self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
+                                             'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})
         self.assertEqual(first['output_config'], {'effort': 'low'})
         self.assertEqual(first['messages'], [{'role': 'user', 'content': [{'type': 'text', 'text': 'tool:shared'}]}])
         assistant = second['messages'][1]

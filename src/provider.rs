@@ -157,6 +157,9 @@ pub struct Completion {
     pub items: Vec<Bytes>,
     pub calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
+    /// Replayed thinking blocks the provider dropped because the history
+    /// before them changed. The runtime avoids this, so any is a bug.
+    pub thinking_dropped: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
@@ -451,9 +454,11 @@ impl Provider {
                                 "medium" => 8192,
                                 _ => 16384,
                             };
-                            json!({"type":"enabled","budget_tokens":budget})
+                            json!({"type":"enabled","budget_tokens":budget,
+                                "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         } else {
-                            json!({"type":"adaptive","display":"summarized"})
+                            json!({"type":"adaptive","display":"summarized",
+                                "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         }
                     }),
                     output_config: request
@@ -574,7 +579,11 @@ impl Provider {
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
             (Family::Anthropic, key) => {
-                let http = http.header("anthropic-version", "2023-06-01");
+                // Opt every account into the thinking-binding check, dropping
+                // rather than failing on a mismatch; the drops are reported.
+                let http = http
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", "thinking-binding-controls-2026-08-01");
                 match key {
                     Some(key) => http.header("x-api-key", key),
                     None => http,
@@ -1160,6 +1169,7 @@ mod tests {
         assert!(!text.contains("prompt_cache_key"));
         assert!(text.ends_with(",\"messages\":["));
         assert!(text.contains("\"type\":\"adaptive\""));
+        assert!(text.contains("\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}"));
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
         let legacy = provider
@@ -1176,6 +1186,7 @@ mod tests {
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
         assert!(legacy.contains("\"budget_tokens\":2048"));
+        assert!(legacy.contains("\"prefix_mismatch_behavior\":\"drop_block\""));
         assert!(!legacy.contains("output_config"));
         assert!(!text.contains("budget_tokens"));
         let mut empty_prefix = provider

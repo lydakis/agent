@@ -505,3 +505,12 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertEqual(self.model.binding_errors, [])
         self.assertTrue(all(self.thinking(m) for m in alice['messages'] if m['role'] == 'assistant'))
         self.assertFalse(any(self.thinking(m) for m in carol['messages']))
+
+    def test_thinking_the_provider_drops_is_reported_live(self):
+        client = self.anthropic(())
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        self.turn(client, 'Bob', 0, 'kept')
+        self.model.report_drops = 2
+        self.turn(client, 'Bob', 1, 'dropped')
+        drops = [m for m in client.saved if m.get('event') == 'thinking_dropped']
+        self.assertEqual([(m['bot'], m['count'], m['durable']) for m in drops], [('Bob', 2, False)])

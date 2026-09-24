@@ -1062,6 +1062,17 @@ impl Turn {
                     if let Some(usage) = &completion.usage {
                         self.tokens.add(usage);
                     }
+                    if completion.thinking_dropped > 0 {
+                        // The provider found history edited under replayed
+                        // thinking; the runtime should never cause this.
+                        self.hub
+                            .live(
+                                &self.bot,
+                                json!({"event":"thinking_dropped","bot":self.bot,"turn":turn,
+                                    "durable":false,"count":completion.thinking_dropped}),
+                            )
+                            .await?;
+                    }
                     return Ok(Some(completion));
                 }
                 Err(error) => error,

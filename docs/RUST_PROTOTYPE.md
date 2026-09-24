@@ -441,7 +441,14 @@ differ. Each node records at write time how many bytes its thinking takes,
 so a request still knows its length before it reads the items it streams;
 the bot records the fingerprint and the first node still bound to it. This
 costs the reasoning in the stripped blocks once per change, which already
-invalidated the prompt cache from that point. Empty instructions omit the system block, since empty text
+invalidated the prompt cache from that point. Every Anthropic request opts
+into the check with the `thinking-binding-controls-2026-08-01` beta header
+and `thinking.block_binding.prefix_mismatch_behavior: drop_block`, so older
+accounts get the same check and a mismatch the runtime missed costs the
+dropped blocks rather than the turn. The response reports each drop in
+`input_transformations`; the runtime publishes the count as a non-durable
+`thinking_dropped` event, which should never appear. The synthetic endpoint
+in the tests refuses mismatches outright, as `error` would. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
