@@ -291,8 +291,9 @@ impl Session {
     }
 
     /// Send one `response.create` and read its events until the terminal one.
-    /// Only content renews the stall bound; pings do not. The startup permit
-    /// is released when the first frame arrives.
+    /// The stall bound covers the write, since a peer that stops reading
+    /// blocks it, and only content renews it; pings do not. The startup
+    /// permit is released when the first event arrives.
     pub(super) async fn exchange<F, Fut>(
         &mut self,
         text: String,
@@ -305,10 +306,12 @@ impl Session {
         F: FnMut(Delta) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        self.socket
-            .send(Message::text(text))
-            .await
-            .map_err(|_| Failure::unsent(Error::new("provider_stream_failed")))?;
+        match tokio::time::timeout(stall, self.socket.send(Message::text(text))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(Failure::unsent(Error::new("provider_stream_failed"))),
+            // Part of the request may have reached the provider.
+            Err(_) => return Err(Failure::transport(Error::new("provider_stream_stalled"))),
+        }
         let deadline = tokio::time::sleep(stall);
         tokio::pin!(deadline);
         let mut total = 0usize;
@@ -317,10 +320,13 @@ impl Session {
                 message = self.socket.next() => message,
                 () = &mut deadline => return Err(Failure::transport(Error::new("provider_stream_stalled"))),
             };
-            // Startup is bounded until the provider answers, as on HTTP.
-            admission.take();
             let text = match message {
-                Some(Ok(Message::Text(text))) => text,
+                // Startup is bounded until the provider answers, as on HTTP;
+                // a control frame is the connection's, not an answer.
+                Some(Ok(Message::Text(text))) => {
+                    admission.take();
+                    text
+                }
                 Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                 Some(Ok(Message::Binary(_))) => {
                     return Err(Failure::transport(Error::new("provider_unexpected_binary")));
@@ -561,5 +567,17 @@ mod tests {
         let headers = limited.headers.unwrap();
         assert_eq!(headers["retry-after"], "2");
         assert_eq!(headers["x-ratelimit-limit-requests"], "10");
+    }
+
+    #[test]
+    fn an_overloaded_status_closes_the_pool_as_on_http() {
+        let pace = super::super::pace::Pace::default();
+        let overloaded = Failure::event(
+            Error::new("provider_incomplete"),
+            r#"{"type":"error","status":529,"error":{"code":"overloaded"},"headers":{"retry-after":"30"}}"#,
+        );
+        assert_eq!(overloaded.error.code, "provider_http_529");
+        super::super::limit(&pace, &overloaded);
+        assert!(pace.snapshot().4);
     }
 }

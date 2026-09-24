@@ -158,9 +158,11 @@ a client attaching to a daemon compares it like the family and URL, and
   would reach the next call. `websocket_connection_limit_reached` becomes
   the retryable `provider_socket_expired`.
 - An `error` event's `status` and `headers` stand in for an HTTP response's:
-  a 429 closes the pool with its `retry-after`, `insufficient_quota` is
+  a 429 or 529 closes the pool with its `retry-after`, `insufficient_quota` is
   `provider_quota_exhausted`, other statuses are `provider_http_N`, and the
-  pacer learns limits from the upgrade response and from these headers. A
+  pacer learns limits from these headers. The upgrade response's headers
+  predate the call, so they set the pool's balance without settling the
+  call, which is charged its own usage. A
   refused upgrade is treated the same way, so its `retry-after` holds the
   pool. A refusal with no usage settles at zero, since no inference ran, and
   so does a request that could not be written to a connection the provider
@@ -168,8 +170,10 @@ a client attaching to a daemon compares it like the family and URL, and
 - Accounting follows the HTTP path's boundaries: the reservation is
   dispatched only when the create event is about to be sent, so a connection
   that never opened is refunded, and the startup permit bounded by
-  `--max-connecting` is held until the provider's first frame and taken again
-  for a full resend.
+  `--max-connecting` is held until the provider's first event, not a control
+  frame, and taken again for a full resend. The stall bound covers writing
+  the request as well as each read, so a provider that stops reading cannot
+  hold a turn or its permit.
 - A socket message is whole, so the input is assembled in memory before it
   is sent, unlike the streamed HTTP body. Incoming messages and frames are
   bounded at 16 MiB, the HTTP path's response bound. A continuation is small; a full

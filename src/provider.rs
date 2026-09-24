@@ -703,8 +703,6 @@ impl Provider {
         };
         let key = socket::key(&prefix, window.map_or(&[][..], |(head, _)| head));
         let ids = window.map(|(_, ids)| ids);
-        // A new connection's upgrade response, learned from once dispatched.
-        let mut upgrade = None;
         let mut session = match bot.and_then(|bot| sockets.take(bot)) {
             Some(session) => session,
             None => {
@@ -717,8 +715,10 @@ impl Provider {
                     headers.push(("chatgpt-account-id", account.as_str()));
                 }
                 match sockets.connect(&self.url, &headers).await {
+                    // The upgrade's headers predate this call, so they
+                    // teach the pool without settling its reservation.
                     Ok((session, response)) => {
-                        upgrade = Some(response);
+                        pace.seed(&response, self.family);
                         session
                     }
                     // A connection that never opened sent no request, and the
@@ -741,9 +741,6 @@ impl Provider {
             }
         };
         let mut admission = Some(admission);
-        // The pacer learns from one response's headers per reservation: the
-        // upgrade's on a new connection, else an error event's.
-        let mut learned = false;
         let mut plan = session.plan(key, ids);
         let (mut items, mut tail) = (Some(items), tail);
         let mut parser = responses::State::default();
@@ -763,10 +760,6 @@ impl Provider {
             if !report.dispatched {
                 reservation.dispatch();
                 report.dispatched = true;
-                if let Some(headers) = upgrade.take() {
-                    reservation.learn(&headers, self.family);
-                    learned = true;
-                }
             }
             match session
                 .exchange(
@@ -810,7 +803,7 @@ impl Provider {
                 parser.finish()
             }
             Err(failure) => {
-                if let Some(headers) = failure.headers.as_deref().filter(|_| !learned) {
+                if let Some(headers) = failure.headers.as_deref() {
                     reservation.learn(headers, self.family);
                 }
                 limit(pace, &failure);
@@ -832,10 +825,11 @@ impl Provider {
     }
 }
 
-/// Close the model's pool for a rate limit a socket reported: a 429 status
-/// with its `retry-after`, or an in-stream rate limit naming its delay.
+/// Close the model's pool for a rate limit a socket reported: a 429 or 529
+/// status with its `retry-after`, as on HTTP, or an in-stream rate limit
+/// naming its delay.
 fn limit(pace: &pace::Pace, failure: &socket::Failure) {
-    if failure.status == Some(429) || failure.error.code == "provider_rate_limited" {
+    if matches!(failure.status, Some(429 | 529)) || failure.error.code == "provider_rate_limited" {
         let after = failure
             .headers
             .as_ref()
