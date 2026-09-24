@@ -470,6 +470,7 @@ impl Provider {
                 .await
                 .map_err(|_| Error::new("provider_admission_timeout"))?
                 .map_err(|_| Error::new("provider_admission_closed"))?;
+        let cache_key = request.cache_key;
         let (body, len) = self.body(prefix, request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -492,6 +493,11 @@ impl Provider {
         };
         if let Some(account) = &self.account {
             http = http.header("chatgpt-account-id", account);
+        }
+        // The ChatGPT Codex endpoint takes cache affinity from this header, not
+        // from prompt_cache_key (openai/codex 53446f9, core/src/client.rs).
+        if let (Family::Responses, Some(key)) = (self.family, cache_key) {
+            http = http.header("session-id", key);
         }
         reservation.dispatch();
         report.dispatched = true;
@@ -1036,8 +1042,17 @@ mod tests {
             cache_key: None,
             items: Items::empty(),
         };
-        let _ = provider.complete(request, |_| async { Ok(()) }).await;
+        let _ = provider
+            .complete(
+                Request {
+                    cache_key: Some("synthetic-key"),
+                    ..request
+                },
+                |_| async { Ok(()) },
+            )
+            .await;
         let head = head.await.unwrap();
+        assert!(head.contains("\r\nsession-id: synthetic-key\r\n"), "{head}");
         assert!(head.starts_with("post /responses "), "{head}");
         assert!(
             head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
