@@ -1869,7 +1869,18 @@ impl Database {
         }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
-            return fail("bot_busy");
+            // Name the ways past a busy bot; callers do not find them unaided.
+            let doing = match bot.running_turn {
+                Some(turn) => format!("turn {turn} is running"),
+                None => "earlier work is waiting".to_owned(),
+            };
+            return fail_with(
+                "bot_busy",
+                format!(
+                    "{doing}; retry with delivery steer to add this to the running turn, \
+                     queue to run it afterwards, or fork the bot to ask without interrupting it"
+                ),
+            );
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");

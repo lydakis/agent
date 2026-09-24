@@ -740,7 +740,10 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
 `interrupt` work on the turn unchanged.
 
 - `reject` (default): `bot_busy` while a turn runs or is parked,
-  `active_agent_limit` when no slot is free. Nothing is written.
+  `active_agent_limit` when no slot is free. Nothing is written. The
+  `bot_busy` detail names the running turn and the ways past it (steer,
+  queue, or a fork to ask without interrupting), since a model calling
+  `agent run` does not discover them otherwise.
 - `queue`: the turn is a durable row that starts when the bot is free and a
   slot is open. The response reports `status`: `running` when it started at
   once, `queued` behind the bot's own work, or `ready` when only a slot is
