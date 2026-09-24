@@ -195,7 +195,14 @@ source's rows unchanged.
    turns. Observer reads therefore take the deferred path that follow
    replay already uses (`src/server/mod.rs:1361`): `dispatch` enqueues with
    `try_send` and returns, a full queue answers `observer_busy` at once,
-   and the reader's task sends the response itself. The acceptance check is
+   and the reader's task sends the response itself. A request count alone
+   does not bound memory, since each queued read materializes its whole
+   response. So the observer path serves only bounded pages: `artifact`
+   without a stream and limit returns a whole retained stream today
+   (`src/server/mod.rs:1325-1346`), and on the observer path it requires a
+   stream and a limit capped at the existing 64 KiB page. Admission also
+   counts the bytes that queued and in-flight reads may return, against a
+   daemon-wide budget, and answers `observer_busy` past it. The acceptance check is
    the context reader's queue-time percentiles (the per-operation
    histograms, NEXT item 27), unchanged with N observers replaying long
    logs against the same fleet without them.
@@ -637,8 +644,15 @@ carrying it over.
 7. **Draining a running bot.** A `drain` stops the bot at its next round
    boundary: the model call in flight finishes, its tool calls finish and
    commit, and the turn parks instead of starting the next round. Round
-   boundaries already exist for steers and compaction. This adds a reason to
-   park there, and nothing is cancelled or run twice.
+   boundaries already exist for steers and compaction. Nothing is cancelled
+   or run twice. The existing parked states cannot hold it: a turn parked
+   on no handles completes at once, and startup resumes only `waiting` and
+   `paced` turns (at `e1d413f`: `src/store/db.rs:2550-2561`). So a drain
+   is its own durable turn status, `drained`, which startup leaves alone.
+   It becomes runnable in exactly two ways: import commits it at the target
+   as `ready`, or cancelling the move on the source returns it to `ready`
+   there, under the same refusal rule as any cancel after export. A
+   tombstoned source never resumes it.
 8. **Parked turns that wait on handles.** Once handles are
    store-qualified, a parked turn's handle into its own store still
    resolves at the target only if the whole subtree moves together, a
@@ -733,7 +747,8 @@ carrying it over.
 5. Move bound to one destination instance, with `moving` and tombstone
    states and `bot_moved` answers. Behavior tests: a copy of the
    destination refuses the bundle, and after export a cancel without the
-   destination's refusal is refused. A drained turn resumes at the target
+   destination's refusal is refused. A drained turn stays parked across a
+   source restart and resumes at the target
    under its mapped workspace and checked model, and a move whose bot is
    awaited by a source parent is refused. A client `wait` registered
    before the move is answered with `bot_moved`, and `bot_moved` names a
