@@ -560,7 +560,13 @@ carrying it over.
    (at `e1d413f`: `src/server/mod.rs:1031-1040`), and `compact_if_due`
    looks it up again on its own (`src/server/turn.rs:451-466`), so an
    unchecked import would succeed and then fail every due compaction with
-   `provider_unavailable`.
+   `provider_unavailable`. They also apply per turn. A turn row carries
+   its own `model` and `workspace` overrides (at `e1d413f`:
+   `src/store/db.rs:449-458`), and a resumed turn uses them before the
+   bot's (`src/store/db.rs:2337-2349`). For every unfinished turn a bundle
+   carries, import checks the effective model as above, and the workspace
+   mapping applies to the turn's workspace as well as the bot's. A turn
+   workspace the mapping does not cover fails the import.
    Export refuses while any of the bot's processes is still running, the
    same check deletion makes. A bot with a live background command is
    drained or cancelled, and its process durably resolved, first.
@@ -574,7 +580,16 @@ carrying it over.
    turns loses inherited outputs, and copying the producer turns means
    deciding who owns them at the target, which changes turn listings and
    idempotency. Until that representation is decided, import refuses a bot
-   with fork ancestry and says so. The creator does not travel either: a
+   with fork ancestry and says so. The copy also carries no unfinished
+   turn. A bot can read `idle` while its head turn is `ready`, waiting for
+   capacity, and later turns are `queued` (at `e1d413f`:
+   `src/store/db.rs:1883-1889`). The source is left untouched and will
+   still run them, so importing them would run the same request twice.
+   Export in this slice refuses a bot with any turn that is not finished.
+   Accounting follows a local fork as well, which starts at zero
+   `tokens_used` and takes an optional new budget
+   (`src/store/db.rs:2818`); usage carries over only in a real move. The
+   creator does not travel either: a
    local fork records whoever forked it as its creator, validated in the
    target's transaction (at `e1d413f`: `src/store/db.rs:2781-2816`), not
    the source's creator. Import does the same. Copying `created_by` and
@@ -624,14 +639,24 @@ carrying it over.
    them. A paced turn is requeued at the target as due now, and the
    destination provider's gate decides when it runs; its retry and
    attempt counts carry over. A `wait` deadline moves as the time that
-   remained at export.
+   remained at export. The inverse dependency matters too. Waiters on
+   `turn:BOT/N` are keyed by bot and turn and wake only on that turn's
+   `turn_finished` in the same daemon (at `e1d413f`:
+   `src/server/handles.rs:106`, `144-150`). A source parent parked on a
+   moving child's unfinished turn would never see it finish. So a move
+   refuses while any source turn waits on one of the moving bot's turns,
+   naming the waiters, unless they move together. Any waiter that attaches
+   after that, such as a client `wait`, is answered with an explicit
+   `bot_moved` outcome when the source becomes a tombstone, never left
+   waiting.
 
 ### Risks
 
 - **Workspace divergence.** The model's transcript names absolute paths. If
   the target's workspace is elsewhere, its next tool calls go to the old
   paths. Placing the files is the caller's job (README, Scope). The move
-  should take a workspace mapping and refuse a path that does not exist, and
+  should take a workspace mapping, apply it to the bot and to every
+  unfinished turn's workspace, and refuse a path that does not exist, and
   whether the model is told about the move is a client-policy question.
 - **Side effects.** Only a drained or idle bot moves. A bot that was
   interrupted may have `tool_outcome_unknown` calls whose processes are
@@ -681,7 +706,8 @@ carrying it over.
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
    `result` and artifact reads answer for imported turns, prune and delete
-   work on imported records, the imported bot has no creator, a follow
+   work on imported records, the imported bot has no creator and zero
+   usage, a bot with a `ready` or `queued` turn fails the export, a follow
    of it reports a gap only where the bundle omitted events, a
    submission and a prune racing a paged export yield exactly the cut, and
    a missing provider, compaction provider, or tool, fork ancestry, a
@@ -694,7 +720,9 @@ carrying it over.
 5. Move bound to one destination instance, with `moving` and tombstone
    states and `bot_moved` answers. Behavior tests: a copy of the
    destination refuses the bundle, and after export a cancel without the
-   destination's refusal is refused.
+   destination's refusal is refused. A drained turn resumes at the target
+   under its mapped workspace and checked model, and a move whose bot is
+   awaited by a source parent is refused.
 6. Drain to a round boundary for a running bot.
 7. Moving a parent together with the children it waits on.
 
