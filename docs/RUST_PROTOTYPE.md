@@ -424,7 +424,24 @@ header that the ChatGPT backend routes on: a nonce drawn once per daemon plus
 the id of the bot whose cache the call shares. That is the bot's own id,
 except that a fork keeping its source's instructions shares the source's key,
 because its first call repeats the source's prefix. Summaries add `-summary`,
-since their prefix differs. Empty instructions omit the system block, since empty text
+since their prefix differs.
+
+Newer Claude models bind each replayed thinking block to the exact
+conversation before it (system prompt, tools, and earlier messages) and, for
+accounts created on or after 2026-08-31, reject a block whose earlier context
+changed. Anthropic requests therefore send a block only while the context in
+front of the window is the one it was written under. Each request
+fingerprints that context (the encoded pinned prefix and the window's first
+item); when the fingerprint differs from the bot's last, the window slid, a
+compaction or note landed, or a fork started from other instructions, and
+every node written before that request is sent without its thinking from
+then on. Removing a leading run of blocks is allowed; later blocks keep
+theirs. Summarizer requests carry no thinking, since their instructions
+differ. Each node records at write time how many bytes its thinking takes,
+so a request still knows its length before it reads the items it streams;
+the bot records the fingerprint and the first node still bound to it. This
+costs the reasoning in the stripped blocks once per change, which already
+invalidated the prompt cache from that point. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses

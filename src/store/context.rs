@@ -175,6 +175,62 @@ pub(crate) fn context_prefix(
     })
 }
 
+/// An Anthropic assistant item without its thinking blocks. Newer Claude
+/// models bind each thinking block to the exact conversation before it and
+/// reject a replayed block whose earlier history changed, so blocks written
+/// before the request's leading context last changed are sent without it.
+/// `None` when the item is not an assistant message with thinking, or has
+/// nothing else to keep (an empty message is invalid). Deterministic: the
+/// store records the bytes this removes when the item is written, so a
+/// request knows its length before reading it.
+pub fn without_thinking(item: &[u8]) -> Option<Vec<u8>> {
+    #[derive(serde::Deserialize)]
+    struct Message<'a> {
+        role: &'a str,
+        #[serde(borrow)]
+        content: Vec<&'a serde_json::value::RawValue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Block<'a> {
+        #[serde(rename = "type")]
+        kind: &'a str,
+    }
+    // Most items carry no thinking; a substring search skips parsing them.
+    if !std::str::from_utf8(item).is_ok_and(|text| text.contains("thinking\"")) {
+        return None;
+    }
+    let message: Message<'_> = serde_json::from_slice(item).ok()?;
+    if message.role != "assistant" {
+        return None;
+    }
+    let kept: Vec<_> = message
+        .content
+        .iter()
+        .filter(|block| {
+            !serde_json::from_str::<Block<'_>>(block.get())
+                .is_ok_and(|b| matches!(b.kind, "thinking" | "redacted_thinking"))
+        })
+        .collect();
+    if kept.is_empty() || kept.len() == message.content.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(item.len());
+    out.extend_from_slice(b"{\"content\":[");
+    for (index, block) in kept.iter().enumerate() {
+        if index != 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(block.get().as_bytes());
+    }
+    out.extend_from_slice(b"],\"role\":\"assistant\"}");
+    Some(out)
+}
+
+/// Bytes `without_thinking` removes from an item, recorded when it is stored.
+pub fn thinking_bytes(item: &[u8]) -> usize {
+    without_thinking(item).map_or(0, |kept| item.len() - kept.len())
+}
+
 /// Stable pinned blocks retain their own Anthropic cache breakpoints.
 pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
     match family {
@@ -182,5 +238,31 @@ pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
             "role":"user","content":[{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]
         }))?),
         _ => family.user_item(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_is_removed_only_from_assistant_items_that_keep_something() {
+        let item = br#"{"content":[{"type":"thinking","thinking":"plan","signature":"s"},{"type":"redacted_thinking","data":"x"},{"type":"tool_use","id":"t","name":"echo","input":{"text":"thinking\""}}],"role":"assistant"}"#;
+        let kept = without_thinking(item).unwrap();
+        assert_eq!(
+            kept,
+            br#"{"content":[{"type":"tool_use","id":"t","name":"echo","input":{"text":"thinking\""}}],"role":"assistant"}"#
+        );
+        assert_eq!(thinking_bytes(item), item.len() - kept.len());
+        // Only thinking: removing it would leave an invalid empty message.
+        let alone = br#"{"content":[{"type":"thinking","thinking":"a","signature":"s"}],"role":"assistant"}"#;
+        assert_eq!(without_thinking(alone), None);
+        // A user item that mentions thinking is left alone, as is one without it.
+        let user = br#"{"content":[{"type":"text","text":"\"thinking\""}],"role":"user"}"#;
+        assert_eq!(thinking_bytes(user), 0);
+        assert_eq!(
+            thinking_bytes(br#"{"content":[{"type":"text","text":"hi"}],"role":"assistant"}"#),
+            0
+        );
     }
 }

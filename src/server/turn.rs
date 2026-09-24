@@ -51,6 +51,33 @@ const CATCH_UP_PIECE_NODES: i64 = 1024;
 const WINDOW_BATCH: usize = 64;
 const WINDOW_BATCH_BYTES: u64 = 256 * 1024;
 
+/// Stored items to stream: ids with their sizes, and the bytes each loses
+/// without thinking.
+#[derive(Clone, Copy)]
+struct Span<'a> {
+    ids: &'a [i64],
+    sizes: &'a [u32],
+    thinking: &'a [u32],
+}
+impl Span<'_> {
+    const EMPTY: Span<'static> = Span {
+        ids: &[],
+        sizes: &[],
+        thinking: &[],
+    };
+}
+
+/// A stable fingerprint of the context in front of a window: its encoded
+/// prefix and first item. FNV-1a, so it survives restarts and upgrades.
+fn fingerprint(prefix: &[u8], first: i64) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in prefix.iter().chain(&first.to_le_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash as i64
+}
+
 /// Split window items into read-ahead batches by count and by bytes.
 fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
     let mut out: Vec<Vec<i64>> = Vec::with_capacity(ids.len().div_ceil(WINDOW_BATCH));
@@ -287,6 +314,7 @@ impl Turn {
         Ok(Context {
             window: Some(window),
             prefix,
+            thinking_floor: 0,
         })
     }
 
@@ -367,19 +395,72 @@ impl Turn {
     }
 
     fn items(&self, context: &Context) -> Items {
-        let (ids, sizes) = context
+        match &context.window {
+            Some(w) => self.window_items(
+                context.prefix.bytes.clone(),
+                Span {
+                    ids: &w.ids,
+                    sizes: &w.sizes,
+                    thinking: &w.thinking,
+                },
+                context.thinking_floor,
+            ),
+            None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, 0),
+        }
+    }
+
+    /// Anthropic thinking replay. Each thinking block is bound to the exact
+    /// context before it, so once the context in front of the window changes
+    /// (the window slides, a compaction or note lands, or a fork starts from
+    /// other instructions) the blocks written under the old one are sent
+    /// without thinking; blocks written after the change keep theirs. Other
+    /// families send items unchanged.
+    async fn thinking_floor(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        context: &mut Context,
+    ) -> Result<()> {
+        let Some(window) = context
             .window
             .as_ref()
-            .map_or((&[][..], &[][..]), |w| (&w.ids[..], &w.sizes[..]));
-        self.window_items(context.prefix.bytes.clone(), ids, sizes)
+            .filter(|w| w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty())
+        else {
+            return Ok(());
+        };
+        let prefix = fingerprint(&context.prefix.bytes, window.ids[0]);
+        if record.thinking_prefix != Some(prefix) {
+            let floor = window.ids[window.ids.len() - 1] + 1;
+            let bot = self.bot.clone();
+            self.store
+                .op("set_thinking", move |db| {
+                    db.set_thinking(&bot, prefix, floor)
+                })
+                .await?;
+            record.thinking_prefix = Some(prefix);
+            record.thinking_floor = floor;
+        }
+        context.thinking_floor = record.thinking_floor;
+        Ok(())
     }
 
     /// The context prefix, then the items of `ids` read from the store in
-    /// batches as the request streams.
-    fn window_items(&self, prefix: Bytes, ids: &[i64], sizes: &[u32]) -> Items {
+    /// batches as the request streams; items below `floor` without thinking.
+    fn window_items(&self, prefix: Bytes, span: Span<'_>, floor: i64) -> Items {
+        let Span {
+            ids,
+            sizes,
+            thinking,
+        } = span;
+        let stripped: usize = ids
+            .iter()
+            .zip(thinking)
+            .filter(|(id, _)| **id < floor)
+            .map(|(_, &bytes)| bytes as usize)
+            .sum();
         let total = prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
-            + ids.len().saturating_sub(1);
+            + ids.len().saturating_sub(1)
+            - stripped;
         let store = self.store.clone();
         let chunks = batches(ids, sizes);
         let body = stream::iter([Ok(prefix)]).chain(
@@ -387,7 +468,7 @@ impl Turn {
                 let store = store.clone();
                 async move {
                     let mut bytes = store
-                        .read("items_by_ids", move |db| db.items_by_ids(&chunk))
+                        .read("items_by_ids", move |db| db.items_by_ids(&chunk, floor))
                         .await
                         .map_err(|error| std::io::Error::other(error.code))?;
                     if index != 0 {
@@ -655,6 +736,20 @@ impl Turn {
         {
             return fail("compaction_input_limit");
         }
+        // The summarizer's instructions differ from the bot's, so no
+        // thinking block in the span is bound to this request.
+        let stripped: usize = if family == agent_runtime::codec::Family::Anthropic {
+            let ids = plan.ids.clone();
+            self.store
+                .read("thinking_of", move |db| db.thinking_of(&ids))
+                .await?
+                .iter()
+                .map(|&bytes| bytes as usize)
+                .sum()
+        } else {
+            0
+        };
+        let total = total - stripped;
         let store = self.store.clone();
         let batches = batches(&plan.ids, &plan.sizes);
         let body = stream::iter([Ok(Bytes::from(head))])
@@ -663,7 +758,7 @@ impl Turn {
                     let store = store.clone();
                     async move {
                         let mut bytes = store
-                            .read("items_by_ids", move |db| db.items_by_ids(&chunk))
+                            .read("items_by_ids", move |db| db.items_by_ids(&chunk, i64::MAX))
                             .await
                             .map_err(|error| std::io::Error::other(error.code))?;
                         if index != 0 {
@@ -786,7 +881,8 @@ impl Turn {
             if model_rounds >= MAX_ROUNDS {
                 return fail("tool_round_limit");
             }
-            let context = self.fit_context(context, self.input_limit()).await?;
+            let mut context = self.fit_context(context, self.input_limit()).await?;
+            self.thinking_floor(&mut record, &mut context).await?;
             let Some(response) = self
                 .call(
                     provider,
@@ -1071,11 +1167,17 @@ impl Turn {
             Body::Window(Context {
                 window: Some(window),
                 prefix,
+                thinking_floor,
             }) => Chain {
                 bot: &self.bot,
                 window: Some((&prefix.bytes[..], &window.ids[..])),
                 tail: Box::new(move |skip| {
-                    self.window_items(Bytes::new(), &window.ids[skip..], &window.sizes[skip..])
+                    let span = Span {
+                        ids: &window.ids[skip..],
+                        sizes: &window.sizes[skip..],
+                        thinking: &window.thinking[skip..],
+                    };
+                    self.window_items(Bytes::new(), span, *thinking_floor)
                 }),
             },
             _ => Chain {
@@ -1463,6 +1565,8 @@ use agent_runtime::store::pinned_item;
 struct Context {
     window: Option<Window>,
     prefix: ContextPrefix,
+    /// Items with ids below this go without their thinking blocks.
+    thinking_floor: i64,
 }
 impl Context {
     fn empty() -> Self {
@@ -1472,6 +1576,7 @@ impl Context {
                 bytes: Bytes::new(),
                 items: 0,
             },
+            thinking_floor: 0,
         }
     }
     fn usage(&self) -> ContextUsage {

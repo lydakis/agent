@@ -63,6 +63,14 @@ pub struct Bot {
     /// source's instructions starts from the source's cached prefix. `None`
     /// is the bot's own.
     pub cache_bot: Option<i64>,
+    /// Anthropic thinking replay: a fingerprint of the context in front of
+    /// the window at the last request, and the first node whose thinking
+    /// was written under it. Blocks on older nodes were bound to a context
+    /// the provider no longer sees, so requests send them without thinking.
+    #[serde(skip)]
+    pub thinking_prefix: Option<i64>,
+    #[serde(skip)]
+    pub thinking_floor: i64,
 }
 impl Bot {
     /// The bot id that keys this bot's provider prompt cache.
@@ -209,6 +217,8 @@ pub struct Window {
     pub ids: Vec<i64>,
     /// Each item's encoded length, so read-ahead can be bounded in bytes.
     pub sizes: Vec<u32>,
+    /// Bytes each item loses when sent without its thinking blocks.
+    pub thinking: Vec<u32>,
     /// Sum of item lengths, without separators.
     pub item_bytes: i64,
     /// Full unsummarized span, even when the bounded window omits a backlog.
@@ -414,7 +424,7 @@ impl Database {
         tx.execute_batch("
             CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
-                turn INTEGER, turn_seq INTEGER);
+                turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -445,7 +455,8 @@ impl Database {
                 note INTEGER REFERENCES notes(node),
                 compaction INTEGER REFERENCES compactions(node),
                 compaction_instructions TEXT, compaction_model TEXT,
-                cache_bot INTEGER);
+                cache_bot INTEGER, thinking_prefix INTEGER,
+                thinking_floor INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -651,9 +662,11 @@ impl Database {
             compaction_instructions: r.get(20)?,
             compaction_model: r.get(21)?,
             cache_bot: r.get(22)?,
+            thinking_prefix: r.get(23)?,
+            thinking_floor: r.get(24)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -940,21 +953,27 @@ impl Database {
         };
         let (_, start_depth, before, turn_seq) = chosen;
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,total_bytes) AS (
-                SELECT id,parent,depth,total_bytes FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
-             SELECT id,total_bytes FROM chain ORDER BY depth",
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking) AS (
+                SELECT id,parent,depth,total_bytes,thinking FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.thinking FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
+             SELECT id,total_bytes,thinking FROM chain ORDER BY depth",
         )?;
         // Sizes come from the cumulative byte column, no item is read here.
         let mut ids = Vec::new();
         let mut sizes = Vec::new();
+        let mut thinking = Vec::new();
         let mut previous = before;
         for row in statement.query_map(params![head, start_depth], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })? {
-            let (id, total) = row?;
+            let (id, total, own) = row?;
             ids.push(id);
             sizes.push((total - previous).clamp(0, u32::MAX as i64) as u32);
+            thinking.push(own.clamp(0, u32::MAX as i64) as u32);
             previous = total;
         }
         let compaction = match state.compaction {
@@ -970,6 +989,7 @@ impl Database {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
             ids,
             sizes,
+            thinking,
             item_bytes: head_total - before,
             unsummarized: state.unsummarized,
             omitted_items: start_depth - 1,
@@ -1513,21 +1533,51 @@ impl Database {
         Ok(out)
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
-    pub fn items_by_ids(&self, ids: &[i64]) -> Result<Vec<u8>> {
+    /// Items joined by commas; those with ids below `floor` go without
+    /// their thinking blocks.
+    pub fn items_by_ids(&self, ids: &[i64], floor: i64) -> Result<Vec<u8>> {
         let mut statement = self
             .conn
-            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+            .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
         let mut out = Vec::new();
         for (index, id) in ids.iter().enumerate() {
             if index != 0 {
                 out.push(b',');
             }
             statement.query_row([id], |r| {
-                out.extend_from_slice(r.get_ref(0)?.as_blob()?);
+                let item = r.get_ref(0)?.as_blob()?;
+                match (*id < floor && r.get::<_, i64>(1)? > 0)
+                    .then(|| super::without_thinking(item))
+                    .flatten()
+                {
+                    Some(kept) => out.extend_from_slice(&kept),
+                    None => out.extend_from_slice(item),
+                }
                 Ok(())
             })?;
         }
         Ok(out)
+    }
+    /// Bytes each node loses without its thinking blocks.
+    pub fn thinking_of(&self, ids: &[i64]) -> Result<Vec<u32>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT thinking FROM nodes WHERE id=?")?;
+        ids.iter()
+            .map(|id| {
+                Ok(statement
+                    .query_row([id], |r| r.get::<_, i64>(0))?
+                    .clamp(0, u32::MAX as i64) as u32)
+            })
+            .collect()
+    }
+    /// Record the context fingerprint a bot's requests now start with and
+    /// the first node whose thinking is bound to it.
+    pub fn set_thinking(&mut self, name: &str, prefix: i64, floor: i64) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE bots SET thinking_prefix=?,thinking_floor=? WHERE name=?")?
+            .execute(params![prefix, floor, name])?;
+        Ok(())
     }
     /// Bytes and items in the active turn alone. Older turns can be removed
     /// from the context window; the current turn cannot. The indexed first
@@ -2832,11 +2882,13 @@ impl Database {
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
+        // The same instructions and tools mean the same prefix.
+        let same_prefix = instructions.is_none_or(|own| own == parent.instructions);
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2853,11 +2905,16 @@ impl Database {
                 created_by_id,
                 parent.compaction_instructions,
                 parent.compaction_model,
-                // The same instructions and tools mean the same cached
-                // prefix, so the fork's first call can read the source's.
-                instructions
-                    .is_none_or(|own| own == parent.instructions)
-                    .then(|| parent.cache_bot())
+                // The fork's first call can read the source's cache.
+                same_prefix.then(|| parent.cache_bot()),
+                // The source's thinking is bound to its instructions and to
+                // the context in front of its window. Carry that over only
+                // if it was already in place at the checkpoint; the fork's
+                // first request compares its own context against it.
+                (same_prefix && parent.thinking_floor <= checkpoint.map_or(0, |c| c + 1))
+                    .then_some(parent.thinking_prefix)
+                    .flatten(),
+                parent.thinking_floor
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -4073,6 +4130,32 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // bots keep their own, which the daemon renews at each start anyway.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN cache_bot INTEGER;")?;
     }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='thinking')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 26 -> 27: what each stored item loses without its thinking, and
+        // per bot where thinking still matches its context. Existing bots
+        // have no fingerprint, so their first request sends older thinking
+        // without it once rather than risk a block bound elsewhere.
+        conn.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN thinking INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE bots ADD COLUMN thinking_prefix INTEGER;
+             ALTER TABLE bots ADD COLUMN thinking_floor INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        let mut update = conn.prepare("UPDATE nodes SET thinking=? WHERE id=?")?;
+        let mut select = conn
+            .prepare("SELECT id,item FROM nodes WHERE instr(item,CAST('thinking\"' AS BLOB))>0")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let item: Vec<u8> = row.get(1)?;
+            let bytes = super::thinking_bytes(&item);
+            if bytes > 0 {
+                update.execute(params![bytes as i64, row.get::<_, i64>(0)?])?;
+            }
+        }
+    }
     Ok(())
 }
 /// Keep the oldest and newest excerpts within the text/metadata budget.
@@ -4287,8 +4370,8 @@ fn node_with_turn(
     // ever committed. Allocate atomically in the insert, avoiding a separate
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
-        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?
+        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -4297,7 +4380,8 @@ fn node_with_turn(
         bytes + item.len() as i64,
         depth + 1,
         turn,
-        turn_seq
+        turn_seq,
+        super::thinking_bytes(item) as i64
     ])?;
     Ok(conn.last_insert_rowid())
 }

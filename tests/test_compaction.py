@@ -430,3 +430,78 @@ class CompactionTests(ModelFixture):
         self.assertEqual(second['input'][:-1], fork['input'][:-1])
         self.assertEqual(first['tools'], second['tools'])
         self.assertEqual(first['instructions'], second['instructions'])
+
+
+@skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
+class AnthropicThinkingBindingTests(ModelFixture):
+    """The endpoint refuses a replayed thinking block whose earlier context
+    changed, as newer Claude models do for enforced accounts."""
+    handler = AnthropicModel
+
+    def setUp(self):
+        super().setUp()
+        self.model.bind_thinking = True
+        self.model.binding_errors = []
+
+    def anthropic(self, extra):
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}, extra=extra)
+        self.addCleanup(client.close)
+        return client
+
+    def requests(self):
+        out = []
+        while not self.model.requests.empty():
+            out.append(self.model.requests.get())
+        return out
+
+    def turn(self, client, bot, request, prompt):
+        turn = client.request('submit', bot=bot, request_id=str(request), prompt=prompt)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    @staticmethod
+    def thinking(message):
+        return sum(b['type'] == 'thinking' for b in message['content'])
+
+    def test_a_sliding_window_drops_thinking_bound_to_the_turns_it_left(self):
+        client = self.anthropic(('--context-bytes', '4096'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        for n in range(12):
+            self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 400)
+        requests = self.requests()
+        self.assertEqual(self.model.binding_errors, [])
+        assistants = [[self.thinking(m) for m in r['messages'] if m['role'] == 'assistant'] for r in requests]
+        # The window slid: some requests sent older answers without thinking,
+        # and answers written after the slide kept theirs.
+        self.assertTrue(any(0 in counts for counts in assistants))
+        self.assertTrue(any(counts and counts[-1] == 1 and 0 in counts for counts in assistants))
+
+    def test_summaries_and_the_compacted_window_carry_no_foreign_thinking(self):
+        client = self.anthropic(('--context-bytes', '8192', '--compact-at', '50'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low',
+                       compaction_instructions='Summarize.')
+        for n in range(8):
+            self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 500)
+        requests = self.requests()
+        self.assertEqual(self.model.binding_errors, [])
+        summaries = [r for r in requests if r['system'][0]['text'] == 'Summarize.']
+        self.assertTrue(summaries)
+        self.assertFalse(any(self.thinking(m) for r in summaries for m in r['messages']))
+
+    def test_a_fork_keeps_thinking_only_under_its_sources_instructions(self):
+        client = self.anthropic(('--context-bytes', '65536'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        for n in range(3):
+            self.turn(client, 'Bob', n, ('tool:' if n == 0 else f'{n}:') + 'x' * 100)
+        self.requests()
+        client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
+        self.turn(client, 'Alice', 'a', 'same')
+        alice = self.requests()[0]
+        self.turn(client, 'Carol', 'c', 'other')
+        carol = self.requests()[0]
+        self.assertEqual(self.model.binding_errors, [])
+        self.assertTrue(all(self.thinking(m) for m in alice['messages'] if m['role'] == 'assistant'))
+        self.assertFalse(any(self.thinking(m) for m in carol['messages']))

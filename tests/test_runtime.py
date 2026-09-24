@@ -1,4 +1,5 @@
 """Actual Rust process, disk recovery, provider transport, and tool loop."""
+import hashlib
 import http.server
 import json
 import os
@@ -251,8 +252,26 @@ class Model(http.server.BaseHTTPRequestHandler):
             pass
 
 
+def thinking_binding(request, before):
+    """What a synthetic signature binds to, as newer Claude models do: the
+    system prompt, the tool set, and every message before the block, minus
+    earlier thinking blocks and cache markers."""
+    def plain(value):
+        if isinstance(value, dict):
+            return {k: plain(v) for k, v in value.items() if k != 'cache_control'}
+        if isinstance(value, list):
+            return [plain(v) for v in value]
+        return value
+    messages = [{**m, 'content': [b for b in m['content'] if b['type'] not in ('thinking', 'redacted_thinking')]}
+                for m in before]
+    bound = [plain(request.get('system')), sorted(t['name'] for t in request.get('tools', [])), plain(messages)]
+    return 'sig:' + hashlib.sha256(json.dumps(bound, sort_keys=True).encode()).hexdigest()[:16]
+
+
 class AnthropicModel(http.server.BaseHTTPRequestHandler):
-    """Synthetic Anthropic Messages endpoint: thinking, text, tool_use, tool_result."""
+    """Synthetic Anthropic Messages endpoint: thinking, text, tool_use, tool_result.
+    With `bind_thinking` set on the server, signatures bind to the conversation
+    before them and a replayed block whose context changed is refused."""
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *_):
@@ -287,7 +306,23 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'
-            blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': 'sig-1'}]
+            signature = 'sig-1'
+            if getattr(self.server, 'bind_thinking', False):
+                for index, message in enumerate(request['messages']):
+                    for block in message['content']:
+                        if block['type'] == 'thinking' and block['signature'] != thinking_binding(
+                                request, request['messages'][:index]):
+                            self.server.binding_errors.append(index)
+                            body = json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error',
+                                'message': f'messages.{index}: The block is bound to a different conversation.'}}).encode()
+                            self.send_response(400)
+                            self.send_header('Content-Length', str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            self.wfile.flush()
+                            return
+                signature = thinking_binding(request, request['messages'])
+            blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
             if last['content'][0]['type'] == 'tool_result':
                 blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'end_turn'
