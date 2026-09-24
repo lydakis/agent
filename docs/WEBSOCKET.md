@@ -66,7 +66,7 @@ Read from `src/provider.rs` at `e1d5f8c`.
   upload grows with the square of the round count, and the server re-renders
   the prefix each round. Prompt caching saves compute on that prefix but not
   the upload, the tokenization, or the service hops the launch post names.
-- No `prompt_cache_key` is sent yet; see the last section.
+- Each bot's calls carry its prompt cache key; see the last section.
 
 ## Where the gain would come from
 
@@ -231,11 +231,13 @@ takes cache affinity from a `session-id` request header, so PR #12 sends the
 key in that header too.
 
 On the socket, `prompt_cache_key` needs no work: the create event is built
-from the same request fields as the HTTP body, so it carries the key once
-PR #12 lands. The header does: a socket has one set of request headers, the
-upgrade's. Because each bot has its own connection, the bot's key can be sent
-as `session-id` on the upgrade, and every call on the connection carries it.
-That is wired when PR #12 is on main, since the key comes from that change.
-The screen must not run before both arms send the same key and header: a
+from the same request fields as the HTTP body, so it carries the key. The
+header does: a socket has one set of request headers, the upgrade's. Because
+each bot has its own connection, the bot's key goes as `session-id` on the
+upgrade, and every call on the connection carries it
+(`tests/test_responses_socket.py` checks both). A fork that keeps its
+source's instructions shares the source's key, since its first call repeats
+the source's prefix. The screen must still send the same key and header in
+both arms: a
 cache hit-rate gap alone could explain much of the latency difference, and it
 would be credited to the wrong change.

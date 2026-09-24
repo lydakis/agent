@@ -417,8 +417,14 @@ discards provider-specific state such as thinking signatures.
 Anthropic requests carry a `cache_control` breakpoint after the instructions
 and top-level automatic caching for the growing history, so repeated prefixes
 are read from the provider cache once they exceed the model's minimum; the
-[live run](ANTHROPIC_SMOKE.md) records the effect. Responses caching needs no
-request change. Empty instructions omit the system block, since empty text
+[live run](ANTHROPIC_SMOKE.md) records the effect. Anthropic caches any
+byte-identical prefix, so a fork reads its source's cache with no key.
+Responses requests carry a `prompt_cache_key`, also sent as the `session-id`
+header that the ChatGPT backend routes on: a nonce drawn once per daemon plus
+the id of the bot whose cache the call shares. That is the bot's own id,
+except that a fork keeping its source's instructions shares the source's key,
+because its first call repeats the source's prefix. Summaries add `-summary`,
+since their prefix differs. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses

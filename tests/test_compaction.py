@@ -383,12 +383,20 @@ class CompactionTests(ModelFixture):
             self.assertGreaterEqual(c['reclaimed_items'], 0)
             self.assertEqual(c['headroom_bytes'], c['input_limit']['bytes'] - c['context_after']['bytes'])
 
-    def test_prompt_cache_keys_follow_the_bot_and_its_prefix(self):
+    def test_prompt_cache_keys_follow_the_shared_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
         self.create(client)
+        self.create(client, bot='Eve')
+        # A fork with its source's instructions shares the source's prefix
+        # and so its key, as does a fork of that fork; new instructions or a
+        # new bot mean a new prefix and a key of their own.
         client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
-        self.run_turn(client, 'Alice', 'a', 'small')
-        alice = self.requests()
+        client.request('fork', source='Alice', bot='Ann', workspace=str(self.path))
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
+        keys = {}
+        for name in ('Alice', 'Ann', 'Carol', 'Eve'):
+            self.run_turn(client, name, name, 'small')
+            keys[name] = self.requests()[0]['prompt_cache_key']
         for n in range(3):
             self.run_turn(client, 'Bob', n, str(n) * 500)
         bob = self.requests()
@@ -396,7 +404,8 @@ class CompactionTests(ModelFixture):
         summaries = {r['prompt_cache_key'] for r in bob if r['instructions'] == 'Summarize.'}
         self.assertEqual(len(calls), 1)
         self.assertEqual(summaries, {calls.copy().pop() + '-summary'})
-        self.assertNotIn(alice[0]['prompt_cache_key'], calls | summaries)
+        self.assertEqual({keys['Alice'], keys['Ann']}, calls)
+        self.assertEqual(len({keys['Carol'], keys['Eve']} | calls), 3)
 
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))

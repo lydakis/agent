@@ -5058,3 +5058,51 @@ fn oversized_history_items_do_not_hide_the_rest_of_the_batch() {
     }
     assert!(serde_json::to_vec(&batch).unwrap().len() < 768 * 1024);
 }
+
+#[test]
+fn cache_lineage_migrates_and_follows_forks_that_keep_their_instructions() {
+    let path =
+        std::env::temp_dir().join(format!("agent-cache-lineage-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE bots DROP COLUMN cache_bot; PRAGMA user_version=26;")
+            .unwrap();
+    }
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!((bob.cache_bot, bob.cache_bot()), (None, bob.id));
+    db.fork("Bob", "Alice", Fork::default()).unwrap();
+    db.fork("Alice", "Ann", Fork::default()).unwrap();
+    db.fork(
+        "Bob",
+        "Carol",
+        Fork {
+            instructions: Some("Other."),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    // Same instructions as the source: the same prefix, so the same cache.
+    db.fork(
+        "Bob",
+        "Dan",
+        Fork {
+            instructions: Some(&bob.instructions),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    for (name, cache) in [("Alice", bob.id), ("Ann", bob.id), ("Dan", bob.id)] {
+        assert_eq!(db.inspect(name).unwrap().cache_bot(), cache, "{name}");
+    }
+    let carol = db.inspect("Carol").unwrap();
+    assert_eq!(carol.cache_bot(), carol.id);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}

@@ -59,8 +59,16 @@ pub struct Bot {
     pub compaction: Option<i64>,
     pub compaction_instructions: Option<String>,
     pub compaction_model: Option<String>,
+    /// The bot whose provider prompt cache this one shares: a fork with its
+    /// source's instructions starts from the source's cached prefix. `None`
+    /// is the bot's own.
+    pub cache_bot: Option<i64>,
 }
 impl Bot {
+    /// The bot id that keys this bot's provider prompt cache.
+    pub fn cache_bot(&self) -> i64 {
+        self.cache_bot.unwrap_or(self.id)
+    }
     pub fn family(&self) -> Result<Family> {
         Family::parse(&self.family).ok_or(Error::new("store_family_unsupported"))
     }
@@ -349,7 +357,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 26;
+    pub const SCHEMA: i32 = 27;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -436,7 +444,8 @@ impl Database {
                 created_by_id INTEGER,
                 note INTEGER REFERENCES notes(node),
                 compaction INTEGER REFERENCES compactions(node),
-                compaction_instructions TEXT, compaction_model TEXT);
+                compaction_instructions TEXT, compaction_model TEXT,
+                cache_bot INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -641,9 +650,10 @@ impl Database {
             compaction: r.get(19)?,
             compaction_instructions: r.get(20)?,
             compaction_model: r.get(21)?,
+            cache_bot: r.get(22)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -2826,7 +2836,7 @@ impl Database {
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2842,7 +2852,12 @@ impl Database {
                 created_by,
                 created_by_id,
                 parent.compaction_instructions,
-                parent.compaction_model
+                parent.compaction_model,
+                // The same instructions and tools mean the same cached
+                // prefix, so the fork's first call can read the source's.
+                instructions
+                    .is_none_or(|own| own == parent.instructions)
+                    .then(|| parent.cache_bot())
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -4048,6 +4063,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE artifacts ADD COLUMN raw_bytes INTEGER NOT NULL DEFAULT 0;",
         )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='cache_bot')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 26 -> 27: forks share their source's prompt cache key. Existing
+        // bots keep their own, which the daemon renews at each start anyway.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN cache_bot INTEGER;")?;
     }
     Ok(())
 }

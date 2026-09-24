@@ -70,8 +70,9 @@ fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
     out
 }
 
-/// The Responses prompt-cache key for a bot's calls: its store id under a
-/// nonce drawn once per daemon, so bots of different stores (every Harbor
+/// The Responses prompt-cache key for a bot's calls: the store id of the bot
+/// whose cache it shares (its own, or a fork's source) under a nonce drawn
+/// once per daemon, so bots of different stores (every Harbor
 /// container's first bot is id 1) never share a key. A restart costs each bot
 /// one cache miss. Summaries have their own prefix, so their own key.
 fn cache_key(bot: i64, summary: bool) -> String {
@@ -928,7 +929,7 @@ impl Turn {
         let prior_spent =
             std::time::Duration::from_millis(std::mem::take(&mut accounting.call_spent_ms));
         let paced_before = accounting.totals().1;
-        let cache_key = cache_key(record.id, matches!(body, Body::Span(_)));
+        let cache_key = cache_key(record.cache_bot(), matches!(body, Body::Span(_)));
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context),
