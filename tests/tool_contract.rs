@@ -33,24 +33,35 @@ async fn shell_preserves_exit_status_and_separate_outputs() {
 #[tokio::test]
 async fn shell_timeout_and_output_overflow_are_bounded() {
     let tools = Registry::new("echo,shell").unwrap();
-    for (command, timeout, error) in [
-        ("sleep 10", 30, "shell_timeout"),
-        ("yes x", 1000, "shell_output_limit"),
-    ] {
+    let cwd = std::env::temp_dir();
+    let run = |command: &str, timeout: u64| {
         let prepared = tools
             .prepare(
                 "shell",
                 &json!({"command":command,"timeout_ms":timeout}).to_string(),
             )
             .unwrap();
-        let result = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            tools.execute(prepared, &std::env::temp_dir(), &[]),
+            tools.execute(prepared, &cwd, &[]),
         )
-        .await
-        .unwrap();
-        assert_eq!(result.unwrap_err().code, error);
-    }
+    };
+    // A timed-out command still shows what it wrote before it was killed.
+    let output: Value = serde_json::from_str(
+        &run("printf before; printf warn >&2; sleep 10", 300)
+            .await
+            .unwrap()
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    assert_eq!(output["stdout"], "before");
+    assert_eq!(output["stderr"], "warn");
+    assert_eq!(output["timed_out"], true);
+    assert_eq!(output["success"], false);
+    assert!(output["exit_code"].is_null());
+    let overflow = run("yes x", 1000).await.unwrap().unwrap_err();
+    assert_eq!(overflow.code, "shell_output_limit");
 }
 
 #[tokio::test]

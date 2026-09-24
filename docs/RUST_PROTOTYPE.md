@@ -1197,7 +1197,7 @@ The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
 `history`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
-(unknown tool, invalid arguments, missing file, ambiguous edit, timeout, output
+(unknown tool, invalid arguments, missing file, ambiguous edit, output
 overflow) returns an error result to the model and the turn continues. Only a
 closed tool scheduler fails the turn. Allowed tools run without approval prompts.
 A store remains bound to its tool set; changing it requires a new store.
@@ -1218,8 +1218,13 @@ accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Results include separate output, exit code, and
-success status. Nonzero exit is a recorded tool result. Timeout and overflow kill
-the owned process group. Turn cancellation requests the same kill for a
+success status. Nonzero exit is a recorded tool result. A command's return,
+timeout, or overflow kills its owned process group, so a process it started
+with `&` does not outlive it; the tool description tells the model so. A
+timeout is a result, not an error: the output written before the kill, with
+`timed_out: true` and no exit code, since a long command's partial output is
+often what the model needs next. Background commands are killed when the
+daemon stops. Turn cancellation requests the same kill for a
 foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
