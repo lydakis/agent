@@ -548,15 +548,24 @@ carrying it over.
 3. **Renumbering at import.** Node, turn, bot, process, and event ids are
    per-store sequences, so import allocates fresh ones and rewrites every
    reference: parents, head, context start, note and compaction chains,
-   cuts, checkpoints, and each turn's `prompt_node`. Two ids cannot simply
-   be rewritten:
+   cuts, checkpoints, and each turn's `prompt_node`. It also rewrites the
+   ids inside the payloads of the events the bundle carries, because
+   `result` returns that data as it is: a finished turn's
+   `turn_finished.data.checkpoint` (at `e1d413f`: `src/store/db.rs:2441`),
+   a steered turn's `into` and `node` (`src/store/db.rs:2178`), and a fork
+   event's `source`, `checkpoint`, and `node` (`src/store/db.rs:2865`).
+   Two ids cannot simply be rewritten:
    - Transcript text already holds turn ids in `TURN/CALL_ID/STREAM`
      artifact references and in `turn:` and `proc:` handles, and history is
      never rewritten (AGENTS.md). An artifact reference is read by the bot
      that holds it and authorized against that bot's lineage, so an origin
      turn id that collides with a target turn fails explicitly rather than
-     returning another bot's output. An alias from origin ids to
-     new ones would keep such references readable.
+     returning another bot's output. That is safe but breaks the history:
+     a truncated tool result tells the model to read a reference that no
+     longer resolves, though the bundle carries the output. An alias from
+     origin ids to new ones would keep such references readable. Until
+     that alias exists, import refuses a bot whose transcript holds
+     artifact references, and names them, as it does for handles.
    - Handles are different. `proc:N` names no bot, the client `wait`
      operation takes no bot (at `8ebbc44`: `src/server/mod.rs:157-163`), and
      a process result is looked up by id alone (`src/store/db.rs:2444`). An
@@ -742,18 +751,19 @@ carrying it over.
 2. Export of an idle root bot with no running processes, and import as a
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
-   `result` and artifact reads answer for imported turns, prune and delete
+   `result` and artifact reads answer for imported turns, with the
+   checkpoint and steer ids in `result` rewritten to target ids, prune and delete
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
    of it, one-bot or `follow *`, reports a gap only where the bundle
    omitted events, a
    submission and a prune racing a paged export yield exactly the cut, and
    a missing provider, compaction provider, or tool, fork ancestry, a
-   handle in the transcript, or a running process each fail the export or
-   import explicitly.
+   handle or artifact reference in the transcript, or a running process
+   each fail the export or import explicitly.
 3. The alias decision for artifact references, with a test that reads one
-   written before the move, and store-qualified handles so that bots that
-   delegate can move.
+   written before the move, and store-qualified handles, so that bots with
+   truncated tool output or delegation can move.
 4. A representation for fork ancestry, so forks can be imported.
 5. Move bound to one destination instance, with `moving` and tombstone
    states and `bot_moved` answers. Behavior tests: a copy of the
