@@ -3888,3 +3888,230 @@ temporary store write lock exposed the difference: 240 ms end-to-end versus
 29 ms reported by the old observer. The historical latency figures have not
 been rerun with this correction; the separate storage comparison drivers already
 time from before submission.
+
+## Effective context budgeting
+
+2026-09-22, local macOS arm64, release builds. Baseline `8ebbc4438cc340428721406f65f0e82546ab9207`
+(binary SHA-256 prefix `218a3729`), candidate `381636d4`. The candidate counts
+encoded pinned summaries, retained prompts, notes, omission listings, separators,
+and item counts, with a quarter of the conversation envelope reserved for
+completion growth. This is encoded-size accounting, not model token budgeting.
+The summarizer receives a byte target; replacements that do not shrink the view
+or cannot coexist with the active turn are billed and rejected. Successful
+compaction events report before/after usage, reclaimed space, and headroom.
+
+The steady path prepares the prefix once per round, shares its encoded bytes
+across retries, and fetches note/summary metadata with the indexed window state.
+It no longer performs separate note, summary, and compaction-trigger lookups.
+Optional omission listings use a stable allowance and logarithmic sizing rather
+than repeatedly dropping one entry and re-encoding the entire list.
+
+Matched screen: eight bots, sixteen turns each, echo tool calls with all five
+`echo,shell,read,write,edit` schemas, socket transport and one follower per bot.
+Three alternating measured pairs plus one warmup pair per case. Both builds
+reached eight overlapping provider requests. Request counts, provider request
+and response bytes, tool results, follower/replay equality, restart, duplicate
+reconciliation, and historical forks matched; no observer quality warnings.
+The enabled case supplied compaction instructions but stayed below the trigger,
+so it measures the accounting path without unequal summarizer work.
+
+| Case | Daemon CPU seconds, median before → after | Peak RSS MiB, median before → after | Turn p95 ms, median before → after |
+| --- | ---: | ---: | ---: |
+| 256-byte history per prompt | 0.364 → 0.362 | 14.50 → 14.39 | 68.37 → 67.17 |
+| 64-KiB history per prompt | 0.612 → 0.610 | 18.81 → 18.66 | 65.40 → 64.04 |
+| 4-KiB prompts, compaction enabled | 0.383 → 0.388 | 15.56 → 15.42 | 66.55 → 66.27 |
+
+CPU, RSS, and p95 ranges overlap in each case. For example, enabled-case CPU
+ranged 0.372–0.406 s before and 0.375–0.391 s after; its baseline had one
+115 ms p95 outlier. This screen detects no clear common-path regression and
+establishes no universal speedup. Active-compaction throughput, long soaks,
+real-model quality, and model-token headroom remain separate measurement gaps.
+Captures and the exact driver: `.local/context-budget/perf-v2/result.json` and
+`.local/context-budget/compare.py`.
+
+Validation: 120 Rust tests and strict Clippy passed. Fifteen focused runtime
+checks cover byte/item pressure, escaped pinned notes, rejected-summary billing,
+catch-up, prefix stability, forks, restart, bounded history paging, and evaluator
+boundary classification. The offline query-plan audit still reports no growing
+table scans. Live test command examples now select `openai/gpt-6-luna`;
+historical results retain the models actually measured. No paid model calls
+were made for this slice.
+
+
+### Context-budget review corrections
+
+2026-09-23. The full Python suite reproduced two failures in the preceding
+candidate: the minimum item envelope could not hold a resumed prompt plus its
+omission note, and retained prompt copies crowded out history retrieval after
+compaction. The focused checks above had missed these failures. The quarter
+reserve described above is superseded by the following policy.
+
+The configured byte/item envelope remains the hard input bound. A known output
+cap supplies a soft compaction threshold at an estimated four bytes per token,
+with the reserve capped at one quarter; an unset Responses output cap supplies
+no estimate. This is planning, not a token-to-JSON size guarantee. Compaction
+limits the encoded summary block, including retained prompt copies, to half the
+byte envelope. It trims a middle range of copies, preserving the oldest and
+newest when they fit. Original transcripts and installed-prefix stability are
+unchanged. History allowance now uses indexed active-turn totals and bounded
+prefix metadata on the reader, avoiding the extra full-window construction and
+writer job per history read.
+
+Validation of the corrected tree: 120 Rust tests passed, strict Clippy and
+format checks passed, and the full Python suite ran 208 tests with 204 passing
+and four opt-in engine integration checks skipped. This includes the original
+minimum-limit and history-recovery regressions, repeated compaction with escaped
+prompts, rejection and billing of oversized encoded summaries, output-cap
+trigger behavior, and history paging after 56 KiB of work within a 64-KiB
+envelope. No paid model calls were made.
+
+Matched history screen: corrected binary `b0fb2541` against the reviewed
+candidate `381636d4`, local release builds, one bot with 160 history-tool turns,
+a 1-MiB envelope, 97-byte requested pages and no optional omission listing.
+One warmup pair and three alternating measured pairs. All runs completed;
+321 canonicalized provider requests, totaling 23,821,178 bytes, and their full
+content hashes matched exactly. Every history result was successful.
+
+Median daemon CPU fell from 0.594 to 0.563 seconds (about 5.3%); ranges were
+0.591–0.612 and 0.560–0.577 seconds. Median turn p95 was 7.55 to 7.06 ms; one
+baseline pair had a 16.55-ms outlier. Median sampled peak RSS was effectively
+flat at 14.08 to 14.09 MiB. Window constructions fell from 481 to 321, replacing
+160 writer jobs with bounded history-usage reads. This establishes a modest
+improvement for this synthetic retrieval workload, not a general runtime
+speedup. Captures: `.local/context-review/history-perf/result.json`; driver:
+`.local/context-review/history_perf.py`.
+
+The original eight-bot echo screen was also repeated against `381636d4`, with
+three alternating measured pairs per case plus warmups. A candidate short-case
+p95 outlier and a small enabled-case CPU difference prompted two additional
+measured pairs for those two cases, again with warmups. All provider workload
+counts/bytes and lifecycle/follower checks matched. Combined medians:
+
+| Case | Daemon CPU seconds, before → after | Peak RSS MiB, before → after | Turn p95 ms, before → after |
+| --- | ---: | ---: | ---: |
+| Short, five pairs | 0.323 → 0.326 | 14.47 → 14.56 | 67.22 → 65.38 |
+| Long, three pairs | 0.583 → 0.543 | 19.03 → 18.64 | 83.49 → 63.28 |
+| Compaction enabled, five pairs | 0.329 → 0.338 | 15.31 → 15.42 | 64.43 → 67.54 |
+
+The 174-ms candidate short-case outlier did not repeat; baseline p95 outliers
+also occurred. These small runs are noisy, and the enabled case has modestly
+higher CPU and p95 medians, so this is not proof of universal parity. Captures:
+`.local/context-review/common-perf/result.json` and
+`.local/context-review/common-confirm/result.json`. Both enabled screens remain
+below the compaction trigger. Simultaneous active-compaction construction on
+the writer remains item 37, separate from these measurements.
+
+A larger confirmation attempt used 32 bots and 64 turns each. The first
+baseline completed all provider turns but exposed the lifecycle driver's
+single-page replay assumption. A temporary driver then collected every page.
+Its warmup pair and one measured pair passed, but the next baseline failed the
+restart/resume/replay/fork audit after all 4,096 provider requests completed.
+That incomplete screen is excluded from performance conclusions; the audit
+failure has not been diagnosed. Captures: `.local/context-review/enabled-scale-v2/`
+and `.local/context-review/enabled-scale-v2.log`. Correctness fixes and the
+retrieval improvement are verified; broad performance parity remains unproven.
+
+### Preview and note admission fixes (2026-09-23)
+
+Compared the pre-fix candidate `b0fb25417ee059492d9a18bc9a7cc2d5c3f98feea204284744236faef6348708`
+with final binary `53195bc2781634bfc031f1f1e36e043a3df2085398525139f377e09e4aaf120a`
+on the same macOS arm64 host. One bot submits sequential synthetic 150-byte
+prompts over stdio. The ordinary case has a 1 MiB context; the overflow case
+has 4 KiB and default omission previews. Each screen has one warmup pair and
+three alternating measured pairs. Provider request counts, bytes, and complete
+body digests match between binaries. CPU covers the daemon; latency spans submit
+through terminal event receipt; RSS is the maximum sample taken after each turn.
+
+| Case | Turns per run | CPU seconds, before → after | Sampled RSS MiB, before → after | Turn p95 ms, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary, short | 240 | 0.434 → 0.451 | 13.64 → 13.70 | 3.16 → 3.46 |
+| Ordinary, longer confirmation | 640 | 1.805 → 1.811 | 15.02 → 15.16 | 7.09 → 6.81 |
+| Context overflow | 240 | 0.353 → 0.328 | 13.77 → 13.89 | 2.65 → 2.25 |
+
+Values are medians across measured runs. The short ordinary screen had a
+candidate p95 outlier (10.44 ms); the longer confirmation did not repeat it,
+and CPU was within 0.4%. Overflow CPU and p95 medians were lower, but paired
+results varied in direction. These are small synthetic screens, not a general
+speedup claim. Sampled RSS was about 0.06–0.14 MiB higher. Normal requests and
+successful context trimming add no store operations: the current-turn lookup
+runs only when normal trimming fails and optional previews may be reduced.
+Nonempty note writes add bounded reader-side validation; these screens do not
+measure note-write throughput.
+
+Captures and drivers: `.local/context-fixes/perf-final/result.json`,
+`.local/context-fixes/perf-confirm/result.json`, `perf_final.py`, and
+`perf_confirm.py` in the same local directory. An earlier implementation that
+queried the current-turn minimum on every overflow was screened in
+`.local/context-fixes/perf/result.json` and replaced before final measurement.
+Both reported regressions failed before the fixes and pass afterward. The full
+Python suite passed 217 tests with six opt-in skips; all 17 compaction tests and
+120 Rust tests also passed after the final overflow-path optimization. Strict
+Clippy and formatting checks passed.
+
+### History result admission ahead of previews (2026-09-23)
+
+History admission now counts the current turn and mandatory prefix only. Optional
+omission previews yield to the encoded tool result during request fitting. This
+also removes an omitted-prompt traversal and preview serialization per history
+call; pinned summaries, notes, and the bare omission notice still count.
+
+Compared pre-fix binary
+`53195bc2781634bfc031f1f1e36e043a3df2085398525139f377e09e4aaf120a`
+with candidate
+`55e6e7e61a9dc737ed5a0af5b9e7debf6dc7d7422af6c8177337f37c1c4d4a57`
+on the same macOS arm64 host. One bot seeds a synthetic fact, then performs 160
+history-read turns with 97-byte pages, a 4 KiB context, and default previews.
+One warmup pair precedes three alternating measured pairs. Every run has 321
+provider requests and 1,403,840 normalized request-body bytes, with identical
+complete-body digests. Median daemon CPU is 0.408 → 0.392 seconds (3.8% lower),
+turn p95 is 4.36 → 4.31 ms, and maximum sampled RSS is 14.11 → 14.19 MiB.
+All three measured CPU pairs favor the candidate. The store counters report
+median aggregate `history_usage` execution time of 20 → 4 ms across the 160
+reads, consistent with removing the preview traversal and encoding. This
+supports a modest improvement for this retrieval workload, not a general
+speedup claim.
+
+CPU is measured after the seed turn through completion of the history turns;
+turn latency spans submit through terminal-event receipt, and RSS is sampled
+after each turn. Captures: `.local/history-admission/perf/result.json`;
+driver: `.local/history-admission/perf.py`. The regression additionally checks
+paging after 1.8 KiB of assistant output, retaining the omission notice and
+keeping UTF-8 request input within 4,096 bytes.
+
+Validation: 120 Rust tests and 218 Python tests passed (six opt-in Python skips),
+with strict Clippy, formatting, and diff checks clean. The regression failed on
+the saved baseline and passes after the fix, including continuation to the next
+97-byte page.
+
+### Compaction minimum admission without previews (2026-09-23)
+
+The minimum-fit check now counts the candidate summary, retained prompts, note,
+bare omission notice, and active turn. Optional previews yield during request
+fitting; excluding them also avoids an omitted-turn traversal and preview
+encoding on this check. A 4 KiB regression seeds 15 short turns and submits five
+1.7 KiB prompts: the baseline rejects all five summaries without advancing its
+compaction, while the candidate installs each summary and keeps all requests
+within the input envelope. This repairs useful work, not a matched speedup.
+
+Compared baseline `55e6e7e61a9dc737ed5a0af5b9e7debf6dc7d7422af6c8177337f37c1c4d4a57`
+with candidate `ae1db0b9b23cb1c55c2e85a8aef0162d678401271a237cde1cda7e8f06cee898`
+on macOS arm64. A separate matched workload uses one bot, an 8 KiB context,
+50% compaction trigger, default previews, and numbered 500-byte synthetic
+prompts. Both lengths use one warmup pair and three alternating measured pairs.
+The 160-turn screen showed median daemon CPU 0.449 → 0.531 seconds and turn
+p95 5.80 → 10.99 ms. A longer 640-turn check showed CPU 1.747 → 1.755 seconds
+(+0.45%), p95 4.76 → 4.90 ms, and maximum sampled RSS 16.375 → 16.453 MiB.
+The large short-screen difference did not persist in the longer check; these
+results do not establish a speedup or universal performance parity.
+
+Each short run sent 318 requests totaling 1,435,793 normalized body bytes;
+each long run sent 1,278 requests totaling 5,832,874 bytes. Complete request-body
+digests match between binaries at each length. CPU excludes startup and the seed
+turn; latency spans submission through terminal-event receipt, and RSS is sampled
+after turns. Drivers and both result sets are retained under
+`.local/compaction-admission/{perf,perf-long}.py` and
+`.local/compaction-admission/{perf,perf-long}/result.json`.
+
+Validation: 120 Rust tests, all 19 Python compaction tests, strict Clippy,
+formatting, and diff checks passed. The new regression fails on the saved
+baseline and passes on the candidate.

@@ -518,17 +518,22 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
-33. Budget the effective request. The compaction trigger reads the raw
-    unsummarized span (`unsummarized_bytes`) against a percentage of `--context-bytes`; it
-    excludes the summary, the kept prompts, the carry-forward note, and the
-    omission listing, and ignores `--context-items`. Trigger on the
-    effective request, whichever of bytes and items is nearest exhaustion,
-    reserve room for output, give the summarizer a size target, and record
-    per compaction how much headroom it bought; a compaction whose view is
-    not smaller than what it replaced is a failure to report, not a
-    success. Tests: thousands of small items exhausting the item budget
-    below the byte trigger; a large pinned prefix leaving little tail room.
-    (From Astra Pro's compaction review.)
+33. Done: budget the effective context view, including the encoded summary,
+    retained prompts, carry-forward note, omission listing, separators, and
+    item counts. The configured envelope remains the hard input limit. Known
+    output caps supply a soft completion-headroom estimate, capped at a quarter
+    of the envelope; this is not model token budgeting (item 17). Either dimension
+    can trigger compaction. The tail target shrinks
+    with pinned overhead, the summarizer receives a byte target, and a candidate
+    that expands the view or crowds out the active turn is rejected and billed.
+    Retained prompt copies fit an encoded prefix budget, preserving history
+    retrieval; its allowance uses indexed active-turn and bounded prefix reads.
+    Compaction events report before/after usage and remaining headroom, negative
+    while a backlog still exceeds the input envelope. Context metadata/prefixes
+    are prepared once per round and reused across retries; the old separate
+    unsummarized-span query is gone from the turn loop. Performance evidence is
+    recorded in [the matched screen](DAEMON_MEASUREMENTS.md#effective-context-budgeting).
+    Within-turn reclamation remains item 34.
 34. Compaction inside a running turn. Cuts land only at submitted-turn
     starts and the window must hold the whole current turn, so one long
     autonomous task with many tool rounds in a single turn still reaches
@@ -562,12 +567,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     summarizer latency per correctly completed task. Compare a few
     threshold policies on it before changing the 75/25 defaults. (From
     Astra Pro's compaction review, and the remainder of item 16.)
-37. Context construction cost, measured before built. Each request
-    rebuilds the pinned blocks and reruns the omitted-turns walk although
-    the prefix is stable between compactions; an enabled bot pays a
-    separate `unsummarized_bytes` read before `window`, and planning reads
-    the bot again. Planning now runs on the reader, with catch-up walks
-    yielding every 1,024 nodes. Measure
+37. Context construction cost, measured before built. Item 33 shares an
+    encoded prefix across retries, combines window metadata, removes the
+    separate `unsummarized_bytes` lookup, and avoids full-window construction
+    for history reads. Each model round still rebuilds stable pinned blocks
+    and reruns the omitted-turns walk. Compaction validation reconstructs
+    before/after/minimum views on the writer. Planning runs on the reader,
+    with catch-up walks yielding every 1,024 nodes. Measure
     the walk on long tool-heavy histories and ordinary-turn latency during
     simultaneous compactions with the operation histograms; only then a
     bounded cache of encoded prefix pieces keyed by family, summary

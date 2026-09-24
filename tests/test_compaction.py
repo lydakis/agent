@@ -42,6 +42,182 @@ class AnthropicCompactionTests(ModelFixture):
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class CompactionTests(ModelFixture):
+    def test_optional_previews_do_not_block_compaction_of_large_turns(self):
+        self.model.compaction_text = 'A brief summary.'
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        for n in range(15):
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'],
+                             'completed')
+        previous = client.request('resume', bot='Bob')['result']['compaction']
+        self.assertIsNotNone(previous)
+        self.requests()
+        for n in range(15, 20):
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 1700)['data']['status'],
+                             'completed')
+            current = client.request('resume', bot='Bob')['result']['compaction']
+            self.assertNotEqual(current, previous)
+            previous = current
+        requests = self.requests()
+        self.assertEqual(sum(r['instructions'] == 'Summarize.' for r in requests), 5)
+        self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2
+                            <= 4096 for r in requests))
+        self.assertFalse(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
+                             for m in client.saved))
+
+    def test_output_cap_advances_compaction_without_reducing_the_input_envelope(self):
+        for cap in (None, 2048):
+            with self.subTest(cap=cap):
+                extra = ('--context-bytes', '8192', '--compact-at', '95')
+                if cap is not None:
+                    extra += ('--max-output-tokens', str(cap))
+                client = Client(self.binary, self.path / f'cap-{cap}.sqlite', self.url, extra=extra)
+                self.addCleanup(client.close)
+                self.create(client)
+                for n in range(7):
+                    self.assertEqual(self.run_turn(client, 'Bob', n, 'x' * 500)['data']['status'], 'completed')
+                requests = self.requests()
+                self.assertEqual(any(r['instructions'] == 'Summarize.' for r in requests), cap is not None)
+                self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) - 2 <= 8192
+                                    for r in requests))
+                client.close()
+
+    def test_retained_prompts_leave_room_for_history_after_repeated_compactions(self):
+        client = self.client(tools='echo,history', extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        for n in range(12):
+            text = 'x' * 500 if n % 2 == 0 else '\"\\\nλ' * 100
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + text)['data']['status'], 'completed')
+        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        for offset in (0, 97):
+            ended = self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset},97')
+            self.assertEqual(ended['data']['status'], 'completed')
+            requests = self.requests()
+            results = [json.loads(i['output']) for r in requests for i in r['input']
+                       if i.get('type') == 'function_call_output' and i.get('call_id') == 'history-1']
+            self.assertTrue(results)
+            self.assertTrue(all('error' not in r and r['text'] for r in results), results)
+            self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2
+                                <= 4096 for r in requests))
+        self.assertFalse(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
+                             for m in client.saved))
+
+    def test_nonshrinking_summary_is_billed_without_installing_it(self):
+        self.model.compaction_text = 'x' * 900
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        for n in range(3):
+            self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
+        bot = client.request('resume', bot='Bob')['result']
+        self.assertIsNone(bot['compaction'])
+        self.assertEqual(bot['tokens_used'], 440)  # three answers plus the rejected summary
+        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_not_smaller'
+                            for m in client.saved))
+
+    def test_escaped_summary_cannot_exceed_the_encoded_prefix_budget(self):
+        self.model.compaction_text = '\\' * 1100  # raw target fits; encoded block does not
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        for n in range(3):
+            self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
+        bot = client.request('resume', bot='Bob')['result']
+        self.assertIsNone(bot['compaction'])
+        self.assertEqual(bot['tokens_used'], 440)
+        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_context_limit'
+                            for m in client.saved))
+
+    def test_small_items_trigger_compaction_below_the_byte_threshold(self):
+        client = self.client(extra=('--context-bytes', '65536', '--context-items', '16'))
+        self.create(client)
+        for n in range(10):
+            self.assertEqual(self.run_turn(client, 'Bob', n, 'small')['data']['status'], 'completed')
+        requests = self.requests()
+        self.assertTrue(any(r['instructions'] == 'Summarize.' for r in requests))
+        self.assertTrue(all(len(r['input']) <= 15 for r in requests))
+
+    def test_history_result_takes_precedence_over_optional_previews(self):
+        client = self.client(tools='history', extra=('--context-bytes', '4096'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        for n in range(30):
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'], 'completed')
+        self.requests()
+        self.model.history_prefill = 1800
+        for offset in (0, 97):
+            self.assertEqual(self.run_turn(client, 'Bob', f'h-{offset}', f'history:1,{offset},97')['data']['status'],
+                             'completed')
+            requests = self.requests()
+            results = [json.loads(i['output']) for r in requests for i in r['input']
+                       if i.get('type') == 'function_call_output' and i.get('call_id') == 'history-1']
+            self.assertTrue(results)
+            page = results[-1]
+            self.assertNotIn('error', page)
+            self.assertEqual(page['offset'], offset)
+            self.assertEqual(page['next_offset'], offset + 97)
+            self.assertEqual(len(page['text'].encode()), 97)
+            self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2 <= 4096
+                                for r in requests))
+            self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
+
+    def test_optional_previews_leave_room_for_the_current_prompt(self):
+        client = self.client(extra=('--context-bytes', '4096'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        for n in range(30):
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'], 'completed')
+        self.requests()
+        self.assertEqual(self.run_turn(client, 'Bob', 'large', 'y' * 2000)['data']['status'], 'completed')
+        requests = self.requests()
+        self.assertTrue(requests)
+        self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) - 2 <= 4096
+                            for r in requests))
+        self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
+
+    def test_oversized_note_preserves_previous_note_and_bot_remains_usable(self):
+        client = self.client(tools='note', extra=('--context-bytes', '4096'))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        self.assertEqual(self.run_turn(client, 'Bob', 'seed', 'note:remember violet')['data']['status'], 'completed')
+        for n, note in enumerate(('x' * 5000, '\\' * 2100, 'n' * 2000)):
+            self.model.note_text = note
+            ended = self.run_turn(client, 'Bob', f'bad-{n}', 'note:replace')
+            if n == 2:
+                self.assertEqual(ended['data']['status'], 'completed')
+                self.assertTrue(any('note_context_limit' in str(r['input']) for r in self.requests()))
+            # The provider output itself can overflow this turn, but its note
+            # must not poison subsequent turns or replace the last good note.
+            self.requests()
+            self.assertEqual(self.run_turn(client, 'Bob', f'next-{n}', 'continue')['data']['status'], 'completed')
+            requests = self.requests()
+            self.assertTrue(any('remember violet' in str(r['input']) for r in requests))
+            with sqlite3.connect(self.path / 'state.sqlite') as db:
+                self.assertEqual(db.execute('select n.text from bots b join notes n on n.node=b.note where b.name=?',
+                                            ('Bob',)).fetchone()[0], 'remember violet')
+        del self.model.note_text
+        self.assertEqual(self.run_turn(client, 'Bob', 'clear', 'note:')['data']['status'], 'completed')
+
+    def test_pinned_note_counts_toward_compaction_and_request_room(self):
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '75'))
+        self.create(client)
+        # Seed a durable note at an existing node, then reopen the daemon.
+        # Escaped note bytes count; transcript payloads remain small.
+        self.run_turn(client, 'Bob', 'seed', 'seed')
+        client.close()
+        db = sqlite3.connect(self.path / 'state.sqlite')
+        head = db.execute('select head from bots where name="Bob"').fetchone()[0]
+        db.execute('insert into notes(node,text) values (?,?)', (head, '"\n' * 550))
+        db.execute('update bots set note=? where name="Bob"', (head,))
+        db.commit()
+        db.close()
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        extra=('--context-bytes', '4096', '--compact-at', '75'))
+        self.addCleanup(client.close)
+        self.requests()
+        for n in range(6):
+            self.assertEqual(self.run_turn(client, 'Bob', n, 'small')['data']['status'], 'completed')
+        requests = self.requests()
+        self.assertTrue(any(r['instructions'] == 'Summarize.' for r in requests))
+        normal = [r for r in requests if r['instructions'] != 'Summarize.']
+        self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) - 2 <= 4096
+                            for r in normal))
+
     def test_parked_summary_resumes_as_a_summary_after_restart(self):
         extra = ('--context-bytes', '4096', '--compact-at', '50')
         client = self.client(extra=extra)
@@ -177,14 +353,15 @@ class CompactionTests(ModelFixture):
         self.assertEqual(len(client.request('turns', bot='Bob', after=0, limit=64)['result']['turns']), 24)
 
     def test_a_backlog_is_caught_up_oldest_first_once_summaries_succeed(self):
+        self.model.reply_text = 'x' * 500
         self.model.reject_compaction = True
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
         self.create(client)
         for n in range(12):
-            self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 500)
+            self.run_turn(client, 'Bob', n, f'{n}: short')
         self.model.reject_compaction = False
         for n in range(12, 24):
-            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 500)['data']['status'], 'completed')
+            self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: short')['data']['status'], 'completed')
         compacted, after = [], 0
         while page := client.request('events', bot='Bob', after=after, limit=256)['result']['events']:
             compacted += [e['data'] for e in page if e['event'] == 'compacted']
@@ -201,6 +378,10 @@ class CompactionTests(ModelFixture):
         self.assertEqual([c['catch_up'] for c in compacted],
                          [True] * len(steps) + [False] * (len(compacted) - len(steps)))
         self.assertFalse(compacted[-1]['catch_up'])
+        for c in compacted:
+            self.assertGreater(c['reclaimed_bytes'], 0)
+            self.assertGreaterEqual(c['reclaimed_items'], 0)
+            self.assertEqual(c['headroom_bytes'], c['input_limit']['bytes'] - c['context_after']['bytes'])
 
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))

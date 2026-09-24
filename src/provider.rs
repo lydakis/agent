@@ -251,6 +251,16 @@ impl Provider {
     pub fn family(&self) -> Family {
         self.family
     }
+
+    /// Planning estimate only: tokens do not bound encoded JSON bytes.
+    /// An unset Responses cap is unknown, not an invented output limit.
+    pub fn output_byte_estimate(&self) -> Option<usize> {
+        match self.family {
+            Family::Responses => self.max_output_tokens,
+            Family::Anthropic => Some(ANTHROPIC_MAX_TOKENS),
+        }
+        .map(|tokens| (tokens as usize).saturating_mul(4))
+    }
     /// How much longer this model's pool is closed by a rate limit, if it is.
     pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
         self.pools.get(&self.family.pool_key(model)).blocked_for()

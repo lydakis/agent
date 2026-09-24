@@ -301,11 +301,11 @@ bound; the operating system is then the only limit.
 | `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
-| `--context-bytes` | Encoded bytes of stored items in one model request's context window (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
-| `--context-items` | Items in one model request's context window. Minimum 2. | 4,096 |
+| `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
+| `--context-items` | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
 | `--note-turns` | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
-| `--compact-at` | Percent of `--context-bytes` the window may hold before a bot with compaction instructions compacts at its next round boundary. | 75 |
-| `--compact-keep` | Percent of `--context-bytes` kept verbatim, as whole newest turns, when it does. Must be below `--compact-at`. | 25 |
+| `--compact-at` | Percent of either context envelope that triggers compaction. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
+| `--compact-keep` | Target percent of either context envelope kept verbatim as newest whole turns, reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
 | `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -988,11 +988,22 @@ with it.
 
 Stored history has no length limit. What a model sees per request is a
 context window: the newest whole turns of the bot's lineage that fit
-`--context-bytes` and `--context-items`. The window starts at a turn boundary
+the full input allowance of `--context-bytes` and `--context-items`. Completion
+headroom can advance the compaction trigger; it does not reduce the hard input
+allowance. The allowance counts the encoded summary, retained prompts, carry-forward
+note, omission item, transcript items, and JSON separators. These are runtime
+conversation-byte/item bounds; system instructions, tool schemas, provider JSON
+framing, and model token limits are separate, not inferred from byte counts.
+For compaction planning, a known output-token cap is estimated at four bytes
+per token, capped at a quarter of the envelope. The earlier of that headroom
+threshold and `--compact-at` triggers compaction. An unset Responses cap adds
+no estimate; Anthropic uses its configured wire cap. This estimate is not a
+guarantee about encoded completion size or model token capacity.
+The window starts at a turn boundary
 (a user prompt), so a model never sees a tool call without its result or a
 reply without its prompt. Its start is persisted per bot (`context_start`) and
 only moves when the window overflows; it then jumps back to the oldest turn
-boundary within three quarters of both budgets, so the request prefix stays
+boundary within three quarters of the available transcript budgets, so the request prefix stays
 byte-identical across many turns and provider prompt caches keep hitting. A
 fork inherits the lineage, not the start; its first request computes its own
 window over the shared history.
@@ -1002,12 +1013,16 @@ When turns are omitted, the request begins with one user item:
 history tool with a turn number from 1 to N to read any of them.` followed,
 newest first, by the ordinal and the first line (up to 120 bytes) of each
 omitted turn's prompt, at most `--note-turns` of them (default 48, 0 lists
-none), and a line naming the older turns the list left out. The list is
+none), and a line naming the older turns the list left out. The optional
+listing is additionally bounded so pinned context plus the listing targets at
+most two thirds of the input byte allowance. On overflow, previews shrink further
+to leave room for the current turn; requests that already fit keep their prefix. Mandatory summaries and notes are
+never clipped to achieve that target. The allowance stays fixed while requests fit, so normal appends do not resize
+the listing. Overflow can reduce optional previews without changing pinned blocks. The list is
 data, not an instruction: it lets the model see what it is missing and
 judge for itself whether a turn is worth reading. The note is
-part of the request, never stored; it changes only when the window's start
-moves, as the request prefix already does, so it costs the prompt cache
-nothing extra. It is built on the storage reader from the omitted turns'
+part of the request, never stored; moving the window start or shrinking previews
+on overflow changes that portion of the request prefix. It is built on the storage reader from the omitted turns'
 prompt nodes alone, so deleting the source bot does not remove a surviving
 fork's previews. Turn numbers are ordinals along the lineage
 (`turn_seq`, stored on each turn's first item and indexed), so a fork's numbering
@@ -1022,7 +1037,12 @@ whitespace inside text strings remains intact. Pages
 contain at most 64 KiB of text. Optional `limit` (4–65,536 bytes) requests a
 smaller page.
 The runtime also limits the encoded tool result, including escaping and page
-metadata, to half the current turn's remaining byte budget. This leaves room
+metadata, to half the input-byte allowance remaining after the current turn
+and its mandatory prefix (summary, carry-forward note, and bare omission notice).
+Optional prompt previews do not consume this allowance; request fitting shrinks
+them only when needed to accommodate the result. Indexed turn totals and bounded
+prefix reads avoid constructing the context window or traversing omitted prompts
+for history admission. This leaves room
 for subsequent work; the current turn's overall item and byte limits still
 apply. If too little space remains, the tool returns `history_context_exhausted`.
 Start with `offset: 0`, then pass each `next_offset` until
@@ -1209,9 +1229,11 @@ usable; history tells the model to inspect current state before retrying.
 
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
-model call, when the turns since the last summary hold `--compact-at` percent of the context
-budget, the daemon summarizes everything older than the newest whole turns
-that hold `--compact-keep` percent verbatim. The summary is one model call
+model call, when the effective view since the last summary reaches
+`--compact-at` percent of either envelope, the daemon summarizes everything older than the newest whole turns
+that hold `--compact-keep` percent verbatim, limited by the room left after
+pinned context. The item dimension can choose the cut even when small messages
+have barely consumed the byte budget. The summary is one model call
 under the bot's compaction instructions, with tool calls disabled, to the bot's own
 model or the `compaction_model` the client named at creation (same family;
 another family's items cannot be replayed to it). Its request carries the
@@ -1285,12 +1307,29 @@ and only rows inside the budget leave SQLite. A turn larger than the whole
 budget cannot be summarized and answers `compaction_span_limit`. Catch-up
 converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
-marker. Oversized summaries are rejected above a quarter of the byte budget
-or 64 KiB, whichever is smaller. These failures leave the bot usable and
+marker and the item count, and the final marker gives the summarizer its
+maximum summary size in UTF-8 bytes. Oversized summaries are rejected above a third of the byte budget
+or 64 KiB, whichever is smaller. At installation, verbatim prompt copies are further bounded so
+they fit alongside the encoded summary within half the byte envelope. A middle
+range is removed, retaining the oldest and newest excerpts when they fit. Original prompts remain available through history; installed
+prefixes are unchanged until the next compaction. A replacement must reduce encoded bytes,
+not increase items, and leave enough room for the active turn with its pinned
+prefix; otherwise `compaction_not_smaller` or `compaction_context_limit` leaves
+the old view intact. Such completed calls are still billed. `compacted` events
+include `context_before`, `context_after`, `input_limit`, `reclaimed_bytes`,
+`reclaimed_items`, `headroom_bytes`, and `headroom_items`. These describe the
+complete logical view since the cut; headroom can be negative during catch-up,
+while the actual request still uses a bounded window. These failures leave the bot usable and
 original history retrievable. The
 CLI ships a default compaction text for new bots and `--no-compaction`,
 `--compaction-instructions`, `--compaction-instructions-file`, and
 `--compaction-model` to change it. The daemon holds no such text.
+
+Nonempty note writes are checked against the encoded context envelope, including
+pinned summary metadata, the current turn, and the tool result. A write that cannot
+fit returns `note_context_limit` and preserves the previous note. Clearing the note
+always remains permitted. A provider output that already exceeds the current-turn
+limit can still fail that turn, but its rejected note cannot block later turns.
 
 `note` writes or replaces the bot's carry-forward note: up to 8 KiB of text
 the runtime places ahead of the conversation window in every request, so it

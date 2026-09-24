@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{Store, Window},
+    store::{ContextPrefix, ContextUsage, Store, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -255,106 +255,111 @@ impl Turn {
         Exit::Finished(error)
     }
 
-    /// The bot's current context window as a streamed request body: a note
-    /// about omitted turns, then the window's items in store-read batches.
-    async fn items(&self) -> Result<Items> {
-        let (bot, bytes, count) = (self.bot.clone(), self.context_bytes, self.context_items);
+    /// Prepare metadata and the encoded prefix once per model round. Retries
+    /// stream the same immutable nodes without rebuilding the context view.
+    async fn context(&self, bytes: usize, count: usize, prefix_budget: usize) -> Result<Context> {
+        let bot = self.bot.clone();
         let window = self
             .store
             .op("window", move |db| {
                 db.window(&bot, bytes as i64, count as i64)
             })
             .await?;
-        let Some(Window {
-            family,
-            ids,
-            sizes,
-            item_bytes,
-            omitted_items,
-            omitted_turns,
-            note,
-            compaction,
-        }) = window
-        else {
-            return Ok(Items::empty());
+        let Some(window) = window else {
+            return Ok(Context::empty());
         };
-        let mut total = item_bytes as usize + ids.len().saturating_sub(1);
-        let mut head = Vec::new();
-        // The compaction in place of the turns it covered: the summary and
-        // their prompts verbatim. Changes only at the next compaction.
-        if let Some(view) = compaction {
-            let mut text = format!(
-                "[compaction summary, version {}, covering turns {} to {}]\n{}",
-                view.version, view.covered.0, view.covered.1, view.summary
-            );
-            if !view.prompts.is_empty() {
-                text.push_str("\n\nUser messages from those turns, verbatim:");
-                for (ordinal, prompt) in &view.prompts {
-                    text.push_str(&format!("\n{ordinal}: {prompt}"));
+        let prefix = self.prefix(&window, prefix_budget).await?;
+        Ok(Context {
+            window: Some(window),
+            prefix,
+        })
+    }
+
+    async fn prefix(
+        &self,
+        window: &agent_runtime::store::Window,
+        budget: usize,
+    ) -> Result<ContextPrefix> {
+        let listed = if window.omitted_items > 0 && self.note_turns > 0 {
+            let (start, limit) = (window.ids[0], self.note_turns);
+            self.store
+                .read("omitted_turns", move |db| db.omitted_turns(start, limit))
+                .await?
+        } else {
+            Vec::new()
+        };
+        window.prefix(&listed, budget)
+    }
+
+    /// The configured envelope bounds input. Completion headroom is a soft
+    /// compaction trigger, not a tax on every request's usable history.
+    fn input_limit(&self) -> ContextUsage {
+        ContextUsage {
+            bytes: self.context_bytes,
+            items: self.context_items,
+        }
+    }
+
+    async fn fit_context(&self, mut context: Context, limit: ContextUsage) -> Result<Context> {
+        let mut raw = ContextUsage {
+            bytes: self.context_bytes,
+            items: self.context_items,
+        };
+        let mut prefix_budget = limit.bytes * 2 / 3;
+        while !context.usage().fits(limit) {
+            let next = ContextUsage {
+                bytes: raw
+                    .bytes
+                    .min(limit.bytes.saturating_sub(context.prefix.bytes.len())),
+                items: raw
+                    .items
+                    .min(limit.items.saturating_sub(context.prefix.items)),
+            };
+            if next.bytes == 0 || next.items == 0 {
+                return agent_runtime::fail_with(
+                    "context_limit",
+                    "pinned context and the current turn exceed the input budget",
+                );
+            }
+            match self.context(next.bytes, next.items, prefix_budget).await {
+                Ok(resized) => {
+                    raw = next;
+                    context = resized;
                 }
-            }
-            let mut item = pinned_item(family, &text)?;
-            if !ids.is_empty() {
-                item.push(b',');
-            }
-            total += item.len();
-            head.extend_from_slice(&item);
-        }
-        // The bot's own carry-forward note, ahead of the window and behind
-        // the summary: it changes only when the bot rewrites it.
-        if let Some((version, text)) = note.filter(|(_, text)| !text.is_empty()) {
-            let mut pinned = pinned_item(
-                family,
-                &format!("[carry-forward note, version {version}]\n{text}"),
-            )?;
-            if !ids.is_empty() {
-                pinned.push(b',');
-            }
-            total += pinned.len();
-            head.extend_from_slice(&pinned);
-        }
-        if omitted_items > 0 {
-            // Omission is explicit: the model is told what is missing and how
-            // to read it, and sees how each omitted turn began, so it can
-            // judge for itself whether one is worth reading. The note is
-            // part of the request, never the store; it changes only when the
-            // window's start moves, as the request prefix already does.
-            let mut note = format!(
-                "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown. \
-                 Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
-            );
-            if self.note_turns > 0 && !ids.is_empty() {
-                let (start, limit) = (ids[0], self.note_turns);
-                let listed = self
-                    .store
-                    .read("omitted_turns", move |db| db.omitted_turns(start, limit))
-                    .await?;
-                if !listed.is_empty() {
-                    note.push_str(" How they began, newest first:");
-                    for (ordinal, opening) in &listed {
-                        note.push_str(&format!("\n{ordinal}: {opening}"));
+                Err(error) if error.code == "context_limit" && self.note_turns > 0 => {
+                    // Normal trimming needs no extra lookup. Only a current
+                    // turn that cannot fit beside the previews needs its
+                    // indexed minimum and a smaller optional listing.
+                    let (bot, turn) = (self.bot.clone(), self.turn);
+                    let (_, bytes, items) = self
+                        .store
+                        .read("turn_usage", move |db| db.turn_usage(&bot, turn))
+                        .await?;
+                    let smaller = prefix_budget
+                        .min(limit.bytes.saturating_sub(bytes + items.saturating_sub(1)));
+                    if smaller == prefix_budget {
+                        return Err(error);
                     }
-                    if let Some((oldest, _)) = listed.last()
-                        && *oldest > 1
-                    {
-                        note.push_str(&format!(
-                            "\nTurns 1 to {} are older than this list.",
-                            oldest - 1
-                        ));
+                    prefix_budget = smaller;
+                    if let Some(window) = &context.window {
+                        context.prefix = self.prefix(window, prefix_budget).await?;
                     }
                 }
+                Err(error) => return Err(error),
             }
-            let mut item = family.user_item(&note)?;
-            if !ids.is_empty() {
-                item.push(b',');
-            }
-            total += item.len();
-            head.extend_from_slice(&item);
         }
+        Ok(context)
+    }
+
+    fn items(&self, context: &Context) -> Items {
+        let total = context.usage().bytes;
         let store = self.store.clone();
-        let batches = batches(&ids, &sizes);
-        let body = stream::iter([Ok(Bytes::from(head))]).chain(
-            stream::iter(batches.into_iter().enumerate()).then(move |(index, chunk)| {
+        let chunks = context
+            .window
+            .as_ref()
+            .map_or_else(Vec::new, |w| batches(&w.ids, &w.sizes));
+        let body = stream::iter([Ok(context.prefix.bytes.clone())]).chain(
+            stream::iter(chunks.into_iter().enumerate()).then(move |(index, chunk)| {
                 let store = store.clone();
                 async move {
                     let mut bytes = store
@@ -368,10 +373,10 @@ impl Turn {
                 }
             }),
         );
-        Ok(Items {
+        Items {
             bytes: total,
             stream: body.boxed(),
-        })
+        }
     }
 
     /// Compaction at a round boundary: once the turns since the last summary
@@ -383,6 +388,7 @@ impl Turn {
     /// leaves the context view unchanged and is reported live; the turn goes on
     /// with the window as it is. Returns a park time if the summarizer's
     /// call parked the turn.
+    #[allow(clippy::too_many_arguments)]
     async fn compact_if_due(
         &self,
         record: &mut agent_runtime::store::Bot,
@@ -390,25 +396,41 @@ impl Turn {
         turn: i64,
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
+        context: &mut Context,
+        output_bytes: Option<usize>,
     ) -> Result<Option<u64>> {
         if record.compaction_instructions.is_none() {
             return Ok(None);
         }
-        let bot = self.bot.clone();
-        let bytes = self
-            .store
-            .op("unsummarized_bytes", move |db| db.unsummarized_bytes(&bot))
-            .await?;
-        if (bytes as usize) < self.context_bytes / 100 * self.compact_at {
+        let pressure = context.pressure();
+        let limit = self.input_limit();
+        let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
+        if pressure.bytes < (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
+            && pressure.items < (self.context_items * self.compact_at / 100).min(limit.items)
+        {
             return Ok(None);
         }
-        let keep = (self.context_bytes / 100 * self.compact_keep) as i64;
-        let (max_bytes, max_items) = (self.context_bytes as i64, self.context_items as i64);
+        let keep = (self.context_bytes / 100 * self.compact_keep)
+            .min(
+                limit.bytes.saturating_sub(context.prefix.bytes.len()) * self.compact_keep
+                    / self.compact_at,
+            )
+            .max(1) as i64;
+        let keep_items = (self.context_items * self.compact_keep / 100)
+            .min(
+                limit.items.saturating_sub(context.prefix.items) * self.compact_keep
+                    / self.compact_at,
+            )
+            .max(1) as i64;
+        let (max_bytes, max_items) = (limit.bytes as i64, limit.items as i64);
         // Nodes are immutable and only this turn moves the bot's head, so
         // the reader's snapshot plans what the worker would. A catch-up walk
         // over a long backlog goes in pieces, so neither other bots' commits
         // nor their context reads wait behind all of it.
-        let plan = match self.plan_compaction(keep, max_bytes, max_items).await {
+        let plan = match self
+            .plan_compaction(keep, keep_items, max_bytes, max_items)
+            .await
+        {
             Ok(Some(plan)) => plan,
             Ok(None) => return Ok(None),
             Err(error) if error.code == "compaction_span_limit" => {
@@ -483,7 +505,7 @@ impl Turn {
         }
         let usage = completion.usage;
         let summary = completion_text(&completion.items);
-        let invalid = if summary.len() > (self.context_bytes / 4).min(64 * 1024) {
+        let invalid = if summary.len() > plan.summary_bytes {
             Some(Error::new("compaction_summary_limit"))
         } else if summary.trim().is_empty() {
             Some(Error::new("empty_summary"))
@@ -501,10 +523,19 @@ impl Turn {
         }
         let bot = self.bot.clone();
         let billed = usage.clone();
+        let note_turns = self.note_turns;
+        let input_limit = self.input_limit();
         if let Err(error) = self
             .store
             .op("compact", move |db| {
-                db.compact(&bot, &plan, &summary, usage.as_ref())
+                db.compact(
+                    &bot,
+                    &plan,
+                    &summary,
+                    usage.as_ref(),
+                    note_turns,
+                    input_limit,
+                )
             })
             .await
         {
@@ -513,14 +544,29 @@ impl Turn {
                     db.compaction_usage(turn, billed.as_ref())
                 })
                 .await?;
+            if matches!(
+                error.code.as_str(),
+                "compaction_not_smaller" | "compaction_context_limit"
+            ) {
+                self.compaction_failed(turn, &error).await?;
+                return Ok(None);
+            }
             return Err(error);
         }
+        *context = self
+            .context(
+                self.context_bytes,
+                self.context_items,
+                self.context_bytes * 2 / 3,
+            )
+            .await?;
         Ok(None)
     }
 
     async fn plan_compaction(
         &self,
         keep: i64,
+        keep_items: i64,
         max_bytes: i64,
         max_items: i64,
     ) -> Result<Option<agent_runtime::store::CompactionPlan>> {
@@ -529,7 +575,7 @@ impl Turn {
         let planning = self
             .store
             .read("compaction_plan", move |db| {
-                db.compaction_plan(&bot, keep, max_bytes, max_items)
+                db.compaction_plan(&bot, keep, keep_items, max_bytes, max_items)
             })
             .await?;
         let mut walk = match planning {
@@ -570,13 +616,19 @@ impl Turn {
             .store
             .op("inspect", move |db| db.inspect(&bot)?.family())
             .await?;
-        let (head, tail) =
-            agent_runtime::store::CompactionPlan::frame(family, plan.previous_summary.as_deref())?;
+        let (head, tail) = agent_runtime::store::CompactionPlan::frame(
+            family,
+            plan.previous_summary.as_deref(),
+            plan.summary_bytes,
+        )?;
         let total = head.len()
             + plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
             + plan.ids.len().saturating_sub(1)
             + tail.len();
-        if total > self.context_bytes {
+        if total > self.input_limit().bytes
+            || plan.ids.len() + 1 + usize::from(plan.previous_summary.is_some())
+                > self.input_limit().items
+        {
             return fail("compaction_input_limit");
         }
         let store = self.store.clone();
@@ -682,9 +734,24 @@ impl Turn {
             // Resume the parked call, not the whole boundary. In particular,
             // an exhausted summary must not start over when the ordinary call
             // parks on the same pool. A later model round may compact again.
+            let mut context = self
+                .context(
+                    self.context_bytes,
+                    self.context_items,
+                    self.context_bytes * 2 / 3,
+                )
+                .await?;
             if !std::mem::take(&mut resume_window)
                 && let Some(parked) = self
-                    .compact_if_due(&mut record, &mut model_rounds, turn, accounting, &tools)
+                    .compact_if_due(
+                        &mut record,
+                        &mut model_rounds,
+                        turn,
+                        accounting,
+                        &tools,
+                        &mut context,
+                        provider.output_byte_estimate(),
+                    )
                     .await?
             {
                 return Ok(Round::Paced(parked));
@@ -695,11 +762,13 @@ impl Turn {
             if model_rounds >= MAX_ROUNDS {
                 return fail("tool_round_limit");
             }
+            let context = self.fit_context(context, self.input_limit()).await?;
             let Some(response) = self
                 .call(
                     provider,
                     model,
                     &tools,
+                    &context,
                     &mut record,
                     &mut model_rounds,
                     turn,
@@ -775,8 +844,8 @@ impl Turn {
         Ok(steered)
     }
 
-    /// One model call with retries. Each attempt rebuilds the request from
-    /// the store, so nothing about the turn changes between attempts; a
+    /// One model call with retries. Each attempt streams the same immutable
+    /// nodes and shares its prepared prefix; a
     /// refusal for pace holds the provider's pool rather than this turn.
     #[allow(clippy::too_many_arguments)]
     async fn call(
@@ -784,6 +853,7 @@ impl Turn {
         provider: &Provider,
         model: &str,
         tools: &serde_json::value::RawValue,
+        context: &Context,
         record: &mut agent_runtime::store::Bot,
         model_rounds: &mut usize,
         turn: i64,
@@ -795,7 +865,7 @@ impl Turn {
             model,
             &instructions,
             tools,
-            Body::Window,
+            Body::Window(context),
             record,
             model_rounds,
             turn,
@@ -827,7 +897,7 @@ impl Turn {
         let paced_before = accounting.totals().1;
         loop {
             let items = match body {
-                Body::Window => self.items().await?,
+                Body::Window(context) => self.items(context),
                 Body::Span(plan) => self.span_items(plan).await?,
             };
             accounting.begin(attempt > 0);
@@ -838,7 +908,7 @@ impl Turn {
                         instructions,
                         reasoning: record.reasoning.as_deref(),
                         tools,
-                        allow_tool_calls: matches!(body, Body::Window),
+                        allow_tool_calls: matches!(body, Body::Window(_)),
                         items,
                     },
                     |delta| {
@@ -1058,11 +1128,32 @@ impl Turn {
                 },
                 // Stored with the result: one commit records the note, its
                 // version node, and the tool outcome together.
-                Ok(Prepared::Note { text }) => Outcome {
-                    output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
-                    artifacts: Vec::new(),
-                    note: Some(text),
-                },
+                Ok(Prepared::Note { text }) => {
+                    let outcome = Outcome {
+                        output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
+                        artifacts: Vec::new(),
+                        note: Some(text),
+                    };
+                    // Clearing is always permitted. Nonempty notes must fit
+                    // before they become a mandatory prefix on future turns.
+                    if outcome.note.as_ref().is_some_and(|text| text.is_empty()) {
+                        outcome
+                    } else {
+                        let (bot, id, limit) =
+                            (self.bot.clone(), call.call_id.clone(), self.input_limit());
+                        match self
+                            .store
+                            .read("validate_note", move |db| {
+                                db.validate_note(&bot, turn, &id, &outcome, limit)?;
+                                Ok(outcome)
+                            })
+                            .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(error) => failure(error),
+                        }
+                    }
+                }
                 Ok(prepared) => match self
                     .registry
                     .execute(prepared, workspace, environment)
@@ -1089,27 +1180,23 @@ impl Turn {
         offset: u64,
         limit: usize,
     ) -> Result<Outcome> {
-        let (bot, turn, bytes, items) = (
-            self.bot.clone(),
-            self.turn,
-            self.context_bytes,
-            self.context_items,
-        );
-        let (family, budget, mut page) = self
+        // Old turns can leave the window; the current turn and pinned items
+        // cannot. Indexed accounting avoids rebuilding a full window per read.
+        let allowance = self.input_limit();
+        let (bot, turn) = (self.bot.clone(), self.turn);
+        let (family, used) = self
             .store
-            .op("turn_usage", move |db| {
-                let (family, used, count) = db.turn_usage(&bot, turn)?;
-                // Reserve half the remaining bytes for subsequent model/tool work.
-                // Account against this turn only: older turns can leave the window.
-                let budget = bytes.saturating_sub(used) / 2;
-                if count >= items || budget < 256 {
-                    return fail("history_context_exhausted");
-                }
-                Ok((
-                    family,
-                    budget,
-                    db.history_read(&bot, wanted, offset, limit.min(budget))?,
-                ))
+            .read("history_usage", move |db| db.history_usage(&bot, turn))
+            .await?;
+        let budget = allowance.bytes.saturating_sub(used.bytes + 1) / 2;
+        if used.items >= allowance.items || budget < 256 {
+            return fail("history_context_exhausted");
+        }
+        let bot = self.bot.clone();
+        let mut page = self
+            .store
+            .read("history_read", move |db| {
+                db.history_read(&bot, wanted, offset, limit.min(budget))
             })
             .await?;
         loop {
@@ -1308,22 +1395,43 @@ fn annotate(mut outcome: Outcome, turn: i64, call_id: &str) -> Outcome {
     outcome
 }
 
-/// Stable pinned blocks get their own Anthropic write points. Together
-/// with system and automatic tail caching this uses at most four breakpoints.
-/// Responses gateways retain their existing wire format.
-fn pinned_item(family: agent_runtime::codec::Family, text: &str) -> Result<Vec<u8>> {
-    match family {
-        agent_runtime::codec::Family::Anthropic => Ok(serde_json::to_vec(&json!({
-            "role":"user","content":[{"type":"text","text":text,"cache_control":{"type":"ephemeral"}}]
-        }))?),
-        _ => family.user_item(text),
+#[cfg(test)]
+use agent_runtime::store::pinned_item;
+
+struct Context {
+    window: Option<Window>,
+    prefix: ContextPrefix,
+}
+impl Context {
+    fn empty() -> Self {
+        Self {
+            window: None,
+            prefix: ContextPrefix {
+                bytes: Bytes::new(),
+                items: 0,
+            },
+        }
+    }
+    fn usage(&self) -> ContextUsage {
+        self.window.as_ref().map_or(ContextUsage::default(), |w| {
+            ContextUsage {
+                bytes: w.item_bytes as usize,
+                items: w.ids.len(),
+            }
+            .with_prefix(&self.prefix)
+        })
+    }
+    fn pressure(&self) -> ContextUsage {
+        self.window.as_ref().map_or(ContextUsage::default(), |w| {
+            w.unsummarized.with_prefix(&self.prefix)
+        })
     }
 }
 
 /// What a model call sends: the bot's window, or a compaction's span.
 #[derive(Clone, Copy)]
 enum Body<'a> {
-    Window,
+    Window(&'a Context),
     Span(&'a agent_runtime::store::CompactionPlan),
 }
 

@@ -111,7 +111,7 @@ impl Tool {
                 "required":["turn"],"additionalProperties":false}),
             ),
             Tool::Note => (
-                "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes; empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
+                "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes and must fit the current context budget; an oversized write preserves the previous note. Empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
                 json!({"type":"object","properties":{"text":{"type":"string","maxLength":8192}},
                 "required":["text"],"additionalProperties":false}),
             ),

@@ -9,7 +9,9 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 mod artifact;
+mod context;
 mod db;
+pub use context::{ContextPrefix, ContextUsage, pinned_item};
 pub use db::{
     Absorbed, Binding, Bot, CatchUp, CompactionPlan, CompactionView, Database, Delivery, Fork,
     Planning, Publication, Started, TurnContext, TurnOptions, Waiting, Window, cache_hit,

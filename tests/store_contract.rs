@@ -46,7 +46,7 @@ fn compaction_plan(
     max_bytes: i64,
     max_items: i64,
 ) -> Result<Option<CompactionPlan>> {
-    match db.compaction_plan(name, keep, max_bytes, max_items)? {
+    match db.compaction_plan(name, keep, i64::MAX, max_bytes, max_items)? {
         None => Ok(None),
         Some(Planning::Plan(plan)) => Ok(Some(plan)),
         Some(Planning::CatchUp(mut walk)) => {
@@ -4276,6 +4276,11 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                     )
                     .unwrap()
                     .turn;
+                let item = match family {
+                    Family::Responses => assistant(&"answer ".repeat(100)),
+                    Family::Anthropic => serde_json::to_vec(&json!({"role":"assistant","content":[{"type":"text","text":"answer ".repeat(100)}]})).unwrap().into(),
+                };
+                db.append(turn, vec![item], &[], None).unwrap();
                 db.finish(turn, None).unwrap();
             }
             let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
@@ -4315,8 +4320,18 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
                     (1, format!("{}…", prompts[0].lines().next().unwrap())),
                 ]
             );
-            db.compact("Alice", &plan, "retained summary", None)
-                .unwrap();
+            db.compact(
+                "Alice",
+                &plan,
+                "retained summary",
+                None,
+                0,
+                agent_runtime::store::ContextUsage {
+                    bytes: 4096,
+                    items: 256,
+                },
+            )
+            .unwrap();
             let view = db
                 .window("Alice", 4096, 256)
                 .unwrap()
@@ -4329,8 +4344,8 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
             let raw = db.items_by_ids(&plan.ids).unwrap();
             let items: Vec<Value> =
                 serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
-            assert_eq!(items.len(), 3);
-            for (item, prompt) in items.iter().zip(prompts) {
+            assert_eq!(items.len(), 6);
+            for (item, prompt) in items.iter().step_by(2).zip(prompts) {
                 assert_eq!(item["content"][0]["text"], prompt);
             }
         }
@@ -4371,7 +4386,18 @@ fn compaction_prompt_metadata_stays_bounded_across_planning_and_merging() {
         };
         assert!(cost(&plan.prompts) <= Database::COMPACTION_PROMPTS_BYTES);
         assert_eq!(plan.prompts.last().unwrap().0, n as i64);
-        db.compact("Bob", &plan, "summary", None).unwrap();
+        db.compact(
+            "Bob",
+            &plan,
+            "summary",
+            None,
+            0,
+            agent_runtime::store::ContextUsage {
+                bytes: 4096,
+                items: 256,
+            },
+        )
+        .unwrap();
         let view = db
             .window("Bob", i64::MAX, i64::MAX)
             .unwrap()
@@ -4433,7 +4459,19 @@ fn compaction_summarizes_older_turns_keeps_prompts_and_versions_bind_forks() {
     assert_eq!(plan.ids.len(), plan.sizes.len());
     assert!(plan.previous_summary.is_none());
     let checkpoint_before = db.inspect("Bob").unwrap().head.unwrap();
-    let event = db.compact("Bob", &plan, "summary one", None).unwrap();
+    let event = db
+        .compact(
+            "Bob",
+            &plan,
+            "summary one",
+            None,
+            0,
+            agent_runtime::store::ContextUsage {
+                bytes: 4096,
+                items: 256,
+            },
+        )
+        .unwrap();
     assert_eq!(event["event"], "compacted");
     assert_eq!(event["data"]["covered_turns"], json!([1, 5]));
     let bot = db.inspect("Bob").unwrap();
@@ -4465,7 +4503,18 @@ fn compaction_summarizes_older_turns_keeps_prompts_and_versions_bind_forks() {
     assert_eq!(second.covered, (6, 8));
     assert_eq!(second.previous_summary.as_deref(), Some("summary one"));
     assert!(second.ids.len() < 10);
-    db.compact("Bob", &second, "summary two", None).unwrap();
+    db.compact(
+        "Bob",
+        &second,
+        "summary two",
+        None,
+        0,
+        agent_runtime::store::ContextUsage {
+            bytes: 4096,
+            items: 256,
+        },
+    )
+    .unwrap();
     let view = db
         .window("Bob", i64::MAX, i64::MAX)
         .unwrap()
@@ -4573,8 +4622,30 @@ fn independent_branches_can_compact_the_same_cut_without_rewriting_each_other() 
         .unwrap()
         .unwrap();
     assert_eq!(p.cut, q.cut);
-    db.compact("Bob", &p, "Bob summary", None).unwrap();
-    db.compact("Alice", &q, "Alice summary", None).unwrap();
+    db.compact(
+        "Bob",
+        &p,
+        "Bob summary",
+        None,
+        0,
+        agent_runtime::store::ContextUsage {
+            bytes: 4096,
+            items: 256,
+        },
+    )
+    .unwrap();
+    db.compact(
+        "Alice",
+        &q,
+        "Alice summary",
+        None,
+        0,
+        agent_runtime::store::ContextUsage {
+            bytes: 4096,
+            items: 256,
+        },
+    )
+    .unwrap();
     let b = db.window("Bob", 4096, 256).unwrap().unwrap();
     let a = db.window("Alice", 4096, 256).unwrap().unwrap();
     assert_ne!(
@@ -4638,14 +4709,35 @@ fn oversized_backlogs_are_summarized_oldest_first_in_bounded_spans() {
             .unwrap()
             .unwrap();
         let bytes: i64 = plan.sizes.iter().map(|s| *s as i64).sum();
-        if db.unsummarized_bytes("Bob").unwrap() <= max_bytes {
+        if !plan.catch_up {
             // Caught up: the ordinary plan keeps its verbatim tail.
-            let event = db.compact("Bob", &plan, "summary", None).unwrap();
+            let event = db
+                .compact(
+                    "Bob",
+                    &plan,
+                    "summary",
+                    None,
+                    0,
+                    agent_runtime::store::ContextUsage {
+                        bytes: 4096,
+                        items: 256,
+                    },
+                )
+                .unwrap();
             assert_eq!(event["data"]["catch_up"], false);
             assert_eq!(plan.covered.0, covered_to + 1);
             break;
         }
-        let request = bytes + plan.ids.len() as i64 + 256;
+        let (head_frame, tail_frame) = CompactionPlan::frame(
+            Family::Responses,
+            plan.previous_summary.as_deref(),
+            plan.summary_bytes,
+        )
+        .unwrap();
+        let request = bytes
+            + plan.ids.len().saturating_sub(1) as i64
+            + head_frame.len() as i64
+            + tail_frame.len() as i64;
         assert!(
             request <= max_bytes,
             "step {steps} summarized {bytes} bytes"
@@ -4660,7 +4752,17 @@ fn oversized_backlogs_are_summarized_oldest_first_in_bounded_spans() {
             format!("p{}", covered_to + 1)
         );
         let event = db
-            .compact("Bob", &plan, &format!("summary {steps}"), None)
+            .compact(
+                "Bob",
+                &plan,
+                &format!("summary {steps}"),
+                None,
+                0,
+                agent_runtime::store::ContextUsage {
+                    bytes: 4096,
+                    items: 256,
+                },
+            )
             .unwrap();
         assert_eq!(event["data"]["catch_up"], true);
         assert_eq!(event["data"]["covered_turns"], json!([1, plan.covered.1]));
@@ -4713,7 +4815,9 @@ fn catch_up_is_bounded_by_items_and_rejects_a_turn_larger_than_the_budget() {
     assert_eq!(plan.ids.len(), 14);
     // The walk's pieces do not change the plan, whatever their size.
     for piece in [1, 7, 4096] {
-        let Some(Planning::CatchUp(mut walk)) = db.compaction_plan("Bob", 1, i64::MAX, 16).unwrap()
+        let Some(Planning::CatchUp(mut walk)) = db
+            .compaction_plan("Bob", 1, i64::MAX, i64::MAX, 16)
+            .unwrap()
         else {
             panic!("expected a catch-up walk");
         };
@@ -4759,13 +4863,24 @@ fn compaction_cut_migrates_without_replacing_the_recorded_summary() {
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
-        for n in 1..=3 {
+        for n in 1..=6 {
             converse(&mut db, "Bob", n);
         }
         let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
         cut = plan.cut;
         version = db.inspect("Bob").unwrap().head.unwrap();
-        db.compact("Bob", &plan, "retained summary", None).unwrap();
+        db.compact(
+            "Bob",
+            &plan,
+            "retained summary",
+            None,
+            0,
+            agent_runtime::store::ContextUsage {
+                bytes: 4096,
+                items: 256,
+            },
+        )
+        .unwrap();
     }
     {
         let conn = Connection::open(&path).unwrap();
@@ -4781,9 +4896,20 @@ fn compaction_cut_migrates_without_replacing_the_recorded_summary() {
         let w = db.window("Bob", 4096, 256).unwrap().unwrap();
         assert_eq!(w.ids[0], cut);
         assert_eq!(w.compaction.unwrap().summary, "retained summary");
-        converse(&mut db, "Bob", 4);
+        converse(&mut db, "Bob", 7);
         let plan = compaction_plan(&db, "Bob", 1, 4096, 256).unwrap().unwrap();
-        db.compact("Bob", &plan, "new summary", None).unwrap();
+        db.compact(
+            "Bob",
+            &plan,
+            "new summary",
+            None,
+            0,
+            agent_runtime::store::ContextUsage {
+                bytes: 4096,
+                items: 256,
+            },
+        )
+        .unwrap();
         assert!(db.inspect("Bob").unwrap().compaction.unwrap() > version);
         db.delete_bot("Bob").unwrap();
     }

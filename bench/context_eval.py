@@ -14,7 +14,7 @@ examples or workspace files can also carry the marker after rule omission.
 Real model, real spend: a few cents per conversation on a cheap model.
 
     (set -a; . ./.env.local; set +a; .local/venv/bin/python -m bench.context_eval \
-        --model openai/gpt-5.6-luna --bots 8 --out .local/context-eval/luna.json)
+        --model openai/gpt-6-luna --bots 8 --out .local/context-eval/luna.json)
 """
 import argparse
 import json
@@ -229,7 +229,7 @@ def summarize(block):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', required=True, help='PROVIDER/MODEL, for example openai/gpt-5.6-luna')
+    parser.add_argument('--model', required=True, help='PROVIDER/MODEL, for example openai/gpt-6-luna')
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--bots', type=int, default=8, help='conversations per condition, run in lockstep')
     parser.add_argument('--fillers', type=int, default=12)

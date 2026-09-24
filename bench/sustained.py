@@ -9,7 +9,7 @@ threads, and open files over time, and store growth. Context is bounded with
 comes from the caller's environment and is never printed or stored.
 
     .local/venv/bin/python -m bench.sustained --bots 64 --minutes 5 \
-        --model openai/gpt-5.6-luna --out .local/bench/sustained-luna-64
+        --model openai/gpt-6-luna --out .local/bench/sustained-luna-64
 """
 import argparse
 import json
