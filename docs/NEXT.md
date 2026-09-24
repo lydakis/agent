@@ -660,14 +660,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `store: false` call can send `previous_response_id` and only the new
     items; Codex uses it by default for API keys and the ChatGPT login.
     OpenAI reports about 40% faster loops of 20 or more tool calls, which is
-    their claim, not ours. Build a transport for the `openai` and `chatgpt`
-    presets that leases a lane per active turn, sends a delta only when the
-    request extends the previous one exactly, and sends the full input on
-    every other case, including `previous_response_not_found`; the store
-    stays the only history. Then run the matched HTTP versus WebSocket screen
-    in [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap.
-    Open: rate limits have no per-call headers on the socket, and whether a
-    connect failure falls back to HTTP.
+    their claim, not ours. The prototype is built: family `responses-ws`,
+    one connection per bot, delta input only when the request extends the
+    previous one exactly, the full input on every other case including
+    `previous_response_not_found`; the store stays the only history. Next,
+    the matched HTTP versus WebSocket screen in
+    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap, with a
+    prompt cache key in both arms. Open: lanes to share a connection among
+    bots, pacing without per-call headers, and HTTP after a failed upgrade.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

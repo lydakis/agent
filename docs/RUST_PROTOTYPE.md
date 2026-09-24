@@ -327,12 +327,17 @@ model response, without an additional disk commit.
 ## Providers and models
 
 A model reference is `PROVIDER/MODEL`. A provider spec is
-`NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]` with two families:
+`NAME[=FAMILY[,BASE_URL[,KEY_ENV]]]` with two protocol families:
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
 | `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login |
 | `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY` |
+
+The family `responses-ws` is the Responses API over a WebSocket per bot,
+continuing from the bot's previous response where it can; for example
+`--provider openai=responses-ws` or `--provider chatgpt=responses-ws` keep
+those presets' endpoints and credentials. See [WEBSOCKET.md](WEBSOCKET.md).
 
 Responses gateways can be configured as named providers, for example
 `--provider gw=responses,https://gateway.example.test/v1,GW_KEY`. Model IDs may

@@ -5,8 +5,8 @@ this runtime faster? Short answer: probably yes for tool-heavy turns on the
 `openai` and `chatgpt` providers, mostly through server-side work it lets
 OpenAI skip, not through the socket itself. The size of the win for this
 runtime is unmeasured. It needs a paid, matched screen before it counts as a
-result, and the screen needs a prototype transport, since the comparison that
-matters is this daemon over HTTP against this daemon over WebSocket.
+result. The [prototype](#prototype) exists so that the comparison that matters,
+this daemon over HTTP against this daemon over WebSocket, can be run.
 
 ## Source facts
 
@@ -66,8 +66,7 @@ Read from `src/provider.rs` at `e1d5f8c`.
   upload grows with the square of the round count, and the server re-renders
   the prefix each round. Prompt caching saves compute on that prefix but not
   the upload, the tokenization, or the service hops the launch post names.
-- No `prompt_cache_key` is sent. That is a separate, cheaper question; see
-  the last section.
+- No `prompt_cache_key` is sent yet; see the last section.
 
 ## Where the gain would come from
 
@@ -128,6 +127,50 @@ is made durable.
   rather than a legacy HTTP mode. Whether to keep HTTP for a provider whose
   socket fails to connect, as Codex does, is a decision for the prototype.
 
+## Prototype
+
+Built 2026-09-24 on this branch. `--provider NAME=responses-ws[,URL[,KEY_ENV]]`
+selects it; `openai=responses-ws` and `chatgpt=responses-ws` keep those
+presets' endpoints and credentials. HTTP stays the default for every preset
+until the screen below says otherwise. `ready.providers` names the transport,
+and `stats` reports open sockets.
+
+- One connection per bot, opened on its first call and kept between calls
+  (`src/provider/socket.rs`). A connection idle for 60 s, or older than 55
+  minutes, is closed at the next checkout rather than by a timer. Lanes
+  (`stream_id`) are not used: the guide does not show how events on a shared
+  connection name their lane, Codex does not use them, and this thread has no
+  key to find out. So a fleet holds one TLS connection per active bot rather
+  than one per 64 streams, and the screen has to report that cost.
+- The request is the HTTP body's fields as a `response.create` event. A
+  call continues only when its fields and context head hash to the previous
+  call's, and its window ids start with the previous window plus the node ids
+  the turn stored for the previous response's items. The turn names those
+  ids after its append (`Provider::recorded`), so a response the store did
+  not accept is never continued from. The input is then the window's
+  remaining items with `previous_response_id`.
+- `previous_response_not_found` resends the full input on the same
+  connection inside the same call, so it is not a retry. A failure in the
+  middle of a response closes the connection, since its remaining events
+  would reach the next call. `websocket_connection_limit_reached` becomes
+  the retryable `provider_socket_expired`.
+- An `error` event's `status` and `headers` stand in for an HTTP response's:
+  a 429 closes the pool with its `retry-after`, `insufficient_quota` is
+  `provider_quota_exhausted`, other statuses are `provider_http_N`, and the
+  pacer learns limits from the upgrade response and from these headers.
+- A socket message is whole, so the input is assembled in memory before it
+  is sent, unlike the streamed HTTP body. A continuation is small; a full
+  send holds one copy of the window.
+- Not built: warmup with `generate: false`, lanes, and HTTP after a failed
+  upgrade; a failed connection is retried like an HTTP connection failure.
+
+Tests: `provider::socket::tests` covers when a call continues and how error
+events are classified. `tests/test_responses_socket.py` runs the daemon
+against a minimal WebSocket server for two turns with a tool call each, and
+checks one connection, the beta header, delta input on every continuation,
+and a full resend with no retry after the server forgets a response. With
+continuation disabled it fails.
+
 ## Measurement plan
 
 The launch numbers are OpenAI's; this runtime needs its own. Follow
@@ -148,9 +191,13 @@ transport changed.
   subset under a plan login. This thread has no key, so these runs are
   George's.
 
-## Related cheap change
+## Prompt cache key
 
 `prompt_cache_key` lets OpenAI route requests with the same prefix to the same
-cache. Many bots share instructions and tools, so a per-bot key may raise
-cached-input share on the current HTTP path at no transport cost. It belongs
-in the same screen as a separate arm, not folded into the WebSocket result.
+cache. The Harbor benchmark thread found that only 21% of this runtime's input
+hit OpenAI's prompt cache on a Terminal-Bench run against 94% for Codex, which
+sends its session id as the key, and is adding a per-bot key in its own
+change. The socket request is built from the same request fields as the HTTP
+body, so it carries the key once that lands. Both arms of the screen must
+send it: a cache hit-rate gap alone could explain much of the latency
+difference, and it would be credited to the wrong change.

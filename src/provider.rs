@@ -12,8 +12,10 @@ use tokio::sync::Semaphore;
 mod anthropic;
 pub mod pace;
 mod responses;
+mod socket;
 
 pub use pace::Report;
+pub use socket::Sockets;
 
 pub const MAX_OUTPUT: usize = 512 * 1024;
 const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
@@ -122,6 +124,8 @@ pub struct Provider {
     account: Option<String>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
+    /// Responses over WebSocket, one connection per bot, instead of HTTP.
+    sockets: Option<Arc<Sockets>>,
 }
 
 #[derive(Debug)]
@@ -182,6 +186,21 @@ pub struct Request<'a> {
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
     pub items: Items,
+    /// Which bot is asking, and where the items sit in its history, so a
+    /// socket provider can send only what the server has not seen.
+    pub chain: Option<Chain<'a>>,
+}
+
+/// A request's place in its bot's history. `items` is the whole input; when
+/// the server already holds the previous response, only `tail(n)`, the
+/// items after the first `n` window ids, is sent instead.
+pub struct Chain<'a> {
+    pub bot: &'a str,
+    /// Context bytes ahead of the window items (summary and notes), and the
+    /// window's node ids; `None` for a request that is not a window, such as
+    /// a summary over a span.
+    pub window: Option<(&'a [u8], &'a [i64])>,
+    pub tail: Box<dyn FnOnce(usize) -> Items + Send + 'a>,
 }
 
 enum Parser {
@@ -240,13 +259,36 @@ impl Provider {
             account: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
+            sockets: None,
         })
     }
     /// Model pool levels behind this provider, for `stats`.
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "pools": self.pools.status(),
-        })
+        });
+        if let Some(sockets) = &self.sockets {
+            status["sockets"] = sockets.open().into();
+        }
+        status
+    }
+
+    /// Carry Responses calls over WebSocket, keeping one connection per bot
+    /// so a call can continue from the bot's previous response.
+    pub fn with_socket(mut self) -> Result<Self> {
+        if self.family != Family::Responses {
+            return fail("invalid_provider_transport");
+        }
+        self.sockets = Some(Arc::new(Sockets::new()?));
+        Ok(self)
+    }
+
+    /// The bot recorded the response it was just given as these node ids.
+    /// Its next window can then continue from that response.
+    pub fn recorded(&self, bot: &str, ids: &[i64]) {
+        if let Some(sockets) = &self.sockets {
+            sockets.recorded(bot, ids);
+        }
     }
     pub fn family(&self) -> Family {
         self.family
@@ -462,6 +504,19 @@ impl Provider {
                 .await
                 .map_err(|_| Error::new("provider_admission_timeout"))?
                 .map_err(|_| Error::new("provider_admission_closed"))?;
+        if let Some(sockets) = &self.sockets {
+            return self
+                .complete_socket(
+                    sockets,
+                    request,
+                    prefix,
+                    delta,
+                    report,
+                    (&pace, reservation, estimate),
+                    admission,
+                )
+                .await;
+        }
         let (body, len) = self.body(prefix, request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -613,6 +668,149 @@ impl Provider {
             }
         })
     }
+}
+
+impl Provider {
+    /// One call over the bot's socket. A continuation that the server no
+    /// longer holds is sent again in full on the same connection; everything
+    /// else fails as the HTTP path would.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_socket<F, Fut>(
+        &self,
+        sockets: &Sockets,
+        request: Request<'_>,
+        prefix: Vec<u8>,
+        mut delta: F,
+        report: &mut Report,
+        (pace, mut reservation, estimate): (&pace::Pace, pace::Reservation<'_>, pace::Cost),
+        admission: tokio::sync::SemaphorePermit<'_>,
+    ) -> Result<Completion>
+    where
+        F: FnMut(Delta) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let Request { items, chain, .. } = request;
+        let (bot, window, tail) = match chain {
+            Some(Chain { bot, window, tail }) => (Some(bot), window, Some(tail)),
+            None => (None, None, None),
+        };
+        let key = socket::key(&prefix, window.map_or(&[][..], |(head, _)| head));
+        let ids = window.map(|(_, ids)| ids);
+        reservation.dispatch();
+        report.dispatched = true;
+        let mut learned = false;
+        let mut session = match bot.and_then(|bot| sockets.take(bot)) {
+            Some(session) => session,
+            None => {
+                let mut headers = Vec::with_capacity(2);
+                let bearer = self.key.as_ref().map(|key| format!("Bearer {key}"));
+                if let Some(bearer) = &bearer {
+                    headers.push(("authorization", bearer.as_str()));
+                }
+                if let Some(account) = &self.account {
+                    headers.push(("chatgpt-account-id", account.as_str()));
+                }
+                match sockets.connect(&self.url, &headers).await {
+                    Ok((session, response)) => {
+                        reservation.learn(&response, self.family);
+                        learned = true;
+                        session
+                    }
+                    Err(error) => {
+                        reservation.settle(0);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        drop(admission);
+        let mut plan = session.plan(key, ids);
+        let (mut items, mut tail) = (Some(items), tail);
+        let mut parser = responses::State::default();
+        let outcome = loop {
+            let input = match (&plan.previous, tail.take()) {
+                (Some(_), Some(tail)) => tail(plan.skip),
+                _ => items.take().expect("the full input is sent at most once"),
+            };
+            let text = match create(&prefix, plan.previous.as_deref(), input).await {
+                Ok(text) => text,
+                Err(error) => {
+                    reservation.settle(0);
+                    return Err(error);
+                }
+            };
+            match session
+                .exchange(text, &mut parser, &mut delta, self.stall_timeout)
+                .await
+            {
+                Err(failure)
+                    if failure.error.code == "provider_previous_response_not_found"
+                        && plan.previous.is_some()
+                        && items.is_some() =>
+                {
+                    plan = socket::Plan {
+                        previous: None,
+                        skip: 0,
+                    };
+                    parser = responses::State::default();
+                }
+                outcome => break outcome,
+            }
+        };
+        report.usage = parser.usage();
+        let mut keep = bot.is_some();
+        let completed = match outcome {
+            Ok(()) => {
+                session.completed(parser.id(), key, ids);
+                parser.finish()
+            }
+            Err(failure) => {
+                if let Some(headers) = failure.headers.as_ref().filter(|_| !learned) {
+                    reservation.learn(headers, self.family);
+                }
+                if failure.status == Some(429) || failure.error.code == "provider_rate_limited" {
+                    let after = failure
+                        .headers
+                        .as_ref()
+                        .and_then(|headers| headers.get("retry-after"))
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+                        .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
+                    pace.limited(after);
+                }
+                session.completed(None, key, ids);
+                keep &= !failure.dead;
+                Err(failure.error)
+            }
+        };
+        reservation.settle_usage(report.usage.as_ref(), estimate);
+        if let Some(bot) = bot.filter(|_| keep) {
+            sockets.put(bot, session);
+        }
+        completed
+    }
+}
+
+/// A `response.create` event: the request fields, the continuation if any,
+/// and the input. A socket message is whole, so the input is assembled here.
+async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Result<String> {
+    let mut text = Vec::with_capacity(prefix.len() + items.bytes + 96);
+    text.extend_from_slice(br#"{"type":"response.create","#);
+    if let Some(previous) = previous {
+        text.extend_from_slice(br#""previous_response_id":"#);
+        serde_json::to_writer(&mut text, previous)?;
+        text.push(b',');
+    }
+    text.extend_from_slice(&prefix[1..]);
+    while let Some(chunk) = items.stream.next().await {
+        text.extend_from_slice(&chunk.map_err(|error| Error {
+            code: error.to_string(),
+            detail: None,
+        })?);
+    }
+    text.extend_from_slice(b"]}");
+    String::from_utf8(text).map_err(|_| Error::new("invalid_item_encoding"))
 }
 
 /// Model ids that predate adaptive thinking and still require a token budget.
@@ -775,6 +973,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
@@ -790,6 +989,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
@@ -804,6 +1004,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         empty_prefix.extend_from_slice(b"]}");
@@ -825,6 +1026,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -854,6 +1056,7 @@ mod tests {
                             tools,
                             allow_tool_calls: allow,
                             items: Items::empty(),
+                            chain: None,
                         })
                         .unwrap();
                     prefix.extend_from_slice(b"]}");
@@ -956,6 +1159,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             },
             |delta| {
                 if let Delta::Text(part) = delta {
@@ -1018,6 +1222,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
         };
         let _ = provider.complete(request, |_| async { Ok(()) }).await;
         let head = head.await.unwrap();
@@ -1059,6 +1264,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
         };
         let error = provider
             .complete(request, |_| async { Ok(()) })
@@ -1106,6 +1312,7 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
         };
         let completion = provider
             .complete(request, |_| async { Ok(()) })
