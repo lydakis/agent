@@ -7,14 +7,16 @@ instruction as one blocking `agent run` in the task's working directory, and
 reports the bot's provider-reported tokens back to Harbor. It needs Harbor's
 Python environment, not bench/requirements.txt; see docs/HARBOR.md.
 
-    harbor run -d terminal-bench@2.0 --agent-import-path bench.harbor_agent:Agent \
+    harbor run -d terminal-bench/terminal-bench-2-1 -a bench.harbor_agent:Agent \
         -m anthropic/claude-opus-5-5
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import shlex
+import sqlite3
 from pathlib import Path
 from typing import Any, ClassVar, override
 
@@ -40,6 +42,7 @@ REPOSITORY = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = REPOSITORY / '.local/target/x86_64-unknown-linux-musl/release/agent'
 REMOTE_BINARY = '/installed-agent/agent'
 REMOTE_CODEX_HOME = '/installed-agent/codex'
+CHATGPT_URL = 'https://chatgpt.com/backend-api/codex'
 # SQLite stays on the container's own disk: the log directory is a host mount.
 REMOTE_STORE = '/tmp/agent-harbor'
 BOT = 'task'
@@ -102,12 +105,23 @@ class Agent(BaseInstalledAgent):
         self._providers = [provider] if isinstance(provider, str) else list(provider or [])
         self._reasoning = reasoning
         self._limits = limits
-        # A chatgpt/ model signs in with the ChatGPT login Codex saved.
-        self._chatgpt = (self.model_name or '').startswith('chatgpt/')
-        if self._chatgpt and not any(p.partition('=')[0] == 'chatgpt' for p in self._providers):
+        # A chatgpt/ model signs in with the ChatGPT login Codex saved, unless
+        # a chatgpt spec names another endpoint, which never gets the login.
+        if ((self.model_name or '').startswith('chatgpt/')
+                and not any(p.partition('=')[0] == 'chatgpt' for p in self._providers)):
             self._providers.append('chatgpt')
+        self._chatgpt = any(self._signs_in(spec) for spec in self._providers)
         codex_home = os.environ.get('CODEX_HOME') or Path.home() / '.codex'
         self._codex_auth = Path(codex_auth or Path(codex_home) / 'auth.json')
+
+    @staticmethod
+    def _signs_in(spec: str) -> bool:
+        """Whether the daemon reads Codex's login for this spec: the chatgpt
+        name at its own endpoint with no key variable, as ProviderSpec::parse."""
+        name, _, rest = spec.partition('=')
+        fields = [field for field in rest.split(',') if field]
+        url = fields[1] if len(fields) > 1 else CHATGPT_URL
+        return name == 'chatgpt' and len(fields) < 3 and url == CHATGPT_URL
 
     @staticmethod
     @override
@@ -175,24 +189,19 @@ class Agent(BaseInstalledAgent):
         return (f'mkdir -p {REMOTE_STORE} {logs}; '
                 f'{run} < /dev/null | tee {logs}/agent.jsonl; exit ${{PIPESTATUS[0]}}')
 
-    def _finish_command(self, bots: list[str]) -> str:
-        """Record every bot's turns, then stop the daemon and save its store.
+    @staticmethod
+    def _finish_command() -> str:
+        """Stop the daemon and save its store, the trial's accounting record.
 
         Bots the task delegated to may still be running, and after Harbor's
         timeout so is the task bot: shutdown cancels their turns and returns
-        once the daemon has committed them and exited, so the copy is whole.
+        once the daemon has committed them and exited, so the copy is final.
         """
         logs = EnvironmentPaths.agent_dir.as_posix()
-        # {"bot": [turn, ...], ...}, from the JSON each command prints.
-        turns = ['printf {']
-        for index, bot in enumerate(bots):
-            key = (',' if index else '') + json.dumps(bot) + ':'
-            turns += [f'printf %s {shlex.quote(key)}',
-                      f'agent turns --bot {shlex.quote(bot)} --no-spawn']
-        turns.append('printf }')
         store = f'{REMOTE_STORE}/state.sqlite'
         return (
-            f'{{ {"; ".join(turns)}; }} > {logs}/turns.json; '
+            # No socket: the daemon never started, so nothing ran.
+            f'[ -S {store}.sock ] || exit 0; '
             f'agent stats --no-spawn > {logs}/stats.json; '
             f'agent shutdown && cp {store} {logs}/ && '
             # A clean exit checkpoints the WAL away; a crash may leave it.
@@ -223,24 +232,16 @@ class Agent(BaseInstalledAgent):
             # would otherwise keep calling the model and tools in the container.
             try:
                 async with asyncio.timeout(FINISH_TIMEOUT):
-                    await self._finish(environment)
+                    await self.exec_as_agent(environment, command=self._finish_command(),
+                                             env=self._env())
             except Exception as error:  # bookkeeping never replaces the trial's outcome
                 self.logger.warning(f'lydakis-agent bookkeeping failed: {error}')
-
-    async def _finish(self, environment: BaseEnvironment) -> None:
-        try:
-            listing = await self.exec_as_agent(environment, command='agent ls', env=self._env())
-        except RuntimeError:  # no daemon: it never started, so nothing ran
-            return
-        bots = [bot['name'] for bot in json.loads(listing.stdout)]
-        await self.exec_as_agent(environment, command=self._finish_command(bots), env=self._env())
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:
         # Every bot's turns, so tokens a delegated bot spent on another model
         # are priced at that model's rates.
-        bots = self._read_json('turns.json') or {}
-        turns = [turn for records in bots.values() for turn in records]
+        turns = self._store_turns() or []
         models: dict[str, ModelUsage] = {}
         for turn in turns:
             usage = models.setdefault(turn['model'], ModelUsage())
@@ -267,23 +268,36 @@ class Agent(BaseInstalledAgent):
         if turns:
             context.metadata = {key: sum(t[key] for t in turns)
                                 for key in ('model_rounds', 'retries', 'paced_ms')}
-            context.metadata['status'] = [t['status'] for t in bots.get(BOT, [])]
-            context.metadata['bots'] = len(bots)
+            context.metadata['status'] = [t['status'] for t in turns if t['bot'] == BOT]
+            context.metadata['bots'] = len({t['bot'] for t in turns})
 
-    def _read_json(self, name: str) -> Any:
-        """A bookkeeping file, or None when the daemon never started or its
-        bookkeeping failed partway."""
-        path = self.logs_dir / name
+    def _store_turns(self) -> list[dict[str, Any]] | None:
+        """Every turn in the store copied after the daemon exited, or None when
+        there is no copy: the daemon never started or its shutdown failed.
+
+        Read from the final store rather than asked of the running daemon, so
+        a delegated bot's last call, or a bot created at the end, is counted.
+        The columns and model fallback are the daemon's own `turns` listing's.
+        """
+        path = self.logs_dir / 'state.sqlite'
+        if not path.is_file():
+            return None
         try:
-            return json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                db.row_factory = sqlite3.Row
+                return [dict(row) for row in db.execute(
+                    "SELECT t.bot,COALESCE(t.model,b.provider||'/'||b.model) AS model,t.status,"
+                    't.input_tokens,t.cached_input_tokens,t.output_tokens,'
+                    't.model_rounds,t.retries,t.paced_ms '
+                    'FROM turns t JOIN bots b ON b.name=t.bot ORDER BY t.id')]
+        except sqlite3.Error:
             return None
 
     def _streamed_usage(self) -> dict[str, int] | None:
         """The task bot's per-round usage events, streamed as they happened.
 
-        Used when the turn records could not be read; bots it delegated to
-        are not in this stream.
+        Used when there is no store copy; bots it delegated to are not in
+        this stream.
         """
         path = self.logs_dir / 'agent.jsonl'
         if not path.is_file():

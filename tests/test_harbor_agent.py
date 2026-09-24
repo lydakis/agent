@@ -2,6 +2,8 @@
 import asyncio
 import json
 import os
+import socket
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -16,21 +18,34 @@ try:
     from bench.harbor_agent import Agent
 except ImportError:  # Harbor is not a bench dependency; see docs/HARBOR.md
     Agent = None
+from tests.test_runtime import ModelFixture
 
 
 class Environment:
     """Answers the adapter's execs; the task command runs until cancelled."""
 
-    def __init__(self, bots):
-        self.bots = bots
+    def __init__(self):
         self.commands = []
 
     async def exec(self, command, user=None, env=None, cwd=None, timeout_sec=None):
         self.commands.append(command)
         if 'agent run ' in command:
             await asyncio.Event().wait()
-        stdout = json.dumps([{'name': bot} for bot in self.bots]) if command.endswith('agent ls') else ''
-        return ExecResult(stdout=stdout, return_code=0)
+        return ExecResult(stdout='', return_code=0)
+
+
+def store(path, turns):
+    """The columns of a store's bots and turns that accounting reads."""
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE bots(name TEXT, provider TEXT, model TEXT)')
+        db.execute('CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT, model TEXT, status TEXT, '
+                   'input_tokens INT, cached_input_tokens INT, output_tokens INT, '
+                   'model_rounds INT, retries INT, paced_ms INT)')
+        db.executemany('INSERT INTO bots VALUES (?,?,?)',
+                       {(t[0], 'gw', 'm') for t in turns})
+        db.executemany('INSERT INTO turns(bot,model,status,input_tokens,cached_input_tokens,'
+                       'output_tokens,model_rounds,retries,paced_ms) VALUES (?,?,?,?,?,?,2,1,5)',
+                       [(bot, model, status, n, n // 2, n // 10) for bot, model, status, n in turns])
 
 
 @unittest.skipIf(Agent is None, 'harbor is not installed')
@@ -56,6 +71,17 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual(env['AGENT_STORE'], '/tmp/agent-harbor/state.sqlite')
         self.assertIn(f'--provider {spec} ', command)
 
+    def test_the_login_is_uploaded_only_when_the_daemon_signs_in(self):
+        with tempfile.TemporaryDirectory() as logs:
+            def signs_in(**kwargs):
+                return Agent(logs_dir=Path(logs), model_name='chatgpt/m', **kwargs)._chatgpt
+            self.assertTrue(signs_in())
+            self.assertTrue(signs_in(provider=f'chatgpt=responses,{harbor_agent.CHATGPT_URL}'))
+            self.assertFalse(signs_in(provider='chatgpt=responses,https://gw.example.test/v1,GW_KEY'))
+            self.assertFalse(signs_in(provider='chatgpt=responses,http://127.0.0.1:9/v1'))
+            self.assertFalse(signs_in(provider=f'chatgpt=responses,{harbor_agent.CHATGPT_URL},K'))
+            self.assertFalse(self.agent(logs)._chatgpt)
+
     def test_a_chatgpt_model_signs_in_with_the_codex_login(self):
         with tempfile.TemporaryDirectory() as logs:
             auth = Path(logs, 'auth.json')
@@ -74,18 +100,14 @@ class HarborAgentTest(unittest.TestCase):
             self.assertNotIn('CODEX_HOME', self.agent(logs)._env())
 
     def test_each_model_is_priced_at_its_own_rates(self):
-        def turn(model, tokens, status='completed'):
-            return {'model': model, 'input_tokens': tokens, 'cached_input_tokens': tokens // 2,
-                    'output_tokens': tokens // 10, 'model_rounds': 2, 'retries': 1,
-                    'paced_ms': 5, 'status': status}
         rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5,
                           'cache_read_input_token_cost': 1e-7},
                  'gw/small': {'input_cost_per_token': 1e-7, 'output_cost_per_token': 1e-6}}
         with tempfile.TemporaryDirectory() as logs, \
                 mock.patch.dict('litellm.model_cost', rates):
-            Path(logs, 'turns.json').write_text(json.dumps({
-                'task': [turn('gw/m', 900), turn('gw/m', 100, 'cancelled')],
-                'helper': [turn('gw/small', 2000)]}))
+            store(Path(logs, 'state.sqlite'), [('task', 'gw/m', 'completed', 900),
+                                               ('helper', 'gw/small', 'cancelled', 2000),
+                                               ('task', None, 'interrupted', 100)])
             context = AgentContext()
             self.agent(logs).populate_context_post_run(context)
             unpriced = AgentContext()
@@ -94,53 +116,42 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual((context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens),
                          (3000, 1500, 300))
         usage = context.model_usage
+        # A turn with no model of its own ran on its bot's.
         self.assertEqual((usage['gw/m'].n_input_tokens, usage['gw/small'].n_input_tokens), (1000, 2000))
         self.assertAlmostEqual(usage['gw/m'].cost_usd, 500e-6 + 500e-7 + 100e-5)
         # No cached rate: cached input is priced as input.
         self.assertAlmostEqual(usage['gw/small'].cost_usd, 2000e-7 + 200e-6)
         self.assertAlmostEqual(context.cost_usd, usage['gw/m'].cost_usd + usage['gw/small'].cost_usd)
         self.assertEqual(context.metadata, {'model_rounds': 6, 'retries': 3, 'paced_ms': 15,
-                                            'status': ['completed', 'cancelled'], 'bots': 2})
+                                            'status': ['completed', 'interrupted'], 'bots': 2})
         self.assertIsNone(unpriced.cost_usd)
         self.assertEqual(unpriced.n_output_tokens, 300)
 
-    def test_bookkeeping_records_every_bot_then_waits_for_the_daemon(self):
+    def test_finishing_stops_the_daemon_before_copying_the_store(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
-            logs, store, bin_ = root / 'logs', root / 'store', root / 'bin'
-            for directory in (logs, store, bin_):
+            logs, remote, bin_ = root / 'logs', root / 'store', root / 'bin'
+            for directory in (logs, remote, bin_):
                 directory.mkdir()
-            (store / 'state.sqlite').write_text('db')
-            # Prints what the daemon would and logs each call.
+            (remote / 'state.sqlite').write_text('db')
             fake = bin_ / 'agent'
-            fake.write_text(f"""#!/bin/sh
-echo "$*" >> {root}/calls
-case "$1" in
-  turns) printf '[%s]' "${{#3}}" ;;
-  stats) echo '{{"tokens":{{}}}}' ;;
-esac
-""")
+            fake.write_text(f'#!/bin/sh\necho "$*" >> {root}/calls\n')
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
             with mock.patch.object(harbor_agent.EnvironmentPaths, 'agent_dir', logs), \
-                    mock.patch.object(harbor_agent, 'REMOTE_STORE', str(store)):
-                command = self.agent(logs)._finish_command(['task', 'it\'s "odd"'])
-            subprocess.run(['bash', '-c', command], check=True,
-                           env={**os.environ, 'PATH': f'{bin_}:{os.environ["PATH"]}'})
-            self.assertEqual(json.loads((logs / 'turns.json').read_text()),
-                             {'task': [4], 'it\'s "odd"': [10]})
-            self.assertEqual((root / 'calls').read_text().splitlines()[-2:],
-                             ['stats --no-spawn', 'shutdown'])
+                    mock.patch.object(harbor_agent, 'REMOTE_STORE', str(remote)):
+                command = Agent._finish_command()
+            env = {**os.environ, 'PATH': f'{bin_}:{os.environ["PATH"]}'}
+            # The daemon never started: nothing to stop or save.
+            subprocess.run(['bash', '-c', command], check=True, env=env)
+            self.assertFalse((root / 'calls').exists())
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(remote / 'state.sqlite.sock'))
+                subprocess.run(['bash', '-c', command], check=True, env=env)
+            self.assertEqual((root / 'calls').read_text().splitlines(), ['stats --no-spawn', 'shutdown'])
             self.assertEqual((logs / 'state.sqlite').read_text(), 'db')
-            empty = self.agent(logs)
-            with mock.patch.object(harbor_agent.EnvironmentPaths, 'agent_dir', logs), \
-                    mock.patch.object(harbor_agent, 'REMOTE_STORE', str(store)):
-                command = empty._finish_command([])
-            subprocess.run(['bash', '-c', command], check=True,
-                           env={**os.environ, 'PATH': f'{bin_}:{os.environ["PATH"]}'})
-            self.assertEqual(json.loads((logs / 'turns.json').read_text()), {})
 
     def test_a_timed_out_trial_still_stops_the_daemon(self):
-        environment = Environment(['task', 'helper'])
+        environment = Environment()
         with tempfile.TemporaryDirectory() as logs:
             agent = self.agent(logs)
 
@@ -148,17 +159,15 @@ esac
                 await asyncio.wait_for(agent.run('task', environment, AgentContext()), 0.1)
             with self.assertRaises(TimeoutError):
                 asyncio.run(trial())
-        run, listing, finish = environment.commands
+        run, finish = environment.commands
         self.assertIn('agent run ', run)
-        self.assertTrue(listing.endswith('agent ls'))
-        self.assertIn("agent turns --bot helper --no-spawn", finish)
         self.assertIn('agent shutdown && cp ', finish)
 
     def test_unreadable_turn_records_fall_back_to_streamed_usage(self):
         usage = {'input_tokens': 100, 'cached_input_tokens': 40, 'output_tokens': 7}
         with tempfile.TemporaryDirectory() as logs:
-            # A turns listing that failed partway.
-            Path(logs, 'turns.json').write_text('{"task":')
+            # A store the daemon never finished writing.
+            Path(logs, 'state.sqlite').write_text('not a database')
             Path(logs, 'agent.jsonl').write_text('\n'.join(
                 [json.dumps({'event': 'usage', 'data': usage})] * 2
                 + [json.dumps({'event': 'text_delta', 'text': 'x'}), 'agent: diagnostic',
@@ -171,10 +180,28 @@ esac
     def test_a_daemon_that_never_started_reports_nothing(self):
         with tempfile.TemporaryDirectory() as logs:
             Path(logs, 'agent.jsonl').write_text('')
-            Path(logs, 'turns.json').write_text('')
             context = AgentContext()
             self.agent(logs).populate_context_post_run(context)
         self.assertTrue(context.is_empty())
+
+
+@unittest.skipIf(Agent is None, 'harbor is not installed')
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class HarborStoreTest(ModelFixture):
+    def test_accounting_reads_a_real_store(self):
+        client = self.client()
+        client.request('create', bot='task', workspace=str(self.path))
+        turn = client.request('submit', bot='task', request_id='r', prompt='hello')['result']['turn']
+        client.finished(turn)
+        listed = client.request('turns', bot='task', after=0, limit=8)['result']['turns']
+        client.request('shutdown')
+        client.close()
+        context = AgentContext()
+        Agent(logs_dir=self.path, model_name='openai/synthetic-model').populate_context_post_run(context)
+        self.assertGreater(context.n_input_tokens, 0)
+        self.assertEqual((context.n_input_tokens, context.n_output_tokens, context.metadata['status']),
+                         (listed[0]['input_tokens'], listed[0]['output_tokens'], ['completed']))
+        self.assertEqual(list(context.model_usage), ['openai/synthetic-model'])
 
 
 if __name__ == '__main__':

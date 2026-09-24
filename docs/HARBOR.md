@@ -62,13 +62,15 @@ the same model can drive each harness on the same tasks.
    `/tmp/agent-harbor`, and the event stream is written to `/logs/agent/agent.jsonl`
    as it happens. The turn's exit status becomes the trial's.
 3. **Finish.** After the turn, and also when Harbor's agent timeout cancels it,
-   the adapter saves every bot's `agent turns` and `agent stats`, then shuts the
-   daemon down. Shutdown cancels any turn still running, including bots the task
-   delegated to, so nothing calls the model or runs tools past the deadline. It
-   returns once the daemon has exited, and the store is then copied into the
-   trial's logs whole.
-4. **Account.** Tokens come from every bot's turn records and are grouped by
-   model, so a delegated bot on another model is priced at its own rates. Cost is
+   the adapter saves `agent stats` and shuts the daemon down. Shutdown cancels
+   any turn still running, including bots the task delegated to, so nothing
+   calls the model or runs tools past the deadline. It returns once the daemon
+   has committed those turns and exited, and the store is then copied into the
+   trial's logs.
+4. **Account.** Tokens come from every bot's turn records in that final copy,
+   so a delegated bot's last call, or a bot created at the very end, is counted.
+   They are grouped by model, so a delegated bot on another model is priced at
+   its own rates. Cost is
    computed from LiteLLM's price table, as Harbor's own adapters do. It is left
    empty when any model used is missing from the table, rather than reported low.
    Provider failures map to Harbor's retryable error types, for example
@@ -85,8 +87,9 @@ endpoint answering 401 produced reward 0 and `AgentAuthenticationError`. On
 Its copied store recorded the turn as `interrupted`, with the first round's
 1,000 input and 50 output tokens.
 `tests/test_harbor_agent.py` covers argument quoting, provider key forwarding,
-the ChatGPT login upload, per-model accounting, the finishing command and
-cleanup after a timeout. It runs under Harbor's Python and skips without Harbor.
+when the ChatGPT login is uploaded and what it holds, per-model accounting, the
+finishing command and cleanup after a timeout, and reads a store the runtime
+wrote. It runs under Harbor's Python and skips without Harbor.
 
 ## Running it
 
@@ -113,7 +116,9 @@ To run on a ChatGPT plan instead of an API key, sign in with `codex login` and
 name the model `chatgpt/MODEL`, using the id Codex's `/model` picker shows. The
 adapter copies the access token and account id from Codex's `auth.json` into each
 task container, readable only by the agent user, and adds `--provider chatgpt`.
-The refresh and ID tokens stay on the host. The model's tools can still read the
+The refresh and ID tokens stay on the host, and nothing is uploaded when a
+`provider` spec points `chatgpt` at another endpoint, since the daemon then never
+reads the login. The model's tools can still read the
 access token file; the daemon redacts the token from tool output. The token is
 not refreshed during a run, so run any `codex` command just before starting. Plan usage windows cap how
 many tasks one run can finish, and whether a ChatGPT plan may drive a harness
@@ -139,10 +144,9 @@ variable is forwarded from the host). Keep job outputs under the ignored
 - **Anthropic cost is a lower bound.** Turn records fold cache writes into input
   tokens, and Anthropic bills cache writes above the base input rate. Recording
   cache-creation tokens separately would close this.
-- **Timeouts miss the call in flight.** Turn records are read before shutdown
-  cancels the running turn, so the model call in progress at the timeout is not
-  counted, and the task bot's status reads `running`. The copied store has the
-  final `interrupted` status.
+- **Timeouts miss the call in flight.** Shutdown cancels the model call in
+  progress at the timeout before the provider reports its usage, so those
+  tokens are not counted even if the provider bills them.
 - **No trajectory.** The adapter does not emit Harbor's ATIF trajectory, so
   `harbor view` and `harbor analyze` show no steps. The copied store holds the
   full transcript.
