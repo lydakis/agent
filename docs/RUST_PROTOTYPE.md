@@ -331,7 +331,7 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY` |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login |
 | `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY` |
 
 Responses gateways can be configured as named providers, for example
@@ -341,6 +341,22 @@ variable is read only when it is named in the spec or implied by a default
 endpoint; a custom URL without a key field sends no credential. Compatibility
 requires the request fields and streaming subset implemented by this adapter;
 the family label alone does not establish support for an arbitrary gateway.
+
+`--provider chatgpt` uses a ChatGPT plan instead of an API key. Codex's own
+source (openai/codex `15922a5`, read 2026-09-23) shows that, when signed in with
+ChatGPT, Codex sends Responses requests to `https://chatgpt.com/backend-api/codex`
+with the saved access token as the bearer and a `ChatGPT-Account-ID` header. The
+daemon reads `tokens.access_token` and `tokens.account_id` from
+`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) once at startup and sends
+the same two headers. It never refreshes the token: Codex does that when it runs,
+so run any `codex` command first if the login is stale, and restart the daemon to
+pick up a refreshed file. A missing or unreadable file fails startup with
+`provider_login_unavailable`. The login goes only to that endpoint: a `chatgpt`
+spec naming another URL authenticates with the key variable it names, or with
+nothing, so a local or synthetic endpoint never receives the real token. The
+daemon redacts the access token from tool output like a key. Only a synthetic
+endpoint has exercised the headers; whether the ChatGPT backend accepts every
+field this adapter sends has not been observed.
 
 Responses requests explicitly include `reasoning.encrypted_content` even when
 no reasoning effort is configured, because a model can reason by default.
@@ -473,6 +489,12 @@ event without subscribing (the benchmark and lifecycle tools use it). With
 number of Unix-socket sessions, and runs until `shutdown`, SIGTERM, or SIGINT.
 Each socket session begins with a `ready` line and must `follow` the bots it
 wants to observe.
+
+`agent shutdown` returns once the daemon process has exited, so a caller may
+copy or reopen the store: the daemon answers the request first, then cancels
+active turns, commits their records and closes the database. The `ready` line
+carries the daemon's `pid` for this. The command fails with
+`daemon_shutdown_timeout` after 30 seconds.
 
 On shutdown, committed turn events get up to five seconds to drain through
 the publisher. Background commands can keep the storage stream open; when

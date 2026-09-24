@@ -1,4 +1,5 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
+import fcntl
 import json
 import http.server
 import concurrent.futures
@@ -36,10 +37,7 @@ class SocketAndCliTests(ModelFixture):
     def shutdown(self):
         if self.socket.exists():
             subprocess.run([*self.base, 'shutdown', '--store', str(self.store)], env=clean_env(),
-                           capture_output=True, timeout=5)
-            deadline = time.monotonic() + 5
-            while self.socket.exists() and time.monotonic() < deadline:
-                time.sleep(.05)
+                           capture_output=True, timeout=35)
 
     def agent(self, *args, check=True, timeout=30, stdin=None):
         result = subprocess.run([*self.base, *args], env=clean_env(), capture_output=True, text=True,
@@ -91,10 +89,20 @@ class SocketAndCliTests(ModelFixture):
         pretty = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--pretty', 'truncate', check=False)
         self.assertIn('missing_completion', pretty.stderr)
         self.agent('shutdown', '--store', str(self.store))
-        deadline = time.monotonic() + 2
-        while self.socket.exists() and time.monotonic() < deadline:
-            time.sleep(.01)
         self.assertFalse(self.socket.exists())
+
+    def test_shutdown_returns_once_the_daemon_has_exited(self):
+        handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'wait').stdout)
+        self.model.requests.get(timeout=3)
+        self.agent('shutdown', '--store', str(self.store))
+        # The active turn's record is committed and the store is released:
+        # a caller may copy or reopen it now.
+        self.assertFalse(self.socket.exists())
+        with open(f'{self.store}.owner-lock', 'r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with sqlite3.connect(self.store) as db:
+            status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
+        self.assertNotIn(status, ('queued', 'ready', 'running'))
 
     def test_stats_and_wait_any_from_the_cli(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')

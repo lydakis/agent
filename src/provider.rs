@@ -117,6 +117,8 @@ pub struct Provider {
     family: Family,
     url: reqwest::Url,
     key: Option<String>,
+    /// ChatGPT workspace for a ChatGPT-login key, sent as `ChatGPT-Account-ID`.
+    account: Option<String>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
 }
@@ -234,6 +236,7 @@ impl Provider {
             family,
             url,
             key,
+            account: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
         })
@@ -259,6 +262,15 @@ impl Provider {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
+        Ok(self)
+    }
+
+    /// Name the ChatGPT workspace a ChatGPT-login access token acts for.
+    pub fn with_account(mut self, account: String) -> Result<Self> {
+        if self.family != Family::Responses || account.is_empty() {
+            return fail("invalid_provider_account");
+        }
+        self.account = Some(account);
         Ok(self)
     }
 
@@ -458,6 +470,9 @@ impl Provider {
             }
             (Family::Responses, None) => http,
         };
+        if let Some(account) = &self.account {
+            http = http.header("chatgpt-account-id", account);
+        }
         reservation.dispatch();
         report.dispatched = true;
         let response = match http.send().await {
@@ -936,6 +951,58 @@ mod tests {
                 .with_stall_timeout(Duration::ZERO)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn an_account_rides_with_the_key_on_every_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, head) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
+            let _ = seen.send(String::from_utf8_lossy(&request).to_lowercase());
+            let _ = socket
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let provider = Provider::new(
+            Transport::new(0, 1).unwrap(),
+            Family::Responses,
+            &url,
+            Some("synthetic-token".into()),
+        )
+        .unwrap()
+        .with_account("synthetic-account".into())
+        .unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let _ = provider.complete(request, |_| async { Ok(()) }).await;
+        let head = head.await.unwrap();
+        assert!(head.starts_with("post /responses "), "{head}");
+        assert!(
+            head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nchatgpt-account-id: synthetic-account\r\n"),
+            "{head}"
+        );
+        let anthropic = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None);
+        assert!(anthropic.unwrap().with_account("w".into()).is_err());
     }
 
     #[test]

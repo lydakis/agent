@@ -6,6 +6,8 @@ Responses SSE endpoint. The original binary transport client remains a calibrati
 target. The new Rust core runs the same workload through its shared provider
 transport and history implementation. These experiments measure
 ephemeral text conversations, not durable agent capacity or model quality.
+Task-quality benchmarks such as Terminal-Bench run through Harbor instead;
+see [HARBOR.md](HARBOR.md).
 
 ## Reuse decision
 

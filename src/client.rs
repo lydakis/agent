@@ -21,6 +21,8 @@ use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 const DEFAULT_INSTRUCTIONS: &str = agent_client::policy::PREAMBLE;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Shutdown drains each client and the event publisher under 5 s bounds.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn startup_remaining(deadline: Instant) -> Result<Duration> {
     deadline
@@ -488,7 +490,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     if options.providers.is_empty() {
         return fail_with(
             "usage",
-            "no provider: pass --provider (anthropic, openai, openrouter, or NAME=FAMILY,URL,KEY_ENV) or export a provider key",
+            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, or NAME=FAMILY,URL,KEY_ENV) or export a provider key",
         );
     }
     if let Some(parent) = options.store.parent() {
@@ -627,11 +629,40 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "ls" => list(&options),
         "shutdown" => {
             let mut connection = Connection::connect(&options.socket)?;
+            let pid = connection.ready["pid"]
+                .as_u64()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .ok_or(Error::new("daemon_protocol_mismatch"))?;
             connection.request("shutdown", json!({}))?;
+            await_exit(pid)?;
             Ok(0)
         }
         _ => fail("usage"),
     }
+}
+
+/// Return once the daemon process is gone, so a caller may copy or reopen
+/// the store: it answers shutdown before it cancels active turns, commits
+/// their records and closes the database. An unreaped zombie counts as gone.
+fn await_exit(pid: i32) -> Result<()> {
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    let running = || {
+        // SAFETY: signal 0 only checks that the process exists.
+        let exists = unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists
+            && std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ")
+                    .is_none_or(|(_, state)| !state.starts_with('Z'))
+            })
+    };
+    while running() {
+        if Instant::now() >= deadline {
+            return fail_with("daemon_shutdown_timeout", pid.to_string());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn print_json(value: &Value, pretty: bool) -> Result<()> {
