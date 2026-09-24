@@ -15,7 +15,7 @@ use agent_runtime::{
     Error, Result,
     codec::split_model,
     fail,
-    provider::{Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
+    provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
     store::{ContextPrefix, ContextUsage, Store, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
@@ -366,13 +366,22 @@ impl Turn {
     }
 
     fn items(&self, context: &Context) -> Items {
-        let total = context.usage().bytes;
-        let store = self.store.clone();
-        let chunks = context
+        let (ids, sizes) = context
             .window
             .as_ref()
-            .map_or_else(Vec::new, |w| batches(&w.ids, &w.sizes));
-        let body = stream::iter([Ok(context.prefix.bytes.clone())]).chain(
+            .map_or((&[][..], &[][..]), |w| (&w.ids[..], &w.sizes[..]));
+        self.window_items(context.prefix.bytes.clone(), ids, sizes)
+    }
+
+    /// The context prefix, then the items of `ids` read from the store in
+    /// batches as the request streams.
+    fn window_items(&self, prefix: Bytes, ids: &[i64], sizes: &[u32]) -> Items {
+        let total = prefix.len()
+            + sizes.iter().map(|&size| size as usize).sum::<usize>()
+            + ids.len().saturating_sub(1);
+        let store = self.store.clone();
+        let chunks = batches(ids, sizes);
+        let body = stream::iter([Ok(prefix)]).chain(
             stream::iter(chunks.into_iter().enumerate()).then(move |(index, chunk)| {
                 let store = store.clone();
                 async move {
@@ -802,15 +811,25 @@ impl Turn {
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
-            if let Err(error) = self
+            match self
                 .store
                 .op("append", move |db| {
                     db.append(turn, items, &calls, usage.as_ref())
                 })
                 .await
             {
-                self.failed_usage(response.usage.clone()).await?;
-                return Err(error);
+                Ok(entries) => {
+                    let nodes: Vec<i64> = entries
+                        .iter()
+                        .filter(|entry| entry["event"] == "message")
+                        .filter_map(|entry| entry["data"]["node"].as_i64())
+                        .collect();
+                    provider.recorded(&self.bot, &nodes);
+                }
+                Err(error) => {
+                    self.failed_usage(response.usage.clone()).await?;
+                    return Err(error);
+                }
             }
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
@@ -926,6 +945,7 @@ impl Turn {
                         allow_tool_calls: matches!(body, Body::Window(_)),
                         cache_key: Some(&cache_key),
                         items,
+                        chain: Some(self.chain(body)),
                     },
                     |delta| {
                         let (kind, text) = match delta {
@@ -1039,6 +1059,28 @@ impl Turn {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+        }
+    }
+
+    /// Where this request sits in the bot's history, for a provider that can
+    /// continue from the bot's previous response. A span has no window.
+    fn chain<'a>(&'a self, body: Body<'a>) -> Chain<'a> {
+        match body {
+            Body::Window(Context {
+                window: Some(window),
+                prefix,
+            }) => Chain {
+                bot: &self.bot,
+                window: Some((&prefix.bytes[..], &window.ids[..])),
+                tail: Box::new(move |skip| {
+                    self.window_items(Bytes::new(), &window.ids[skip..], &window.sizes[skip..])
+                }),
+            },
+            _ => Chain {
+                bot: &self.bot,
+                window: None,
+                tail: Box::new(|_| Items::empty()),
+            },
         }
     }
 
@@ -1374,6 +1416,7 @@ fn retryable(code: &str) -> bool {
             | "provider_stream_stalled"
             | "truncated_sse_frame"
             | "provider_admission_timeout"
+            | "provider_socket_expired"
     ) || code.starts_with("provider_connection_")
 }
 

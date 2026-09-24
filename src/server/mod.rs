@@ -177,8 +177,14 @@ pub struct ProviderSpec {
     pub key_env: Option<String>,
     /// Authenticate with the ChatGPT login Codex saved, not a key variable.
     pub chatgpt_login: bool,
+    /// Carry Responses calls over WebSocket (family `responses-ws`).
+    pub socket: bool,
 }
 impl ProviderSpec {
+    /// How calls reach the provider, as `ready.providers` reports it.
+    pub fn transport(&self) -> &'static str {
+        if self.socket { "websocket" } else { "http" }
+    }
     /// `NAME[=FAMILY[,URL[,KEY_ENV]]]`. Known names have defaults; the key
     /// variable is read only when named here or implied by a default endpoint.
     /// `chatgpt` at its default endpoint without a key variable uses Codex's
@@ -216,6 +222,10 @@ impl ProviderSpec {
             _ => ("", "", None),
         };
         let family = family.as_deref().unwrap_or(default_family);
+        let (family, socket) = match family {
+            "responses-ws" => ("responses", true),
+            family => (family, false),
+        };
         let family = Family::parse(family).ok_or(Error::with("invalid_provider_spec", spec))?;
         let url = match url {
             Some(url) => url,
@@ -236,6 +246,7 @@ impl ProviderSpec {
             family,
             url,
             key_env,
+            socket,
         })
     }
 }
@@ -481,13 +492,17 @@ pub async fn run(config: Configuration) -> Result<()> {
         {
             provider = provider.with_max_output_tokens(cap)?;
         }
+        if spec.socket {
+            provider = provider.with_socket()?;
+        }
         let provider = provider.with_stall_timeout(stall_timeout)?;
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
         bindings.insert(
             spec.name.clone(),
-            json!({"family":spec.family.name(),"url":spec.url}),
+            json!({"family":spec.family.name(),"url":spec.url,
+                "transport":spec.transport()}),
         );
     }
     if providers.is_empty() {
@@ -1078,6 +1093,7 @@ impl Service {
                     .op("inspect", move |db| Ok(db.inspect(&name)?.id))
                     .await?;
                 let (store, hub, output) = (store.clone(), self.hub.clone(), output.clone());
+                let providers = self.providers.clone();
                 self.retention.spawn(async move {
                     let result = async {
                         let mut deleted = json!({"turns":0,"events":0,"nodes":0});
@@ -1101,6 +1117,11 @@ impl Service {
                             if piece["done"] == true {
                                 break;
                             }
+                        }
+                        // Its connections go with it, and a later bot of the
+                        // same name starts on a fresh one.
+                        for provider in providers.values() {
+                            provider.forget(&bot);
                         }
                         // Followers learn the bot is gone; nothing durable remains to replay.
                         hub.live(&bot, json!({"event":"deleted","bot":bot,"durable":false}))
