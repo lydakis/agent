@@ -82,10 +82,10 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A background command runs until it exits, times out, or the daemon stops.",
+                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid and a log file of its output are returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
-                "background":{"type":"boolean"}},
+                "background":{"type":"boolean"},"detach":{"type":"boolean"}},
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
@@ -172,6 +172,8 @@ pub enum Prepared {
         timeout_ms: u64,
         background: bool,
     },
+    /// A command in its own session, neither tracked nor killed.
+    Detach(String),
     /// Resolved by the runtime, never by the registry.
     History {
         turn: i64,
@@ -414,6 +416,8 @@ impl Registry {
             timeout_ms: u64,
             #[serde(default)]
             background: bool,
+            #[serde(default)]
+            detach: bool,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -489,8 +493,12 @@ impl Registry {
                     || args.command.len() > 16 * 1024
                     || args.command.contains('\0')
                     || !(1..=MAX_SHELL_TIMEOUT_MS).contains(&args.timeout_ms)
+                    || (args.detach && args.background)
                 {
                     return fail("invalid_shell_arguments");
+                }
+                if args.detach {
+                    return Ok(Prepared::Detach(args.command));
                 }
                 Prepared::Shell {
                     command: args.command,
@@ -595,6 +603,7 @@ impl Registry {
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
+            Prepared::Detach(command) => detach(&command, workspace, self, environment),
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
@@ -854,6 +863,74 @@ pub enum Exit {
     TimedOut,
 }
 
+/// `/bin/sh -c command` in the workspace, with the registry's environment and
+/// none of the credentials the daemon holds.
+#[cfg(unix)]
+fn sh(
+    command: &str,
+    workspace: &Path,
+    registry: &Registry,
+    environment: &[(String, String)],
+) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new("/bin/sh");
+    for credential in registry.credentials.iter() {
+        process.env_remove(&credential.name);
+    }
+    // A set AGENT_PARENT names this bot's creator and nothing else; a root
+    // bot must not pass on one the daemon itself was started with.
+    process.env_remove("AGENT_PARENT");
+    process.env_remove("AGENT_PARENT_ID");
+    for (name, value) in registry.environment.iter().chain(environment) {
+        process.env(name, value);
+    }
+    process.arg("-c").arg(command).current_dir(workspace);
+    process
+}
+
+/// Start a command in a new session with its output appended to a log file,
+/// for a service that must outlive the turn and the daemon. No process slot,
+/// group kill, or handle applies to it; tokio reaps it if it exits while the
+/// daemon runs.
+#[cfg(unix)]
+fn detach(
+    command: &str,
+    workspace: &Path,
+    registry: &Registry,
+    environment: &[(String, String)],
+) -> Result<Outcome> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let log = std::env::temp_dir().join(format!(
+        "agent-detached-{}-{}.log",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::File::create(&log)?;
+    let mut process = sh(command, workspace, registry, environment);
+    process
+        .stdin(std::process::Stdio::null())
+        .stdout(file.try_clone()?)
+        .stderr(file);
+    // SAFETY: setsid is async-signal-safe and touches no parent state.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let pid = process.spawn()?.id();
+    Ok(Outcome::text(
+        json!({"detached":true,"pid":pid,"log":log}).to_string(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn detach(_: &str, _: &Path, _: &Registry, _: &[(String, String)]) -> Result<Outcome> {
+    fail("shell_platform_unsupported")
+}
+
 #[cfg(unix)]
 async fn shell(
     command: &str,
@@ -863,7 +940,7 @@ async fn shell(
     environment: &[(String, String)],
 ) -> Result<(Vec<u8>, Vec<u8>, Exit)> {
     use std::process::Stdio;
-    use tokio::process::{Child, Command};
+    use tokio::process::Child;
     struct ProcessGroup {
         child: Child,
         group: i32,
@@ -879,21 +956,7 @@ async fn shell(
             }
         }
     }
-    let mut process = Command::new("/bin/sh");
-    for credential in registry.credentials.iter() {
-        process.env_remove(&credential.name);
-    }
-    // A set AGENT_PARENT names this bot's creator and nothing else; a root
-    // bot must not pass on one the daemon itself was started with.
-    process.env_remove("AGENT_PARENT");
-    process.env_remove("AGENT_PARENT_ID");
-    for (name, value) in registry.environment.iter().chain(environment) {
-        process.env(name, value);
-    }
-    let child = process
-        .arg("-c")
-        .arg(command)
-        .current_dir(workspace)
+    let child = sh(command, workspace, registry, environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

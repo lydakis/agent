@@ -266,3 +266,48 @@ async fn read_distinguishes_long_lines_from_eof_and_keeps_pages_bounded() {
     assert!(output.contains("continue with offset="));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn detached_commands_run_in_their_own_session_and_log_their_output() {
+    let tools = Registry::new("echo,shell").unwrap();
+    assert!(
+        tools
+            .prepare(
+                "shell",
+                r#"{"command":"true","detach":true,"background":true}"#
+            )
+            .is_err()
+    );
+    let prepared = tools
+        .prepare(
+            "shell",
+            &json!({"command":"echo up; exec sleep 30","detach":true}).to_string(),
+        )
+        .unwrap();
+    let output: Value = serde_json::from_str(
+        &tools
+            .execute(prepared, &std::env::temp_dir(), &[])
+            .await
+            .unwrap()
+            .output,
+    )
+    .unwrap();
+    let pid = output["pid"].as_i64().unwrap() as i32;
+    let log = std::path::PathBuf::from(output["log"].as_str().unwrap());
+    // Its own session, so no group kill of the calling command reaches it.
+    assert_eq!(unsafe { libc::getsid(pid) }, pid);
+    let mut logged = String::new();
+    for _ in 0..100 {
+        logged = std::fs::read_to_string(&log).unwrap();
+        if !logged.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(logged, "up\n");
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    std::fs::remove_file(log).unwrap();
+}

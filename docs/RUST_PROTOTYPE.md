@@ -1224,7 +1224,14 @@ with `&` does not outlive it; the tool description tells the model so. A
 timeout is a result, not an error: the output written before the kill, with
 `timed_out: true` and no exit code, since a long command's partial output is
 often what the model needs next. Background commands are killed when the
-daemon stops. Turn cancellation requests the same kill for a
+daemon stops. `detach: true` is the way to leave a service running: the
+command starts in a new session with stdin closed and stdout and stderr
+appended to a log file in the system temporary directory, and the call
+returns its pid and log path at once. No process slot, timeout, group kill, or
+handle applies to it, so it outlives the turn and the daemon and is outside
+`--max-processes`; stopping it is the bot's job. It exists because Terminal-Bench
+tasks that leave a server for the grader failed when the server died with its
+command. Turn cancellation requests the same kill for a
 foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
