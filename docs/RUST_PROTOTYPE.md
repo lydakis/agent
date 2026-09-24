@@ -351,9 +351,12 @@ daemon reads `tokens.access_token` and `tokens.account_id` from
 the same two headers. It never refreshes the token: Codex does that when it runs,
 so run any `codex` command first if the login is stale, and restart the daemon to
 pick up a refreshed file. A missing or unreadable file fails startup with
-`provider_login_unavailable`. A `chatgpt` spec that names a key variable uses
-that key instead. Only a synthetic backend has exercised this; whether the ChatGPT
-backend accepts every field this adapter sends has not been observed.
+`provider_login_unavailable`. The login goes only to that endpoint: a `chatgpt`
+spec naming another URL authenticates with the key variable it names, or with
+nothing, so a local or synthetic endpoint never receives the real token. The
+daemon redacts the access token from tool output like a key. Only a synthetic
+endpoint has exercised the headers; whether the ChatGPT backend accepts every
+field this adapter sends has not been observed.
 
 Responses requests explicitly include `reasoning.encrypted_content` even when
 no reasoning effort is configured, because a model can reason by default.
@@ -486,6 +489,12 @@ event without subscribing (the benchmark and lifecycle tools use it). With
 number of Unix-socket sessions, and runs until `shutdown`, SIGTERM, or SIGINT.
 Each socket session begins with a `ready` line and must `follow` the bots it
 wants to observe.
+
+`agent shutdown` returns once the daemon process has exited, so a caller may
+copy or reopen the store: the daemon answers the request first, then cancels
+active turns, commits their records and closes the database. The `ready` line
+carries the daemon's `pid` for this. The command fails with
+`daemon_shutdown_timeout` after 30 seconds.
 
 On shutdown, committed turn events get up to five seconds to drain through
 the publisher. Background commands can keep the storage stream open; when

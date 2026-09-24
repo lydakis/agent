@@ -181,7 +181,8 @@ pub struct ProviderSpec {
 impl ProviderSpec {
     /// `NAME[=FAMILY[,URL[,KEY_ENV]]]`. Known names have defaults; the key
     /// variable is read only when named here or implied by a default endpoint.
-    /// `chatgpt` without a key variable uses Codex's saved ChatGPT login.
+    /// `chatgpt` at its default endpoint without a key variable uses Codex's
+    /// saved ChatGPT login; the login never goes to a caller-chosen URL.
     pub fn parse(spec: &str) -> Result<Self> {
         let (name, rest) = spec.split_once('=').unwrap_or((spec, ""));
         let mut fields = rest.split(',').filter(|s| !s.is_empty());
@@ -230,7 +231,7 @@ impl ProviderSpec {
             return fail_with("invalid_provider_spec", spec);
         }
         Ok(Self {
-            chatgpt_login: name == "chatgpt" && key_env.is_none(),
+            chatgpt_login: name == "chatgpt" && key_env.is_none() && url == default_url,
             name: name.to_owned(),
             family,
             url,
@@ -239,17 +240,21 @@ impl ProviderSpec {
     }
 }
 
-/// The access token and workspace from Codex's `auth.json`
-/// (`$CODEX_HOME`, else `~/.codex`). Codex refreshes the token when it runs;
-/// this reads it once at startup and never refreshes it itself.
-fn chatgpt_login() -> Result<(String, String)> {
-    let home = std::env::var_os("CODEX_HOME")
+/// Codex's `auth.json`: `$CODEX_HOME`, else `~/.codex`.
+fn codex_auth() -> Result<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .ok_or(Error::new("provider_login_unavailable"))?;
-    let path = home.join("auth.json");
+        .map(|home| home.join("auth.json"))
+        .ok_or(Error::new("provider_login_unavailable"))
+}
+
+/// The access token and workspace from Codex's `auth.json`. Codex refreshes
+/// the token when it runs; this reads it once at startup and never
+/// refreshes it itself.
+fn chatgpt_login(path: &Path) -> Result<(String, String)> {
     let unavailable = || Error::with("provider_login_unavailable", path.display().to_string());
-    let auth: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|_| unavailable())?)
+    let auth: Value = serde_json::from_slice(&std::fs::read(path).map_err(|_| unavailable())?)
         .map_err(|_| unavailable())?;
     let tokens = &auth["tokens"];
     match (
@@ -449,7 +454,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
         let (key, account) = if spec.chatgpt_login {
-            let (token, account) = chatgpt_login()?;
+            let (token, account) = chatgpt_login(&codex_auth()?)?;
             // No variable carries it; listed so tool output redacts it.
             credentials.push(("AGENT_CHATGPT_TOKEN".into(), token.clone()));
             (Some(token), Some(account))
@@ -520,7 +525,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .with_environment(environment)
         .with_process_budget(limits.processes);
     let hub = Hub::default();
-    let ready = json!({"event":"ready","protocol":3,
+    let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
         "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
@@ -1595,11 +1600,32 @@ mod tests {
         let login = ProviderSpec::parse("chatgpt").unwrap();
         assert_eq!(login.url, "https://chatgpt.com/backend-api/codex");
         assert!(login.chatgpt_login && login.key_env.is_none());
+        // Another endpoint never receives the login, even a local one.
         let local = ProviderSpec::parse("chatgpt=responses,http://127.0.0.1:9/backend-api/codex");
-        assert!(local.unwrap().chatgpt_login);
+        let local = local.unwrap();
+        assert!(!local.chatgpt_login && local.key_env.is_none());
         let keyed = ProviderSpec::parse("chatgpt=responses,https://gw.example.test/v1,GW_KEY");
         assert!(!keyed.unwrap().chatgpt_login);
         assert!(!ProviderSpec::parse("openai").unwrap().chatgpt_login);
+    }
+
+    #[test]
+    fn the_login_is_the_access_token_and_workspace_only() {
+        let dir = std::env::temp_dir().join(format!("agent-codex-login-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"OPENAI_API_KEY":null,"tokens":{"id_token":"i","access_token":"a","refresh_token":"r","account_id":"w"}}"#,
+        )
+        .unwrap();
+        assert_eq!(chatgpt_login(&path).unwrap(), ("a".into(), "w".into()));
+        std::fs::write(&path, r#"{"tokens":{"access_token":"a"}}"#).unwrap();
+        let missing = chatgpt_login(&path).unwrap_err();
+        assert_eq!(missing.code, "provider_login_unavailable");
+        std::fs::remove_dir_all(dir).unwrap();
+        let absent = chatgpt_login(&path).unwrap_err();
+        assert_eq!(absent.detail, Some(path.display().to_string()));
     }
 
     #[tokio::test]

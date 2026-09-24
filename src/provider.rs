@@ -953,6 +953,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_account_rides_with_the_key_on_every_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, head) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
+            let _ = seen.send(String::from_utf8_lossy(&request).to_lowercase());
+            let _ = socket
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let provider = Provider::new(
+            Transport::new(0, 1).unwrap(),
+            Family::Responses,
+            &url,
+            Some("synthetic-token".into()),
+        )
+        .unwrap()
+        .with_account("synthetic-account".into())
+        .unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let _ = provider.complete(request, |_| async { Ok(()) }).await;
+        let head = head.await.unwrap();
+        assert!(head.starts_with("post /responses "), "{head}");
+        assert!(
+            head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nchatgpt-account-id: synthetic-account\r\n"),
+            "{head}"
+        );
+        let anthropic = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None);
+        assert!(anthropic.unwrap().with_account("w".into()).is_err());
+    }
+
     #[test]
     fn body_length_counts_prefix_items_separators_and_close() {
         let transport = Transport::new(64, 1).unwrap();

@@ -11,6 +11,7 @@ Python environment, not bench/requirements.txt; see docs/HARBOR.md.
         -m anthropic/claude-opus-5-5
 """
 
+import asyncio
 import json
 import os
 import shlex
@@ -42,6 +43,8 @@ REMOTE_CODEX_HOME = '/installed-agent/codex'
 # SQLite stays on the container's own disk: the log directory is a host mount.
 REMOTE_STORE = '/tmp/agent-harbor'
 BOT = 'task'
+# Shutdown waits up to 30 s for the daemon to exit; the rest is a few execs.
+FINISH_TIMEOUT = 60
 
 
 class Agent(BaseInstalledAgent):
@@ -67,7 +70,8 @@ class Agent(BaseInstalledAgent):
         ErrorPattern(r'"error":"provider_http_(?:500|502|504)"', ApiInternalServerError),
         ErrorPattern(r'"error":"provider_(?:http_503|http_529|unavailable)"', ApiOverloadedError),
         ErrorPattern(r'"error":"provider_stream_stalled"', ApiResponseStalledError),
-        ErrorPattern(r'"error":"provider_connection_[a-z0-9_]+"', NetworkConnectionError),
+        ErrorPattern(r'"error":"(?:provider_connection_[a-z0-9_]+|provider_stream_failed'
+                     r'|truncated_sse_frame|provider_admission_timeout)"', NetworkConnectionError),
         ErrorPattern(r'"error":"provider_(?:http_401|http_403|key_unavailable)"', AgentAuthenticationError),
     ]
     # The HTTP client reads the platform's root certificates at daemon start,
@@ -140,10 +144,20 @@ class Agent(BaseInstalledAgent):
             command=f'chmod 755 {REMOTE_BINARY} && ln -sf {REMOTE_BINARY} /usr/local/bin/agent',
         )
         if self._chatgpt:
-            remote = f'{REMOTE_CODEX_HOME}/auth.json'
+            # Only what a request carries: the refresh and ID tokens stay on
+            # the host, where the model's tools cannot read them. The daemon
+            # redacts the access token from tool output.
             await self.exec_as_root(environment, command=f'mkdir -p -m 755 {REMOTE_CODEX_HOME}')
-            await self._upload_agent_owned_file(environment, self._codex_auth, remote)
-            await self.exec_as_root(environment, command=f'chmod 600 {remote}')
+            await self._upload_config_text(
+                environment, content=json.dumps({'tokens': self._chatgpt_login()}),
+                remote_path=f'{REMOTE_CODEX_HOME}/auth.json', filename='auth.json')
+
+    def _chatgpt_login(self) -> dict[str, str]:
+        tokens = json.loads(self._codex_auth.read_text()).get('tokens') or {}
+        login = {key: tokens.get(key) for key in ('access_token', 'account_id')}
+        if not all(isinstance(value, str) and value for value in login.values()):
+            raise ValueError(f'{self._codex_auth} has no ChatGPT login; run `codex login`')
+        return login
 
     def _command(self, instruction: str) -> str:
         if not self.model_name:
@@ -157,16 +171,32 @@ class Agent(BaseInstalledAgent):
             flags += [self._LIMITS[key], str(value)]
         logs = EnvironmentPaths.agent_dir.as_posix()
         run = shlex.join(['agent', 'run', *flags, '--', instruction])
-        # The turn's exit status decides the trial; bookkeeping after it must
-        # not mask it, and must still run when the turn fails.
+        # The turn's exit status decides the trial, not tee's.
+        return (f'mkdir -p {REMOTE_STORE} {logs}; '
+                f'{run} < /dev/null | tee {logs}/agent.jsonl; exit ${{PIPESTATUS[0]}}')
+
+    def _finish_command(self, bots: list[str]) -> str:
+        """Record every bot's turns, then stop the daemon and save its store.
+
+        Bots the task delegated to may still be running, and after Harbor's
+        timeout so is the task bot: shutdown cancels their turns and returns
+        once the daemon has committed them and exited, so the copy is whole.
+        """
+        logs = EnvironmentPaths.agent_dir.as_posix()
+        # {"bot": [turn, ...], ...}, from the JSON each command prints.
+        turns = ['printf {']
+        for index, bot in enumerate(bots):
+            key = (',' if index else '') + json.dumps(bot) + ':'
+            turns += [f'printf %s {shlex.quote(key)}',
+                      f'agent turns --bot {shlex.quote(bot)} --no-spawn']
+        turns.append('printf }')
+        store = f'{REMOTE_STORE}/state.sqlite'
         return (
-            f'mkdir -p {REMOTE_STORE} {logs}; '
-            f'{run} < /dev/null | tee {logs}/agent.jsonl; status=${{PIPESTATUS[0]}}; '
-            f'agent turns --bot {BOT} > {logs}/turns.json; '
-            f'agent stats > {logs}/stats.json; '
-            'agent shutdown; '
-            f'cp {REMOTE_STORE}/state.sqlite{{,-wal,-shm}} {logs}/ 2>/dev/null; '
-            'exit $status'
+            f'{{ {"; ".join(turns)}; }} > {logs}/turns.json; '
+            f'agent stats --no-spawn > {logs}/stats.json; '
+            f'agent shutdown && cp {store} {logs}/ && '
+            # A clean exit checkpoints the WAL away; a crash may leave it.
+            f'for f in {store}-wal {store}-shm; do [ ! -e "$f" ] || cp "$f" {logs}/; done'
         )
 
     def _env(self) -> dict[str, str]:
@@ -184,44 +214,76 @@ class Agent(BaseInstalledAgent):
     @with_prompt_template
     async def run(self, instruction: str, environment: BaseEnvironment,
                   context: AgentContext) -> None:
-        await self.exec_as_agent(environment, command=self._command(instruction), env=self._env())
+        try:
+            await self.exec_as_agent(environment, command=self._command(instruction),
+                                     env=self._env())
+        finally:
+            # Also after Harbor's timeout cancels this: the command it gave up
+            # on, and the daemon that runs its turn in its own process group,
+            # would otherwise keep calling the model and tools in the container.
+            try:
+                async with asyncio.timeout(FINISH_TIMEOUT):
+                    await self._finish(environment)
+            except Exception as error:  # bookkeeping never replaces the trial's outcome
+                self.logger.warning(f'lydakis-agent bookkeeping failed: {error}')
+
+    async def _finish(self, environment: BaseEnvironment) -> None:
+        try:
+            listing = await self.exec_as_agent(environment, command='agent ls', env=self._env())
+        except RuntimeError:  # no daemon: it never started, so nothing ran
+            return
+        bots = [bot['name'] for bot in json.loads(listing.stdout)]
+        await self.exec_as_agent(environment, command=self._finish_command(bots), env=self._env())
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:
-        # Daemon-wide totals include any bots the task bot delegated to.
-        stats = self._read_json('stats.json')
-        tokens = stats['tokens'] if stats else self._streamed_usage()
-        if tokens is None:
+        # Every bot's turns, so tokens a delegated bot spent on another model
+        # are priced at that model's rates.
+        bots = self._read_json('turns.json') or {}
+        turns = [turn for records in bots.values() for turn in records]
+        models: dict[str, ModelUsage] = {}
+        for turn in turns:
+            usage = models.setdefault(turn['model'], ModelUsage())
+            usage.n_input_tokens += turn['input_tokens']
+            usage.n_cache_tokens += turn['cached_input_tokens']
+            usage.n_output_tokens += turn['output_tokens']
+        if not models and (streamed := self._streamed_usage()):
+            models[self.model_name or 'unknown'] = ModelUsage(
+                n_input_tokens=streamed['input_tokens'],
+                n_cache_tokens=streamed['cached_input_tokens'],
+                n_output_tokens=streamed['output_tokens'],
+            )
+        if not models:
             return
-        usage = ModelUsage(
-            n_input_tokens=tokens['input_tokens'],
-            n_cache_tokens=tokens['cached_input_tokens'],
-            n_output_tokens=tokens['output_tokens'],
-        )
-        usage.cost_usd = self._cost(usage)
-        context.n_input_tokens = usage.n_input_tokens
-        context.n_cache_tokens = usage.n_cache_tokens
-        context.n_output_tokens = usage.n_output_tokens
-        context.cost_usd = usage.cost_usd
-        context.model_usage = {self.model_name or 'unknown': usage}
-        turns = self._read_json('turns.json')
+        for model, usage in models.items():
+            usage.cost_usd = self._cost(model, usage)
+        costs = [usage.cost_usd for usage in models.values()]
+        context.n_input_tokens = sum(u.n_input_tokens for u in models.values())
+        context.n_cache_tokens = sum(u.n_cache_tokens for u in models.values())
+        context.n_output_tokens = sum(u.n_output_tokens for u in models.values())
+        # A model the price table lacks leaves the trial's cost unknown, not low.
+        context.cost_usd = None if None in costs else sum(costs)
+        context.model_usage = models
         if turns:
             context.metadata = {key: sum(t[key] for t in turns)
                                 for key in ('model_rounds', 'retries', 'paced_ms')}
-            context.metadata['status'] = [t['status'] for t in turns]
+            context.metadata['status'] = [t['status'] for t in bots.get(BOT, [])]
+            context.metadata['bots'] = len(bots)
 
     def _read_json(self, name: str) -> Any:
-        """A bookkeeping file, or None when the daemon never started or the
-        trial hit its agent timeout, which kills the command before it runs."""
+        """A bookkeeping file, or None when the daemon never started or its
+        bookkeeping failed partway."""
         path = self.logs_dir / name
-        if path.is_file() and (text := path.read_text().strip()):
-            return json.loads(text)
-        return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
 
     def _streamed_usage(self) -> dict[str, int] | None:
         """The task bot's per-round usage events, streamed as they happened.
 
-        Used after a timeout; bots it delegated to are not in this stream.
+        Used when the turn records could not be read; bots it delegated to
+        are not in this stream.
         """
         path = self.logs_dir / 'agent.jsonl'
         if not path.is_file():
@@ -240,7 +302,8 @@ class Agent(BaseInstalledAgent):
                     totals[key] += event['data'][key]
         return totals if seen else None
 
-    def _cost(self, usage: ModelUsage) -> float | None:
+    @staticmethod
+    def _cost(model: str, usage: ModelUsage) -> float | None:
         """Aggregate-token cost from LiteLLM's table, as Harbor's own adapters do.
 
         Anthropic cache writes are billed above the base input rate, but the
@@ -250,7 +313,6 @@ class Agent(BaseInstalledAgent):
             import litellm
         except ImportError:
             return None
-        model = self.model_name or ''
         key = next((k for k in (model, model.split('/', 1)[-1]) if litellm.model_cost.get(k)), None)
         if key is None:
             return None
