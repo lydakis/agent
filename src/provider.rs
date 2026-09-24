@@ -279,7 +279,7 @@ impl Provider {
         if self.family != Family::Responses {
             return fail("invalid_provider_transport");
         }
-        self.sockets = Some(Arc::new(Sockets::new()?));
+        self.sockets = Some(Sockets::new()?);
         Ok(self)
     }
 
@@ -343,7 +343,9 @@ impl Provider {
         struct Responses<'a> {
             model: &'a str,
             instructions: &'a str,
-            stream: bool,
+            /// Absent over a socket, where the create event takes no `stream`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream: Option<bool>,
             store: bool,
             include: [&'static str; 1],
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,7 +385,7 @@ impl Provider {
                 serde_json::to_vec(&Responses {
                     model: request.model,
                     instructions: request.instructions,
-                    stream: true,
+                    stream: self.sockets.is_none().then_some(true),
                     store: false,
                     // Request opaque reasoning for stateless continuation across endpoints.
                     include: ["reasoning.encrypted_content"],
@@ -696,9 +698,8 @@ impl Provider {
         };
         let key = socket::key(&prefix, window.map_or(&[][..], |(head, _)| head));
         let ids = window.map(|(_, ids)| ids);
-        reservation.dispatch();
-        report.dispatched = true;
-        let mut learned = false;
+        // A new connection's upgrade response, learned from once dispatched.
+        let mut upgrade = None;
         let mut session = match bot.and_then(|bot| sockets.take(bot)) {
             Some(session) => session,
             None => {
@@ -712,18 +713,29 @@ impl Provider {
                 }
                 match sockets.connect(&self.url, &headers).await {
                     Ok((session, response)) => {
-                        reservation.learn(&response, self.family);
-                        learned = true;
+                        upgrade = Some(response);
                         session
                     }
-                    Err(error) => {
-                        reservation.settle(0);
-                        return Err(error);
+                    // A connection that never opened sent no request, and the
+                    // reservation is refunded as it drops. A refused upgrade
+                    // reached the provider: charge it nothing, but learn from
+                    // its headers and honor a rate limit, as on HTTP.
+                    Err(failure) => {
+                        if failure.refused {
+                            reservation.dispatch();
+                            report.dispatched = true;
+                            if let Some(headers) = &failure.headers {
+                                reservation.learn(headers, self.family);
+                            }
+                            limit(pace, &failure);
+                            reservation.settle(0);
+                        }
+                        return Err(failure.error);
                     }
                 }
             }
         };
-        drop(admission);
+        let mut admission = Some(admission);
         let mut plan = session.plan(key, ids);
         let (mut items, mut tail) = (Some(items), tail);
         let mut parser = responses::State::default();
@@ -734,13 +746,27 @@ impl Provider {
             };
             let text = match create(&prefix, plan.previous.as_deref(), input).await {
                 Ok(text) => text,
+                Err(error) if !report.dispatched => return Err(error),
                 Err(error) => {
                     reservation.settle(0);
                     return Err(error);
                 }
             };
+            if !report.dispatched {
+                reservation.dispatch();
+                report.dispatched = true;
+                if let Some(headers) = upgrade.take() {
+                    reservation.learn(&headers, self.family);
+                }
+            }
             match session
-                .exchange(text, &mut parser, &mut delta, self.stall_timeout)
+                .exchange(
+                    text,
+                    &mut parser,
+                    &mut delta,
+                    self.stall_timeout,
+                    &mut admission,
+                )
                 .await
             {
                 Err(failure)
@@ -762,33 +788,42 @@ impl Provider {
         let completed = match outcome {
             Ok(()) => {
                 session.completed(parser.id(), key, ids);
+                reservation.settle_usage(report.usage.as_ref(), estimate);
                 parser.finish()
             }
             Err(failure) => {
-                if let Some(headers) = failure.headers.as_ref().filter(|_| !learned) {
-                    reservation.learn(headers, self.family);
-                }
-                if failure.status == Some(429) || failure.error.code == "provider_rate_limited" {
-                    let after = failure
-                        .headers
-                        .as_ref()
-                        .and_then(|headers| headers.get("retry-after"))
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.trim().parse::<f64>().ok())
-                        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
-                        .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
-                    pace.limited(after);
-                }
+                limit(pace, &failure);
                 session.completed(None, key, ids);
                 keep &= !failure.dead;
+                // A refusal ran no inference; anything else may have.
+                if failure.refused && report.usage.is_none() {
+                    reservation.settle(0);
+                } else {
+                    reservation.settle_usage(report.usage.as_ref(), estimate);
+                }
                 Err(failure.error)
             }
         };
-        reservation.settle_usage(report.usage.as_ref(), estimate);
         if let Some(bot) = bot.filter(|_| keep) {
             sockets.put(bot, session);
         }
         completed
+    }
+}
+
+/// Close the model's pool for a rate limit a socket reported: a 429 status
+/// with its `retry-after`, or an in-stream rate limit naming its delay.
+fn limit(pace: &pace::Pace, failure: &socket::Failure) {
+    if failure.status == Some(429) || failure.error.code == "provider_rate_limited" {
+        let after = failure
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("retry-after"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
+        pace.limited(after);
     }
 }
 

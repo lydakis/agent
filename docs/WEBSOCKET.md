@@ -133,16 +133,19 @@ Built 2026-09-24 on this branch. `--provider NAME=responses-ws[,URL[,KEY_ENV]]`
 selects it; `openai=responses-ws` and `chatgpt=responses-ws` keep those
 presets' endpoints and credentials. HTTP stays the default for every preset
 until the screen below says otherwise. `ready.providers` names the transport,
-and `stats` reports open sockets.
+a client attaching to a daemon compares it like the family and URL, and
+`stats` reports open sockets, idle or in a call.
 
 - One connection per bot, opened on its first call and kept between calls
-  (`src/provider/socket.rs`). A connection idle for 60 s, or older than 55
-  minutes, is closed at the next checkout rather than by a timer. Lanes
+  (`src/provider/socket.rs`). A task holding only a weak reference closes
+  connections idle for 60 s or older than 55 minutes, checking every 5 s, and
+  a call never starts on one past that age. Lanes
   (`stream_id`) are not used: the guide does not show how events on a shared
   connection name their lane, Codex does not use them, and this thread has no
   key to find out. So a fleet holds one TLS connection per active bot rather
   than one per 64 streams, and the screen has to report that cost.
-- The request is the HTTP body's fields as a `response.create` event. A
+- The request is the HTTP body's fields, less `stream`, as a
+  `response.create` event. A
   call continues only when its fields and context head hash to the previous
   call's, and its window ids start with the previous window plus the node ids
   the turn stored for the previous response's items. The turn names those
@@ -157,7 +160,13 @@ and `stats` reports open sockets.
 - An `error` event's `status` and `headers` stand in for an HTTP response's:
   a 429 closes the pool with its `retry-after`, `insufficient_quota` is
   `provider_quota_exhausted`, other statuses are `provider_http_N`, and the
-  pacer learns limits from the upgrade response and from these headers.
+  pacer learns limits from the upgrade response and from these headers. A
+  refused upgrade is treated the same way, so its `retry-after` holds the
+  pool. A refusal with no usage settles at zero, since no inference ran.
+- Accounting follows the HTTP path's boundaries: the reservation is
+  dispatched only when the create event is about to be sent, so a connection
+  that never opened is refunded, and the startup permit bounded by
+  `--max-connecting` is held until the provider's first frame.
 - A socket message is whole, so the input is assembled in memory before it
   is sent, unlike the streamed HTTP body. A continuation is small; a full
   send holds one copy of the window.
@@ -167,9 +176,11 @@ and `stats` reports open sockets.
 Tests: `provider::socket::tests` covers when a call continues and how error
 events are classified. `tests/test_responses_socket.py` runs the daemon
 against a minimal WebSocket server for two turns with a tool call each, and
-checks one connection, the beta header, delta input on every continuation,
-and a full resend with no retry after the server forgets a response. With
-continuation disabled it fails.
+checks one connection, the beta header, no `stream` field, delta input on
+every continuation, a full resend with no retry after the server forgets a
+response, and the open-socket count. With continuation disabled it fails. A
+second test refuses the first upgrade with a 429 and `Retry-After: 1` and
+checks the turn waits it out; without the pacing it retries at once and fails.
 
 ## Measurement plan
 

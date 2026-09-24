@@ -10,6 +10,7 @@ import socketserver
 import struct
 import tempfile
 import threading
+import time
 import unittest
 
 from bench.runtime_client import Client
@@ -54,6 +55,13 @@ class Socket(socketserver.BaseRequestHandler):
             request += self.request.recv(4096)
         headers = dict(line.split(': ', 1) for line in request.decode().split('\r\n')[1:] if ': ' in line)
         headers = {k.lower(): v for k, v in headers.items()}
+        with self.server.lock:
+            refuse = self.server.refuse > 0
+            self.server.refuse -= refuse
+        if refuse:
+            self.request.sendall(b'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n'
+                                 b'Content-Length: 0\r\n\r\n')
+            return
         accept = base64.b64encode(hashlib.sha1(headers['sec-websocket-key'].encode() + GUID).digest())
         self.request.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
                              b'Connection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
@@ -92,18 +100,40 @@ class Socket(socketserver.BaseRequestHandler):
             pass
 
 
+def serve(test, forget=(), refuse=0):
+    server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Socket)
+    server.daemon_threads = True
+    server.lock, server.connections, server.requests = threading.Lock(), [], []
+    server.forget, server.refuse = set(forget), refuse
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    test.addCleanup(server.server_close)
+    test.addCleanup(server.shutdown)
+    return server
+
+
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires built Rust runtime')
 class ResponsesSocketTests(unittest.TestCase):
+    def test_a_rate_limited_upgrade_waits_out_its_retry_after(self):
+        root = Path(__file__).resolve().parent.parent
+        server = serve(self, refuse=1)
+        with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
+            client = Client(root/'.local/target/release/agent', Path(directory)/'agent.db',
+                            f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws')
+            self.addCleanup(client.close)
+            client.request('create', bot='Bob', workspace=directory)
+            started = time.monotonic()
+            turn = client.request('submit', bot='Bob', request_id='r', prompt='hello')['result']['turn']
+            retry = client.receive(lambda e: e.get('event') == 'retry' and e.get('turn') == turn)
+            self.assertEqual(retry['error'], 'provider_http_429')
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            # The pool stayed closed for the upgrade's retry-after.
+            self.assertGreaterEqual(time.monotonic() - started, 0.9)
+            self.assertEqual(len(server.connections), 1)
+
     def test_a_bot_continues_on_its_connection_and_resends_in_full_when_the_server_forgot(self):
         root = Path(__file__).resolve().parent.parent
-        server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Socket)
-        server.daemon_threads = True
-        server.lock, server.connections, server.requests = threading.Lock(), [], []
         # The fourth request is turn two's tool result; the server has lost it.
-        server.forget = {4}
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
+        server = serve(self, forget={4})
         with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
             client = Client(root/'.local/target/release/agent', Path(directory)/'agent.db',
                             f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws')
@@ -117,7 +147,7 @@ class ResponsesSocketTests(unittest.TestCase):
             self.assertEqual(server.connections[0].get('openai-beta'), 'responses_websockets=2026-02-06')
             self.assertEqual({connection for connection, _ in requests}, {0})
             bodies = [body for _, body in requests]
-            self.assertTrue(all(b['type'] == 'response.create' for b in bodies))
+            self.assertTrue(all(b['type'] == 'response.create' and 'stream' not in b for b in bodies))
             self.assertEqual([b.get('previous_response_id') for b in bodies],
                              [None, 'resp_1', 'resp_2', 'resp_3', None])
             # The first call carries the prompt; each continuation only what is new.
@@ -131,6 +161,9 @@ class ResponsesSocketTests(unittest.TestCase):
                              ['user', 'function_call', 'function_call_output', 'message',
                               'user', 'function_call', 'function_call_output'])
             self.assertEqual(full[-1], bodies[3]['input'][0])
+            # The idle connection is kept for Bob's next call and counted.
+            stats = client.request('stats')['result']
+            self.assertEqual(stats['providers']['openai']['sockets'], 1)
             turns = client.request('turns', bot='Bob')['result']['turns']
             self.assertEqual([t['retries'] for t in turns], [0, 0])
 

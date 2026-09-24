@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,6 +24,8 @@ use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
 const MAX_AGE: Duration = Duration::from_secs(55 * 60);
 /// An idle bot's connection is closed after this, like an idle pooled one.
 const IDLE: Duration = Duration::from_secs(60);
+/// How often idle and aged connections are looked for.
+const SWEEP: Duration = Duration::from_secs(5);
 const CONNECT: Duration = Duration::from_secs(10);
 /// Codex sends this with every socket; OpenAI's guide names no header.
 const BETA: &str = "responses_websockets=2026-02-06";
@@ -36,6 +39,13 @@ pub(super) struct Session {
     opened: Instant,
     used: Instant,
     last: Option<Last>,
+    /// The provider's count of open connections, held or checked out.
+    live: Arc<AtomicUsize>,
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// What the server holds for this connection: the previous response, and the
@@ -59,16 +69,15 @@ pub(super) struct Plan {
 }
 
 pub struct Sockets {
-    sessions: Mutex<Sessions>,
+    by_bot: Mutex<HashMap<Box<str>, Session>>,
+    live: Arc<AtomicUsize>,
     tls: Arc<rustls::ClientConfig>,
-}
-struct Sessions {
-    by_bot: HashMap<Box<str>, Session>,
-    swept: Instant,
 }
 
 impl Sockets {
-    pub fn new() -> Result<Self> {
+    /// Idle and aged connections are closed by a task that holds only a weak
+    /// reference, so it ends with the provider.
+    pub fn new() -> Result<Arc<Self>> {
         use rustls_platform_verifier::BuilderVerifierExt;
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut tls = rustls::ClientConfig::builder_with_provider(provider)
@@ -78,53 +87,68 @@ impl Sockets {
             .with_no_client_auth();
         // The upgrade is an HTTP/1.1 request; HTTP/2 would refuse it.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Self {
-            sessions: Mutex::new(Sessions {
-                by_bot: HashMap::new(),
-                swept: Instant::now(),
-            }),
+        let sockets = Arc::new(Self {
+            by_bot: Mutex::new(HashMap::new()),
+            live: Arc::new(AtomicUsize::new(0)),
             tls: Arc::new(tls),
-        })
-    }
-
-    /// Open connections, for `stats`.
-    pub fn open(&self) -> usize {
-        self.sessions.lock().unwrap().by_bot.len()
-    }
-
-    /// Take a bot's connection for one call. Idle and aged connections are
-    /// closed here, at most once a second, rather than by a timer task.
-    pub(super) fn take(&self, bot: &str) -> Option<Session> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let now = Instant::now();
-        if now.duration_since(sessions.swept) >= Duration::from_secs(1) {
-            sessions.swept = now;
-            sessions.by_bot.retain(|_, session| {
-                now.duration_since(session.used) < IDLE
-                    && now.duration_since(session.opened) < MAX_AGE
+        });
+        let weak = Arc::downgrade(&sockets);
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::new("http_client_init"))?
+            .spawn(async move {
+                let mut tick = tokio::time::interval(SWEEP);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let Some(sockets) = weak.upgrade() else { break };
+                    sockets.sweep(Instant::now());
+                }
             });
+        Ok(sockets)
+    }
+
+    /// Open connections, idle or in a call, for `stats`.
+    pub fn open(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// Close connections idle past the bound or near the server's age limit.
+    /// They are dropped after the lock is released.
+    fn sweep(&self, now: Instant) {
+        let mut closed = Vec::new();
+        {
+            let mut by_bot = self.by_bot.lock().unwrap();
+            let stale: Vec<Box<str>> = by_bot
+                .iter()
+                .filter(|(_, session)| {
+                    now.duration_since(session.used) >= IDLE
+                        || now.duration_since(session.opened) >= MAX_AGE
+                })
+                .map(|(bot, _)| bot.clone())
+                .collect();
+            for bot in stale {
+                closed.extend(by_bot.remove(&bot));
+            }
         }
-        sessions
-            .by_bot
-            .remove(bot)
-            .filter(|session| now.duration_since(session.opened) < MAX_AGE)
+        drop(closed);
+    }
+
+    /// Take a bot's connection for one call, unless it is near the age limit.
+    pub(super) fn take(&self, bot: &str) -> Option<Session> {
+        let session = self.by_bot.lock().unwrap().remove(bot)?;
+        (session.opened.elapsed() < MAX_AGE).then_some(session)
     }
 
     pub(super) fn put(&self, bot: &str, mut session: Session) {
         session.used = Instant::now();
-        self.sessions
-            .lock()
-            .unwrap()
-            .by_bot
-            .insert(bot.into(), session);
+        self.by_bot.lock().unwrap().insert(bot.into(), session);
     }
 
     /// The caller recorded the last response's items as these window ids, so
     /// the next request that extends them can send only what follows.
     pub(super) fn recorded(&self, bot: &str, ids: &[i64]) {
-        let mut sessions = self.sessions.lock().unwrap();
-        if let Some(last) = sessions
-            .by_bot
+        let mut by_bot = self.by_bot.lock().unwrap();
+        if let Some(last) = by_bot
             .get_mut(bot)
             .and_then(|session| session.last.as_mut())
             .filter(|last| !last.armed)
@@ -134,11 +158,26 @@ impl Sockets {
         }
     }
 
+    /// Open a connection. A refused upgrade carries its status and headers,
+    /// so a 429's `retry-after` paces the pool as on the HTTP path.
     pub(super) async fn connect(
         &self,
         url: &reqwest::Url,
         headers: &[(&'static str, &str)],
-    ) -> Result<(Session, HeaderMap)> {
+    ) -> std::result::Result<(Session, HeaderMap), Failure> {
+        self.open_socket(url, headers)
+            .await
+            .map_err(|error| match error {
+                Opening::Refused(failure) => failure,
+                Opening::Failed(error) => Failure::transport(error),
+            })
+    }
+
+    async fn open_socket(
+        &self,
+        url: &reqwest::Url,
+        headers: &[(&'static str, &str)],
+    ) -> std::result::Result<(Session, HeaderMap), Opening> {
         let secure = url.scheme() == "https";
         let host = url.host_str().ok_or(Error::new("invalid_provider_url"))?;
         let port = url
@@ -182,19 +221,38 @@ impl Sockets {
         .await
         .map_err(|_| Error::new("provider_connection_timeout"))?
         .map_err(|error| match error {
-            tungstenite::Error::Http(response) => Error {
-                code: format!("provider_http_{}", response.status().as_u16()),
-                detail: None,
-            },
-            _ => Error::new("provider_connection_handshake"),
+            tungstenite::Error::Http(response) => {
+                let status = response.status().as_u16();
+                let quota = status == 429
+                    && response.body().as_deref().is_some_and(|body| {
+                        String::from_utf8_lossy(body).contains("insufficient_quota")
+                    });
+                Opening::Refused(Failure {
+                    error: Error {
+                        code: if quota {
+                            "provider_quota_exhausted".into()
+                        } else {
+                            format!("provider_http_{status}")
+                        },
+                        detail: None,
+                    },
+                    dead: true,
+                    refused: true,
+                    status: (!quota).then_some(status),
+                    headers: Some(Box::new(response.headers().clone())),
+                })
+            }
+            _ => Opening::Failed(Error::new("provider_connection_handshake")),
         })?;
         let now = Instant::now();
+        self.live.fetch_add(1, Ordering::Relaxed);
         Ok((
             Session {
                 socket,
                 opened: now,
                 used: now,
                 last: None,
+                live: self.live.clone(),
             },
             response.headers().clone(),
         ))
@@ -220,13 +278,15 @@ impl Session {
     }
 
     /// Send one `response.create` and read its events until the terminal one.
-    /// Only content renews the stall bound; pings do not.
+    /// Only content renews the stall bound; pings do not. The startup permit
+    /// is released when the first frame arrives.
     pub(super) async fn exchange<F, Fut>(
         &mut self,
         text: String,
         parser: &mut responses::State,
         delta: &mut F,
         stall: Duration,
+        admission: &mut Option<tokio::sync::SemaphorePermit<'_>>,
     ) -> std::result::Result<(), Failure>
     where
         F: FnMut(Delta) -> Fut,
@@ -235,28 +295,30 @@ impl Session {
         self.socket
             .send(Message::text(text))
             .await
-            .map_err(|_| Failure::transport("provider_stream_failed"))?;
+            .map_err(|_| Failure::transport(Error::new("provider_stream_failed")))?;
         let deadline = tokio::time::sleep(stall);
         tokio::pin!(deadline);
         let mut total = 0usize;
         while !parser.done() {
             let message = tokio::select! {
                 message = self.socket.next() => message,
-                () = &mut deadline => return Err(Failure::transport("provider_stream_stalled")),
+                () = &mut deadline => return Err(Failure::transport(Error::new("provider_stream_stalled"))),
             };
+            // Startup is bounded until the provider answers, as on HTTP.
+            admission.take();
             let text = match message {
                 Some(Ok(Message::Text(text))) => text,
                 Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                 Some(Ok(Message::Binary(_))) => {
-                    return Err(Failure::transport("provider_unexpected_binary"));
+                    return Err(Failure::transport(Error::new("provider_unexpected_binary")));
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
-                    return Err(Failure::transport("provider_stream_failed"));
+                    return Err(Failure::transport(Error::new("provider_stream_failed")));
                 }
             };
             total += text.len();
             if total > 16 * 1024 * 1024 {
-                return Err(Failure::transport("provider_response_limit"));
+                return Err(Failure::transport(Error::new("provider_response_limit")));
             }
             match parser.frame(text.as_bytes()) {
                 Ok(Frame::Delta(part)) => delta(part).await.map_err(Failure::call)?,
@@ -269,20 +331,33 @@ impl Session {
     }
 }
 
+enum Opening {
+    Refused(Failure),
+    Failed(Error),
+}
+impl From<Error> for Opening {
+    fn from(error: Error) -> Self {
+        Opening::Failed(error)
+    }
+}
+
 /// Why a call on a socket failed, and whether the connection is still usable.
 pub(super) struct Failure {
     pub error: Error,
     /// The connection is broken or closing; drop it.
     pub dead: bool,
+    /// The provider refused the request before any inference.
+    pub refused: bool,
     /// Status and headers an error event carried, for pacing.
     pub status: Option<u16>,
     pub headers: Option<Box<HeaderMap>>,
 }
 impl Failure {
-    fn transport(code: &'static str) -> Self {
+    fn transport(error: Error) -> Self {
         Self {
-            error: Error::new(code),
+            error,
             dead: true,
+            refused: false,
             status: None,
             headers: None,
         }
@@ -293,6 +368,7 @@ impl Failure {
         Self {
             error,
             dead: true,
+            refused: false,
             status: None,
             headers: None,
         }
@@ -312,6 +388,8 @@ impl Failure {
         if value["type"] != "error" {
             return failure;
         }
+        // An `error` event ends the request before any output.
+        failure.refused = true;
         let quota = [&value["error"]["code"], &value["error"]["type"]]
             .iter()
             .any(|field| field.as_str() == Some("insufficient_quota"));

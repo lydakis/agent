@@ -181,6 +181,10 @@ pub struct ProviderSpec {
     pub socket: bool,
 }
 impl ProviderSpec {
+    /// How calls reach the provider, as `ready.providers` reports it.
+    pub fn transport(&self) -> &'static str {
+        if self.socket { "websocket" } else { "http" }
+    }
     /// `NAME[=FAMILY[,URL[,KEY_ENV]]]`. Known names have defaults; the key
     /// variable is read only when named here or implied by a default endpoint.
     /// `chatgpt` at its default endpoint without a key variable uses Codex's
@@ -498,7 +502,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         bindings.insert(
             spec.name.clone(),
             json!({"family":spec.family.name(),"url":spec.url,
-                "transport":if spec.socket { "websocket" } else { "http" }}),
+                "transport":spec.transport()}),
         );
     }
     if providers.is_empty() {

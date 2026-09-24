@@ -408,14 +408,17 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
                 differences.push(format!("--provider {}: not registered", requested.name));
             } else if running["family"] != requested.family.name()
                 || running["url"] != requested.url
+                || running["transport"] != requested.transport()
             {
                 differences.push(format!(
-                    "--provider {}: requested {},{} but daemon has {},{}",
+                    "--provider {}: requested {},{} over {} but daemon has {},{} over {}",
                     requested.name,
                     requested.family.name(),
                     requested.url,
+                    requested.transport(),
                     running["family"].as_str().unwrap_or(""),
-                    running["url"].as_str().unwrap_or("")
+                    running["url"].as_str().unwrap_or(""),
+                    running["transport"].as_str().unwrap_or("")
                 ));
             }
         }
