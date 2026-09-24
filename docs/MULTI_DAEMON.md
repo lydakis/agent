@@ -71,13 +71,18 @@ address a daemon, idea 4 to record where an imported bot came from, idea 2
 to tell per-workspace daemons apart, and idea 1 to qualify cursors across
 daemons. A copied store file keeps the same id, so that id alone names a
 store's lineage, not one store. The identity therefore has two parts: the
-lineage id, and an instance id that the daemon reissues at open whenever
-the store file's device and inode differ from the pair it recorded last
-time. A copy, a restore from backup, or a move across filesystems gets a
-new instance; a restart or a rename in place keeps it. Anything that must
+lineage id, and an instance id that the daemon reissues at open when
+either of two checks fails. The store file's device and inode must match
+the pair recorded last time, which catches a copy or a move across
+filesystems. The instance id must also match a copy kept outside the
+database, in a sidecar file next to the store (like the existing
+`.owner-lock`), which catches a backup restored in place: that keeps
+device and inode but brings back an older instance id than the sidecar
+holds. A restart or a rename in place keeps the instance. Anything that must
 name exactly one store, such as a client's state key or a move's
 destination, uses the instance id. A block-level clone of a whole disk or
-machine keeps device and inode and is not detected; that is out of scope
+machine, or a restore that also brings back the sidecar, keeps both and
+is not detected; that is out of scope
 and stated as such.
 
 ## 1. Watch a bot without disturbing it
@@ -662,8 +667,13 @@ carrying it over.
    restarted daemon puts a paced turn's deadline straight into its pacing
    heap (`src/server/mod.rs:593-598`, `633-635`). So import does not copy
    them. A paced turn is requeued at the target as due now, and the
-   destination provider's gate decides when it runs; its retry and
-   attempt counts carry over. A `wait` deadline moves as the time that
+   destination provider's gate decides when it runs. The per-call retry
+   budget restarts there: a resumed turn restores `call_attempts` and
+   `call_spent_ms` from its waiting record before checking the attempt
+   and 300-second caps (at `e1d413f`: `src/server/turn.rs:44`, `713-714`,
+   `913-915`), and a budget spent against the source's provider says
+   nothing about the destination's. Import zeroes both, and keeps the
+   turn's `retries` and `paced_ms` totals as history. A `wait` deadline moves as the time that
    remained at export. The inverse dependency matters too. Waiters on
    `turn:BOT/N` are keyed by bot and turn and wake only on that turn's
    `turn_finished` in the same daemon (at `e1d413f`:
@@ -727,7 +737,8 @@ carrying it over.
 ### Order
 
 1. Store identity, lineage and instance. Behavior tests: a restart keeps
-   the instance, and a copied store file announces a new one.
+   the instance, and a copied store file and a backup restored in place
+   each announce a new one.
 2. Export of an idle root bot with no running processes, and import as a
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
@@ -752,7 +763,8 @@ carrying it over.
    under its mapped workspace and checked model, and a move whose bot is
    awaited by a source parent is refused. A client `wait` registered
    before the move is answered with `bot_moved`, and `bot_moved` names a
-   renamed destination bot.
+   renamed destination bot. A paced turn resumes at the target with a
+   fresh per-call retry budget.
 6. Drain to a round boundary for a running bot.
 7. Moving a parent together with the children it waits on.
 
