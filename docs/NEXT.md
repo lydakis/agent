@@ -518,17 +518,22 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
     socket-protocol client already covers the human way in.
-33. Budget the effective request. The compaction trigger reads the raw
-    unsummarized span (`unsummarized_bytes`) against a percentage of `--context-bytes`; it
-    excludes the summary, the kept prompts, the carry-forward note, and the
-    omission listing, and ignores `--context-items`. Trigger on the
-    effective request, whichever of bytes and items is nearest exhaustion,
-    reserve room for output, give the summarizer a size target, and record
-    per compaction how much headroom it bought; a compaction whose view is
-    not smaller than what it replaced is a failure to report, not a
-    success. Tests: thousands of small items exhausting the item budget
-    below the byte trigger; a large pinned prefix leaving little tail room.
-    (From Astra Pro's compaction review.)
+33. Done: budget the effective context view, including the encoded summary,
+    retained prompts, carry-forward note, omission listing, separators, and
+    item counts. The configured envelope remains the hard input limit. Known
+    output caps supply a soft completion-headroom estimate, capped at a quarter
+    of the envelope; this is not model token budgeting (item 17). Either dimension
+    can trigger compaction. The tail target shrinks
+    with pinned overhead, the summarizer receives a byte target, and a candidate
+    that expands the view or crowds out the active turn is rejected and billed.
+    Retained prompt copies fit an encoded prefix budget, preserving history
+    retrieval; its allowance uses indexed active-turn and bounded prefix reads.
+    Compaction events report before/after usage and remaining headroom, negative
+    while a backlog still exceeds the input envelope. Context metadata/prefixes
+    are prepared once per round and reused across retries; the old separate
+    unsummarized-span query is gone from the turn loop. Performance evidence is
+    recorded in [the matched screen](DAEMON_MEASUREMENTS.md#effective-context-budgeting).
+    Within-turn reclamation remains item 34.
 34. Compaction inside a running turn. Cuts land only at submitted-turn
     starts and the window must hold the whole current turn, so one long
     autonomous task with many tool rounds in a single turn still reaches
@@ -562,12 +567,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     summarizer latency per correctly completed task. Compare a few
     threshold policies on it before changing the 75/25 defaults. (From
     Astra Pro's compaction review, and the remainder of item 16.)
-37. Context construction cost, measured before built. Each request
-    rebuilds the pinned blocks and reruns the omitted-turns walk although
-    the prefix is stable between compactions; an enabled bot pays a
-    separate `unsummarized_bytes` read before `window`, and planning reads
-    the bot again. Planning now runs on the reader, with catch-up walks
-    yielding every 1,024 nodes. Measure
+37. Context construction cost, measured before built. Item 33 shares an
+    encoded prefix across retries, combines window metadata, removes the
+    separate `unsummarized_bytes` lookup, and avoids full-window construction
+    for history reads. Each model round still rebuilds stable pinned blocks
+    and reruns the omitted-turns walk. Compaction validation reconstructs
+    before/after/minimum views on the writer. Planning runs on the reader,
+    with catch-up walks yielding every 1,024 nodes. Measure
     the walk on long tool-heavy histories and ordinary-turn latency during
     simultaneous compactions with the operation histograms; only then a
     bounded cache of encoded prefix pieces keyed by family, summary
@@ -648,6 +654,35 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     results, filesystem effects, and final answer as the current loop;
     anything else fails the comparison rather than ranking as cheaper.
     Then a small real-provider check under a stated spend cap.
+40. Done: a ChatGPT login that outlives one token. `--provider chatgpt`
+    used to read Codex's `auth.json` once and never again, so a daemon that
+    outlived the token failed every call until restarted. The login is now
+    re-read when its token's `exp` claim passes, after pacing and admission,
+    and on a 401 for its current token. A concurrent 401 for an older token
+    reuses the login already installed. A changed token or account is retried
+    without backoff, and every token is redacted from then on. An
+    unchanged login is reported as `provider_login_rejected` naming the file,
+    and an expired file as `provider_login_expired` naming the time.
+    Codex still does the signing in. A success that names no content type
+    and finishes without an SSE frame is reported as `provider_expected_sse`
+    with the message it held. Transport failures and partial SSE frames remain
+    retryable. Anthropic subscription use is deliberately not attempted: the
+    terms are a gray area and the account is George's. Performance evidence in
+    [the login screen](DAEMON_MEASUREMENTS.md#login-re-read-and-unnamed-bodies).
+
+40. Responses over WebSocket, measured before kept. OpenAI's WebSocket mode
+    keeps the latest response per lane in a connection-local cache, so a
+    `store: false` call can send `previous_response_id` and only the new
+    items; Codex uses it by default for API keys and the ChatGPT login.
+    OpenAI reports about 40% faster loops of 20 or more tool calls, which is
+    their claim, not ours. The prototype is built: family `responses-ws`,
+    one connection per bot, delta input only when the request extends the
+    previous one exactly, the full input on every other case including
+    `previous_response_not_found`; the store stays the only history. Next,
+    the matched HTTP versus WebSocket screen in
+    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap, with a
+    prompt cache key in both arms. Open: lanes to share a connection among
+    bots, pacing without per-call headers, and HTTP after a failed upgrade.
 41. Several daemons, moving bots, and watching them: a
     [roadmap](MULTI_DAEMON.md) for watching a bot without disturbing it
     (including a transcript summary), a daemon per workspace, one client over

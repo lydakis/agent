@@ -1,5 +1,8 @@
 //! OpenAI Responses streaming subset: text and reasoning-summary deltas, then
-//! a validated terminal `response.completed` payload.
+//! a validated terminal `response.completed` payload. The response's items are
+//! those streamed as `response.output_item.done`, kept once and moved into the
+//! completion; the terminal output stands in only when none streamed. The
+//! ChatGPT Codex endpoint streams items and leaves the terminal output empty.
 use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -15,14 +18,20 @@ struct Event<'a> {
     delta: Option<Cow<'a, str>>,
     #[serde(borrow)]
     response: Option<&'a RawValue>,
+    #[serde(borrow)]
+    item: Option<&'a RawValue>,
 }
 
 #[derive(Default)]
 pub struct State {
     text: String,
     thinking: usize,
+    items: Vec<Bytes>,
+    item_bytes: usize,
     completion: Option<Completion>,
     usage: Option<Usage>,
+    /// The completed response's id, for a socket's `previous_response_id`.
+    id: Option<String>,
 }
 
 impl State {
@@ -48,12 +57,25 @@ impl State {
                 }
                 Ok(Frame::Delta(Delta::Thinking(part.into_owned())))
             }
+            "response.output_item.done" => {
+                let item = event.item.ok_or(Error::new("missing_output_item"))?;
+                self.item_bytes += item.get().len();
+                if self.item_bytes > MAX_OUTPUT || self.items.len() >= 64 {
+                    return fail("output_limit");
+                }
+                self.items
+                    .push(Bytes::copy_from_slice(item.get().as_bytes()));
+                Ok(Frame::Quiet)
+            }
             "response.completed" => {
                 let raw = event.response.ok_or(Error::new("missing_response"))?;
+                let streamed = std::mem::take(&mut self.items);
                 self.completion = Some(parse_completion_with_usage(
                     raw,
+                    streamed,
                     &self.text,
                     &mut self.usage,
+                    &mut self.id,
                 )?);
                 Ok(Frame::Quiet)
             }
@@ -99,6 +121,13 @@ impl State {
     pub fn usage(&self) -> Option<Usage> {
         self.usage.clone()
     }
+    /// The terminal event arrived; a socket reads no further for this call.
+    pub fn done(&self) -> bool {
+        self.completion.is_some()
+    }
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
     pub fn finish(self) -> Result<Completion> {
         self.completion.ok_or(Error::new("missing_completion"))
     }
@@ -106,16 +135,20 @@ impl State {
 
 #[cfg(test)]
 fn parse_completion(raw: &RawValue, streamed: &str) -> Result<Completion> {
-    parse_completion_with_usage(raw, streamed, &mut None)
+    parse_completion_with_usage(raw, Vec::new(), streamed, &mut None, &mut None)
 }
 
 fn parse_completion_with_usage(
     raw: &RawValue,
+    streamed_items: Vec<Bytes>,
     streamed: &str,
     reported: &mut Option<Usage>,
+    id: &mut Option<String>,
 ) -> Result<Completion> {
     #[derive(Deserialize)]
     struct Response<'a> {
+        #[serde(default, borrow)]
+        id: Option<Cow<'a, str>>,
         status: &'a str,
         #[serde(borrow)]
         output: Vec<&'a RawValue>,
@@ -123,6 +156,7 @@ fn parse_completion_with_usage(
     }
     let response: Response<'_> = serde_json::from_str(raw.get())?;
     *reported = response.usage.as_ref().map(parse_usage);
+    *id = response.id.map(Cow::into_owned);
     if response.status != "completed" {
         return fail("provider_incomplete");
     }
@@ -130,12 +164,21 @@ fn parse_completion_with_usage(
     let mut calls = Vec::new();
     let mut text = String::new();
     let mut bytes = 0;
-    for raw in response.output {
-        bytes += raw.get().len();
-        if bytes > MAX_OUTPUT || items.len() >= 64 {
-            return fail("output_limit");
+    let output = if streamed_items.is_empty() {
+        let mut output = Vec::with_capacity(response.output.len());
+        for raw in response.output {
+            bytes += raw.get().len();
+            if bytes > MAX_OUTPUT || output.len() >= 64 {
+                return fail("output_limit");
+            }
+            output.push(Bytes::copy_from_slice(raw.get().as_bytes()));
         }
-        let item: Value = serde_json::from_str(raw.get())?;
+        output
+    } else {
+        streamed_items
+    };
+    for raw in output {
+        let item: Value = serde_json::from_slice(&raw)?;
         match item["type"].as_str() {
             Some("message") if item["role"] == "assistant" => {
                 for content in item["content"]
@@ -162,7 +205,7 @@ fn parse_completion_with_usage(
             Some("reasoning") => {} // Preserve opaque provider reasoning for replay.
             _ => return fail("unsupported_output_item"),
         }
-        items.push(Bytes::copy_from_slice(raw.get().as_bytes()));
+        items.push(raw);
     }
     if text != streamed {
         return fail("stream_terminal_mismatch");
@@ -233,6 +276,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(limited.code, "provider_rate_limited");
         assert!(limited.detail.unwrap().contains("TPM"));
+    }
+    #[test]
+    fn streamed_items_stand_in_for_an_empty_terminal_output() {
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
+            .unwrap();
+        state.frame(br#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#).unwrap();
+        state.frame(br#"{"type":"response.output_item.done","item":{"type":"function_call","name":"echo","call_id":"c1","arguments":"{}"}}"#).unwrap();
+        state
+            .frame(
+                br#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+            )
+            .unwrap();
+        let completion = state.finish().unwrap();
+        assert_eq!(completion.items.len(), 2);
+        assert_eq!(completion.calls[0].call_id, "c1");
+
+        // Items that streamed and also came in the terminal output are the
+        // response once.
+        let mut state = State::default();
+        state.frame(br#"{"type":"response.output_item.done","item":{"type":"function_call","name":"echo","call_id":"c1","arguments":"{}"}}"#).unwrap();
+        state.frame(br#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"c1","arguments":"{}"}]}}"#).unwrap();
+        assert_eq!(state.finish().unwrap().calls.len(), 1);
+
+        // Streamed items are validated like terminal ones.
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"unstreamed"}]}}"#)
+            .unwrap();
+        let error = state
+            .frame(
+                br#"{"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "stream_terminal_mismatch");
     }
     #[test]
     fn rate_limit_codes_do_not_depend_on_message_wording() {

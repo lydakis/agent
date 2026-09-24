@@ -10,10 +10,13 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 mod anthropic;
+pub mod login;
 pub mod pace;
 mod responses;
+mod socket;
 
 pub use pace::Report;
+pub use socket::Sockets;
 
 pub const MAX_OUTPUT: usize = 512 * 1024;
 const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
@@ -59,6 +62,7 @@ impl Transport {
                 // No total deadline: long generations are legitimate. Idle
                 // reads are bounded so a stalled stream cannot hold a turn.
                 let client = reqwest::Client::builder()
+                    .user_agent(concat!("agent-runtime/", env!("CARGO_PKG_VERSION")))
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
@@ -117,8 +121,14 @@ pub struct Provider {
     family: Family,
     url: reqwest::Url,
     key: Option<String>,
+    /// ChatGPT workspace for a ChatGPT-login key, sent as `ChatGPT-Account-ID`.
+    account: Option<String>,
+    /// A ChatGPT login re-read from its file, in place of a fixed key.
+    login: Option<Arc<login::Login>>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
+    /// Responses over WebSocket, one connection per bot, instead of HTTP.
+    sockets: Option<Arc<Sockets>>,
 }
 
 #[derive(Debug)]
@@ -179,6 +189,21 @@ pub struct Request<'a> {
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
     pub items: Items,
+    /// Which bot is asking, and where the items sit in its history, so a
+    /// socket provider can send only what the server has not seen.
+    pub chain: Option<Chain<'a>>,
+}
+
+/// A request's place in its bot's history. `items` is the whole input; when
+/// the server already holds the previous response, only `tail(n)`, the
+/// items after the first `n` window ids, is sent instead.
+pub struct Chain<'a> {
+    pub bot: &'a str,
+    /// Context bytes ahead of the window items (summary and notes), and the
+    /// window's node ids; `None` for a request that is not a window, such as
+    /// a summary over a span.
+    pub window: Option<(&'a [u8], &'a [i64])>,
+    pub tail: Box<dyn FnOnce(usize) -> Items + Send + 'a>,
 }
 
 enum Parser {
@@ -234,18 +259,60 @@ impl Provider {
             family,
             url,
             key,
+            account: None,
+            login: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
+            sockets: None,
         })
     }
     /// Model pool levels behind this provider, for `stats`.
     pub fn status(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut status = serde_json::json!({
             "pools": self.pools.status(),
-        })
+        });
+        if let Some(sockets) = &self.sockets {
+            status["sockets"] = sockets.open().into();
+        }
+        status
+    }
+
+    /// Carry Responses calls over WebSocket, keeping one connection per bot
+    /// so a call can continue from the bot's previous response.
+    pub fn with_socket(mut self) -> Result<Self> {
+        if self.family != Family::Responses {
+            return fail("invalid_provider_transport");
+        }
+        self.sockets = Some(Sockets::new()?);
+        Ok(self)
+    }
+
+    /// The bot was deleted; close its connection.
+    pub fn forget(&self, bot: &str) {
+        if let Some(sockets) = &self.sockets {
+            sockets.forget(bot);
+        }
+    }
+
+    /// The bot recorded the response it was just given as these node ids.
+    /// Its next window can then continue from that response.
+    pub fn recorded(&self, bot: &str, ids: &[i64]) {
+        if let Some(sockets) = &self.sockets {
+            sockets.recorded(bot, ids);
+        }
     }
     pub fn family(&self) -> Family {
         self.family
+    }
+
+    /// Planning estimate only: tokens do not bound encoded JSON bytes.
+    /// An unset Responses cap is unknown, not an invented output limit.
+    pub fn output_byte_estimate(&self) -> Option<usize> {
+        match self.family {
+            Family::Responses => self.max_output_tokens,
+            Family::Anthropic => Some(ANTHROPIC_MAX_TOKENS),
+        }
+        .map(|tokens| (tokens as usize).saturating_mul(4))
     }
     /// How much longer this model's pool is closed by a rate limit, if it is.
     pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
@@ -259,6 +326,25 @@ impl Provider {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
+        Ok(self)
+    }
+
+    /// Name the ChatGPT workspace a ChatGPT-login access token acts for.
+    pub fn with_account(mut self, account: String) -> Result<Self> {
+        if self.family != Family::Responses || account.is_empty() {
+            return fail("invalid_provider_account");
+        }
+        self.account = Some(account);
+        Ok(self)
+    }
+
+    /// Send a ChatGPT login's current token and workspace on every request,
+    /// re-read from its file when it expires or the endpoint refuses it.
+    pub fn with_login(mut self, login: Arc<login::Login>) -> Result<Self> {
+        if self.family != Family::Responses {
+            return fail("invalid_provider_account");
+        }
+        self.login = Some(login);
         Ok(self)
     }
 
@@ -278,7 +364,9 @@ impl Provider {
         struct Responses<'a> {
             model: &'a str,
             instructions: &'a str,
-            stream: bool,
+            /// Absent over a socket, where the create event takes no `stream`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream: Option<bool>,
             store: bool,
             include: [&'static str; 1],
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,7 +406,7 @@ impl Provider {
                 serde_json::to_vec(&Responses {
                     model: request.model,
                     instructions: request.instructions,
-                    stream: true,
+                    stream: self.sockets.is_none().then_some(true),
                     store: false,
                     // Request opaque reasoning for stateless continuation across endpoints.
                     include: ["reasoning.encrypted_content"],
@@ -405,9 +493,15 @@ impl Provider {
         Fut: Future<Output = Result<()>>,
     {
         *report = Report::default();
-        self.complete_inner(request, delta, report)
-            .await
-            .map_err(|error| sanitize_error(error, self.key.as_deref()))
+        let mut session = None;
+        let result = self
+            .complete_inner(request, delta, report, &mut session)
+            .await;
+        let key = session
+            .as_ref()
+            .map(|s| s.token.as_str())
+            .or(self.key.as_deref());
+        result.map_err(|error| sanitize_error(error, key))
     }
 
     async fn complete_inner<F, Fut>(
@@ -415,6 +509,7 @@ impl Provider {
         request: Request<'_>,
         mut delta: F,
         report: &mut Report,
+        session: &mut Option<login::Session>,
     ) -> Result<Completion>
     where
         F: FnMut(Delta) -> Fut,
@@ -434,20 +529,40 @@ impl Provider {
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
-        let admission =
-            tokio::time::timeout(Duration::from_secs(60), self.transport.starting.acquire())
-                .await
-                .map_err(|_| Error::new("provider_admission_timeout"))?
-                .map_err(|_| Error::new("provider_admission_closed"))?;
+        let admission = self.admit().await?;
+        if let Some(sockets) = &self.sockets {
+            return self
+                .complete_socket(
+                    sockets,
+                    request,
+                    prefix,
+                    delta,
+                    report,
+                    (&pace, reservation, estimate),
+                    admission,
+                )
+                .await;
+        }
         let (body, len) = self.body(prefix, request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
+        // A token can expire while pacing or waiting for admission. Read it
+        // only now, before building the headers that will carry it.
+        if let Some(login) = &self.login {
+            *session = Some(login.current()?);
+        }
+        let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
+        let account = session
+            .as_ref()
+            .map(|s| &s.account)
+            .or(self.account.as_ref());
         let mut http = client
             .post(self.url.clone())
             .header("content-type", "application/json")
             .header("content-length", len)
+            .header("accept", "text/event-stream")
             .body(body);
-        http = match (self.family, &self.key) {
+        http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
             (Family::Anthropic, key) => {
                 let http = http.header("anthropic-version", "2023-06-01");
@@ -458,6 +573,9 @@ impl Provider {
             }
             (Family::Responses, None) => http,
         };
+        if let Some(account) = account {
+            http = http.header("chatgpt-account-id", account);
+        }
         reservation.dispatch();
         report.dispatched = true;
         let response = match http.send().await {
@@ -472,6 +590,24 @@ impl Provider {
             let status = response.status().as_u16();
             let headers = response.headers().clone();
             let body = error_body(response).await.unwrap_or_default();
+            // A refused login is re-read once: Codex may have signed in or
+            // selected another account. Retry when either auth field changed.
+            if status == 401
+                && let (Some(login), Some(session)) = (&self.login, session.as_ref())
+            {
+                reservation.settle(0);
+                let refused = body.detail.unwrap_or_else(|| "HTTP 401".to_owned());
+                return Err(match login.reload(session)? {
+                    true => Error::with("provider_login_refreshed", refused),
+                    false => Error::with(
+                        "provider_login_rejected",
+                        format!(
+                            "{refused}; {} holds the refused token, run any codex command to sign in again",
+                            login.path().display()
+                        ),
+                    ),
+                });
+            }
             let quota = status == 429 && body.quota;
             if !quota {
                 reservation.learn(&headers, self.family);
@@ -496,13 +632,30 @@ impl Provider {
             });
         }
         reservation.learn(response.headers(), self.family);
-        if response
+        let status = response.status().as_u16();
+        let content_type = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .is_none_or(|v| v.split(';').next() != Some("text/event-stream"))
+            .map(str::to_owned);
+        // The ChatGPT Codex endpoint streams without naming a content type, so
+        // only a named non-stream type is refused; an unnamed body is decoded
+        // and fails as a truncated or incomplete stream if it is not one.
+        if let Some(content_type) = content_type
+            .as_deref()
+            .filter(|v| v.split(';').next() != Some("text/event-stream"))
         {
-            return fail("provider_expected_sse");
+            // Name what came instead, and the message it carried when the
+            // body is a short error, so a gateway's refusal is diagnosable.
+            let body = error_body(response).await.and_then(|body| body.detail);
+            let detail = [
+                Some(format!("HTTP {status}, content-type {content_type}")),
+                body,
+            ];
+            return Err(Error::with(
+                "provider_expected_sse",
+                detail.into_iter().flatten().collect::<Vec<_>>().join(": "),
+            ));
         }
         let mut stream = response.bytes_stream();
         let mut decoder = Decoder::default();
@@ -510,6 +663,9 @@ impl Provider {
             Family::Responses => Parser::Responses(responses::State::default()),
             Family::Anthropic => Parser::Anthropic(anthropic::State::default()),
         };
+        let unnamed = content_type.is_none();
+        let mut frames = 0usize;
+        let mut preview = Vec::new();
         let result = async {
             let mut total = 0usize;
             // Only a content frame renews the stall deadline. The client's
@@ -527,11 +683,21 @@ impl Provider {
                 if total > 16 * 1024 * 1024 {
                     return fail("provider_response_limit");
                 }
+                if unnamed && frames == 0 && preview.len() < 4096 {
+                    let room = 4096 - preview.len();
+                    preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
                 let mut progressed = false;
                 for byte in chunk {
                     let Some(frame) = decoder.byte(byte)? else {
                         continue;
                     };
+                    if unnamed && frames == 0 {
+                        // A completed frame rules out the no-frame diagnostic.
+                        // Release its bounded preview for the rest of the stream.
+                        preview = Vec::new();
+                    }
+                    frames += 1;
                     if frame == b"[DONE]" {
                         continue;
                     }
@@ -555,6 +721,30 @@ impl Provider {
             Ok(())
         }
         .await;
+        // A success that named no content type and carried no SSE frame was
+        // not a stream: say so, with the short message it held, instead of
+        // reporting a truncated or incomplete stream.
+        let no_stream = unnamed
+            && frames == 0
+            && match &result {
+                Ok(()) => true,
+                Err(error) => {
+                    error.code == "truncated_sse_frame" && !looks_like_sse_prefix(&preview)
+                }
+            };
+        let result = if no_stream {
+            let detail = parse_error_body(&preview, false).and_then(|body| body.detail);
+            Err(Error::with(
+                "provider_expected_sse",
+                [Some(format!("HTTP {status}, no content-type")), detail]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(": "),
+            ))
+        } else {
+            result
+        };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
         if let Err(error) = &result
@@ -569,6 +759,194 @@ impl Provider {
             }
         })
     }
+}
+
+impl Provider {
+    /// A startup permit: held until the provider answers, so at most
+    /// `--max-connecting` requests await their first response at once.
+    async fn admit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        tokio::time::timeout(Duration::from_secs(60), self.transport.starting.acquire())
+            .await
+            .map_err(|_| Error::new("provider_admission_timeout"))?
+            .map_err(|_| Error::new("provider_admission_closed"))
+    }
+
+    /// One call over the bot's socket. A continuation that the server no
+    /// longer holds is sent again in full on the same connection; everything
+    /// else fails as the HTTP path would.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_socket<F, Fut>(
+        &self,
+        sockets: &Sockets,
+        request: Request<'_>,
+        prefix: Vec<u8>,
+        mut delta: F,
+        report: &mut Report,
+        (pace, mut reservation, estimate): (&pace::Pace, pace::Reservation<'_>, pace::Cost),
+        admission: tokio::sync::SemaphorePermit<'_>,
+    ) -> Result<Completion>
+    where
+        F: FnMut(Delta) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let Request { items, chain, .. } = request;
+        let (bot, window, tail) = match chain {
+            Some(Chain { bot, window, tail }) => (Some(bot), window, Some(tail)),
+            None => (None, None, None),
+        };
+        let key = socket::key(&prefix, window.map_or(&[][..], |(head, _)| head));
+        let ids = window.map(|(_, ids)| ids);
+        let mut session = match bot.and_then(|bot| sockets.take(bot)) {
+            Some(session) => session,
+            None => {
+                let mut headers = Vec::with_capacity(2);
+                let bearer = self.key.as_ref().map(|key| format!("Bearer {key}"));
+                if let Some(bearer) = &bearer {
+                    headers.push(("authorization", bearer.as_str()));
+                }
+                if let Some(account) = &self.account {
+                    headers.push(("chatgpt-account-id", account.as_str()));
+                }
+                match sockets.connect(&self.url, &headers).await {
+                    // The upgrade's headers predate this call, so they
+                    // teach the pool without settling its reservation.
+                    Ok((session, response)) => {
+                        pace.seed(&response, self.family);
+                        session
+                    }
+                    // A connection that never opened sent no request, and the
+                    // reservation is refunded as it drops. A refused upgrade
+                    // reached the provider: charge it nothing, but learn from
+                    // its headers and honor a rate limit, as on HTTP.
+                    Err(failure) => {
+                        if failure.refused {
+                            reservation.dispatch();
+                            report.dispatched = true;
+                            if let Some(headers) = &failure.headers {
+                                reservation.learn(headers, self.family);
+                            }
+                            limit(pace, &failure);
+                            reservation.settle(0);
+                        }
+                        return Err(failure.error);
+                    }
+                }
+            }
+        };
+        let mut admission = Some(admission);
+        let mut plan = session.plan(key, ids);
+        let (mut items, mut tail) = (Some(items), tail);
+        let mut parser = responses::State::default();
+        let outcome = loop {
+            let input = match (&plan.previous, tail.take()) {
+                (Some(_), Some(tail)) => tail(plan.skip),
+                _ => items.take().expect("the full input is sent at most once"),
+            };
+            // Each send holds its own undispatched reservation, refunded if
+            // the input cannot be assembled.
+            let text = create(&prefix, plan.previous.as_deref(), input).await?;
+            reservation.dispatch();
+            report.dispatched = true;
+            match session
+                .exchange(
+                    text,
+                    &mut parser,
+                    &mut delta,
+                    self.stall_timeout,
+                    &mut admission,
+                )
+                .await
+            {
+                Err(failure)
+                    if failure.error.code == "provider_previous_response_not_found"
+                        && plan.previous.is_some()
+                        && items.is_some() =>
+                {
+                    plan = socket::Plan {
+                        previous: None,
+                        skip: 0,
+                    };
+                    session.completed(None, key, ids);
+                    parser = responses::State::default();
+                    // The refused continuation ran no inference, but it was
+                    // a request, so the full send is paced as another. It
+                    // awaits a first event under a fresh startup permit.
+                    reservation.settle(0);
+                    let paced = report.paced_ms;
+                    reservation = pace.acquire_reported(estimate, report).await?;
+                    report.paced_ms += paced;
+                    admission = Some(self.admit().await?);
+                }
+                outcome => break outcome,
+            }
+        };
+        report.usage = parser.usage();
+        let mut keep = bot.is_some();
+        let completed = match outcome {
+            Ok(()) => {
+                session.completed(parser.id(), key, ids);
+                reservation.settle_usage(report.usage.as_ref(), estimate);
+                parser.finish()
+            }
+            Err(failure) => {
+                if let Some(headers) = failure.headers.as_deref() {
+                    reservation.learn(headers, self.family);
+                }
+                limit(pace, &failure);
+                session.failed(&failure);
+                keep &= !failure.dead;
+                // A refusal ran no inference; anything else may have.
+                if failure.refused && report.usage.is_none() {
+                    reservation.settle(0);
+                } else {
+                    reservation.settle_usage(report.usage.as_ref(), estimate);
+                }
+                Err(failure.error)
+            }
+        };
+        if let Some(bot) = bot.filter(|_| keep) {
+            sockets.put(bot, session);
+        }
+        completed
+    }
+}
+
+/// Close the model's pool for a rate limit a socket reported: a 429 or 529
+/// status with its `retry-after`, as on HTTP, or an in-stream rate limit
+/// naming its delay.
+fn limit(pace: &pace::Pace, failure: &socket::Failure) {
+    if matches!(failure.status, Some(429 | 529)) || failure.error.code == "provider_rate_limited" {
+        let after = failure
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("retry-after"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .or_else(|| failure.error.detail.as_deref().and_then(pace::named_delay));
+        pace.limited(after);
+    }
+}
+
+/// A `response.create` event: the request fields, the continuation if any,
+/// and the input. A socket message is whole, so the input is assembled here.
+async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Result<String> {
+    let mut text = Vec::with_capacity(prefix.len() + items.bytes + 96);
+    text.extend_from_slice(br#"{"type":"response.create","#);
+    if let Some(previous) = previous {
+        text.extend_from_slice(br#""previous_response_id":"#);
+        serde_json::to_writer(&mut text, previous)?;
+        text.push(b',');
+    }
+    text.extend_from_slice(&prefix[1..]);
+    while let Some(chunk) = items.stream.next().await {
+        text.extend_from_slice(&chunk.map_err(|error| Error {
+            code: error.to_string(),
+            detail: None,
+        })?);
+    }
+    text.extend_from_slice(b"]}");
+    String::from_utf8(text).map_err(|_| Error::new("invalid_item_encoding"))
 }
 
 /// Model ids that predate adaptive thinking and still require a token budget.
@@ -647,7 +1025,27 @@ async fn error_body(response: reqwest::Response) -> Option<ErrorBody> {
         }
         body.extend_from_slice(&chunk);
     }
-    let text = std::str::from_utf8(&body).ok()?.trim();
+    parse_error_body(&body, expects_json)
+}
+
+/// Recognize a partial event stream before treating an unnamed body as a
+/// non-stream provider message. Called only after a frame-free clean EOF.
+fn looks_like_sse_prefix(body: &[u8]) -> bool {
+    body.split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.starts_with(b"data:")
+                || line.starts_with(b"event:")
+                || line.starts_with(b"id:")
+                || line.starts_with(b"retry:")
+                || line.starts_with(b":")
+        })
+}
+
+/// A short provider message from a bounded body, or nothing safe to show.
+fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
+    let text = std::str::from_utf8(body).ok()?.trim();
     if text.is_empty() {
         return None;
     }
@@ -731,6 +1129,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
@@ -746,6 +1145,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
@@ -760,6 +1160,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         empty_prefix.extend_from_slice(b"]}");
@@ -781,6 +1182,7 @@ mod tests {
                 tools: &none(),
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -810,6 +1212,7 @@ mod tests {
                             tools,
                             allow_tool_calls: allow,
                             items: Items::empty(),
+                            chain: None,
                         })
                         .unwrap();
                     prefix.extend_from_slice(b"]}");
@@ -912,6 +1315,7 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
             },
             |delta| {
                 if let Delta::Text(part) = delta {
@@ -936,6 +1340,404 @@ mod tests {
                 .with_stall_timeout(Duration::ZERO)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn an_account_rides_with_the_key_on_every_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, head) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
+            let _ = seen.send(String::from_utf8_lossy(&request).to_lowercase());
+            let _ = socket
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let provider = Provider::new(
+            Transport::new(0, 1).unwrap(),
+            Family::Responses,
+            &url,
+            Some("synthetic-token".into()),
+        )
+        .unwrap()
+        .with_account("synthetic-account".into())
+        .unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+        };
+        let _ = provider.complete(request, |_| async { Ok(()) }).await;
+        let head = head.await.unwrap();
+        assert!(head.starts_with("post /responses "), "{head}");
+        assert!(
+            head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nchatgpt-account-id: synthetic-account\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("\r\naccept: text/event-stream\r\n"), "{head}");
+        assert!(head.contains("\r\nuser-agent: agent-runtime/"), "{head}");
+        let anthropic = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None);
+        assert!(anthropic.unwrap().with_account("w".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_success_without_a_stream_names_what_came_instead() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let body = r#"{"detail":"x","error":{"message":"Unsupported client"}}"#;
+            let _ = socket
+                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_expected_sse");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("HTTP 200, content-type application/json: Unsupported client")
+        );
+    }
+
+    /// Answer every connection: 401 unless the bearer is `accepted`, then a
+    /// minimal Responses stream without a content type.
+    async fn gated(accepted: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let head = String::from_utf8_lossy(&request).to_lowercase();
+                let response = if head.contains(&format!("authorization: bearer {accepted}\r\n")) {
+                    let body = concat!(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                        "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",",
+                        "\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],",
+                        "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    let body = r#"{"error":{"message":"token expired"}}"#;
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_is_reread_and_retried_only_when_the_file_changed() {
+        let dir = std::env::temp_dir().join(format!("agent-relogin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |token: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
+            )
+            .unwrap();
+        };
+        write("stale");
+        let credentials = crate::tools::Credentials::default();
+        let login = Arc::new(login::Login::open(&path, Some(credentials.clone())).unwrap());
+        let url = gated("fresh").await;
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login)
+            .unwrap();
+        let tools = none();
+        let request = || Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        // Refused, and the file still holds the refused token: final, and
+        // the detail names the file, never the token.
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_rejected");
+        let detail = error.detail.unwrap();
+        assert!(
+            detail.starts_with("token expired; ") && detail.contains("auth.json"),
+            "{detail}"
+        );
+        assert!(!detail.contains("stale"));
+        // Codex signed in again: the refusal becomes a retryable error, and
+        // the retry carries the new token, which is redacted from then on.
+        write("fresh");
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_refreshed");
+        assert_eq!(error.detail.as_deref(), Some("token expired"));
+        let completion = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(
+            credentials.redact("stale fresh".into()),
+            "[REDACTED] [REDACTED]"
+        );
+        assert!(
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
+                .unwrap()
+                .with_login(Arc::new(login::Login::open(&path, None).unwrap()))
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_login_is_checked_after_startup_admission() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-admission-login-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |token: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
+            )
+            .unwrap();
+        };
+        write("stale");
+        let login = Arc::new(login::Login::open(&path, None).unwrap());
+        let transport = Transport::new(1, 1).unwrap();
+        let admission = transport.starting.acquire().await.unwrap();
+        let url = gated("fresh").await;
+        let provider = Provider::new(transport.clone(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login.clone())
+            .unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let call = provider.complete(request, |_| async { Ok(()) });
+        tokio::pin!(call);
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        write("fresh");
+        login.expire_now();
+        drop(admission);
+        assert_eq!(call.await.unwrap().items.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_success_without_a_content_type_or_a_stream_names_what_it_held() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let body = r#"{"error":{"message":"Unsupported client"}}"#;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_expected_sse");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("HTTP 200, no content-type: Unsupported client")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_stream_failure_before_the_first_frame_stays_retryable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (headers, expected) in [
+            ("content-length: 100\r\n", "provider_stream_failed"),
+            ("", "truncated_sse_frame"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = socket.read(&mut [0; 4096]).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n{headers}connection: close\r\n\r\ndata: incomplete"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+            let provider =
+                Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+                    .unwrap();
+            let tools = none();
+            let request = Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                items: Items::empty(),
+            };
+            let error = provider
+                .complete(request, |_| async { Ok(()) })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_unnamed_success_is_not_an_incomplete_model_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_expected_sse");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_names_no_content_type_is_still_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let body = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",",
+                "\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],",
+                "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+            );
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+        };
+        let completion = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(completion.items.len(), 1);
     }
 
     #[test]

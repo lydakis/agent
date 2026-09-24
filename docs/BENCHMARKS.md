@@ -6,6 +6,8 @@ Responses SSE endpoint. The original binary transport client remains a calibrati
 target. The new Rust core runs the same workload through its shared provider
 transport and history implementation. These experiments measure
 ephemeral text conversations, not durable agent capacity or model quality.
+Task-quality benchmarks such as Terminal-Bench run through Harbor instead;
+see [HARBOR.md](HARBOR.md).
 
 ## Reuse decision
 
@@ -515,7 +517,7 @@ binary hash. See [LIVE_FLEET.md](LIVE_FLEET.md#sustained-load).
 
 ```sh
 .local/venv/bin/python -m bench.sustained --bots 64 --minutes 5 \
-  --model openai/gpt-5.6-luna --out .local/bench/sustained-luna-64
+  --model openai/gpt-6-luna --out .local/bench/sustained-luna-64
 ```
 
 ## Query plan audit
@@ -893,7 +895,7 @@ a transitional turn. Visible examples and workspace files remain possible
 sources of the rule. This is not a CPU, memory, or latency benchmark.
 
 ```sh
-(set -a; . ./.env.local; set +a; .local/venv/bin/python -m bench.context_eval --model openai/gpt-5.6-luna --out .local/context-eval/luna.json)
+(set -a; . ./.env.local; set +a; .local/venv/bin/python -m bench.context_eval --model openai/gpt-6-luna --out .local/context-eval/luna.json)
 ```
 
 Synthetic regression checks require no paid calls:

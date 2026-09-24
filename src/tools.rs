@@ -111,7 +111,7 @@ impl Tool {
                 "required":["turn"],"additionalProperties":false}),
             ),
             Tool::Note => (
-                "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes; empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
+                "Write or replace your carry-forward note: text the runtime places ahead of the conversation window in every request, so it stays in view when earlier turns leave the window. Up to 8192 bytes and must fit the current context budget; an oversized write preserves the previous note. Empty text removes it. The note is versioned with the conversation and a fork inherits the version at its checkpoint.",
                 json!({"type":"object","properties":{"text":{"type":"string","maxLength":8192}},
                 "required":["text"],"additionalProperties":false}),
             ),
@@ -140,7 +140,7 @@ pub struct Registry {
     /// Background commands accepted and waiting for a slot. The operating
     /// system never sees these, so only this count can bound them.
     pending: Arc<std::sync::atomic::AtomicUsize>,
-    credentials: Arc<Vec<Credential>>,
+    credentials: Credentials,
     environment: Arc<Vec<(String, String)>>,
     /// Request encodings per (family, selection); see `encoded`.
     encodings: Encodings,
@@ -163,6 +163,63 @@ impl Drop for Queued {
 struct Credential {
     name: String,
     value: String,
+}
+
+/// Values that never appear in tool output and never reach a shell's
+/// environment. Shared, so a login re-read while the daemon runs is
+/// redacted from then on; earlier values stay listed.
+#[derive(Clone, Default)]
+pub struct Credentials(Arc<std::sync::RwLock<CredentialSet>>);
+
+#[derive(Default)]
+struct CredentialSet {
+    /// Longer values first, so a shorter old token cannot mask only a prefix
+    /// of a new token. Refreshes pay for insertion; tool output stays sorted.
+    values: Vec<Credential>,
+    names: Vec<String>,
+}
+
+impl Credentials {
+    pub fn set(&self, name: &str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        let mut set = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if set
+            .values
+            .iter()
+            .any(|c| c.name == name && c.value == value)
+        {
+            return;
+        }
+        if !set.names.iter().any(|existing| existing == name) {
+            set.names.push(name.to_owned());
+        }
+        let index = set.values.partition_point(|c| c.value.len() > value.len());
+        set.values.insert(
+            index,
+            Credential {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            },
+        );
+    }
+    pub fn names(&self) -> Vec<String> {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .names
+            .clone()
+    }
+    pub fn redact(&self, mut text: String) -> String {
+        let set = self.0.read().unwrap_or_else(|e| e.into_inner());
+        for credential in &set.values {
+            if text.contains(&credential.value) {
+                text = text.replace(&credential.value, "[REDACTED]");
+            }
+        }
+        text
+    }
 }
 
 pub enum Prepared {
@@ -283,7 +340,7 @@ impl Registry {
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
             pending: Arc::default(),
-            credentials: Arc::new(Vec::new()),
+            credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             encodings: Arc::default(),
         })
@@ -370,18 +427,20 @@ impl Registry {
         self.environment = Arc::new(environment);
         self
     }
-    pub fn exclude_credentials(mut self, credentials: Vec<(String, String)>) -> Self {
-        self.credentials = Arc::new(
-            credentials
-                .into_iter()
-                .filter(|(_, value)| !value.is_empty())
-                .map(|(name, value)| Credential { name, value })
-                .collect(),
-        );
+    pub fn exclude_credentials(self, credentials: Vec<(String, String)>) -> Self {
+        for (name, value) in credentials {
+            self.credentials.set(&name, &value);
+        }
         self
     }
     pub fn exclude_credential(self, name: &str, value: &str) -> Self {
         self.exclude_credentials(vec![(name.into(), value.into())])
+    }
+    /// Share a credential set that others may add to later, such as a login
+    /// that is re-read while the daemon runs.
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = credentials;
+        self
     }
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -389,13 +448,8 @@ impl Registry {
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools.iter().map(|t| t.schema()).collect()
     }
-    fn redact(&self, mut text: String) -> String {
-        for credential in self.credentials.iter() {
-            if text.contains(&credential.value) {
-                text = text.replace(&credential.value, "[REDACTED]");
-            }
-        }
-        text
+    fn redact(&self, text: String) -> String {
+        self.credentials.redact(text)
     }
 
     // Full access to this configured registry, within caller host permissions.
@@ -874,8 +928,8 @@ async fn shell(
         }
     }
     let mut process = Command::new("/bin/sh");
-    for credential in registry.credentials.iter() {
-        process.env_remove(&credential.name);
+    for name in registry.credentials.names() {
+        process.env_remove(name);
     }
     // A set AGENT_PARENT names this bot's creator and nothing else; a root
     // bot must not pass on one the daemon itself was started with.

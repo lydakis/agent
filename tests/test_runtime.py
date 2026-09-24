@@ -126,7 +126,7 @@ class Model(http.server.BaseHTTPRequestHandler):
             elif user.startswith('note:') and last.get('type') != 'function_call_output':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'note', 'call_id': 'note-1',
-                           'arguments': json.dumps({'text': user[5:]})}]
+                           'arguments': json.dumps({'text': getattr(self.server, 'note_text', user[5:])})}]
             elif user.startswith('readart:'):
                 text = ''
                 reference, _, rest = user[8:].partition(' ')
@@ -177,14 +177,18 @@ class Model(http.server.BaseHTTPRequestHandler):
             elif user.startswith('tool:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
-                           'arguments': json.dumps({'text': user[5:]})}]
+                           'arguments': json.dumps({'text': getattr(self.server, 'note_text', user[5:])})}]
             elif user == 'large-call-id':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 210000,
                            'arguments': json.dumps({'text': 'ok'})}]
             else:
-                text = 'reply:' + user
+                text = getattr(self.server, 'reply_text', 'reply:' + user)
                 output = [{'id': 'msg_text', 'type': 'message', 'role': 'assistant',
+                           'content': [{'type': 'output_text', 'text': text}]}]
+            if request.get('instructions') == 'Summarize.':
+                text = getattr(self.server, 'compaction_text', 'A short synthetic summary.')
+                output = [{'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
             if getattr(self.server, 'history_reasoning', None):
                 output.insert(0, self.server.history_reasoning)
@@ -929,8 +933,7 @@ class RuntimeTests(ModelFixture):
             self.assertEqual(page['offset'], offset)
             self.assertLessEqual(len(page['text'].encode()), 97 if offset == 0 else 65536)
             for request in requests:
-                inputs = request['input'][1:] if request['input'][0].get('content', [{}])[0].get('text', '').startswith('[context note]') else request['input']
-                self.assertLessEqual(sum(len(json.dumps(i, ensure_ascii=False, separators=(',', ':')).encode()) for i in inputs), 65536)
+                self.assertLessEqual(len(json.dumps(request['input'], ensure_ascii=False, separators=(',', ':')).encode()) - 2, 65536)
             pieces.append(page['text'])
             if page['done']:
                 break

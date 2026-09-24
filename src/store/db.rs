@@ -203,6 +203,8 @@ pub struct Window {
     pub sizes: Vec<u32>,
     /// Sum of item lengths, without separators.
     pub item_bytes: i64,
+    /// Full unsummarized span, even when the bounded window omits a backlog.
+    pub unsummarized: super::ContextUsage,
     pub omitted_items: i64,
     pub omitted_turns: i64,
     /// The bot's carry-forward note: its version node and text.
@@ -234,12 +236,17 @@ pub struct CompactionPlan {
     /// A bounded step through a backlog larger than the budget: the span
     /// ends where the next step starts, not at the verbatim tail.
     pub catch_up: bool,
+    pub summary_bytes: usize,
 }
 impl CompactionPlan {
     /// The summarizer request around the span's items: the previous summary
     /// to merge, if any, with its separating comma, and the request to
     /// write, with its leading comma.
-    pub fn frame(family: Family, previous_summary: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub fn frame(
+        family: Family,
+        previous_summary: Option<&str>,
+        summary_bytes: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut head = Vec::new();
         if let Some(previous) = previous_summary {
             head = family.user_item(&format!(
@@ -247,9 +254,9 @@ impl CompactionPlan {
             ))?;
             head.push(b',');
         }
-        let mut tail = family.user_item(
-            "[compaction request] Write the summary of the conversation above now, following your instructions.",
-        )?;
+        let mut tail = family.user_item(&format!(
+            "[compaction request] Write the summary of the conversation above now, following your instructions. Keep the summary within {summary_bytes} UTF-8 bytes; be shorter when possible."
+        ))?;
         tail.insert(0, b',');
         Ok((head, tail))
     }
@@ -281,8 +288,8 @@ pub struct CatchUp {
     previous_cut: i64,
     /// The head's bytes, and the bytes and depth before the previous cut.
     totals: (i64, i64, i64),
-    /// Verbatim tail bytes, and the byte and item budget.
-    bounds: (i64, i64, i64),
+    /// Verbatim tail byte/item targets, then input byte/item limits.
+    bounds: (i64, i64, i64, i64),
     /// Where the next piece starts, and the child it continues from.
     next: Option<(i64, Option<i64>, Option<i64>)>,
     /// Rows inside the budget, in no particular order.
@@ -808,14 +815,23 @@ impl Database {
             start_depth: i64,
             before: i64,
             turn_seq: i64,
+            unsummarized: super::ContextUsage,
+            note: Option<(i64, String)>,
+            compaction: Option<(i64, String, String, i64, i64)>,
         }
         let state = self
             .conn
             .prepare_cached(
                 "SELECT b.head,b.family,COALESCE(h.total_bytes,0),COALESCE(h.depth,0),
-                    s.id,COALESCE(s.depth,0),COALESCE(p.total_bytes,0),COALESCE(s.turn_seq,1)
+                    s.id,COALESCE(s.depth,0),COALESCE(p.total_bytes,0),COALESCE(s.turn_seq,1),
+                    COALESCE(h.total_bytes,0)-COALESCE(cp.total_bytes,0),
+                    COALESCE(h.depth,0)-COALESCE(cp.depth,0),
+                    note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to
              FROM bots b LEFT JOIN nodes h ON h.id=b.head
              LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+             LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
+             LEFT JOIN nodes cp ON cp.id=cut.parent
+             LEFT JOIN notes note ON note.node=b.note
              WHERE b.name=?",
             )?
             .query_row([name], |r| {
@@ -828,6 +844,20 @@ impl Database {
                     start_depth: r.get(5)?,
                     before: r.get(6)?,
                     turn_seq: r.get(7)?,
+                    unsummarized: super::ContextUsage {
+                        bytes: r.get::<_, i64>(8)? as usize,
+                        items: r.get::<_, i64>(9)? as usize,
+                    },
+                    note: r
+                        .get::<_, Option<i64>>(10)?
+                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(11)?)) })
+                        .transpose()?,
+                    compaction: r
+                        .get::<_, Option<i64>>(12)?
+                        .map(|id| -> rusqlite::Result<_> {
+                            Ok((id, r.get(13)?, r.get(14)?, r.get(15)?, r.get(16)?))
+                        })
+                        .transpose()?,
                 })
             })
             .optional()?
@@ -841,7 +871,8 @@ impl Database {
             .start
             .map(|start| (start, state.start_depth, state.before, state.turn_seq));
         let fits = |depth: i64, before: i64| {
-            head_total - before <= context_bytes && head_depth - depth < context_items
+            head_total - before + head_depth - depth <= context_bytes
+                && head_depth - depth < context_items
         };
         let chosen = match current {
             Some((start, depth, before, seq)) if fits(depth, before) => (start, depth, before, seq),
@@ -875,8 +906,8 @@ impl Database {
                     if !fits(depth, before) {
                         break;
                     }
-                    let within_target =
-                        head_total - before <= target_bytes && head_depth - depth < target_items;
+                    let within_target = head_total - before + head_depth - depth <= target_bytes
+                        && head_depth - depth < target_items;
                     if within_target || pick.is_none() {
                         pick = Some((id, depth, before, seq));
                     }
@@ -916,22 +947,25 @@ impl Database {
             sizes.push((total - previous).clamp(0, u32::MAX as i64) as u32);
             previous = total;
         }
-        let note: Option<(i64, String)> = self
-            .conn
-            .prepare_cached(
-                "SELECT n.node,n.text FROM bots b JOIN notes n ON n.node=b.note WHERE b.name=?",
-            )?
-            .query_row([name], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
+        let compaction = match state.compaction {
+            Some((version, summary, prompts, from, to)) => Some(CompactionView {
+                version,
+                summary,
+                prompts: serde_json::from_str(&prompts)?,
+                covered: (from, to),
+            }),
+            None => None,
+        };
         Ok(Some(Window {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
             ids,
             sizes,
             item_bytes: head_total - before,
+            unsummarized: state.unsummarized,
             omitted_items: start_depth - 1,
             omitted_turns: turn_seq - 1,
-            note,
-            compaction: self.compaction_view(name)?,
+            note: state.note,
+            compaction,
         }))
     }
     fn compaction_view(&self, name: &str) -> Result<Option<CompactionView>> {
@@ -973,7 +1007,7 @@ impl Database {
     }
     /// Choose what a compaction covers: walk back from the head over the
     /// span since the previous compaction, keep the newest whole turns that
-    /// hold at least `keep_bytes` verbatim, and summarize everything older,
+    /// reach either the byte or item tail target, and summarize everything older,
     /// back to the previous cut. Returns nothing when no whole older turn
     /// exists to summarize. A span larger than the budget is caught up
     /// oldest first instead: this returns the walk to take in pieces with
@@ -982,6 +1016,7 @@ impl Database {
         &self,
         name: &str,
         keep_bytes: i64,
+        keep_items: i64,
         max_bytes: i64,
         max_items: i64,
     ) -> Result<Option<Planning>> {
@@ -1013,7 +1048,7 @@ impl Database {
                 head,
                 previous_cut,
                 totals: (head_total, before, depth_before),
-                bounds: (keep_bytes, max_bytes, max_items),
+                bounds: (keep_bytes, keep_items, max_bytes, max_items),
                 next: Some((head, None, None)),
                 rows: Vec::new(),
             })));
@@ -1040,10 +1075,12 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
-        // The newest prompt whose tail holds keep_bytes.
+        // The newest prompt whose tail reaches either retention target.
         let mut cut = None;
         for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
-            if seq.is_some() && head_total - before >= keep_bytes {
+            if seq.is_some()
+                && (head_total - before >= keep_bytes || (index + 1) as i64 >= keep_items)
+            {
                 cut = Some((index, *id));
                 break;
             }
@@ -1061,12 +1098,36 @@ impl Database {
             .rev()
             .map(|(id, total, before, seq, prompt)| (*id, total - before, *seq, prompt.as_deref()));
         let previous_summary = self.previous_summary(&bot)?;
-        Ok(Some(Planning::Plan(Self::span_plan(
+        let plan = Self::span_plan(
             cut,
             span,
             previous_summary,
             false,
-        ))))
+            (max_bytes as usize / 3).min(64 * 1024),
+        );
+        let (head_frame, tail_frame) = CompactionPlan::frame(
+            bot.family()?,
+            plan.previous_summary.as_deref(),
+            plan.summary_bytes,
+        )?;
+        if plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
+            + plan.ids.len().saturating_sub(1)
+            + head_frame.len()
+            + tail_frame.len()
+            > max_bytes as usize
+            || plan.ids.len() + 1 + usize::from(plan.previous_summary.is_some())
+                > max_items as usize
+        {
+            return Ok(Some(Planning::CatchUp(CatchUp {
+                head,
+                previous_cut,
+                totals: (head_total, before, depth_before),
+                bounds: (keep_bytes, keep_items, max_bytes, max_items),
+                next: Some((head, None, None)),
+                rows: Vec::new(),
+            })));
+        }
+        Ok(Some(Planning::Plan(plan)))
     }
     /// One piece of a catch-up walk: at most `limit` nodes further back
     /// along the head's lineage toward the previous cut, reading node
@@ -1077,7 +1138,7 @@ impl Database {
             return Ok(());
         };
         let (_, before, depth_before) = walk.totals;
-        let (_, max_bytes, max_items) = walk.bounds;
+        let (_, _, max_bytes, max_items) = walk.bounds;
         // Each row carries its child on the lineage, so cutting at a prompt
         // child needs no parent lookup: the span ends at this row. Only rows
         // inside the budget and the piece's oldest row leave SQLite.
@@ -1137,7 +1198,7 @@ impl Database {
         }
         let CatchUp {
             totals: (head_total, before, depth_before),
-            bounds: (keep_bytes, max_bytes, max_items),
+            bounds: (keep_bytes, keep_items, max_bytes, max_items),
             mut rows,
             ..
         } = walk;
@@ -1146,12 +1207,20 @@ impl Database {
         // The request carries the previous summary and the request to write
         // besides the span, and a comma between the span's items.
         let previous_summary = self.previous_summary(&bot)?;
-        let (head_frame, tail_frame) =
-            CompactionPlan::frame(bot.family()?, previous_summary.as_deref())?;
+        let (head_frame, tail_frame) = CompactionPlan::frame(
+            bot.family()?,
+            previous_summary.as_deref(),
+            (max_bytes as usize / 3).min(64 * 1024),
+        )?;
         let span_bytes = max_bytes - (head_frame.len() + tail_frame.len()) as i64 + 1;
         let span_items = max_items - 1 - previous_summary.is_some() as i64;
         // The span ending at row i is cut at its child, which must start a
         // turn, leave keep_bytes verbatim, and follow at least one prompt.
+        let head_depth: i64 =
+            self.conn
+                .query_row("SELECT depth FROM nodes WHERE id=?", [walk.head], |r| {
+                    r.get(0)
+                })?;
         let mut prompted = false;
         let mut end = None;
         for (index, (_, depth, total, seq, _, child_seq, _)) in rows.iter().enumerate() {
@@ -1160,7 +1229,10 @@ impl Database {
             if items > span_items || total - before + items > span_bytes {
                 break;
             }
-            if prompted && child_seq.is_some() && head_total - total >= keep_bytes {
+            if prompted
+                && child_seq.is_some()
+                && (head_total - total >= keep_bytes || head_depth - depth >= keep_items)
+            {
                 end = Some(index);
             }
         }
@@ -1180,7 +1252,13 @@ impl Database {
                 previous = *total;
                 (*id, size, *seq, prompt.as_deref())
             });
-        Ok(Some(Self::span_plan(cut, span, previous_summary, true)))
+        Ok(Some(Self::span_plan(
+            cut,
+            span,
+            previous_summary,
+            true,
+            (max_bytes as usize / 3).min(64 * 1024),
+        )))
     }
     fn previous_summary(&self, bot: &Bot) -> Result<Option<String>> {
         Ok(match bot.compaction {
@@ -1199,6 +1277,7 @@ impl Database {
         span: impl Iterator<Item = (i64, i64, Option<i64>, Option<&'a str>)>,
         previous_summary: Option<String>,
         catch_up: bool,
+        summary_bytes: usize,
     ) -> CompactionPlan {
         let (mut ids, mut sizes, mut prompts) = (Vec::new(), Vec::new(), Vec::new());
         let (mut from, mut to) = (i64::MAX, 0);
@@ -1220,6 +1299,7 @@ impl Database {
             covered: (from, to),
             previous_summary,
             catch_up,
+            summary_bytes,
         }
     }
     /// Record a compaction at the current head. The separate cut marks the
@@ -1231,6 +1311,8 @@ impl Database {
         plan: &CompactionPlan,
         summary: &str,
         usage: Option<&Usage>,
+        note_turns: usize,
+        input_limit: super::ContextUsage,
     ) -> Result<Value> {
         let bot = self.inspect(name)?;
         // A compaction stands for everything since the first: the summary
@@ -1246,6 +1328,61 @@ impl Database {
         }
         prompts.extend(plan.prompts.iter().cloned());
         bound_prompts(&mut prompts);
+        // Assess the complete logical view, not just the summary's text. A
+        // catch-up step may still exceed the input budget; it must buy room
+        // without inflating either resource. Reads use indexed totals plus
+        // the same bounded omission listing and encoding as model requests.
+        let mut candidate = CompactionView {
+            version: bot.head.ok_or(Error::new("storage_error"))?,
+            summary: summary.to_owned(),
+            prompts,
+            covered: (covered_from, plan.covered.1),
+        };
+        candidate.bound_prompt_bytes(bot.family()?, input_limit.bytes / 2)?;
+        let old = self.compaction_view(name)?;
+        let old_cut = bot
+            .compaction
+            .map(|id| {
+                self.conn
+                    .query_row("SELECT cut FROM compactions WHERE node=?", [id], |r| {
+                        r.get::<_, i64>(0)
+                    })
+            })
+            .transpose()?;
+        let before =
+            self.compaction_context_usage(&bot, old_cut, old.as_ref(), note_turns, input_limit)?;
+        let after = self.compaction_context_usage(
+            &bot,
+            Some(plan.cut),
+            Some(&candidate),
+            note_turns,
+            input_limit,
+        )?;
+        if after.bytes >= before.bytes || after.items > before.items {
+            return fail_with(
+                "compaction_not_smaller",
+                "the summary, retained prompts and omission listing did not reduce the context view",
+            );
+        }
+        // Catch-up may leave an oversized backlog, but it must not install a
+        // pinned prefix that makes even the active turn impossible to send.
+        // Optional previews yield during request fitting. Exclude them from
+        // this minimum check, also avoiding another omitted-turn traversal.
+        if !after.fits(input_limit)
+            && let Some(turn) = bot.running_turn
+        {
+            let start: i64 =
+                self.conn
+                    .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
+            let minimum =
+                self.compaction_context_usage(&bot, Some(start), Some(&candidate), 0, input_limit)?;
+            if !minimum.fits(input_limit) {
+                return fail_with(
+                    "compaction_context_limit",
+                    "the new pinned prefix leaves insufficient room for the active turn",
+                );
+            }
+        }
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to) VALUES (?,?,?,?,?,?,?)",
@@ -1254,7 +1391,7 @@ impl Database {
                 bot.compaction,
                 plan.cut,
                 summary,
-                serde_json::to_string(&prompts)?,
+                serde_json::to_string(&candidate.prompts)?,
                 covered_from,
                 plan.covered.1
             ],
@@ -1267,7 +1404,13 @@ impl Database {
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
             "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
-            "catch_up":plan.catch_up});
+            "catch_up":plan.catch_up,
+            "context_before":before,"context_after":after,
+            "input_limit":input_limit,
+            "headroom_bytes":input_limit.bytes as i64 - after.bytes as i64,
+            "headroom_items":input_limit.items as i64 - after.items as i64,
+            "reclaimed_bytes":before.bytes - after.bytes,
+            "reclaimed_items":before.items - after.items});
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
             if let Some(usage) = usage {
@@ -1281,6 +1424,47 @@ impl Database {
         let cursor = event(&tx, name, bot.running_turn, "compacted", data.clone())?;
         tx.commit()?;
         Ok(entry(cursor, name, bot.running_turn, "compacted", data))
+    }
+    fn compaction_context_usage(
+        &self,
+        bot: &Bot,
+        cut: Option<i64>,
+        view: Option<&CompactionView>,
+        note_turns: usize,
+        input_limit: super::ContextUsage,
+    ) -> Result<super::ContextUsage> {
+        let (bytes, items, omitted, turns): (i64, i64, i64, i64) = self.conn.query_row(
+            "SELECT h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0),
+                COALESCE(p.depth,0),COALESCE(c.turn_seq,1)-1
+             FROM nodes h LEFT JOIN nodes c ON c.id=?2 LEFT JOIN nodes p ON p.id=c.parent WHERE h.id=?1",
+            params![bot.head, cut], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+        )?;
+        let note: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT node,text FROM notes WHERE node=?",
+                [bot.note],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let listed = match cut {
+            Some(cut) if note_turns > 0 && omitted > 0 => self.omitted_turns(cut, note_turns)?,
+            _ => Vec::new(),
+        };
+        let prefix = super::context::context_prefix(
+            bot.family()?,
+            view,
+            note.as_ref(),
+            omitted,
+            turns,
+            &listed,
+            input_limit.bytes * 2 / 3,
+        )?;
+        Ok(super::ContextUsage {
+            bytes: bytes as usize,
+            items: items as usize,
+        }
+        .with_prefix(&prefix))
     }
     /// The turns a window omits, newest first, at most `limit`: each turn's
     /// ordinal along the lineage and how its prompt began. Walks back from
@@ -1357,6 +1541,79 @@ impl Database {
             Family::parse(&family).ok_or(Error::new("store_family_unsupported"))?,
             bytes as usize,
             items as usize,
+        ))
+    }
+
+    /// Minimum request view a history result must join. Read indexed active
+    /// turn totals and mandatory prefix metadata. Optional previews yield to
+    /// the result when fitting the next request; admission never walks them
+    /// or moves the bot's cached window start on the writer.
+    pub fn history_usage(&self, name: &str, turn: i64) -> Result<(Family, super::ContextUsage)> {
+        self.minimum_context_usage(name, turn, None)
+    }
+
+    /// Check a proposed note against the next request before persisting it.
+    /// The result node becomes its version; reserve the maximum encoded ID
+    /// width without querying the global node allocator or taking a writer lock.
+    pub fn validate_note(
+        &self,
+        name: &str,
+        turn: i64,
+        call_id: &str,
+        outcome: &Outcome,
+        limit: super::ContextUsage,
+    ) -> Result<()> {
+        let note = (
+            i64::MAX,
+            outcome.note.clone().ok_or(Error::new("missing_note"))?,
+        );
+        let (family, mut used) = self.minimum_context_usage(name, turn, Some(&note))?;
+        used.bytes += family.tool_result_item(call_id, &outcome.output)?.len() + 1;
+        used.items += 1;
+        if !used.fits(limit) {
+            return crate::fail_with(
+                "note_context_limit",
+                "the encoded note and current turn exceed the context budget; previous note unchanged",
+            );
+        }
+        Ok(())
+    }
+
+    fn minimum_context_usage(
+        &self,
+        name: &str,
+        turn: i64,
+        note_override: Option<&(i64, String)>,
+    ) -> Result<(Family, super::ContextUsage)> {
+        let (family, bytes, items) = self.turn_usage(name, turn)?;
+        let (omitted, turns, note) = self
+            .conn
+            .prepare_cached(
+                "SELECT s.depth-1,s.turn_seq-1,n.node,n.text
+             FROM bots b JOIN nodes s ON s.turn=?2 LEFT JOIN notes n ON n.node=b.note
+             WHERE b.name=?1 AND b.running_turn=?2",
+            )?
+            .query_row(params![name, turn], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?
+                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get::<_, String>(3)?)) })
+                        .transpose()?,
+                ))
+            })?;
+        let prefix = super::context::context_prefix(
+            family,
+            self.compaction_view(name)?.as_ref(),
+            note_override.or(note.as_ref()),
+            omitted,
+            turns,
+            &[],
+            0,
+        )?;
+        Ok((
+            family,
+            super::ContextUsage { bytes, items }.with_prefix(&prefix),
         ))
     }
 
