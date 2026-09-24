@@ -162,13 +162,17 @@ a client attaching to a daemon compares it like the family and URL, and
   `provider_quota_exhausted`, other statuses are `provider_http_N`, and the
   pacer learns limits from the upgrade response and from these headers. A
   refused upgrade is treated the same way, so its `retry-after` holds the
-  pool. A refusal with no usage settles at zero, since no inference ran.
+  pool. A refusal with no usage settles at zero, since no inference ran, and
+  so does a request that could not be written to a connection the provider
+  had closed.
 - Accounting follows the HTTP path's boundaries: the reservation is
   dispatched only when the create event is about to be sent, so a connection
   that never opened is refunded, and the startup permit bounded by
-  `--max-connecting` is held until the provider's first frame.
+  `--max-connecting` is held until the provider's first frame and taken again
+  for a full resend.
 - A socket message is whole, so the input is assembled in memory before it
-  is sent, unlike the streamed HTTP body. A continuation is small; a full
+  is sent, unlike the streamed HTTP body. Incoming messages and frames are
+  bounded at 16 MiB, the HTTP path's response bound. A continuation is small; a full
   send holds one copy of the window.
 - Not built: warmup with `generate: false`, lanes, and HTTP after a failed
   upgrade; a failed connection is retried like an HTTP connection failure.

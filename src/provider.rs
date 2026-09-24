@@ -501,11 +501,7 @@ impl Provider {
         let mut reservation = pace.acquire_reported(estimate, report).await?;
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
-        let admission =
-            tokio::time::timeout(Duration::from_secs(60), self.transport.starting.acquire())
-                .await
-                .map_err(|_| Error::new("provider_admission_timeout"))?
-                .map_err(|_| Error::new("provider_admission_closed"))?;
+        let admission = self.admit().await?;
         if let Some(sockets) = &self.sockets {
             return self
                 .complete_socket(
@@ -673,6 +669,15 @@ impl Provider {
 }
 
 impl Provider {
+    /// A startup permit: held until the provider answers, so at most
+    /// `--max-connecting` requests await their first response at once.
+    async fn admit(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        tokio::time::timeout(Duration::from_secs(60), self.transport.starting.acquire())
+            .await
+            .map_err(|_| Error::new("provider_admission_timeout"))?
+            .map_err(|_| Error::new("provider_admission_closed"))
+    }
+
     /// One call over the bot's socket. A continuation that the server no
     /// longer holds is sent again in full on the same connection; everything
     /// else fails as the HTTP path would.
@@ -736,6 +741,9 @@ impl Provider {
             }
         };
         let mut admission = Some(admission);
+        // The pacer learns from one response's headers per reservation: the
+        // upgrade's on a new connection, else an error event's.
+        let mut learned = false;
         let mut plan = session.plan(key, ids);
         let (mut items, mut tail) = (Some(items), tail);
         let mut parser = responses::State::default();
@@ -757,6 +765,7 @@ impl Provider {
                 report.dispatched = true;
                 if let Some(headers) = upgrade.take() {
                     reservation.learn(&headers, self.family);
+                    learned = true;
                 }
             }
             match session
@@ -779,6 +788,15 @@ impl Provider {
                         skip: 0,
                     };
                     parser = responses::State::default();
+                    // The refusal was the first frame and released the
+                    // permit; the full send awaits a first frame again.
+                    match self.admit().await {
+                        Ok(permit) => admission = Some(permit),
+                        Err(error) => {
+                            reservation.settle(0);
+                            return Err(error);
+                        }
+                    }
                 }
                 outcome => break outcome,
             }
@@ -792,6 +810,9 @@ impl Provider {
                 parser.finish()
             }
             Err(failure) => {
+                if let Some(headers) = failure.headers.as_deref().filter(|_| !learned) {
+                    reservation.learn(headers, self.family);
+                }
                 limit(pace, &failure);
                 session.completed(None, key, ids);
                 keep &= !failure.dead;

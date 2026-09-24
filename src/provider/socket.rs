@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::{self, Message, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{
+    self, Message, client::IntoClientRequest, protocol::WebSocketConfig,
+};
 
 /// The server closes a connection at 60 minutes; one this old is not reused,
 /// so a call never starts on a connection about to be cut.
@@ -27,6 +29,9 @@ const IDLE: Duration = Duration::from_secs(60);
 /// How often idle and aged connections are looked for.
 const SWEEP: Duration = Duration::from_secs(5);
 const CONNECT: Duration = Duration::from_secs(10);
+/// Bytes one response may deliver, as on the HTTP path. Messages and frames
+/// are bounded by it too, so one event cannot allocate past it.
+const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 /// Codex sends this with every socket; OpenAI's guide names no header.
 const BETA: &str = "responses_websockets=2026-02-06";
 
@@ -216,7 +221,15 @@ impl Sockets {
         }
         let (socket, response) = tokio::time::timeout(
             CONNECT,
-            tokio_tungstenite::client_async_with_config(request, io, None),
+            tokio_tungstenite::client_async_with_config(
+                request,
+                io,
+                Some(
+                    WebSocketConfig::default()
+                        .max_message_size(Some(MAX_RESPONSE))
+                        .max_frame_size(Some(MAX_RESPONSE)),
+                ),
+            ),
         )
         .await
         .map_err(|_| Error::new("provider_connection_timeout"))?
@@ -295,7 +308,7 @@ impl Session {
         self.socket
             .send(Message::text(text))
             .await
-            .map_err(|_| Failure::transport(Error::new("provider_stream_failed")))?;
+            .map_err(|_| Failure::unsent(Error::new("provider_stream_failed")))?;
         let deadline = tokio::time::sleep(stall);
         tokio::pin!(deadline);
         let mut total = 0usize;
@@ -317,7 +330,7 @@ impl Session {
                 }
             };
             total += text.len();
-            if total > 16 * 1024 * 1024 {
+            if total > MAX_RESPONSE {
                 return Err(Failure::transport(Error::new("provider_response_limit")));
             }
             match parser.frame(text.as_bytes()) {
@@ -360,6 +373,14 @@ impl Failure {
             refused: false,
             status: None,
             headers: None,
+        }
+    }
+    /// The request could not be written, as when the provider had closed an
+    /// idle connection: no inference ran, so it costs nothing.
+    fn unsent(error: Error) -> Self {
+        Self {
+            refused: true,
+            ..Self::transport(error)
         }
     }
     /// The caller's own failure, such as a closed event consumer. The

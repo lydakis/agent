@@ -135,8 +135,10 @@ class ResponsesSocketTests(unittest.TestCase):
         # The fourth request is turn two's tool result; the server has lost it.
         server = serve(self, forget={4})
         with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
+            # One startup permit: the full resend must take it again, not hold it.
             client = Client(root/'.local/target/release/agent', Path(directory)/'agent.db',
-                            f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws')
+                            f'http://127.0.0.1:{server.server_address[1]}/v1', family='responses-ws',
+                            extra=['--max-connecting', '1'])
             self.addCleanup(client.close)
             client.request('create', bot='Bob', workspace=directory)
             for prompt in ('hello', 'again'):
