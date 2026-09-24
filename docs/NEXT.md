@@ -654,6 +654,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     results, filesystem effects, and final answer as the current loop;
     anything else fails the comparison rather than ranking as cheaper.
     Then a small real-provider check under a stated spend cap.
+40. Done: a ChatGPT login that outlives one token. `--provider chatgpt`
+    used to read Codex's `auth.json` once and never again, so a daemon that
+    outlived the token failed every call until restarted. The login is now
+    re-read when its token's `exp` claim passes, after pacing and admission,
+    and on a 401 for its current token. A concurrent 401 for an older token
+    reuses the login already installed. A changed token or account is retried
+    without backoff, and every token is redacted from then on. An
+    unchanged login is reported as `provider_login_rejected` naming the file,
+    and an expired file as `provider_login_expired` naming the time.
+    Codex still does the signing in. A success that names no content type
+    and finishes without an SSE frame is reported as `provider_expected_sse`
+    with the message it held. Transport failures and partial SSE frames remain
+    retryable. Anthropic subscription use is deliberately not attempted: the
+    terms are a gray area and the account is George's. Performance evidence in
+    [the login screen](DAEMON_MEASUREMENTS.md#login-re-read-and-unnamed-bodies).
 
 40. Responses over WebSocket, measured before kept. OpenAI's WebSocket mode
     keeps the latest response per lane in a connection-local cache, so a

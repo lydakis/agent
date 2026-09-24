@@ -1024,6 +1024,7 @@ impl Turn {
             let delay = match park {
                 Some(block) => block,
                 None if paced => std::time::Duration::ZERO,
+                None if error.code == "provider_login_refreshed" => std::time::Duration::ZERO,
                 None => backoff(attempt, turn as u64),
             };
             self.hub
@@ -1398,6 +1399,7 @@ fn retryable(code: &str) -> bool {
             | "provider_http_529"
             | "provider_stream_failed"
             | "provider_stream_stalled"
+            | "provider_login_refreshed"
             | "truncated_sse_frame"
             | "provider_admission_timeout"
             | "provider_socket_expired"

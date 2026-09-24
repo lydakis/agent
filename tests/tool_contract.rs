@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use agent_runtime::tools::Registry;
+use agent_runtime::tools::{Credentials, Registry};
 use serde_json::{Value, json};
 
 #[tokio::test]
@@ -91,6 +91,35 @@ async fn known_credential_text_is_redacted_before_tool_result_serialization() {
         .unwrap();
     let result: Value = serde_json::from_str(&outcome.output).unwrap();
     assert_eq!(result["stdout"], "\u{fffd}[REDACTED]");
+}
+
+#[tokio::test]
+async fn rotated_overlapping_credentials_are_fully_redacted() {
+    let credentials = Credentials::default();
+    credentials.set("AGENT_TEST_FAKE_KEY", "synthetic-prefix");
+    credentials.set("AGENT_OTHER_FAKE_KEY", "other-secret");
+    credentials.set("AGENT_TEST_FAKE_KEY", "synthetic-prefix-rotated");
+    let tools = Registry::new("echo")
+        .unwrap()
+        .with_credentials(credentials.clone());
+    let echo = tools
+        .prepare(
+            "echo",
+            &json!({"text":"synthetic-prefix-rotated"}).to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        tools
+            .execute(echo, &std::env::temp_dir(), &[])
+            .await
+            .unwrap()
+            .output,
+        "[REDACTED]"
+    );
+    assert_eq!(
+        credentials.names(),
+        ["AGENT_TEST_FAKE_KEY", "AGENT_OTHER_FAKE_KEY"]
+    );
 }
 
 #[tokio::test]

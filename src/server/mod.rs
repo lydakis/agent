@@ -261,22 +261,11 @@ fn codex_auth() -> Result<PathBuf> {
 }
 
 /// The access token and workspace from Codex's `auth.json`. Codex refreshes
-/// the token when it runs; this reads it once at startup and never
-/// refreshes it itself.
+/// the token when it runs; the daemon re-reads the file when the token
+/// expires or is refused, and never refreshes it itself.
+#[cfg(test)]
 fn chatgpt_login(path: &Path) -> Result<(String, String)> {
-    let unavailable = || Error::with("provider_login_unavailable", path.display().to_string());
-    let auth: Value = serde_json::from_slice(&std::fs::read(path).map_err(|_| unavailable())?)
-        .map_err(|_| unavailable())?;
-    let tokens = &auth["tokens"];
-    match (
-        tokens["access_token"].as_str(),
-        tokens["account_id"].as_str(),
-    ) {
-        (Some(token), Some(account)) if !token.is_empty() && !account.is_empty() => {
-            Ok((token.to_owned(), account.to_owned()))
-        }
-        _ => Err(unavailable()),
-    }
+    agent_runtime::provider::login::read(path).map(|s| (s.token, s.account))
 }
 
 pub struct Configuration {
@@ -461,14 +450,17 @@ pub async fn run(config: Configuration) -> Result<()> {
         .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
-    let mut credentials = Vec::new();
+    let credentials = agent_runtime::tools::Credentials::default();
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
-        let (key, account) = if spec.chatgpt_login {
-            let (token, account) = chatgpt_login(&codex_auth()?)?;
-            // No variable carries it; listed so tool output redacts it.
-            credentials.push(("AGENT_CHATGPT_TOKEN".into(), token.clone()));
-            (Some(token), Some(account))
+        let (key, login) = if spec.chatgpt_login {
+            // No variable carries the token; the shared set redacts it, and
+            // every token the login re-reads later.
+            let login = agent_runtime::provider::login::Login::open(
+                &codex_auth()?,
+                Some(credentials.clone()),
+            )?;
+            (None, Some(Arc::new(login)))
         } else {
             let key = spec
                 .key_env
@@ -479,13 +471,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                 })
                 .transpose()?;
             if let (Some(env), Some(value)) = (&spec.key_env, &key) {
-                credentials.push((env.clone(), value.clone()));
+                credentials.set(env, value);
             }
             (key, None)
         };
         let mut provider = Provider::new(transport.clone(), spec.family, &spec.url, key)?;
-        if let Some(account) = account {
-            provider = provider.with_account(account)?;
+        if let Some(login) = login {
+            provider = provider.with_login(login)?;
         }
         if let Some(cap) = config.max_output_tokens
             && spec.family == Family::Responses
@@ -536,7 +528,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ));
     }
     let registry = registry
-        .exclude_credentials(credentials)
+        .with_credentials(credentials)
         .with_environment(environment)
         .with_process_budget(limits.processes);
     let hub = Hub::default();

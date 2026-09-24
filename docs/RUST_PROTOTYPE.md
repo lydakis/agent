@@ -352,14 +352,25 @@ source (openai/codex `15922a5`, read 2026-09-23) shows that, when signed in with
 ChatGPT, Codex sends Responses requests to `https://chatgpt.com/backend-api/codex`
 with the saved access token as the bearer and a `ChatGPT-Account-ID` header. The
 daemon reads `tokens.access_token` and `tokens.account_id` from
-`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) once at startup and sends
-the same two headers. It never refreshes the token: Codex does that when it runs,
-so run any `codex` command first if the login is stale, and restart the daemon to
-pick up a refreshed file. A missing or unreadable file fails startup with
-`provider_login_unavailable`. The login goes only to that endpoint: a `chatgpt`
-spec naming another URL authenticates with the key variable it names, or with
-nothing, so a local or synthetic endpoint never receives the real token. The
-daemon redacts the access token from tool output like a key. Only a synthetic
+`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) at startup and sends
+the same two headers. It never refreshes the token itself; Codex does that
+when it runs. The daemon re-reads the file in two cases: when the token's own
+`exp` claim has passed, after pacing and admission but before sending, and
+on a 401 for the currently held token. A concurrent 401 for an older token
+reuses the login already installed. A re-read that finds a different token or
+account retries the call without backoff (`provider_login_refreshed`), and
+every token read this way is redacted from tool output. An unchanged login
+ends the turn with `provider_login_rejected`, naming the file; an expired one
+on disk answers `provider_login_expired` with the expiry time, at startup or
+before a call.
+Either way the remedy is any `codex` command, which signs in again, and
+nothing has to restart. The token observed on 2026-09-23 was valid for ten
+days from issue. A missing or unreadable file fails startup with
+`provider_login_unavailable`. The login goes only to that
+endpoint: a `chatgpt` spec naming another URL authenticates with the key
+variable it names, or with nothing, so a local or synthetic endpoint never
+receives the real token. The daemon redacts the access token from tool output
+like a key. Only a synthetic
 endpoint has exercised the headers; whether the ChatGPT backend accepts every
 field this adapter sends has not been observed.
 
