@@ -383,6 +383,21 @@ class CompactionTests(ModelFixture):
             self.assertGreaterEqual(c['reclaimed_items'], 0)
             self.assertEqual(c['headroom_bytes'], c['input_limit']['bytes'] - c['context_after']['bytes'])
 
+    def test_prompt_cache_keys_follow_the_bot_and_its_prefix(self):
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
+        self.run_turn(client, 'Alice', 'a', 'small')
+        alice = self.requests()
+        for n in range(3):
+            self.run_turn(client, 'Bob', n, str(n) * 500)
+        bob = self.requests()
+        calls = {r['prompt_cache_key'] for r in bob if r['instructions'] != 'Summarize.'}
+        summaries = {r['prompt_cache_key'] for r in bob if r['instructions'] == 'Summarize.'}
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(summaries, {calls.copy().pop() + '-summary'})
+        self.assertNotIn(alice[0]['prompt_cache_key'], calls | summaries)
+
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
         self.create(client)

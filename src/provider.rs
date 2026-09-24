@@ -181,6 +181,11 @@ pub struct Request<'a> {
     pub tools: &'a RawValue,
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
+    /// Groups calls that share a prefix for the Responses prompt cache. All
+    /// bots share their leading instructions, so without a key their calls
+    /// route by that prefix alone, pile onto the same cache machines and
+    /// spill; the Messages API has no such field.
+    pub cache_key: Option<&'a str>,
     pub items: Items,
 }
 
@@ -311,6 +316,8 @@ impl Provider {
             tool_choice: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_key: Option<&'a str>,
         }
         #[derive(Serialize)]
         struct ToolChoice {
@@ -351,6 +358,7 @@ impl Provider {
                     reasoning: request
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
+                    prompt_cache_key: request.cache_key,
                 })?,
                 &b",\"input\":["[..],
             ),
@@ -774,10 +782,12 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: Some("k"),
                 items: Items::empty(),
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
+        assert!(!text.contains("prompt_cache_key"));
         assert!(text.ends_with(",\"messages\":["));
         assert!(text.contains("\"type\":\"adaptive\""));
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
@@ -789,6 +799,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: None,
                 items: Items::empty(),
             })
             .unwrap();
@@ -803,6 +814,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: None,
                 items: Items::empty(),
             })
             .unwrap();
@@ -824,12 +836,14 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: Some("k"),
                 items: Items::empty(),
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
         let body: Value = serde_json::from_slice(&prefix).unwrap();
         assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["prompt_cache_key"], "k");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
     }
@@ -853,6 +867,7 @@ mod tests {
                             reasoning: None,
                             tools,
                             allow_tool_calls: allow,
+                            cache_key: None,
                             items: Items::empty(),
                         })
                         .unwrap();
@@ -955,6 +970,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                cache_key: None,
                 items: Items::empty(),
             },
             |delta| {
@@ -1017,6 +1033,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            cache_key: None,
             items: Items::empty(),
         };
         let _ = provider.complete(request, |_| async { Ok(()) }).await;
@@ -1058,6 +1075,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            cache_key: None,
             items: Items::empty(),
         };
         let error = provider
@@ -1105,6 +1123,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            cache_key: None,
             items: Items::empty(),
         };
         let completion = provider

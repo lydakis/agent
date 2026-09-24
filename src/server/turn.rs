@@ -70,6 +70,20 @@ fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
     out
 }
 
+/// The Responses prompt-cache key for a bot's calls: its store id under a
+/// nonce drawn once per daemon, so bots of different stores (every Harbor
+/// container's first bot is id 1) never share a key. A restart costs each bot
+/// one cache miss. Summaries have their own prefix, so their own key.
+fn cache_key(bot: i64, summary: bool) -> String {
+    use std::hash::BuildHasher;
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let nonce = *NONCE.get_or_init(|| {
+        std::collections::hash_map::RandomState::new().hash_one(std::process::id())
+    });
+    let suffix = if summary { "-summary" } else { "" };
+    format!("{nonce:016x}-{bot}{suffix}")
+}
+
 pub struct Turn {
     pub bot: String,
     pub turn: i64,
@@ -895,6 +909,7 @@ impl Turn {
         let prior_spent =
             std::time::Duration::from_millis(std::mem::take(&mut accounting.call_spent_ms));
         let paced_before = accounting.totals().1;
+        let cache_key = cache_key(record.id, matches!(body, Body::Span(_)));
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context),
@@ -909,6 +924,7 @@ impl Turn {
                         reasoning: record.reasoning.as_deref(),
                         tools,
                         allow_tool_calls: matches!(body, Body::Window(_)),
+                        cache_key: Some(&cache_key),
                         items,
                     },
                     |delta| {
