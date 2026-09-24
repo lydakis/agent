@@ -4115,3 +4115,47 @@ after turns. Drivers and both result sets are retained under
 Validation: 120 Rust tests, all 19 Python compaction tests, strict Clippy,
 formatting, and diff checks passed. The new regression fails on the saved
 baseline and passes on the candidate.
+
+## Login re-read and unnamed bodies
+
+2026-09-24, local macOS arm64, release builds. Baseline `2c10f02` (binary
+`23a4c256`), candidate at capture (`02fd4787`): a ChatGPT login that is
+re-read when its token expires or is refused, redaction through a shared
+credential set instead of a fixed list, and a named error for a success that
+carries neither a content type nor an SSE frame. With a key provider, which is
+every provider in this screen, the request path gains one `None` check for a
+login and one frame counter per stream; the redaction path takes a read lock
+per tool output.
+
+The 32-agent socket echo screen with all five tool schemas, two alternating
+pairs of three measured runs each:
+
+| Pair | Daemon CPU s, baseline → candidate | Peak RSS MiB | Turn p95 ms |
+| --- | ---: | ---: | ---: |
+| 1 | 0.329 (0.317–0.360) → 0.304 (0.302–0.311) | 18.00 → 17.89 | 590.4 → 587.9 |
+| 2 | 0.315 (0.307–0.334) → 0.329 (0.317–0.363) | 17.94 → 18.00 | 587.4 → 597.7 |
+
+The pairs disagree in direction and every range overlaps; the candidate's
+second pair held one 667 ms p95 outlier. No measurable cost on the common
+path, and no speedup claim. The login path itself is exercised only by unit
+tests against a local server that answers 401 until the file changes; the
+ChatGPT endpoint's real refusal shape has not been observed.
+
+Validation: 120 Rust tests, 239 Python tests with 16 opt-in skips, strict
+Clippy and formatting. Captures: `.local/bench/slice-login-*`.
+
+The reviewed tree (`40456a60`), with the account-change, dispatch-time
+expiry, concurrent-refusal, empty-body, partial-SSE, longest-first redaction,
+and preview-release fixes, was screened again the same way against the same
+baseline:
+
+| Pair | Daemon CPU s, baseline → candidate | Peak RSS MiB | Turn p95 ms |
+| --- | ---: | ---: | ---: |
+| 1 | 0.398 (0.391–0.402) → 0.380 (0.348–0.394) | 17.94 → 17.94 | 592.6 → 593.4 |
+| 2 | 0.329 (0.325–0.352) → 0.338 (0.325–0.350) | 17.89 → 18.12 | 588.7 → 592.7 |
+
+Same reading: directions disagree between pairs, ranges overlap, no
+measurable cost. The first pair ran while the host was busier, which both
+binaries show. Validation of the reviewed tree: 121 Rust tests, 239 Python
+tests with 16 opt-in skips, strict Clippy and formatting. Captures:
+`.local/bench/slice-login2-*`.

@@ -1,4 +1,6 @@
 """The chatgpt provider reads Codex's saved ChatGPT login only for its own endpoint."""
+import base64
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -25,6 +27,20 @@ class ChatgptLoginTests(unittest.TestCase):
         self.assertNotEqual(process.returncode, 0)
         self.assertIn('provider_login_unavailable', process.stderr)
         self.assertIn(str(Path(directory) / 'codex' / 'auth.json'), process.stderr)
+
+    def test_an_expired_login_stops_startup_and_names_the_time(self):
+        # A JWT whose exp claim is one second after the epoch; never verified.
+        payload = base64.urlsafe_b64encode(b'{"exp":1}').rstrip(b'=').decode()
+        with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:
+            codex = Path(directory) / 'codex'
+            codex.mkdir()
+            (codex / 'auth.json').write_text(json.dumps(
+                {'tokens': {'access_token': f'eyJhbGciOiJSUzI1NiJ9.{payload}.sig', 'account_id': 'w'}}))
+            process = self.serve(directory, 'chatgpt')
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn('provider_login_expired', process.stderr)
+        self.assertIn('1970-01-01T00:00:01Z', process.stderr)
+        self.assertIn('codex', process.stderr)
 
     def test_another_endpoint_never_reads_the_login(self):
         with tempfile.TemporaryDirectory(dir=self.root / '.local') as directory:

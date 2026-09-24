@@ -10,6 +10,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 mod anthropic;
+pub mod login;
 pub mod pace;
 mod responses;
 mod socket;
@@ -122,6 +123,8 @@ pub struct Provider {
     key: Option<String>,
     /// ChatGPT workspace for a ChatGPT-login key, sent as `ChatGPT-Account-ID`.
     account: Option<String>,
+    /// A ChatGPT login re-read from its file, in place of a fixed key.
+    login: Option<Arc<login::Login>>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
@@ -262,6 +265,7 @@ impl Provider {
             url,
             key,
             account: None,
+            login: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
             sockets: None,
@@ -336,6 +340,16 @@ impl Provider {
             return fail("invalid_provider_account");
         }
         self.account = Some(account);
+        Ok(self)
+    }
+
+    /// Send a ChatGPT login's current token and workspace on every request,
+    /// re-read from its file when it expires or the endpoint refuses it.
+    pub fn with_login(mut self, login: Arc<login::Login>) -> Result<Self> {
+        if self.family != Family::Responses {
+            return fail("invalid_provider_account");
+        }
+        self.login = Some(login);
         Ok(self)
     }
 
@@ -487,9 +501,15 @@ impl Provider {
         Fut: Future<Output = Result<()>>,
     {
         *report = Report::default();
-        self.complete_inner(request, delta, report)
-            .await
-            .map_err(|error| sanitize_error(error, self.key.as_deref()))
+        let mut session = None;
+        let result = self
+            .complete_inner(request, delta, report, &mut session)
+            .await;
+        let key = session
+            .as_ref()
+            .map(|s| s.token.as_str())
+            .or(self.key.as_deref());
+        result.map_err(|error| sanitize_error(error, key))
     }
 
     async fn complete_inner<F, Fut>(
@@ -497,6 +517,7 @@ impl Provider {
         request: Request<'_>,
         mut delta: F,
         report: &mut Report,
+        session: &mut Option<login::Session>,
     ) -> Result<Completion>
     where
         F: FnMut(Delta) -> Fut,
@@ -534,13 +555,23 @@ impl Provider {
         let (body, len) = self.body(prefix, request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
+        // A token can expire while pacing or waiting for admission. Read it
+        // only now, before building the headers that will carry it.
+        if let Some(login) = &self.login {
+            *session = Some(login.current()?);
+        }
+        let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
+        let account = session
+            .as_ref()
+            .map(|s| &s.account)
+            .or(self.account.as_ref());
         let mut http = client
             .post(self.url.clone())
             .header("content-type", "application/json")
             .header("content-length", len)
             .header("accept", "text/event-stream")
             .body(body);
-        http = match (self.family, &self.key) {
+        http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
             (Family::Anthropic, key) => {
                 let http = http.header("anthropic-version", "2023-06-01");
@@ -551,7 +582,7 @@ impl Provider {
             }
             (Family::Responses, None) => http,
         };
-        if let Some(account) = &self.account {
+        if let Some(account) = account {
             http = http.header("chatgpt-account-id", account);
         }
         // The ChatGPT Codex endpoint takes cache affinity from this header, not
@@ -573,6 +604,24 @@ impl Provider {
             let status = response.status().as_u16();
             let headers = response.headers().clone();
             let body = error_body(response).await.unwrap_or_default();
+            // A refused login is re-read once: Codex may have signed in or
+            // selected another account. Retry when either auth field changed.
+            if status == 401
+                && let (Some(login), Some(session)) = (&self.login, session.as_ref())
+            {
+                reservation.settle(0);
+                let refused = body.detail.unwrap_or_else(|| "HTTP 401".to_owned());
+                return Err(match login.reload(session)? {
+                    true => Error::with("provider_login_refreshed", refused),
+                    false => Error::with(
+                        "provider_login_rejected",
+                        format!(
+                            "{refused}; {} holds the refused token, run any codex command to sign in again",
+                            login.path().display()
+                        ),
+                    ),
+                });
+            }
             let quota = status == 429 && body.quota;
             if !quota {
                 reservation.learn(&headers, self.family);
@@ -628,6 +677,9 @@ impl Provider {
             Family::Responses => Parser::Responses(responses::State::default()),
             Family::Anthropic => Parser::Anthropic(anthropic::State::default()),
         };
+        let unnamed = content_type.is_none();
+        let mut frames = 0usize;
+        let mut preview = Vec::new();
         let result = async {
             let mut total = 0usize;
             // Only a content frame renews the stall deadline. The client's
@@ -645,11 +697,21 @@ impl Provider {
                 if total > 16 * 1024 * 1024 {
                     return fail("provider_response_limit");
                 }
+                if unnamed && frames == 0 && preview.len() < 4096 {
+                    let room = 4096 - preview.len();
+                    preview.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
                 let mut progressed = false;
                 for byte in chunk {
                     let Some(frame) = decoder.byte(byte)? else {
                         continue;
                     };
+                    if unnamed && frames == 0 {
+                        // A completed frame rules out the no-frame diagnostic.
+                        // Release its bounded preview for the rest of the stream.
+                        preview = Vec::new();
+                    }
+                    frames += 1;
                     if frame == b"[DONE]" {
                         continue;
                     }
@@ -673,6 +735,30 @@ impl Provider {
             Ok(())
         }
         .await;
+        // A success that named no content type and carried no SSE frame was
+        // not a stream: say so, with the short message it held, instead of
+        // reporting a truncated or incomplete stream.
+        let no_stream = unnamed
+            && frames == 0
+            && match &result {
+                Ok(()) => true,
+                Err(error) => {
+                    error.code == "truncated_sse_frame" && !looks_like_sse_prefix(&preview)
+                }
+            };
+        let result = if no_stream {
+            let detail = parse_error_body(&preview, false).and_then(|body| body.detail);
+            Err(Error::with(
+                "provider_expected_sse",
+                [Some(format!("HTTP {status}, no content-type")), detail]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(": "),
+            ))
+        } else {
+            result
+        };
         report.usage = parser.usage();
         reservation.settle_usage(report.usage.as_ref(), estimate);
         if let Err(error) = &result
@@ -962,7 +1048,27 @@ async fn error_body(response: reqwest::Response) -> Option<ErrorBody> {
         }
         body.extend_from_slice(&chunk);
     }
-    let text = std::str::from_utf8(&body).ok()?.trim();
+    parse_error_body(&body, expects_json)
+}
+
+/// Recognize a partial event stream before treating an unnamed body as a
+/// non-stream provider message. Called only after a frame-free clean EOF.
+fn looks_like_sse_prefix(body: &[u8]) -> bool {
+    body.split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.starts_with(b"data:")
+                || line.starts_with(b"event:")
+                || line.starts_with(b"id:")
+                || line.starts_with(b"retry:")
+                || line.starts_with(b":")
+        })
+}
+
+/// A short provider message from a bounded body, or nothing safe to show.
+fn parse_error_body(body: &[u8], expects_json: bool) -> Option<ErrorBody> {
+    let text = std::str::from_utf8(body).ok()?.trim();
     if text.is_empty() {
         return None;
     }
@@ -1367,6 +1473,279 @@ mod tests {
             error.detail.as_deref(),
             Some("HTTP 200, content-type application/json: Unsupported client")
         );
+    }
+
+    /// Answer every connection: 401 unless the bearer is `accepted`, then a
+    /// minimal Responses stream without a content type.
+    async fn gated(accepted: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let head = String::from_utf8_lossy(&request).to_lowercase();
+                let response = if head.contains(&format!("authorization: bearer {accepted}\r\n")) {
+                    let body = concat!(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                        "\"output\":[{\"type\":\"message\",\"role\":\"assistant\",",
+                        "\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],",
+                        "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    let body = r#"{"error":{"message":"token expired"}}"#;
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_is_reread_and_retried_only_when_the_file_changed() {
+        let dir = std::env::temp_dir().join(format!("agent-relogin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |token: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
+            )
+            .unwrap();
+        };
+        write("stale");
+        let credentials = crate::tools::Credentials::default();
+        let login = Arc::new(login::Login::open(&path, Some(credentials.clone())).unwrap());
+        let url = gated("fresh").await;
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login)
+            .unwrap();
+        let tools = none();
+        let request = || Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+            cache_key: None,
+        };
+        // Refused, and the file still holds the refused token: final, and
+        // the detail names the file, never the token.
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_rejected");
+        let detail = error.detail.unwrap();
+        assert!(
+            detail.starts_with("token expired; ") && detail.contains("auth.json"),
+            "{detail}"
+        );
+        assert!(!detail.contains("stale"));
+        // Codex signed in again: the refusal becomes a retryable error, and
+        // the retry carries the new token, which is redacted from then on.
+        write("fresh");
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_refreshed");
+        assert_eq!(error.detail.as_deref(), Some("token expired"));
+        let completion = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(completion.items.len(), 1);
+        assert_eq!(
+            credentials.redact("stale fresh".into()),
+            "[REDACTED] [REDACTED]"
+        );
+        assert!(
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None)
+                .unwrap()
+                .with_login(Arc::new(login::Login::open(&path, None).unwrap()))
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_login_is_checked_after_startup_admission() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-admission-login-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |token: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
+            )
+            .unwrap();
+        };
+        write("stale");
+        let login = Arc::new(login::Login::open(&path, None).unwrap());
+        let transport = Transport::new(1, 1).unwrap();
+        let admission = transport.starting.acquire().await.unwrap();
+        let url = gated("fresh").await;
+        let provider = Provider::new(transport.clone(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login.clone())
+            .unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+            cache_key: None,
+        };
+        let call = provider.complete(request, |_| async { Ok(()) });
+        tokio::pin!(call);
+        std::future::poll_fn(|cx| {
+            assert!(call.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        write("fresh");
+        login.expire_now();
+        drop(admission);
+        assert_eq!(call.await.unwrap().items.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_success_without_a_content_type_or_a_stream_names_what_it_held() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let body = r#"{"error":{"message":"Unsupported client"}}"#;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+            cache_key: None,
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_expected_sse");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("HTTP 200, no content-type: Unsupported client")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unnamed_stream_failure_before_the_first_frame_stays_retryable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (headers, expected) in [
+            ("content-length: 100\r\n", "provider_stream_failed"),
+            ("", "truncated_sse_frame"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = socket.read(&mut [0; 4096]).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n{headers}connection: close\r\n\r\ndata: incomplete"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+            let provider =
+                Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+                    .unwrap();
+            let tools = none();
+            let request = Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                items: Items::empty(),
+                chain: None,
+                cache_key: None,
+            };
+            let error = provider
+                .complete(request, |_| async { Ok(()) })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_unnamed_success_is_not_an_incomplete_model_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0; 4096]).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let request = Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            items: Items::empty(),
+            chain: None,
+            cache_key: None,
+        };
+        let error = provider
+            .complete(request, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_expected_sse");
     }
 
     #[tokio::test]

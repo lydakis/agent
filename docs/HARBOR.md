@@ -119,8 +119,12 @@ task container, readable only by the agent user, and adds `--provider chatgpt`.
 The refresh and ID tokens stay on the host, and nothing is uploaded when a
 `provider` spec points `chatgpt` at another endpoint, since the daemon then never
 reads the login. The model's tools can still read the
-access token file; the daemon redacts the token from tool output. The token is
-not refreshed during a run, so run any `codex` command just before starting. Plan usage windows cap how
+access token file; the daemon redacts the token from tool output, but a task
+that reads the file holds a login to the plan, so run only tasks you trust on
+your own account. The token is not refreshed during a run: the daemon re-reads
+the copied file when the token expires or is refused, and nothing in the
+container writes a new one, so run any `codex` command just before starting.
+Plan usage windows cap how
 many tasks one run can finish, and whether a ChatGPT plan may drive a harness
 other than Codex is a question for OpenAI's terms. Harbor's own Codex adapter
 takes the same login with `CODEX_FORCE_AUTH_JSON=1`, so the Codex baseline can
