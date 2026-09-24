@@ -69,9 +69,16 @@ sequences are kept, and announce it in `ready`. It costs one small one-way
 migration and one field. Every idea below needs it. Idea 3 uses it to
 address a daemon, idea 4 to record where an imported bot came from, idea 2
 to tell per-workspace daemons apart, and idea 1 to qualify cursors across
-daemons. A copied store file keeps the same id, so the id names a store's
-lineage, not a unique running process. Section 4 has to handle that; see
-its risks.
+daemons. A copied store file keeps the same id, so that id alone names a
+store's lineage, not one store. The identity therefore has two parts: the
+lineage id, and an instance id that the daemon reissues at open whenever
+the store file's device and inode differ from the pair it recorded last
+time. A copy, a restore from backup, or a move across filesystems gets a
+new instance; a restart or a rename in place keeps it. Anything that must
+name exactly one store, such as a client's state key or a move's
+destination, uses the instance id. A block-level clone of a whole disk or
+machine keeps device and inode and is not detected; that is out of scope
+and stated as such.
 
 ## 1. Watch a bot without disturbing it
 
@@ -178,7 +185,15 @@ source's rows unchanged.
    that completes a handle. SQLite in
    WAL mode lets both read concurrently. The observer reader has a bounded
    queue and each connection keeps at most one page in flight, so many
-   observers slow each other, not the watched bots. The acceptance check is
+   observers slow each other, not the watched bots. Admission must not
+   block the service loop either. Today that loop awaits each request's
+   `dispatch` (at `e1d413f`: `src/server/mod.rs:706-707`), and a `read`
+   awaits both queue space and the result (`src/store.rs:272-295`), so a
+   slow transcript read already holds up completions, resumes, and ready
+   turns. Observer reads therefore take the deferred path that follow
+   replay already uses (`src/server/mod.rs:1361`): `dispatch` enqueues with
+   `try_send` and returns, a full queue answers `observer_busy` at once,
+   and the reader's task sends the response itself. The acceptance check is
    the context reader's queue-time percentiles (the per-operation
    histograms, NEXT item 27), unchanged with N observers replaying long
    logs against the same fleet without them.
@@ -362,12 +377,11 @@ rendezvous directory must be the user's own and mode `0700`
 1. **Store identity in `ready`** (the shared first step). The app stores
    per-view state per socket and workspace ([APP.md](APP.md), "Closing the
    window is detaching"). A forwarded socket's path is arbitrary, so the
-   path alone cannot be the key. Neither can the identity alone, since a
-   copied store keeps its source's identity (see "Copies of stores" in
-   section 4) and two divergent copies would share cursors and bot state.
-   The client keys state by endpoint name and store identity together, and
-   refuses an endpoint list in which two endpoints announce the same
-   identity, naming both, until one store's identity is reissued.
+   path alone cannot be the key. Neither can the lineage id, since a
+   copied store keeps it and two divergent copies would share cursors and
+   bot state. The client keys state by endpoint name and instance id
+   together, and refuses an endpoint list in which two endpoints announce
+   the same instance, naming both, since that is one store reached twice.
 2. **A client-side endpoint list.** A small file mapping names to socket
    paths, local or forwarded: `--daemon NAME` on the CLI, and a daemon
    switcher or a merged fleet view in the app with one `follow *` per
@@ -571,7 +585,8 @@ carrying it over.
    (`src/store/db.rs:642-661`). An import from the CLI is therefore a root
    bot, and the import result names the creator it dropped.
 6. **Then a real move, bound to one destination.** The move names its
-   destination store identity before export. The source marks the bot
+   destination's instance id before export, not its lineage id, which
+   copies of that store share. The source marks the bot
    `moving` and refuses work, the way `deleting` does
    (`src/store/db.rs:418`), and records the destination and a move nonce.
    The bundle carries both. A target imports only a bundle that names its
@@ -580,9 +595,17 @@ carrying it over.
    target's receipt, carried back by the caller, turns the source into a
    tombstone that answers `bot_moved` with the destination's identity. A
    later submission is answered with that, never `bot_not_found` or a fresh
-   bot. Cancelling a move clears `moving` only while no receipt exists. A
-   crash between steps leaves a `moving` source and at most one imported
-   copy, at the named destination, and re-running the move resolves it.
+   bot. Before a bundle has been written, cancelling just clears `moving`.
+   After that, the source cannot tell a lost receipt from an import that
+   never happened, since no daemon talks to another. So cancelling then
+   needs the destination's refusal: the caller asks the named destination
+   to durably refuse that nonce, which it does only if it has not imported
+   it, and carries the refusal back. The source clears `moving` only on a
+   receipt-free refusal. A destination that is gone for good leaves the
+   source `moving`; clearing that is an explicit operator override whose
+   error text names the risk of two live copies. A crash between steps
+   leaves a `moving` source and at most one imported copy, at the named
+   destination, and re-running the move resolves it.
    This holds against mistakes, not against a caller who edits a bundle:
    every caller is already the store's full-access user.
 7. **Draining a running bot.** A `drain` stops the bot at its next round
@@ -624,11 +647,12 @@ carrying it over.
   children that stayed behind can no longer reach it through
   `AGENT_PARENT`. This is the same cross-daemon lineage question as section
   3. Until it is answered, import drops the source's creator (item 5).
-- **Copies of stores.** Two stores with the same identity, one copied from
-  the other, would both accept a bundle bound to that identity, which
-  breaks the one-destination rule. Store identity therefore needs a way to
-  be reissued when a store is copied, or the destination key has to include
-  something a copy does not share.
+- **Copies of stores.** Two copies of one store share its lineage id and
+  would both accept a bundle bound to it, which breaks the one-destination
+  rule. Binding a move to the instance id, which a copy does not keep,
+  closes that for file copies. It does not close it for a block-level
+  clone of the whole disk or machine, which keeps device and inode; the
+  one-destination guarantee is stated with that exception.
 - **Size and sensitivity.** Histories of 100k items are measured
   ([DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#long-history)), so export
   runs in bounded pieces like retention does (NEXT item 29).
@@ -651,7 +675,8 @@ carrying it over.
 
 ### Order
 
-1. Store identity.
+1. Store identity, lineage and instance. Behavior tests: a restart keeps
+   the instance, and a copied store file announces a new one.
 2. Export of an idle root bot with no running processes, and import as a
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
@@ -666,8 +691,10 @@ carrying it over.
    written before the move, and store-qualified handles so that bots that
    delegate can move.
 4. A representation for fork ancestry, so forks can be imported.
-5. Move bound to one destination, with `moving` and tombstone states and
-   `bot_moved` answers.
+5. Move bound to one destination instance, with `moving` and tombstone
+   states and `bot_moved` answers. Behavior tests: a copy of the
+   destination refuses the bundle, and after export a cancel without the
+   destination's refusal is refused.
 6. Drain to a round boundary for a running bot.
 7. Moving a parent together with the children it waits on.
 
