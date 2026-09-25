@@ -1,230 +1,127 @@
 # Amazon Bedrock as a provider
 
-Surveyed 2026-09-22 against AWS and Anthropic documentation; no paid call was
-made, so every runtime behaviour below is documented or inferred, never
-observed. Facts are labelled: **documented** cites a page, **source** cites
-this repository, **unverified** is a hypothesis a smoke run must settle.
+Surveyed 2026-09-22 and revised 2026-09-25 against AWS, Anthropic and OpenAI
+documentation. Facts are labelled: **documented** cites a page, **source**
+cites this repository, **unverified** is a hypothesis the live run below must
+settle. No paid Bedrock call has been made yet.
 
-The question was whether Agent should grow a Bedrock provider covering both the
-`bedrock-mantle` and `bedrock-runtime` endpoints, for Anthropic and OpenAI
-models. The short answer is that Bedrock needs no new wire family and no new
-adapter: it speaks the two families this runtime already encodes, over plain
-SSE, with the key headers the adapter already sends. What it does not carry is
-the rate-limit telemetry the pacer is built on, and its model ids break two
-name-prefix rules in the request encoder. Those are the whole cost.
+Bedrock needs no new wire family: it serves the Anthropic Messages API and the
+OpenAI Responses API over ordinary SSE, so a Bedrock binding is a base URL and
+a way to authenticate. The work is authentication, and carrying over the
+features that depend on the first-party APIs.
 
-## The four routes
+## What the vendors recommend now
 
-Both endpoints serve both families. Bedrock routes are therefore base URLs, not
-adapters (**source**: `src/provider.rs`, `bedrock_routes_are_ordinary_base_urls_for_the_families_we_speak`).
+- **Endpoint.** Anthropic documents Claude Opus 4.7 and later on Bedrock at
+  `bedrock-mantle.{region}.api.aws/anthropic/v1/messages`, with its
+  `AnthropicBedrockMantle` client. OpenAI documents Mantle,
+  `bedrock-mantle.{region}.api.aws/openai/v1`, as the endpoint for new
+  deployments. AWS serves both families on `bedrock-runtime` too, through
+  geographic (`us.`, `eu.`, `au.`) or global (`global.`) inference profiles.
+- **Authentication.** All three name SigV4 through the standard AWS credential
+  chain as the production path. Bedrock API keys, sent as a bearer token or
+  `x-api-key`, are for exploration; short-term ones last at most twelve hours.
+- **Quotas.** **Documented**: Mantle has separate input and output
+  tokens-per-minute quotas per model and region, and no requests-per-minute
+  quota. Runtime counts input plus output against one tokens-per-minute quota,
+  deducts `input + max_tokens` when a call starts, and burns output down at 10x
+  for current Claude and GPT-5.6 models (15x for Claude 4.8). The two
+  endpoints' quotas are independent even for the same model.
+- **Price.** **Documented** by Anthropic: regional endpoints carry a 10%
+  premium over global routing. Mantle serves Claude in-region, so the
+  premium is inferred to apply there; runtime's `global.` profiles avoid it.
 
-| Endpoint | Family | Path | Model id form |
+## What was chosen
+
+`--provider bedrock` binds Claude on Mantle and `--provider bedrock-openai`
+binds OpenAI models on Mantle, in `AWS_REGION` (or `AWS_DEFAULT_REGION`). Mantle
+because both model vendors document it and because its quota shape suits a
+fleet: separate input and output allowances with no output burndown and no
+request cap. Runtime is one explicit URL away, for its global routing and no
+regional premium; see [providers and models](RUST_PROTOTYPE.md#providers-and-models).
+
+Any Bedrock URL without a key field signs with SigV4 (**source**:
+`src/provider/aws.rs`). The signer is in-tree on `aws-lc-rs`, which rustls
+already builds, so Bedrock adds no crate to the lock file. It matches the AWS
+SigV4 test suite's published signatures and botocore 1.43's output for the
+same requests. The AWS SDK's signer and credential chain (`aws-sigv4`,
+`aws-config`) measured 39 more crates, before the HTTP client its SSO and
+instance-role providers need; instead,
+credentials resolve in the chain's own order: static environment keys first,
+then the AWS CLI's `configure export-credentials`, which is the chain itself
+(profiles, SSO, assumed roles, container and instance roles) in the standard
+`credential_process` format. Temporary keys are re-resolved five minutes before
+expiry, single-flight, and once on a 401 or 403, which retries the call; a
+refused fleet re-runs the CLI at most every ten seconds.
+
+Request bodies stream from the store and are never held, so the payload is
+signed as `UNSIGNED-PAYLOAD` over TLS. **Unverified**: whether Bedrock accepts
+that. botocore sends it only for operations modelled as unsigned, and none of
+bedrock-runtime's are. If Bedrock refuses it, the alternative is hashing each
+request by reading its history from the store twice; the live run decides.
+
+## Features, carried over or not
+
+| Feature | First-party | Bedrock | Status |
 | --- | --- | --- | --- |
-| `bedrock-mantle.{region}.api.aws` | Anthropic Messages | `/anthropic/v1/messages` | `anthropic.claude-sonnet-5` |
-| `bedrock-mantle.{region}.api.aws` | OpenAI Responses | `/openai/v1/responses` | `openai.gpt-5.6-sol` |
-| `bedrock-runtime.{region}.amazonaws.com` | Anthropic Messages | `/anthropic/v1/messages` | `global.anthropic.claude-sonnet-5` |
-| `bedrock-runtime.{region}.amazonaws.com` | OpenAI Responses | `/openai/v1/responses` | `openai.gpt-5.6-sol` |
+| Messages and Responses over SSE | yes | yes, both endpoints | carried |
+| Prompt caching, explicit and automatic | yes | **documented** explicit and implicit on both | carried; the top-level `cache_control` spelling is **unverified** |
+| Responses `prompt_cache_key` | yes | **documented** supported | carried |
+| Responses `store: false` with `reasoning.encrypted_content` | yes | `store` documented; encrypted reasoning **unverified** | carried, pending the live run |
+| Adaptive thinking with `output_config.effort` | yes | not named by Bedrock pages | carried, **unverified** |
+| Thinking-binding check (`anthropic-beta: thinking-binding-controls-2026-08-01`, `block_binding`) | yes (PR #12) | not named; Bedrock pages list no beta headers | carried, **unverified**: an unknown beta may be refused |
+| Server-side fallbacks (`fallbacks`, PR #13) | yes | **documented** unsupported; use client-side fallback | not carried |
+| Responses over WebSocket | yes | **documented** unsupported on either endpoint | refused for Bedrock URLs |
+| Rate-limit headers for pacing | yes | **documented** absent | escalating refusal backoff instead |
+| Legacy thinking budgets by model name | yes | ids are vendor- and profile-prefixed | carried: `us.anthropic.claude-haiku-4-5…` reads as `claude-haiku-4-5` |
+| Output cap | Responses only | quota deducted up front | `--max-output-tokens` now reaches Anthropic as `max_tokens` |
 
-**Documented**: the Anthropic route requires `anthropic-version: 2023-06-01`
-and accepts a Bedrock API key in `x-api-key`; the OpenAI route accepts the same
-key as `Authorization: Bearer`. Streaming on both is ordinary
-`text/event-stream` with the families' own event names.
+## The gaps from the first survey, on current main
 
-Model ids carry a vendor prefix, and the prefix is not cosmetic. **Documented**
-on the Opus 5 and Sonnet 5 model cards: `bedrock-mantle` takes the bare
-`anthropic.<model>` id and serves it in-region, in five regions only
-(`us-east-1`, `us-gov-west-1`, `eu-north-1`, `eu-west-1`, `ap-southeast-4`).
-`bedrock-runtime` has no in-region availability for these models at all; it is
-reachable only through a geographic (`us.`, `eu.`, `au.`) or global
-(`global.`) inference profile, which `bedrock-mantle` in turn rejects. So the
-two endpoints are not two spellings of one route: each has an id form the other
-refuses. Claude is on the Messages API on both and on the Responses API on
-neither, so there is no cross-family choice to make for it.
+1. **The pacer learned nothing without headers.** A 429 naming no delay used
+   to close the pool for a flat second, forever. It now closes it for a
+   second, doubling to 32 each time the pool reopens only to be refused, and
+   resets on the next accepted call (**source**: `Pace::limited`). Refusals of
+   calls already in flight during a block are one overload, not several. The
+   turn's own jittered backoff still spreads retries. Proactive pacing would
+   need the account's quota numbers, which Bedrock does not return per call.
+2. **Model ids broke the name rules.** `legacy_thinking` now reads the Claude
+   model inside a Bedrock id, so a Haiku 4.5 id on Bedrock gets a budget and
+   current models get adaptive thinking. Pool keys are left as given: geo and
+   global profiles are separate quotas.
+3. **The fixed 32k `max_tokens`.** Still the default, but `--max-output-tokens`
+   now sets it, with a legacy thinking budget clamped to leave 1,024 tokens for
+   the answer. On both Bedrock endpoints the bound is charged against quota up
+   front, so it is the throughput knob.
+4. **Twelve-hour tokens read once.** SigV4 through the chain replaces them:
+   keys refresh themselves. A Bedrock API key in a key field still works and
+   is still read once.
 
-**Source**: `Provider::new` appends the family route to the configured base
-path, and `complete_inner` already picks `x-api-key` plus `anthropic-version`
-for `Family::Anthropic` and bearer for `Family::Responses`. That is exactly
-what Bedrock wants, so all four routes bind today through the existing spec:
+## The live run
 
-```
---provider mantle=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK
---provider mantle-oai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK
---provider br=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK
---provider br-oai=responses,https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1,AWS_BEARER_TOKEN_BEDROCK
-```
+To settle every **unverified** row, in the shape of
+[ANTHROPIC_SMOKE.md](ANTHROPIC_SMOKE.md), on one Claude and one OpenAI model:
 
-Bedrock gets no named default beside `openai` and `anthropic`, because its URL
-carries both the region and the endpoint choice and there is no useful single
-value for either. Four bindings is also the right shape rather than a
-concession: **documented**, mantle and runtime quotas are independent even for
-the same model, so one `Pools` per binding is what the quota actually is.
-
-The legacy `InvokeModelWithResponseStream` route, with its binary
-`application/vnd.amazon.eventstream` framing and per-model body dialect, is the
-one thing here that would cost a second framing decoder beside `sse::Decoder`.
-Nothing needs it: **documented**, current Claude models are served by the
-Messages API on both endpoints, so the SSE routes above already reach
-everything. Do not implement it.
-
-## Which endpoint for Claude
-
-Neither is worse on anything this runtime uses. **Documented** on both model
-cards: same Messages API, same SSE, same tool use, and explicit *and* implicit
-prompt caching on both, with four checkpoints, 5-minute and 1-hour TTLs, over
-`system`, `messages` and `tools`. The choice is about capacity and quota shape,
-not capability.
-
-| | `bedrock-mantle` | `bedrock-runtime` |
-| --- | --- | --- |
-| Reach | one region, five available | geographic and global profiles |
-| RPM quota | none at all | model-specific; absent for recent Opus |
-| Token quota | separate input TPM and output TPM | input and output combined in one TPM |
-| Daily ceiling | none documented | max tokens per day, per model per region |
-| Upfront check | input **plus `max_tokens`** against input TPM | at usage |
-
-Recommend `bedrock-runtime` through a global profile as the primary Anthropic
-binding. Its cross-region capacity is real headroom that Mantle has no form of,
-and for a runtime whose whole question is many active agents that outweighs
-Mantle's separate output bucket. The RPM difference that would have argued for
-Mantle mostly is not one: **documented**, RPM is already absent on runtime for
-recent Opus models.
-
-Bind Mantle as a second provider rather than instead of it. **Documented**, the
-two endpoints' quotas are independent even for the same model, so two bindings
-are two allowances, not a fallback branch. Note that a bot's model reference is
-durable with the bot, so this spreads a fleet across both endpoints; it does not
-spread one bot.
-
-Mantle's upfront `input + max_tokens` check is the one place it is actively
-worse for us today, and only because of the fixed ceiling in gap 3 below. Fix
-that before leaning on Mantle for throughput.
-
-## Where it strains
-
-Four real gaps, in the order they would bite.
-
-### 1. The pacer goes blind
-
-`pace.rs` learns each pool's per-minute allowance only from response headers,
-and a bucket with no reported limit is treated as unbounded
-(**source**: `Bucket::per_minute` is `None` until `learn` runs). **Documented**:
-Bedrock's Anthropic endpoint does not send rate-limit response headers at all,
-and the Mantle quota page publishes no remaining-quota header either. So on
-Bedrock the pacer never learns anything, admits every request immediately, and
-the runtime's whole proactive mechanism is inert. All that remains is the
-reactive path: a 429 calls `pace.limited(retry-after)`, and with no
-`retry-after` that is a flat one-second block, retried forever without backoff.
-A fleet against a Bedrock quota would spin on that.
-
-The shape of the fix is already right, which is the good news. **Documented**:
-Mantle enforces separate input-tokens-per-minute and output-tokens-per-minute
-quotas per model per region and no RPM quota at all, while runtime enforces one
-combined TPM plus a daily token ceiling and a model-specific RPM that recent
-Opus models do not carry. Those token quotas are dimensions 1, 2 and 0 of the
-pacer's existing `DIMS` array. What is missing is a way to seed a limit from
-configuration instead of from headers, plus real backoff when a block repeats.
-That is a change to `pace.rs`, not to the adapter. The daily ceiling has no
-dimension at all and would be the one genuinely new thing to model, and only
-for a sustained soak.
-
-### 2. Model ids break two prefix rules
-
-**Source**: `legacy_thinking` in `src/provider.rs` decides between an explicit
-thinking budget and adaptive thinking by `model.starts_with("claude-haiku-4-5")`
-and six siblings. Bedrock ids are `anthropic.claude-haiku-4-5` and
-`us.anthropic.claude-haiku-4-5`, so every one of those matches fails: the
-adapter would send adaptive thinking to a model that requires a budget, and the
-[Anthropic smoke run](ANTHROPIC_SMOKE.md) records exactly that as a
-`provider_http_400`. `Family::pool_key` has the milder version of the same
-problem: it strips an eight-digit date suffix that Bedrock ids do not carry, so
-it is harmless today but equally name-shaped.
-
-This is [NEXT.md](NEXT.md) item 17's per-model capability configuration
-arriving with a bill attached. A prefix strip would paper over it; the right
-answer is to look capability up rather than parse it out of a name.
-
-### 3. The fixed output ceiling costs quota
-
-**Source**: every Anthropic request sends `max_tokens: 32_768`, and
-`with_max_output_tokens` refuses to set anything else for that family.
-**Documented**: Mantle checks input tokens **plus `max_tokens`** upfront against
-the input-token quota. So each call reserves 32,768 tokens of input allowance it
-will almost never use. Against the documented 20,000,000 input TPM default for
-Claude Opus 4.7 that padding alone caps the endpoint near 610 requests a
-minute before a single prompt token is counted. This is the other half of item
-17, and Bedrock turns it from tidiness into throughput.
-
-### 4. Credentials expire under a long-lived daemon
-
-**Documented**: Bedrock bearer tokens are short-term, valid at most 12 hours;
-SigV4 is the durable path. **Source**: `run` in `src/server/mod.rs` reads each
-`key_env` once at startup and the `Provider` holds that string for the life of
-the process. A daemon meant to run for days would begin failing every Bedrock
-call after twelve hours with no refresh path.
-
-SigV4 is the strain worth naming precisely. Request bodies here are streamed,
-never assembled — `Items` yields pre-encoded history with only a byte count
-known in advance — so the runtime cannot hash a payload it never holds. SigV4
-over a streamed body therefore only works with `UNSIGNED-PAYLOAD`, which is the
-one open question: **unverified** whether Bedrock accepts it on these routes. If
-it does, SigV4 is a per-request signing step over headers and a credential
-source that can refresh. If it does not, streamed bodies and SigV4 are
-incompatible and Bedrock is limited to twelve-hour tokens with a re-read.
-
-## Smaller unknowns for a smoke run
-
-- **Unverified**: whether `include: ["reasoning.encrypted_content"]`, which the
-  Responses encoder always sends and which stateless continuation depends on, is
-  honoured on Bedrock. A third-party bug report describes Bedrock Runtime
-  replaying encrypted reasoning, which suggests it is, but that is not a source.
-- **Unverified**: whether the top-level automatic `cache_control` breakpoint and
-  `output_config: {"effort": …}` are accepted. **Documented**: prompt caching
-  itself is supported on both endpoints, explicit and implicit, so the risk is
-  narrow — the encoder's particular spelling, not the capability. Mantle rejects
-  `output_config.format` with a 400, which says nothing about `effort`.
-- **Unverified**: what Bedrock reports when output TPM runs out mid-generation.
-  **Documented**: generation stops with a finish reason rather than a 429.
-  **Source**: `anthropic::State::finish` turns `max_tokens` into
-  `provider_incomplete` and anything unrecognised into `provider_incomplete`
-  too, and neither reaches `pace.limited`. Either way a quota exhaustion
-  surfaces as a turn failure with no pacing feedback, which is the sharpest
-  version of gap 1.
-- **Documented** and worth stating: structured outputs, server-side tools, Files
-  API input sources and message batches are unsupported on the Bedrock Anthropic
-  route. None is used here. The two sources disagree about `count_tokens` —
-  Anthropic's page lists it as unsupported, the AWS model cards list it as a
-  Mantle-only feature — which is moot here but a reminder that neither page is
-  authoritative alone.
-
-## Recommendation
-
-Do not build a Bedrock adapter; there is nothing to adapt. The reach is already
-there, and the four gaps above are all pre-existing weaknesses that Bedrock
-exposes rather than causes. Take them in this order:
-
-1. A paid smoke run against both endpoints on one Claude model, in the shape of
-   [ANTHROPIC_SMOKE.md](ANTHROPIC_SMOKE.md), to settle every **unverified**
-   above. Both, because the id forms differ and each endpoint refuses the
-   other's. Nothing else should be built before it.
-2. Item 17's per-model capability configuration, which gaps 2 and 3 both need
-   and which no longer has a workaround once Bedrock ids are in play.
-3. Configured pool limits and real backoff in `pace.rs`, for any endpoint that
-   publishes no rate-limit headers.
-4. SigV4 only if the smoke run shows twelve-hour tokens are not enough, and only
-   after `UNSIGNED-PAYLOAD` is confirmed.
+- SigV4 with `UNSIGNED-PAYLOAD` on Mantle and on runtime.
+- A tool-using turn with thinking on a current Claude model, which exercises
+  the thinking-binding beta header, `block_binding`, adaptive thinking, effort
+  and automatic caching together; and one on Haiku 4.5 for the budget form.
+- A two-turn Responses conversation, which shows whether encrypted reasoning
+  comes back and is accepted when replayed.
+- Whether Mantle accepts a `global.` profile id.
 
 ## Sources
 
-Observed 2026-09-22.
+Observed 2026-09-22 to 2026-09-25.
 
 - [Endpoints supported by Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html)
-- [APIs supported by Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/apis.html)
 - [Inference using Anthropic Messages API](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-messages-api.html)
-- [API compatibility](https://docs.aws.amazon.com/bedrock/latest/userguide/models-api-compatibility.html)
-- [Responses API (Bedrock Mantle)](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html)
 - [Quotas for the bedrock-mantle endpoint](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-mantle.html)
 - [Quotas for the bedrock-runtime endpoint](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-runtime.html)
+- [How tokens are counted in Amazon Bedrock](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html)
 - [Claude Opus 5 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5.html)
 - [Claude Sonnet 5 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-sonnet-5.html)
-- [Claude in Amazon Bedrock (Opus 4.7 and later)](https://platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock)
+- [Claude in Amazon Bedrock](https://platform.claude.com/docs/en/build-with-claude/claude-in-amazon-bedrock)
 - [OpenAI models in Amazon Bedrock](https://developers.openai.com/api/docs/guides/amazon-bedrock)
+- botocore 1.43.102 `auth.py` and the bedrock-runtime service model, read for
+  how it signs payloads.

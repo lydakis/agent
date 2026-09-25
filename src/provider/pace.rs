@@ -93,6 +93,8 @@ struct State {
     requests: Bucket,
     tokens: [Dim; DIMS],
     blocked_until: Option<Instant>,
+    /// Blocks in a row that ended in another refusal naming no delay.
+    unnamed_blocks: u32,
     reserved_requests: u64,
 }
 
@@ -331,14 +333,31 @@ impl Pace {
             .filter(|left| !left.is_zero())
     }
     /// The provider refused for pace; nothing is admitted before `after`.
+    /// A refusal that names no delay closes the pool for one second, doubled
+    /// up to 32 each time the pool reopens only to be refused again, until a
+    /// call succeeds. Refusals of calls already in flight while it is closed
+    /// are the same overload and do not escalate it. Providers that publish
+    /// no allowance, such as Bedrock, are paced by this alone.
     pub fn limited(&self, after: Option<Duration>) {
         let mut state = self.state.lock().unwrap();
-        let until = Instant::now() + after.unwrap_or(Duration::from_secs(1));
+        let now = Instant::now();
+        let delay = after.unwrap_or_else(|| {
+            if state.blocked_until.is_none_or(|until| until <= now) {
+                state.unnamed_blocks = (state.unnamed_blocks + 1).min(6);
+            }
+            Duration::from_secs(1 << (state.unnamed_blocks - 1))
+        });
+        let until = now + delay;
         state.blocked_until = Some(state.blocked_until.map_or(until, |u| u.max(until)));
         drop(state);
         // Wake the FIFO head even when it was waiting for allowance refill.
         // It parks and releases the gate; queued callers then observe the block.
         self.changed.notify_one();
+    }
+    /// A call was accepted: the next unnamed refusal starts again at a second.
+    pub fn accepted(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.unnamed_blocks = 0;
     }
     /// Learn the allowance from headers that precede every call they could
     /// count, such as a WebSocket upgrade's. Outstanding reservations stay
@@ -602,6 +621,31 @@ mod tests {
         .expect("unknown capacity must not impose an admission cap");
         assert!(held.iter().all(|r| r.waited.is_zero()));
         assert_eq!(pace.state.lock().unwrap().reserved_requests, 128);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusals_naming_no_delay_back_off_until_a_call_is_accepted() {
+        let pace = Pace::default();
+        let left = |pace: &Pace| pace.blocked_for().unwrap_or_default().as_secs_f64().round();
+        pace.limited(None);
+        assert_eq!(left(&pace), 1.0);
+        // Refusals of calls already in flight are the same overload.
+        pace.limited(None);
+        pace.limited(None);
+        assert_eq!(left(&pace), 1.0);
+        for expected in [2.0, 4.0, 8.0, 16.0, 32.0, 32.0] {
+            tokio::time::advance(Duration::from_secs(33)).await;
+            pace.limited(None);
+            assert_eq!(left(&pace), expected);
+        }
+        // A named delay is taken as given and leaves the streak alone.
+        tokio::time::advance(Duration::from_secs(33)).await;
+        pace.limited(Some(Duration::from_secs(3)));
+        assert_eq!(left(&pace), 3.0);
+        tokio::time::advance(Duration::from_secs(33)).await;
+        pace.accepted();
+        pace.limited(None);
+        assert_eq!(left(&pace), 1.0);
     }
 
     #[tokio::test(start_paused = true)]

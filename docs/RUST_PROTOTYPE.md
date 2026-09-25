@@ -299,7 +299,7 @@ bound; the operating system is then the only limit.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
+| `--max-output-tokens` | Generated tokens per model call, including reasoning. Anthropic calls send it as `max_tokens` (at least 2,048, so a legacy thinking budget of 1,024 or more fits beside the answer) in place of 32,768. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
@@ -332,8 +332,8 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login |
-| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY` |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.$AWS_REGION.api.aws/openai/v1`, SigV4 |
+| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-mantle.$AWS_REGION.api.aws/anthropic/v1`, SigV4 |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
 continuing from the bot's previous response where it can; for example
@@ -347,6 +347,29 @@ variable is read only when it is named in the spec or implied by a default
 endpoint; a custom URL without a key field sends no credential. Compatibility
 requires the request fields and streaming subset implemented by this adapter;
 the family label alone does not establish support for an arbitrary gateway.
+
+Amazon Bedrock serves both families, so a Bedrock binding is a base URL and
+a way to authenticate; [BEDROCK.md](BEDROCK.md) records the survey and the
+choices. `bedrock` and `bedrock-openai` take the region from `AWS_REGION`, or
+`AWS_DEFAULT_REGION`, and fail at startup naming the spec when neither is set.
+Any `bedrock-mantle.{region}.api.aws` or `bedrock-runtime.{region}.amazonaws.com`
+URL without a key field signs every request with SigV4, for example
+`--provider br=anthropic,https://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1`
+with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
+its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
+`AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
+`AWS_PROFILE` or the default profile, SSO and assumed roles included, through
+`aws configure export-credentials`. Temporary keys are re-resolved five
+minutes before they expire and once on a 401 or 403, which retries the call
+as `provider_login_refreshed`; the secret and session token are redacted
+from tool output and, from the environment, kept out of shells. A key field
+instead sends a Bedrock API key the family's own way, as
+`--provider b=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK`;
+short-term API keys last at most twelve hours and are read once. Bedrock has no
+WebSocket transport, so `responses-ws` is refused for it. Bedrock publishes no
+rate-limit headers, so its pools learn no allowance and are paced by refusals
+alone: a 429 naming no delay closes the pool for a second, doubling to 32 while
+refusals continue, until a call is accepted.
 
 `--provider chatgpt` uses a ChatGPT plan instead of an API key. Codex's own
 source (openai/codex `15922a5`, read 2026-09-23) shows that, when signed in with

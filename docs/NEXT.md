@@ -335,13 +335,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    fixed Anthropic output ceiling and the `legacy_thinking` name-prefix match
    with a small per-provider, per-model capability configuration. Preserve
    native provider state; do not force every family into identical semantics.
-   [Bedrock](BEDROCK.md) is the case that removes the workaround: its four
-   routes need no adapter and bind through the existing provider spec today,
-   but its model ids are vendor-prefixed, so every name-prefix rule here
-   misses, and Mantle charges the fixed output ceiling against an upfront
-   input quota. That survey also says what a paid smoke run must settle first,
-   and why an endpoint publishing no rate-limit headers leaves the pacer
-   proactively inert with only a flat one-second reactive block.
+   [Bedrock](BEDROCK.md) is now a binding: `bedrock` and `bedrock-openai`
+   sign with SigV4 through the AWS credential chain, and the two rules it
+   broke were fixed in place (Claude names are read inside Bedrock ids, and
+   `--max-output-tokens` reaches Anthropic's `max_tokens`). Both fixes are
+   still name- and flag-shaped; a per-model capability table would absorb
+   them. The live Bedrock run that settles its unverified rows comes first.
 18. Extend measured tools and recovery semantics, slow-reader and
     sustained-load tests. Profile CPU/allocations to explain regressions;
     compare matched revisions.

@@ -10,6 +10,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 mod anthropic;
+pub mod aws;
 pub mod login;
 pub mod pace;
 mod responses;
@@ -129,6 +130,8 @@ pub struct Provider {
     stall_timeout: Duration,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
+    /// Bedrock signs every request with SigV4 instead of sending a key.
+    aws: Option<Arc<aws::Aws>>,
 }
 
 #[derive(Debug)]
@@ -286,6 +289,7 @@ impl Provider {
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
             sockets: None,
+            aws: None,
         })
     }
     /// Model pool levels behind this provider, for `stats`.
@@ -302,7 +306,8 @@ impl Provider {
     /// Carry Responses calls over WebSocket, keeping one connection per bot
     /// so a call can continue from the bot's previous response.
     pub fn with_socket(mut self) -> Result<Self> {
-        if self.family != Family::Responses {
+        // Bedrock serves Responses over HTTP only.
+        if self.family != Family::Responses || aws::endpoint(&self.url).is_some() {
             return fail("invalid_provider_transport");
         }
         self.sockets = Some(Sockets::new()?);
@@ -332,7 +337,7 @@ impl Provider {
     pub fn output_byte_estimate(&self) -> Option<usize> {
         match self.family {
             Family::Responses => self.max_output_tokens,
-            Family::Anthropic => Some(ANTHROPIC_MAX_TOKENS),
+            Family::Anthropic => Some(self.max_output_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS)),
         }
         .map(|tokens| (tokens as usize).saturating_mul(4))
     }
@@ -341,10 +346,13 @@ impl Provider {
         self.pools.get(&self.family.pool_key(model)).blocked_for()
     }
 
-    /// Bound generated tokens (including reasoning) for Responses calls.
-    /// Other families need their own budget validation and reject this option.
+    /// Bound generated tokens, reasoning included. Anthropic calls send it
+    /// as `max_tokens` in place of the default, and need room for a thinking
+    /// budget of at least 1,024 tokens beside the answer. Bedrock deducts
+    /// input plus this bound from quota when a call starts, so a bound near
+    /// real output is throughput there.
     pub fn with_max_output_tokens(mut self, limit: u32) -> Result<Self> {
-        if self.family != Family::Responses || limit == 0 {
+        if limit == 0 || (self.family == Family::Anthropic && limit < 2048) {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
@@ -367,6 +375,19 @@ impl Provider {
             return fail("invalid_provider_account");
         }
         self.login = Some(login);
+        Ok(self)
+    }
+
+    /// Sign every request for this Bedrock endpoint with SigV4, in place of
+    /// a key; the URL must be a Bedrock host of the same region and service.
+    pub fn with_aws(mut self, aws: Arc<aws::Aws>) -> Result<Self> {
+        if aws::endpoint(&self.url) != Some((aws.region().to_owned(), aws.service()))
+            || self.key.is_some()
+            || self.login.is_some()
+        {
+            return fail("invalid_provider_auth");
+        }
+        self.aws = Some(aws);
         Ok(self)
     }
 
@@ -428,6 +449,7 @@ impl Provider {
             fallbacks: &'static str,
         }
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
+        let max_tokens = self.max_output_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS);
         let (mut bytes, field) = match self.family {
             Family::Responses => (
                 serde_json::to_vec(&Responses {
@@ -450,7 +472,7 @@ impl Provider {
             Family::Anthropic => (
                 serde_json::to_vec(&Anthropic {
                     model: request.model,
-                    max_tokens: ANTHROPIC_MAX_TOKENS,
+                    max_tokens,
                     // An explicit breakpoint after the static prefix (tools
                     // and instructions) guarantees a read point for it.
                     system: (!request.instructions.is_empty()).then(|| {
@@ -470,7 +492,8 @@ impl Provider {
                                 "low" => 2048,
                                 "medium" => 8192,
                                 _ => 16384,
-                            };
+                            }
+                            .min(max_tokens - 1024);
                             json!({"type":"enabled","budget_tokens":budget,
                                 "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         } else {
@@ -583,6 +606,10 @@ impl Provider {
         if let Some(login) = &self.login {
             *session = Some(login.current()?);
         }
+        let signer = match &self.aws {
+            Some(aws) => Some((aws, aws.current().await?)),
+            None => None,
+        };
         let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
         let account = session
             .as_ref()
@@ -620,6 +647,12 @@ impl Provider {
         if let (Family::Responses, Some(key)) = (self.family, cache_key) {
             http = http.header("session-id", key);
         }
+        // Signed last, at send time: the signature covers the moment it is made.
+        if let Some((aws, keys)) = &signer {
+            for (name, value) in aws.sign(keys, "POST", &self.url, std::time::SystemTime::now()) {
+                http = http.header(name, value);
+            }
+        }
         reservation.dispatch();
         report.dispatched = true;
         let response = match http.send().await {
@@ -652,6 +685,17 @@ impl Provider {
                     ),
                 });
             }
+            // Expired or replaced AWS keys are re-resolved once, as a login is.
+            if matches!(status, 401 | 403)
+                && let Some((aws, keys)) = &signer
+                && aws.reload(keys).await?
+            {
+                reservation.settle(0);
+                return Err(Error::with(
+                    "provider_login_refreshed",
+                    body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                ));
+            }
             let quota = status == 429 && body.quota;
             if !quota {
                 reservation.learn(&headers, self.family);
@@ -676,6 +720,7 @@ impl Provider {
             });
         }
         reservation.learn(response.headers(), self.family);
+        pace.accepted();
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -1002,8 +1047,25 @@ async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Resu
     String::from_utf8(text).map_err(|_| Error::new("invalid_item_encoding"))
 }
 
+/// The Claude model a Bedrock id names: `anthropic.claude-…` and a
+/// geographic or global profile such as `us.anthropic.claude-…` or
+/// `global.anthropic.claude-…` name `claude-…`. Other ids are unchanged.
+fn claude_model(model: &str) -> &str {
+    if let Some(name) = model.strip_prefix("anthropic.") {
+        return name;
+    }
+    model
+        .split_once('.')
+        .filter(|(profile, _)| {
+            !profile.is_empty() && profile.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        })
+        .and_then(|(_, rest)| rest.strip_prefix("anthropic."))
+        .unwrap_or(model)
+}
+
 /// Model ids that predate adaptive thinking and still require a token budget.
 fn legacy_thinking(model: &str) -> bool {
+    let model = claude_model(model);
     [
         "claude-haiku-4-5",
         "claude-sonnet-4-5",
@@ -1233,7 +1295,7 @@ mod tests {
         let responses = Provider::new(transport, Family::Responses, "http://h/v1/", None).unwrap();
         assert_eq!(responses.url.path(), "/v1/responses");
         assert!(responses.clone().with_max_output_tokens(0).is_err());
-        assert!(provider.with_max_output_tokens(2048).is_err());
+        assert!(provider.clone().with_max_output_tokens(2047).is_err());
         let responses = responses.with_max_output_tokens(2048).unwrap();
         let mut prefix = responses
             .prefix(&Request {
@@ -1301,6 +1363,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Bedrock ids name Claude models under a vendor prefix and, on runtime,
+    /// a geographic or global profile; capability rules read the model.
+    #[test]
+    fn bedrock_model_ids_follow_the_claude_model_they_name() {
+        for (id, legacy) in [
+            ("anthropic.claude-haiku-4-5", true),
+            ("us.anthropic.claude-haiku-4-5-20251001-v1:0", true),
+            ("global.anthropic.claude-sonnet-4-5-20250929-v1:0", true),
+            ("us-gov.anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+            ("anthropic.claude-opus-5", false),
+            ("global.anthropic.claude-opus-5", false),
+            ("eu.anthropic.claude-sonnet-4-6", false),
+            ("claude-haiku-4-5", true),
+            ("claude-opus-5", false),
+        ] {
+            assert_eq!(legacy_thinking(id), legacy, "{id}");
+        }
+        assert_eq!(claude_model("openai.gpt-6-sol"), "openai.gpt-6-sol");
+        assert_eq!(
+            claude_model("US.anthropic.claude-x"),
+            "US.anthropic.claude-x"
+        );
+    }
+
+    /// An output cap reaches Anthropic calls as `max_tokens`, and a legacy
+    /// thinking budget stays inside it with room for the answer.
+    #[test]
+    fn anthropic_output_cap_bounds_max_tokens_and_thinking_budget() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+            None,
+        )
+        .unwrap()
+        .with_max_output_tokens(4096)
+        .unwrap();
+        assert_eq!(provider.output_byte_estimate(), Some(4096 * 4));
+        let body = |model: &str| {
+            let mut prefix = provider
+                .prefix(&Request {
+                    model,
+                    instructions: "i",
+                    reasoning: Some("high"),
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                })
+                .unwrap();
+            prefix.extend_from_slice(b"]}");
+            serde_json::from_slice::<Value>(&prefix).unwrap()
+        };
+        let legacy = body("us.anthropic.claude-haiku-4-5-20251001-v1:0");
+        assert_eq!(legacy["max_tokens"], 4096);
+        assert_eq!(legacy["thinking"]["budget_tokens"], 3072);
+        let current = body("anthropic.claude-opus-5");
+        assert_eq!(current["max_tokens"], 4096);
+        assert_eq!(current["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn bedrock_bindings_refuse_websocket_and_mismatched_signers() {
+        let transport = Transport::new(64, 1).unwrap();
+        let mantle = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+        let bedrock = || Provider::new(transport.clone(), Family::Responses, mantle, None).unwrap();
+        assert!(bedrock().with_socket().is_err());
+        let keys = || aws::Keys::new("AKIDEXAMPLE".into(), "secret".into(), None);
+        let signer = |region: &str, service| Arc::new(aws::Aws::fixed(region, service, keys()));
+        assert!(
+            bedrock()
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_ok()
+        );
+        assert!(
+            bedrock()
+                .with_aws(signer("us-west-2", "bedrock-mantle"))
+                .is_err()
+        );
+        assert!(bedrock().with_aws(signer("us-east-1", "bedrock")).is_err());
+        let keyed = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            mantle,
+            Some("k".into()),
+        )
+        .unwrap();
+        assert!(
+            keyed
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_err()
+        );
+        let first_party = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://api.openai.com/v1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            first_party
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_err()
+        );
     }
 
     /// Bedrock serves both wire families this runtime already speaks, on two
