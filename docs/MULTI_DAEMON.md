@@ -89,7 +89,16 @@ The implementation must satisfy the whole path from admission to delivery:
    protocol instead of materializing the whole value. Size large blobs
    before loading them; reserve encoding overhead as well as payload
    bytes. Artifact reads require a named stream and a bounded page.
-   Update the CLI, shared client, and app to consume the new pages.
+   `resume` returns a bounded bot view: `instructions` and
+   `compaction_instructions` (64 KiB each today) are read through the
+   range protocol rather than inlined. Bound the SQLite work behind a
+   page, not only its output: oldest-first `history_nodes` orders the
+   whole ancestry before its `LIMIT`, and `history_items` walks from the
+   head to the oldest requested node. Use an indexed position (for
+   example a stored depth or ancestor anchors) or a scan budget that
+   returns a continuation, so a deep page costs about what a shallow one
+   does. Update the CLI (including `follow` and `interrupt`), shared
+   client, and app to consume the new pages.
 3. **Hold the charge through delivery.** Queued, materialized, serialized,
    and socket-held data all remain charged until written or discarded.
    Cancelling a request, disconnecting, or closing an overloaded follower
@@ -106,6 +115,10 @@ The implementation must satisfy the whole path from admission to delivery:
    admitted in bounded batches with at most one batch queued on the
    worker. Validate each follower against its requested stream, including
    a quiet bot whose last event is older than the fleet's last cursor.
+   The hub keys subscriptions and replay by name today; capture the bot
+   id at the initial lookup and check it at the handoff. A bot deleted
+   and recreated under that name ends the follow with an explicit
+   replacement notice instead of continuing on the new identity.
    A worker-ordered watermark or equivalent barrier must establish that
    replay and live delivery leave no gap. Do not substitute a comparison
    of unrelated per-bot and fleet cursors. Keep both the queued work and
@@ -127,6 +140,8 @@ tests, not claims about tests already written or passed.
 | A stopped reader, cancellation, and disconnect | Byte charges persist through socket delivery, then release; queued work and session/subscription counts return to baseline. |
 | Idle and stopped followers, both one-bot and fleet-wide | Admission and output stay bounded; closure is explicit; reconnect replays the retained interval. |
 | Commits during replay and a burst of tail attachments | Durable stream equals replay without gaps or duplicates, including quiet bots, retention notices, and restart. |
+| Deepest pages of a long history, and `resume` on a bot with maximal instructions | Page cost stays bounded by the page, not by history depth; the bot view fits the page ceiling and its long fields reassemble exactly. |
+| Delete and recreate a followed bot's name during replay | The follow ends with a replacement notice and never delivers the new bot's events. |
 | Existing CLI and app consumers | Their history, artifact, result, and follow flows still work through the bounded protocol. |
 
 Use the socket transport, synthetic provider, and fixtures from the
@@ -374,6 +389,16 @@ After a destination restore, use the origin and move nonce to verify the
 imported bot before rebinding to a new instance and replaying from scratch.
 A backup predating import answers `moved_bot_missing`, not a same-named bot.
 
+A source restore needs a fact the backup cannot roll back, because a
+backup from before prepare carries neither the nonce nor the fence.
+Destinations record each import by origin lineage and bot id. Restoring a
+store rotates its instance and leaves every bot fenced as
+`restore_unverified`; a bot runs again only after each configured peer
+confirms it holds no import of that bot from this lineage, or after an
+operator release that states the duplicate-execution risk. An unreachable
+peer keeps the fence. This relies on restore being detected, so it
+inherits the identity section's unsupported cases.
+
 Move runtime-local clocks and limits by meaning, not raw values. A paced
 turn re-enters the destination's provider gate, with a fresh per-call retry
 budget and preserved cumulative retry/pacing history. Charge source pacing
@@ -397,7 +422,7 @@ a time.
 | Restricted fork | Compare next request context against a local fork at the same checkpoint, including summary/note; preserve results, history ordinals, idempotency, older checkpoints, prune/delete, and imported-event visibility. Race submission and retention against paged export. Exercise every stated refusal. |
 | References and ancestry | Use colliding source/target ids across every carried record and event kind. Read pre-import outputs from the imported bot and its later local fork. Resolve handles embedded in instructions, notes, summaries, artifacts, and process results, including after another import. Reject missing or ambiguous origins. |
 | Drain | Drain a multi-round turn, restart, release, and prove its prompt and every completed round appear exactly once with no tool replay. |
-| Move | Crash/retry at each ownership boundary; race cancel, delete, waits, and followers; rename at import; exceed target pending bounds; use skewed clocks and restores before/after import. Prove at most one side can continue and old handles route correctly. |
+| Move | Crash/retry at each ownership boundary; race cancel, delete, waits, and followers; rename at import; exceed target pending bounds; use skewed clocks and restores before/after import; restore the source from a pre-prepare backup and submit to both sides. Prove at most one side can continue and old handles route correctly. |
 | Group | Move a waiting parent with its child atomically; the child completes, the parent resumes, and subsequent parent/child communication uses the remapped identities. |
 
 Each phase needs bounded resource measurements on long histories as well
