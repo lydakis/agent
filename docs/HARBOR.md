@@ -70,7 +70,8 @@ the same model can drive each harness on the same tasks.
 4. **Account.** Tokens come from every bot's turn records in that final copy,
    so a delegated bot's last call, or a bot created at the very end, is counted.
    They are grouped by model, so a delegated bot on another model is priced at
-   its own rates. Cost is
+   its own rates, and so is each call Anthropic's server-side fallback ran on
+   another model (the `models` split of its `usage` event). Cost is
    computed from LiteLLM's price table, as Harbor's own adapters do. It is left
    empty when any model used is missing from the table, rather than reported low.
    Provider failures map to Harbor's retryable error types, for example

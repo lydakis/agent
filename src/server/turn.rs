@@ -1067,6 +1067,17 @@ impl Turn {
                     if let Some(usage) = &completion.usage {
                         self.tokens.add(usage);
                     }
+                    for (from, to) in &completion.fallbacks {
+                        // A classifier declined and the provider continued
+                        // on another model; the usage event prices each.
+                        self.hub
+                            .live(
+                                &self.bot,
+                                json!({"event":"model_fallback","bot":self.bot,"turn":turn,
+                                    "durable":false,"from":from,"to":to}),
+                            )
+                            .await?;
+                    }
                     if completion.thinking_dropped > 0 {
                         // The provider found history edited under replayed
                         // thinking; the runtime should never cause this.

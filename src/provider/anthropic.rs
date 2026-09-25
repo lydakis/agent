@@ -1,7 +1,7 @@
 //! Anthropic Messages streaming: the assistant message is reconstructed from
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
-use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of};
+use super::{Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -18,6 +18,9 @@ enum Block {
         name: String,
         input: String,
     },
+    /// Where a server-side fallback switched models. Kept in place: the
+    /// API checks the thinking around it by its position.
+    Fallback(Value),
 }
 
 #[derive(Default)]
@@ -29,6 +32,8 @@ pub struct State {
     saw_usage: bool,
     done: bool,
     thinking_dropped: usize,
+    fallbacks: Vec<(Option<String>, String)>,
+    stop_details: Option<String>,
 }
 
 impl State {
@@ -79,7 +84,10 @@ impl State {
                         .map(str::to_owned)
                         .ok_or(Error::new("invalid_content"))
                 };
-                if block["type"] == "redacted_thinking" {
+                if matches!(
+                    block["type"].as_str(),
+                    Some("redacted_thinking" | "fallback")
+                ) {
                     self.account(frame.len())?;
                 }
                 self.blocks.push(match block["type"].as_str() {
@@ -89,6 +97,14 @@ impl State {
                         signature: String::new(),
                     },
                     Some("redacted_thinking") => Block::Redacted(block.clone()),
+                    Some("fallback") => {
+                        let to = block["to"]["model"]
+                            .as_str()
+                            .ok_or(Error::new("invalid_content"))?;
+                        let from = block["from"]["model"].as_str().map(str::to_owned);
+                        self.fallbacks.push((from, to.to_owned()));
+                        Block::Fallback(block.clone())
+                    }
                     Some("tool_use") => Block::ToolUse {
                         id: string("id")?,
                         name: string("name")?,
@@ -142,6 +158,25 @@ impl State {
                 if let Some(output) = event["usage"]["output_tokens"].as_u64() {
                     self.usage.output_tokens = output;
                 }
+                if let Some(iterations) = event["usage"]["iterations"].as_array() {
+                    self.iterations(iterations);
+                }
+                let details = &event["delta"]["stop_details"];
+                if details.is_object() {
+                    let part = |key: &str, label: &str| {
+                        details[key]
+                            .as_str()
+                            .map(|value| format!("{label} {value}"))
+                    };
+                    let parts: Vec<String> = [
+                        part("category", "category"),
+                        part("recommended_model", "retry on"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    self.stop_details = (!parts.is_empty()).then(|| parts.join("; "));
+                }
                 // Sent again after a server-side fallback.
                 self.dropped(&event["input_transformations"]);
                 self.dropped(&event["delta"]["input_transformations"]);
@@ -159,6 +194,43 @@ impl State {
             Some("ping") => Ok(Frame::Keepalive),
             _ => Ok(Frame::Quiet), // content_block_stop, unknown metadata
         }
+    }
+    /// Per-attempt usage after a server-side fallback, or on a turn a
+    /// sticky fallback served. An attempt declined before any output is not
+    /// billed; every other attempt is, at its own model's rates.
+    fn iterations(&mut self, iterations: &[Value]) {
+        let fallback = iterations.len() > 1
+            || iterations
+                .iter()
+                .any(|entry| entry["type"] == "fallback_message");
+        if !fallback {
+            return;
+        }
+        let tokens = |entry: &Value, key: &str| entry[key].as_u64().unwrap_or(0);
+        let last = iterations.len() - 1;
+        let models: Vec<ModelTokens> = iterations
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| *index == last || tokens(entry, "output_tokens") > 0)
+            .map(|(_, entry)| {
+                let read = tokens(entry, "cache_read_input_tokens");
+                ModelTokens {
+                    model: entry["model"].as_str().unwrap_or_default().to_owned(),
+                    input_tokens: tokens(entry, "input_tokens")
+                        + read
+                        + tokens(entry, "cache_creation_input_tokens"),
+                    output_tokens: tokens(entry, "output_tokens"),
+                    cached_input_tokens: read,
+                }
+            })
+            .collect();
+        self.usage = Usage {
+            input_tokens: models.iter().map(|m| m.input_tokens).sum(),
+            output_tokens: models.iter().map(|m| m.output_tokens).sum(),
+            cached_input_tokens: models.iter().map(|m| m.cached_input_tokens).sum(),
+            models,
+        };
+        self.saw_usage = true;
     }
     /// The thinking blocks the request lost to the binding check.
     fn dropped(&mut self, transformations: &Value) {
@@ -179,7 +251,21 @@ impl State {
         match self.stop_reason.as_deref() {
             Some("end_turn" | "stop_sequence" | "tool_use") => {}
             Some("max_tokens") => return fail_with("provider_incomplete", "max_tokens"),
-            Some("refusal") => return fail("provider_refusal"),
+            // With a fallback requested, the whole chain declined.
+            Some("refusal") => {
+                // The models already switched to ran and are billed too, so
+                // the failure names them.
+                let parts: Vec<String> = self
+                    .fallbacks
+                    .iter()
+                    .map(|(_, to)| format!("fell back to {to}"))
+                    .chain(self.stop_details)
+                    .collect();
+                return match parts.is_empty() {
+                    true => fail("provider_refusal"),
+                    false => fail_with("provider_refusal", parts.join("; ")),
+                };
+            }
             other => {
                 return fail_with(
                     "provider_incomplete",
@@ -189,8 +275,24 @@ impl State {
         }
         let mut content = Vec::with_capacity(self.blocks.len());
         let mut calls: Vec<ToolCall> = Vec::new();
-        for block in self.blocks {
+        // A model that declined partway through leaves its partial output
+        // before the last fallback block. Its text stays (an empty block
+        // would be rejected); its thinking and tool calls are not sent back,
+        // and its calls never run.
+        let switch = self
+            .blocks
+            .iter()
+            .rposition(|block| matches!(block, Block::Fallback(_)))
+            .unwrap_or(0);
+        for (index, block) in self.blocks.into_iter().enumerate() {
+            if index < switch
+                && !matches!(&block, Block::Text(text) if !text.is_empty())
+                && !matches!(block, Block::Fallback(_))
+            {
+                continue;
+            }
             content.push(match block {
+                Block::Fallback(block) => block,
                 Block::Text(text) => json!({"type":"text","text":text}),
                 Block::Thinking {
                     thinking,
@@ -223,6 +325,7 @@ impl State {
         let item = serde_json::to_vec(&json!({"role":"assistant","content":content}))?;
         Ok(Completion {
             thinking_dropped: self.thinking_dropped,
+            fallbacks: self.fallbacks,
             items: vec![Bytes::from(item)],
             calls,
             usage: self.saw_usage.then_some(self.usage),
@@ -277,7 +380,8 @@ mod tests {
             Some(Usage {
                 input_tokens: 20,
                 output_tokens: 7,
-                cached_input_tokens: 3
+                cached_input_tokens: 3,
+                models: Vec::new(),
             })
         );
     }
@@ -295,6 +399,127 @@ mod tests {
         let mut state = State::default();
         feed(&mut state, &[start, text, fallback, stop]);
         assert_eq!(state.finish().unwrap().thinking_dropped, 2);
+    }
+    #[test]
+    fn a_fallback_keeps_the_switch_and_prices_each_billed_attempt() {
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_start","message":{"model":"claude-opus-5-5","usage":{"input_tokens":5}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"old"}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"partial"}}"#,
+                r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t0","name":"shell","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"comm"}}"#,
+                r#"{"type":"content_block_start","index":4,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+                r#"{"type":"content_block_start","index":5,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":5,"delta":{"type":"text_delta","text":"done"}}"#,
+                r#"{"type":"content_block_start","index":6,"content_block":{"type":"tool_use","id":"t1","name":"shell","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":6,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7,"iterations":[{"type":"message","model":"claude-opus-5-5","input_tokens":5,"output_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":9,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":4}]}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let completion = state.finish().unwrap();
+        let item: Value = serde_json::from_slice(&completion.items[0]).unwrap();
+        let kinds: Vec<&str> = item["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        // The declined model's thinking, empty text and unfinished call are gone.
+        assert_eq!(kinds, ["text", "fallback", "text", "tool_use"]);
+        assert_eq!(item["content"][1]["to"]["model"], "claude-opus-4-8");
+        assert_eq!(completion.calls.len(), 1);
+        assert_eq!(completion.calls[0].call_id, "t1");
+        assert_eq!(
+            completion.fallbacks,
+            [(
+                Some("claude-opus-5-5".to_owned()),
+                "claude-opus-4-8".to_owned()
+            )]
+        );
+        let usage = completion.usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (20, 10));
+        assert_eq!(usage.cached_input_tokens, 2);
+        assert_eq!(usage.models.len(), 2);
+        assert_eq!(usage.models[1].model, "claude-opus-4-8");
+        assert_eq!(usage.models[1].input_tokens, 13);
+    }
+    #[test]
+    fn a_decline_before_output_is_not_billed_and_a_chain_refusal_says_why() {
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":9}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"ok"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1,"iterations":[{"type":"message","model":"claude-opus-5-5","input_tokens":9,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":9,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let usage = state.finish().unwrap().usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (9, 1));
+        assert_eq!(usage.models.len(), 1);
+        // A turn a sticky fallback served has no block but is still priced
+        // at the model that ran it; a plain turn carries no split.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1,"iterations":[{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":4,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert_eq!(
+            state.finish().unwrap().usage.unwrap().models[0].model,
+            "claude-opus-4-8"
+        );
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":4}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1,"iterations":[{"type":"message","model":"claude-opus-5-5","input_tokens":4,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}]}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert!(state.finish().unwrap().usage.unwrap().models.is_empty());
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber","recommended_model":"claude-opus-4-8"}},"usage":{"output_tokens":0}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let error = state.finish().unwrap_err();
+        assert_eq!(error.code, "provider_refusal");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("category cyber; retry on claude-opus-4-8")
+        );
+        // A chain that switched models and still declined names the switch.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"}},"usage":{"output_tokens":0}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert_eq!(
+            state.finish().unwrap_err().detail.as_deref(),
+            Some("fell back to claude-opus-4-8; category cyber")
+        );
     }
     #[test]
     fn truncated_or_errored_streams_never_complete() {

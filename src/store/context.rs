@@ -267,6 +267,14 @@ mod tests {
         let alone = br#"{"content":[{"type":"thinking","thinking":"a","signature":"s"}],"role":"assistant"}"#;
         assert_eq!(without_thinking(alone), Some(Vec::new()));
         assert_eq!(thinking_bytes(alone), alone.len() + 1);
+        // After a fallback only the answering model's thinking is stored,
+        // after the marker; removing it leaves the marker between the same
+        // blocks, and nothing on the declined side for the API to check.
+        let fallback = br#"{"content":[{"type":"text","text":"a"},{"type":"fallback","from":{"model":"x"},"to":{"model":"y"}},{"type":"thinking","thinking":"t","signature":"s"},{"type":"text","text":"b"}],"role":"assistant"}"#;
+        assert_eq!(
+            without_thinking(fallback).unwrap(),
+            br#"{"content":[{"type":"text","text":"a"},{"type":"fallback","from":{"model":"x"},"to":{"model":"y"}},{"type":"text","text":"b"}],"role":"assistant"}"#
+        );
         // A user item that mentions thinking is left alone, as is one without it.
         let user = br#"{"content":[{"type":"text","text":"\"thinking\""}],"role":"user"}"#;
         assert_eq!(thinking_bytes(user), 0);

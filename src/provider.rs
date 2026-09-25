@@ -151,6 +151,18 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    /// The billed attempts, when a provider-side fallback ran more than one
+    /// model for the call, so each can be priced at its model's rates. The
+    /// totals above are their sum.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelTokens>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelTokens {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
 }
 #[derive(Debug)]
 pub struct Completion {
@@ -160,6 +172,8 @@ pub struct Completion {
     /// Replayed thinking blocks the provider dropped because the history
     /// before them changed. The runtime avoids this, so any is a bug.
     pub thinking_dropped: usize,
+    /// Each model switch a provider-side fallback made, as (from, to).
+    pub fallbacks: Vec<(Option<String>, String)>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
@@ -409,6 +423,9 @@ impl Provider {
             thinking: Option<Value>,
             #[serde(skip_serializing_if = "Option::is_none")]
             output_config: Option<Value>,
+            /// A request a safety classifier declines is rerun on the model
+            /// Anthropic recommends for that refusal category.
+            fallbacks: &'static str,
         }
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
         let (mut bytes, field) = match self.family {
@@ -465,6 +482,7 @@ impl Provider {
                         .reasoning
                         .filter(|_| !legacy_thinking(request.model))
                         .map(|level| json!({"effort":level})),
+                    fallbacks: "default",
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -581,9 +599,12 @@ impl Provider {
             (Family::Anthropic, key) => {
                 // Opt every account into the thinking-binding check, dropping
                 // rather than failing on a mismatch; the drops are reported.
-                let http = http
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", "thinking-binding-controls-2026-08-01");
+                // Server-side fallbacks rerun a declined request on another
+                // model instead of ending the turn with a refusal.
+                let http = http.header("anthropic-version", "2023-06-01").header(
+                    "anthropic-beta",
+                    "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01",
+                );
                 match key {
                     Some(key) => http.header("x-api-key", key),
                     None => http,
@@ -1170,6 +1191,7 @@ mod tests {
         assert!(text.ends_with(",\"messages\":["));
         assert!(text.contains("\"type\":\"adaptive\""));
         assert!(text.contains("\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}"));
+        assert!(text.contains("\"fallbacks\":\"default\""));
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
         let legacy = provider
@@ -1187,6 +1209,7 @@ mod tests {
         let legacy = String::from_utf8(legacy).unwrap();
         assert!(legacy.contains("\"budget_tokens\":2048"));
         assert!(legacy.contains("\"prefix_mismatch_behavior\":\"drop_block\""));
+        assert!(legacy.contains("\"fallbacks\":\"default\""));
         assert!(!legacy.contains("output_config"));
         assert!(!text.contains("budget_tokens"));
         let mut empty_prefix = provider

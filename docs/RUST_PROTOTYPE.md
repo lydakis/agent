@@ -241,7 +241,8 @@ a process budget of two, because waiters hold nothing.
 
 ## Accounting and budgets
 
-Provider-reported usage records a durable `usage` event, and the store keeps running
+Provider-reported usage records a durable `usage` event (with a per-model
+`models` split when a provider-side fallback ran another model), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
@@ -450,6 +451,39 @@ dropped blocks rather than the turn. The response reports each drop in
 `thinking_dropped` event, which should never appear. The synthetic endpoint
 in the tests refuses mismatches outright, as `error` would. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
+
+Every Anthropic request also opts into server-side fallbacks
+(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header).
+The protocol described here is from Anthropic's documentation, read
+2026-09-25: [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)
+for the stream, the `usage.iterations` entries, billing and the replay rules,
+and Anthropic's model migration guide (the Claude Opus 5 and Claude Fable 5.1
+sections) for the `"default"` form and its beta header. Only model acceptance
+of the field was observed live; the fallback stream itself is exercised against
+a synthetic endpoint built from that description. With it, a request a safety
+classifier declines is rerun, on the same stream, on the
+model Anthropic recommends for that refusal category instead of ending the turn
+with `provider_refusal`. A `fallback` content block marks each switch. Blocks
+before the last one are a declined attempt's partial output: its non-empty text
+is kept as part of the answer, while its thinking and tool calls are neither
+stored, replayed, nor run. The marker is stored in place, since the API checks
+the thinking around it by its position. Each switch is published as a
+non-durable `model_fallback` event with `from` and `to`. When the response's
+per-attempt `usage.iterations` list is present it replaces the top-level usage,
+which covers only the last attempt: an attempt declined before any output is
+reported but not billed, so it is not counted, and every other attempt is
+billed at the rates of the model that ran it. The `usage` event then carries a
+`models` list with each billed attempt, including a turn that sticky routing
+(about an hour after a fallback) sent straight to the fallback model, so
+clients can price them per model; its totals are their sum. A refusal that
+survives the fallbacks still fails the turn with `provider_refusal`, with the
+models it switched to, the refusal category and any recommended retry model as
+its detail. Bedrock,
+Vertex and Foundry do not offer server-side fallback. Observed 2026-09-24:
+`claude-sonnet-5`, `claude-haiku-4-5` and `claude-sonnet-4-5` accept the field,
+and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
+with it set; a live refusal was not reproduced, so the fallback path is covered
+by parser and synthetic-endpoint tests.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
