@@ -217,7 +217,16 @@ source's rows unchanged.
    item over the 64 KiB page is served in byte ranges, the way `artifact`
    pages are. Admission also
    counts the bytes that queued and in-flight reads may return, against a
-   daemon-wide budget, and answers `observer_busy` past it. The acceptance check is
+   daemon-wide budget, and answers `observer_busy` past it. The charge
+   lasts until the bytes reach the socket, not until the reader hands the
+   response off: each session's output queue holds up to 2 MiB until its
+   writer drains it (at `da0f2ab`: `src/output.rs:14`), so a client that
+   stops reading would otherwise keep accepted pages in memory uncharged,
+   and N such observers would grow memory linearly again. The output
+   packet already carries its per-session byte permit and drops it once
+   written (`src/output.rs:16`, `45`, `72`); an observer page carries its
+   daemon-wide permit the same way, and the page counts as in flight for
+   its connection until then. The acceptance check is
    the context reader's queue-time percentiles (the per-operation
    histograms, NEXT item 27), unchanged with N observers replaying long
    logs against the same fleet without them.
@@ -262,7 +271,10 @@ source's rows unchanged.
    comes first because the reads below would otherwise use the two paths
    that already disturb bots, the context reader and the worker.
    Behavior test: an observer `item` read of an item larger than the
-   budget is charged its length before loading and served in ranges.
+   budget is charged its length before loading and served in ranges, and
+   observers that stop reading hold their pages' budget until the pages
+   are written, so further observer reads get `observer_busy` while bots
+   keep running.
 2. The `summary` read on it, plus the observe capability.
 3. The client digest in the CLI (JSON), then in the app.
 4. `fork` with a tool selection, and the summary-fork recipe, with the
@@ -593,6 +605,13 @@ carrying it over.
      origin ids to new ones would keep such references readable. Until
      that alias exists, import refuses a bot whose transcript holds
      artifact references, and names them, as it does for handles.
+   - "Transcript" here means everything the model sees, not only lineage
+     nodes. The context window also sends the bot's current note and its
+     compaction summary and prompts, which live in their own tables (at
+     `da0f2ab`: `src/store/db.rs:800-834`), and a summary can quote a
+     handle or an artifact reference from the history it covers. Every
+     scan, refusal, and alias rule for references and handles below
+     applies to the carried notes and compaction rows too.
    - Handles are different. `proc:N` names no bot, the client `wait`
      operation takes no bot (at `8ebbc44`: `src/server/mod.rs:157-163`), and
      a process result is looked up by id alone (`src/store/db.rs:2444`). An
@@ -825,7 +844,9 @@ carrying it over.
    next turn sees the same context as a local fork at the same node,
    `result` answers for imported turns, with the checkpoint and steer ids
    rewritten to target ids, a fork from an older imported completion stops
-   at its imported checkpoint, prune and delete
+   at its imported checkpoint, a compacted bot's next turn sees the same
+   summary and note, one whose note or summary quotes a handle or an
+   artifact reference fails the import, prune and delete
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
    of it, one-bot or `follow *`, replays the `imported` event and no false
@@ -870,9 +891,14 @@ carrying it over.
    rows and handle aliases, and one group receipt that tombstones every
    source bot together. Moving them one by one cannot work, since a child
    whose parent waits on it is refused and so is a parent whose child
-   handle does not travel. Behavior test: a parent parked on its child's
-   turn moves with the child and resumes at the destination when the
-   child finishes there.
+   handle does not travel. Creator links inside the group travel too:
+   the destination transaction remaps a child's `created_by` and
+   `created_by_id` to its moved parent's new name and id, so the child's
+   next turn still gets `AGENT_PARENT` and can reach it. Only a creator
+   outside the group is dropped, as in a single import. Behavior tests: a
+   parent parked on its child's turn moves with the child and resumes at
+   the destination when the child finishes there, and the child's next
+   turn after the move messages its parent there.
 
 ## Combined order
 
