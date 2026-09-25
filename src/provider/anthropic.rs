@@ -1,7 +1,9 @@
 //! Anthropic Messages streaming: the assistant message is reconstructed from
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
-use super::{Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of};
+use super::{
+    Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
+};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -130,7 +132,12 @@ impl State {
                     "signature_delta" => text("signature")?,
                     _ => return Ok(Frame::Quiet),
                 };
-                self.account(part.len())?;
+                // Partial JSON and signatures are stored as they arrive;
+                // text and thinking are escaped again when stored.
+                self.account(match kind.as_str() {
+                    "text_delta" | "thinking_delta" => encoded_len(&part),
+                    _ => part.len(),
+                })?;
                 match (kind.as_str(), self.block(&event["index"])?) {
                     ("text_delta", Block::Text(text)) => {
                         text.push_str(&part);
@@ -521,6 +528,27 @@ mod tests {
             Some("fell back to claude-opus-4-8; category cyber")
         );
     }
+    #[test]
+    fn the_output_bound_counts_text_as_it_will_be_encoded() {
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            ],
+        );
+        // Each quote takes two bytes once stored, so this fits decoded but
+        // not encoded.
+        let quotes = "\\\"".repeat(MAX_OUTPUT / 2 + 1);
+        let frame = format!(
+            r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{quotes}"}}}}"#
+        );
+        assert_eq!(
+            state.frame(frame.as_bytes()).unwrap_err().code,
+            "output_limit"
+        );
+    }
+
     #[test]
     fn truncated_or_errored_streams_never_complete() {
         let mut state = State::default();
