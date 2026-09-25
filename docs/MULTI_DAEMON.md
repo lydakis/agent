@@ -696,15 +696,32 @@ carrying it over.
    `bot_moved` event with the same destination details, which live
    followers receive and later replays show. Deletion today only sends a
    live, non-durable `deleted` notice (`src/server/mod.rs:1119`), which a
-   follower that reconnects would miss. Before a bundle has been written, cancelling just clears `moving`.
-   After that, the source cannot tell a lost receipt from an import that
+   follower that reconnects would miss. The line between a free cancel
+   and a guarded one is the export's cut, not the bundle file. The cut and
+   a cancel are both writes on the storage worker, so they are ordered:
+   the cut durably marks the move `exported` in the same transaction that
+   captures it, and every later export page checks that mark and the
+   nonce. A cancel that runs before the cut clears `moving` and retires
+   the nonce, so an exporter that already asked for it is refused at its
+   first page and the caller discards anything partial. Once the cut has
+   committed, the source cannot tell a lost receipt from an import that
    never happened, since no daemon talks to another. So cancelling then
    needs the destination's refusal: the caller asks the named destination
    to durably refuse that nonce, which it does only if it has not imported
    it, and carries the refusal back. The source clears `moving` only on a
    receipt-free refusal. A destination that is gone for good leaves the
    source `moving`; clearing that is an explicit operator override whose
-   error text names the risk of two live copies. A crash between steps
+   error text names the risk of two live copies.
+   The destination may later be restored, which reissues its instance
+   (see the shared first step), so the tombstone also names the
+   destination's lineage, and the imported bot keeps the move nonce and the
+   source instance in its row. A client that finds the named lineage under
+   a new instance does not trust the old mapping: it asks the destination
+   for the bot with that nonce. If the restored store has it, the client
+   rebinds to the new instance and replays from scratch, since cursors
+   from the old instance mean nothing there. If the backup predates the
+   import, the answer is `moved_bot_missing`, never a same-named bot.
+   A crash between steps
    leaves a `moving` source and at most one imported copy, at the named
    destination, and re-running the move resolves it.
    This holds against mistakes, not against a caller who edits a bundle:
@@ -839,11 +856,23 @@ carrying it over.
    awaited by a source parent is refused. A client `wait` registered
    before the move and one sent after the receipt are both answered with
    `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
-   names a renamed destination bot, `result` on a turn that finished
+   names a renamed destination bot, a cancel racing the export's first
+   page either refuses that page or needs the destination's refusal, a
+   destination restored from a backup after the import rebinds with a
+   fresh replay and one from before it answers `moved_bot_missing`,
+   `result` on a turn that finished
    before the move names its target handle, and a follower attached before the move
    receives the `bot_moved` event. A paced turn resumes at the target with a
    fresh per-call retry budget.
-7. Moving a parent together with the children it waits on.
+7. Moving a parent together with the children it waits on, as one group:
+   one bundle and one nonce that mark every participant `moving` in one
+   source transaction, one destination transaction that imports all their
+   rows and handle aliases, and one group receipt that tombstones every
+   source bot together. Moving them one by one cannot work, since a child
+   whose parent waits on it is refused and so is a parent whose child
+   handle does not travel. Behavior test: a parent parked on its child's
+   turn moves with the child and resumes at the destination when the
+   child finishes there.
 
 ## Combined order
 
