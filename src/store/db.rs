@@ -1932,16 +1932,22 @@ impl Database {
         }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
-            // Name the ways past a busy bot; callers do not find them unaided.
-            let doing = match bot.running_turn {
-                Some(turn) => format!("turn {turn} is running"),
-                None => "earlier work is waiting".to_owned(),
+            // Name the ways past a busy bot as flags to copy; callers, models
+            // included, do not act on a description of them.
+            let wait = match bot.running_turn {
+                Some(turn) => format!(
+                    "turn {turn} is running; resend with --delivery steer --turn {turn} \
+                     to add this to it, or --delivery queue to run it afterwards"
+                ),
+                None => "earlier work is waiting; resend with --delivery queue to run \
+                         this after it"
+                    .to_owned(),
             };
             return fail_with(
                 "bot_busy",
                 format!(
-                    "{doing}; retry with delivery steer to add this to the running turn, \
-                     queue to run it afterwards, or fork the bot to ask without interrupting it"
+                    "{wait}; to ask without interrupting, fork --source {name} --bot NEW \
+                     and send it to NEW"
                 ),
             );
         }

@@ -299,7 +299,7 @@ bound; the operating system is then the only limit.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls keep their fixed `max_tokens`. | none |
+| `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls use the model's full output limit. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
@@ -487,10 +487,21 @@ by parser and synthetic-endpoint tests.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
-(`thinking.type: adaptive` with summarized display) plus `output_config.effort`
-under a 32,768 `max_tokens` ceiling. Known legacy Claude ids (Haiku 4.5, 4.5 and
-older) instead get the budget form with 2,048, 8,192, or 16,384 tokens, since
-current models reject budgets and older ones require them. Reasoning summaries and thinking stream as
+(`thinking.type: adaptive` with summarized display) plus `output_config.effort`.
+Every Anthropic call sets `max_tokens` to the model's full output limit:
+128,000 for Claude 4.6 and later, 64,000 for Haiku 4.5, Sonnet 4.5, Opus 4.5,
+Sonnet 4 and Sonnet 3.7, 32,000 for Opus 4 and 4.1, and 8,192 or 4,096 for the
+Claude 3.5 and 3 models. A lower cap fails any answer that runs past it (a
+32,768 cap cut off a Sonnet 5 benchmark task mid-answer), and Anthropic counts
+only generated tokens against output rate limits, so the full limit costs
+nothing until it is used ([rate limits](https://platform.claude.com/docs/en/api/rate-limits),
+read 2026-09-25). The 128,000 and 64,000 values for current models come from the
+[models overview](https://platform.claude.com/docs/en/about-claude/models/overview),
+read 2026-09-25; the older values are Anthropic's published figures for those
+models, not re-read on that date. Known legacy Claude ids (Haiku 4.5, 4.5 and
+older) instead get the budget form with 2,048, 8,192, or 16,384 tokens, kept
+below `max_tokens`, since current models reject budgets and older ones require
+them. Reasoning summaries and thinking stream as
 `thinking_delta` events; Anthropic thinking blocks and signatures are stored in
 the assistant item so tool-using turns continue correctly. Usage is recorded as a
 durable `usage` event per model call. HTTP requests have a 10 second connect
@@ -527,7 +538,8 @@ or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
-history is unbounded), 256 KiB input prompt, 64 KiB instructions, 512 KiB terminal provider output, 2 MiB SSE frame,
+history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB terminal provider output
+(a full 128,000-token answer, under the 1 MiB event cap), 2 MiB SSE frame,
 16 MiB response stream, 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
@@ -805,9 +817,11 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
 
 - `reject` (default): `bot_busy` while a turn runs or is parked,
   `active_agent_limit` when no slot is free. Nothing is written. The
-  `bot_busy` detail names the running turn and the ways past it (steer,
-  queue, or a fork to ask without interrupting), since a model calling
-  `agent run` does not discover them otherwise.
+  `bot_busy` detail names the running turn and the ways past it as flags
+  to copy (`--delivery steer --turn N`, `--delivery queue`, or
+  `fork --source NAME --bot NEW` to ask without interrupting). A model
+  calling `agent run` does not discover them otherwise, and in benchmark runs
+  it ignored a prose description of them.
 - `queue`: the turn is a durable row that starts when the bot is free and a
   slot is open. The response reports `status`: `running` when it started at
   once, `queued` behind the bot's own work, or `ready` when only a slot is
