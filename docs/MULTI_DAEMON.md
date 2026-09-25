@@ -3,10 +3,14 @@
 A roadmap for four ideas George raised on 2026-09-20. None of it is built.
 Each section says what the code does today, what would have to change, the
 main risks, and an order of work. Source references are to `612ae1d` and were
-read on 2026-09-23, except references marked `8ebbc44`, which were added
-after main moved to schema 26 and after the first review, and references
-marked `e1d413f`, which were added on 2026-09-24 after the second review.
-Claims about the code are verified at those revisions; everything
+read on 2026-09-23, except references marked with another revision:
+`8ebbc44` (read 2026-09-23, after main moved to schema 26), `e1d413f`
+(read 2026-09-24, after the second review), and the review branch's own
+commits `f47adff` (read 2026-09-24) and `da0f2ab`, `8b3479b`, `61c24e1`,
+`bcc6b1c`, and `d006bb4` (read 2026-09-25). The branch changes only
+documentation after merging `e1d413f`, so the code at those later
+commits is the code at `e1d413f`. Claims about the code are verified at
+those revisions; everything
 under "would change" and "order" is a proposal, and anything unmeasured says
 so.
 
@@ -83,7 +87,14 @@ written back over the same file: device, inode, and id all still match.
 So a restore must replace the store file rather than overwrite it, which
 gives it a new inode and a new instance; an `agent restore` helper that
 writes beside the store and renames over it makes that the easy path, and
-overwriting a live store's file in place is unsupported. Anything that must
+overwriting a live store's file in place is unsupported. The store runs
+in WAL mode, so the main file alone is not a restore boundary: after an
+unclean stop, a `-wal` file left beside it can hold committed frames that
+SQLite would replay into the restored file, bringing back turns, events,
+or move nonces the backup discarded. The helper therefore takes the
+owner lock (so no daemon has the store open), writes the backup as one
+self-contained file, removes the old `-wal` and `-shm`, and only then
+renames the backup over the store. Anything that must
 name exactly one store, such as a client's state key or a move's
 destination, uses the instance id. A block-level clone of a whole disk or
 machine keeps device, inode, and sidecar and is not detected either; both
@@ -180,7 +191,16 @@ source's rows unchanged.
    replay page except the last off the worker. Keep the final "empty page,
    switch to live" step as a worker job, since that is what guarantees no
    committed event falls between replay and live
-   (`src/server/hub.rs:139-141`). The pages must not go to the existing
+   (`src/server/hub.rs:139-141`). One such job per follower would let a
+   burst of followers that are already at the tail queue one job each
+   ahead of later commits on the single FIFO worker
+   (`src/server/hub.rs:146-157`). So the handoffs are batched: followers
+   that reach the tail wait for one shared handoff job, which reads the
+   current last cursor once and switches every waiting follower whose
+   cursor matches to live, sending the rest back to the observer reader
+   for another page. At most one handoff job is queued at a time,
+   whatever the number of followers. The acceptance workload includes a
+   burst of tail follows and measures commit tail latency during it. The pages must not go to the existing
    reader: that one thread also streams context into model requests, so
    moving replay there only moves the stall from commits to request
    construction. They go to a second read-only connection that serves
@@ -647,7 +667,11 @@ carrying it over.
      so a command's output that names a handle is a reference too. Every
      scan, refusal, and alias rule for references and handles below
      applies to all of these: lineage nodes, notes, compaction rows,
-     instructions, and carried artifact streams. Export already
+     instructions, carried artifact streams, and finished process results.
+     A finished background command is allowed in the first slice, its
+     result is stored as text (at `d006bb4`: `src/store/db.rs:2675`), and
+     a later `wait` on its handle returns that text to the model
+     (`src/store/db.rs:2705`), retained-output references included. Export already
      decompresses each stream through `artifact::read`, so the scan
      reads bytes that are passing through anyway.
    - Handles are different. `proc:N` names no bot, the client `wait`
@@ -852,6 +876,16 @@ carrying it over.
   should take a workspace mapping, apply it to the bot and to every
   unfinished turn's workspace, and refuse a path that does not exist, and
   whether the model is told about the move is a client-policy question.
+- **Queued work.** A drained bot can still have `ready` and `queued`
+  turns behind the drained one, and a move carries them. The target's
+  pending bounds apply to them as to any submission: today a submission
+  that would wait is refused with `pending_limit` when the store is at
+  its turn or byte bound (at `d006bb4`: `src/store/db.rs:1891-1905`).
+  Import counts the whole incoming queue against the target's bounds in
+  its transaction and refuses the whole import with `pending_limit` and
+  the counts if it does not fit; it never admits part of a queue. There
+  is no override: the caller can drain the queue at the source or raise
+  the target's bounds.
 - **Side effects.** Only a drained or idle bot moves. A bot that was
   interrupted may have `tool_outcome_unknown` calls whose processes are
   still running on the source host. The move does not change that; the
@@ -895,7 +929,9 @@ carrying it over.
 ### Order
 
 1. Store identity, lineage and instance. Behavior tests: a restart keeps
-   the instance, and a copied store file, a restore through the helper,
+   the instance, a restore through the helper over a store with an
+   uncheckpointed WAL keeps none of the discarded frames, and a copied
+   store file, a restore through the helper,
    and a restore of a backup from an earlier instance each announce a new
    one.
 2. Export of an idle root bot with no running processes, and import as a
@@ -919,7 +955,9 @@ carrying it over.
 3. The alias decision for artifact references, with a test that reads one
    written before the move, from the imported bot and from a local fork
    of it, and store-qualified handles with import-time
-   handle aliases, with a test that an artifact whose contents name a
+   handle aliases, with a test that `wait` on a finished background
+   command's handle after import returns its result with any references
+   in it resolved, a test that an artifact whose contents name a
    moved handle resolves through the alias when read back, and a test
    that an imported bot's `wait` on a
    `turn:` and a `proc:` handle from before the move resolves at the
@@ -951,7 +989,9 @@ carrying it over.
    fresh replay and one from before it answers `moved_bot_missing`,
    `result` on a turn that finished
    before the move names its target handle, and a follower attached before the move
-   receives the `bot_moved` event. A paced turn resumes at the target with a
+   receives the `bot_moved` event. A drained bot with more queued work
+   than the target's pending bound is refused whole with `pending_limit`.
+   A paced turn resumes at the target with a
    fresh per-call retry budget and `paced_ms` that counts source pacing
    up to the cut and target pacing from the import, with the two hosts'
    clocks set apart.
