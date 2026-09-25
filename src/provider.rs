@@ -174,18 +174,33 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Input tokens written to the provider's prompt cache, which Anthropic
+    /// bills above the base input rate. Part of `input_tokens`, like cache
+    /// reads; zero for providers that do not bill writes.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
     /// The billed attempts, when a provider-side fallback ran more than one
-    /// model for the call, so each can be priced at its model's rates. The
-    /// totals above are their sum.
+    /// model for the call, or the summarizer's model on a compaction call,
+    /// so each can be priced at its model's rates. The totals above are
+    /// their sum.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelTokens>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelTokens {
     pub model: String,
+    /// The provider binding that ran it, when that may not be the turn's:
+    /// set on summarizer calls, which can use another provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 #[derive(Debug)]
 pub struct Completion {

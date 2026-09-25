@@ -61,13 +61,15 @@ impl State {
             Some("message_start") => {
                 // Anthropic reports cache reads and cache writes outside
                 // input_tokens; count every processed input token, as the
-                // Responses family does, and keep cache reads separately.
+                // Responses family does, and keep reads and writes separately
+                // since each is billed at its own rate.
                 let usage = &event["message"]["usage"];
                 let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
                 let created = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
                 self.usage.input_tokens =
                     usage["input_tokens"].as_u64().unwrap_or(0) + read + created;
                 self.usage.cached_input_tokens = read;
+                self.usage.cache_write_tokens = created;
                 self.saw_usage = true;
                 self.dropped(&event["message"]["input_transformations"]);
                 Ok(Frame::Quiet)
@@ -221,13 +223,14 @@ impl State {
             .filter(|(index, entry)| *index == last || tokens(entry, "output_tokens") > 0)
             .map(|(_, entry)| {
                 let read = tokens(entry, "cache_read_input_tokens");
+                let written = tokens(entry, "cache_creation_input_tokens");
                 ModelTokens {
                     model: entry["model"].as_str().unwrap_or_default().to_owned(),
-                    input_tokens: tokens(entry, "input_tokens")
-                        + read
-                        + tokens(entry, "cache_creation_input_tokens"),
+                    provider: None,
+                    input_tokens: tokens(entry, "input_tokens") + read + written,
                     output_tokens: tokens(entry, "output_tokens"),
                     cached_input_tokens: read,
+                    cache_write_tokens: written,
                 }
             })
             .collect();
@@ -235,6 +238,7 @@ impl State {
             input_tokens: models.iter().map(|m| m.input_tokens).sum(),
             output_tokens: models.iter().map(|m| m.output_tokens).sum(),
             cached_input_tokens: models.iter().map(|m| m.cached_input_tokens).sum(),
+            cache_write_tokens: models.iter().map(|m| m.cache_write_tokens).sum(),
             models,
         };
         self.saw_usage = true;
@@ -388,6 +392,7 @@ mod tests {
                 input_tokens: 20,
                 output_tokens: 7,
                 cached_input_tokens: 3,
+                cache_write_tokens: 5,
                 models: Vec::new(),
             })
         );
@@ -456,6 +461,9 @@ mod tests {
         assert_eq!(usage.models.len(), 2);
         assert_eq!(usage.models[1].model, "claude-opus-4-8");
         assert_eq!(usage.models[1].input_tokens, 13);
+        // Cache writes stay with the attempt that made them.
+        assert_eq!(usage.cache_write_tokens, 4);
+        assert_eq!(usage.models[1].cache_write_tokens, 4);
     }
     #[test]
     fn a_decline_before_output_is_not_billed_and_a_chain_refusal_says_why() {

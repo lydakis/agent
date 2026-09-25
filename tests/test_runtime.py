@@ -426,9 +426,12 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([(m['from'], m['to']) for m in fallback], [('synthetic-claude', 'synthetic-fallback')])
         # Both attempts produced output, so both are billed, each at its model.
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2, 'models': [
+        # Cache writes are recorded with the attempt that made them.
+        self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2,
+                                    'cache_write_tokens': 1, 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
-            {'model': 'synthetic-fallback', 'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 0}]})
+            {'model': 'synthetic-fallback', 'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 0,
+             'cache_write_tokens': 1}]})
         model.requests.get(timeout=1)
         second = model.requests.get(timeout=1)
         # The declined attempt's text continues the answer; its thinking and

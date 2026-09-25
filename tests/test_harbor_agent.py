@@ -153,6 +153,57 @@ class HarborAgentTest(unittest.TestCase):
         # Totals are unchanged; only the split moves.
         self.assertEqual((context.n_input_tokens, context.n_output_tokens), (1000, 100))
 
+    def test_cache_writes_are_priced_at_the_write_rate(self):
+        rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5,
+                          'cache_read_input_token_cost': 1e-7, 'cache_creation_input_token_cost': 1.25e-6},
+                 'gw/backup': {'input_cost_per_token': 2e-6, 'output_cost_per_token': 2e-5,
+                               'cache_creation_input_token_cost': 2.5e-6}}
+        with tempfile.TemporaryDirectory() as logs, \
+                mock.patch.dict('litellm.model_cost', rates):
+            path = Path(logs, 'state.sqlite')
+            store(path, [('task', 'gw/m', 'completed', 1000)])
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE events(id INTEGER PRIMARY KEY, bot TEXT, turn INT, kind TEXT, data TEXT)')
+                usage = [{'input_tokens': 600, 'output_tokens': 50, 'cached_input_tokens': 300,
+                          'cache_write_tokens': 200},
+                         {'input_tokens': 400, 'output_tokens': 50, 'cached_input_tokens': 200,
+                          'cache_write_tokens': 100,
+                          'models': [{'model': 'm', 'input_tokens': 100, 'output_tokens': 0,
+                                      'cached_input_tokens': 0, 'cache_write_tokens': 0},
+                                     {'model': 'backup', 'input_tokens': 300, 'output_tokens': 50,
+                                      'cached_input_tokens': 200, 'cache_write_tokens': 100}]}]
+                for data in usage:
+                    db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                               (json.dumps(data),))
+            context = AgentContext()
+            self.agent(logs).populate_context_post_run(context)
+        usage = context.model_usage
+        # gw/m: 700 input of which 300 cached and 200 written; the fallback's
+        # write is priced at the backup model's own write rate.
+        self.assertAlmostEqual(usage['gw/m'].cost_usd, 200 * 1e-6 + 200 * 1.25e-6 + 300 * 1e-7 + 50 * 1e-5)
+        self.assertAlmostEqual(usage['gw/backup'].cost_usd, 100 * 2.5e-6 + 200 * 2e-6 + 50 * 2e-5)
+
+    def test_a_summary_is_priced_at_the_summarizers_provider_and_model(self):
+        rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5},
+                 'other/cheap': {'input_cost_per_token': 1e-7, 'output_cost_per_token': 1e-6,
+                                 'cache_creation_input_token_cost': 2e-7}}
+        with tempfile.TemporaryDirectory() as logs, \
+                mock.patch.dict('litellm.model_cost', rates):
+            path = Path(logs, 'state.sqlite')
+            store(path, [('task', 'gw/m', 'completed', 1000)])
+            summary = {'model': 'cheap', 'provider': 'other', 'input_tokens': 400, 'output_tokens': 40,
+                       'cached_input_tokens': 0, 'cache_write_tokens': 100}
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE events(id INTEGER PRIMARY KEY, bot TEXT, turn INT, kind TEXT, data TEXT)')
+                db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                           (json.dumps({**summary, 'purpose': 'compaction', 'models': [summary]}),))
+            context = AgentContext()
+            self.agent(logs).populate_context_post_run(context)
+        usage = context.model_usage
+        self.assertEqual(sorted(usage), ['gw/m', 'other/cheap'])
+        self.assertAlmostEqual(usage['other/cheap'].cost_usd, 300 * 1e-7 + 100 * 2e-7 + 40 * 1e-6)
+        self.assertEqual(usage['gw/m'].n_input_tokens, 600)
+
     def test_a_turn_served_only_by_the_fallback_needs_no_price_for_the_requested_model(self):
         rates = {'gw/backup': {'input_cost_per_token': 2e-6, 'output_cost_per_token': 2e-5}}
         with tempfile.TemporaryDirectory() as logs, \
@@ -218,6 +269,24 @@ class HarborAgentTest(unittest.TestCase):
             self.agent(logs).populate_context_post_run(context)
         self.assertEqual((context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens),
                          (200, 80, 14))
+
+    def test_streamed_usage_keeps_each_calls_model_split(self):
+        rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5},
+                 'other/cheap': {'input_cost_per_token': 1e-7, 'output_cost_per_token': 1e-6,
+                                 'cache_creation_input_token_cost': 2e-7}}
+        answer = {'input_tokens': 100, 'cached_input_tokens': 40, 'output_tokens': 7}
+        split = {'model': 'cheap', 'provider': 'other', 'input_tokens': 400, 'output_tokens': 40,
+                 'cached_input_tokens': 0, 'cache_write_tokens': 100}
+        summary = {**split, 'purpose': 'compaction', 'models': [split]}
+        with tempfile.TemporaryDirectory() as logs, \
+                mock.patch.dict('litellm.model_cost', rates):
+            Path(logs, 'agent.jsonl').write_text('\n'.join(
+                json.dumps({'event': 'usage', 'data': data}) for data in (answer, summary)))
+            context = AgentContext()
+            self.agent(logs).populate_context_post_run(context)
+        usage = context.model_usage
+        self.assertEqual((usage['gw/m'].n_input_tokens, usage['other/cheap'].n_input_tokens), (100, 400))
+        self.assertAlmostEqual(usage['other/cheap'].cost_usd, 300 * 1e-7 + 100 * 2e-7 + 40 * 1e-6)
 
     def test_a_daemon_that_never_started_reports_nothing(self):
         with tempfile.TemporaryDirectory() as logs:

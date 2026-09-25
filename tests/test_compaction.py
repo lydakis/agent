@@ -296,6 +296,12 @@ class CompactionTests(ModelFixture):
         usage = [e['data'] for e in events if e['event'] == 'usage']
         self.assertEqual(sum(u['input_tokens'] + u['output_tokens'] for u in usage), 330)
         self.assertEqual(sum(u.get('purpose') == 'compaction' for u in usage), 1)
+        # The summary names the model that wrote it, so it is priced at that
+        # model's rates even when that is not the turn's model.
+        summary = next(u for u in usage if u.get('purpose') == 'compaction')
+        bob = client.request('resume', bot='Bob')['result']
+        self.assertEqual([(m['provider'], m['model']) for m in summary['models']],
+                         [(bob['provider'], bob['model'])])
         self.assertFalse(any(m.get('event') == 'text_delta' and '[compaction request]' in m.get('text', '')
                              for m in client.saved))
         self.assertTrue(any(m.get('event') == 'compaction_text_delta' for m in client.saved))
