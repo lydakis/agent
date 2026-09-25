@@ -819,7 +819,9 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   `active_agent_limit` when no slot is free. Nothing is written. The
   `bot_busy` detail names the running turn and the ways past it as flags
   to copy (`--delivery steer --turn N`, `--delivery queue`, or
-  `fork --source NAME --bot NEW` to ask without interrupting). A model
+  `fork --source NAME --checkpoint C --bot NEW` to ask without interrupting,
+  where `C` is the head the running turn started from; a first turn has no
+  such point, so no fork is offered). A model
   calling `agent run` does not discover them otherwise, and in benchmark runs
   it ignored a prose description of them.
 - `queue`: the turn is a durable row that starts when the bot is free and a

@@ -1,6 +1,7 @@
 """The agent command: daemon startup, run/follow/ls, peers, and socket rendezvous."""
 import fcntl
 import json
+import re
 import http.server
 import concurrent.futures
 import threading
@@ -135,9 +136,15 @@ class SocketAndCliTests(ModelFixture):
         refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('bot_busy', refused.stderr + refused.stdout)
-        # The refusal gives flags to copy, not a description of them.
-        for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue', 'fork --source Bob --bot NEW'):
+        # The refusal gives flags to copy, not a description of them, and the
+        # fork it offers works while the turn runs.
+        for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue'):
             self.assertIn(flags, refused.stderr + refused.stdout)
+        fork = re.search(r'fork (--source Bob --checkpoint \d+) --bot NEW', refused.stderr + refused.stdout)
+        self.assertIsNotNone(fork, refused.stderr + refused.stdout)
+        self.agent('fork', '--store', str(self.store), *fork.group(1).split(), '--bot', 'Side')
+        side = self.agent('run', '--store', str(self.store), '--bot', 'Side', 'aside')
+        self.assertEqual(side.returncode, 0)
         queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'queue', 'second').stdout)
         self.assertEqual(queued['status'], 'queued')

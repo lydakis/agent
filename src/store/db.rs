@@ -1943,12 +1943,28 @@ impl Database {
                          this after it"
                     .to_owned(),
             };
+            // A fork needs a settled point: during a turn, the head the turn
+            // started from. A first turn has none, so no fork is offered.
+            let checkpoint = match bot.running_turn {
+                Some(turn) => self
+                    .conn
+                    .query_row("SELECT parent FROM nodes WHERE turn=?", [turn], |row| {
+                        row.get::<_, Option<i64>>(0)
+                    })
+                    .optional()?
+                    .flatten()
+                    .map(|node| format!(" --checkpoint {node}")),
+                None => Some(String::new()),
+            };
             return fail_with(
                 "bot_busy",
-                format!(
-                    "{wait}; to ask without interrupting, fork --source {name} --bot NEW \
-                     and send it to NEW"
-                ),
+                match checkpoint {
+                    Some(checkpoint) => format!(
+                        "{wait}; to ask without interrupting, fork --source {name}{checkpoint} \
+                         --bot NEW and send it to NEW"
+                    ),
+                    None => wait,
+                },
             );
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
