@@ -94,9 +94,13 @@ environment keys never conflict; a stated provider must be registered with the
 same family and URL. Limit comparisons
 use effective values: `--idle-exit 0` disables idle exit, and positive context
 limits below 1,024 bytes or two items are raised to those minimums.
-Providers are selected explicitly with `--provider`, or implied by which of the
-well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`)
-are set. No other credential discovery happens. `--no-spawn` refuses to start a
+Providers are selected explicitly with `--provider`; otherwise by
+`AGENT_PROVIDER`, which holds the same specs separated by whitespace (a spec
+contains commas), such as `AGENT_PROVIDER="chatgpt bedrock"`; otherwise by which
+of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
+for starting a daemon: a running daemon is not checked against it, since every
+bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
 daemon. Default tools are `shell,read,write,edit,wait,history`; `note`, the
 carry-forward note, is in the universe and chosen per bot.
 
