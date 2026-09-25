@@ -635,13 +635,21 @@ carrying it over.
      origin ids to new ones would keep such references readable. Until
      that alias exists, import refuses a bot whose transcript holds
      artifact references, and names them, as it does for handles.
-   - "Transcript" here means everything the model sees, not only lineage
-     nodes. The context window also sends the bot's current note and its
-     compaction summary and prompts, which live in their own tables (at
-     `da0f2ab`: `src/store/db.rs:800-834`), and a summary can quote a
-     handle or an artifact reference from the history it covers. Every
+   - "Transcript" here means everything the model sees or can read back,
+     not only lineage nodes. The context window also sends the bot's
+     current note and its compaction summary and prompts, which live in
+     their own tables (at `da0f2ab`: `src/store/db.rs:800-834`), and a
+     summary can quote a handle or an artifact reference from the history
+     it covers. Every request also carries the bot's instructions and its
+     compaction instructions (at `bcc6b1c`: `src/server/turn.rs:411`,
+     `468`, `881`), which a caller may have written with a handle in them.
+     And a retained artifact is text the model reads back through `read`,
+     so a command's output that names a handle is a reference too. Every
      scan, refusal, and alias rule for references and handles below
-     applies to the carried notes and compaction rows too.
+     applies to all of these: lineage nodes, notes, compaction rows,
+     instructions, and carried artifact streams. Export already
+     decompresses each stream through `artifact::read`, so the scan
+     reads bytes that are passing through anyway.
    - Handles are different. `proc:N` names no bot, the client `wait`
      operation takes no bot (at `8ebbc44`: `src/server/mod.rs:157-163`), and
      a process result is looked up by id alone (`src/store/db.rs:2444`). An
@@ -790,10 +798,16 @@ carrying it over.
    on no handles completes at once, and startup resumes only `waiting` and
    `paced` turns (at `e1d413f`: `src/store/db.rs:2550-2561`). So a drain
    is its own durable turn status, `drained`, which startup leaves alone.
-   It becomes runnable in exactly two ways: import commits it at the target
-   as `ready`, or cancelling the move on the source returns it to `ready`
-   there, under the same refusal rule as any cancel after export. A
-   tombstoned source never resumes it.
+   It becomes runnable in exactly two ways: import commits it at the
+   target, or cancelling the move on the source releases it there, under
+   the same refusal rule as any cancel after export. A tombstoned source
+   never resumes it. Released is not `ready`. A `ready` turn goes through
+   `start`, whose `start_locked` appends the turn's prompt as a new user
+   item (at `bcc6b1c`: `src/store/db.rs:3679-3684`), and a drained turn
+   has already appended its prompt and run rounds. So a released drained
+   turn stays started and goes through the resume path, as a restarted
+   daemon resumes a paced turn: it continues from the durable head at the
+   round boundary without appending anything.
 8. **Parked turns that wait on handles.** Once handles are
    store-qualified, a parked turn's handle into its own store still
    resolves at the target only if the whole subtree moves together, a
@@ -890,7 +904,8 @@ carrying it over.
    `result` answers for imported turns, with the checkpoint and steer ids
    rewritten to target ids, a fork from an older imported completion stops
    at its imported checkpoint, a compacted bot's next turn sees the same
-   summary and note, one whose note or summary quotes a handle or an
+   summary and note, one whose note, summary, or instructions quote a
+   handle or an
    artifact reference fails the import, prune and delete
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
@@ -904,7 +919,9 @@ carrying it over.
 3. The alias decision for artifact references, with a test that reads one
    written before the move, from the imported bot and from a local fork
    of it, and store-qualified handles with import-time
-   handle aliases, with a test that an imported bot's `wait` on a
+   handle aliases, with a test that an artifact whose contents name a
+   moved handle resolves through the alias when read back, and a test
+   that an imported bot's `wait` on a
    `turn:` and a `proc:` handle from before the move resolves at the
    destination, so that bots with retained tool output or delegation can
    move. Until this step, the
@@ -914,13 +931,16 @@ carrying it over.
 4. A representation for fork ancestry, so forks can be imported.
 5. Drain to a round boundary for a running bot, with the durable
    `drained` status. Behavior tests: a drained turn stays parked across a
-   restart, and undraining it on the same store returns it to `ready`.
+   restart, and undraining it on the same store resumes it at the round
+   boundary with its prompt in the transcript exactly once.
 6. Move bound to one destination instance, with `moving` and tombstone
    states and `bot_moved` answers. Behavior tests: a copy of the
    destination refuses the bundle, and after export a cancel without the
    destination's refusal is refused. A drained turn stays parked across a
    source restart and resumes at the target
-   under its mapped workspace and checked model, and a move whose bot is
+   under its mapped workspace and checked model, a drained turn that ran
+   several rounds before the move has its prompt and each round in the
+   target transcript exactly once, and a move whose bot is
    awaited by a source parent is refused. A client `wait` registered
    before the move and one sent after the receipt are both answered with
    `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
