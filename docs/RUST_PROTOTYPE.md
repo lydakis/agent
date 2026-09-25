@@ -250,7 +250,8 @@ Provider-reported usage records a durable `usage` event (with a per-model
 summarizer call, naming the summarizer's provider and model, and
 `cache_write_tokens` when Anthropic wrote input to its prompt cache: part of
 `input_tokens`, billed above the base rate, and kept only in the event since
-no budget or cache ratio needs it), and the store keeps running
+no budget or cache ratio needs it; a prompt-cache refresh's event carries
+`purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
@@ -309,6 +310,7 @@ bound; the operating system is then the only limit.
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--max-output-tokens` | Generated tokens per model call, including reasoning. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
+| `--keep-warm` | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 disables. | 240 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
@@ -485,6 +487,40 @@ dropped blocks rather than the turn. The response reports each drop in
 `thinking_dropped` event, which should never appear. The synthetic endpoint
 in the tests refuses mismatches outright, as `error` would. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
+
+### Keeping the Anthropic cache warm
+
+Anthropic's default prompt cache lives five minutes from its last read, and a
+foreground tool call may run ten. On 2026-09-25 a Sonnet 5 bot idle for eight
+minutes between two calls read only its 2.3k-token system and tools prefix
+from cache; the 6.8k-token conversation was written again at 1.25 times the
+input rate. The one-hour cache read all 9.0k, but it bills every write at
+twice the input rate, idle or not. So the daemon keeps the five-minute cache
+instead. While a turn runs a tool, once the last call's cache has gone
+`--keep-warm` seconds unread (240 by default), it sends that call's request
+again with `max_tokens: 0` and `stream: false`. That request generates
+nothing, bills a cache read, and restarts the cache's lifetime. It repeats
+until the tool finishes. A refresh the tool's result interrupts is dropped if
+it was not yet sent, and otherwise answered, so its cost is recorded.
+Nothing else in the request differs, since the cache is keyed on everything it
+renders. A refresh is paced like a call, but gives up after 30 seconds
+waiting for its pool, since it would land after the cache expired. A refused
+refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
+until the next model call, which pays the write it would have paid anyway.
+
+The refresh follows Anthropic's
+[prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+guidance, read 2026-09-25 through Anthropic's API skill, not the live page. It recommends this over the
+one-hour cache for five-to-sixty-minute gaps, especially on Claude Fable
+5.1, whose cache reads cost 0.025 times the input rate. It also lists the
+requests `max_tokens: 0` rejects: streaming, budgeted thinking
+(`thinking.type: "enabled"`), structured outputs, and forced tool choice. So
+older models with thinking on are not refreshed. Bedrock is also left out
+until the same request is verified there. Refreshes cover foreground tool
+calls only: a turn parked on `wait` has no live task to send them, and a bot
+between turns may never be called again. The Responses cache needs none: the
+ChatGPT backend still read 7.4k of 7.7k tokens after a 20-minute gap, and it
+refuses `prompt_cache_retention: "24h"` with a 400.
 
 Every Anthropic request also opts into server-side fallbacks
 (`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header).

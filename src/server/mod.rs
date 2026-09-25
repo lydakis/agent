@@ -342,6 +342,9 @@ pub struct Configuration {
     /// Seconds an established provider stream may go without a content
     /// frame before the attempt fails and is retried; default 120.
     pub stall_timeout: Option<u64>,
+    /// Seconds an Anthropic prompt cache may sit unread while a tool runs
+    /// before it is refreshed; default 240, 0 disables.
+    pub keep_warm: Option<u64>,
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
@@ -501,6 +504,11 @@ pub async fn run(config: Configuration) -> Result<()> {
     let stall_timeout = config
         .stall_timeout
         .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
+    let keep_warm = match config.keep_warm {
+        Some(0) => None,
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => Some(agent_runtime::provider::KEEP_WARM),
+    };
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let credentials = agent_runtime::tools::Credentials::default();
@@ -548,7 +556,9 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.socket {
             provider = provider.with_socket()?;
         }
-        let provider = provider.with_stall_timeout(stall_timeout)?;
+        let provider = provider
+            .with_stall_timeout(stall_timeout)?
+            .with_keep_warm(keep_warm)?;
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
@@ -601,6 +611,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs(),
+            "keep_warm_seconds":keep_warm.map_or(0, |after| after.as_secs()),
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
             "retain_turns":config.retain_turns},

@@ -194,6 +194,23 @@ impl TokenTotals {
     }
 }
 
+/// The last model call of a turn, kept so its prompt cache can be refreshed
+/// while the calls it planned run: see [`Turn::run_tool`].
+struct Warm<'a> {
+    provider: &'a Provider,
+    model: &'a str,
+    instructions: &'a str,
+    reasoning: Option<&'a str>,
+    tools: &'a serde_json::value::RawValue,
+    context: &'a Context,
+    after: std::time::Duration,
+    /// When the cache was last read, by the call or a refresh.
+    read_at: tokio::time::Instant,
+    stopped: bool,
+    /// Tokens the refreshes billed, for the bot's budget.
+    tokens: u64,
+}
+
 /// Lives outside the cancellable rounds future. No allocation or per-attempt
 /// storage write: each execution segment flushes once, including when parked.
 #[derive(Default)]
@@ -830,7 +847,13 @@ impl Turn {
                     .await?;
                 // Calls that followed the wait in the same model response.
                 if self
-                    .execute_calls(waiting.pending, &workspace, &environment, &record.tools)
+                    .execute_calls(
+                        waiting.pending,
+                        &workspace,
+                        &environment,
+                        &record.tools,
+                        None,
+                    )
                     .await?
                 {
                     return Ok(Round::Parked);
@@ -882,6 +905,8 @@ impl Turn {
             }
             let mut context = self.fit_context(context, self.input_limit()).await?;
             self.thinking_floor(&mut record, &mut context).await?;
+            // No earlier than the call's cache read; pacing only moves it later.
+            let read_at = tokio::time::Instant::now();
             let Some(response) = self
                 .call(
                     provider,
@@ -935,10 +960,32 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            if self
-                .execute_calls(response.calls, &workspace, &environment, &record.tools)
-                .await?
-            {
+            let mut warm = provider
+                .keep_warm_after(model, record.reasoning.as_deref())
+                .map(|after| Warm {
+                    provider,
+                    model,
+                    instructions: &record.instructions,
+                    reasoning: record.reasoning.as_deref(),
+                    tools: &tools,
+                    context: &context,
+                    after,
+                    read_at,
+                    stopped: false,
+                    tokens: 0,
+                });
+            let parked = self
+                .execute_calls(
+                    response.calls,
+                    &workspace,
+                    &environment,
+                    &record.tools,
+                    warm.as_mut(),
+                )
+                .await?;
+            let refreshed = warm.map_or(0, |warm| warm.tokens);
+            record.tokens_used = record.tokens_used.saturating_add(refreshed);
+            if parked {
                 return Ok(Round::Parked);
             }
             self.absorb().await?;
@@ -1221,6 +1268,102 @@ impl Turn {
         Ok(())
     }
 
+    /// Run a prepared tool, refreshing the last model call's prompt cache
+    /// each time it has sat unread for `after`. The outer error is the
+    /// runtime's; the inner one is the tool's result.
+    async fn run_tool(
+        &self,
+        prepared: Prepared,
+        workspace: &std::path::Path,
+        environment: &[(String, String)],
+        warm: Option<&mut Warm<'_>>,
+    ) -> Result<Result<Outcome>> {
+        let run = self.registry.execute(prepared, workspace, environment);
+        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
+            return Ok(run.await);
+        };
+        tokio::pin!(run);
+        let (provider, context) = (warm.provider, warm.context);
+        let (model, instructions, reasoning, tools) =
+            (warm.model, warm.instructions, warm.reasoning, warm.tools);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut run => return Ok(result),
+                () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
+            }
+            let sent = tokio::time::Instant::now();
+            let dispatched = std::sync::atomic::AtomicBool::new(false);
+            let refresh = provider.keep_warm(
+                ModelRequest {
+                    model,
+                    instructions,
+                    reasoning,
+                    tools,
+                    allow_tool_calls: true,
+                    cache_key: None,
+                    items: self.items(context),
+                    chain: None,
+                },
+                &dispatched,
+            );
+            tokio::pin!(refresh);
+            tokio::select! {
+                biased;
+                result = &mut run => {
+                    // A refresh already sent is billed: let it answer, so
+                    // what it cost is recorded. An unsent one costs nothing.
+                    if dispatched.load(Relaxed) {
+                        let refreshed = refresh.await;
+                        self.refreshed(warm, sent, refreshed).await?;
+                    }
+                    return Ok(result);
+                }
+                refreshed = &mut refresh => self.refreshed(warm, sent, refreshed).await?,
+            }
+            if warm.stopped {
+                return Ok(run.await);
+            }
+        }
+    }
+
+    /// Record a refresh: billed like any call but not a model round. A
+    /// refused one ends the refreshes until the next model call, which
+    /// rebuilds the cache as it would have without them.
+    async fn refreshed(
+        &self,
+        warm: &mut Warm<'_>,
+        sent: tokio::time::Instant,
+        refreshed: Result<agent_runtime::provider::Usage>,
+    ) -> Result<()> {
+        let usage = match refreshed {
+            Ok(usage) => usage,
+            Err(error) => {
+                warm.stopped = true;
+                return self
+                    .hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"keep_warm_failed","bot":self.bot,"turn":self.turn,
+                            "durable":false,"error":error.code,"detail":error.detail}),
+                    )
+                    .await;
+            }
+        };
+        self.tokens.add(&usage);
+        warm.tokens = warm
+            .tokens
+            .saturating_add(usage.input_tokens)
+            .saturating_add(usage.output_tokens);
+        warm.read_at = sent;
+        let turn = self.turn;
+        self.store
+            .op("keep_warm_usage", move |db| {
+                db.keep_warm_usage(turn, &usage)
+            })
+            .await
+    }
+
     /// Run planned calls in order. Returns true when a wait parked the turn;
     /// the calls after it are stored with the parked state.
     async fn execute_calls(
@@ -1229,6 +1372,7 @@ impl Turn {
         workspace: &std::path::Path,
         environment: &[(String, String)],
         allowed: &[String],
+        mut warm: Option<&mut Warm<'_>>,
     ) -> Result<bool> {
         let turn = self.turn;
         let mut calls = calls.into_iter();
@@ -1340,9 +1484,8 @@ impl Turn {
                     }
                 }
                 Ok(prepared) => match self
-                    .registry
-                    .execute(prepared, workspace, environment)
-                    .await
+                    .run_tool(prepared, workspace, environment, warm.as_deref_mut())
+                    .await?
                 {
                     Ok(outcome) => annotate(outcome, turn, &call.call_id),
                     Err(error) if error.code == "tool_scheduler_closed" => return Err(error),

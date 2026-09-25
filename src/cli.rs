@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -183,6 +183,10 @@ fn print_flags(flags: &str) {
                 "SECONDS",
                 "Retry a provider stream with no content this long; default 120",
             ),
+            "--keep-warm" => (
+                "SECONDS",
+                "Refresh an idle Anthropic prompt cache during a tool call after this long; default 240, 0 disables",
+            ),
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
             "--context-bytes" => ("N", "Maximum model context bytes"),
             "--context-items" => ("N", "Maximum model context items"),
@@ -315,6 +319,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                         format!("{flag} needs a positive integer up to {max}"),
                     );
                 }
+            }
+            if flag == "--keep-warm" && !value.parse::<u64>().is_ok_and(|n| n < 300) {
+                return fail_with("usage", "--keep-warm needs seconds below 300 (0 disables)");
             }
             if flag == "--after" && !value.parse::<i64>().is_ok_and(|n| n >= 0) {
                 return fail_with("usage", "--after needs a nonnegative integer");

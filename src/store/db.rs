@@ -2351,6 +2351,15 @@ impl Database {
         tx.commit()?;
         Ok(entry)
     }
+    /// Charge a prompt-cache refresh sent while a tool ran. It generated
+    /// nothing, so it is not a model round.
+    pub fn keep_warm_usage(&mut self, turn: i64, usage: &Usage) -> Result<()> {
+        let bot = self.active(turn)?;
+        let tx = self.conn.transaction()?;
+        record_usage_for(&tx, &bot.name, turn, usage, Some("keep_warm"))?;
+        tx.commit()?;
+        Ok(())
+    }
     /// Charge a summarizer response without adding it to the transcript.
     pub fn compaction_usage(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
         let bot = self.active(turn)?;

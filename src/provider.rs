@@ -51,6 +51,22 @@ pub const STREAMS_PER_CONNECTION: usize = 64;
 /// Keepalives do not count: a provider that only pings is stalled.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Default idle time after which an Anthropic prompt cache is refreshed while
+/// a turn runs a tool: under the cache's five-minute lifetime, with a minute's
+/// margin for the request itself.
+pub const KEEP_WARM: Duration = Duration::from_secs(240);
+/// The longest a cache refresh waits for its pool: past this it would land
+/// after the cache it was sent to keep had expired.
+const KEEP_WARM_WAIT: Duration = Duration::from_secs(30);
+
+/// Betas every Anthropic API request opts into: the thinking-binding check,
+/// dropping rather than failing on a mismatch (the drops are reported), and
+/// server-side fallbacks, which rerun a declined request on another model
+/// instead of ending the turn with a refusal. Bedrock takes only the first.
+const ANTHROPIC_BETAS: &str =
+    "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01";
+const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
+
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
 /// connection per host; a request takes the least-loaded shard and holds it
@@ -145,6 +161,8 @@ pub struct Provider {
     login: Option<Arc<login::Login>>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
+    /// Refresh an idle Anthropic prompt cache after this long; `None` disables.
+    keep_warm: Option<Duration>,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
     /// Bedrock signs every request with SigV4 instead of sending a key.
@@ -332,6 +350,7 @@ impl Provider {
             login: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
+            keep_warm: Some(KEEP_WARM),
             sockets: None,
             aws: None,
             bedrock,
@@ -454,8 +473,39 @@ impl Provider {
         Ok(self)
     }
 
+    /// Refresh an idle prompt cache after `after`, under its five-minute
+    /// lifetime; `None` disables it.
+    pub fn with_keep_warm(mut self, after: Option<Duration>) -> Result<Self> {
+        if after.is_some_and(|after| after.is_zero() || after >= Duration::from_secs(300)) {
+            return fail("invalid_keep_warm");
+        }
+        self.keep_warm = after;
+        Ok(self)
+    }
+
+    /// How long a turn may sit on a tool before its prompt cache is refreshed
+    /// with [`Provider::keep_warm`], or `None` where that does not apply.
+    /// Anthropic's own API only: a request with `max_tokens: 0` generates
+    /// nothing, bills a cache read, and restarts the cache's lifetime. It
+    /// rejects budgeted thinking, so older models with thinking on are left
+    /// out, and Bedrock is left out until the same request is verified there.
+    /// The Responses cache outlives a long tool call without help.
+    pub fn keep_warm_after(&self, model: &str, reasoning: Option<&str>) -> Option<Duration> {
+        let applies = self.family == Family::Anthropic
+            && !self.bedrock
+            && !(reasoning.is_some() && legacy_thinking(model));
+        self.keep_warm.filter(|_| applies)
+    }
+
     /// Everything before the history array, ending with `[`.
     fn prefix(&self, request: &Request<'_>) -> Result<Vec<u8>> {
+        self.prefix_for(request, false)
+    }
+
+    /// The prefix of `request`, or with `warm` of the same request sent only
+    /// to refresh its cache: no output and no stream. Nothing else differs,
+    /// since the cache is keyed on everything the request renders.
+    fn prefix_for(&self, request: &Request<'_>, warm: bool) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Responses<'a> {
             model: &'a str,
@@ -506,6 +556,7 @@ impl Provider {
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
         let max_tokens = self.anthropic_max_tokens(request.model);
         let (mut bytes, field) = match self.family {
+            Family::Responses if warm => return fail("keep_warm_unsupported"),
             Family::Responses => (
                 serde_json::to_vec(&Responses {
                     model: request.model,
@@ -527,14 +578,14 @@ impl Provider {
             Family::Anthropic => (
                 serde_json::to_vec(&Anthropic {
                     model: request.model,
-                    max_tokens,
+                    max_tokens: if warm { 0 } else { max_tokens },
                     // An explicit breakpoint after the static prefix (tools
                     // and instructions) guarantees a read point for it.
                     system: (!request.instructions.is_empty()).then(|| {
                         json!([{"type":"text","text":request.instructions,
                             "cache_control":{"type":"ephemeral"}}])
                     }),
-                    stream: true,
+                    stream: !warm,
                     cache_control: json!({"type":"ephemeral"}),
                     tools: (request.tools.get() != "[]").then_some(request.tools),
                     tool_choice: disable_tools.then_some(ToolChoice { r#type: "none" }),
@@ -575,6 +626,129 @@ impl Provider {
     fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
         let len = prefix.len() + items.bytes + 2;
         (reqwest::Body::wrap_stream(framed(prefix, items)), len)
+    }
+
+    /// Send `request` again only to restart its prompt cache's lifetime:
+    /// no output and no stream, so it bills a read of the cache the previous
+    /// call left. Paced and admitted like any call, but it gives up rather
+    /// than wait past the cache's lifetime for a closed or busy pool.
+    /// `dispatched` turns true as the request is sent: from then on it is
+    /// billed, and dropping it loses what it cost.
+    pub async fn keep_warm(
+        &self,
+        request: Request<'_>,
+        dispatched: &std::sync::atomic::AtomicBool,
+    ) -> Result<Usage> {
+        self.keep_warm_inner(request, dispatched)
+            .await
+            .map_err(|error| sanitize_error(error, self.key.as_deref()))
+    }
+
+    async fn keep_warm_inner(
+        &self,
+        request: Request<'_>,
+        dispatched: &std::sync::atomic::AtomicBool,
+    ) -> Result<Usage> {
+        if self
+            .keep_warm_after(request.model, request.reasoning)
+            .is_none()
+        {
+            return fail("keep_warm_unsupported");
+        }
+        let pace = self.pools.get(&self.family.pool_key(request.model));
+        let prefix = Bytes::from(self.prefix_for(&request, true)?);
+        let estimate = pace::Cost {
+            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            output: 0,
+        };
+        let mut park_for = None;
+        let mut reservation =
+            tokio::time::timeout(KEEP_WARM_WAIT, pace.acquire_cost(estimate, &mut park_for))
+                .await
+                .map_err(|_| Error::new("provider_paced"))??;
+        let admission = self.admit().await?;
+        let (body, len) = self.body(prefix, &request.items);
+        let (client, _lease) = self.transport.lease();
+        let http = client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .header("content-length", len)
+            .header("accept", "application/json")
+            .body(body);
+        let http = self.anthropic_headers(http, self.key.as_ref());
+        reservation.dispatch();
+        dispatched.store(true, std::sync::atomic::Ordering::Relaxed);
+        let response = match http.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                reservation.settle(0);
+                return Err(connection_error(error));
+            }
+        };
+        drop(admission);
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let headers = response.headers().clone();
+            let body = error_body(response).await.unwrap_or_default();
+            let quota = status == 429 && body.quota;
+            if !quota {
+                reservation.learn(&headers, self.family);
+            }
+            if matches!(status, 429 | 529) && !quota {
+                let after = headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+                pace.limited(after);
+            }
+            reservation.settle(0);
+            return Err(Error {
+                code: if quota {
+                    "provider_quota_exhausted".to_owned()
+                } else {
+                    format!("provider_http_{status}")
+                },
+                detail: body.detail,
+            });
+        }
+        reservation.learn(response.headers(), self.family);
+        // The answer is a message with no content; only its usage matters.
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
+            if chunk.len() > 64 * 1024 - body.len() {
+                reservation.settle(0);
+                return fail("provider_response_limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let message: Value = serde_json::from_slice(&body)
+            .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
+        let usage = anthropic::usage(&message["usage"]);
+        reservation.settle_usage(Some(&usage), estimate);
+        Ok(usage)
+    }
+
+    /// Version, betas, and key for an Anthropic request.
+    fn anthropic_headers(
+        &self,
+        http: reqwest::RequestBuilder,
+        key: Option<&String>,
+    ) -> reqwest::RequestBuilder {
+        let http = http.header("anthropic-version", "2023-06-01").header(
+            "anthropic-beta",
+            if self.bedrock {
+                BEDROCK_BETAS
+            } else {
+                ANTHROPIC_BETAS
+            },
+        );
+        match key {
+            Some(key) => http.header("x-api-key", key),
+            None => http,
+        }
     }
 
     pub async fn complete<F, Fut>(&self, request: Request<'_>, delta: F) -> Result<Completion>
@@ -685,25 +859,7 @@ impl Provider {
             .body(body);
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
-            (Family::Anthropic, key) => {
-                // Opt every account into the thinking-binding check, dropping
-                // rather than failing on a mismatch; the drops are reported.
-                // Server-side fallbacks rerun a declined request on another
-                // model instead of ending the turn with a refusal.
-                let http = http.header("anthropic-version", "2023-06-01").header(
-                    "anthropic-beta",
-                    match self.bedrock {
-                        true => "thinking-binding-controls-2026-08-01",
-                        false => {
-                            "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"
-                        }
-                    },
-                );
-                match key {
-                    Some(key) => http.header("x-api-key", key),
-                    None => http,
-                }
-            }
+            (Family::Anthropic, key) => self.anthropic_headers(http, key),
             (Family::Responses, None) => http,
         };
         if let Some(account) = account {
@@ -1712,6 +1868,114 @@ mod tests {
             let text = String::from_utf8(prefix).unwrap();
             assert!(!text.contains("fallbacks"), "{text}");
             assert!(text.contains("\"block_binding\""), "{text}");
+        }
+    }
+
+    /// A refresh is the call's own request with no output and no stream:
+    /// anything else it rendered differently would miss the call's cache.
+    #[test]
+    fn a_keep_warm_request_differs_only_in_output_and_streaming() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap();
+        let tools = none();
+        let request = || Request {
+            model: "claude-sonnet-5",
+            instructions: "i",
+            reasoning: Some("high"),
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+        };
+        let parse = |mut bytes: Vec<u8>| -> Value {
+            bytes.extend_from_slice(b"]}");
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        let call = parse(provider.prefix(&request()).unwrap());
+        let mut warm = parse(provider.prefix_for(&request(), true).unwrap());
+        assert_eq!(
+            (&warm["max_tokens"], &warm["stream"]),
+            (&json!(0), &json!(false))
+        );
+        warm["max_tokens"] = call["max_tokens"].clone();
+        warm["stream"] = json!(true);
+        assert_eq!(warm, call);
+    }
+
+    /// Only Anthropic's own API refreshes: the Responses cache outlives a
+    /// long tool call, budgeted thinking refuses `max_tokens: 0`, and Bedrock
+    /// has not been verified to take it.
+    #[test]
+    fn keep_warm_applies_where_a_zero_output_request_is_accepted() {
+        let transport = Transport::new(64, 1).unwrap();
+        let anthropic = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            anthropic.keep_warm_after("claude-sonnet-5", Some("high")),
+            Some(KEEP_WARM)
+        );
+        assert_eq!(
+            anthropic.keep_warm_after("claude-haiku-4-5", None),
+            Some(KEEP_WARM)
+        );
+        assert_eq!(
+            anthropic.keep_warm_after("claude-haiku-4-5", Some("low")),
+            None
+        );
+        let off = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap()
+        .with_keep_warm(None)
+        .unwrap();
+        assert_eq!(off.keep_warm_after("claude-sonnet-5", None), None);
+        let responses = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://api.openai.com/v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(responses.keep_warm_after("gpt-5", None), None);
+        let bedrock = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bedrock.keep_warm_after("anthropic.claude-sonnet-5", None),
+            None
+        );
+        for after in [0, 300] {
+            let refused = Provider::new(
+                transport.clone(),
+                Family::Anthropic,
+                "https://a.test/v1",
+                None,
+            )
+            .unwrap()
+            .with_keep_warm(Some(Duration::from_secs(after)));
+            assert_eq!(
+                refused.err().map(|e| e.code),
+                Some("invalid_keep_warm".to_owned())
+            );
         }
     }
 

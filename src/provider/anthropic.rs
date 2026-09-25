@@ -25,6 +25,22 @@ enum Block {
     Fallback(Value),
 }
 
+/// Input usage from a Messages `usage` object. Anthropic reports cache
+/// reads and cache writes outside input_tokens; count every processed input
+/// token, as the Responses family does, and keep reads and writes separately
+/// since each is billed at its own rate.
+pub(crate) fn usage(usage: &Value) -> Usage {
+    let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let created = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    Usage {
+        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) + read + created,
+        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        cached_input_tokens: read,
+        cache_write_tokens: created,
+        models: Vec::new(),
+    }
+}
+
 #[derive(Default)]
 pub struct State {
     blocks: Vec<Block>,
@@ -59,17 +75,7 @@ impl State {
         }
         match event["type"].as_str() {
             Some("message_start") => {
-                // Anthropic reports cache reads and cache writes outside
-                // input_tokens; count every processed input token, as the
-                // Responses family does, and keep reads and writes separately
-                // since each is billed at its own rate.
-                let usage = &event["message"]["usage"];
-                let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-                let created = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
-                self.usage.input_tokens =
-                    usage["input_tokens"].as_u64().unwrap_or(0) + read + created;
-                self.usage.cached_input_tokens = read;
-                self.usage.cache_write_tokens = created;
+                self.usage = usage(&event["message"]["usage"]);
                 self.saw_usage = true;
                 self.dropped(&event["message"]["input_transformations"]);
                 Ok(Frame::Quiet)

@@ -290,7 +290,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert request['fallbacks'] == 'default'
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
-            assert request['model'] == 'synthetic-claude' and request['stream'] and request['max_tokens'] > 0
+            # A cache refresh is the same request with no output and no stream.
+            warm = request['max_tokens'] == 0
+            assert request['model'] == 'synthetic-claude' and request['stream'] != warm
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == {'type': 'ephemeral'}
             assert request['cache_control'] == {'type': 'ephemeral'}
@@ -312,6 +314,27 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'
+            if warm and getattr(self.server, 'refuse_warm', False):
+                body = b'{"type":"error","error":{"type":"invalid_request_error","message":"no"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
+            if warm:
+                time.sleep(getattr(self.server, 'warm_delay', 0))
+                body = json.dumps({'type': 'message', 'role': 'assistant', 'content': [],
+                                   'stop_reason': 'max_tokens', 'usage': {
+                                       'input_tokens': 0, 'cache_read_input_tokens': 9,
+                                       'cache_creation_input_tokens': 0, 'output_tokens': 0}}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             signature = 'sig-1'
             if getattr(self.server, 'bind_thinking', False):
                 for index, message in enumerate(request['messages']):
@@ -338,6 +361,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     stop = 'end_turn'
                 elif user.startswith('tool:'):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
+                    stop = 'tool_use'
+                elif user.startswith('shell:'):
+                    blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'shell',
+                                   'input': {'command': user[6:]}})
                     stop = 'tool_use'
                 elif user.startswith('fallback:'):
                     # A classifier declines mid-output and another model
@@ -399,7 +426,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AnthropicRuntimeTests(unittest.TestCase):
-    def start(self):
+    def start(self, extra=()):
         root = Path(__file__).resolve().parent.parent
         temp = tempfile.TemporaryDirectory(dir=root / '.local')
         self.addCleanup(temp.cleanup)
@@ -413,9 +440,62 @@ class AnthropicRuntimeTests(unittest.TestCase):
         env = {**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}
         client = Client(root / '.local/target/release/agent', path / 'state.sqlite',
                         f'http://127.0.0.1:{model.server_port}/v1', 'echo,shell', model='synthetic-claude',
-                        key_env='ANTHROPIC_TEST_KEY', env=env, provider='anthropic', family='anthropic')
+                        key_env='ANTHROPIC_TEST_KEY', env=env, provider='anthropic', family='anthropic',
+                        extra=extra)
         self.addCleanup(client.close)
         return client, model, path
+
+    def test_a_long_tool_call_keeps_the_prompt_cache_warm(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not model.requests.empty():
+            requests.append(model.requests.get())
+        call, warms, answer = requests[0], requests[1:-1], requests[-1]
+        # Refreshed once a second of the command's run, never after it ended;
+        # each is the call's request with no output and no stream.
+        self.assertEqual(len(warms), 2)
+        for warm in warms:
+            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
+        self.assertEqual(answer['messages'][2]['content'][0]['type'], 'tool_result')
+        # Each refresh is billed as the cache read it was, not as a model round.
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual([u for u in usage if u.get('purpose') == 'keep_warm'], [
+            {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm'}] * 2)
+        self.assertEqual(len(usage), 4)
+
+    def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        model.refuse_warm = True
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        failed = [m for m in client.saved if m.get('event') == 'keep_warm_failed']
+        self.assertEqual([(m['turn'], m['error'], m['durable']) for m in failed],
+                         [(turn, 'provider_http_400', False)])
+        warms = [r for r in iter(lambda: None if model.requests.empty() else model.requests.get(), None)
+                 if r['max_tokens'] == 0]
+        self.assertEqual(len(warms), 1)
+
+    def test_a_refresh_sent_before_the_tool_ends_is_still_recorded(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        model.warm_delay = 1
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 1.5')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
+
+    def test_a_short_tool_call_sends_no_refresh(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:true')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual([r['max_tokens'] > 0 for r in (model.requests.get(timeout=1),
+                                                         model.requests.get(timeout=1))], [True, True])
+        self.assertTrue(model.requests.empty())
 
     def test_a_fallback_answer_replays_without_the_declined_attempt(self):
         client, model, path = self.start()

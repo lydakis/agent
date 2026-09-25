@@ -197,6 +197,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-pending-bytes"
                     | "--max-output-tokens"
                     | "--stall-timeout"
+                    | "--keep-warm"
                     | "--idle-exit"
                     | "--context-bytes"
                     | "--context-items"
@@ -448,6 +449,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-pending-bytes" => "pending_bytes",
             "--max-output-tokens" => "output_tokens",
             "--stall-timeout" => "stall_timeout_seconds",
+            "--keep-warm" => "keep_warm_seconds",
             "--idle-exit" => "idle_exit_seconds",
             "--context-bytes" => "context_bytes",
             "--context-items" => "context_items",
