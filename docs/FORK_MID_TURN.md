@@ -1,8 +1,9 @@
 # Forking a running bot, and fork versus a fresh bot
 
 Status: design note, 2026-09-25. Nothing here is built. Code facts are from
-lydakis/agent at 03ab47c. Anthropic cache behavior is from its prompt caching
-guidance, read 2026-09-25 through Anthropic's API skill.
+lydakis/agent at 02e79eb. Anthropic cache behavior is from its
+[prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+page, whose cache invalidation table was read live on 2026-09-25.
 
 ## The question
 
@@ -55,9 +56,11 @@ Add one line to the preamble, and let the model pick:
 
 Costs behind the rule:
 
-- **A fork starts warm and large.** Its first call reads the source's whole
-  history, mostly from cache. That is cheap per token, but every later call
-  carries it too.
+- **A fork starts warm and large.** Its first call carries the source's
+  context window, mostly from cache. That window is bounded by
+  `--context-bytes` and `--context-items`, and compaction, not by the whole
+  lineage. It is cheap per token, but every later call carries a window that
+  size too.
 - **A fresh bot starts cold and small.** It pays for the brief only, and it
   doesn't share the source's blind spots. That is why reviews should start
   fresh.
@@ -92,6 +95,13 @@ round boundary. When no round has finished yet, it is the turn's prompt.
 - **A bot forking itself** (`fork --source "$AGENT_BOT"`) gets the round
   before the one that is running its `fork` command. Whatever the fork should
   do goes in the message its caller sends next.
+- **Inherited process handles are unavailable.** A finished round can hold a
+  background shell's `proc:N` result while that process still runs. Today
+  `proc:N` resolves by process id store-wide, so a fork that waits on it gets
+  its source's result (NEXT.md item 39 names the same gap). Process handles
+  must be scoped to the bot that started them, and an inherited one answered
+  as unavailable, before this default ships. Peer `turn:BOT/N` handles name
+  another bot's turn and stay valid.
 
 ### 2. An optional allowed-tools list
 
@@ -101,15 +111,18 @@ fork on its source's cache.
 
 - **Tools stay shown.** Removing a tool changes the tool definitions, which
   rebuilds the whole cache on every model.
-- **Answer only can't use `tool_choice: none` on Anthropic.** Changing
-  `tool_choice` invalidates Anthropic's messages cache, which is the whole
-  conversation; only tools and system survive. The mechanism
+- **Answer only can't use `tool_choice: none` on Anthropic.** Per the
+  prompt caching page's invalidation table, changing `tool_choice`
+  invalidates the messages cache, which is the whole conversation; only the
+  tools and system caches survive. The mechanism
   `allow_tool_calls: false` sends exactly that, so it doesn't fit here.
   Whether `tool_choice` breaks OpenAI's prefix cache is unknown, and should
   be measured before we rely on it.
 - **So `fork` takes an optional `allow` list, checked at dispatch.** It must
-  be a subset of the source's tools. It is stored in a new `bots.allowed`
-  column (one small store migration). The existing dispatch check
+  be a subset of the source's tools. It is stored in a new nullable
+  `bots.allowed` column, where NULL means the bot's whole `tools` set. The
+  migration only adds the column, so every existing bot keeps its current
+  access, and a migration test checks that. The existing dispatch check
   (src/server/turn.rs:1446) already refuses unlisted tools with
   `tool_not_available`; this narrows the list it checks.
 - **The default is all of the source's tools,** so a plain fork behaves like
@@ -125,8 +138,9 @@ fork on its source's cache.
 - **`bot_busy` from `submit`** offers `fork --source NAME --bot NEW` with no
   checkpoint. That now means the newest finished round, including on a first
   turn.
-- **The preamble** replaces `--checkpoint N` with the fork-or-fresh sentence
-  above. This is the one opinion kept. It lives in the replaceable policy
+- **The preamble** keeps an executable fork command, `"$AGENT_BIN" fork
+  --source NAME --bot NEW`, without the checkpoint, and adds the
+  fork-or-fresh sentence above. This is the one opinion kept. It lives in the replaceable policy
   layer (`client/src/policy.rs`), which already teaches delegation.
 
 Dropped after George's review on 2026-09-25: framing text in the fork's first
@@ -136,11 +150,14 @@ live came from the wrong fork point, not from missing framing.
 ## What changes, in order
 
 1. **Store:** fork at the newest closed node when no checkpoint is given,
-   and report it in `forked`. Add store contract tests for a running turn, a
-   parked turn, a turn with no finished round, and a fork of oneself.
-2. **Store and daemon:** add `allow` and `bots.allowed`, with refusal at
-   dispatch. Test that the request's tool list and instructions are
-   byte-identical to the source's.
+   and report it in `forked`. Scope process handles to the bot that started
+   them. Add store contract tests for a running turn, a parked turn, a turn
+   with no finished round, a fork of oneself, and a fork that waits on an
+   inherited `proc:N`.
+2. **Store and daemon:** add `allow` and the nullable `bots.allowed`, with
+   refusal at dispatch. Test that the request's tool list and instructions are
+   byte-identical to the source's, and that bots from before the migration
+   keep their tools.
 3. **Client:** the `bot_busy` hint and the preamble sentence.
 4. **App:** side chat forks with its chosen list, in a worktree it makes for
    all tools.
@@ -148,7 +165,7 @@ live came from the wrong fork point, not from missing framing.
 ## Measure before keeping
 
 - **Cache.** A fork's first call should read nearly all of the source's last
-  input, on Sonnet 5 and on ChatGPT. The runs need a nonce per arm, because
+  request, which is its bounded context window, on Sonnet 5 and on ChatGPT. The runs need a nonce per arm, because
   Anthropic shares its cache across an organization.
 - **Answer only: dispatch refusal versus `tool_choice: none`.** Compare
   cached tokens and extra rounds on both providers. Keep refusal unless
