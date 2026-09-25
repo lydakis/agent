@@ -730,8 +730,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     checked at dispatch, which a fork inherits and can only narrow, so a
     fork keeps its source's tool definitions and prompt cache. The daemon
     and CLI add no text for the fork. Next, the store change with contract
-    tests, including process handles scoped to the bot that started them
-    (item 39), then the list, then measurement of the cache and of the
+    tests, including process handles and their stored output scoped to the
+    bot that started them (item 39), then the list, then measurement of the cache and of the
     fork-or-fresh rule in the preamble.
 
 Kept out of the queue: process sandboxing, which is the host's job as the

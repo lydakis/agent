@@ -93,12 +93,21 @@ round boundary. When no round has finished yet, it is the turn's prompt.
   (db.rs:2827) walks back until it reaches a `checkpoints` row, and only a
   finished turn writes one. On a running turn it would read every round
   since the turn began, up to `MAX_ROUNDS` (200), on the store's serialized
-  worker. So each turn records a boundary: when it appends a model
-  response, the head before that response is closed, since the request that
-  produced it had to answer every earlier call. A nullable `bots.closed`
-  column holds that node, set in the transaction that already appends the
-  response. Validation stops there as it does at a checkpoint, so finding
-  and proving the fork point reads only the newest round's items.
+  worker. So each running turn keeps a boundary in a nullable
+  `bots.closed` column. A turn sets it to its prompt when it starts. When it
+  appends a model response, it moves it to the head before that response,
+  since the request that produced it had to answer every earlier call. Both
+  writes ride transactions that already exist, and finishing the turn
+  clears it. The fork reads the items after the boundary and picks the
+  newest one where every call since the boundary is answered. Once a
+  round's results are all in, that is the head itself, even while the next
+  model call is in flight. So finding and proving the fork point reads
+  only the newest round's items.
+- **Upgraded stores get a boundary once.** Waiting and paced turns are
+  restored at open and may already hold many rounds. The migration that
+  adds `bots.closed` walks each running turn once and stores its newest
+  closed node, so no fork has to fall back to a full scan. An upgrade test
+  covers a parked turn with several finished rounds.
 - **The fork keeps its source's window.** Today a fork's `context_start` is
   the carried compaction's cut, or NULL (db.rs:2978). The fork's first call
   then picks a new start at three quarters of the budget, which differs from
@@ -126,6 +135,16 @@ round boundary. When no round has finished yet, it is the turn's prompt.
   must be scoped to the bot that started them, and an inherited one answered
   as unavailable, before this default ships. Peer `turn:BOT/N` handles name
   another bot's turn and stay valid.
+- **So is the output a process stores when it finishes.** `process_finish`
+  (db.rs:2772) stores a background process's large streams under the call
+  that started it. `authorize_artifact` (db.rs:3580) lets any branch whose
+  history holds that call's result read them, and the call's first result
+  is only `proc:N`. So a fork could read its source's later output even
+  with the handle unavailable. A process's artifacts should be readable by
+  the bot that started it, and by a fork only when the fork's history holds
+  the `wait` result that delivered them. The store records that result's
+  node when it commits, and authorization checks it against the reader's
+  lineage, as it checks a tool result today.
 
 ### 2. An optional allowed-tools list
 
@@ -179,13 +198,17 @@ live came from the wrong fork point, not from missing framing.
 
 ## What changes, in order
 
-1. **Store:** record `bots.closed` each round, fork at the newest closed
-   node when no checkpoint is given, and report it in `forked`. Copy the
-   source's window start as section 1 describes. Scope process handles to
+1. **Store:** record `bots.closed` each round and backfill it for running
+   turns, fork at the newest closed node when no checkpoint is given, and
+   report it in `forked`. Copy the source's window start as section 1
+   describes. Scope process handles, and the artifacts processes store, to
    the bot that started them. Add store contract tests for a running turn,
-   a parked turn, a turn with no finished round, a fork of oneself, a fork
-   that waits on an inherited `proc:N`, and a fork of a turn at
-   `MAX_ROUNDS` whose validation reads only the newest round.
+   a parked turn, a turn with no finished round, a fork while the next
+   model call is in flight, a fork of oneself, a fork that waits on an
+   inherited `proc:N`, a fork that tries to read a large-output process's
+   streams after it finishes, and a fork of a turn at `MAX_ROUNDS` whose
+   validation reads only the newest round. Add an upgrade test for a
+   parked turn with several finished rounds.
 2. **Store and daemon:** add `allow` and the nullable `bots.allowed`, with
    refusal at dispatch. Test that the fork's first request repeats the
    source's last request byte for byte up to the source's newest item:
