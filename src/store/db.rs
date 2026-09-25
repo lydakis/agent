@@ -92,8 +92,6 @@ pub struct Fork<'a> {
     pub checkpoint: Option<i64>,
     pub workspace: Option<&'a str>,
     pub budget_tokens: Option<u64>,
-    /// Replaces the source's instructions for the new bot only.
-    pub instructions: Option<&'a str>,
     pub created_by: Option<&'a str>,
     pub created_by_id: Option<i64>,
 }
@@ -2901,16 +2899,14 @@ impl Database {
     /// Branch a new bot from any message in the source's history. Without a
     /// node, the source's current head is used and the source must be idle,
     /// since a live head is still moving. The point must leave no tool call
-    /// unanswered; the source itself is never changed. The fork keeps the
-    /// source's binding; `instructions` replaces the source's text for the
-    /// new bot only, so a changed AGENTS.md reaches a fresh bot while every
-    /// existing one stays immutable.
+    /// unanswered; the source itself is never changed. The fork copies the
+    /// source's binding, instructions, and tools as they are, so its first
+    /// call repeats the source's prefix and can read the source's cache.
     pub fn fork(&mut self, source: &str, name: &str, fork: Fork<'_>) -> Result<(Bot, Value)> {
         let Fork {
             checkpoint: node,
             workspace,
             budget_tokens,
-            instructions,
             created_by,
             created_by_id,
         } = fork;
@@ -2938,8 +2934,6 @@ impl Database {
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
-        // The same instructions and tools mean the same prefix.
-        let same_prefix = instructions.is_none_or(|own| own == parent.instructions);
         let tx = self.conn.transaction()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
@@ -2953,7 +2947,7 @@ impl Database {
                 parent.provider,
                 parent.family,
                 parent.model,
-                instructions.unwrap_or(&parent.instructions),
+                parent.instructions,
                 parent.reasoning,
                 budget_tokens.map(|b| b as i64),
                 parent.tools.join(","),
@@ -2962,12 +2956,12 @@ impl Database {
                 parent.compaction_instructions,
                 parent.compaction_model,
                 // The fork's first call can read the source's cache.
-                same_prefix.then(|| parent.cache_bot()),
-                // The source's thinking is bound to its instructions and to
-                // the context in front of its window. Carry that over only
-                // if it was already in place at the checkpoint; the fork's
-                // first request compares its own context against it.
-                (same_prefix && parent.thinking_floor <= checkpoint.map_or(0, |c| c + 1))
+                parent.cache_bot(),
+                // The source's thinking is bound to the context in front of
+                // its window. Carry that over only if it was already in
+                // place at the checkpoint; the fork's first request compares
+                // its own context against it.
+                (parent.thinking_floor <= checkpoint.map_or(0, |c| c + 1))
                     .then_some(parent.thinking_prefix)
                     .flatten(),
                 parent.thinking_floor,

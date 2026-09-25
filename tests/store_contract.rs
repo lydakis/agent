@@ -1303,7 +1303,7 @@ fn fork_events_publish_the_persisted_workspace() {
 }
 
 #[test]
-fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
+fn forks_keep_the_binding_and_instructions_and_record_a_creator() {
     let mut db = db();
     let mut created = binding();
     created.instructions = "first text";
@@ -1318,7 +1318,7 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
     assert_eq!(event["data"]["status"], "idle");
     assert_eq!(event["data"]["provider"], "openai");
     assert_eq!(event["data"]["workspace"], "/synthetic");
-    // A fork without an override keeps the source's text and names its own creator.
+    // A fork keeps the source's text and names its own creator.
     let (same, _) = db
         .fork(
             "Bob",
@@ -1337,18 +1337,9 @@ fn forks_keep_the_binding_and_may_replace_instructions_and_record_a_creator() {
         Some(bot.id),
         "the creator's identity, not its name"
     );
-    // With an override the fork gets the new text; the source is untouched.
-    let (changed, forked) = db
-        .fork(
-            "Bob",
-            "changed",
-            Fork {
-                instructions: Some("second text"),
-                ..Fork::default()
-            },
-        )
-        .unwrap();
-    assert_eq!(changed.instructions, "second text");
+    // Without a creator the fork records none; the source is untouched.
+    let (changed, forked) = db.fork("Bob", "changed", Fork::default()).unwrap();
+    assert_eq!(changed.instructions, "first text");
     assert_eq!(changed.created_by, None);
     assert_eq!(forked["data"]["created_by"], serde_json::Value::Null);
     assert_eq!(db.inspect("Bob").unwrap().instructions, "first text");
@@ -5131,32 +5122,13 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
     assert!(!String::from_utf8(sent).unwrap().contains("\"thinking\""));
     let bob = db.inspect("Bob").unwrap();
     assert_eq!((bob.cache_bot, bob.cache_bot()), (None, bob.id));
+    // A fork repeats its source's prefix, so it shares the source's cache,
+    // and so does a fork of that fork.
     db.fork("Bob", "Alice", Fork::default()).unwrap();
     db.fork("Alice", "Ann", Fork::default()).unwrap();
-    db.fork(
-        "Bob",
-        "Carol",
-        Fork {
-            instructions: Some("Other."),
-            ..Fork::default()
-        },
-    )
-    .unwrap();
-    // Same instructions as the source: the same prefix, so the same cache.
-    db.fork(
-        "Bob",
-        "Dan",
-        Fork {
-            instructions: Some(&bob.instructions),
-            ..Fork::default()
-        },
-    )
-    .unwrap();
-    for (name, cache) in [("Alice", bob.id), ("Ann", bob.id), ("Dan", bob.id)] {
-        assert_eq!(db.inspect(name).unwrap().cache_bot(), cache, "{name}");
+    for name in ["Alice", "Ann"] {
+        assert_eq!(db.inspect(name).unwrap().cache_bot(), bob.id, "{name}");
     }
-    let carol = db.inspect("Carol").unwrap();
-    assert_eq!(carol.cache_bot(), carol.id);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }
@@ -5169,25 +5141,20 @@ fn a_store_keeps_its_identity_and_forks_inherit_fallbacks() {
     let identity = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let identity = db.store_identity().unwrap();
-        // Off unless the client asks; asked for, a fork with the same
-        // instructions and one with new instructions both keep it.
+        // Off unless the client asks; asked for, forks keep it.
         let plain = db.create("plain", None, binding()).unwrap().0;
         assert!(!plain.fallbacks);
         let mut asked = binding();
         asked.fallbacks = true;
         let bot = db.create("bot", None, asked).unwrap().0;
         assert!(bot.fallbacks);
-        for (name, instructions) in [("same", None), ("other", Some("Other."))] {
-            let fork = Fork {
-                checkpoint: None,
-                workspace: None,
-                budget_tokens: None,
-                instructions,
-                created_by: None,
-                created_by_id: None,
-            };
-            assert!(db.fork("bot", name, fork).unwrap().0.fallbacks, "{name}");
-        }
+        assert!(db.fork("bot", "fork", Fork::default()).unwrap().0.fallbacks);
+        assert!(
+            !db.fork("plain", "plain-fork", Fork::default())
+                .unwrap()
+                .0
+                .fallbacks
+        );
         identity
     };
     // The identity is the file's, not the process's or the open's.

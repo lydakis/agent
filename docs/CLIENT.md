@@ -38,13 +38,13 @@ It fails as soon as the index cannot fit, then sorts only the bounded result.
 
 ## Who uses it
 
-- **CLI**: plumbing by default, the preamble alone. `--agents` on `run` and
-  `fork` composes the policy for the workspace; exclusive with
-  `--instructions`.
+- **CLI**: plumbing by default, the preamble alone. `--agents` on `run`
+  composes the policy for the workspace; exclusive with `--instructions`.
 - **app**: the policy is the default for `/new`. The create notice says what went in, for example `preamble + 2 AGENTS.md + 1 skills`.
-- A **fork** with `--agents` or `--instructions` gets new text; its source is
-  untouched. That is how an edited AGENTS.md reaches a fresh bot while every
-  existing bot stays immutable.
+- A **fork** takes no instructions: it copies its source's, so its first call
+  can read the source's prompt cache. An edited AGENTS.md reaches a new bot;
+  a caller that wants an existing conversation to follow it says so in a
+  message, and every existing bot stays immutable.
 
 ## Verified
 

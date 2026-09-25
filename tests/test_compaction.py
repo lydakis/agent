@@ -393,14 +393,12 @@ class CompactionTests(ModelFixture):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
         self.create(client)
         self.create(client, bot='Eve')
-        # A fork with its source's instructions shares the source's prefix
-        # and so its key, as does a fork of that fork; new instructions or a
-        # new bot mean a new prefix and a key of their own.
+        # A fork repeats its source's prefix and so shares its key, as does a
+        # fork of that fork; a new bot means a new prefix and a key of its own.
         client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
         client.request('fork', source='Alice', bot='Ann', workspace=str(self.path))
-        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
         keys = {}
-        for name in ('Alice', 'Ann', 'Carol', 'Eve'):
+        for name in ('Alice', 'Ann', 'Eve'):
             self.run_turn(client, name, name, 'small')
             keys[name] = self.requests()[0]['prompt_cache_key']
         for n in range(3):
@@ -451,7 +449,7 @@ class CompactionTests(ModelFixture):
         self.addCleanup(restored.close)
         self.assertNotEqual(restored.ready['store']['identity'], copied_identity)
         self.assertEqual({keys['Alice'], keys['Ann']}, calls)
-        self.assertEqual(len({keys['Carol'], keys['Eve']} | calls), 3)
+        self.assertEqual(len({keys['Eve']} | calls), 2)
 
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
@@ -536,36 +534,41 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertTrue(summaries)
         self.assertFalse(any(self.thinking(m) for r in summaries for m in r['messages']))
 
-    def test_a_fork_keeps_thinking_only_under_its_sources_instructions(self):
+    def test_a_fork_keeps_its_sources_thinking(self):
         client = self.anthropic(('--context-bytes', '65536'))
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
         for n in range(3):
             self.turn(client, 'Bob', n, ('tool:' if n == 0 else f'{n}:') + 'x' * 100)
         self.requests()
         client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
-        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
         self.turn(client, 'Alice', 'a', 'same')
         alice = self.requests()[0]
-        self.turn(client, 'Carol', 'c', 'other')
-        carol = self.requests()[0]
         self.assertEqual(self.model.binding_errors, [])
         self.assertTrue(all(self.thinking(m) for m in alice['messages'] if m['role'] == 'assistant'))
-        self.assertFalse(any(self.thinking(m) for m in carol['messages']))
 
     def test_an_answer_of_only_thinking_is_left_out_once_its_context_changes(self):
-        client = self.anthropic(('--context-bytes', '65536'))
+        client = self.anthropic(('--context-bytes', '4096'))
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
-        self.turn(client, 'Bob', 0, 'think-only')
-        self.turn(client, 'Bob', 1, 'after')
+        text = lambda m: m['content'][0].get('text')
+        self.turn(client, 'Bob', 0, 'x' * 1500)
+        self.turn(client, 'Bob', 1, 'think-only')
+        self.turn(client, 'Bob', 2, 'after')
         bob = self.requests()[-1]
         # Under unchanged context the answer goes back as it was written.
-        self.assertEqual([self.thinking(m) for m in bob['messages']], [0, 1, 0])
-        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
-        self.turn(client, 'Carol', 'c', 'other')
-        carol = self.requests()[0]
+        self.assertEqual(text(bob['messages'][0]), 'x' * 1500)
+        self.assertEqual([self.thinking(m) for m in bob['messages']], [0, 1, 0, 1, 0])
+        # A long prompt slides the window past the first turn, which changes
+        # the context in front of the answer: its only block goes, and so
+        # does the answer.
+        self.turn(client, 'Bob', 3, 'y' * 1500)
+        slid = self.requests()[-1]
         self.assertEqual(self.model.binding_errors, [])
-        self.assertFalse(any(self.thinking(m) for m in carol['messages']))
-        self.assertEqual([m['role'] for m in carol['messages']], ['user', 'user', 'assistant', 'user'])
+        texts = [text(m) for m in slid['messages']]
+        self.assertNotIn('x' * 1500, texts)
+        at = texts.index('think-only')
+        self.assertEqual([m['role'] for m in slid['messages'][at:at + 2]], ['user', 'user'])
+        self.assertEqual(texts[at + 1], 'after')
+        self.assertFalse(any(self.thinking(m) for m in slid['messages'][:at + 2]))
 
     def test_thinking_the_provider_drops_is_reported_live(self):
         client = self.anthropic(())

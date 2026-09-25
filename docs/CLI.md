@@ -45,13 +45,13 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   turn stays queued and runs separately with those choices.
 - Unknown flags, flags belonging to another command, unexpected operands,
   and repeated singleton flags are usage errors. `--provider` is repeatable.
-- `--instructions` and `--instructions-file` are mutually exclusive. On
-  `fork` they replace the source's instructions for the new bot only.
+- `--instructions` and `--instructions-file` are mutually exclusive.
   `--agents` composes the shared client policy instead: the harness preamble,
   every AGENTS.md from the workspace up to the root plus `~/.agent/AGENTS.md`,
   and an index of `.agent/skills/*.md` files ([CLIENT.md](CLIENT.md)). It is
   opt-in on the CLI, the default in the app, and exclusive with
-  `--instructions`.
+  `--instructions`. `fork` takes none of the three: a fork is an exact copy
+  of its source, instructions included.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,

@@ -741,7 +741,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     transcript, and keeps the source's window start. It adds an optional
     allowed-tools list checked at dispatch, which a fork inherits and can
     only narrow, so a fork keeps its source's tool definitions and prompt
-    cache. The daemon and CLI add no text for the fork. Next, the store
+    cache. The daemon and CLI add no text for the fork, and a fork takes
+    no instructions of its own: done, it is an exact copy. Next, the store
     change with contract tests, including process handles and their stored
     output scoped to the bot that started them (item 39), then the list,
     then measurement of the cache and of the fork-or-fresh rule in the

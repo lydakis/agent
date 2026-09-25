@@ -72,8 +72,6 @@ enum Command {
         bot: String,
         workspace: Option<String>,
         budget_tokens: Option<u64>,
-        /// Replace the source's instructions for the fork; the source keeps its own.
-        instructions: Option<String>,
         created_by: Option<String>,
         created_by_id: Option<i64>,
     },
@@ -1362,7 +1360,6 @@ impl Service {
                 bot,
                 workspace: path,
                 budget_tokens,
-                instructions,
                 created_by,
                 created_by_id,
             } => {
@@ -1372,9 +1369,6 @@ impl Service {
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;
-                }
-                if instructions.as_ref().is_some_and(|i| i.len() > 64 * 1024) {
-                    return fail("instructions_limit");
                 }
                 let path = path.as_deref().map(workspace).transpose()?;
                 let (created, event) = store
@@ -1386,7 +1380,6 @@ impl Service {
                                 checkpoint,
                                 workspace: path.as_deref(),
                                 budget_tokens,
-                                instructions: instructions.as_deref(),
                                 created_by: created_by.as_deref(),
                                 created_by_id,
                             },

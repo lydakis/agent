@@ -1,7 +1,9 @@
 # Forking a running bot, and fork versus a fresh bot
 
-Status: design note, 2026-09-25. Nothing here is built. Code facts are from
-lydakis/agent at 02e79eb. Anthropic cache behavior is from its
+Status: design note, 2026-09-25. Nothing here is built except that a fork is
+now an exact copy, with no instructions of its own (same pull request). Other
+code facts are from lydakis/agent at 02e79eb. Anthropic cache behavior is
+from its
 [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 page, whose cache invalidation table was read live on 2026-09-25.
 
@@ -42,9 +44,9 @@ What already works:
   before any tool runs, and each tool result commits as it finishes. So the
   newest fully answered round of a running turn is durable, and a fork there
   passes validation (tests/store_contract.rs:1428).
-- **A fork keeps its source's cache key and tools.** It inherits the key
-  when its instructions match (db.rs:2943), and a fork cannot change its
-  tools. Its window start is not kept yet (see section 1), so its first
+- **A fork keeps its source's cache key, instructions and tools.** It
+  takes no instructions or tools of its own, so it always inherits the
+  key. Its window start is not kept yet (see section 1), so its first
   request can still begin somewhere other than the source's.
 
 ## Fork or fresh: the rule
@@ -61,11 +63,10 @@ Costs behind the rule:
   context window, mostly from cache. That window is bounded by
   `--context-bytes` and `--context-items`, and compaction, not by the whole
   lineage. It is cheap per token, but every later call carries a window that
-  size too. Warm holds for the forks this note designs: the source's
-  instructions, the default fork point, and the model that warmed the
-  cache. A fork given its own `--instructions` gets its own cache key
-  (db.rs:2919-2949), and one at an older `--checkpoint` may start from a
-  different window, so both can start cold. A fork also copies the bot's
+  size too. Warm holds for the forks this note designs: the default fork
+  point and the model that warmed the cache. A fork at an older
+  `--checkpoint` may start from a different window, so it can start
+  cold. A fork also copies the bot's
   stored model, not a per-turn `--model` the running turn uses
   (`turns.model`). A caller that ran the source's turn on another model
   passes the same `--model` to the fork's first turn, or starts cold. The
@@ -300,10 +301,9 @@ live came from the wrong fork point, not from missing framing.
   ChatGPT. Include a source whose window has grown past three quarters of
   its budget, where today's reset would move the start, and one within a
   message of the budget, where the fork's own first message forces a reset.
-  Count how often the second happens. Measure separately a fork with its
-  own `--instructions`, one at an older `--checkpoint`, and a fork of a
-  turn run with `--model`, with and without the same `--model` on the
-  fork's first turn. The runs need a
+  Count how often the second happens. Measure separately a fork at an
+  older `--checkpoint` and a fork of a turn run with `--model`, with and
+  without the same `--model` on the fork's first turn. The runs need a
   nonce per arm, because Anthropic shares its cache across an
   organization.
 - **Answer only: dispatch refusal versus `tool_choice: none`.** Compare
