@@ -92,7 +92,8 @@ connection-start slot.
 1. **The pacer learned nothing without headers.** A 429 naming no delay used
    to close the pool for a flat second, forever. It now closes it for a
    second, doubling to 32 each time the pool reopens only to be refused, and
-   resets on the next accepted call (**source**: `Pace::limited`). Refusals of
+   resets when a call's stream completes; a 200 whose stream ends in a rate
+   limit is still a refusal (**source**: `Pace::limited`). Refusals of
    calls already in flight during a block are one overload, not several. The
    turn's own jittered backoff still spreads retries. Proactive pacing would
    need the account's quota numbers, which Bedrock does not return per call.

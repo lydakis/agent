@@ -409,16 +409,20 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             } else if running["family"] != requested.family.name()
                 || running["url"] != requested.url
                 || running["transport"] != requested.transport()
+                || (running["auth"] == "sigv4") != requested.sigv4
             {
+                let signed = |sigv4| if sigv4 { " signed with SigV4" } else { "" };
                 differences.push(format!(
-                    "--provider {}: requested {},{} over {} but daemon has {},{} over {}",
+                    "--provider {}: requested {},{} over {}{} but daemon has {},{} over {}{}",
                     requested.name,
                     requested.family.name(),
                     requested.url,
                     requested.transport(),
+                    signed(requested.sigv4),
                     running["family"].as_str().unwrap_or(""),
                     running["url"].as_str().unwrap_or(""),
-                    running["transport"].as_str().unwrap_or("")
+                    running["transport"].as_str().unwrap_or(""),
+                    signed(running["auth"] == "sigv4")
                 ));
             }
         }
@@ -1217,6 +1221,38 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client asking for SigV4 must not attach to a daemon that sends a
+    /// Bedrock API key to the same URL, nor the other way round.
+    #[test]
+    fn attach_compares_how_a_bedrock_binding_authenticates() {
+        let url = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1";
+        let args = |spec: &str| {
+            ["stats", "--store", "s", "--provider", spec]
+                .map(str::to_owned)
+                .to_vec()
+        };
+        let signed = parse(&args(&format!("b=anthropic,{url}"))).unwrap();
+        let keyed = parse(&args(&format!("b=anthropic,{url},BEDROCK_KEY"))).unwrap();
+        let ready = |auth: Option<&str>| {
+            let mut binding = json!({"family":"anthropic","url":url,"transport":"http"});
+            if let Some(auth) = auth {
+                binding["auth"] = json!(auth);
+            }
+            json!({"providers":{"b":binding}})
+        };
+        assert!(check_daemon(&signed, &ready(Some("sigv4"))).is_ok());
+        assert!(check_daemon(&keyed, &ready(None)).is_ok());
+        let refused = check_daemon(&signed, &ready(None)).unwrap_err();
+        assert_eq!(refused.code, "daemon_configuration_mismatch");
+        assert!(
+            refused
+                .detail
+                .unwrap()
+                .contains("over http signed with SigV4 but daemon has")
+        );
+        assert!(check_daemon(&keyed, &ready(Some("sigv4"))).is_err());
+    }
 
     #[test]
     fn readiness_preserves_buffered_events_and_allows_later_events() {

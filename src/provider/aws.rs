@@ -191,13 +191,24 @@ impl Aws {
 
     fn install(&self, keys: Keys) {
         if let Some(redaction) = &self.redaction {
+            // The key id too: it names the account's credential, and a shell
+            // left with it alone is no use to anyone.
             let names = match self.source {
-                Source::Environment => ["AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
-                Source::Cli => ["AGENT_AWS_SECRET_ACCESS_KEY", "AGENT_AWS_SESSION_TOKEN"],
+                Source::Environment => [
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                ],
+                Source::Cli => [
+                    "AGENT_AWS_ACCESS_KEY_ID",
+                    "AGENT_AWS_SECRET_ACCESS_KEY",
+                    "AGENT_AWS_SESSION_TOKEN",
+                ],
             };
-            redaction.set(names[0], &keys.secret);
+            redaction.set(names[0], &keys.access);
+            redaction.set(names[1], &keys.secret);
             if let Some(token) = &keys.token {
-                redaction.set(names[1], token);
+                redaction.set(names[2], token);
             }
         }
         *self.keys.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(keys);
@@ -650,6 +661,36 @@ mod tests {
             // Signed, but sent by the client: a second `host` on HTTP/2
             // breaks the signature.
             assert_eq!(get("host"), None);
+        }
+    }
+
+    /// The key id, secret and token are all redacted from tool output, and
+    /// the environment names that carried them are kept out of shells.
+    #[test]
+    fn every_part_of_the_keys_stays_out_of_tools() {
+        let credentials = Credentials::default();
+        let mut aws = Aws::fixed(
+            "us-east-1",
+            "bedrock-mantle",
+            Keys::new("A".into(), "S".into(), None),
+        );
+        aws.redaction = Some(credentials.clone());
+        aws.install(Keys::new(
+            "AKIDEXAMPLE".into(),
+            "s3cr3t".into(),
+            Some("t0k3n".into()),
+        ));
+        assert_eq!(
+            credentials.names(),
+            [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN"
+            ]
+        );
+        let text = credentials.redact("AKIDEXAMPLE s3cr3t t0k3n".into());
+        for value in ["AKIDEXAMPLE", "s3cr3t", "t0k3n"] {
+            assert!(!text.contains(value), "{text}");
         }
     }
 

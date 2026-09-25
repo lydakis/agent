@@ -754,7 +754,6 @@ impl Provider {
             });
         }
         reservation.learn(response.headers(), self.family);
-        pace.accepted();
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -876,11 +875,16 @@ impl Provider {
             pace.limited(error.detail.as_deref().and_then(pace::named_delay));
         }
         result?;
-        parser.finish().inspect_err(|error| {
-            if error.code == "provider_rate_limited" {
-                pace.limited(error.detail.as_deref().and_then(pace::named_delay));
-            }
-        })
+        // Only a completed stream ends a refusal streak: a 200 can still end
+        // in an in-stream rate limit.
+        parser
+            .finish()
+            .inspect(|_| pace.accepted())
+            .inspect_err(|error| {
+                if error.code == "provider_rate_limited" {
+                    pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+                }
+            })
     }
 }
 
@@ -1018,7 +1022,7 @@ impl Provider {
             Ok(()) => {
                 session.completed(parser.id(), key, ids);
                 reservation.settle_usage(report.usage.as_ref(), estimate);
-                parser.finish()
+                parser.finish().inspect(|_| pace.accepted())
             }
             Err(failure) => {
                 if let Some(headers) = failure.headers.as_deref() {
@@ -1686,6 +1690,64 @@ mod tests {
                 .with_stall_timeout(Duration::ZERO)
                 .is_err()
         );
+    }
+
+    /// A 200 whose stream ends in a rate limit is a refusal, not an accepted
+    /// call, so refusals of that kind still escalate the pool's block.
+    #[tokio::test]
+    async fn in_stream_refusals_escalate_although_the_status_was_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let _ = socket
+                    .write_all(concat!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":",
+                        "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Slow down.\"}}}\n\n",
+                    ).as_bytes())
+                    .await;
+            }
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        for expected in [1, 2] {
+            let request = Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                cache_key: None,
+                items: Items::empty(),
+                chain: None,
+            };
+            let error = provider
+                .complete(request, |_| async { Ok(()) })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "provider_rate_limited");
+            let left = provider.blocked_for("m").unwrap();
+            let seconds = left.as_secs_f64();
+            assert!(
+                seconds > expected as f64 - 0.5 && seconds <= expected as f64,
+                "{seconds}"
+            );
+            // Called while closed, the pool refuses without asking; after it
+            // reopens, the next refusal is the next step of the streak.
+            if expected == 1 {
+                tokio::time::sleep(left + Duration::from_millis(20)).await;
+            }
+        }
     }
 
     #[tokio::test]

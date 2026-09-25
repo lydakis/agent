@@ -336,13 +336,14 @@ impl Pace {
     /// A refusal that names no delay closes the pool for one second, doubled
     /// up to 32 each time the pool reopens only to be refused again, until a
     /// call succeeds. Refusals of calls already in flight while it is closed
-    /// are the same overload and do not escalate it. Providers that publish
-    /// no allowance, such as Bedrock, are paced by this alone.
+    /// are the same overload and do not escalate it, though one arriving
+    /// during a named delay starts the streak. Providers that publish no
+    /// allowance, such as Bedrock, are paced by this alone.
     pub fn limited(&self, after: Option<Duration>) {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         let delay = after.unwrap_or_else(|| {
-            if state.blocked_until.is_none_or(|until| until <= now) {
+            if state.unnamed_blocks == 0 || state.blocked_until.is_none_or(|until| until <= now) {
                 state.unnamed_blocks = (state.unnamed_blocks + 1).min(6);
             }
             Duration::from_secs(1 << (state.unnamed_blocks - 1))
@@ -354,7 +355,7 @@ impl Pace {
         // It parks and releases the gate; queued callers then observe the block.
         self.changed.notify_one();
     }
-    /// A call was accepted: the next unnamed refusal starts again at a second.
+    /// A call completed: the next unnamed refusal starts again at a second.
     pub fn accepted(&self) {
         let mut state = self.state.lock().unwrap();
         state.unnamed_blocks = 0;
@@ -646,6 +647,16 @@ mod tests {
         pace.accepted();
         pace.limited(None);
         assert_eq!(left(&pace), 1.0);
+        // An unnamed refusal in flight during a named delay joins that block
+        // and starts the streak; the next one after it reopens escalates.
+        tokio::time::advance(Duration::from_secs(33)).await;
+        pace.accepted();
+        pace.limited(Some(Duration::from_secs(5)));
+        pace.limited(None);
+        assert_eq!(left(&pace), 5.0);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        pace.limited(None);
+        assert_eq!(left(&pace), 2.0);
     }
 
     #[tokio::test(start_paused = true)]

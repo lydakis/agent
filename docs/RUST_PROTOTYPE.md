@@ -361,8 +361,8 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `AWS_PROFILE` or the default profile, SSO and assumed roles included, through
 `aws configure export-credentials`. Temporary keys are re-resolved five
 minutes before they expire and once on a 401 or 403, which retries the call
-as `provider_login_refreshed`; the secret and session token are redacted
-from tool output and, from the environment, kept out of shells. Mantle takes
+as `provider_login_refreshed`; the key id, secret and session token are
+redacted from tool output and, from the environment, kept out of shells. Mantle takes
 the body unsigned; runtime signs its SHA-256, so a runtime call reads its
 history from the store twice, once to digest it and once as it streams. A key field
 instead sends a Bedrock API key the family's own way, as
@@ -371,7 +371,7 @@ short-term API keys last at most twelve hours and are read once. Bedrock has no
 WebSocket transport, so `responses-ws` is refused for it. Bedrock publishes no
 rate-limit headers, so its pools learn no allowance and are paced by refusals
 alone: a 429 naming no delay closes the pool for a second, doubling to 32 while
-refusals continue, until a call is accepted.
+refusals continue, until a call's stream completes.
 
 `--provider chatgpt` uses a ChatGPT plan instead of an API key. Codex's own
 source (openai/codex `15922a5`, read 2026-09-23) shows that, when signed in with
