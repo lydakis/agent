@@ -1036,8 +1036,9 @@ fn anthropic_max_tokens(model: &str) -> u32 {
         ("claude-opus-4-0", 32_000),
         ("claude-opus-4-2025", 32_000),
         ("claude-3-5-", 8_192),
-        ("claude-3-haiku", 4_096),
-        ("claude-3-opus", 4_096),
+        // Every other Claude 3 and Claude 2 model; order matters above.
+        ("claude-3-", 4_096),
+        ("claude-2", 4_096),
     ];
     // Claude 4.6 and every later model generate up to 128,000 tokens.
     LIMITS
@@ -1236,6 +1237,9 @@ mod tests {
             ("claude-3-7-sonnet-20250219", 64_000),
             ("claude-3-5-haiku-20241022", 8_192),
             ("claude-3-haiku-20240307", 4_096),
+            ("claude-3-sonnet-20240229", 4_096),
+            ("claude-3-opus-20240229", 4_096),
+            ("claude-2.1", 4_096),
         ] {
             assert_eq!(anthropic_max_tokens(model), limit, "{model}");
         }

@@ -490,8 +490,8 @@ by parser and synthetic-endpoint tests.
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`.
 Every Anthropic call sets `max_tokens` to the model's full output limit:
 128,000 for Claude 4.6 and later, 64,000 for Haiku 4.5, Sonnet 4.5, Opus 4.5,
-Sonnet 4 and Sonnet 3.7, 32,000 for Opus 4 and 4.1, and 8,192 or 4,096 for the
-Claude 3.5 and 3 models. A lower cap fails any answer that runs past it (a
+Sonnet 4 and Sonnet 3.7, 32,000 for Opus 4 and 4.1, and 8,192 for the Claude
+3.5 models, and 4,096 for the other Claude 3 and Claude 2 models. A lower cap fails any answer that runs past it (a
 32,768 cap cut off a Sonnet 5 benchmark task mid-answer), and Anthropic counts
 only generated tokens against output rate limits, so the full limit costs
 nothing until it is used ([rate limits](https://platform.claude.com/docs/en/api/rate-limits),
