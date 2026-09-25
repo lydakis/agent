@@ -101,19 +101,23 @@ turn's prompt.
   running turn in a nullable `bots.closed` column, and a default fork reads
   it instead of scanning. Each write rides a transaction that already
   exists:
-  - A turn sets it to its prompt when it starts. The prompt is closed
-    because `finish` answers every open call (db.rs:2488), so a turn always
-    starts on a closed head.
+  - A turn sets it to its prompt, and `open_calls` (below) to zero, when it
+    starts. The prompt is closed because `finish` answers every open call
+    (db.rs:2488), so a turn always starts on a closed head.
+  - Appending a model response with calls sets it to the head before that
+    response, since the request that produced it had to answer every
+    earlier call. In a turn's normal flow it is already there. The same
+    write sets a new nullable `turns.open_calls` count to the response's
+    number of calls, for the same reason.
   - Appending a model response with no calls moves it to the new head,
     unless the response ends on a reasoning item, which stays unforkable
-    (`fork_point_splits_reasoning`). A response with calls leaves it where
-    it is.
-  - Committing a result (`tool_finish`) moves it to that result when the
-    turn has no call left open. A partial index on open `tools` rows makes
-    that check one index probe.
+    (`fork_point_splits_reasoning`).
+  - Committing a result (`tool_finish`) decrements `open_calls` on the
+    turn's row. When it reaches zero, the boundary moves to that result. No
+    index and no scan of `tools` rows is needed.
   - Absorbing a batch of steers (`Database::absorb`, db.rs:2188) moves it to
-    the batch's last item. Absorbing happens only at a round boundary, and
-    steers hold no calls.
+    the batch's last item and sets `open_calls` to zero. Absorbing happens
+    only at a round boundary, and steers hold no calls.
   - Finishing the turn clears it.
 
   Because every write keeps the column closed, the default path needs no
@@ -124,17 +128,17 @@ turn's prompt.
   history the source's own turn already sends. Explicit `--checkpoint`
   forks keep today's validation.
 - **Turns running across the upgrade are refused, not guessed.** The
-  migration only adds the column, so opening an upgraded store reads no
-  transcript and writes no row. A waiting or paced turn restored at open
-  has no recorded boundary until its next write above: the end of its
-  current round, a steer batch, or a final answer. Until then a default
-  fork of it fails with `fork_point_unknown`, which names `--checkpoint`.
-  Guessing the prompt would repeat the failure seen live, a fork that
-  redoes the task. Finding the real node would take the transcript scan
-  this design avoids.
-  An upgrade test opens a store with thousands of parked turns, checks that
-  open reads no items, and checks that the refusal lifts at the turn's next
-  finished round.
+  migration only adds the two nullable columns. It builds no index and
+  reads or writes no row, so opening an upgraded store costs the same
+  however much history it holds. A waiting or paced turn restored at open
+  has no boundary and no count until its next model response or steer
+  batch writes them. Until then a default fork of it fails with
+  `fork_point_unknown`, which names `--checkpoint`. Guessing the prompt
+  would repeat the failure seen live, a fork that redoes the task. Finding
+  the real node would take the transcript scan this design avoids. An
+  upgrade test opens a store with thousands of parked turns and many
+  finished ones. It checks that open reads no transcript or `tools` rows,
+  and that the refusal lifts at the turn's next model response.
 - **The fork keeps its source's window.** Today a fork's `context_start` is
   the carried compaction's cut, or NULL (db.rs:2978). The fork's first call
   then picks a new start at three quarters of the budget, which differs from
@@ -158,6 +162,11 @@ turn's prompt.
 - **The `forked` event** reports the node chosen.
 - **`--checkpoint N` keeps its meaning,** for callers that want a specific
   point.
+- **An idle source keeps today's rule:** fork at its head, validated as
+  today. A head that is a reasoning-only completion is still refused with
+  `fork_point_splits_reasoning` (tests/store_contract.rs:1584), and the
+  caller picks an earlier point with `--checkpoint`. `finish` clears the
+  boundary, so the idle path gains no state to keep correct.
 - **A bot forking itself** (`fork --source "$AGENT_BOT"`) gets the round
   before the one that is running its `fork` command. Whatever the fork should
   do goes in the message its caller sends next.
@@ -209,6 +218,11 @@ fork on its source's cache.
 - **For an unrestricted source, a plain fork gets all its tools.** George
   chose this for forks a model starts, in the parent's folder unless the
   caller gives `--workspace`.
+- **The wire shape keeps "inherit" and "none" apart.** In the protocol,
+  an absent `allow` inherits, `[]` allows no tool, and a list of names
+  allows those. `null` is refused as invalid. The CLI's `--allow LIST`
+  uses the same comma syntax as `--tools`: no flag inherits, and
+  `--allow ''` sends `[]`.
 - **There are no named modes** in the daemon or the CLI. The app maps its
   three choices to lists, and makes the worktree itself; per
   [MULTI_DAEMON.md](MULTI_DAEMON.md), placement and file copying stay with
@@ -232,8 +246,8 @@ live came from the wrong fork point, not from missing framing.
 ## What changes, in order
 
 1. **Store:** keep `bots.closed` at each running turn's newest closed
-   node, with the partial index on open `tools` rows. Fork at it when no
-   checkpoint is given, and report it in `forked`. Copy the source's window
+   node, with `turns.open_calls`. Fork at it when no checkpoint is given,
+   and report it in `forked`. Copy the source's window
    start as section 1 describes. Scope process handles, and the artifacts
    processes store, to the bot that started them. Add store contract tests
    for a running turn, a parked turn, a turn with no finished round, a fork
@@ -249,8 +263,10 @@ live came from the wrong fork point, not from missing framing.
    refusal at dispatch. Test that the fork's first request repeats the
    source's last request byte for byte up to the source's newest item:
    instructions, tools, and the window's items. Also test that a plain fork
-   of a restricted bot keeps its list, that a wider `allow` is refused, and
-   that bots from before the migration keep their tools.
+   of a restricted bot keeps its list, that a wider `allow` is refused,
+   that an absent `allow`, `[]`, and `null` inherit, allow nothing, and
+   are refused, in the protocol and through `--allow`, and that bots from
+   before the migration keep their tools.
 3. **Client:** the `bot_busy` hint and the preamble sentence.
 4. **App:** side chat forks with its chosen list, in a worktree it makes for
    all tools.
