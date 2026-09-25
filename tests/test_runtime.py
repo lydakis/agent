@@ -33,6 +33,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                     pass
                 else:
                     gate.wait(timeout=5)
+            if hasattr(self.server, 'routes'):
+                # Sticky routing: a fresh token on every response; the client
+                # should keep the first of its turn.
+                self.server.routes.append(self.headers.get('x-codex-turn-state'))
             if hasattr(self.server, 'expected_authorization'):
                 self.server.auth_checks.append(self.headers.get('Authorization') == self.server.expected_authorization)
             if getattr(self.server, 'reject_compaction', False) and request.get('instructions') == 'Summarize.':
@@ -220,6 +224,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Transfer-Encoding', 'chunked')
+            if hasattr(self.server, 'routes'):
+                self.send_header('x-codex-turn-state', f'route-{len(self.server.routes)}')
             if user.startswith('paced:'):
                 # The allowance is spent; the daemon must hold the next call.
                 self.send_header('x-ratelimit-limit-tokens', '60000')
@@ -761,6 +767,16 @@ class RuntimeTests(ModelFixture):
         self.assertNotIn('second', json.dumps(alt_history))
         self.assertEqual(requests[3]['input'][-1]['output'], 'shared prefix')
         self.assertEqual(client.request('resume', bot='Bob')['result']['head'], before['events'][-1]['data']['checkpoint'])
+
+    def test_a_turn_keeps_its_first_routing_token_and_the_next_turn_starts_without_one(self):
+        self.model.routes = []
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        for request_id, prompt in (('a', 'tool:one'), ('b', 'tool:two')):
+            turn = client.request('submit', bot='Bob', request_id=request_id, prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # Each turn is two calls; the second carries the token the first got back.
+        self.assertEqual(self.model.routes, [None, 'route-1', None, 'route-3'])
 
     def test_tools_are_per_bot_shown_to_the_model_and_enforced_at_dispatch(self):
         client = self.client('echo,shell')

@@ -46,6 +46,9 @@ pub(super) struct Session {
     last: Option<Last>,
     /// The provider's count of open connections, held or checked out.
     live: Arc<AtomicUsize>,
+    /// A hash of the login the upgrade carried, 0 when none: a connection is
+    /// not reused once the login changes.
+    pub(super) auth: u64,
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -272,6 +275,7 @@ impl Sockets {
                 used: now,
                 last: None,
                 live: self.live.clone(),
+                auth: 0,
             },
             response.headers().clone(),
         ))

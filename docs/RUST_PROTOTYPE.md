@@ -465,6 +465,17 @@ except that a fork keeping its source's instructions shares the source's key,
 because its first call repeats the source's prefix. Summaries add `-summary`,
 since their prefix differs.
 
+Within a turn, Responses calls over HTTP also return the ChatGPT backend's
+sticky-routing token. The backend sends `x-codex-turn-state` on a turn's
+first response, and each later call of that turn sends the first token back,
+so the backend can route it to the server holding the turn's cache. Codex
+does the same and never carries a token into another turn (openai/codex
+aa38089, `core/src/client.rs`, read 2026-09-25). A new turn and a summary
+start without one. The socket path does not carry the token. On short
+Terminal-Bench tasks over HTTP on 2026-09-25, 1 to 4 calls per task read
+nothing from the cache, while the calls around them read the whole previous
+request. Whether the token removes those misses has not been measured yet.
+
 Newer Claude models bind each replayed thinking block to the exact
 conversation before it (system prompt, tools, and earlier messages) and, for
 accounts created on or after 2026-08-31, reject a block whose earlier context
@@ -507,10 +518,10 @@ last refresh, was sent. Each refresh runs as a task of its own: when the tool
 ends or the turn is interrupted, one not yet sent is dropped at no cost, and
 one already sent is answered, so its cost is recorded.
 Nothing else in the request differs, since the cache is keyed on everything it
-renders. A refresh is paced and admitted like a call, but gives up after 30
-seconds waiting for its pool and startup admission together, since it would
-land after the cache expired. Usage is read per attempt, as for a call, when a
-server-side fallback served it. A refused
+renders. A refresh is paced and admitted like a call, but gives up waiting
+for its pool and startup admission once the cache it would refresh has
+expired, and after 30 seconds in any case. Usage is read per attempt, as for
+a call, when a server-side fallback served it. A refused
 refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
 until the next model call, which pays the write it would have paid anyway.
 

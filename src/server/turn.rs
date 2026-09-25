@@ -217,8 +217,8 @@ struct Warm<'a> {
 /// A refresh running as its own task, and whether it has been sent.
 struct Pending {
     refresh: Arc<agent_runtime::provider::Refresh>,
-    task: tokio::task::JoinHandle<Result<agent_runtime::provider::Usage>>,
-    started: tokio::time::Instant,
+    /// The usage, and when the refresh was sent.
+    task: tokio::task::JoinHandle<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>>,
 }
 
 /// Lives outside the cancellable rounds future. No allocation or per-attempt
@@ -238,6 +238,8 @@ struct Accounting {
     compaction: bool,
     /// A prompt-cache refresh in flight while a tool runs.
     refresh: Option<Pending>,
+    /// The provider's sticky-routing token for this turn's model calls.
+    route: std::sync::OnceLock<String>,
 }
 impl Accounting {
     fn totals(&self) -> (u64, u64) {
@@ -316,7 +318,7 @@ impl Turn {
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
         if let Some(pending) = accounting.refresh.take()
-            && let Some((_, Ok(usage))) = settle(pending).await
+            && let Some(Ok((usage, _))) = settle(pending).await
             && let Err(error) = self.record_refresh(usage).await
         {
             result = Err(error);
@@ -1113,6 +1115,8 @@ impl Turn {
                         cache_key: Some(&cache_key),
                         items,
                         chain: Some(self.chain(body)),
+                        // A summary is a request of its own, off the turn's route.
+                        route: matches!(body, Body::Window(_)).then_some(&accounting.route),
                     },
                     |delta| {
                         let (kind, text) = match delta {
@@ -1304,7 +1308,7 @@ impl Turn {
     ) -> Result<Result<Outcome>> {
         enum Next {
             Ran(Result<Outcome>),
-            Refreshed(Result<agent_runtime::provider::Usage>),
+            Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
         }
         let run = self.registry.execute(prepared, workspace, environment);
         let Some(warm) = warm.filter(|warm| !warm.stopped) else {
@@ -1334,13 +1338,13 @@ impl Turn {
                 // billed, so it is answered and recorded; an unsent one is
                 // dropped at no cost.
                 Next::Ran(result) => {
-                    if let Some((started, refreshed)) = settle(pending).await {
-                        self.refreshed(warm, started, refreshed).await?;
+                    if let Some(refreshed) = settle(pending).await {
+                        self.refreshed(warm, refreshed).await?;
                     }
                     return Ok(result);
                 }
                 Next::Refreshed(refreshed) => {
-                    self.refreshed(warm, pending.started, refreshed).await?;
+                    self.refreshed(warm, refreshed).await?;
                 }
             }
             if warm.stopped {
@@ -1360,6 +1364,7 @@ impl Turn {
         let tools = warm.tools.to_owned();
         let items = self.items(warm.context);
         let sent = refresh.clone();
+        let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
         let task = tokio::spawn(async move {
             let request = ModelRequest {
                 model: &model,
@@ -1370,14 +1375,11 @@ impl Turn {
                 cache_key: None,
                 items,
                 chain: None,
+                route: None,
             };
-            provider.keep_warm(request, &sent).await
+            provider.keep_warm(request, &sent, expires).await
         });
-        Pending {
-            refresh,
-            task,
-            started: tokio::time::Instant::now(),
-        }
+        Pending { refresh, task }
     }
 
     /// Record a refresh: billed like any call but not a model round. A
@@ -1386,11 +1388,10 @@ impl Turn {
     async fn refreshed(
         &self,
         warm: &mut Warm<'_>,
-        started: tokio::time::Instant,
-        refreshed: Result<agent_runtime::provider::Usage>,
+        refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
     ) -> Result<()> {
-        let usage = match refreshed {
-            Ok(usage) => usage,
+        let (usage, sent_at) = match refreshed {
+            Ok(refreshed) => refreshed,
             Err(error) => {
                 warm.stopped = true;
                 return self
@@ -1407,8 +1408,8 @@ impl Turn {
             .tokens
             .saturating_add(usage.input_tokens)
             .saturating_add(usage.output_tokens);
-        // No later than the refresh's own read, so the next comes in time.
-        warm.read_at = started;
+        // The refresh's own read, from when it was sent.
+        warm.read_at = sent_at;
         self.record_refresh(usage).await
     }
 
@@ -1721,20 +1722,20 @@ impl Turn {
     }
 }
 
-/// Cancel a refresh not yet sent, or wait for the answer to one that was,
-/// with when it started.
+/// Cancel a refresh not yet sent, or wait for the answer to one that was.
 async fn settle(
     pending: Pending,
-) -> Option<(tokio::time::Instant, Result<agent_runtime::provider::Usage>)> {
+) -> Option<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>> {
     if pending.refresh.cancel() {
         pending.task.abort();
         return None;
     }
-    let refreshed = pending
-        .task
-        .await
-        .unwrap_or_else(|_| fail("keep_warm_lost"));
-    Some((pending.started, refreshed))
+    Some(
+        pending
+            .task
+            .await
+            .unwrap_or_else(|_| fail("keep_warm_lost")),
+    )
 }
 
 fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {
