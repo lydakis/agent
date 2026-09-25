@@ -451,6 +451,26 @@ dropped blocks rather than the turn. The response reports each drop in
 in the tests refuses mismatches outright, as `error` would. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
+Every Anthropic request also opts into server-side fallbacks
+(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header),
+so a request a safety classifier declines is rerun, on the same stream, on the
+model Anthropic recommends for that refusal category instead of ending the turn
+with `provider_refusal`. A `fallback` content block marks each switch. Blocks
+before the last one are a declined attempt's partial output: its text is kept
+as part of the answer, while its thinking and tool calls are neither stored,
+replayed, nor run, and the marker itself is not stored. When the response's
+per-attempt `usage.iterations` list is present it replaces the top-level usage,
+which covers only the last attempt; an attempt declined before any output is
+reported but not billed, so it is not counted. The model that answered is
+published as a non-durable `model_fallback` event. After a fallback, Anthropic
+routes the same conversation to the fallback model for about an hour, and the
+turn record still names the requested model, so per-model pricing of those
+tokens is approximate. A refusal that survives the fallbacks still fails the
+turn with `provider_refusal`. Observed 2026-09-24: `claude-sonnet-5` and
+`claude-haiku-4-5` accept the field, and `claude-opus-5-5` answers normally
+with it set; a live refusal was not reproduced, so the fallback path is
+covered by parser and synthetic-endpoint tests.
+
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking
 (`thinking.type: adaptive` with summarized display) plus `output_config.effort`

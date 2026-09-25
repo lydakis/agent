@@ -148,6 +148,9 @@ variable is forwarded from the host). Keep job outputs under the ignored
 - **Anthropic cost is a lower bound.** Turn records fold cache writes into input
   tokens, and Anthropic bills cache writes above the base input rate. Recording
   cache-creation tokens separately would close this.
+- **Fallback-served tokens are priced as the requested model.** Turn records
+  name the bot's model, so tokens an Anthropic server-side fallback served on
+  another model are priced at the requested model's rates.
 - **Timeouts miss the call in flight.** Shutdown cancels the model call in
   progress at the timeout before the provider reports its usage, so those
   tokens are not counted even if the provider bills them.

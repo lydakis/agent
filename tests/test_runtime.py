@@ -285,7 +285,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/messages'
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
-            assert self.headers.get('anthropic-beta') == 'thinking-binding-controls-2026-08-01'
+            assert self.headers.get('anthropic-beta') == (
+                'thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01')
+            assert request['fallbacks'] == 'default'
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             assert request['model'] == 'synthetic-claude' and request['stream'] and request['max_tokens'] > 0
@@ -337,6 +339,16 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 elif user.startswith('tool:'):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
                     stop = 'tool_use'
+                elif user.startswith('fallback:'):
+                    # A classifier declines mid-output and another model
+                    # finishes: the declined partial stays in the stream.
+                    blocks += [{'type': 'text', 'text': 'Partial '},
+                               {'type': 'tool_use', 'id': 'toolu_0', 'name': 'echo', 'input': {'text': 'declined'}},
+                               {'type': 'fallback', 'from': {'model': 'synthetic-claude'},
+                                'to': {'model': 'synthetic-fallback'}},
+                               {'type': 'text', 'text': 'rest'},
+                               {'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[9:]}}]
+                    stop = 'tool_use'
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
@@ -346,6 +358,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                                                   for _ in range(self.server.report_drops)]
             events = [('message_start', {'message': start})]
             for index, block in enumerate(blocks):
+                if block['type'] == 'fallback':
+                    events.append(('content_block_start', {'index': index, 'content_block': block}))
+                    continue
                 start = {**block, 'thinking': ''} if block['type'] == 'thinking' else (
                     {**block, 'text': ''} if block['type'] == 'text' else {**block, 'input': {}})
                 events.append(('content_block_start', {'index': index, 'content_block': start}))
@@ -360,7 +375,13 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                     for part in (payload[:4], payload[4:]):
                         events.append(('content_block_delta', {'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': part}}))
                 events.append(('content_block_stop', {'index': index}))
-            events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': {'output_tokens': 7}}))
+            usage = {'output_tokens': 7}
+            if any(b['type'] == 'fallback' for b in blocks):
+                usage['iterations'] = [
+                    {'type': 'message', 'model': None, 'input_tokens': 5, 'cache_read_input_tokens': 2, 'output_tokens': 4},
+                    {'type': 'fallback_message', 'model': 'synthetic-fallback', 'input_tokens': 6,
+                     'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 1, 'output_tokens': 7}]
+            events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': usage}))
             events.append(('message_stop', {}))
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
@@ -377,7 +398,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AnthropicRuntimeTests(unittest.TestCase):
-    def test_messages_family_round_trips_thinking_tools_and_usage(self):
+    def start(self):
         root = Path(__file__).resolve().parent.parent
         temp = tempfile.TemporaryDirectory(dir=root / '.local')
         self.addCleanup(temp.cleanup)
@@ -393,6 +414,30 @@ class AnthropicRuntimeTests(unittest.TestCase):
                         f'http://127.0.0.1:{model.server_port}/v1', 'echo,shell', model='synthetic-claude',
                         key_env='ANTHROPIC_TEST_KEY', env=env, provider='anthropic', family='anthropic')
         self.addCleanup(client.close)
+        return client, model, path
+
+    def test_a_fallback_answer_replays_without_the_declined_attempt(self):
+        client, model, path = self.start()
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='f1', prompt='fallback:kept')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
+        self.assertEqual([m['model'] for m in fallback], ['synthetic-fallback'])
+        # Both attempts produced output, so both are billed.
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2})
+        model.requests.get(timeout=1)
+        second = model.requests.get(timeout=1)
+        # The declined attempt's text continues the answer; its thinking and
+        # its tool call are neither replayed nor run, and the marker is dropped.
+        self.assertEqual(second['messages'][1]['content'], [
+            {'type': 'text', 'text': 'Partial '}, {'type': 'text', 'text': 'rest'},
+            {'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': 'kept'}}])
+        self.assertEqual(second['messages'][2]['content'],
+                         [{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'kept'}])
+
+    def test_messages_family_round_trips_thinking_tools_and_usage(self):
+        client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:shared')['result']['turn']
         finished = client.finished(turn)
