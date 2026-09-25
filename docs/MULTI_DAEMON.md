@@ -94,11 +94,13 @@ The implementation must satisfy the whole path from admission to delivery:
    range protocol rather than inlined. Bound the SQLite work behind a
    page, not only its output: oldest-first `history_nodes` orders the
    whole ancestry before its `LIMIT`, and `history_items` walks from the
-   head to the oldest requested node. Use an indexed position (for
-   example a stored depth or ancestor anchors) or a scan budget that
-   returns a continuation, so a deep page costs about what a shallow one
-   does. Update the CLI (including `follow` and `interrupt`), shared
-   client, and app to consume the new pages.
+   head to the oldest requested node. Bound the work in each scheduled
+   chunk and make progress resumable, so one request cannot hold the
+   reader for the length of a history. That bounds each chunk, not the
+   total cost of reaching a deep page. Choose an index (such as a stored
+   depth) only after measuring its write and storage cost. Update the
+   CLI (including `follow` and `interrupt`), shared client, and app to
+   consume the new pages.
 3. **Hold the charge through delivery.** Queued, materialized, serialized,
    and socket-held data all remain charged until written or discarded.
    Cancelling a request, disconnecting, or closing an overloaded follower
@@ -115,10 +117,11 @@ The implementation must satisfy the whole path from admission to delivery:
    admitted in bounded batches with at most one batch queued on the
    worker. Validate each follower against its requested stream, including
    a quiet bot whose last event is older than the fleet's last cursor.
-   The hub keys subscriptions and replay by name today; capture the bot
-   id at the initial lookup and check it at the handoff. A bot deleted
-   and recreated under that name ends the follow with an explicit
-   replacement notice instead of continuing on the new identity.
+   The hub keys subscriptions and replay by name today. Capture the bot
+   id at the initial lookup and enforce it on every replay page and live
+   event, not only at the handoff. A bot deleted and recreated under
+   that name ends the follow with an explicit replacement notice before
+   any of the new identity's events are delivered.
    A worker-ordered watermark or equivalent barrier must establish that
    replay and live delivery leave no gap. Do not substitute a comparison
    of unrelated per-bot and fleet cursors. Keep both the queued work and
@@ -140,7 +143,7 @@ tests, not claims about tests already written or passed.
 | A stopped reader, cancellation, and disconnect | Byte charges persist through socket delivery, then release; queued work and session/subscription counts return to baseline. |
 | Idle and stopped followers, both one-bot and fleet-wide | Admission and output stay bounded; closure is explicit; reconnect replays the retained interval. |
 | Commits during replay and a burst of tail attachments | Durable stream equals replay without gaps or duplicates, including quiet bots, retention notices, and restart. |
-| Deepest pages of a long history, and `resume` on a bot with maximal instructions | Page cost stays bounded by the page, not by history depth; the bot view fits the page ceiling and its long fields reassemble exactly. |
+| Deepest pages of a long history, and `resume` on a bot with maximal instructions | Each chunk's work stays bounded and resumable regardless of history depth; the bot view fits the page ceiling and its long fields reassemble exactly. |
 | Delete and recreate a followed bot's name during replay | The follow ends with a replacement notice and never delivers the new bot's events. |
 | Existing CLI and app consumers | Their history, artifact, result, and follow flows still work through the bounded protocol. |
 
@@ -389,15 +392,12 @@ After a destination restore, use the origin and move nonce to verify the
 imported bot before rebinding to a new instance and replaying from scratch.
 A backup predating import answers `moved_bot_missing`, not a same-named bot.
 
-A source restore needs a fact the backup cannot roll back, because a
-backup from before prepare carries neither the nonce nor the fence.
-Destinations record each import by origin lineage and bot id. Restoring a
-store rotates its instance and leaves every bot fenced as
-`restore_unverified`; a bot runs again only after each configured peer
-confirms it holds no import of that bot from this lineage, or after an
-operator release that states the duplicate-execution risk. An unreachable
-peer keeps the fence. This relies on restore being detected, so it
-inherits the identity section's unsupported cases.
+A source restore can undo the fence: a backup from before prepare carries
+neither the nonce nor the tombstone, so both copies could run. A restored
+store keeps execution fenced until ownership is explicitly reconciled.
+The durable ownership record that makes reconciliation safe is a phase 5
+design gate, not specified here. An operator override is outside the
+single-owner guarantee and must say so.
 
 Move runtime-local clocks and limits by meaning, not raw values. A paced
 turn re-enters the destination's provider gate, with a fresh per-call retry
