@@ -117,7 +117,12 @@ turn's prompt.
   - Finishing the turn clears it.
 
   Because every write keeps the column closed, the default path needs no
-  validation walk. Explicit `--checkpoint` forks keep today's validation.
+  validation walk. The column only ever names a node that today's
+  validator accepts as an explicit checkpoint. That validator checks the
+  node itself and the calls since the last checkpoint. It accepts, for
+  example, a prompt that follows a reasoning-only completion, which is
+  history the source's own turn already sends. Explicit `--checkpoint`
+  forks keep today's validation.
 - **Turns running across the upgrade are refused, not guessed.** The
   migration only adds the column, so opening an upgraded store reads no
   transcript and writes no row. A waiting or paced turn restored at open
@@ -233,8 +238,9 @@ live came from the wrong fork point, not from missing framing.
    processes store, to the bot that started them. Add store contract tests
    for a running turn, a parked turn, a turn with no finished round, a fork
    while the next model call is in flight, a fork after several batches of
-   steers, a fork while a reasoning-only response waits to finish, a fork
-   of oneself, a fork that waits on an inherited `proc:N`, and a fork that
+   steers, a fork while a reasoning-only response waits to finish, a turn
+   that starts after a reasoning-only completion, where the default fork
+   picks what an explicit checkpoint would accept, a fork of oneself, a fork that waits on an inherited `proc:N`, and a fork that
    tries to read a large-output process's streams after it finishes. Test
    that a fork during a round with many large results, in a turn near
    `MAX_ROUNDS`, reads no transcript item. Add the upgrade test above.
