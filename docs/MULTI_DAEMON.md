@@ -230,6 +230,15 @@ source's rows unchanged.
    the context reader's queue-time percentiles (the per-operation
    histograms, NEXT item 27), unchanged with N observers replaying long
    logs against the same fleet without them.
+   Live `follow` subscriptions need the same bound. Each durable event is
+   cloned into every live follower's own output queue, up to 2 MiB each,
+   and a full queue closes that follower (`src/server/hub.rs:96-120`), so
+   N stopped followers hold up to N times 2 MiB and every commit pays
+   N clones. Fan-out should serialize each event once and share the
+   bytes, and live follower queues charge the same daemon-wide budget as
+   observer pages. A follower that cannot be charged is closed the way a
+   full queue closes it today, and resumes by replay from its cursor. The
+   acceptance workload includes stopped live followers.
 5. **A tool selection on `fork`.** An optional `tools` list, empty allowed,
    validated the way `create` validates it. Heterogeneous forks want this
    anyway. With it, "fork at the current node with no tools, ask it to
@@ -555,7 +564,13 @@ carrying it over.
      target events before its import, and the gap goes in band instead.
      Import writes an `imported` event for the bot, before its imported
      events, naming the source lineage and instance and whether the
-     bundle omitted events. One-bot and `follow *` followers both replay
+     bundle omitted events. It also carries the fields a `created` event
+     carries (the target's bot id, provider, and the rest of the bot's
+     list entry), because the app changes its fleet only on `created`,
+     `forked`, and `deleted` and requires those fields on the first two
+     (at `8b3479b`: `app/ui/app.js:240-271`). The app treats `imported` as
+     one more creation kind, so a live `follow *` at the target shows the
+     bot at once. One-bot and `follow *` followers both replay
      it, and the store-wide watermark in `event_retention`
      (`src/store/db.rs:2927-2933`) stays untouched, so no other bot sees a
      false gap.
@@ -689,6 +704,13 @@ carrying it over.
    copies of that store share. The source marks the bot
    `moving` and refuses work, the way `deleting` does
    (`src/store/db.rs:418`), and records the destination and a move nonce.
+   It refuses `delete` too. Deletion today checks only for a running turn,
+   running processes, and queued or ready turns (at `8b3479b`:
+   `src/store/db.rs:2987-3004`), which an idle moving bot passes, and
+   deleting it between import and receipt would lose the nonce and the
+   `bot_moved` route. A tombstone is not deletable by `delete` either; it
+   goes only through an explicit tombstone expiry that names what callers
+   lose.
    The bundle carries both. A target imports only a bundle that names its
    own identity, idempotently by nonce, so a caller that loses an import
    response and retries against another machine is refused there. The
@@ -772,7 +794,15 @@ carrying it over.
    and 300-second caps (at `e1d413f`: `src/server/turn.rs:44`, `713-714`,
    `913-915`), and a budget spent against the source's provider says
    nothing about the destination's. Import zeroes both, and keeps the
-   turn's `retries` and `paced_ms` totals as history. A `wait` deadline moves as the time that
+   turn's `retries` and `paced_ms` totals as history. The pacing clock is
+   rebased the same way. A paced turn's waiting record holds
+   `paced_since_ms`, a source-clock time, and a resume adds now minus it
+   to `paced_ms` (at `8b3479b`: `src/store/db.rs:191-195`); its presence
+   is also what tells a resume to continue the model call rather than
+   finish a tool wait (`src/server/turn.rs:711-716`). So the export cut
+   adds the source's elapsed pacing to `paced_ms`, and import sets
+   `paced_since_ms` to the target's clock at import. Transfer time and
+   clock skew between hosts are charged nowhere. A `wait` deadline moves as the time that
    remained at export. The inverse dependency matters too. Waiters on
    `turn:BOT/N` are keyed by bot and turn and wake only on that turn's
    `turn_finished` in the same daemon (at `e1d413f`:
@@ -850,7 +880,8 @@ carrying it over.
    work on imported records, the imported bot has no creator and zero
    usage, a bot with a `ready` or `queued` turn fails the export, a follow
    of it, one-bot or `follow *`, replays the `imported` event and no false
-   `pruned_before`, a
+   `pruned_before`, a live `follow *` at the target lists the imported bot
+   from its `imported` event, a
    submission and a prune racing a paged export yield exactly the cut, and
    a missing provider, compaction provider, or tool, fork ancestry, a
    handle or artifact reference in the transcript, or a running process
@@ -877,14 +908,17 @@ carrying it over.
    awaited by a source parent is refused. A client `wait` registered
    before the move and one sent after the receipt are both answered with
    `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
-   names a renamed destination bot, a cancel racing the export's first
+   names a renamed destination bot, a `delete` between import and
+   receipt is refused, a cancel racing the export's first
    page either refuses that page or needs the destination's refusal, a
    destination restored from a backup after the import rebinds with a
    fresh replay and one from before it answers `moved_bot_missing`,
    `result` on a turn that finished
    before the move names its target handle, and a follower attached before the move
    receives the `bot_moved` event. A paced turn resumes at the target with a
-   fresh per-call retry budget.
+   fresh per-call retry budget and `paced_ms` that counts source pacing
+   up to the cut and target pacing from the import, with the two hosts'
+   clocks set apart.
 7. Moving a parent together with the children it waits on, as one group:
    one bundle and one nonce that mark every participant `moving` in one
    source transaction, one destination transaction that imports all their
