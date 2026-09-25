@@ -299,8 +299,9 @@ class CompactionTests(ModelFixture):
         # The summary names the model that wrote it, so it is priced at that
         # model's rates even when that is not the turn's model.
         summary = next(u for u in usage if u.get('purpose') == 'compaction')
-        self.assertEqual([m['model'] for m in summary['models']],
-                         [client.request('resume', bot='Bob')['result']['model']])
+        bob = client.request('resume', bot='Bob')['result']
+        self.assertEqual([(m['provider'], m['model']) for m in summary['models']],
+                         [(bob['provider'], bob['model'])])
         self.assertFalse(any(m.get('event') == 'text_delta' and '[compaction request]' in m.get('text', '')
                              for m in client.saved))
         self.assertTrue(any(m.get('event') == 'compaction_text_delta' for m in client.saved))

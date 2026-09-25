@@ -226,6 +226,7 @@ impl State {
                 let written = tokens(entry, "cache_creation_input_tokens");
                 ModelTokens {
                     model: entry["model"].as_str().unwrap_or_default().to_owned(),
+                    provider: None,
                     input_tokens: tokens(entry, "input_tokens") + read + written,
                     output_tokens: tokens(entry, "output_tokens"),
                     cached_input_tokens: read,

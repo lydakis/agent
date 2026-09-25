@@ -50,6 +50,14 @@ BOT = 'task'
 FINISH_TIMEOUT = 60
 
 
+
+def ran_on(turn_provider: str, attempt: dict[str, Any]) -> str:
+    """The model an attempt in a usage event's `models` split ran on: its own
+    provider when the event names one (a summarizer's), else the turn's."""
+    provider = attempt['provider'] + '/' if 'provider' in attempt else turn_provider
+    return provider + attempt['model']
+
+
 class Agent(BaseInstalledAgent):
     """The lydakis/agent daemon, one bot per trial.
 
@@ -256,7 +264,7 @@ class Agent(BaseInstalledAgent):
             provider = turn_model.split('/', 1)[0] + '/' if '/' in turn_model else ''
             moved.add(turn_model)
             for attempt in attempts:
-                for model, sign in ((turn_model, -1), (provider + attempt['model'], 1)):
+                for model, sign in ((turn_model, -1), (ran_on(provider, attempt), 1)):
                     usage = models.setdefault(model, ModelUsage())
                     usage.n_input_tokens += sign * attempt['input_tokens']
                     usage.n_cache_tokens += sign * attempt['cached_input_tokens']
@@ -266,7 +274,7 @@ class Agent(BaseInstalledAgent):
         for model, data in events:
             provider = model.split('/', 1)[0] + '/' if '/' in model else ''
             for attempt in data.get('models') or [data]:
-                key = provider + attempt['model'] if 'model' in attempt else model
+                key = ran_on(provider, attempt) if 'model' in attempt else model
                 writes[key] = writes.get(key, 0) + attempt.get('cache_write_tokens', 0)
         # A turn sticky routing served entirely elsewhere leaves nothing to price.
         for model in moved:

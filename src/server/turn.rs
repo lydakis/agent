@@ -561,12 +561,7 @@ impl Turn {
             }
             Err(error) => return Err(error),
         };
-        // The summarizer: the bot's own model unless the client named one
-        // of the same family, checked at creation.
-        let reference = record
-            .compaction_model
-            .clone()
-            .unwrap_or_else(|| format!("{}/{}", record.provider, record.model));
+        let reference = summarizer(record);
         let (name, model) = split_model(&reference)?;
         let Some(summarizer) = self.providers.get(name) else {
             self.hub
@@ -625,7 +620,9 @@ impl Turn {
                 .saturating_add(usage.input_tokens)
                 .saturating_add(usage.output_tokens);
         }
-        let usage = completion.usage.map(|usage| summarizer_usage(usage, model));
+        let usage = completion
+            .usage
+            .map(|usage| summarizer_usage(usage, name, model));
         let summary = completion_text(&completion.items);
         let invalid = if summary.len() > plan.summary_bytes {
             Some(Error::new("compaction_summary_limit"))
@@ -1118,7 +1115,8 @@ impl Turn {
             let usage = accounting.report.usage.take();
             if matches!(body, Body::Span(_)) {
                 if let Some(usage) = usage {
-                    let usage = summarizer_usage(usage, model);
+                    let reference = summarizer(record);
+                    let usage = summarizer_usage(usage, split_model(&reference)?.0, model);
                     self.store
                         .op("compaction_usage", move |db| {
                             db.compaction_usage(turn, Some(&usage))
@@ -1658,21 +1656,35 @@ fn failure(error: Error) -> Outcome {
     }
 }
 
+/// The summarizer: the bot's own model unless the client named one of the
+/// same family, checked at creation.
+fn summarizer(record: &agent_runtime::store::Bot) -> String {
+    record
+        .compaction_model
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}", record.provider, record.model))
+}
+
 /// A summary is charged to the turn that needed it, but the summarizer may
-/// be another model; name it, as a fallback names its attempts, so the call
-/// is priced at that model's rates.
+/// be another model on another provider; name both, as a fallback names its
+/// attempts, so the call is priced at that model's rates.
 fn summarizer_usage(
     mut usage: agent_runtime::provider::Usage,
+    provider: &str,
     model: &str,
 ) -> agent_runtime::provider::Usage {
     if usage.models.is_empty() {
         usage.models.push(agent_runtime::provider::ModelTokens {
             model: model.to_owned(),
+            provider: None,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_write_tokens: usage.cache_write_tokens,
         });
+    }
+    for attempt in &mut usage.models {
+        attempt.provider = Some(provider.to_owned());
     }
     usage
 }

@@ -183,6 +183,10 @@ pub struct Usage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelTokens {
     pub model: String,
+    /// The provider binding that ran it, when that may not be the turn's:
+    /// set on summarizer calls, which can use another provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,

@@ -71,7 +71,8 @@ the same model can drive each harness on the same tasks.
    so a delegated bot's last call, or a bot created at the very end, is counted.
    They are grouped by model, so a delegated bot on another model is priced at
    its own rates, and so is each call Anthropic's server-side fallback ran on
-   another model or a summarizer ran on a `--compaction-model` (the `models`
+   another model or a summarizer ran on a `--compaction-model`, on that
+   model's own provider (the `models`
    split of its `usage` event). Cost is
    computed from LiteLLM's price table, as Harbor's own adapters do. Cache
    reads are priced at the cache-read rate and Anthropic cache writes (the

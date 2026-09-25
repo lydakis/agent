@@ -243,7 +243,7 @@ a process budget of two, because waiters hold nothing.
 
 Provider-reported usage records a durable `usage` event (with a per-model
 `models` split when a provider-side fallback ran another model and on every
-summarizer call, naming the summarizer's model, and
+summarizer call, naming the summarizer's provider and model, and
 `cache_write_tokens` when Anthropic wrote input to its prompt cache: part of
 `input_tokens`, billed above the base rate, and kept only in the event since
 no budget or cache ratio needs it), and the store keeps running
