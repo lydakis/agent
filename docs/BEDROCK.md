@@ -73,14 +73,15 @@ connection-start slot.
 
 | Feature | First-party | Bedrock | Status |
 | --- | --- | --- | --- |
-| Messages and Responses over SSE | yes | yes, both endpoints | carried |
-| Prompt caching, explicit and automatic | yes | **documented** explicit and implicit on both; **observed** on Mantle, top-level `cache_control` included | carried |
-| Responses `prompt_cache_key` | yes | **documented** supported; **observed** cached input on Mantle | carried |
-| Responses `store: false` with `reasoning.encrypted_content` | yes | **observed** on Mantle: returned and accepted on replay | carried |
-| Adaptive thinking with `output_config.effort` | yes | **observed** on Mantle | carried |
+| Messages and Responses over SSE | yes | **observed** on both endpoints, Claude and GPT-5.6 | carried |
+| Prompt caching, explicit and automatic | yes | **documented** explicit and implicit on both; **observed** on both, top-level `cache_control` included | carried |
+| Responses `prompt_cache_key` | yes | **documented** supported; **observed** cached input on both | carried |
+| Responses `store: false` with `reasoning.encrypted_content` | yes | **observed** on both: returned and accepted on replay | carried |
+| Responses reasoning summaries (`summary: "auto"`) | yes | **observed** empty on both for GPT-5.6 Luna at high | requested; none arrived to stream |
+| Adaptive thinking with `output_config.effort` | yes | **observed** on both | carried |
 | Legacy thinking budget (Haiku 4.5) | yes | **observed** on Mantle | carried |
-| Thinking-binding check (`anthropic-beta: thinking-binding-controls-2026-08-01`, `block_binding`) | yes (PR #12) | **observed** on Mantle: the beta is honored, and `block_binding` without it is a 400 | carried |
-| Server-side fallbacks (`fallbacks`, PR #13) | yes | **documented** unsupported; use client-side fallback | not carried: Bedrock requests send neither the field nor its beta |
+| Thinking-binding check (`anthropic-beta: thinking-binding-controls-2026-08-01`, `block_binding`) | yes (PR #12) | **observed** on both: signed blocks replayed with no drops; on Mantle `block_binding` without the beta is a 400 | carried |
+| Server-side fallbacks (`fallbacks`, PR #13) | yes | **documented** unsupported; **observed** on Mantle: the field and the beta are each a 400 | not carried: Bedrock requests send neither |
 | Responses over WebSocket | yes | **documented** unsupported on either endpoint | refused for Bedrock URLs |
 | Rate-limit headers for pacing | yes | **documented** absent | escalating refusal backoff instead |
 | Legacy thinking budgets by model name | yes | ids are vendor- and profile-prefixed | carried: `us.anthropic.claude-haiku-4-5…` reads as `claude-haiku-4-5` |
@@ -110,9 +111,10 @@ connection-start slot.
 ## The live run
 
 Observed 2026-09-25 in us-east-1, with an SSO profile resolved through the
-AWS CLI, on a release build of 84e10c6 with an isolated store: about twenty
-small calls on synthetic prompts (list three files and count them, check a
-number for primality). Token counts are per call.
+AWS CLI, on release builds with an isolated store, in two runs: about twenty
+calls on 84e10c6, then eighteen on 4cef67a after the fixes below and the rebase
+onto server-side fallbacks. Prompts were synthetic (list three files and count
+them, check a number for primality). Token counts are per call.
 
 **Two transport faults**, both now pinned by tests:
 
@@ -150,14 +152,27 @@ support the '/openai/v1/responses' API". The model list is `GET /v1/models` on
 the Mantle host, not `/openai/v1/models` (404); it named the GPT-5.4 to
 GPT-6 and gpt-oss families and Claude Haiku 4.5 to Opus 5.5.
 
-**Runtime**: `global.anthropic.claude-sonnet-5` through the daemon was refused
-with a signature mismatch, and curl showed why: runtime signs the real body
-digest. With the payload hashed it answered 200. The daemon now hashes runtime
-bodies; that path has not yet run live.
+**Runtime** on 84e10c6: `global.anthropic.claude-sonnet-5` through the daemon
+was refused with a signature mismatch, and curl showed why: runtime signs the
+real body digest. With the payload hashed it answered 200.
 
-Still open, for the next run on this revision: a runtime Claude and OpenAI
-turn through the daemon, and the Mantle turns again after the rebase onto
-server-side fallbacks, which Bedrock requests now leave out.
+**Second run, on 4cef67a**, every turn at high effort, a tool turn and then a
+turn without tools on one bot:
+
+| Endpoint, model | Result |
+| --- | --- |
+| Mantle, `anthropic.claude-sonnet-5` | accepted; three signed thinking blocks stored in turn 1 and replayed in turn 2 with none dropped; cache reads from the second call on (3,170 of 3,588 in turn 2) |
+| Mantle, `openai.gpt-5.6-luna` | accepted; two encrypted reasoning items replayed; turn 2 read 1,360 of 1,647 cached; the first prompt (1,001 tokens) is under the 1,024-token cache minimum |
+| Runtime, `global.anthropic.claude-sonnet-5` | accepted on every call with the hashed payload, no signature mismatch or credential refresh; two thinking blocks replayed with none dropped; turn 2 read 2,963 of 3,336 cached |
+| Runtime, `global.openai.gpt-5.6-luna` | accepted; runtime serves it on `/openai/v1/responses`, as `global.` and `us.` inference profiles; three encrypted reasoning items replayed; turn 2 read 1,472 of 1,727 cached |
+
+A trivial prompt at high effort produced no thinking at all: adaptive thinking
+skipped it. Both GPT-5.6 Luna bindings returned reasoning items whose summary
+was empty, so no reasoning text streamed. Curl to Mantle with `"fallbacks":
+"default"` gave 400 `fallbacks: Extra inputs are not permitted`, with or
+without the `server-side-fallback-2026-07-01` beta, and the beta alone gave
+400 for an unexpected `anthropic-beta` value, so both stay out of Bedrock
+requests.
 
 ## Sources
 
