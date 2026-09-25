@@ -241,7 +241,8 @@ a process budget of two, because waiters hold nothing.
 
 ## Accounting and budgets
 
-Provider-reported usage records a durable `usage` event, and the store keeps running
+Provider-reported usage records a durable `usage` event (with a per-model
+`models` split when a provider-side fallback ran another model), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of
@@ -456,20 +457,25 @@ Every Anthropic request also opts into server-side fallbacks
 so a request a safety classifier declines is rerun, on the same stream, on the
 model Anthropic recommends for that refusal category instead of ending the turn
 with `provider_refusal`. A `fallback` content block marks each switch. Blocks
-before the last one are a declined attempt's partial output: its text is kept
-as part of the answer, while its thinking and tool calls are neither stored,
-replayed, nor run, and the marker itself is not stored. When the response's
+before the last one are a declined attempt's partial output: its non-empty text
+is kept as part of the answer, while its thinking and tool calls are neither
+stored, replayed, nor run. The marker is stored in place, since the API checks
+the thinking around it by its position. Each switch is published as a
+non-durable `model_fallback` event with `from` and `to`. When the response's
 per-attempt `usage.iterations` list is present it replaces the top-level usage,
-which covers only the last attempt; an attempt declined before any output is
-reported but not billed, so it is not counted. The model that answered is
-published as a non-durable `model_fallback` event. After a fallback, Anthropic
-routes the same conversation to the fallback model for about an hour, and the
-turn record still names the requested model, so per-model pricing of those
-tokens is approximate. A refusal that survives the fallbacks still fails the
-turn with `provider_refusal`. Observed 2026-09-24: `claude-sonnet-5` and
-`claude-haiku-4-5` accept the field, and `claude-opus-5-5` answers normally
-with it set; a live refusal was not reproduced, so the fallback path is
-covered by parser and synthetic-endpoint tests.
+which covers only the last attempt: an attempt declined before any output is
+reported but not billed, so it is not counted, and every other attempt is
+billed at the rates of the model that ran it. The `usage` event then carries a
+`models` list with each billed attempt, including a turn that sticky routing
+(about an hour after a fallback) sent straight to the fallback model, so
+clients can price them per model; its totals are their sum. A refusal that
+survives the fallbacks still fails the turn with `provider_refusal`, with the
+refusal category and any recommended retry model as its detail. Bedrock,
+Vertex and Foundry do not offer server-side fallback. Observed 2026-09-24:
+`claude-sonnet-5`, `claude-haiku-4-5` and `claude-sonnet-4-5` accept the field,
+and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
+with it set; a live refusal was not reproduced, so the fallback path is covered
+by parser and synthetic-endpoint tests.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
 `reasoning.effort` with summaries requested, and to Anthropic adaptive thinking

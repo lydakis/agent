@@ -127,6 +127,32 @@ class HarborAgentTest(unittest.TestCase):
         self.assertIsNone(unpriced.cost_usd)
         self.assertEqual(unpriced.n_output_tokens, 300)
 
+    def test_a_fallback_attempt_is_priced_at_the_model_that_ran_it(self):
+        rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5},
+                 'gw/backup': {'input_cost_per_token': 2e-6, 'output_cost_per_token': 2e-5}}
+        with tempfile.TemporaryDirectory() as logs, \
+                mock.patch.dict('litellm.model_cost', rates):
+            path = Path(logs, 'state.sqlite')
+            store(path, [('task', 'gw/m', 'completed', 1000)])
+            attempts = [{'model': 'm', 'input_tokens': 300, 'output_tokens': 20, 'cached_input_tokens': 0},
+                        {'model': 'backup', 'input_tokens': 400, 'output_tokens': 30, 'cached_input_tokens': 100}]
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE events(id INTEGER PRIMARY KEY, bot TEXT, turn INT, kind TEXT, data TEXT)')
+                db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                           (json.dumps({'input_tokens': 700, 'output_tokens': 50, 'cached_input_tokens': 100,
+                                        'models': attempts}),))
+                db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                           (json.dumps({'input_tokens': 300, 'output_tokens': 50, 'cached_input_tokens': 400}),))
+            context = AgentContext()
+            self.agent(logs).populate_context_post_run(context)
+        usage = context.model_usage
+        self.assertEqual((usage['gw/m'].n_input_tokens, usage['gw/m'].n_cache_tokens, usage['gw/m'].n_output_tokens),
+                         (600, 400, 70))
+        self.assertEqual((usage['gw/backup'].n_input_tokens, usage['gw/backup'].n_cache_tokens,
+                          usage['gw/backup'].n_output_tokens), (400, 100, 30))
+        # Totals are unchanged; only the split moves.
+        self.assertEqual((context.n_input_tokens, context.n_output_tokens), (1000, 100))
+
     def test_finishing_stops_the_daemon_before_copying_the_store(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

@@ -248,6 +248,16 @@ class Agent(BaseInstalledAgent):
             usage.n_input_tokens += turn['input_tokens']
             usage.n_cache_tokens += turn['cached_input_tokens']
             usage.n_output_tokens += turn['output_tokens']
+        # A call Anthropic's server-side fallback ran on another model is in
+        # its turn's totals; move each attempt to the model that ran it.
+        for turn_model, attempts in self._fallback_usage():
+            provider = turn_model.split('/', 1)[0] + '/' if '/' in turn_model else ''
+            for attempt in attempts:
+                for model, sign in ((turn_model, -1), (provider + attempt['model'], 1)):
+                    usage = models.setdefault(model, ModelUsage())
+                    usage.n_input_tokens += sign * attempt['input_tokens']
+                    usage.n_cache_tokens += sign * attempt['cached_input_tokens']
+                    usage.n_output_tokens += sign * attempt['output_tokens']
         if not models and (streamed := self._streamed_usage()):
             models[self.model_name or 'unknown'] = ModelUsage(
                 n_input_tokens=streamed['input_tokens'],
@@ -292,6 +302,21 @@ class Agent(BaseInstalledAgent):
                     'FROM turns t JOIN bots b ON b.name=t.bot ORDER BY t.id')]
         except sqlite3.Error:
             return None
+
+    def _fallback_usage(self) -> list[tuple[str, list[dict[str, Any]]]]:
+        """Per-model attempts of each call a server-side fallback served, with
+        the model its turn is counted under, from the store's usage events."""
+        path = self.logs_dir / 'state.sqlite'
+        if not path.is_file():
+            return []
+        try:
+            with contextlib.closing(sqlite3.connect(path)) as db:
+                return [(model, json.loads(data)['models']) for model, data in db.execute(
+                    "SELECT COALESCE(t.model,b.provider||'/'||b.model),e.data "
+                    'FROM events e JOIN turns t ON t.id=e.turn JOIN bots b ON b.name=t.bot '
+                    "WHERE e.kind='usage' AND json_extract(e.data,'$.models') IS NOT NULL")]
+        except sqlite3.Error:
+            return []
 
     def _streamed_usage(self) -> dict[str, int] | None:
         """The task bot's per-round usage events, streamed as they happened.

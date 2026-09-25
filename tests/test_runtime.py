@@ -378,7 +378,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             usage = {'output_tokens': 7}
             if any(b['type'] == 'fallback' for b in blocks):
                 usage['iterations'] = [
-                    {'type': 'message', 'model': None, 'input_tokens': 5, 'cache_read_input_tokens': 2, 'output_tokens': 4},
+                    {'type': 'message', 'model': 'synthetic-claude', 'input_tokens': 5, 'cache_read_input_tokens': 2,
+                     'cache_creation_input_tokens': 0, 'output_tokens': 4},
                     {'type': 'fallback_message', 'model': 'synthetic-fallback', 'input_tokens': 6,
                      'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 1, 'output_tokens': 7}]
             events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': usage}))
@@ -422,16 +423,21 @@ class AnthropicRuntimeTests(unittest.TestCase):
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='fallback:kept')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
-        self.assertEqual([m['model'] for m in fallback], ['synthetic-fallback'])
-        # Both attempts produced output, so both are billed.
+        self.assertEqual([(m['from'], m['to']) for m in fallback], [('synthetic-claude', 'synthetic-fallback')])
+        # Both attempts produced output, so both are billed, each at its model.
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
-        self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2})
+        self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2, 'models': [
+            {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
+            {'model': 'synthetic-fallback', 'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 0}]})
         model.requests.get(timeout=1)
         second = model.requests.get(timeout=1)
         # The declined attempt's text continues the answer; its thinking and
-        # its tool call are neither replayed nor run, and the marker is dropped.
+        # its tool call are neither replayed nor run. The marker stays in
+        # place, since the API checks the thinking around it by position.
         self.assertEqual(second['messages'][1]['content'], [
-            {'type': 'text', 'text': 'Partial '}, {'type': 'text', 'text': 'rest'},
+            {'type': 'text', 'text': 'Partial '},
+            {'type': 'fallback', 'from': {'model': 'synthetic-claude'}, 'to': {'model': 'synthetic-fallback'}},
+            {'type': 'text', 'text': 'rest'},
             {'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': 'kept'}}])
         self.assertEqual(second['messages'][2]['content'],
                          [{'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': 'kept'}])

@@ -213,7 +213,7 @@ fn parse_completion_with_usage(
     let usage = reported.clone();
     Ok(Completion {
         thinking_dropped: 0,
-        fallback: None,
+        fallbacks: Vec::new(),
         items,
         calls,
         usage,
@@ -227,6 +227,7 @@ fn parse_usage(usage: &Value) -> Usage {
         cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or(0),
+        models: Vec::new(),
     }
 }
 
@@ -263,7 +264,8 @@ mod tests {
             Some(Usage {
                 input_tokens: 10,
                 output_tokens: 2,
-                cached_input_tokens: 4
+                cached_input_tokens: 4,
+                models: Vec::new(),
             })
         );
         let failed = State::default()

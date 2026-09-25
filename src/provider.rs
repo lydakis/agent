@@ -151,6 +151,18 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    /// The billed attempts, when a provider-side fallback ran more than one
+    /// model for the call, so each can be priced at its model's rates. The
+    /// totals above are their sum.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelTokens>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelTokens {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
 }
 #[derive(Debug)]
 pub struct Completion {
@@ -160,9 +172,8 @@ pub struct Completion {
     /// Replayed thinking blocks the provider dropped because the history
     /// before them changed. The runtime avoids this, so any is a bug.
     pub thinking_dropped: usize,
-    /// The model a server-side fallback switched to, which produced this
-    /// message instead of the requested one.
-    pub fallback: Option<String>,
+    /// Each model switch a provider-side fallback made, as (from, to).
+    pub fallbacks: Vec<(Option<String>, String)>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
@@ -1198,6 +1209,7 @@ mod tests {
         let legacy = String::from_utf8(legacy).unwrap();
         assert!(legacy.contains("\"budget_tokens\":2048"));
         assert!(legacy.contains("\"prefix_mismatch_behavior\":\"drop_block\""));
+        assert!(legacy.contains("\"fallbacks\":\"default\""));
         assert!(!legacy.contains("output_config"));
         assert!(!text.contains("budget_tokens"));
         let mut empty_prefix = provider
