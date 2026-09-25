@@ -1,1061 +1,422 @@
 # Several daemons, moving bots, and watching them
 
-A roadmap for four ideas George raised on 2026-09-20. None of it is built.
-Each section says what the code does today, what would have to change, the
-main risks, and an order of work. Source references are to `612ae1d` and were
-read on 2026-09-23, except references marked with another revision:
-`8ebbc44` (read 2026-09-23, after main moved to schema 26), `e1d413f`
-(read 2026-09-24, after the second review), and the review branch's own
-commits `f47adff` (read 2026-09-24) and `da0f2ab`, `8b3479b`, `61c24e1`,
-`bcc6b1c`, and `d006bb4` (read 2026-09-25). The branch changes only
-documentation after merging `e1d413f`, so the code at those later
-commits is the code at `e1d413f`. Claims about the code are verified at
-those revisions; everything
-under "would change" and "order" is a proposal, and anything unmeasured says
-so.
+Status: proposed roadmap. None of the additions below is implemented. The
+next implementation is bounded observation within one daemon, with behavior
+tests and a matched performance screen. Multi-daemon clients and bot mobility
+remain later phases; their design questions do not block that first slice.
 
-The four ideas, in the order this document recommends building them:
+The four goals are to watch a bot without changing its work, optionally run
+a daemon per workspace, use one client across daemons, and continue a bot's
+conversation on another machine. Agent owns durable state and the model/tool
+loop. Callers own machine selection, workspace provisioning, file transfer,
+and host isolation. Reuse SSH for remote socket access. Keep one daemon per
+user as the default until a matched screen supports another recommendation.
 
-1. [Watch a bot without disturbing it](#1-watch-a-bot-without-disturbing-it),
-   including a summary drawn from its transcript.
-2. [One daemon per workspace or project](#2-one-daemon-per-workspace-or-project),
-   for failure isolation.
-3. [One client over several daemons](#3-one-client-over-several-daemons),
-   across machines.
-4. [Move a bot to a daemon on another machine](#4-move-a-bot-to-another-daemon).
+Source observations below were checked on 2026-09-25 against
+[`e1d413f`](https://github.com/lydakis/agent/tree/e1d413ffa3e2c1adf9995f19442c0469fbbe077f).
+The roadmap branch through `46dc064` has identical runtime, client, and app
+source. File links and symbols identify those observations; implementation
+must recheck them against its own base. Acceptance limits below are proposed
+engineering gates, not measured results.
 
-The order runs from what is mostly there to what needs the most new
-semantics. Each later idea reuses something an earlier one adds.
+## Contracts that apply across phases
 
-Two boundaries from the design record hold throughout. Agent is not a remote
-execution service (AGENTS.md, "Preserve the question"), and "workspace
-provisioning, Git branching, diff application, and machine placement belong
-to callers or other tools" (README, Scope). So the daemon's part in every
-idea below is durable state and its import and export. Choosing machines,
-copying files, and carrying bytes between hosts belong to callers, standard
-transports, or a separate process.
+| Contract | Requirement |
+| --- | --- |
+| Observation has a bounded cost | Bound admission, queued work, materialized bytes, socket output, and live fan-out. Measure commit and model-request latency under observation; a separate reader alone cannot prove isolation from shared CPU or disk. |
+| A reference keeps its meaning | Every id is scoped to its issuing store. A client or import must resolve the intended object, or explicitly refuse it, never use a colliding local id. This applies to structured fields and every carried text a model can see or retrieve. |
+| History and outcomes stay durable | Preserve original transcript bytes, context versions, historical forks, retained outputs, and known or unknown tool outcomes. A consistent export cut must survive concurrent submission and retention. |
+| Continuation has one execution owner | A fork is a new identity. A move transfers permission to continue an existing conversation. Cancellation, restart, retries, and restore must not make both sides runnable or replay completed tool work. |
+| Destination admission is real admission | Validate all effective models, tools, workspace mappings, and incoming pending work before import commits. Unsupported state fails explicitly. Configuration validation cannot promise provider acceptance. |
 
-## What the four ideas share: a daemon is its store
+These contracts are requirements. Later sections record candidate mechanisms
+and the evidence needed to select them. They do not freeze every storage
+column, error shape, or migration algorithm. Agent has no compatibility
+requirement for its own earlier protocols; update current callers together
+instead of adding legacy modes. Preserving durable history is still required.
 
-Today one daemon owns one store, and every identity it hands out is scoped to
-that store.
+## Phase 1: bounded observation in one daemon
 
-- **One owner per store.** `Store::open` takes an exclusive lock on
-  `<store>.owner-lock` and fails with `store_already_owned`
-  (`src/store.rs:136-147`). The socket has its own ownership lock and refuses
-  to displace a live listener (`src/server/socket.rs:18-64`). `serve` exits 75
-  on either conflict (`src/main.rs:9`, `src/main.rs:34`).
-- **The socket follows from the store.** Clients, the daemon, and the app
-  resolve the socket from the store path: `<store>.sock`, or a hashed name
-  under `/tmp/agent-<uid>` when that path is too long
-  (`client/src/socket.rs:41-70`).
-- **Every id is a per-store sequence.** Bot ids come from `bot_sequence`,
-  history nodes from `node_sequence`, and turns from `turn_sequence`. Event
-  cursors and process ids are `AUTOINCREMENT` rows
-  (`src/store/db.rs:335-418`). Bot names are the `bots` primary key.
-- **Handles carry no daemon.** `turn:BOT/N` and `proc:N` parse to a bot
-  name and a store-wide turn or process id (`src/server/handles.rs:14-51`).
-- **Model-visible text holds store ids too.** A truncated tool result names
-  its retained output as `TURN/CALL_ID/STREAM` using the store-wide turn id
-  (`src/server/turn.rs:1265-1279`, parsed at `src/tools.rs:220-235`).
-  Detached runs and background shells hand the model `turn:` and `proc:`
-  handles.
-- **The `ready` line doesn't say which daemon this is.** It announces
-  protocol 3, capabilities, limits, schema, tools, and providers
-  (`src/server/mod.rs:475-486`), but no identity for the store behind it.
+### Current paths
 
-So two daemons can each have a bot `bob` with id 7, turn 42, and node 1000,
-and nothing on the wire tells them apart.
+The protocol already exposes most of the data an observer needs. Routing is
+in [`Service::dispatch`](../src/server/mod.rs); storage execution is in
+[`Store::op` and `Store::read`](../src/store.rs).
 
-**Shared first step (proposal): a store identity.** Generate a random id
-once, when the store is created, keep it in a singleton table the way the
-sequences are kept, and announce it in `ready`. It costs one small one-way
-migration and one field. Every idea below needs it. Idea 3 uses it to
-address a daemon, idea 4 to record where an imported bot came from, idea 2
-to tell per-workspace daemons apart, and idea 1 to qualify cursors across
-daemons. A copied store file keeps the same id, so that id alone names a
-store's lineage, not one store. The identity therefore has two parts: the
-lineage id, and an instance id that the daemon reissues at open when
-either of two checks fails. The store file's device and inode must match
-the pair recorded last time, which catches a copy or a move across
-filesystems. The instance id must also match a copy kept outside the
-database, in a sidecar file next to the store (like the existing
-`.owner-lock`), which catches a restore of a backup taken under an
-earlier instance. A restart or a rename in place keeps the instance.
-Neither check catches a backup taken under the current instance and
-written back over the same file: device, inode, and id all still match.
-So a restore must replace the store file rather than overwrite it, which
-gives it a new inode and a new instance; an `agent restore` helper that
-writes beside the store and renames over it makes that the easy path, and
-overwriting a live store's file in place is unsupported. The store runs
-in WAL mode, so the main file alone is not a restore boundary: after an
-unclean stop, a `-wal` file left beside it can hold committed frames that
-SQLite would replay into the restored file, bringing back turns, events,
-or move nonces the backup discarded. Deleting that WAL is no answer
-either: a crash between the delete and the rename would reopen the old
-store without its committed frames. So the helper takes the owner lock
-(so no daemon has the store open), writes the backup beside the store
-as one self-contained file and syncs it, then opens the old store and
-checkpoints its WAL fully into the main file with a truncating
-checkpoint, syncs, and only then renames the backup over the store and
-syncs the directory. A crash before the rename leaves the old store
-whole, since its committed frames are already in its main file; a
-crash after it leaves the restored store beside an empty WAL. Neither
-state replays frames into the wrong file or drops committed ones. Anything that must
-name exactly one store, such as a client's state key or a move's
-destination, uses the instance id. A block-level clone of a whole disk or
-machine keeps device, inode, and sidecar and is not detected either; both
-exceptions are out of scope and stated as such.
+| Read | Current execution path |
+| --- | --- |
+| `bots`, `turns`, `result`, `resume` inspection, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
+| `history_nodes`, `history_items`, `item` | Reader shared with model-context construction |
+| `follow` | Bot inspection and replay on the worker; live delivery through the hub |
+| `wait` | Handle registration and settlement against durable outcomes |
 
-## 1. Watch a bot without disturbing it
+[`Hub::replay`](../src/server/hub.rs) performs its final replay-to-live
+transition on the worker to avoid missing a commit between those modes.
+`Hub::fan_out` visits subscriptions and clones events into their output
+queues. Slow socket followers close on a failed `try_send`; the stdio owner
+is backpressured and is not the observer transport.
 
-Let a person or another agent see what a bot is doing, including a summary
-drawn from its transcript, without changing what the bot does or how fast
-it runs.
+[`Output`](../src/output.rs) bounds each session's queue at 2 MiB and holds
+its byte permit until writing finishes. That does not bound the aggregate
+cost of many observers. Dispatch also awaits storage reads, so a read can
+delay the service loop even when it writes nothing.
 
-### What exists
+Compaction summaries and carry-forward notes already exist in the store,
+versioned with history. There is no protocol read for their text. A local
+fork can inspect a completed checkpoint, but inherits its source's tools
+and consumes model allowance if asked to summarize. Those are later client
+features, not prerequisites for measuring the observation path.
 
-Observation is already a protocol capability; there is just no word for it.
-These operations write nothing:
+### Implementation boundary
 
-| Operation | What it gives an observer | Where it runs |
+Move the observation reads above to a separate read-only connection, leaving
+the context reader for model requests. Route `resume`'s inspection and
+`follow`'s initial bot lookup through it too. Keep decisions coupled to
+writes, including handle settlement for `wait`, on the worker. This is a
+change to the current protocol path, not an optional alternate mode.
+
+The implementation must satisfy the whole path from admission to delivery:
+
+1. **Admit before allocating.** Dispatch uses bounded, non-blocking
+   admission and returns immediately; a full observer queue answers
+   `observer_busy`. Bound observer sessions, subscriptions, outstanding
+   jobs, and response bytes separately. One connection has at most one
+   observation page in flight, including while its socket is blocked.
+   Refusals must not create an unbounded queue of error responses.
+2. **Read bounded pages.** Apply encoded-byte and item limits to every
+   observation operation, including listings and batched history reads.
+   A single oversized item or result uses an explicit range/continuation
+   protocol instead of materializing the whole value. Size large blobs
+   before loading them; reserve encoding overhead as well as payload
+   bytes. Artifact reads require a named stream and a bounded page.
+   Update the CLI, shared client, and app to consume the new pages.
+3. **Hold the charge through delivery.** Queued, materialized, serialized,
+   and socket-held data all remain charged until written or discarded.
+   Cancelling a request, disconnecting, or closing an overloaded follower
+   releases its outstanding work and permits. The reader itself must not
+   wait for a slow socket to drain.
+4. **Bound live delivery too.** Serialize once and share event bytes where
+   possible. Charge follower output to the aggregate budget and cap
+   subscriptions before accepting them, including idle `follow *`
+   subscriptions. Byte sharing does not remove per-subscriber CPU work.
+   Close overloaded followers promptly; they reconnect from their last
+   received durable cursor.
+5. **Preserve replay ordering.** Replay pages use the observer reader.
+   The final transition remains ordered with commits, but handoffs are
+   admitted in bounded batches with at most one batch queued on the
+   worker. Validate each follower against its requested stream, including
+   a quiet bot whose last event is older than the fleet's last cursor.
+   A worker-ordered watermark or equivalent barrier must establish that
+   replay and live delivery leave no gap. Do not substitute a comparison
+   of unrelated per-bot and fleet cursors. Keep both the queued work and
+   the execution time of a handoff batch bounded.
+
+An observer connection is not a new authorization boundary. Today socket
+permissions grant full access to one principal. When a second principal
+needs observation alone, add a separately protected socket that serves only
+the observe set; a client-selected flag cannot enforce read-only access.
+
+### Acceptance before adding observer features
+
+Behavior tests must cover the distinct contracts below. These are planned
+tests, not claims about tests already written or passed.
+
+| Path | Required observation |
+| --- | --- |
+| Every observe operation, including an oversized item, result, and batched history request | No unbounded materialization; ranges reassemble exactly; overload refuses promptly while unrelated bots progress. |
+| A stopped reader, cancellation, and disconnect | Byte charges persist through socket delivery, then release; queued work and session/subscription counts return to baseline. |
+| Idle and stopped followers, both one-bot and fleet-wide | Admission and output stay bounded; closure is explicit; reconnect replays the retained interval. |
+| Commits during replay and a burst of tail attachments | Durable stream equals replay without gaps or duplicates, including quiet bots, retention notices, and restart. |
+| Existing CLI and app consumers | Their history, artifact, result, and follow flows still work through the bounded protocol. |
+
+Use the socket transport, synthetic provider, and fixtures from the
+[lifecycle screen](BENCHMARKS.md#rust-lifecycle-and-feature-costs) and
+[mixed-workload soak](BENCHMARKS.md#mixed-workload-soak). Extend the harness
+for this matrix; existing soak results do not establish these contracts.
+
+Freeze the host, revisions, workload seed, achieved concurrency, store
+snapshot, provider timing, and durability before comparing. Use five
+alternating baseline/candidate pairs with identical completed model and tool
+work. Verify normalized provider requests and tool outcomes as well as turn
+counts; the existing soak provider does not validate conversation content.
+Separate the required controller connection from additional observers.
+Exercise no extra observers, long-log replay, stopped readers, idle live
+followers, and bursts attaching at the tail. Include individual and fleet
+subscriptions, long histories, compaction, retained outputs, and retention.
+Use a steady offered turn rate and enough headroom that provider saturation
+does not hide runtime delay; record completed work and refusals in each arm.
+Overload arms may complete different amounts of observer work because the
+candidate refuses excess demand. Report that difference as a feature cost;
+do not turn it into an equal-work efficiency ranking.
+
+For this screen, fix the candidate's observer output budget at 16 MiB,
+read-page ceiling at 64 KiB encoded, job limit at 128, and session and
+subscription limits at 64 each. These are fixture settings, not selected
+production defaults. Include the controller within the limits and reserve
+room for it. Ramp extra observers through 1, 8, 32, and the remaining
+admissible slots, then offer four times the limit to test refusal. Existing
+live-event size limits remain distinct from the read-page ceiling.
+
+Report daemon CPU, RSS, threads, file descriptors, store/WAL growth,
+completed turns, observer throughput, refusals, and p95/p99 commit,
+model-context queue, and turn latency. Attribute worker, context-reader,
+and observer-reader work separately. Report controller/provider/child costs
+outside daemon totals. Histograms give percentile intervals; if their
+buckets cannot resolve a gate, add focused timing before drawing a verdict.
+
+Proposed gates, to be recorded before running the candidate:
+
+- With no extra observers, median daemon CPU per completed turn grows by
+  at most 5%, and peak RSS by at most 2 MiB. Each latency p99 grows by no
+  more than the larger of 5% or 1 ms against the matched baseline.
+- Under each observer load, candidate commit, context-queue, and turn p99
+  remain within the larger of 5% or 1 ms of the candidate without extra
+  observers. Completed work at the fixed offered rate is unchanged and
+  no additional bot failures occur. Also report the old implementation
+  under the same load; do not hide its cost in the no-observer comparison.
+- Charged response bytes, jobs, sessions, and subscriptions never exceed
+  their bounds. After warm-up, repeated four-times-limit overload cycles
+  show no continuing RSS, descriptor, task, or WAL growth attributable to
+  observers. Report SQLite/cache/allocator memory separately from the
+  response-byte budget; that budget is not a bound on total RSS.
+- Stream and transcript checks pass in every run. Publish all five pairs
+  and their spread. A noisy result that cannot distinguish the gate is
+  inconclusive, not a pass; change a gate only with an explicit rationale
+  recorded before another candidate run.
+
+These limits make "without disturbing" a testable, bounded claim rather
+than a promise of zero shared-resource cost. Follow
+[COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md); performance evidence does
+not replace the behavior tests.
+
+## Later phases and their entry gates
+
+| Phase | Deliverable | Gate before implementation |
 | --- | --- | --- |
-| `bots`, `turns`, `result` | Identity, status, per-turn model, tokens, timing, outcomes | storage worker |
-| `events`, `follow` (one bot or `*`) | Durable event log, then live deltas | worker for replay pages; hub for live |
-| `history_nodes`, `history_items`, `item` | The transcript itself | storage reader |
-| `artifact` | Full retained tool output | storage worker |
-| `stats` | Daemon-wide live state | service loop, plus a storage-worker count (at `e1d413f`: `src/server/mod.rs:1188-1194`) |
+| 2. Observer features | Versioned `summary` read, observe capability, CLI digest, then app presentation | Phase 1 behavior and performance evidence |
+| 3. Several endpoints | Store identity, opt-in store discovery, named endpoints, then a merged client view | Identity lifecycle and reconnect contract; matched one-versus-N daemon screen before changing defaults |
+| 4. Cross-store fork | Export a restricted, completed root bot and import a new identity | Bundle/reference contract, consistent export, destination validation, and round-trip acceptance cases |
+| 5. Move a bot | Drain/resume, transfer ownership, durable destination routing | Tested single-store drain plus a crash/retry/cancel/restore state machine |
+| 6. Move dependent bots | Transfer a parent and the children it awaits together | Phase 5 evidence and an atomic group contract |
 
-(`src/server/mod.rs:87-172`; routing at `src/server/mod.rs:1005-1280`.)
+Only phase 1 is the next implementation. Later phases are provisional and
+may change after measurements or a concrete workload. No restore utility,
+cross-store alias layer, or group-move subsystem is required to begin it.
 
-Another agent can already observe from its shell tool using `agent follow
---bot X`, `agent turns`, and `agent result` ([CLI.md](CLI.md)). The app works
-the same way: one `follow *` and pipelined item loads ([APP.md](APP.md)).
+### Observer features
 
-A slow observer cannot hold a bot back. The hub delivers live events with
-`try_send`, and a socket follower that lags is closed rather than waited on
-(`src/server/hub.rs:96-122`). The exception is the stdio owner. It gets a
-backpressured firehose (`src/server/hub.rs:122-137`), so an observer should
-never be the stdio owner.
+A `summary` read returns the compaction summary, covered turns, version,
+and carry-forward note selected for that bot's history. It spends no model
+tokens and can be absent or stale. A client digest combines turn state,
+events, recent output, and usage, returning JSON by default.
 
-Summaries already exist for some bots. Compaction writes a model-generated
-summary, the covered turns, and their verbatim prompts to the `compactions`
-table (`src/store/db.rs:343-346`, written at `src/store/db.rs:1038-1070`).
-The bot's carry-forward note is versioned in `notes`
-(`src/store/db.rs:340-342`). But no protocol operation returns either text.
-The `compacted` event carries only sizes (`src/store/db.rs:1054-1057`), and
-the summary is read only to build the next compaction and the model's
-context (`src/store/db.rs:996-1002`).
+An explicitly requested model summary can use a fork with tools disabled.
+Add and validate fork tool selection before offering that recipe. Preserve
+provider-required schemas for historical tool blocks while forbidding new
+calls; test both provider families. The model call consumes shared provider
+allowance and may affect fleet pacing, so it is never automatic polling and
+does not inherit the no-model observer performance claim. Cache reuse is
+unmeasured. A protected observe-only socket waits for a second principal.
 
-A fork can already ask a bot about itself without touching it. A fork at an
-explicit checkpoint is allowed while the source is running. Only a fork of
-the current head requires the source to be idle
-(`src/store/db.rs:2316-2329`). The fork shares history nodes and leaves the
-source's rows unchanged.
+### Several endpoints
 
-### Where watching disturbs a bot today
+Per-workspace daemons already work with an explicit store path. Separate
+daemons isolate daemon-local failures; they share host resources and user
+permissions. They also multiply provider pools, learned pacing, process
+bounds, and baseline memory. Opt-in discovery can search for a workspace
+store, but must document ignoring database/WAL files and excluding live
+stores from ordinary workspace copies. Keep the default store unchanged.
 
-- **Replay competes with commits.** `events`, `artifact`, and every follow
-  replay page run on the storage worker (`src/server/mod.rs:1233-1237`,
-  `src/server/mod.rs:1258-1275`, `src/server/hub.rs:142-160`), the one
-  thread every bot's commits wait on (`src/store.rs:243-266`). Several
-  observers attaching to long logs queue behind, and in front of, fleet
-  commits.
-- **Transcript reads compete with requests.** `history_*` and `item` run on
-  the storage reader (`src/store.rs:269-290`). That same thread streams
-  context items into model requests (`src/server/turn.rs:358`,
-  `src/server/turn.rs:565`). A heavy transcript reader delays request
-  construction.
-- **A summary fork isn't read-only.** `fork` takes no tool selection
-  (`src/server/mod.rs:65-77`) and copies the source's tools
-  (`src/store/db.rs:2344-2356`). A "summarize what you are doing" fork
-  therefore has `shell` and `write`. It also writes a `forked` event and
-  shows up in the lineage tree.
-- **A model summary spends the fleet's allowance.** Every model call passes
-  the same per-provider pacing gate (`src/provider/pace.rs:1-10`). A summary
-  a person or agent asks for is paid from the budget the watched bots are
-  using.
-- **Nothing makes a session read-only.** The only authorization is the
-  socket file's permissions (`client/src/socket.rs:59-67`). A client that
-  can `follow` can also `interrupt`, `delete`, or submit.
+Before a client aggregates endpoints, define identity across normal
+restart, file copy, and backup restore. A candidate uses a lineage id plus
+an instance id: lineage survives copying; instance distinguishes live
+stores and cursor histories. File device/inode and an external sidecar
+are possible detection inputs, not proof against every restore or clone.
+Replacing a database with an old backup must invalidate the old cursor
+identity. State unsupported cases, including full-machine/block clones,
+before claiming unique move destinations. Restore must leave either the
+complete old store or the complete restored store after a crash, including
+committed WAL frames; deleting sidecars before replacing the database is
+not a sufficient protocol. Select and crash-test that protocol in this
+phase rather than treating an inode recipe as an established guarantee.
 
-### What would change
+Announce identity in `ready`. Key client state by endpoint and instance,
+detect duplicate instances, qualify displayed bot identities and handles,
+and keep a separate replay cursor per endpoint. Reconnect one endpoint
+without clearing another's state. A lost `wait` request must be reissued
+using its handle; replay cursors do not resume requests.
 
-1. **Name the observer set.** Document the operations above as the observe
-   contract, and advertise it as a capability in `ready`. This is
-   documentation plus one capability string.
-2. **A `summary` read.** Return the bot's current compaction summary, its
-   covered turn range, and its note, all from the reader. This costs no model
-   call. It only has content for bots that compacted or wrote a note, and it
-   is as fresh as the last compaction. Forks already bind to the right
-   versions (`src/store/db.rs:2363-2388`), so the read is correct for forks.
-3. **A digest in the client, without a model.** The client builds what a
-   bot is doing now from `turns`, the current turn's events, and the last
-   text: running turn, tool calls in flight, last output lines, tokens. It
-   uses JSON by default and a rendered view under `--pretty`, like every
-   other command. This is client policy, not daemon mechanism (NEXT item 20).
-4. **Replay pages off the worker, onto an observer reader.** Move every
-   replay page except the last off the worker. Keep the final "empty page,
-   switch to live" step as a worker job, since that is what guarantees no
-   committed event falls between replay and live
-   (`src/server/hub.rs:139-141`). One such job per follower would let a
-   burst of followers that are already at the tail queue one job each
-   ahead of later commits on the single FIFO worker
-   (`src/server/hub.rs:146-157`). So the handoffs are batched: followers
-   that reach the tail wait for one shared handoff job, which reads the
-   current last cursor once and switches every waiting follower whose
-   cursor matches to live, sending the rest back to the observer reader
-   for another page. At most one handoff job is queued at a time,
-   whatever the number of followers. The acceptance workload includes a
-   burst of tail follows and measures commit tail latency during it. The pages must not go to the existing
-   reader: that one thread also streams context into model requests, so
-   moving replay there only moves the stall from commits to request
-   construction. They go to a second read-only connection that serves
-   observers alone, while the context reader keeps serving turns. It takes
-   every read in the observe set: replay pages, `events`, `history_*`,
-   `item`, the `summary` read, and also `bots`, `turns`, `result`,
-   `artifact`, and the store counts behind `stats`, which run on the
-   worker today (at `e1d413f`:
-   `src/server/mod.rs:1066-1071`, `1168-1179`, `1188-1194`, `1254-1260`,
-   `1325-1346`). Leaving those
-   there would keep digests and retained-output reads queued ahead of fleet
-   commits. `wait` stays on the worker, since it decides against the write
-   that completes a handle. SQLite in
-   WAL mode lets both read concurrently. The observer reader has a bounded
-   queue and each connection keeps at most one page in flight, so many
-   observers slow each other, not the watched bots. Admission must not
-   block the service loop either. Today that loop awaits each request's
-   `dispatch` (at `e1d413f`: `src/server/mod.rs:706-707`), and a `read`
-   awaits both queue space and the result (`src/store.rs:272-295`), so a
-   slow transcript read already holds up completions, resumes, and ready
-   turns. Observer reads therefore take the deferred path that follow
-   replay already uses (`src/server/mod.rs:1361`): `dispatch` enqueues with
-   `try_send` and returns, a full queue answers `observer_busy` at once,
-   and the reader's task sends the response itself. A request count alone
-   does not bound memory, since each queued read materializes its whole
-   response. So the observer path serves only bounded pages: `artifact`
-   without a stream and limit returns a whole retained stream today
-   (`src/server/mod.rs:1325-1346`), and on the observer path it requires a
-   stream and a limit capped at the existing 64 KiB page. `item` has the
-   same problem: it loads the whole `nodes.item` blob with no size check
-   (at `f47adff`: `src/store/db.rs:3375-3385`). On the observer path it
-   first reads `length(item)`, which SQLite answers from the record header
-   without loading the blob, and charges that length before reading. An
-   item over the 64 KiB page is served in byte ranges, the way `artifact`
-   pages are. Admission also
-   counts the bytes that queued and in-flight reads may return, against a
-   daemon-wide budget, and answers `observer_busy` past it. The charge
-   lasts until the bytes reach the socket, not until the reader hands the
-   response off: each session's output queue holds up to 2 MiB until its
-   writer drains it (at `da0f2ab`: `src/output.rs:14`), so a client that
-   stops reading would otherwise keep accepted pages in memory uncharged,
-   and N such observers would grow memory linearly again. The output
-   packet already carries its per-session byte permit and drops it once
-   written (`src/output.rs:16`, `45`, `72`); an observer page carries its
-   daemon-wide permit the same way, and the page counts as in flight for
-   its connection until then. The acceptance check is
-   the context reader's queue-time percentiles (the per-operation
-   histograms, NEXT item 27), unchanged with N observers replaying long
-   logs against the same fleet without them.
-   Live `follow` subscriptions need the same bound. Each durable event is
-   cloned into every live follower's own output queue, up to 2 MiB each,
-   and a full queue closes that follower (`src/server/hub.rs:96-120`), so
-   N stopped followers hold up to N times 2 MiB and every commit pays
-   N clones. Fan-out should serialize each event once and share the
-   bytes, and live follower queues charge the same daemon-wide budget as
-   observer pages. A follower that cannot be charged is closed the way a
-   full queue closes it today, and resumes by replay from its cursor.
-   Bytes alone do not bound the publisher's work: `fan_out` snapshots and
-   visits every subscription on the bot and every `follow *` subscription
-   for each durable event, so idle followers that hold no bytes still add
-   commit-tail work per event. Follow admission therefore also has a
-   daemon-wide count limit, with `follow *` counted against it on every
-   bot's path, and a follow past the limit is refused with
-   `observer_busy`. The acceptance workload includes both stopped and
-   idle live followers.
-5. **A tool selection on `fork`.** An optional `tools` list, empty allowed,
-   validated the way `create` validates it. Heterogeneous forks want this
-   anyway. With it, "fork at the current node with no tools, ask it to
-   summarize" becomes a safe recipe for a model-written summary on demand.
-   "No tools" must mean no calls, not no definitions: the Messages family
-   needs the definitions for historical tool blocks, which is why
-   compaction keeps the bot's encoded selection and sets `tool_choice` to
-   none (at `e1d413f`: `src/server/turn.rs:469-473`). An empty selection
-   does the same: it keeps the inherited schemas in the request and
-   forbids new calls.
-   The caller deletes the fork afterwards.
-6. **Read-only access, once another principal needs it.** A second socket
-   that serves only the observe set, with its own file permissions, so the
-   operating system decides who may connect to which. A flag the client
-   chooses at connect is not a boundary: the same principal can reconnect
-   without it and use the full-access socket. Defer this until someone other
-   than the store's owner observes. Today every client is the same uid.
+Keep remote access on SSH-forwarded Unix sockets in a private directory.
+The operator starts remote daemons. A forwarded full-access socket grants
+the daemon user's tool authority. Cross-daemon creators/parents remain an
+explicitly unsupported relationship until their identity and routing
+contract exists; never resolve them by a same-named local bot.
 
-### Risks
+Measure one daemon with N workspaces against N daemons on identical work:
+total CPU/RSS, connections, achieved concurrency, p95/p99 latency, and
+shared-key pacing/refusals. Synthetic checks come first; a real-provider
+check needs a stated spend cap. Add jitter or shared pacing only if evidence
+requires it. Per-workspace daemons remain opt-in meanwhile.
 
-- A summary is a model's reading of a transcript. It can omit what the bot
-  is really doing, and a stale compaction summary can describe work that
-  finished long ago. Always return the covered range and the version with
-  the text.
-- An on-demand summary costs input tokens roughly the size of the window,
-  from the same pool as the fleet. Many observers asking often could pace
-  the watched bots. Keep any model summary behind an explicit call, never
-  on a timer.
-- The summary fork's first turn shares the source's prefix and model, so it
-  may hit the provider's prompt cache. That is unmeasured.
-- Transcripts carry whatever tools read, and summaries inherit that. Anyone
-  granted observe access sees all of it.
+## Mobility: constraints to settle before implementation
 
-### Order
+This section preserves the durability requirements behind the reviews.
+It is not an approved import format or a complete move algorithm. Resolve
+each contract once for the whole carried state, then test it across the
+relevant record types instead of adding a separate exception per field.
 
-1. The observer reader with bounded, non-blocking admission, then replay
-   pages and the rest of the observe set on it, measured on the
-   slow-follower and mixed-workload screens (NEXT items 16 and 18). It
-   comes first because the reads below would otherwise use the two paths
-   that already disturb bots, the context reader and the worker.
-   Behavior test: an observer `item` read of an item larger than the
-   budget is charged its length before loading and served in ranges, and
-   observers that stop reading hold their pages' budget until the pages
-   are written, so further observer reads get `observer_busy` while bots
-   keep running.
-2. The `summary` read on it, plus the observe capability.
-3. The client digest in the CLI (JSON), then in the app.
-4. `fork` with a tool selection, and the summary-fork recipe, with the
-   cache-hit ratio measured.
-5. A read-only socket, only when a second principal appears.
+### Bundle and reference contract
 
-## 2. One daemon per workspace or project
+Use a versioned bundle carried by the caller; daemons do not connect to one
+another. The bundle represents one durable cut and includes the records
+needed for the promised history, context, result, fork, and retention
+operations. An implementation inventory must cover:
 
-Run a daemon per workspace or project, so that a stall, crash, or runaway
-in one does not reach the others.
+- Bot configuration; lineage nodes and checkpoint rows; turns and request
+  ids; tool intents and known/unknown outcomes; completed process results;
+  retained artifacts; note/compaction versions; outcome and authorization
+  events; and retained-turn ownership.
+- Every structural id in columns and event payloads, including
+  `nodes.turn`, turn ownership in associated tables, prompt-node links,
+  checkpoint/cut/parent links, and completion/steer/tool-completion ids.
+  Reassign store-local ids consistently. Keep lineage ordinals unchanged.
+- Every carried model-visible or retrievable value: transcript nodes,
+  notes, summaries and retained prompts, bot and compaction instructions,
+  artifact streams, and completed process-result text. Preserve their
+  bytes. References in any of these need an origin-aware resolution rule
+  or explicit refusal, including references whose objects did not travel.
 
-### What exists
+Use the storage codecs instead of copying encoded columns blindly:
+[`artifact::read` and `artifact::put`](../src/store/artifact.rs) handle
+artifact encoding, and large turn prompts are resolved through
+`prompt_node`. A round trip must retain idempotent request comparison.
 
-This works today by choosing a store per workspace. `--store` or
-`AGENT_STORE` selects the store, and the socket follows from it
-([CLI.md](CLI.md), "Connection and startup"). `run` starts a daemon for a
-store on demand, in its own process group so it outlives the CLI
-(`src/client.rs:469-545`). `--idle-exit` retires a socket daemon with no
-sessions, no live turns, and no running commands, and parked turns resume
-on its next start (`src/server/mod.rs:577-600`). Both ownership locks keep
-two daemons off one store. Delegation stays inside the daemon: a bot's
-shell inherits `AGENT_STORE` and `AGENT_SOCKET`
-(`src/server/mod.rs:451-470`), so the `agent run` it issues reaches the same
-daemon.
+Outcome events are required even when most replay history is omitted:
+[`turn_outcome` and `authorize_artifact`](../src/store/db.rs) use them for
+results and fork-authorized artifact reads. Rebuild retained-turn ownership
+so prune/delete work. Remap payload ids as well as relational columns.
+Import creates fresh event cursors and an `imported` creation event carrying
+the target bot's list fields, origin, and any omitted-history notice.
+Clients must understand that event. Do not copy the source retention
+watermark or mark newly retained events as pruned; the target per-bot
+watermark starts at zero and unrelated fleet retention is unchanged.
 
-So `agent run --store "$PWD/.agent/state.sqlite" ...` already gives a
-per-workspace daemon. What is missing is a convention, and an honest
-account of what the isolation buys.
+The first cross-store fork is deliberately restricted: a root bot with only
+finished turns, no running processes, no fork ancestry, no retained
+artifacts, and no handles or artifact references anywhere in the carried
+values above. Refuse each unsupported case explicitly. Source work remains
+untouched, so carrying ready/queued turns would duplicate execution.
+The new identity starts with zero usage and an optional new budget, like a
+local fork. Drop the source creator, report that fact, and validate any
+new target-local creator rather than exporting a stale parent identity.
 
-### What separate daemons do and do not isolate
+Before lifting those restrictions, choose an origin-qualified handle and
+artifact-reference design. Imported handles need a mapping to the carried
+local records, not just a foreign-store tag. A reference to a child that
+stayed behind must fail explicitly. Preserve resolution through later
+local forks and subsequent imports; ambiguous unqualified references cannot
+silently select a target object. Fork ancestry also needs an ownership
+representation for inherited turns and outputs before forked bots travel.
 
-They isolate daemon-local failures. Each daemon has its own storage
-worker, so a 693 ms deletion stall like the one measured in NEXT item 3
-stops only its own store. Each has its own `--max-active`, process and
-pending bounds, retention, WAL, and crash.
+### Consistency and destination admission
 
-They do not isolate the host. Every daemon runs under the same operating
-system limits, and each gets its own process allowance, so one workspace's
-shell or model workload can still exhaust CPU, memory, process ids, or file
-descriptors and raise tail latency for the others. Resource isolation
-belongs to caller-supplied cgroups, containers, or equivalent host
-controls.
+Capture the bot state, history head, and turn/event cut in one writer
+transaction. Export in bounded pieces that all read the same cut. Fence
+prune/deletion for the captured records until export finishes or aborts;
+release the fence on disconnect. New work after the cut must not leak into
+it. Avoid holding a long read transaction that pins the WAL fleet-wide.
+Bundles contain transcripts and tool output and belong in ignored storage.
 
-They do not isolate security. Every daemon runs as the same user with
-full-access tools. `read`, `write`, and `edit` resolve a path by
-`workspace.join(path)` (`src/tools.rs:816-818`), and an absolute path
-replaces the workspace entirely, so a bot in project A can edit project B.
-Process sandboxing is explicitly kept out of the queue (NEXT, end of the
-queue). Per-workspace daemons are a daemon-local fault boundary, not a
-sandbox and not a resource boundary.
+Before committing an import, validate provider name/family, compaction
+provider, selected tools, name availability, and all effective per-turn
+models/workspaces. Map the bot's and unfinished turns' workspace paths;
+refuse unmapped or absent paths. Admit the entire incoming pending queue
+against the destination's turn and byte bounds atomically, or refuse the
+whole import with `pending_limit`. Do not partially import a queue.
 
-They also give up what one daemon shares, which is most of this project's
-performance thesis:
+These are local checks. Provider acceptance of stored reasoning, especially
+across credentials or organizations, remains a per-family validation task.
+A first-call error is reported normally and never replaced with a fresh
+conversation. Stored absolute paths can still direct tools to source paths;
+workspace placement and the client instruction explaining a move need an
+explicit contract before claiming transparent continuation. Cache transfer
+or reuse is unmeasured.
 
-- **Provider connections.** Each daemon has its own transport and HTTP/2
-  shards, sized from its own `--max-active` (`src/server/mod.rs:275-320`).
-- **Pacing.** Each daemon learns its own pools from response headers
-  (`src/provider/pace.rs:1-10`). N daemons on one key are N independent
-  clients, each assuming the whole allowance until it is refused. NEXT item
-  10 anticipated exactly this case ("several hosts on one provider key") and
-  proposed jitter. It is equally true of several daemons on one host.
-- **The process bound.** It defaults to 64 per logical CPU per daemon
-  (`src/server/mod.rs:300`), so N daemons oversubscribe the host N
-  times.
-- **Memory.** An ad hoc probe measured about 10.7 MiB RSS and four threads
-  for a daemon holding 500 idle bots
-  ([DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md), parked-turn table). An
-  empty daemon's cost has not been measured.
-- **Cross-workspace work.** A bot cannot `wait` on another daemon's handles
-  or fork from another store's history. Creating a bot in another daemon from
-  a bot's shell fails, because the client sends `AGENT_BOT` and
-  `AGENT_BOT_ID` as the creator (`src/client.rs:572-587`), and the target
-  store requires that creator to exist there (`src/store/db.rs:574-592`),
-  answering `creator_not_found`.
+### Drain and ownership transfer
 
-### What would change
+First implement and test drain within one store. A bot drains only at a
+durable round boundary after its in-flight model/tool work commits. Running
+background processes are checked separately from bot idleness and must
+finish or be durably resolved. Unknown tool outcomes stay unknown; moving
+is never permission to replay their side effects.
 
-1. **Store identity** (the shared first step), so clients and logs can tell
-   per-workspace daemons apart.
-2. **Store discovery in the client.** Opt-in: walk from the workspace
-   toward the root for `.agent/state.sqlite`, the way client policy already
-   walks for `AGENTS.md` ([CLIENT.md](CLIENT.md)), and fall back to
-   `~/.agent/state.sqlite`. This changes the client only. The daemon remains
-   unaware of workspaces beyond each turn's path.
-3. **A matched screen before any recommendation.** Run one daemon with N
-   workspaces against N daemons on the same workload. Measure total RSS,
-   CPU, connections, and 429s on a shared key. Per AGENTS.md, the screen,
-   not the principle, decides.
-4. **Host-level pacing, only if the screen shows it is needed.** If N
-   daemons on one key storm the provider, the cheapest fix is jitter on
-   retries and resumes (item 10's note). A shared pace across daemons, such
-   as a lock file or a small pacing process, is a subsystem and should wait
-   for evidence.
+A durable `drained` turn remains parked across restart. Releasing it resumes
+from its existing head without appending its prompt again. It must not go
+through the `ready`/`start_locked` path used for fresh submissions. Queued
+work behind it stays queued and subject to destination admission.
 
-### Risks
+The candidate move protocol has these ownership boundaries:
 
-- A store inside the workspace is one `git add .` away from being committed,
-  along with its transcripts and tool output, and a workspace snapshot copies
-  the store and WAL mid-write. The convention has to include ignoring
-  `.agent/*.sqlite*`. A copied store is also a second store with the same
-  identity (section 4's risks).
-- Calling this "isolation" invites the security and resource readings.
-  The docs have to say daemon-local fault boundary every time.
-- Many small daemons each learn pacing from nothing and each keep their own
-  connection pools, so the fleet numbers in [LIVE_FLEET.md](LIVE_FLEET.md),
-  all measured through one daemon, no longer describe the system.
+| Boundary | Required behavior |
+| --- | --- |
+| Prepare | Name one destination instance and a nonce; mark the source `moving`; fence submissions, deletion, and conflicting transitions. |
+| Export cut | Atomically bind the cut and exported state to that nonce. A cancel ordered before it retires the nonce and prevents later export pages. |
+| Destination import | Accept only the named instance, atomically and idempotently by nonce. The source stays non-runnable if the response is lost. |
+| Receipt | Tombstone the source with destination lineage/instance, bot name/id, and mappings for every carried turn, finished or unfinished. |
+| Cancel after the cut | Require the destination's durable refusal of that nonce, issued only if it has not imported it. An unreachable destination leaves the source fenced; any operator override must state the duplicate-execution risk. |
 
-### Order
+Tombstones answer submissions, old/new `wait`s, and `result` with
+`bot_moved` and the correct destination turn handle. Resolve already
+registered waiters too, and emit a durable `bot_moved` event for existing
+followers and reconnects. Ordinary delete cannot remove a moving bot or its
+tombstone; explicit expiry must state the routing guarantees it removes.
+After a destination restore, use the origin and move nonce to verify the
+imported bot before rebinding to a new instance and replaying from scratch.
+A backup predating import answers `moved_bot_missing`, not a same-named bot.
 
-1. Store identity.
-2. Client discovery, opt-in, with the ignore rule documented.
-3. The one-versus-N screen.
-4. Jitter or shared pacing only if the screen calls for it.
+Move runtime-local clocks and limits by meaning, not raw values. A paced
+turn re-enters the destination's provider gate, with a fresh per-call retry
+budget and preserved cumulative retry/pacing history. Charge source pacing
+through the cut, start target pacing at import, and exclude transfer time
+and clock skew. Preserve the state discriminator used to resume a model
+call. A wait timeout carries its remaining duration under an explicitly
+defined transfer-time policy.
 
-Until the screen says otherwise, the default stays one daemon per user.
-Per-workspace daemons are for people who want a failure boundary.
+Refuse a move with outbound dependencies whose records do not travel, or
+with source turns waiting on the moved bot. Client waiters can be redirected
+as above. Group moves are a separate phase: one nonce, source transaction,
+destination transaction, and receipt for all participants. Remap internal
+creator/parent links along with handle references; drop external creators
+explicitly. Do not emulate this by moving mutually dependent bots one at
+a time.
 
-## 3. One client over several daemons
+### Evidence required to advance mobility
 
-Let one UI or CLI manage several daemons, on this machine and others.
+| Gate | Acceptance cases |
+| --- | --- |
+| Restricted fork | Compare next request context against a local fork at the same checkpoint, including summary/note; preserve results, history ordinals, idempotency, older checkpoints, prune/delete, and imported-event visibility. Race submission and retention against paged export. Exercise every stated refusal. |
+| References and ancestry | Use colliding source/target ids across every carried record and event kind. Read pre-import outputs from the imported bot and its later local fork. Resolve handles embedded in instructions, notes, summaries, artifacts, and process results, including after another import. Reject missing or ambiguous origins. |
+| Drain | Drain a multi-round turn, restart, release, and prove its prompt and every completed round appear exactly once with no tool replay. |
+| Move | Crash/retry at each ownership boundary; race cancel, delete, waits, and followers; rename at import; exceed target pending bounds; use skewed clocks and restores before/after import. Prove at most one side can continue and old handles route correctly. |
+| Group | Move a waiting parent with its child atomically; the child completes, the parent resumes, and subsequent parent/child communication uses the remapped identities. |
 
-### What exists
+Each phase needs bounded resource measurements on long histories as well
+as behavior evidence. These gates are requirements for future implementation,
+not prerequisites for merging this roadmap or starting phase 1.
 
-The daemon already serves any number of clients. Its accept loop gives each
-connection its own session (`src/server/mod.rs:492-515`), and `follow *`
-gives each client the whole fleet on one subscription with a store-wide
-cursor ([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#fleet-controllers)).
+## Source map
 
-Every client talks to exactly one daemon at a time. The CLI resolves one
-store and socket per invocation and checks that daemon's configuration
-against what it asked for (`src/client.rs:398-467`). The app holds one
-`Client` (`app/src-tauri/src/main.rs:24`, connected at
-`app/src-tauri/src/main.rs:182`). The shared client crate connects only to
-a Unix socket path and requires protocol 3 (`client/src/lib.rs:141-160`).
+The observations above refer to the pinned revision at the top. Recheck
+these symbols when implementing; this table is not a claim about later main.
 
-Remote use already works for one daemon. [APP.md](APP.md) records that
-forwarding the daemon's socket over `ssh -L` runs the app locally at full
-speed against a daemon elsewhere, and the client is built for that latency:
-one `follow *`, pipelined item loads, nothing polled.
-
-Authorization is the socket file's permissions and nothing else. The short
-rendezvous directory must be the user's own and mode `0700`
-(`client/src/socket.rs:59-67`).
-
-### What would change
-
-1. **Store identity in `ready`** (the shared first step). The app stores
-   per-view state per socket and workspace ([APP.md](APP.md), "Closing the
-   window is detaching"). A forwarded socket's path is arbitrary, so the
-   path alone cannot be the key. Neither can the lineage id, since a
-   copied store keeps it and two divergent copies would share cursors and
-   bot state. The client keys state by endpoint name and instance id
-   together, and refuses an endpoint list in which two endpoints announce
-   the same instance, naming both, since that is one store reached twice.
-2. **A client-side endpoint list.** A small file mapping names to socket
-   paths, local or forwarded: `--daemon NAME` on the CLI, and a daemon
-   switcher or a merged fleet view in the app with one `follow *` per
-   daemon. A client that spans daemons qualifies everything it shows:
-   `daemon/bot`, handles, and one cursor per daemon. The daemon does not
-   change.
-3. **Transport: reuse SSH, don't add a listener.** AGENTS.md asks for
-   standard transports, and a TCP or TLS listener with authentication would
-   make the daemon the remote execution service the project rules out. If a
-   network endpoint is ever wanted, it should be a separate process in front
-   of the socket, the same shape as the ACP bridge (NEXT item 9).
-4. **Starting remote daemons stays with the operator.** `ensure_daemon`
-   starts a local daemon from the current executable
-   (`src/client.rs:501-522`). A client that runs `ssh host agent serve`
-   would be choosing machines, which the README assigns to callers.
-   Document an ssh or systemd recipe instead.
-5. **Cross-daemon lineage, only when needed.** A bot that creates a peer on
-   another daemon fails today with `creator_not_found` (see section 2).
-   Either the client drops the creator for a remote target, which loses the
-   lineage honestly, or the store accepts a remote creator (store identity,
-   name, id) that it records but cannot check. Leave it until someone needs
-   it.
-
-### Risks
-
-- A forwarded socket is full access for anyone who can reach it: submit,
-  delete, and every bot's `shell`, which amounts to code execution as the
-  daemon's user. Forward to a socket in a `0700` directory, never to a TCP
-  port.
-- Stale forwarded socket files, and a forward that drops mid-`wait`. The
-  shared client fails every pending request with `daemon_disconnected`
-  (at `8ebbc44`: `client/src/lib.rs:203-210`), and the CLI exits. Only the
-  app's follow re-attaches, from its event cursor, and a cursor cannot
-  resume a lost request. The handles are still valid, so a multi-daemon
-  client has to reconnect and re-issue its `wait` per endpoint, without
-  blanking the other daemons.
-- Name collisions across daemons. `bob` on two daemons is two bots, and any
-  merged listing has to show which is which.
-
-### Order
-
-1. Store identity.
-2. `--daemon` and the endpoint list in the CLI.
-3. A multi-daemon view in the app, with one follow per daemon.
-4. A written ssh-forwarding recipe, with the permissions above.
-5. Cross-daemon lineage, only if a workload needs it.
-
-## 4. Move a bot to another daemon
-
-Move a bot, including one with work in progress, to a daemon on another
-machine, and continue it there as the same conversation.
-
-### What exists
-
-Everything a bot is lives in store rows. Its row holds the head, model,
-provider, instructions, tools, budget, note, and compaction version. The
-node tree holds the transcript, and turns, tool intents, processes,
-artifacts, and events hold the rest (`src/store/db.rs:335-418`). Durable
-work survives a restart: queued, ready, and steer submissions are rows (NEXT
-item 8), and parked turns (waiting on handles or paced) are reloaded at
-start (`src/server/mod.rs:530-575`). A bot can be forked from any node of
-its history (`fork_any_node` in `ready`) and deleted in bounded pieces (NEXT
-item 29).
-
-Some of a bot cannot move, by construction:
-
-- **A live model call.** It is a task holding an open provider stream, and
-  partial text is not durable (`"partial_text_durable":false` in `ready`,
-  `src/server/mod.rs:486`).
-- **Foreground tool processes.** They run in their own process group,
-  which is killed when the turn's future is dropped
-  (`src/tools.rs:851-895`).
-- **Background processes.** They are children of this daemon. A restart
-  reports them `process_lost`, meaning supervision ended and the process may
-  still be running (NEXT item 11). An idle bot can own one: `shell` with
-  `background` returns its `proc:` handle at once, and the command outlives
-  the turn. Deletion checks for running processes separately from the bot's
-  status for this reason (at `8ebbc44`: `src/store/db.rs:2734-2746`).
-- **The workspace.** It is an absolute, canonicalized path that must exist
-  on this host (`src/server/mod.rs:333-341`), and the model has seen those
-  paths in its transcript.
-
-So "moving a running bot" really means draining it to a durable boundary,
-then moving that state. Interrupt already reaches a boundary: planned calls
-are cancelled, and executing calls without a committed result become
-`tool_outcome_unknown` (NEXT item 14). But that stops the work instead of
-carrying it over.
-
-### What would change
-
-1. **Export and import, not daemon-to-daemon traffic.** An `export`
-   operation writes the bot's state to a bundle file, a small SQLite file
-   with a schema version and the source store's identity. An `import`
-   operation reads one. The caller carries the file with scp, rsync, or
-   whatever it uses. The daemon never opens a network connection to another
-   daemon.
-2. **What a bundle holds.** The lineage nodes from the head to the root
-   (nodes are shared with the source's other forks, so they are copied, not
-   moved), the bot row, turns with their request ids (so a retried
-   submission stays idempotent at the target), tool intents, completed
-   process results, artifacts, note and compaction versions, and the
-   `checkpoints` rows. Those rows are where `validate_fork_point` stops
-   walking back (at `e1d413f`: `src/store/db.rs:2718-2742`), so without
-   them a fork at an older imported completion would re-walk the whole
-   transcript before it. Import remaps each row's head to the new node
-   id. Two kinds
-   of records are part of the store's contract, so the bundle cannot treat
-   them as optional:
-   - **Outcome events.** A finished turn's result is rebuilt from its
-     `turn_finished` event and its last `message` event, and
-     `turn_result_pruned` is the answer when they are missing (at `8ebbc44`:
-     `src/store/db.rs:2343-2380`). An artifact read is authorized through
-     the `tool_completed` event that names the output's node
-     (`src/store/db.rs:3206-3222`). The bundle carries these events for every
-     turn it carries, under new cursors. The rest of the replay log is
-     optional, since followers' cursors do not survive anyway. The bot
-     row's `pruned_cursor` is in the source's cursor space, and
-     `event_page` compares every request against it (at `e1d413f`:
-     `src/store/db.rs:2921-2939`), so import does not copy it. Nor does it
-     use that watermark for the omitted history: a watermark above
-     retained events makes every replay page before it report
-     `pruned_before`, and a client resuming from it would skip the
-     imported outcome events. The watermark stays 0, since the bot has no
-     target events before its import, and the gap goes in band instead.
-     Import writes an `imported` event for the bot, before its imported
-     events, naming the source lineage and instance and whether the
-     bundle omitted events. It also carries the fields a `created` event
-     carries (the target's bot id, provider, and the rest of the bot's
-     list entry), because the app changes its fleet only on `created`,
-     `forked`, and `deleted` and requires those fields on the first two
-     (at `8b3479b`: `app/ui/app.js:240-271`). The app treats `imported` as
-     one more creation kind, so a live `follow *` at the target shows the
-     bot at once. One-bot and `follow *` followers both replay
-     it, and the store-wide watermark in `event_retention`
-     (`src/store/db.rs:2927-2933`) stays untouched, so no other bot sees a
-     false gap.
-   - **Retained-turn ownership.** `prune` and bounded deletion find a bot's
-     operational records through `retained_turns` (at `8ebbc44`:
-     `src/store/db.rs:454`, read at `src/store/db.rs:2777` and
-     `src/store/db.rs:2927`). Import writes a row for every imported turn
-     whose records it carries. Without them, pruning never frees imported
-     records, and deletion removes turn rows that artifacts and processes
-     still reference.
-   Since schema 26 (`8ebbc44`), two of those rows cannot be copied as raw
-   columns. Export has to read them the way the store itself does:
-   - **Artifacts.** `artifacts.data` may be a block-compressed blob, and
-     `raw_bytes` records the decoded length, with 0 meaning stored raw
-     (`src/store/artifact.rs:1-5`, `src/store/db.rs:468`). Export reads each
-     one through `artifact::read` (`src/store/artifact.rs:59`), as the
-     protocol's `artifact` read does (`src/store/db.rs:3335`), so the bundle
-     never depends on the source's encoding. Import writes it back with
-     `artifact::put`, and the target encodes under its own rules.
-   - **Turn prompts.** A prompt of 4 KiB or more is stored once, as the
-     user item node. The turn row keeps an empty `prompt` and points at that
-     node through `prompt_node` (`src/store/db.rs:15`, set at
-     `src/store/db.rs:3425-3428` for started turns and
-     `src/store/db.rs:1912-1913` for absorbed steers). Export resolves
-     `prompt_node` to the prompt text, the way the idempotency check does
-     (`src/store/db.rs:1557-1561`). Copied raw, a retried submission at the
-     target would compare against an empty prompt and fail
-     `idempotency_conflict`.
-3. **Renumbering at import.** Node, turn, bot, process, and event ids are
-   per-store sequences, so import allocates fresh ones and rewrites every
-   reference: parents, head, context start, note and compaction chains,
-   cuts, checkpoints, each turn's `prompt_node`, and every other column
-   that holds one of those ids: `nodes.turn`, the unique link from a
-   turn to its prompt node (at `4e6b6bb`: `src/store/db.rs:407-411`),
-   while the lineage-local `turn_seq` stays as it is, and the `turn`
-   columns of `events`, `tools`, `processes`, `artifacts`, and
-   `retained_turns`. It also rewrites the
-   ids inside the payloads of the events the bundle carries, because
-   `result` returns that data as it is: a finished turn's
-   `turn_finished.data.checkpoint` (at `e1d413f`: `src/store/db.rs:2441`),
-   a steered turn's `into` and `node` (`src/store/db.rs:2178`), a fork
-   event's `source`, `checkpoint`, and `node` (`src/store/db.rs:2865`),
-   and a `tool_completed` event's `node` and `note` (at `61c24e1`:
-   `src/store/db.rs:2325-2328`, `2405`). The last matters beyond
-   `result`: artifact reads from a fork authorize by finding that node in
-   the fork's lineage (`src/store/db.rs:3463-3483`), so a source node id
-   there would refuse a valid read from a local fork of the imported bot.
-   The rule is every node, turn, bot, and process id in a carried payload;
-   this list is today's instance of it, and a test walks every event kind
-   the bundle carries.
-   Two ids cannot simply be rewritten:
-   - Transcript text already holds turn ids in `TURN/CALL_ID/STREAM`
-     artifact references and in `turn:` and `proc:` handles, and history is
-     never rewritten (AGENTS.md). An artifact reference is read by the bot
-     that holds it and authorized against that bot's lineage, so an origin
-     turn id that collides with a target turn fails explicitly rather than
-     returning another bot's output. That is safe but breaks the history:
-     a truncated tool result tells the model to read a reference that no
-     longer resolves, though the bundle carries the output. An alias from
-     origin ids to new ones would keep such references readable. Until
-     that alias exists, import refuses a bot whose transcript holds
-     artifact references, and names them, as it does for handles.
-   - "Transcript" here means everything the model sees or can read back,
-     not only lineage nodes. The context window also sends the bot's
-     current note and its compaction summary and prompts, which live in
-     their own tables (at `da0f2ab`: `src/store/db.rs:800-834`), and a
-     summary can quote a handle or an artifact reference from the history
-     it covers. Every request also carries the bot's instructions and its
-     compaction instructions (at `bcc6b1c`: `src/server/turn.rs:411`,
-     `468`, `881`), which a caller may have written with a handle in them.
-     And a retained artifact is text the model reads back through `read`,
-     so a command's output that names a handle is a reference too. Every
-     scan, refusal, and alias rule for references and handles below
-     applies to all of these: lineage nodes, notes, compaction rows,
-     instructions, carried artifact streams, and finished process results.
-     A finished background command is allowed in the first slice, its
-     result is stored as text (at `d006bb4`: `src/store/db.rs:2675`), and
-     a later `wait` on its handle returns that text to the model
-     (`src/store/db.rs:2705`), retained-output references included. Export already
-     decompresses each stream through `artifact::read`, so the scan
-     reads bytes that are passing through anyway.
-   - Handles are different. `proc:N` names no bot, the client `wait`
-     operation takes no bot (at `8ebbc44`: `src/server/mod.rs:157-163`), and
-     a process result is looked up by id alone (`src/store/db.rs:2444`). An
-     origin `proc:` handle that collides with a target process would
-     resolve to that unrelated process, and an alias "for an imported bot"
-     has no bot to select it by. A store-qualified form, naming the
-     instance that issued the handle, makes that collision detectable but
-     does not make the handle resolve: the destination holds the copied
-     record under a new id, and no daemon asks another. So import also
-     writes an alias for each handle in the transcript, from the
-     origin-qualified handle to the local one: a `turn:` handle through
-     import's turn renumbering, a `proc:` handle to the carried process result. The
-     destination's handle lookup consults the aliases when a handle names
-     another instance. A handle whose record did not travel, such as a
-     child that stayed behind, fails the import with the handle named.
-     Until qualified handles and aliases exist, import refuses a bot whose
-     transcript holds handles, and names them.
-   - Turn ordinals, which the `history` tool uses, are per lineage and
-     survive unchanged.
-4. **Import checks the local configuration before accepting.** The target
-   must have a provider of that name and family, which is checked today only
-   at admission (`src/server/mod.rs:725-746`), every tool in the bot's
-   selection, and a free name (`bot_exists` otherwise, or import under a new
-   name). A missing piece fails the import with an explicit error. These
-   checks cannot prove the endpoint serves the stored model or accepts the
-   stored reasoning state; only a call can. The first turn after import
-   therefore keeps an explicit failure path: a provider error ends that
-   turn as it would anywhere, and nothing falls back to a fresh bot.
-   The same checks apply to the bot's `compaction_model` when it names a
-   different provider: `create` requires that provider and its family
-   (at `e1d413f`: `src/server/mod.rs:1031-1040`), and `compact_if_due`
-   looks it up again on its own (`src/server/turn.rs:451-466`), so an
-   unchecked import would succeed and then fail every due compaction with
-   `provider_unavailable`. They also apply per turn. A turn row carries
-   its own `model` and `workspace` overrides (at `e1d413f`:
-   `src/store/db.rs:449-458`), and a resumed turn uses them before the
-   bot's (`src/store/db.rs:2337-2349`). For every unfinished turn a bundle
-   carries, import checks the effective model as above, and the workspace
-   mapping applies to the turn's workspace as well as the bot's. A turn
-   workspace the mapping does not cover fails the import.
-   Export refuses while any of the bot's processes is still running, the
-   same check deletion makes. A bot with a live background command is
-   drained or cancelled, and its process durably resolved, first.
-5. **The first slice is a cross-store fork of a root bot.** Importing a
-   copy under a new identity, with the source untouched, is a fork whose
-   history happens to live in another store. That delivers "continue this
-   conversation on that machine from this checkpoint" before any move
-   semantics exist. It is well defined only for a bot whose whole lineage
-   is its own turns. A fork's inherited nodes and outputs belong to turns
-   owned by its source bot (`turns.bot`), so copying only the fork's own
-   turns loses inherited outputs, and copying the producer turns means
-   deciding who owns them at the target, which changes turn listings and
-   idempotency. Until that representation is decided, import refuses a bot
-   with fork ancestry and says so. The copy also carries no unfinished
-   turn. A bot can read `idle` while its head turn is `ready`, waiting for
-   capacity, and later turns are `queued` (at `e1d413f`:
-   `src/store/db.rs:1883-1889`). The source is left untouched and will
-   still run them, so importing them would run the same request twice.
-   Export in this slice refuses a bot with any turn that is not finished.
-   Accounting follows a local fork as well, which starts at zero
-   `tokens_used` and takes an optional new budget
-   (`src/store/db.rs:2818`); usage carries over only in a real move. The
-   creator does not travel either: a
-   local fork records whoever forked it as its creator, validated in the
-   target's transaction (at `e1d413f`: `src/store/db.rs:2781-2816`), not
-   the source's creator. Import does the same. Copying `created_by` and
-   `created_by_id` would export the source's creator as `AGENT_PARENT` on
-   every turn (`src/server/turn.rs:695-698`), and the imported bot's reply
-   to its parent (`client/src/policy.rs:27-29`) would reach no bot, or be
-   refused by the identity check against a same-named one
-   (`src/store/db.rs:642-661`). An import from the CLI is therefore a root
-   bot, and the import result names the creator it dropped.
-6. **Then a real move, bound to one destination.** The move names its
-   destination's instance id before export, not its lineage id, which
-   copies of that store share. The source marks the bot
-   `moving` and refuses work, the way `deleting` does
-   (`src/store/db.rs:418`), and records the destination and a move nonce.
-   It refuses `delete` too. Deletion today checks only for a running turn,
-   running processes, and queued or ready turns (at `8b3479b`:
-   `src/store/db.rs:2987-3004`), which an idle moving bot passes, and
-   deleting it between import and receipt would lose the nonce and the
-   `bot_moved` route. A tombstone is not deletable by `delete` either; it
-   goes only through an explicit tombstone expiry that names what callers
-   lose.
-   The bundle carries both. A target imports only a bundle that names its
-   own identity, idempotently by nonce, so a caller that loses an import
-   response and retries against another machine is refused there. The
-   target's receipt, carried back by the caller, turns the source into a
-   tombstone that answers `bot_moved` with the destination's instance id
-   and the imported bot's name and id. The name matters because import may
-   use a new name to avoid a collision, and retrying the old name at the
-   destination could reach a different bot. Import renumbers turns, so the
-   receipt also maps every carried source turn, finished or not, to its
-   target turn id, and the tombstone keeps that map. Import inserts the
-   turns in source order in one transaction on the only writer, so the
-   target ids form one consecutive run, and the map is the ordered source
-   ids plus the first target id. A waiter on `turn:BOT/N` then gets the
-   target handle for its own turn in `bot_moved` and can resume its wait
-   there, and `result` for a moved turn answers the same way, so a client
-   retrying after a reconnect can find a turn that finished before the
-   move. A later request naming the bot, whether a submission or a `wait`
-   on one of its turn handles, is answered with the same `bot_moved`, never
-   `bot_not_found`, a fresh bot, or a wait on a turn that will never
-   finish. `wait` registers its waiters and then settles each handle from
-   the store (at `f47adff`: `src/server/handles.rs:240-300`), and that
-   store lookup is where it finds the tombstone. Followers attached
-   before the receipt learn it too: tombstoning writes a durable
-   `bot_moved` event with the same destination details, which live
-   followers receive and later replays show. Deletion today only sends a
-   live, non-durable `deleted` notice (`src/server/mod.rs:1119`), which a
-   follower that reconnects would miss. The line between a free cancel
-   and a guarded one is the export's cut, not the bundle file. The cut and
-   a cancel are both writes on the storage worker, so they are ordered:
-   the cut durably marks the move `exported` in the same transaction that
-   captures it, and every later export page checks that mark and the
-   nonce. A cancel that runs before the cut clears `moving` and retires
-   the nonce, so an exporter that already asked for it is refused at its
-   first page and the caller discards anything partial. Once the cut has
-   committed, the source cannot tell a lost receipt from an import that
-   never happened, since no daemon talks to another. So cancelling then
-   needs the destination's refusal: the caller asks the named destination
-   to durably refuse that nonce, which it does only if it has not imported
-   it, and carries the refusal back. The source clears `moving` only on a
-   receipt-free refusal. A destination that is gone for good leaves the
-   source `moving`; clearing that is an explicit operator override whose
-   error text names the risk of two live copies.
-   The destination may later be restored, which reissues its instance
-   (see the shared first step), so the tombstone also names the
-   destination's lineage, and the imported bot keeps the move nonce and the
-   source instance in its row. A client that finds the named lineage under
-   a new instance does not trust the old mapping: it asks the destination
-   for the bot with that nonce. If the restored store has it, the client
-   rebinds to the new instance and replays from scratch, since cursors
-   from the old instance mean nothing there. If the backup predates the
-   import, the answer is `moved_bot_missing`, never a same-named bot.
-   A crash between steps
-   leaves a `moving` source and at most one imported copy, at the named
-   destination, and re-running the move resolves it.
-   This holds against mistakes, not against a caller who edits a bundle:
-   every caller is already the store's full-access user.
-7. **Draining a running bot.** A `drain` stops the bot at its next round
-   boundary: the model call in flight finishes, its tool calls finish and
-   commit, and the turn parks instead of starting the next round. Round
-   boundaries already exist for steers and compaction. Nothing is cancelled
-   or run twice. The existing parked states cannot hold it: a turn parked
-   on no handles completes at once, and startup resumes only `waiting` and
-   `paced` turns (at `e1d413f`: `src/store/db.rs:2550-2561`). So a drain
-   is its own durable turn status, `drained`, which startup leaves alone.
-   It becomes runnable in exactly two ways: import commits it at the
-   target, or cancelling the move on the source releases it there, under
-   the same refusal rule as any cancel after export. A tombstoned source
-   never resumes it. Released is not `ready`. A `ready` turn goes through
-   `start`, whose `start_locked` appends the turn's prompt as a new user
-   item (at `bcc6b1c`: `src/store/db.rs:3679-3684`), and a drained turn
-   has already appended its prompt and run rounds. So a released drained
-   turn stays started and goes through the resume path, as a restarted
-   daemon resumes a paced turn: it continues from the durable head at the
-   round boundary without appending anything.
-8. **Parked turns that wait on handles.** Once handles are
-   store-qualified, a parked turn's handle into its own store still
-   resolves at the target only if the whole subtree moves together, a
-   parent with the children it waits on. Otherwise import refuses with the
-   handles named. Deadlines in a parked turn are absolute times on the
-   source's clock (at `e1d413f`: `src/store/db.rs:2510-2545`), and a
-   restarted daemon puts a paced turn's deadline straight into its pacing
-   heap (`src/server/mod.rs:593-598`, `633-635`). So import does not copy
-   them. A paced turn is requeued at the target as due now, and the
-   destination provider's gate decides when it runs. The per-call retry
-   budget restarts there: a resumed turn restores `call_attempts` and
-   `call_spent_ms` from its waiting record before checking the attempt
-   and 300-second caps (at `e1d413f`: `src/server/turn.rs:44`, `713-714`,
-   `913-915`), and a budget spent against the source's provider says
-   nothing about the destination's. Import zeroes both, and keeps the
-   turn's `retries` and `paced_ms` totals as history. The pacing clock is
-   rebased the same way. A paced turn's waiting record holds
-   `paced_since_ms`, a source-clock time, and a resume adds now minus it
-   to `paced_ms` (at `8b3479b`: `src/store/db.rs:191-195`); its presence
-   is also what tells a resume to continue the model call rather than
-   finish a tool wait (`src/server/turn.rs:711-716`). So the export cut
-   adds the source's elapsed pacing to `paced_ms`, and import sets
-   `paced_since_ms` to the target's clock at import. Transfer time and
-   clock skew between hosts are charged nowhere. A `wait` deadline moves as the time that
-   remained at export. The inverse dependency matters too. Waiters on
-   `turn:BOT/N` are keyed by bot and turn and wake only on that turn's
-   `turn_finished` in the same daemon (at `e1d413f`:
-   `src/server/handles.rs:106`, `144-150`). A source parent parked on a
-   moving child's unfinished turn would never see it finish. So a move
-   refuses while any source turn waits on one of the moving bot's turns,
-   naming the waiters, unless they move together. Client `wait`s are not
-   turns and are not refused. When the source becomes a tombstone, every
-   waiter still registered on the moved bot's turns, whether it attached
-   before the move or during it, is answered with the same `bot_moved`
-   outcome, never left waiting.
-
-### Risks
-
-- **Workspace divergence.** The model's transcript names absolute paths. If
-  the target's workspace is elsewhere, its next tool calls go to the old
-  paths. Placing the files is the caller's job (README, Scope). The move
-  should take a workspace mapping, apply it to the bot and to every
-  unfinished turn's workspace, and refuse a path that does not exist, and
-  whether the model is told about the move is a client-policy question.
-- **Queued work.** A drained bot can still have `ready` and `queued`
-  turns behind the drained one, and a move carries them. The target's
-  pending bounds apply to them as to any submission: today a submission
-  that would wait is refused with `pending_limit` when the store is at
-  its turn or byte bound (at `d006bb4`: `src/store/db.rs:1891-1905`).
-  Import counts the whole incoming queue against the target's bounds in
-  its transaction and refuses the whole import with `pending_limit` and
-  the counts if it does not fit; it never admits part of a queue. There
-  is no override: the caller can drain the queue at the source or raise
-  the target's bounds.
-- **Side effects.** Only a drained or idle bot moves. A bot that was
-  interrupted may have `tool_outcome_unknown` calls whose processes are
-  still running on the source host. The move does not change that; the
-  bundle should carry and show it.
-- **Provider state.** Stored reasoning and thinking items move with the
-  transcript. Whether a different API key or organization accepts another's
-  encrypted reasoning items is unverified and has to be checked per family.
-  The provider's prompt cache doesn't move, so the first turn at the target
-  is a full miss.
-- **Lineage.** `created_by` names a bot in the source store, so the
-  target cannot validate it (`src/store/db.rs:574-592`). The moved bot's
-  children that stayed behind can no longer reach it through
-  `AGENT_PARENT`. This is the same cross-daemon lineage question as section
-  3. Until it is answered, import drops the source's creator (item 5).
-- **Copies of stores.** Two copies of one store share its lineage id and
-  would both accept a bundle bound to it, which breaks the one-destination
-  rule. Binding a move to the instance id, which a copy does not keep,
-  closes that for file copies. It does not close it for a block-level
-  clone of the whole disk or machine, which keeps device and inode; the
-  one-destination guarantee is stated with that exception.
-- **Size and sensitivity.** Histories of 100k items are measured
-  ([DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#long-history)), so export
-  runs in bounded pieces like retention does (NEXT item 29).
-- **A consistent export.** The first slice leaves the source live, so a
-  submission or a prune can land between pieces, and a bundle could pair a
-  head from before it with records from after it. Export therefore starts
-  with one worker transaction that captures a cut: the head node, the bot
-  row, and the highest turn and event ids. Every piece reads only records
-  at or under the cut, so later turns are simply absent. Nodes are
-  immutable and notes and compactions are keyed by node (at `e1d413f`:
-  `src/store/db.rs:412-420`), so the head fixes those too.
-  Records under the cut must also stay: while the export runs, prune and
-  deletion skip that bot's records, a fence held in the daemon for the
-  export's lifetime and released when it finishes or its connection drops.
-  One long read transaction would also give a snapshot, but it pins the
-  WAL and holds back checkpoints for every bot for as long as the export
-  runs. A bundle holds
-  transcripts and tool output, so it belongs in the ignored local directory,
-  never in the repository.
-
-### Order
-
-1. Store identity, lineage and instance. Behavior tests: a restart keeps
-   the instance, a restore through the helper over a store with an
-   uncheckpointed WAL keeps none of the discarded frames, a crash
-   injected at each step of the helper leaves either the whole old store
-   or the whole restored one, and a copied
-   store file, a restore through the helper,
-   and a restore of a backup from an earlier instance each announce a new
-   one.
-2. Export of an idle root bot with no running processes, and import as a
-   new identity: the cross-store fork. Behavior tests: the imported bot's
-   next turn sees the same context as a local fork at the same node,
-   `result` answers for imported turns, with the checkpoint and steer ids
-   rewritten to target ids, a fork from an older imported completion stops
-   at its imported checkpoint, a compacted bot's next turn sees the same
-   summary and note, one whose note, summary, or instructions quote a
-   handle or an
-   artifact reference fails the import, prune and delete
-   work on imported records, the imported bot has no creator and zero
-   usage, a bot with a `ready` or `queued` turn fails the export, a follow
-   of it, one-bot or `follow *`, replays the `imported` event and no false
-   `pruned_before`, a live `follow *` at the target lists the imported bot
-   from its `imported` event, a
-   submission and a prune racing a paged export yield exactly the cut, and
-   a missing provider, compaction provider, or tool, fork ancestry, a
-   handle or artifact reference in the transcript, or a running process
-   each fail the export or import explicitly.
-3. The alias decision for artifact references, with a test that reads one
-   written before the move, from the imported bot and from a local fork
-   of it, and store-qualified handles with import-time
-   handle aliases, with a test that `wait` on a finished background
-   command's handle after import returns its result with any references
-   in it resolved, a test that an artifact whose contents name a
-   moved handle resolves through the alias when read back, and a test
-   that an imported bot's `wait` on a
-   `turn:` and a `proc:` handle from before the move resolves at the
-   destination, so that bots with retained tool output or delegation can
-   move. Until this step, the
-   first slice refuses every bot with a retained artifact, because a
-   tool result always names its retained streams as `TURN/CALL_ID/STREAM`
-   in the stored item (`src/server/turn.rs:1423-1440`).
-4. A representation for fork ancestry, so forks can be imported.
-5. Drain to a round boundary for a running bot, with the durable
-   `drained` status. Behavior tests: a drained turn stays parked across a
-   restart, and undraining it on the same store resumes it at the round
-   boundary with its prompt in the transcript exactly once.
-6. Move bound to one destination instance, with `moving` and tombstone
-   states and `bot_moved` answers. Behavior tests: a copy of the
-   destination refuses the bundle, and after export a cancel without the
-   destination's refusal is refused. A drained turn stays parked across a
-   source restart and resumes at the target
-   under its mapped workspace and checked model, a drained turn that ran
-   several rounds before the move has its prompt and each round in the
-   target transcript exactly once, including into a target whose turn ids
-   overlap the source's, with `history_nodes` naming target turns, and a move whose bot is
-   awaited by a source parent is refused. A client `wait` registered
-   before the move and one sent after the receipt are both answered with
-   `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
-   names a renamed destination bot, a `delete` between import and
-   receipt is refused, a cancel racing the export's first
-   page either refuses that page or needs the destination's refusal, a
-   destination restored from a backup after the import rebinds with a
-   fresh replay and one from before it answers `moved_bot_missing`,
-   `result` on a turn that finished
-   before the move names its target handle, and a follower attached before the move
-   receives the `bot_moved` event. A drained bot with more queued work
-   than the target's pending bound is refused whole with `pending_limit`.
-   A paced turn resumes at the target with a
-   fresh per-call retry budget and `paced_ms` that counts source pacing
-   up to the cut and target pacing from the import, with the two hosts'
-   clocks set apart.
-7. Moving a parent together with the children it waits on, as one group:
-   one bundle and one nonce that mark every participant `moving` in one
-   source transaction, one destination transaction that imports all their
-   rows and handle aliases, and one group receipt that tombstones every
-   source bot together. Moving them one by one cannot work, since a child
-   whose parent waits on it is refused and so is a parent whose child
-   handle does not travel. Creator links inside the group travel too:
-   the destination transaction remaps a child's `created_by` and
-   `created_by_id` to its moved parent's new name and id, so the child's
-   next turn still gets `AGENT_PARENT` and can reach it. Only a creator
-   outside the group is dropped, as in a single import. Behavior tests: a
-   parent parked on its child's turn moves with the child and resumes at
-   the destination when the child finishes there, and the child's next
-   turn after the move messages its parent there.
-
-## Combined order
-
-| Step | Serves | Changes |
-| --- | --- | --- |
-| Store identity in `ready` | all four | store, `ready` |
-| Observer reader and the observe set on it, measured | watching | daemon |
-| `summary` read, observe capability | watching | store read, protocol |
-| Client digest (CLI, then app) | watching | client only |
-| Client store discovery | per-workspace | client only |
-| `--daemon` endpoint list, then app view | several daemons | client only |
-| `fork` with a tool selection | watching, move | protocol |
-| One-versus-N daemon screen | per-workspace | bench |
-| Export and import as a cross-store fork | move | store, protocol |
-| Drain, then move semantics | move | turn loop, store |
-
-Not planned here: a network listener in the daemon, daemon-to-daemon
-connections, starting daemons on other machines, copying workspaces, or
-process sandboxing. Each would make Agent a remote execution service or a
-provisioning tool. Where one of them is needed, it is a separate process or
-the caller's job.
-
-## Open questions
-
-- Should artifact references in an imported transcript resolve through an
-  alias, or fail honestly? The alias keeps old tool results readable after a
-  move. Failing keeps the store free of a translation layer. Handles are not
-  part of this choice: they need a store-qualified form and an alias
-  either way, since delegation depends on waiting on them.
-- Should per-workspace daemons become a default for the app, or stay an
-  opt-in for failure isolation? The one-versus-N screen should come first.
-- Does a model-written summary belong to the observer (a tool-less fork it
-  pays for), or should the daemon offer one? This document assumes the
-  observer, in keeping with NEXT item 20: mechanism in the daemon, opinions
-  in the client.
+| Contract | Starting points |
+| --- | --- |
+| Storage ownership, queues, and metrics | [`Store`, `Counters`](../src/store.rs); [`socket`](../src/server/socket.rs) |
+| Observe routing and service-loop dispatch | [`Command`, `Service::dispatch`](../src/server/mod.rs) |
+| Replay ordering and live fan-out | [`Hub::fan_out`, `replay`](../src/server/hub.rs); [`Output`](../src/output.rs) |
+| History, compaction, results, artifact authorization, retention | [`Database`](../src/store/db.rs); [`artifact`](../src/store/artifact.rs) |
+| Fresh start versus continuation | [`start_locked`, `Database::resume`](../src/store/db.rs); [`rounds`](../src/server/turn.rs) |
+| Handles and waiter settlement | [`Handle`, `Handles`](../src/server/handles.rs) |
+| Per-store connections and client reconnect | [`socket`](../client/src/socket.rs); [`Client`](../client/src/lib.rs); [`ensure_daemon`](../src/client.rs) |
+| Fleet creation events and app connections | [`app.js`](../app/ui/app.js); [`main.rs`](../app/src-tauri/src/main.rs) |
+| Existing measurement fixtures | [`bench.lifecycle`](../bench/lifecycle.py); [`bench.soak`](../bench/soak.py); [`soak_followers`](../bench/soak_followers.py) |
