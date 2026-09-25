@@ -209,7 +209,13 @@ source's rows unchanged.
    response. So the observer path serves only bounded pages: `artifact`
    without a stream and limit returns a whole retained stream today
    (`src/server/mod.rs:1325-1346`), and on the observer path it requires a
-   stream and a limit capped at the existing 64 KiB page. Admission also
+   stream and a limit capped at the existing 64 KiB page. `item` has the
+   same problem: it loads the whole `nodes.item` blob with no size check
+   (at `f47adff`: `src/store/db.rs:3375-3385`). On the observer path it
+   first reads `length(item)`, which SQLite answers from the record header
+   without loading the blob, and charges that length before reading. An
+   item over the 64 KiB page is served in byte ranges, the way `artifact`
+   pages are. Admission also
    counts the bytes that queued and in-flight reads may return, against a
    daemon-wide budget, and answers `observer_busy` past it. The acceptance check is
    the context reader's queue-time percentiles (the per-operation
@@ -255,6 +261,8 @@ source's rows unchanged.
    slow-follower and mixed-workload screens (NEXT items 16 and 18). It
    comes first because the reads below would otherwise use the two paths
    that already disturb bots, the context reader and the worker.
+   Behavior test: an observer `item` read of an item larger than the
+   budget is charged its length before loading and served in ranges.
 2. The `summary` read on it, plus the observe capability.
 3. The client digest in the CLI (JSON), then in the app.
 4. `fork` with a tool selection, and the summary-fork recipe, with the
@@ -660,8 +668,16 @@ carrying it over.
    tombstone that answers `bot_moved` with the destination's instance id
    and the imported bot's name and id. The name matters because import may
    use a new name to avoid a collision, and retrying the old name at the
-   destination could reach a different bot. A later submission is answered
-   with that, never `bot_not_found` or a fresh bot. Followers attached
+   destination could reach a different bot. Import renumbers turns, so the
+   receipt also maps each unfinished source turn to its target turn id,
+   and the tombstone keeps that map. A waiter on `turn:BOT/N` then gets the
+   target handle for its own turn in `bot_moved` and can resume its wait
+   there. A later request naming the bot, whether a submission or a `wait`
+   on one of its turn handles, is answered with the same `bot_moved`, never
+   `bot_not_found`, a fresh bot, or a wait on a turn that will never
+   finish. `wait` registers its waiters and then settles each handle from
+   the store (at `f47adff`: `src/server/handles.rs:240-300`), and that
+   store lookup is where it finds the tombstone. Followers attached
    before the receipt learn it too: tombstoning writes a durable
    `bot_moved` event with the same destination details, which live
    followers receive and later replays show. Deletion today only sends a
@@ -804,8 +820,9 @@ carrying it over.
    source restart and resumes at the target
    under its mapped workspace and checked model, and a move whose bot is
    awaited by a source parent is refused. A client `wait` registered
-   before the move is answered with `bot_moved`, and `bot_moved` names a
-   renamed destination bot, and a follower attached before the move
+   before the move and one sent after the receipt are both answered with
+   `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
+   names a renamed destination bot, and a follower attached before the move
    receives the `bot_moved` event. A paced turn resumes at the target with a
    fresh per-call retry budget.
 7. Moving a parent together with the children it waits on.
