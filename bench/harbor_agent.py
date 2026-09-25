@@ -256,10 +256,19 @@ class Agent(BaseInstalledAgent):
             usage.n_input_tokens += turn['input_tokens']
             usage.n_cache_tokens += turn['cached_input_tokens']
             usage.n_output_tokens += turn['output_tokens']
-        # A call Anthropic's server-side fallback ran on another model is in
-        # its turn's totals; move each attempt to the model that ran it.
-        moved = set()
         events = self._usage_events()
+        if not models and (streamed := self._streamed_usage()):
+            model = self.model_name or 'unknown'
+            models[model] = ModelUsage(
+                n_input_tokens=sum(data['input_tokens'] for data in streamed),
+                n_cache_tokens=sum(data['cached_input_tokens'] for data in streamed),
+                n_output_tokens=sum(data['output_tokens'] for data in streamed),
+            )
+            events = [(model, data) for data in streamed]
+        # A call Anthropic's server-side fallback, or a summarizer, ran on
+        # another model is in its turn's totals; move each attempt to the
+        # model that ran it.
+        moved = set()
         for turn_model, attempts in ((m, d['models']) for m, d in events if 'models' in d):
             provider = turn_model.split('/', 1)[0] + '/' if '/' in turn_model else ''
             moved.add(turn_model)
@@ -281,14 +290,6 @@ class Agent(BaseInstalledAgent):
             usage = models[model]
             if not (usage.n_input_tokens or usage.n_cache_tokens or usage.n_output_tokens):
                 del models[model]
-        if not models and (streamed := self._streamed_usage()):
-            model = self.model_name or 'unknown'
-            models[model] = ModelUsage(
-                n_input_tokens=streamed['input_tokens'],
-                n_cache_tokens=streamed['cached_input_tokens'],
-                n_output_tokens=streamed['output_tokens'],
-            )
-            writes = {model: streamed['cache_write_tokens']}
         if not models:
             return
         for model, usage in models.items():
@@ -343,8 +344,8 @@ class Agent(BaseInstalledAgent):
         except sqlite3.Error:
             return []
 
-    def _streamed_usage(self) -> dict[str, int] | None:
-        """The task bot's per-round usage events, streamed as they happened.
+    def _streamed_usage(self) -> list[dict[str, Any]] | None:
+        """The task bot's per-call usage events, streamed as they happened.
 
         Used when there is no store copy; bots it delegated to are not in
         this stream.
@@ -352,19 +353,15 @@ class Agent(BaseInstalledAgent):
         path = self.logs_dir / 'agent.jsonl'
         if not path.is_file():
             return None
-        keys = ('input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens')
-        totals = dict.fromkeys(keys, 0)
-        seen = False
+        usage = []
         for line in path.read_text().splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:  # diagnostics, or a line cut by the kill
                 continue
             if event.get('event') == 'usage':
-                seen = True
-                for key in keys:
-                    totals[key] += event['data'].get(key, 0)
-        return totals if seen else None
+                usage.append(event['data'])
+        return usage or None
 
     @staticmethod
     def _cost(model: str, usage: ModelUsage, writes: int = 0) -> float | None:

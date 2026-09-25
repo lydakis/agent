@@ -270,6 +270,24 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual((context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens),
                          (200, 80, 14))
 
+    def test_streamed_usage_keeps_each_calls_model_split(self):
+        rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5},
+                 'other/cheap': {'input_cost_per_token': 1e-7, 'output_cost_per_token': 1e-6,
+                                 'cache_creation_input_token_cost': 2e-7}}
+        answer = {'input_tokens': 100, 'cached_input_tokens': 40, 'output_tokens': 7}
+        split = {'model': 'cheap', 'provider': 'other', 'input_tokens': 400, 'output_tokens': 40,
+                 'cached_input_tokens': 0, 'cache_write_tokens': 100}
+        summary = {**split, 'purpose': 'compaction', 'models': [split]}
+        with tempfile.TemporaryDirectory() as logs, \
+                mock.patch.dict('litellm.model_cost', rates):
+            Path(logs, 'agent.jsonl').write_text('\n'.join(
+                json.dumps({'event': 'usage', 'data': data}) for data in (answer, summary)))
+            context = AgentContext()
+            self.agent(logs).populate_context_post_run(context)
+        usage = context.model_usage
+        self.assertEqual((usage['gw/m'].n_input_tokens, usage['other/cheap'].n_input_tokens), (100, 400))
+        self.assertAlmostEqual(usage['other/cheap'].cost_usd, 300 * 1e-7 + 100 * 2e-7 + 40 * 1e-6)
+
     def test_a_daemon_that_never_started_reports_nothing(self):
         with tempfile.TemporaryDirectory() as logs:
             Path(logs, 'agent.jsonl').write_text('')
