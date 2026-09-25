@@ -253,9 +253,17 @@ impl State {
             Some("max_tokens") => return fail_with("provider_incomplete", "max_tokens"),
             // With a fallback requested, the whole chain declined.
             Some("refusal") => {
-                return match self.stop_details {
-                    Some(detail) => fail_with("provider_refusal", detail),
-                    None => fail("provider_refusal"),
+                // The models already switched to ran and are billed too, so
+                // the failure names them.
+                let parts: Vec<String> = self
+                    .fallbacks
+                    .iter()
+                    .map(|(_, to)| format!("fell back to {to}"))
+                    .chain(self.stop_details)
+                    .collect();
+                return match parts.is_empty() {
+                    true => fail("provider_refusal"),
+                    false => fail_with("provider_refusal", parts.join("; ")),
                 };
             }
             other => {
@@ -497,6 +505,20 @@ mod tests {
         assert_eq!(
             error.detail.as_deref(),
             Some("category cyber; retry on claude-opus-4-8")
+        );
+        // A chain that switched models and still declined names the switch.
+        let mut state = State::default();
+        feed(
+            &mut state,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"fallback","from":{"model":"claude-opus-5-5"},"to":{"model":"claude-opus-4-8"}}}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"type":"refusal","category":"cyber"}},"usage":{"output_tokens":0}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert_eq!(
+            state.finish().unwrap_err().detail.as_deref(),
+            Some("fell back to claude-opus-4-8; category cyber")
         );
     }
     #[test]

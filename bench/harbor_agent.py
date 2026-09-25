@@ -250,14 +250,21 @@ class Agent(BaseInstalledAgent):
             usage.n_output_tokens += turn['output_tokens']
         # A call Anthropic's server-side fallback ran on another model is in
         # its turn's totals; move each attempt to the model that ran it.
+        moved = set()
         for turn_model, attempts in self._fallback_usage():
             provider = turn_model.split('/', 1)[0] + '/' if '/' in turn_model else ''
+            moved.add(turn_model)
             for attempt in attempts:
                 for model, sign in ((turn_model, -1), (provider + attempt['model'], 1)):
                     usage = models.setdefault(model, ModelUsage())
                     usage.n_input_tokens += sign * attempt['input_tokens']
                     usage.n_cache_tokens += sign * attempt['cached_input_tokens']
                     usage.n_output_tokens += sign * attempt['output_tokens']
+        # A turn sticky routing served entirely elsewhere leaves nothing to price.
+        for model in moved:
+            usage = models[model]
+            if not (usage.n_input_tokens or usage.n_cache_tokens or usage.n_output_tokens):
+                del models[model]
         if not models and (streamed := self._streamed_usage()):
             models[self.model_name or 'unknown'] = ModelUsage(
                 n_input_tokens=streamed['input_tokens'],

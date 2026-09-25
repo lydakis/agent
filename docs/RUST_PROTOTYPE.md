@@ -453,8 +453,15 @@ in the tests refuses mismatches outright, as `error` would. Empty instructions o
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 Every Anthropic request also opts into server-side fallbacks
-(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header),
-so a request a safety classifier declines is rerun, on the same stream, on the
+(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header).
+The protocol described here is from Anthropic's documentation, read
+2026-09-25: [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)
+for the stream, the `usage.iterations` entries, billing and the replay rules,
+and Anthropic's model migration guide (the Claude Opus 5 and Claude Fable 5.1
+sections) for the `"default"` form and its beta header. Only model acceptance
+of the field was observed live; the fallback stream itself is exercised against
+a synthetic endpoint built from that description. With it, a request a safety
+classifier declines is rerun, on the same stream, on the
 model Anthropic recommends for that refusal category instead of ending the turn
 with `provider_refusal`. A `fallback` content block marks each switch. Blocks
 before the last one are a declined attempt's partial output: its non-empty text
@@ -470,7 +477,8 @@ billed at the rates of the model that ran it. The `usage` event then carries a
 (about an hour after a fallback) sent straight to the fallback model, so
 clients can price them per model; its totals are their sum. A refusal that
 survives the fallbacks still fails the turn with `provider_refusal`, with the
-refusal category and any recommended retry model as its detail. Bedrock,
+models it switched to, the refusal category and any recommended retry model as
+its detail. Bedrock,
 Vertex and Foundry do not offer server-side fallback. Observed 2026-09-24:
 `claude-sonnet-5`, `claude-haiku-4-5` and `claude-sonnet-4-5` accept the field,
 and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally

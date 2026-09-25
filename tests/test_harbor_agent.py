@@ -153,6 +153,22 @@ class HarborAgentTest(unittest.TestCase):
         # Totals are unchanged; only the split moves.
         self.assertEqual((context.n_input_tokens, context.n_output_tokens), (1000, 100))
 
+    def test_a_turn_served_only_by_the_fallback_needs_no_price_for_the_requested_model(self):
+        rates = {'gw/backup': {'input_cost_per_token': 2e-6, 'output_cost_per_token': 2e-5}}
+        with tempfile.TemporaryDirectory() as logs, \
+                mock.patch.dict('litellm.model_cost', rates, clear=True):
+            path = Path(logs, 'state.sqlite')
+            store(path, [('task', 'gw/m', 'completed', 1000)])
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE events(id INTEGER PRIMARY KEY, bot TEXT, turn INT, kind TEXT, data TEXT)')
+                db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                           (json.dumps({'models': [{'model': 'backup', 'input_tokens': 1000, 'output_tokens': 100,
+                                                    'cached_input_tokens': 500}]}),))
+            context = AgentContext()
+            self.agent(logs).populate_context_post_run(context)
+        self.assertEqual(list(context.model_usage), ['gw/backup'])
+        self.assertAlmostEqual(context.cost_usd, 500 * 2e-6 + 500 * 2e-6 + 100 * 2e-5)
+
     def test_finishing_stops_the_daemon_before_copying_the_store(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
