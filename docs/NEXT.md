@@ -708,11 +708,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 42. Anthropic prompt-cache refreshes during long tool calls, measured before
     kept. [Built](RUST_PROTOTYPE.md#keeping-the-anthropic-cache-warm):
     `--keep-warm` (240 seconds by default) resends the last call with
-    `max_tokens: 0` while a tool runs. Next, a live check that the API
-    accepts the refresh with the request's thinking, effort, and fallbacks,
-    then a long-build task with and without it. Open: parked `wait` turns,
-    whose helpers can run past five minutes with no live task to refresh
-    them, and Bedrock.
+    `max_tokens: 0` while a tool runs. Anthropic recommends this over the
+    one-hour cache only on Fable 5.1 and Mythos 5.1. Next, a live check that
+    the API accepts the refresh with the request's thinking, effort, and
+    fallbacks. Then a one-hour cache option, with one-hour writes priced at
+    their own rate, and a matched long-tool task with three arms: the
+    five-minute cache alone, the one-hour cache, and refreshes. Open: parked
+    `wait` turns, whose helpers can run past five minutes with no live task
+    to refresh them, and Bedrock.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

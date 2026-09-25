@@ -495,8 +495,8 @@ foreground tool call may run ten. On 2026-09-25 a Sonnet 5 bot idle for eight
 minutes between two calls read only its 2.3k-token system and tools prefix
 from cache; the 6.8k-token conversation was written again at 1.25 times the
 input rate. The one-hour cache read all 9.0k, but it bills every write at
-twice the input rate, idle or not. So the daemon keeps the five-minute cache
-instead. While a turn runs a tool, once the last call's cache has gone
+twice the input rate, idle or not. The daemon keeps the five-minute cache and
+refreshes it instead. While a turn runs a tool, once the last call's cache has gone
 `--keep-warm` seconds unread (240 by default), it sends that call's request
 again with `max_tokens: 0` and `stream: false`. That request generates
 nothing, bills a cache read, and restarts the cache's lifetime. It repeats
@@ -508,12 +508,20 @@ waiting for its pool, since it would land after the cache expired. A refused
 refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
 until the next model call, which pays the write it would have paid anyway.
 
-The refresh follows Anthropic's
+Anthropic's
 [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-guidance, read 2026-09-25 through Anthropic's API skill, not the live page. It recommends this over the
-one-hour cache for five-to-sixty-minute gaps, especially on Claude Fable
-5.1, whose cache reads cost 0.025 times the input rate. It also lists the
-requests `max_tokens: 0` rejects: streaming, budgeted thinking
+guidance, read 2026-09-25 through Anthropic's API skill rather than the live
+page, documents the `max_tokens: 0` request under pre-warming. It recommends
+this keep-alive over the one-hour cache for five-to-sixty-minute gaps only on
+Claude Fable 5.1 and Mythos 5.1, whose cache reads are nearly free (0.025
+times the input rate on Fable 5.1). For other models, it picks the one-hour
+cache for such gaps. Refreshing those models too is this runtime's inference,
+not Anthropic's advice. During a running tool the next model call is certain,
+so each refresh costs a 0.1-times read of the conversation where expiry costs
+a 1.25-times rewrite; a ten-minute tool takes at most two. Whether it also
+beats the one-hour cache, which covers parked waits and gaps between turns
+but bills every write at twice the input rate, is not measured. The guidance
+also lists the requests `max_tokens: 0` rejects: streaming, budgeted thinking
 (`thinking.type: "enabled"`), structured outputs, and forced tool choice. So
 older models with thinking on are not refreshed. Bedrock is also left out
 until the same request is verified there. Refreshes cover foreground tool
