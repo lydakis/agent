@@ -102,16 +102,18 @@ fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
 /// separator goes only between batches that carry something.
 fn item_chunks(
     store: Store,
-    chunks: Vec<Vec<i64>>,
+    chunks: Arc<[Vec<i64>]>,
     floor: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     let mut started = false;
-    stream::iter(chunks)
-        .then(move |chunk| {
-            let store = store.clone();
+    stream::iter(0..chunks.len())
+        .then(move |index| {
+            let (store, chunks) = (store.clone(), chunks.clone());
             async move {
                 store
-                    .read("items_by_ids", move |db| db.items_by_ids(&chunk, floor))
+                    .read("items_by_ids", move |db| {
+                        db.items_by_ids(&chunks[index], floor)
+                    })
                     .await
                     .map_err(|error| std::io::Error::other(error.code))
             }
@@ -490,15 +492,12 @@ impl Turn {
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
             + ids.len().saturating_sub(1))
         .saturating_sub(stripped);
-        let body = stream::iter([Ok(prefix)]).chain(item_chunks(
-            self.store.clone(),
-            batches(ids, sizes),
-            floor,
-        ));
-        Items {
-            bytes: total,
-            stream: body.boxed(),
-        }
+        let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
+        Items::new(total, move || {
+            stream::iter([Ok(prefix.clone())])
+                .chain(item_chunks(store.clone(), chunks.clone(), floor))
+                .boxed()
+        })
     }
 
     /// Compaction at a round boundary: once the turns since the last summary
@@ -767,17 +766,15 @@ impl Turn {
             0
         };
         let total = total.saturating_sub(stripped);
-        let body = stream::iter([Ok(Bytes::from(head))])
-            .chain(item_chunks(
-                self.store.clone(),
-                batches(&plan.ids, &plan.sizes),
-                i64::MAX,
-            ))
-            .chain(stream::iter([Ok(Bytes::from(tail))]));
-        Ok(Items {
-            bytes: total,
-            stream: body.boxed(),
-        })
+        let (head, tail) = (Bytes::from(head), Bytes::from(tail));
+        let (store, chunks): (_, Arc<[_]>) =
+            (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
+        Ok(Items::new(total, move || {
+            stream::iter([Ok(head.clone())])
+                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX))
+                .chain(stream::iter([Ok(tail.clone())]))
+                .boxed()
+        }))
     }
 
     async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {

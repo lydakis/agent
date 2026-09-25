@@ -1,9 +1,9 @@
 # Amazon Bedrock as a provider
 
 Surveyed 2026-09-22 and revised 2026-09-25 against AWS, Anthropic and OpenAI
-documentation. Facts are labelled: **documented** cites a page, **source**
-cites this repository, **unverified** is a hypothesis the live run below must
-settle. No paid Bedrock call has been made yet.
+documentation, then run live on 2026-09-25. Facts are labelled: **documented**
+cites a page, **source** cites this repository, **observed** comes from the
+[live run](#the-live-run), **unverified** is a hypothesis still open.
 
 Bedrock needs no new wire family: it serves the Anthropic Messages API and the
 OpenAI Responses API over ordinary SSE, so a Bedrock binding is a base URL and
@@ -37,8 +37,10 @@ features that depend on the first-party APIs.
 binds OpenAI models on Mantle, in `AWS_REGION` (or `AWS_DEFAULT_REGION`). Mantle
 because both model vendors document it and because its quota shape suits a
 fleet: separate input and output allowances with no output burndown and no
-request cap. Runtime is one explicit URL away, for its global routing and no
-regional premium; see [providers and models](RUST_PROTOTYPE.md#providers-and-models).
+request cap. It also takes the body unsigned, so a call reads its history
+once. Runtime is one explicit URL away, for its global routing and no
+regional premium, at the cost of a second store read per call to sign the
+body; see [providers and models](RUST_PROTOTYPE.md#providers-and-models).
 
 Any Bedrock URL without a key field signs with SigV4 (**source**:
 `src/provider/aws.rs`). The signer is in-tree on `aws-lc-rs`, which rustls
@@ -54,23 +56,31 @@ then the AWS CLI's `configure export-credentials`, which is the chain itself
 expiry, single-flight, and once on a 401 or 403, which retries the call; a
 refused fleet re-runs the CLI at most every ten seconds.
 
-Request bodies stream from the store and are never held, so the payload is
-signed as `UNSIGNED-PAYLOAD` over TLS. **Unverified**: whether Bedrock accepts
-that. botocore sends it only for operations modelled as unsigned, and none of
-bedrock-runtime's are. If Bedrock refuses it, the alternative is hashing each
-request by reading its history from the store twice; the live run decides.
+Request bodies stream from the store and are never held. **Observed**: Mantle
+accepts the payload signed as `UNSIGNED-PAYLOAD` over TLS, so a Mantle call
+reads its history once. Runtime does not: it puts the SHA-256 of the body it
+received into the canonical request whatever `x-amz-content-sha256` says, and
+answers 401 "The request signature we calculated does not match". A runtime
+call therefore reads its history from the store twice, once to digest it and
+once as it streams (**source**: `Items`, `aws::payload`). That costs a second
+store read and a SHA-256 pass per call, and no memory: the body is still never
+assembled. Buffering the body instead would read once but hold every in-flight
+request whole, up to the context window per call, which is the wrong trade
+for many active bots. The digest runs before admission, so it does not hold a
+connection-start slot.
 
 ## Features, carried over or not
 
 | Feature | First-party | Bedrock | Status |
 | --- | --- | --- | --- |
 | Messages and Responses over SSE | yes | yes, both endpoints | carried |
-| Prompt caching, explicit and automatic | yes | **documented** explicit and implicit on both | carried; the top-level `cache_control` spelling is **unverified** |
-| Responses `prompt_cache_key` | yes | **documented** supported | carried |
-| Responses `store: false` with `reasoning.encrypted_content` | yes | `store` documented; encrypted reasoning **unverified** | carried, pending the live run |
-| Adaptive thinking with `output_config.effort` | yes | not named by Bedrock pages | carried, **unverified** |
-| Thinking-binding check (`anthropic-beta: thinking-binding-controls-2026-08-01`, `block_binding`) | yes (PR #12) | not named; Bedrock pages list no beta headers | carried, **unverified**: an unknown beta may be refused |
-| Server-side fallbacks (`fallbacks`, PR #13) | yes | **documented** unsupported; use client-side fallback | not carried |
+| Prompt caching, explicit and automatic | yes | **documented** explicit and implicit on both; **observed** on Mantle, top-level `cache_control` included | carried |
+| Responses `prompt_cache_key` | yes | **documented** supported; **observed** cached input on Mantle | carried |
+| Responses `store: false` with `reasoning.encrypted_content` | yes | **observed** on Mantle: returned and accepted on replay | carried |
+| Adaptive thinking with `output_config.effort` | yes | **observed** on Mantle | carried |
+| Legacy thinking budget (Haiku 4.5) | yes | **observed** on Mantle | carried |
+| Thinking-binding check (`anthropic-beta: thinking-binding-controls-2026-08-01`, `block_binding`) | yes (PR #12) | **observed** on Mantle: the beta is honored, and `block_binding` without it is a 400 | carried |
+| Server-side fallbacks (`fallbacks`, PR #13) | yes | **documented** unsupported; use client-side fallback | not carried: Bedrock requests send neither the field nor its beta |
 | Responses over WebSocket | yes | **documented** unsupported on either endpoint | refused for Bedrock URLs |
 | Rate-limit headers for pacing | yes | **documented** absent | escalating refusal backoff instead |
 | Legacy thinking budgets by model name | yes | ids are vendor- and profile-prefixed | carried: `us.anthropic.claude-haiku-4-5…` reads as `claude-haiku-4-5` |
@@ -99,16 +109,55 @@ request by reading its history from the store twice; the live run decides.
 
 ## The live run
 
-To settle every **unverified** row, in the shape of
-[ANTHROPIC_SMOKE.md](ANTHROPIC_SMOKE.md), on one Claude and one OpenAI model:
+Observed 2026-09-25 in us-east-1, with an SSO profile resolved through the
+AWS CLI, on a release build of 84e10c6 with an isolated store: about twenty
+small calls on synthetic prompts (list three files and count them, check a
+number for primality). Token counts are per call.
 
-- SigV4 with `UNSIGNED-PAYLOAD` on Mantle and on runtime.
-- A tool-using turn with thinking on a current Claude model, which exercises
-  the thinking-binding beta header, `block_binding`, adaptive thinking, effort
-  and automatic caching together; and one on Haiku 4.5 for the budget form.
-- A two-turn Responses conversation, which shows whether encrypted reasoning
-  comes back and is accepted when replayed.
-- Whether Mantle accepts a `global.` profile id.
+**Two transport faults**, both now pinned by tests:
+
+- At 84e10c6 every daemon call to Mantle failed as `provider_connection_failed`
+  ("stream closed because of a broken pipe"). An HTTP/2 trace showed Mantle
+  answering with GOAWAY `FRAME_SIZE_ERROR` right after the request's DATA
+  frames, and a standalone reqwest probe reproduced it with a single empty
+  chunk in a streamed body: Mantle refuses a zero-length DATA frame that does
+  not end the stream. The daemon sent one whenever a request's context prefix
+  was empty. Bodies now drop empty chunks (**source**: `framed`).
+- The same probe showed that an explicit `host` header on HTTP/2 breaks the
+  signature (401), since the client sends `:authority` as well. The signer
+  already signs `host` without sending it; a test keeps it that way.
+
+**Mantle, Claude**, with the empty-chunk fix:
+
+| Model, effort | Turns | Result |
+| --- | --- | --- |
+| `anthropic.claude-sonnet-5`, low | shell tool turn, then a turn without tools | accepted; second call of the first turn read 2,346 cached tokens; no thinking blocks at low |
+| `anthropic.claude-sonnet-5`, high | tool turn, then without tools | two signed thinking blocks stored and replayed, accepted with no binding drops; cache reads 2,362 and 2,503 |
+| `anthropic.claude-haiku-4-5`, low | one turn | budget form accepted, thinking streamed; no cache read, as the prompt is under Haiku's cache minimum |
+| `global.anthropic.claude-sonnet-5` | one call | 404 "does not exist": Mantle takes bare in-region ids only |
+
+The daemon's full captured body replayed with curl gave 200 with the beta
+header and 400 `thinking.adaptive.block_binding: Extra inputs are not
+permitted` without it, so Mantle validates fields strictly and honors the
+beta. Curl also showed Mantle accepting both a hashed and an unsigned payload,
+and a body streamed without a length over HTTP/2 and HTTP/1.1 chunked.
+
+**Mantle, OpenAI**: `openai.gpt-5.6-luna` at low ran a tool turn and a turn
+without tools (second turn read 1,040 cached tokens). At high it returned three
+reasoning items with `encrypted_content`, and replaying them was accepted
+(1,067 cached). `openai.gpt-oss-20b` is refused on this route: "does not
+support the '/openai/v1/responses' API". The model list is `GET /v1/models` on
+the Mantle host, not `/openai/v1/models` (404); it named the GPT-5.4 to
+GPT-6 and gpt-oss families and Claude Haiku 4.5 to Opus 5.5.
+
+**Runtime**: `global.anthropic.claude-sonnet-5` through the daemon was refused
+with a signature mismatch, and curl showed why: runtime signs the real body
+digest. With the payload hashed it answered 200. The daemon now hashes runtime
+bodies; that path has not yet run live.
+
+Still open, for the next run on this revision: a runtime Claude and OpenAI
+turn through the daemon, and the Mantle turns again after the rebase onto
+server-side fallbacks, which Bedrock requests now leave out.
 
 ## Sources
 

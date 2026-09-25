@@ -9,10 +9,13 @@
 //! they expire and once when the service calls them expired, so a daemon
 //! outlives any one session.
 //!
-//! Requests stream their body from the store, so it is never held to hash:
-//! the payload is signed as `UNSIGNED-PAYLOAD` over TLS.
+//! Requests stream their body from the store and never hold it. Mantle takes
+//! the payload as `UNSIGNED-PAYLOAD` over TLS; Runtime refuses that, so its
+//! bodies are read once to digest them and again as they are sent.
 use crate::{Error, Result, tools::Credentials};
 use aws_lc_rs::{digest, hmac};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use std::{
     sync::{Arc, RwLock},
@@ -169,6 +172,11 @@ impl Aws {
     pub fn service(&self) -> &'static str {
         self.service
     }
+    /// Runtime computes the body's digest into the canonical request whatever
+    /// `x-amz-content-sha256` says; Mantle accepts `UNSIGNED-PAYLOAD`.
+    pub fn signs_payload(&self) -> bool {
+        self.service == "bedrock"
+    }
     /// Where the keys come from, as `ready.providers` reports it.
     pub fn source(&self) -> &'static str {
         match self.source {
@@ -247,24 +255,31 @@ impl Aws {
         Ok(changed)
     }
 
-    /// The headers that sign one request to `url` at `now`.
+    /// The headers that sign one request to `url` at `now`, whose body is
+    /// `payload`: its [`payload()`] digest, or [`UNSIGNED_PAYLOAD`].
     pub fn sign(
         &self,
         keys: &Keys,
         method: &str,
         url: &reqwest::Url,
         now: SystemTime,
+        payload: &str,
     ) -> Vec<(&'static str, String)> {
-        sign(
-            keys,
-            &self.region,
-            self.service,
-            method,
-            url,
-            now,
-            UNSIGNED_PAYLOAD,
-        )
+        sign(keys, &self.region, self.service, method, url, now, payload)
     }
+}
+
+/// The hex SHA-256 of a body, read chunk by chunk as it streams.
+pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result<String> {
+    let mut body = std::pin::pin!(body);
+    let mut context = digest::Context::new(&digest::SHA256);
+    while let Some(chunk) = body.next().await {
+        context.update(&chunk.map_err(|error| Error {
+            code: error.to_string(),
+            detail: None,
+        })?);
+    }
+    Ok(hex(context.finish().as_ref()))
 }
 
 /// Run the AWS CLI's credential export. Its stdout holds the secret, so it
@@ -573,25 +588,42 @@ mod tests {
         }
     }
 
-    /// Whole requests as botocore 1.43 signs them with payload signing off,
-    /// with and without a session token.
-    #[test]
-    fn requests_sign_as_botocore_signs_them() {
+    /// Whole requests as botocore 1.43 signs them, with payload signing off
+    /// and on, with and without a session token. The digest is taken over
+    /// the body in chunks, as it streams.
+    #[tokio::test]
+    async fn requests_sign_as_botocore_signs_them() {
         let now = at(1_790_296_697);
         let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let body = &br#"{"model":"global.anthropic.claude-sonnet-5","max_tokens":2048,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#[..];
+        let chunks =
+            [&body[..40], &body[40..40], &body[40..]].map(|c| Ok(Bytes::copy_from_slice(c)));
+        let digest = payload(futures_util::stream::iter(chunks)).await.unwrap();
+        assert_eq!(
+            digest,
+            "f387b3eb81779313267437e04b7d8d10fd2b7315fa4b37a2f3c0114dd189b890"
+        );
         let cases = [
             (
                 "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages",
                 None,
+                UNSIGNED_PAYLOAD,
                 "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/us-east-1/bedrock-mantle/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0e2767eece6a1fbd3aab62fc4f351e7c13b3ecb410f51377592fd988f9322d81",
             ),
             (
                 "https://bedrock-runtime.eu-west-1.amazonaws.com/openai/v1/responses",
                 Some("FQoGZXIvYXdzEXAMPLE+/token="),
+                UNSIGNED_PAYLOAD,
                 "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/eu-west-1/bedrock/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=af399be6054a5e9a0972d447fa9b21046857282c7ec80616c6c54fadb448e39f",
             ),
+            (
+                "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1/messages",
+                Some("FQoGZXIvYXdzEXAMPLE+/token="),
+                &digest,
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260925/us-east-1/bedrock/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=46273bee2d709a948d8a505050eeb79e6f65c46f9622d9aadbeaad1d6c302886",
+            ),
         ];
-        for (url, token, expected) in cases {
+        for (url, token, payload, expected) in cases {
             let url = reqwest::Url::parse(url).unwrap();
             let (region, service) = endpoint(&url).unwrap();
             let aws = Aws::fixed(
@@ -603,7 +635,8 @@ mod tests {
                     token.map(str::to_owned),
                 ),
             );
-            let headers = aws.sign(&aws.held(), "POST", &url, now);
+            assert_eq!(aws.signs_payload(), service == "bedrock");
+            let headers = aws.sign(&aws.held(), "POST", &url, now, payload);
             let get = |name: &str| {
                 headers
                     .iter()
@@ -612,8 +645,10 @@ mod tests {
             };
             assert_eq!(get("authorization"), Some(expected));
             assert_eq!(get("x-amz-date"), Some("20260925T003817Z"));
-            assert_eq!(get("x-amz-content-sha256"), Some(UNSIGNED_PAYLOAD));
+            assert_eq!(get("x-amz-content-sha256"), Some(payload));
             assert_eq!(get("x-amz-security-token"), token);
+            // Signed, but sent by the client: a second `host` on HTTP/2
+            // breaks the signature.
             assert_eq!(get("host"), None);
         }
     }

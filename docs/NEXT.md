@@ -340,7 +340,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    broke were fixed in place (Claude names are read inside Bedrock ids, and
    `--max-output-tokens` reaches Anthropic's `max_tokens`). Both fixes are
    still name- and flag-shaped; a per-model capability table would absorb
-   them. The live Bedrock run that settles its unverified rows comes first.
+   them. A live run on 2026-09-25 carried every current feature over on
+   Mantle except server-side fallbacks, which Bedrock does not offer.
 18. Extend measured tools and recovery semantics, slow-reader and
     sustained-load tests. Profile CPU/allocations to explain regressions;
     compare matched revisions.

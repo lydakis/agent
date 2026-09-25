@@ -2,7 +2,7 @@
 //! encoding and SSE parsing. History items are streamed by reference.
 use crate::{Error, Result, codec::Family, fail, sse::Decoder};
 use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,6 +132,9 @@ pub struct Provider {
     sockets: Option<Arc<Sockets>>,
     /// Bedrock signs every request with SigV4 instead of sending a key.
     aws: Option<Arc<aws::Aws>>,
+    /// A Bedrock endpoint, however it authenticates: it runs no server-side
+    /// fallbacks and serves no WebSocket.
+    bedrock: bool,
 }
 
 #[derive(Debug)]
@@ -184,20 +187,28 @@ pub struct ToolCall {
     pub call_id: String,
     pub arguments: String,
 }
-/// The conversation items of a request: a stream of pre-encoded,
-/// comma-separated items of known total length, so the body is never
-/// assembled in memory.
+pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
+/// The conversation items of a request: pre-encoded, comma-separated items
+/// of known total length, read as a stream so the body is never assembled in
+/// memory. Each stream reads them from the start, so a signer that digests
+/// the body can read it once before it is sent.
 pub struct Items {
-    /// Exact byte length the stream will yield.
+    /// Exact byte length every stream yields.
     pub bytes: usize,
-    pub stream: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
+    open: Box<dyn Fn() -> ItemStream + Send + Sync>,
 }
 impl Items {
-    pub fn empty() -> Items {
+    pub fn new(bytes: usize, open: impl Fn() -> ItemStream + Send + Sync + 'static) -> Items {
         Items {
-            bytes: 0,
-            stream: stream::empty().boxed(),
+            bytes,
+            open: Box::new(open),
         }
+    }
+    pub fn empty() -> Items {
+        Items::new(0, || stream::empty().boxed())
+    }
+    pub fn stream(&self) -> ItemStream {
+        (self.open)()
     }
 }
 pub struct Request<'a> {
@@ -278,6 +289,7 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
+        let bedrock = aws::endpoint(&url).is_some();
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -290,6 +302,7 @@ impl Provider {
             stall_timeout: STALL_TIMEOUT,
             sockets: None,
             aws: None,
+            bedrock,
         })
     }
     /// Model pool levels behind this provider, for `stats`.
@@ -307,7 +320,7 @@ impl Provider {
     /// so a call can continue from the bot's previous response.
     pub fn with_socket(mut self) -> Result<Self> {
         // Bedrock serves Responses over HTTP only.
-        if self.family != Family::Responses || aws::endpoint(&self.url).is_some() {
+        if self.family != Family::Responses || self.bedrock {
             return fail("invalid_provider_transport");
         }
         self.sockets = Some(Sockets::new()?);
@@ -445,8 +458,10 @@ impl Provider {
             #[serde(skip_serializing_if = "Option::is_none")]
             output_config: Option<Value>,
             /// A request a safety classifier declines is rerun on the model
-            /// Anthropic recommends for that refusal category.
-            fallbacks: &'static str,
+            /// Anthropic recommends for that refusal category. Bedrock does
+            /// not run server-side fallbacks.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fallbacks: Option<&'static str>,
         }
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
         let max_tokens = self.max_output_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS);
@@ -505,7 +520,7 @@ impl Provider {
                         .reasoning
                         .filter(|_| !legacy_thinking(request.model))
                         .map(|level| json!({"effort":level})),
-                    fallbacks: "default",
+                    fallbacks: (!self.bedrock).then_some("default"),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -517,12 +532,9 @@ impl Provider {
 
     /// Content-Length avoids requiring provider support for chunked uploads;
     /// the items stream through without a whole-body copy.
-    fn body(&self, prefix: Vec<u8>, items: Items) -> (reqwest::Body, usize) {
+    fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
         let len = prefix.len() + items.bytes + 2;
-        let framed = stream::iter([Ok(Bytes::from(prefix))])
-            .chain(items.stream)
-            .chain(stream::iter([Ok(Bytes::from_static(b"]}"))]));
-        (reqwest::Body::wrap_stream(framed), len)
+        (reqwest::Body::wrap_stream(framed(prefix, items)), len)
     }
 
     pub async fn complete<F, Fut>(&self, request: Request<'_>, delta: F) -> Result<Completion>
@@ -575,12 +587,22 @@ impl Provider {
         // ceiling on what the provider generates or bills, and the usage the
         // response reports corrects it.
         let pace = self.pools.get(&self.family.pool_key(request.model));
-        let prefix = self.prefix(&request)?;
+        let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
             input: ((prefix.len() + request.items.bytes) / 4) as u64,
             output: u64::from(self.max_output_tokens.unwrap_or(512)),
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
+        // Bedrock Runtime signs the body's digest, so its items are read once
+        // to hash them and again as they stream; Mantle takes the body
+        // unsigned over TLS and reads it once. Hashed before admission, which
+        // bounds connection starts, not store reads.
+        let payload = match &self.aws {
+            Some(aws) if aws.signs_payload() => {
+                Some(aws::payload(framed(prefix.clone(), &request.items)).await?)
+            }
+            _ => None,
+        };
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
         let admission = self.admit().await?;
@@ -598,7 +620,7 @@ impl Provider {
                 .await;
         }
         let cache_key = request.cache_key;
-        let (body, len) = self.body(prefix, request.items);
+        let (body, len) = self.body(prefix, &request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
         // A token can expire while pacing or waiting for admission. Read it
@@ -630,7 +652,12 @@ impl Provider {
                 // model instead of ending the turn with a refusal.
                 let http = http.header("anthropic-version", "2023-06-01").header(
                     "anthropic-beta",
-                    "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01",
+                    match self.bedrock {
+                        true => "thinking-binding-controls-2026-08-01",
+                        false => {
+                            "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"
+                        }
+                    },
                 );
                 match key {
                     Some(key) => http.header("x-api-key", key),
@@ -649,7 +676,14 @@ impl Provider {
         }
         // Signed last, at send time: the signature covers the moment it is made.
         if let Some((aws, keys)) = &signer {
-            for (name, value) in aws.sign(keys, "POST", &self.url, std::time::SystemTime::now()) {
+            let payload = payload.as_deref().unwrap_or(aws::UNSIGNED_PAYLOAD);
+            for (name, value) in aws.sign(
+                keys,
+                "POST",
+                &self.url,
+                std::time::SystemTime::now(),
+                payload,
+            ) {
                 http = http.header(name, value);
             }
         }
@@ -868,7 +902,7 @@ impl Provider {
         &self,
         sockets: &Sockets,
         request: Request<'_>,
-        prefix: Vec<u8>,
+        prefix: Bytes,
         mut delta: F,
         report: &mut Report,
         (pace, mut reservation, estimate): (&pace::Pace, pace::Reservation<'_>, pace::Cost),
@@ -1028,7 +1062,21 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
 
 /// A `response.create` event: the request fields, the continuation if any,
 /// and the input. A socket message is whole, so the input is assembled here.
-async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Result<String> {
+/// A request body as it is sent: the prefix, the items and the close. Empty
+/// chunks (an empty context prefix, a batch of thinking-only items) are
+/// dropped: each would be an empty HTTP/2 DATA frame, which Bedrock answers
+/// with GOAWAY FRAME_SIZE_ERROR.
+fn framed(
+    prefix: Bytes,
+    items: &Items,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    stream::iter([Ok(prefix)])
+        .chain(items.stream())
+        .chain(stream::iter([Ok(Bytes::from_static(b"]}"))]))
+        .filter(|chunk| std::future::ready(!matches!(chunk, Ok(bytes) if bytes.is_empty())))
+}
+
+async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<String> {
     let mut text = Vec::with_capacity(prefix.len() + items.bytes + 96);
     text.extend_from_slice(br#"{"type":"response.create","#);
     if let Some(previous) = previous {
@@ -1037,7 +1085,8 @@ async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Resu
         text.push(b',');
     }
     text.extend_from_slice(&prefix[1..]);
-    while let Some(chunk) = items.stream.next().await {
+    let mut stream = items.stream();
+    while let Some(chunk) = stream.next().await {
         text.extend_from_slice(&chunk.map_err(|error| Error {
             code: error.to_string(),
             detail: None,
@@ -1471,6 +1520,40 @@ mod tests {
                 .with_aws(signer("us-east-1", "bedrock-mantle"))
                 .is_err()
         );
+    }
+
+    /// Bedrock runs no server-side fallbacks, so its requests do not ask for
+    /// them, whichever endpoint and however they authenticate.
+    #[test]
+    fn bedrock_requests_ask_for_no_server_side_fallbacks() {
+        let transport = Transport::new(64, 1).unwrap();
+        for (url, key) in [
+            (
+                "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+                None,
+            ),
+            (
+                "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+                Some("k".to_owned()),
+            ),
+        ] {
+            let provider = Provider::new(transport.clone(), Family::Anthropic, url, key).unwrap();
+            let prefix = provider
+                .prefix(&Request {
+                    model: "anthropic.claude-sonnet-5",
+                    instructions: "i",
+                    reasoning: Some("high"),
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                })
+                .unwrap();
+            let text = String::from_utf8(prefix).unwrap();
+            assert!(!text.contains("fallbacks"), "{text}");
+            assert!(text.contains("\"block_binding\""), "{text}");
+        }
     }
 
     /// Bedrock serves both wire families this runtime already speaks, on two
@@ -2033,14 +2116,37 @@ mod tests {
             .map(|n| Bytes::from(Family::Responses.user_item(&format!("m{n}")).unwrap()))
             .collect();
         let joined = items.iter().map(Bytes::len).sum::<usize>() + items.len() - 1;
-        let prefix = b"{\"input\":[".to_vec();
+        let prefix = Bytes::from_static(b"{\"input\":[");
         let (_, len) = provider.body(
             prefix.clone(),
-            Items {
-                bytes: joined,
-                stream: stream::empty().boxed(),
-            },
+            &Items::new(joined, || stream::empty().boxed()),
         );
         assert_eq!(len, prefix.len() + joined + 2);
+    }
+
+    /// An empty chunk would go out as an empty HTTP/2 DATA frame, which
+    /// Bedrock answers by closing the connection. Every stream of the same
+    /// items reads the same bytes, so a digest matches the body sent.
+    #[tokio::test]
+    async fn bodies_carry_no_empty_chunk_and_read_the_same_every_time() {
+        let items = Items::new(9, || {
+            stream::iter(
+                ["", "{\"a\":1}", "", ",", ""].map(|c| Ok(Bytes::from_static(c.as_bytes()))),
+            )
+            .boxed()
+        });
+        for _ in 0..2 {
+            let chunks: Vec<Bytes> = framed(Bytes::from_static(b"{\"input\":["), &items)
+                .map(|chunk| chunk.unwrap())
+                .collect()
+                .await;
+            assert!(chunks.iter().all(|c| !c.is_empty()), "{chunks:?}");
+            assert_eq!(chunks.concat(), b"{\"input\":[{\"a\":1},]}");
+        }
+        let chunks: Vec<Bytes> = framed(Bytes::new(), &Items::empty())
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        assert_eq!(chunks, [Bytes::from_static(b"]}")]);
     }
 }

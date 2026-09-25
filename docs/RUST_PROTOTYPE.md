@@ -362,7 +362,9 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `aws configure export-credentials`. Temporary keys are re-resolved five
 minutes before they expire and once on a 401 or 403, which retries the call
 as `provider_login_refreshed`; the secret and session token are redacted
-from tool output and, from the environment, kept out of shells. A key field
+from tool output and, from the environment, kept out of shells. Mantle takes
+the body unsigned; runtime signs its SHA-256, so a runtime call reads its
+history from the store twice, once to digest it and once as it streams. A key field
 instead sends a Bedrock API key the family's own way, as
 `--provider b=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK`;
 short-term API keys last at most twelve hours and are read once. Bedrock has no
@@ -502,7 +504,8 @@ clients can price them per model; its totals are their sum. A refusal that
 survives the fallbacks still fails the turn with `provider_refusal`, with the
 models it switched to, the refusal category and any recommended retry model as
 its detail. Bedrock,
-Vertex and Foundry do not offer server-side fallback. Observed 2026-09-24:
+Vertex and Foundry do not offer server-side fallback, so Bedrock requests send
+neither the field nor its beta header. Observed 2026-09-24:
 `claude-sonnet-5`, `claude-haiku-4-5` and `claude-sonnet-4-5` accept the field,
 and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
 with it set; a live refusal was not reproduced, so the fallback path is covered
