@@ -275,13 +275,22 @@ impl ProviderSpec {
         if name.is_empty() || name.len() > 64 || split_model(&format!("{name}/x")).is_err() {
             return fail_with("invalid_provider_spec", spec);
         }
-        let bedrock = reqwest::Url::parse(&url)
-            .ok()
-            .and_then(|url| agent_runtime::provider::aws::endpoint(&url))
+        let parsed = reqwest::Url::parse(&url).ok();
+        let bedrock = parsed
+            .as_ref()
+            .and_then(agent_runtime::provider::aws::endpoint)
             .is_some();
         // Bedrock serves Responses over HTTP only.
         if bedrock && socket {
             return fail_with("invalid_provider_spec", spec);
+        }
+        // Every Bedrock request carries a signature or key and the whole
+        // conversation, so none leaves over cleartext.
+        if bedrock && parsed.is_some_and(|url| url.scheme() != "https") {
+            return Err(Error::with(
+                "invalid_provider_spec",
+                format!("{spec}: Bedrock endpoints need https"),
+            ));
         }
         Ok(Self {
             sigv4: bedrock && key_env.is_none(),
@@ -1675,6 +1684,14 @@ mod tests {
             )
             .is_err()
         );
+        // Nor any cleartext one, signed or keyed.
+        for spec in [
+            "b=anthropic,http://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1",
+            "b=responses,http://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK",
+        ] {
+            let error = ProviderSpec::parse_with(spec, &region).err().unwrap();
+            assert_eq!(error.code, "invalid_provider_spec");
+        }
     }
 
     #[test]

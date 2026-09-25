@@ -5,9 +5,10 @@
 //! Credentials come from the AWS chain in its own order: static keys from the
 //! environment first, then everything else the AWS CLI resolves (profiles,
 //! SSO, assumed roles, container and instance roles) through its standard
-//! `credential_process` output. Temporary keys are re-resolved shortly before
-//! they expire and once when the service calls them expired, so a daemon
-//! outlives any one session.
+//! `credential_process` output. Temporary keys are re-resolved in the
+//! background shortly before they expire, and once when the service calls
+//! them expired, so a daemon outlives any one session and no request waits
+//! on the CLI while its keys still work.
 //!
 //! Requests stream their body from the store and never hold it. Mantle takes
 //! the payload as `UNSIGNED-PAYLOAD` over TLS; Runtime refuses that, so its
@@ -27,10 +28,25 @@ const REFRESH_AHEAD: Duration = Duration::from_secs(300);
 /// Bound on one `aws` credential resolution; an SSO login that needs a
 /// browser fails here with the CLI's own message instead of hanging a turn.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
-/// A refusal re-resolves at most this often, so a fleet refused for another
-/// reason (a model not enabled, a missing permission) cannot spawn the CLI
-/// once per request.
+/// Re-resolution runs at most this often, so neither a CLI outage nor a
+/// fleet refused for another reason (a model not enabled, a missing
+/// permission) can spawn the CLI once per request.
 const RELOAD_INTERVAL: Duration = Duration::from_secs(10);
+/// The AWS CLI's credential export, which resolves the rest of the chain for
+/// `AWS_PROFILE` or the default profile.
+const AWS_CLI: [&str; 5] = [
+    "aws",
+    "configure",
+    "export-credentials",
+    "--format",
+    "process",
+];
+/// The environment's key set: key id, secret, session token.
+const ENVIRONMENT: [&str; 3] = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
 pub const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
 /// The region and signing name of a Bedrock endpoint, from its host:
@@ -93,9 +109,8 @@ enum Source {
     /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, read once: the
     /// process environment cannot change under a running daemon.
     Environment,
-    /// `aws configure export-credentials --format process`, which resolves
-    /// the rest of the chain for `AWS_PROFILE` or the default profile.
-    Cli,
+    /// A command printing `credential_process` output: [`AWS_CLI`].
+    Cli(Box<[String]>),
 }
 
 pub struct Aws {
@@ -103,8 +118,8 @@ pub struct Aws {
     service: &'static str,
     source: Source,
     keys: RwLock<Arc<Keys>>,
-    /// Single flight for re-resolution, and when it last ran.
-    refresh: tokio::sync::Mutex<Option<Instant>>,
+    /// Single flight for re-resolution, and when it last began.
+    refresh: Arc<tokio::sync::Mutex<Option<Instant>>>,
     redaction: Option<Credentials>,
 }
 impl std::fmt::Debug for Aws {
@@ -122,22 +137,20 @@ impl Aws {
     /// never starts with a binding it cannot sign for.
     pub async fn open(url: &reqwest::Url, redaction: Option<Credentials>) -> Result<Self> {
         let (region, service) = endpoint(url).ok_or(Error::new("invalid_provider_url"))?;
-        let from_env = std::env::var("AWS_ACCESS_KEY_ID")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .zip(
-                std::env::var("AWS_SECRET_ACCESS_KEY")
-                    .ok()
-                    .filter(|v| !v.is_empty()),
-            );
-        let (source, keys) = match from_env {
-            Some((access, secret)) => {
-                let token = std::env::var("AWS_SESSION_TOKEN")
-                    .ok()
-                    .filter(|v| !v.is_empty());
-                (Source::Environment, Keys::new(access, secret, token))
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        if let Some(redaction) = &redaction {
+            withhold(redaction, var);
+        }
+        let (source, keys) = match var(ENVIRONMENT[0]).zip(var(ENVIRONMENT[1])) {
+            Some((access, secret)) => (
+                Source::Environment,
+                Keys::new(access, secret, var(ENVIRONMENT[2])),
+            ),
+            None => {
+                let command: Box<[String]> = AWS_CLI.map(str::to_owned).into();
+                let keys = resolve(&command).await?;
+                (Source::Cli(command), keys)
             }
-            None => (Source::Cli, resolve().await?),
         };
         if keys.expired(SystemTime::now()) {
             return Err(Error::new("provider_aws_credentials_expired"));
@@ -147,7 +160,7 @@ impl Aws {
             service,
             source,
             keys: RwLock::new(Arc::new(Keys::new(String::new(), String::new(), None))),
-            refresh: tokio::sync::Mutex::new(None),
+            refresh: Arc::default(),
             redaction,
         };
         aws.install(keys);
@@ -161,7 +174,7 @@ impl Aws {
             service,
             source: Source::Environment,
             keys: RwLock::new(Arc::new(keys)),
-            refresh: tokio::sync::Mutex::new(None),
+            refresh: Arc::default(),
             redaction: None,
         }
     }
@@ -181,7 +194,7 @@ impl Aws {
     pub fn source(&self) -> &'static str {
         match self.source {
             Source::Environment => "environment",
-            Source::Cli => "aws-cli",
+            Source::Cli(_) => "aws-cli",
         }
     }
 
@@ -194,12 +207,8 @@ impl Aws {
             // The key id too: it names the account's credential, and a shell
             // left with it alone is no use to anyone.
             let names = match self.source {
-                Source::Environment => [
-                    "AWS_ACCESS_KEY_ID",
-                    "AWS_SECRET_ACCESS_KEY",
-                    "AWS_SESSION_TOKEN",
-                ],
-                Source::Cli => [
+                Source::Environment => ENVIRONMENT,
+                Source::Cli(_) => [
                     "AGENT_AWS_ACCESS_KEY_ID",
                     "AGENT_AWS_SECRET_ACCESS_KEY",
                     "AGENT_AWS_SESSION_TOKEN",
@@ -214,51 +223,62 @@ impl Aws {
         *self.keys.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(keys);
     }
 
-    /// The keys to sign with now. Keys inside the refresh window are
-    /// re-resolved first, by one caller at a time; while they still work, a
-    /// failed re-resolution keeps them, and once they have expired it fails
-    /// the request.
-    pub async fn current(&self) -> Result<Arc<Keys>> {
+    /// The keys to sign with now. Keys inside the refresh window keep
+    /// signing while one background task re-resolves them, so no request
+    /// waits on the CLI while they still work; a failed attempt keeps them.
+    /// Only expired keys make the caller wait for a re-resolution, and fail
+    /// the request when it fails or another has just failed.
+    pub async fn current(self: &Arc<Self>) -> Result<Arc<Keys>> {
         let held = self.held();
         let now = SystemTime::now();
-        if !held.stale(now) || matches!(self.source, Source::Environment) {
-            return match held.expired(now) {
-                true => Err(Error::new("provider_aws_credentials_expired")),
-                false => Ok(held),
-            };
-        }
-        let mut last = self.refresh.lock().await;
-        let held = self.held();
-        if !held.stale(SystemTime::now()) {
+        let Source::Cli(command) = &self.source else {
+            return usable(held, now);
+        };
+        if !held.stale(now) {
             return Ok(held);
         }
-        *last = Some(Instant::now());
-        match resolve().await {
-            Ok(fresh) => {
-                self.install(fresh);
-                Ok(self.held())
+        if !held.expired(now) {
+            if let Ok(mut last) = Arc::clone(&self.refresh).try_lock_owned()
+                && due(*last)
+            {
+                *last = Some(Instant::now());
+                let aws = Arc::clone(self);
+                tokio::spawn(async move {
+                    // The lock is held until the run ends: one run at a time.
+                    let _last = last;
+                    if let Source::Cli(command) = &aws.source
+                        && let Ok(fresh) = resolve(command).await
+                    {
+                        aws.install(fresh);
+                    }
+                });
             }
-            Err(_) if !held.expired(SystemTime::now()) => Ok(held),
-            Err(error) => Err(error),
+            return Ok(held);
         }
+        let mut last = self.refresh.lock().await;
+        if self.held().stale(SystemTime::now()) && due(*last) {
+            *last = Some(Instant::now());
+            self.install(resolve(command).await?);
+        }
+        usable(self.held(), SystemTime::now())
     }
 
     /// After the service refused `refused` as expired or unrecognized: use
     /// keys another call has already installed, or re-resolve. True when
     /// different keys are now held, so the caller may retry.
     pub async fn reload(&self, refused: &Keys) -> Result<bool> {
-        if matches!(self.source, Source::Environment) {
+        let Source::Cli(command) = &self.source else {
             return Ok(false);
-        }
+        };
         let mut last = self.refresh.lock().await;
         if *self.held() != *refused {
             return Ok(true);
         }
-        if last.is_some_and(|at| at.elapsed() < RELOAD_INTERVAL) {
+        if !due(*last) {
             return Ok(false);
         }
         *last = Some(Instant::now());
-        let fresh = resolve().await?;
+        let fresh = resolve(command).await?;
         let changed = fresh != *refused;
         if changed {
             self.install(fresh);
@@ -280,6 +300,30 @@ impl Aws {
     }
 }
 
+/// Keep whatever part of an environment key set the daemon inherited out of
+/// shells and tool output, whichever source signs: an incomplete set leaves
+/// the CLI to sign, but its values are still credentials.
+fn withhold(redaction: &Credentials, var: impl Fn(&str) -> Option<String>) {
+    for name in ENVIRONMENT {
+        if let Some(value) = var(name) {
+            redaction.set(name, &value);
+        }
+    }
+}
+
+/// `keys`, unless they have expired.
+fn usable(keys: Arc<Keys>, now: SystemTime) -> Result<Arc<Keys>> {
+    match keys.expired(now) {
+        true => Err(Error::new("provider_aws_credentials_expired")),
+        false => Ok(keys),
+    }
+}
+
+/// Whether a re-resolution that last began at `last` may run again.
+fn due(last: Option<Instant>) -> bool {
+    last.is_none_or(|at| at.elapsed() >= RELOAD_INTERVAL)
+}
+
 /// The hex SHA-256 of a body, read chunk by chunk as it streams.
 pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result<String> {
     let mut body = std::pin::pin!(body);
@@ -295,11 +339,11 @@ pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result
 
 /// Run the AWS CLI's credential export. Its stdout holds the secret, so it
 /// never becomes a diagnostic; its stderr is the CLI's own explanation.
-async fn resolve() -> Result<Keys> {
+async fn resolve(argv: &[String]) -> Result<Keys> {
     let unavailable = |why: String| Error::with("provider_aws_credentials_unavailable", why);
-    let mut command = tokio::process::Command::new("aws");
+    let mut command = tokio::process::Command::new(&argv[0]);
     command
-        .args(["configure", "export-credentials", "--format", "process"])
+        .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     let output = tokio::time::timeout(RESOLVE_TIMEOUT, command.output())
@@ -665,7 +709,8 @@ mod tests {
     }
 
     /// The key id, secret and token are all redacted from tool output, and
-    /// the environment names that carried them are kept out of shells.
+    /// the environment names that carried them are kept out of shells, even
+    /// when they do not make a whole set.
     #[test]
     fn every_part_of_the_keys_stays_out_of_tools() {
         let credentials = Credentials::default();
@@ -692,6 +737,81 @@ mod tests {
         for value in ["AKIDEXAMPLE", "s3cr3t", "t0k3n"] {
             assert!(!text.contains(value), "{text}");
         }
+        // A leftover token with no key pair beside it leaves the CLI to sign,
+        // and is withheld all the same.
+        let credentials = Credentials::default();
+        withhold(&credentials, |name| {
+            (name == "AWS_SESSION_TOKEN").then(|| "l3ft0ver".into())
+        });
+        assert_eq!(credentials.names(), ["AWS_SESSION_TOKEN"]);
+        assert!(!credentials.redact("l3ft0ver".into()).contains("l3ft0ver"));
+    }
+
+    /// Stale keys keep signing while one background run re-resolves them,
+    /// and a failed run is not repeated within the interval. Expired keys
+    /// wait for a run and fail with the CLI's reason, or at once when a run
+    /// has just failed.
+    #[tokio::test]
+    async fn stale_keys_refresh_in_the_background_and_failures_wait_their_turn() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (calls, fresh) = (dir.join("calls"), dir.join("fresh"));
+        let script = format!(
+            r#"echo >> '{}'; sleep 0.5; test -e '{}' || {{ echo down >&2; exit 1; }}
+echo '{{"Version":1,"AccessKeyId":"FRESH","SecretAccessKey":"S"}}'"#,
+            calls.display(),
+            fresh.display()
+        );
+        let runs = || std::fs::read_to_string(&calls).map_or(0, |text| text.lines().count());
+        let expiring = |access: &str, secs: i64| {
+            let mut keys = Keys::new(access.into(), "S".into(), None);
+            keys.expires = Some(match secs {
+                0.. => SystemTime::now() + Duration::from_secs(secs as u64),
+                _ => SystemTime::now() - Duration::from_secs(secs.unsigned_abs()),
+            });
+            keys
+        };
+        let mut aws = Aws::fixed("us-east-1", "bedrock-mantle", expiring("STALE", 60));
+        aws.source = Source::Cli(["sh".into(), "-c".into(), script].into());
+        let aws = Arc::new(aws);
+        let settled = || async { drop(aws.refresh.lock().await) };
+
+        // While the CLI is down, a burst signs with the stale keys while one
+        // run is still in flight.
+        for _ in 0..20 {
+            assert_eq!(aws.current().await.unwrap().access, "STALE");
+        }
+        assert!(aws.refresh.try_lock().is_err());
+        settled().await;
+        assert_eq!(runs(), 1);
+        for _ in 0..20 {
+            assert_eq!(aws.current().await.unwrap().access, "STALE");
+        }
+        settled().await;
+        assert_eq!(runs(), 1);
+
+        // After the interval, the next call starts a run whose keys replace
+        // the stale ones.
+        std::fs::write(&fresh, "").unwrap();
+        *aws.refresh.lock().await = Some(Instant::now() - RELOAD_INTERVAL);
+        assert_eq!(aws.current().await.unwrap().access, "STALE");
+        settled().await;
+        assert_eq!(runs(), 2);
+        assert_eq!(aws.current().await.unwrap().access, "FRESH");
+
+        std::fs::remove_file(&fresh).unwrap();
+        aws.install(expiring("EXPIRED", -1));
+        *aws.refresh.lock().await = None;
+        let error = aws.current().await.unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.detail.as_deref()),
+            ("provider_aws_credentials_unavailable", Some("down"))
+        );
+        assert_eq!(runs(), 3);
+        let error = aws.current().await.unwrap_err();
+        assert_eq!(error.code, "provider_aws_credentials_expired");
+        assert_eq!(runs(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

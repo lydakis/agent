@@ -415,9 +415,11 @@ impl Provider {
     }
 
     /// Sign every request for this Bedrock endpoint with SigV4, in place of
-    /// a key; the URL must be a Bedrock host of the same region and service.
+    /// a key; the URL must be an https Bedrock host of the same region and
+    /// service, since the signature and session token travel with it.
     pub fn with_aws(mut self, aws: Arc<aws::Aws>) -> Result<Self> {
         if aws::endpoint(&self.url) != Some((aws.region().to_owned(), aws.service()))
+            || self.url.scheme() != "https"
             || self.key.is_some()
             || self.login.is_some()
         {
@@ -616,19 +618,19 @@ impl Provider {
             output: u64::from(self.max_output_tokens.unwrap_or(512)),
         };
         let mut reservation = pace.acquire_reported(estimate, report).await?;
+        // Bound request startup until response headers arrive; release before
+        // reading SSE so established streams are not capped at this limit.
+        let admission = self.admit().await?;
         // Bedrock Runtime signs the body's digest, so its items are read once
         // to hash them and again as they stream; Mantle takes the body
-        // unsigned over TLS and reads it once. Hashed before admission, which
-        // bounds connection starts, not store reads.
+        // unsigned over TLS and reads it once. Hashed under admission, which
+        // already covers sending the body, so the extra read is bounded too.
         let payload = match &self.aws {
             Some(aws) if aws.signs_payload() => {
                 Some(aws::payload(framed(prefix.clone(), &request.items)).await?)
             }
             _ => None,
         };
-        // Bound request startup until response headers arrive; release before
-        // reading SSE so established streams are not capped at this limit.
-        let admission = self.admit().await?;
         if let Some(sockets) = &self.sockets {
             return self
                 .complete_socket(
@@ -1608,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_bindings_refuse_websocket_and_mismatched_signers() {
+    fn bedrock_bindings_refuse_websocket_cleartext_and_mismatched_signers() {
         let transport = Transport::new(64, 1).unwrap();
         let mantle = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
         let bedrock = || Provider::new(transport.clone(), Family::Responses, mantle, None).unwrap();
@@ -1626,6 +1628,18 @@ mod tests {
                 .is_err()
         );
         assert!(bedrock().with_aws(signer("us-east-1", "bedrock")).is_err());
+        let cleartext = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "http://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            cleartext
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_err()
+        );
         let keyed = Provider::new(
             transport.clone(),
             Family::Responses,

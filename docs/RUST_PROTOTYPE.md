@@ -302,7 +302,7 @@ bound; the operating system is then the only limit.
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
-| `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
+| `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
 | `--max-output-tokens` | Generated tokens per model call, including reasoning. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
@@ -363,9 +363,10 @@ with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
 its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
 `AWS_PROFILE` or the default profile, SSO and assumed roles included, through
-`aws configure export-credentials`. Temporary keys are re-resolved five
-minutes before they expire and once on a 401 or 403, which retries the call
-as `provider_login_refreshed`; the key id, secret and session token are
+`aws configure export-credentials`. Temporary keys are re-resolved in the
+background five minutes before they expire, at most every ten seconds, and
+once on a 401 or 403, which retries the call as `provider_login_refreshed`;
+Bedrock URLs must be https; the key id, secret and session token are
 redacted from tool output and, from the environment, kept out of shells. Mantle takes
 the body unsigned; runtime signs its SHA-256, so a runtime call reads its
 history from the store twice, once to digest it and once as it streams. A key field

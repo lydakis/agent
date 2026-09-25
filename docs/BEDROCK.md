@@ -53,8 +53,14 @@ credentials resolve in the chain's own order: static environment keys first,
 then the AWS CLI's `configure export-credentials`, which is the chain itself
 (profiles, SSO, assumed roles, container and instance roles) in the standard
 `credential_process` format. Temporary keys are re-resolved five minutes before
-expiry, single-flight, and once on a 401 or 403, which retries the call; a
-refused fleet re-runs the CLI at most every ten seconds.
+expiry by one background run while they keep signing, so no call waits on the
+CLI until the keys have actually expired; a 401 or 403 re-resolves once and
+retries the call. The CLI runs at most every ten seconds, so neither a CLI
+outage nor a refused fleet spawns it per request. Any of the three
+`AWS_*` key variables the daemon inherited is kept out of shells and tool
+output, even an incomplete set that leaves the CLI to sign. Bedrock endpoints must be
+https: a Bedrock provider given an `http://` URL, signed or keyed, is refused
+when it is configured.
 
 Request bodies stream from the store and are never held. **Observed**: Mantle
 accepts the payload signed as `UNSIGNED-PAYLOAD` over TLS, so a Mantle call
@@ -66,8 +72,9 @@ once as it streams (**source**: `Items`, `aws::payload`). That costs a second
 store read and a SHA-256 pass per call, and no memory: the body is still never
 assembled. Buffering the body instead would read once but hold every in-flight
 request whole, up to the context window per call, which is the wrong trade
-for many active bots. The digest runs before admission, so it does not hold a
-connection-start slot.
+for many active bots. The digest runs under admission, which already covers
+sending the body, so `--max-connecting` bounds the extra reads and hashing as
+it bounds the sends, and a fleet cannot start every pre-read at once.
 
 ## Features, carried over or not
 
