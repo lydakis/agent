@@ -278,13 +278,16 @@ class Agent(BaseInstalledAgent):
                     usage.n_input_tokens += sign * attempt['input_tokens']
                     usage.n_cache_tokens += sign * attempt['cached_input_tokens']
                     usage.n_output_tokens += sign * attempt['output_tokens']
-        # Cache writes are inside input tokens; they are priced above input.
-        writes: dict[str, int] = {}
+        # Cache writes are inside input tokens; they are priced above input,
+        # hour-long ones higher still.
+        writes: dict[str, tuple[int, int]] = {}
         for model, data in events:
             provider = model.split('/', 1)[0] + '/' if '/' in model else ''
             for attempt in data.get('models') or [data]:
                 key = ran_on(provider, attempt) if 'model' in attempt else model
-                writes[key] = writes.get(key, 0) + attempt.get('cache_write_tokens', 0)
+                total, hourly = writes.get(key, (0, 0))
+                writes[key] = (total + attempt.get('cache_write_tokens', 0),
+                               hourly + attempt.get('cache_write_1h_tokens', 0))
         # A turn sticky routing served entirely elsewhere leaves nothing to price.
         for model in moved:
             usage = models[model]
@@ -293,7 +296,7 @@ class Agent(BaseInstalledAgent):
         if not models:
             return
         for model, usage in models.items():
-            usage.cost_usd = self._cost(model, usage, writes.get(model, 0))
+            usage.cost_usd = self._cost(model, usage, *writes.get(model, (0, 0)))
         costs = [usage.cost_usd for usage in models.values()]
         context.n_input_tokens = sum(u.n_input_tokens for u in models.values())
         context.n_cache_tokens = sum(u.n_cache_tokens for u in models.values())
@@ -364,12 +367,13 @@ class Agent(BaseInstalledAgent):
         return usage or None
 
     @staticmethod
-    def _cost(model: str, usage: ModelUsage, writes: int = 0) -> float | None:
+    def _cost(model: str, usage: ModelUsage, writes: int = 0, hourly: int = 0) -> float | None:
         """Aggregate-token cost from LiteLLM's table, as Harbor's own adapters do.
 
         `writes` of the uncached input tokens went to the prompt cache and are
-        billed at the model's cache-write rate (the 5-minute rate the runtime
-        requests), or as input when the table has none.
+        billed at the model's five-minute cache-write rate, or as input when
+        the table has none. `hourly` of them were cached for an hour, billed at
+        the table's hour rate, or twice input as Anthropic prices it.
         """
         try:
             import litellm
@@ -382,5 +386,7 @@ class Agent(BaseInstalledAgent):
         uncached = usage.n_input_tokens - usage.n_cache_tokens
         cached_rate = rates.get('cache_read_input_token_cost') or rates['input_cost_per_token']
         write_rate = rates.get('cache_creation_input_token_cost') or rates['input_cost_per_token']
-        return ((uncached - writes) * rates['input_cost_per_token'] + writes * write_rate
+        hour_rate = rates.get('cache_creation_input_token_cost_above_1hr') or 2 * rates['input_cost_per_token']
+        return ((uncached - writes) * rates['input_cost_per_token']
+                + (writes - hourly) * write_rate + hourly * hour_rate
                 + usage.n_cache_tokens * cached_rate + usage.n_output_tokens * rates['output_cost_per_token'])

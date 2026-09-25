@@ -194,6 +194,33 @@ impl TokenTotals {
     }
 }
 
+/// The last model call of a turn, kept so its prompt cache can be refreshed
+/// while the calls it planned run: see [`Turn::run_tool`].
+struct Warm<'a> {
+    provider: &'a Provider,
+    model: &'a str,
+    instructions: &'a str,
+    reasoning: Option<&'a str>,
+    tools: &'a serde_json::value::RawValue,
+    context: &'a Context,
+    after: std::time::Duration,
+    /// When the cache was last read, by the call or a refresh.
+    read_at: tokio::time::Instant,
+    stopped: bool,
+    /// Tokens the refreshes billed, for the bot's budget.
+    tokens: u64,
+    /// The refresh in flight, held by [`Accounting`] so an interrupt that
+    /// drops the turn's rounds still settles one already sent.
+    pending: &'a mut Option<Pending>,
+}
+
+/// A refresh running as its own task, and whether it has been sent.
+struct Pending {
+    refresh: Arc<agent_runtime::provider::Refresh>,
+    /// The usage, and when the refresh was sent.
+    task: tokio::task::JoinHandle<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>>,
+}
+
 /// Lives outside the cancellable rounds future. No allocation or per-attempt
 /// storage write: each execution segment flushes once, including when parked.
 #[derive(Default)]
@@ -209,6 +236,10 @@ struct Accounting {
     parked_until: u64,
     /// Persist the call's phase with its existing park transaction.
     compaction: bool,
+    /// A prompt-cache refresh in flight while a tool runs.
+    refresh: Option<Pending>,
+    /// The provider's sticky-routing token for this turn's model calls.
+    route: std::sync::OnceLock<String>,
 }
 impl Accounting {
     fn totals(&self) -> (u64, u64) {
@@ -285,6 +316,13 @@ impl Turn {
             result = self.rounds(&mut accounting) => result,
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
+        // A refresh it had already sent is billed: record what it cost.
+        if let Some(pending) = accounting.refresh.take()
+            && let Some(Ok((usage, _))) = settle(pending).await
+            && let Err(error) = self.record_refresh(usage).await
+        {
+            result = Err(error);
+        }
         let (retries, paced_ms) = accounting.totals();
         let turn = self.turn;
         let flushed = if let Ok(Round::Paced(at)) = &result {
@@ -830,7 +868,13 @@ impl Turn {
                     .await?;
                 // Calls that followed the wait in the same model response.
                 if self
-                    .execute_calls(waiting.pending, &workspace, &environment, &record.tools)
+                    .execute_calls(
+                        waiting.pending,
+                        &workspace,
+                        &environment,
+                        &record.tools,
+                        None,
+                    )
                     .await?
                 {
                     return Ok(Round::Parked);
@@ -935,10 +979,39 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            if self
-                .execute_calls(response.calls, &workspace, &environment, &record.tools)
-                .await?
-            {
+            // The cache's lifetime runs from the sending of the call that read it.
+            let read_at = accounting
+                .report
+                .sent_at
+                .unwrap_or_else(tokio::time::Instant::now);
+            let pending = &mut accounting.refresh;
+            let mut warm = provider
+                .keep_warm_after(model, record.reasoning.as_deref())
+                .map(|after| Warm {
+                    provider,
+                    model,
+                    instructions: &record.instructions,
+                    reasoning: record.reasoning.as_deref(),
+                    tools: &tools,
+                    context: &context,
+                    after,
+                    read_at,
+                    stopped: false,
+                    tokens: 0,
+                    pending,
+                });
+            let parked = self
+                .execute_calls(
+                    response.calls,
+                    &workspace,
+                    &environment,
+                    &record.tools,
+                    warm.as_mut(),
+                )
+                .await?;
+            let refreshed = warm.map_or(0, |warm| warm.tokens);
+            record.tokens_used = record.tokens_used.saturating_add(refreshed);
+            if parked {
                 return Ok(Round::Parked);
             }
             self.absorb().await?;
@@ -1042,6 +1115,8 @@ impl Turn {
                         cache_key: Some(&cache_key),
                         items,
                         chain: Some(self.chain(body)),
+                        // A summary is a request of its own, off the turn's route.
+                        route: matches!(body, Body::Window(_)).then_some(&accounting.route),
                     },
                     |delta| {
                         let (kind, text) = match delta {
@@ -1221,6 +1296,133 @@ impl Turn {
         Ok(())
     }
 
+    /// Run a prepared tool, refreshing the last model call's prompt cache
+    /// each time it has sat unread for `after`. The outer error is the
+    /// runtime's; the inner one is the tool's result.
+    async fn run_tool(
+        &self,
+        prepared: Prepared,
+        workspace: &std::path::Path,
+        environment: &[(String, String)],
+        warm: Option<&mut Warm<'_>>,
+    ) -> Result<Result<Outcome>> {
+        enum Next {
+            Ran(Result<Outcome>),
+            Refreshed(Result<(agent_runtime::provider::Usage, tokio::time::Instant)>),
+        }
+        let run = self.registry.execute(prepared, workspace, environment);
+        let Some(warm) = warm.filter(|warm| !warm.stopped) else {
+            return Ok(run.await);
+        };
+        tokio::pin!(run);
+        loop {
+            if warm.pending.is_none() {
+                tokio::select! {
+                    biased;
+                    result = &mut run => return Ok(result),
+                    () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
+                }
+                *warm.pending = Some(self.refresh(warm));
+            }
+            let next = {
+                let task = &mut warm.pending.as_mut().expect("a refresh in flight").task;
+                tokio::select! {
+                    biased;
+                    result = &mut run => Next::Ran(result),
+                    joined = task => Next::Refreshed(joined.unwrap_or_else(|_| fail("keep_warm_lost"))),
+                }
+            };
+            let pending = warm.pending.take().expect("a refresh in flight");
+            match next {
+                // The tool's result ends the refreshes. One already sent is
+                // billed, so it is answered and recorded; an unsent one is
+                // dropped at no cost.
+                Next::Ran(result) => {
+                    if let Some(refreshed) = settle(pending).await {
+                        self.refreshed(warm, refreshed).await?;
+                    }
+                    return Ok(result);
+                }
+                Next::Refreshed(refreshed) => {
+                    self.refreshed(warm, refreshed).await?;
+                }
+            }
+            if warm.stopped {
+                return Ok(run.await);
+            }
+        }
+    }
+
+    /// Send the last model call's request again, only to refresh its cache,
+    /// as a task of its own: an interrupt that drops the turn's rounds must
+    /// not drop a refresh already sent, which is billed.
+    fn refresh(&self, warm: &Warm<'_>) -> Pending {
+        let refresh = Arc::new(agent_runtime::provider::Refresh::default());
+        let provider = warm.provider.clone();
+        let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
+        let reasoning = warm.reasoning.map(str::to_owned);
+        let tools = warm.tools.to_owned();
+        let items = self.items(warm.context);
+        let sent = refresh.clone();
+        let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
+        let task = tokio::spawn(async move {
+            let request = ModelRequest {
+                model: &model,
+                instructions: &instructions,
+                reasoning: reasoning.as_deref(),
+                tools: &tools,
+                allow_tool_calls: true,
+                cache_key: None,
+                items,
+                chain: None,
+                route: None,
+            };
+            provider.keep_warm(request, &sent, expires).await
+        });
+        Pending { refresh, task }
+    }
+
+    /// Record a refresh: billed like any call but not a model round. A
+    /// refused one ends the refreshes until the next model call, which
+    /// rebuilds the cache as it would have without them.
+    async fn refreshed(
+        &self,
+        warm: &mut Warm<'_>,
+        refreshed: Result<(agent_runtime::provider::Usage, tokio::time::Instant)>,
+    ) -> Result<()> {
+        let (usage, sent_at) = match refreshed {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                warm.stopped = true;
+                return self
+                    .hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"keep_warm_failed","bot":self.bot,"turn":self.turn,
+                            "durable":false,"error":error.code,"detail":error.detail}),
+                    )
+                    .await;
+            }
+        };
+        warm.tokens = warm
+            .tokens
+            .saturating_add(usage.input_tokens)
+            .saturating_add(usage.output_tokens);
+        // The refresh's own read, from when it was sent.
+        warm.read_at = sent_at;
+        self.record_refresh(usage).await
+    }
+
+    async fn record_refresh(&self, usage: agent_runtime::provider::Usage) -> Result<()> {
+        self.tokens.add(&usage);
+        let turn = self.turn;
+        self.store
+            .op("keep_warm_usage", move |db| {
+                db.keep_warm_usage(turn, &usage)
+            })
+            .await
+    }
+
     /// Run planned calls in order. Returns true when a wait parked the turn;
     /// the calls after it are stored with the parked state.
     async fn execute_calls(
@@ -1229,6 +1431,7 @@ impl Turn {
         workspace: &std::path::Path,
         environment: &[(String, String)],
         allowed: &[String],
+        mut warm: Option<&mut Warm<'_>>,
     ) -> Result<bool> {
         let turn = self.turn;
         let mut calls = calls.into_iter();
@@ -1340,9 +1543,8 @@ impl Turn {
                     }
                 }
                 Ok(prepared) => match self
-                    .registry
-                    .execute(prepared, workspace, environment)
-                    .await
+                    .run_tool(prepared, workspace, environment, warm.as_deref_mut())
+                    .await?
                 {
                     Ok(outcome) => annotate(outcome, turn, &call.call_id),
                     Err(error) if error.code == "tool_scheduler_closed" => return Err(error),
@@ -1520,6 +1722,22 @@ impl Turn {
     }
 }
 
+/// Cancel a refresh not yet sent, or wait for the answer to one that was.
+async fn settle(
+    pending: Pending,
+) -> Option<Result<(agent_runtime::provider::Usage, tokio::time::Instant)>> {
+    if pending.refresh.cancel() {
+        pending.task.abort();
+        return None;
+    }
+    Some(
+        pending
+            .task
+            .await
+            .unwrap_or_else(|_| fail("keep_warm_lost")),
+    )
+}
+
 fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {
     budget
         .filter(|&cap| used >= cap)
@@ -1678,6 +1896,7 @@ fn summarizer_usage(
             output_tokens: usage.output_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             cache_write_tokens: usage.cache_write_tokens,
+            cache_write_1h_tokens: usage.cache_write_1h_tokens,
         });
     }
     for attempt in &mut usage.models {

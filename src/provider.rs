@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
@@ -50,6 +51,48 @@ pub const STREAMS_PER_CONNECTION: usize = 64;
 /// Default bound on time between content frames of an established stream.
 /// Keepalives do not count: a provider that only pings is stalled.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The ChatGPT Codex endpoint's sticky-routing header; see `Request::route`.
+const TURN_STATE: &str = "x-codex-turn-state";
+
+/// Default idle time after which an Anthropic prompt cache is refreshed while
+/// a turn runs a tool: under the cache's five-minute lifetime, with a minute's
+/// margin for the request itself.
+pub const KEEP_WARM: Duration = Duration::from_secs(240);
+/// How long an Anthropic prompt cache lives unread, by default.
+pub const CACHE_LIFETIME: Duration = Duration::from_secs(300);
+/// The longest a cache refresh waits for its pool, even when the cache it
+/// refreshes would outlive the wait.
+const KEEP_WARM_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether a cache refresh has been sent: once it has, it is billed and its
+/// answer must be kept; before then, cancelling it costs nothing.
+#[derive(Default)]
+pub struct Refresh(std::sync::atomic::AtomicU8);
+impl Refresh {
+    const SENT: u8 = 1;
+    const CANCELLED: u8 = 2;
+    /// Claim the send; false once cancelled.
+    fn send(&self) -> bool {
+        self.swap_from_idle(Self::SENT)
+    }
+    /// Cancel an unsent refresh; false when it was already sent.
+    pub fn cancel(&self) -> bool {
+        self.swap_from_idle(Self::CANCELLED)
+    }
+    fn swap_from_idle(&self, to: u8) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        self.0.compare_exchange(0, to, AcqRel, Acquire).is_ok()
+    }
+}
+
+/// Betas every Anthropic API request opts into: the thinking-binding check,
+/// dropping rather than failing on a mismatch (the drops are reported), and
+/// server-side fallbacks, which rerun a declined request on another model
+/// instead of ending the turn with a refusal. Bedrock takes only the first.
+const ANTHROPIC_BETAS: &str =
+    "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01";
+const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
 
 /// HTTP connections and the startup-admission budget shared by every
 /// provider. Each shard is its own client, so its own pooled HTTP/2
@@ -145,6 +188,10 @@ pub struct Provider {
     login: Option<Arc<login::Login>>,
     max_output_tokens: Option<u32>,
     stall_timeout: Duration,
+    /// Refresh an idle Anthropic prompt cache after this long; `None` disables.
+    keep_warm: Option<Duration>,
+    /// Ask Anthropic to cache for an hour instead of five minutes.
+    cache_hour: bool,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
     /// Bedrock signs every request with SigV4 instead of sending a key.
@@ -179,6 +226,10 @@ pub struct Usage {
     /// reads; zero for providers that do not bill writes.
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u64,
+    /// The part of `cache_write_tokens` cached for an hour rather than five
+    /// minutes, which Anthropic bills at twice the input rate.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_1h_tokens: u64,
     /// The billed attempts, when a provider-side fallback ran more than one
     /// model for the call, or the summarizer's model on a compaction call,
     /// so each can be priced at its model's rates. The totals above are
@@ -198,6 +249,8 @@ pub struct ModelTokens {
     pub cached_input_tokens: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_1h_tokens: u64,
 }
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -260,6 +313,12 @@ pub struct Request<'a> {
     /// Which bot is asking, and where the items sit in its history, so a
     /// socket provider can send only what the server has not seen.
     pub chain: Option<Chain<'a>>,
+    /// The turn's sticky-routing token, one slot per turn. The ChatGPT Codex
+    /// endpoint returns it on a turn's first response and routes each later
+    /// request carrying it to the server that holds the turn's cache; the
+    /// token must not cross into another turn (openai/codex aa38089,
+    /// core/src/client.rs). HTTP only.
+    pub route: Option<&'a OnceLock<String>>,
 }
 
 /// A request's place in its bot's history. `items` is the whole input; when
@@ -332,6 +391,8 @@ impl Provider {
             login: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
+            keep_warm: Some(KEEP_WARM),
+            cache_hour: false,
             sockets: None,
             aws: None,
             bedrock,
@@ -454,8 +515,48 @@ impl Provider {
         Ok(self)
     }
 
+    /// Refresh an idle prompt cache after `after`, under its five-minute
+    /// lifetime; `None` disables it.
+    pub fn with_keep_warm(mut self, after: Option<Duration>) -> Result<Self> {
+        if after.is_some_and(|after| after.is_zero() || after >= CACHE_LIFETIME) {
+            return fail("invalid_keep_warm");
+        }
+        self.keep_warm = after;
+        Ok(self)
+    }
+
+    /// Ask Anthropic to keep prompt caches for an hour: each write bills
+    /// twice the input rate instead of 1.25 times, and needs no refresh
+    /// across a gap under an hour. The Responses family takes no lifetime.
+    pub fn with_cache_hour(mut self, hour: bool) -> Self {
+        self.cache_hour = hour && self.family == Family::Anthropic;
+        self
+    }
+
+    /// How long a turn may sit on a tool before its prompt cache is refreshed
+    /// with [`Provider::keep_warm`], or `None` where that does not apply.
+    /// Anthropic's own API only: a request with `max_tokens: 0` generates
+    /// nothing, bills a cache read, and restarts the cache's lifetime. It
+    /// rejects budgeted thinking, so older models with thinking on are left
+    /// out, and Bedrock is left out until the same request is verified there.
+    /// The Responses cache outlives a long tool call without help.
+    pub fn keep_warm_after(&self, model: &str, reasoning: Option<&str>) -> Option<Duration> {
+        let applies = self.family == Family::Anthropic
+            && !self.cache_hour
+            && !self.bedrock
+            && !(reasoning.is_some() && legacy_thinking(model));
+        self.keep_warm.filter(|_| applies)
+    }
+
     /// Everything before the history array, ending with `[`.
     fn prefix(&self, request: &Request<'_>) -> Result<Vec<u8>> {
+        self.prefix_for(request, false)
+    }
+
+    /// The prefix of `request`, or with `warm` of the same request sent only
+    /// to refresh its cache: no output and no stream. Nothing else differs,
+    /// since the cache is keyed on everything the request renders.
+    fn prefix_for(&self, request: &Request<'_>, warm: bool) -> Result<Vec<u8>> {
         #[derive(Serialize)]
         struct Responses<'a> {
             model: &'a str,
@@ -505,7 +606,14 @@ impl Provider {
         }
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
         let max_tokens = self.anthropic_max_tokens(request.model);
+        // Both markers take the same lifetime: a longer one may not follow
+        // a shorter one.
+        let cache = match self.cache_hour {
+            true => json!({"type":"ephemeral","ttl":"1h"}),
+            false => json!({"type":"ephemeral"}),
+        };
         let (mut bytes, field) = match self.family {
+            Family::Responses if warm => return fail("keep_warm_unsupported"),
             Family::Responses => (
                 serde_json::to_vec(&Responses {
                     model: request.model,
@@ -527,15 +635,15 @@ impl Provider {
             Family::Anthropic => (
                 serde_json::to_vec(&Anthropic {
                     model: request.model,
-                    max_tokens,
+                    max_tokens: if warm { 0 } else { max_tokens },
                     // An explicit breakpoint after the static prefix (tools
                     // and instructions) guarantees a read point for it.
                     system: (!request.instructions.is_empty()).then(|| {
                         json!([{"type":"text","text":request.instructions,
-                            "cache_control":{"type":"ephemeral"}}])
+                            "cache_control":cache}])
                     }),
-                    stream: true,
-                    cache_control: json!({"type":"ephemeral"}),
+                    stream: !warm,
+                    cache_control: cache.clone(),
                     tools: (request.tools.get() != "[]").then_some(request.tools),
                     tool_choice: disable_tools.then_some(ToolChoice { r#type: "none" }),
                     // Current Claude models take adaptive thinking with an
@@ -575,6 +683,139 @@ impl Provider {
     fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
         let len = prefix.len() + items.bytes + 2;
         (reqwest::Body::wrap_stream(framed(prefix, items)), len)
+    }
+
+    /// Send `request` again only to restart its prompt cache's lifetime:
+    /// no output and no stream, so it bills a read of the cache the previous
+    /// call left. Paced and admitted like any call, but it gives up rather
+    /// than wait for a closed or busy pool or for startup admission past
+    /// `expires`, when the cache it refreshes is gone, or past a 30-second
+    /// bound. `refresh` records the send: from then on the request is
+    /// billed, and dropping it loses what it cost. Returns the usage and
+    /// when the request was sent, which is when the cache was last read.
+    pub async fn keep_warm(
+        &self,
+        request: Request<'_>,
+        refresh: &Refresh,
+        expires: tokio::time::Instant,
+    ) -> Result<(Usage, tokio::time::Instant)> {
+        self.keep_warm_inner(request, refresh, expires)
+            .await
+            .map_err(|error| sanitize_error(error, self.key.as_deref()))
+    }
+
+    async fn keep_warm_inner(
+        &self,
+        request: Request<'_>,
+        refresh: &Refresh,
+        expires: tokio::time::Instant,
+    ) -> Result<(Usage, tokio::time::Instant)> {
+        if self
+            .keep_warm_after(request.model, request.reasoning)
+            .is_none()
+        {
+            return fail("keep_warm_unsupported");
+        }
+        let pace = self.pools.get(&self.family.pool_key(request.model));
+        let prefix = Bytes::from(self.prefix_for(&request, true)?);
+        let estimate = pace::Cost {
+            input: ((prefix.len() + request.items.bytes) / 4) as u64,
+            output: 0,
+        };
+        let mut park_for = None;
+        let by = expires.min(tokio::time::Instant::now() + KEEP_WARM_WAIT);
+        let (mut reservation, admission) = tokio::time::timeout_at(by, async {
+            let reservation = pace.acquire_cost(estimate, &mut park_for).await?;
+            Ok::<_, Error>((reservation, self.admit().await?))
+        })
+        .await
+        .map_err(|_| Error::new("provider_paced"))??;
+        let (body, len) = self.body(prefix, &request.items);
+        let (client, _lease) = self.transport.lease();
+        let http = client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .header("content-length", len)
+            .header("accept", "application/json")
+            .body(body);
+        let http = self.anthropic_headers(http, self.key.as_ref());
+        if !refresh.send() {
+            return fail("keep_warm_cancelled");
+        }
+        reservation.dispatch();
+        let sent_at = tokio::time::Instant::now();
+        let response = match http.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                reservation.settle(0);
+                return Err(connection_error(error));
+            }
+        };
+        drop(admission);
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let headers = response.headers().clone();
+            let body = error_body(response).await.unwrap_or_default();
+            let quota = status == 429 && body.quota;
+            if !quota {
+                reservation.learn(&headers, self.family);
+            }
+            if matches!(status, 429 | 529) && !quota {
+                let after = headers
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok());
+                pace.limited(after);
+            }
+            reservation.settle(0);
+            return Err(Error {
+                code: if quota {
+                    "provider_quota_exhausted".to_owned()
+                } else {
+                    format!("provider_http_{status}")
+                },
+                detail: body.detail,
+            });
+        }
+        reservation.learn(response.headers(), self.family);
+        // The answer is a message with no content; only its usage matters.
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| Error::new("provider_stream_failed"))?;
+            if chunk.len() > 64 * 1024 - body.len() {
+                reservation.settle(0);
+                return fail("provider_response_limit");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let message: Value = serde_json::from_slice(&body)
+            .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
+        let usage = anthropic::message_usage(&message["usage"], self.cache_hour);
+        reservation.settle_usage(Some(&usage), estimate);
+        pace.accepted();
+        Ok((usage, sent_at))
+    }
+
+    /// Version, betas, and key for an Anthropic request.
+    fn anthropic_headers(
+        &self,
+        http: reqwest::RequestBuilder,
+        key: Option<&String>,
+    ) -> reqwest::RequestBuilder {
+        let http = http.header("anthropic-version", "2023-06-01").header(
+            "anthropic-beta",
+            if self.bedrock {
+                BEDROCK_BETAS
+            } else {
+                ANTHROPIC_BETAS
+            },
+        );
+        match key {
+            Some(key) => http.header("x-api-key", key),
+            None => http,
+        }
     }
 
     pub async fn complete<F, Fut>(&self, request: Request<'_>, delta: F) -> Result<Completion>
@@ -647,6 +888,11 @@ impl Provider {
             _ => None,
         };
         if let Some(sockets) = &self.sockets {
+            // Read after pacing and admission, as on HTTP; only a new
+            // connection sends it.
+            if let Some(login) = &self.login {
+                *session = Some(login.current()?);
+            }
             return self
                 .complete_socket(
                     sockets,
@@ -655,11 +901,11 @@ impl Provider {
                     delta,
                     report,
                     (&pace, reservation, estimate),
-                    admission,
+                    (admission, session.as_ref()),
                 )
                 .await;
         }
-        let cache_key = request.cache_key;
+        let (cache_key, route) = (request.cache_key, request.route);
         let (body, len) = self.body(prefix, &request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -685,25 +931,7 @@ impl Provider {
             .body(body);
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
-            (Family::Anthropic, key) => {
-                // Opt every account into the thinking-binding check, dropping
-                // rather than failing on a mismatch; the drops are reported.
-                // Server-side fallbacks rerun a declined request on another
-                // model instead of ending the turn with a refusal.
-                let http = http.header("anthropic-version", "2023-06-01").header(
-                    "anthropic-beta",
-                    match self.bedrock {
-                        true => "thinking-binding-controls-2026-08-01",
-                        false => {
-                            "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"
-                        }
-                    },
-                );
-                match key {
-                    Some(key) => http.header("x-api-key", key),
-                    None => http,
-                }
-            }
+            (Family::Anthropic, key) => self.anthropic_headers(http, key),
             (Family::Responses, None) => http,
         };
         if let Some(account) = account {
@@ -713,6 +941,9 @@ impl Provider {
         // from prompt_cache_key (openai/codex 53446f9, core/src/client.rs).
         if let (Family::Responses, Some(key)) = (self.family, cache_key) {
             http = http.header("session-id", key);
+        }
+        if let (Family::Responses, Some(state)) = (self.family, route.and_then(OnceLock::get)) {
+            http = http.header(TURN_STATE, state);
         }
         // Signed last, at send time: the signature covers the moment it is made.
         if let Some((aws, keys)) = &signer {
@@ -729,6 +960,7 @@ impl Provider {
         }
         reservation.dispatch();
         report.dispatched = true;
+        report.sent_at = Some(tokio::time::Instant::now());
         let response = match http.send().await {
             Ok(response) => response,
             Err(error) => {
@@ -741,23 +973,11 @@ impl Provider {
             let status = response.status().as_u16();
             let headers = response.headers().clone();
             let body = error_body(response).await.unwrap_or_default();
-            // A refused login is re-read once: Codex may have signed in or
-            // selected another account. Retry when either auth field changed.
             if status == 401
                 && let (Some(login), Some(session)) = (&self.login, session.as_ref())
             {
                 reservation.settle(0);
-                let refused = body.detail.unwrap_or_else(|| "HTTP 401".to_owned());
-                return Err(match login.reload(session)? {
-                    true => Error::with("provider_login_refreshed", refused),
-                    false => Error::with(
-                        "provider_login_rejected",
-                        format!(
-                            "{refused}; {} holds the refused token, run any codex command to sign in again",
-                            login.path().display()
-                        ),
-                    ),
-                });
+                return Err(login_refused(login, session, body.detail)?);
             }
             // Expired or replaced AWS keys are re-resolved once, as a login is.
             if matches!(status, 401 | 403)
@@ -794,6 +1014,14 @@ impl Provider {
             });
         }
         reservation.learn(response.headers(), self.family);
+        if self.family == Family::Responses
+            && let Some(route) = route
+            && let Some(state) = response.headers().get(TURN_STATE)
+            && let Ok(state) = state.to_str()
+        {
+            // The first token of the turn holds; a later one is ignored.
+            let _ = route.set(state.to_owned());
+        }
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -823,7 +1051,7 @@ impl Provider {
         let mut decoder = Decoder::default();
         let mut parser = match self.family {
             Family::Responses => Parser::Responses(responses::State::default()),
-            Family::Anthropic => Parser::Anthropic(anthropic::State::default()),
+            Family::Anthropic => Parser::Anthropic(anthropic::State::new(self.cache_hour)),
         };
         let unnamed = content_type.is_none();
         let mut frames = 0usize;
@@ -950,7 +1178,7 @@ impl Provider {
         mut delta: F,
         report: &mut Report,
         (pace, mut reservation, estimate): (&pace::Pace, pace::Reservation<'_>, pace::Cost),
-        admission: tokio::sync::SemaphorePermit<'_>,
+        (admission, login): (tokio::sync::SemaphorePermit<'_>, Option<&login::Session>),
     ) -> Result<Completion>
     where
         F: FnMut(Delta) -> Fut,
@@ -968,15 +1196,25 @@ impl Provider {
         };
         let key = socket::key(&prefix, window.map_or(&[][..], |(head, _)| head));
         let ids = window.map(|(_, ids)| ids);
-        let mut session = match bot.and_then(|bot| sockets.take(bot)) {
+        // A connection opened under an older login would present its token
+        // until it closes; open a new one instead, as Codex does.
+        let auth = login.map_or(0, |s| {
+            use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+            BuildHasherDefault::<DefaultHasher>::default().hash_one((&s.token, &s.account))
+        });
+        let reused = bot
+            .and_then(|bot| sockets.take(bot))
+            .filter(|session| session.auth == auth);
+        let mut session = match reused {
             Some(session) => session,
             None => {
                 let mut headers = Vec::with_capacity(3);
-                let bearer = self.key.as_ref().map(|key| format!("Bearer {key}"));
+                let key = login.map(|s| &s.token).or(self.key.as_ref());
+                let bearer = key.map(|key| format!("Bearer {key}"));
                 if let Some(bearer) = &bearer {
                     headers.push(("authorization", bearer.as_str()));
                 }
-                if let Some(account) = &self.account {
+                if let Some(account) = login.map(|s| &s.account).or(self.account.as_ref()) {
                     headers.push(("chatgpt-account-id", account.as_str()));
                 }
                 // Cache affinity, as on HTTP; the connection is the bot's own.
@@ -986,8 +1224,9 @@ impl Provider {
                 match sockets.connect(&self.url, &headers).await {
                     // The upgrade's headers predate this call, so they
                     // teach the pool without settling its reservation.
-                    Ok((session, response)) => {
+                    Ok((mut session, response)) => {
                         pace.seed(&response, self.family);
+                        session.auth = auth;
                         session
                     }
                     // A connection that never opened sent no request, and the
@@ -998,11 +1237,17 @@ impl Provider {
                         if failure.refused {
                             reservation.dispatch();
                             report.dispatched = true;
+                            report.sent_at = Some(tokio::time::Instant::now());
                             if let Some(headers) = &failure.headers {
                                 reservation.learn(headers, self.family);
                             }
                             limit(pace, &failure);
                             reservation.settle(0);
+                        }
+                        if failure.status == Some(401)
+                            && let (Some(login), Some(session)) = (&self.login, login)
+                        {
+                            return Err(login_refused(login, session, failure.error.detail)?);
                         }
                         return Err(failure.error);
                     }
@@ -1023,6 +1268,7 @@ impl Provider {
             let text = create(&prefix, plan.previous.as_deref(), input).await?;
             reservation.dispatch();
             report.dispatched = true;
+            report.sent_at = Some(tokio::time::Instant::now());
             match session
                 .exchange(
                     text,
@@ -1077,7 +1323,15 @@ impl Provider {
                 } else {
                     reservation.settle_usage(report.usage.as_ref(), estimate);
                 }
-                Err(failure.error)
+                match (failure.status, &self.login, login) {
+                    // The connection presents the refused login; a retry
+                    // opens another with the login as re-read.
+                    (Some(401), Some(refused), Some(login)) => {
+                        keep = false;
+                        Err(login_refused(refused, login, failure.error.detail)?)
+                    }
+                    _ => Err(failure.error),
+                }
             }
         };
         if let Some(bot) = bot.filter(|_| keep) {
@@ -1085,6 +1339,27 @@ impl Provider {
         }
         completed
     }
+}
+
+/// A login the endpoint refused with a 401. Codex may have signed in or
+/// selected another account since, so the refusal is retryable when either
+/// auth field changed; otherwise it is final and names the file.
+fn login_refused(
+    login: &login::Login,
+    session: &login::Session,
+    detail: Option<String>,
+) -> Result<Error> {
+    let refused = detail.unwrap_or_else(|| "HTTP 401".to_owned());
+    Ok(match login.reload(session)? {
+        true => Error::with("provider_login_refreshed", refused),
+        false => Error::with(
+            "provider_login_rejected",
+            format!(
+                "{refused}; {} holds the refused token, run any codex command to sign in again",
+                login.path().display()
+            ),
+        ),
+    })
 }
 
 /// Close the model's pool for a rate limit a socket reported: a 429 or 529
@@ -1409,6 +1684,7 @@ mod tests {
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
+                route: None,
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -1437,6 +1713,7 @@ mod tests {
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
+                route: None,
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
@@ -1457,6 +1734,7 @@ mod tests {
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
+                route: None,
             })
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
@@ -1477,6 +1755,7 @@ mod tests {
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
+                route: None,
             })
             .unwrap();
         empty_prefix.extend_from_slice(b"]}");
@@ -1500,6 +1779,7 @@ mod tests {
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
+                route: None,
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -1532,6 +1812,7 @@ mod tests {
                             cache_key: None,
                             items: Items::empty(),
                             chain: None,
+                            route: None,
                         })
                         .unwrap();
                     prefix.extend_from_slice(b"]}");
@@ -1611,6 +1892,7 @@ mod tests {
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
+                    route: None,
                 })
                 .unwrap();
             prefix.extend_from_slice(b"]}");
@@ -1707,11 +1989,159 @@ mod tests {
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
+                    route: None,
                 })
                 .unwrap();
             let text = String::from_utf8(prefix).unwrap();
             assert!(!text.contains("fallbacks"), "{text}");
             assert!(text.contains("\"block_binding\""), "{text}");
+        }
+    }
+
+    /// A refresh is the call's own request with no output and no stream:
+    /// anything else it rendered differently would miss the call's cache.
+    #[test]
+    fn a_keep_warm_request_differs_only_in_output_and_streaming() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap();
+        let tools = none();
+        let request = || Request {
+            model: "claude-sonnet-5",
+            instructions: "i",
+            reasoning: Some("high"),
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+            route: None,
+        };
+        let parse = |mut bytes: Vec<u8>| -> Value {
+            bytes.extend_from_slice(b"]}");
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        let call = parse(provider.prefix(&request()).unwrap());
+        let mut warm = parse(provider.prefix_for(&request(), true).unwrap());
+        assert_eq!(
+            (&warm["max_tokens"], &warm["stream"]),
+            (&json!(0), &json!(false))
+        );
+        warm["max_tokens"] = call["max_tokens"].clone();
+        warm["stream"] = json!(true);
+        assert_eq!(warm, call);
+    }
+
+    /// An hour-long cache marks both breakpoints alike, since a longer
+    /// lifetime may not follow a shorter one, and needs no refresh.
+    #[test]
+    fn an_hour_long_cache_marks_both_breakpoints_and_is_not_refreshed() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap()
+        .with_cache_hour(true);
+        let tools = none();
+        let request = Request {
+            model: "claude-sonnet-5",
+            instructions: "i",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+            route: None,
+        };
+        let mut bytes = provider.prefix(&request).unwrap();
+        bytes.extend_from_slice(b"]}");
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let hour = json!({"type":"ephemeral","ttl":"1h"});
+        assert_eq!(body["cache_control"], hour);
+        assert_eq!(body["system"][0]["cache_control"], hour);
+        assert_eq!(provider.keep_warm_after("claude-sonnet-5", None), None);
+        let responses = Provider::new(transport, Family::Responses, "https://h/v1", None)
+            .unwrap()
+            .with_cache_hour(true);
+        assert!(!responses.cache_hour);
+    }
+
+    /// Only Anthropic's own API refreshes: the Responses cache outlives a
+    /// long tool call, budgeted thinking refuses `max_tokens: 0`, and Bedrock
+    /// has not been verified to take it.
+    #[test]
+    fn keep_warm_applies_where_a_zero_output_request_is_accepted() {
+        let transport = Transport::new(64, 1).unwrap();
+        let anthropic = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            anthropic.keep_warm_after("claude-sonnet-5", Some("high")),
+            Some(KEEP_WARM)
+        );
+        assert_eq!(
+            anthropic.keep_warm_after("claude-haiku-4-5", None),
+            Some(KEEP_WARM)
+        );
+        assert_eq!(
+            anthropic.keep_warm_after("claude-haiku-4-5", Some("low")),
+            None
+        );
+        let off = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap()
+        .with_keep_warm(None)
+        .unwrap();
+        assert_eq!(off.keep_warm_after("claude-sonnet-5", None), None);
+        let responses = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://api.openai.com/v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(responses.keep_warm_after("gpt-5", None), None);
+        let bedrock = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bedrock.keep_warm_after("anthropic.claude-sonnet-5", None),
+            None
+        );
+        for after in [0, 300] {
+            let refused = Provider::new(
+                transport.clone(),
+                Family::Anthropic,
+                "https://a.test/v1",
+                None,
+            )
+            .unwrap()
+            .with_keep_warm(Some(Duration::from_secs(after)));
+            assert_eq!(
+                refused.err().map(|e| e.code),
+                Some("invalid_keep_warm".to_owned())
+            );
         }
     }
 
@@ -1821,6 +2251,7 @@ mod tests {
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
+                route: None,
             },
             |delta| {
                 if let Delta::Text(part) = delta {
@@ -1885,6 +2316,7 @@ mod tests {
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
+                route: None,
             };
             let error = provider
                 .complete(request, |_| async { Ok(()) })
@@ -1943,6 +2375,7 @@ mod tests {
             cache_key: None,
             items: Items::empty(),
             chain: None,
+            route: None,
         };
         let _ = provider
             .complete(
@@ -1995,6 +2428,7 @@ mod tests {
             cache_key: None,
             items: Items::empty(),
             chain: None,
+            route: None,
         };
         let error = provider
             .complete(request, |_| async { Ok(()) })
@@ -2049,6 +2483,321 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_socket_opens_with_the_login_and_rereads_it_when_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("agent-socket-login-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |token: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
+            )
+            .unwrap();
+        };
+        write("stale");
+        let login = Arc::new(login::Login::open(&path, None).unwrap());
+        // Refuse every upgrade, as the endpoint does an expired token.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, mut heads) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let _ = seen.send(String::from_utf8_lossy(&request).to_lowercase());
+                let _ = socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login)
+            .unwrap()
+            .with_socket()
+            .unwrap();
+        let tools = none();
+        let request = || Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: Some(Chain {
+                bot: "b",
+                window: None,
+                tail: Box::new(|_| Items::empty()),
+            }),
+            route: None,
+        };
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_rejected");
+        let head = heads.recv().await.unwrap();
+        assert!(
+            head.contains("\r\nauthorization: bearer stale\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("\r\nchatgpt-account-id: w\r\n"), "{head}");
+        // Signed in again: retryable, and the next upgrade carries it.
+        write("fresh");
+        let error = provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_login_refreshed");
+        heads.recv().await.unwrap();
+        let _ = provider.complete(request(), |_| async { Ok(()) }).await;
+        let head = heads.recv().await.unwrap();
+        assert!(
+            head.contains("\r\nauthorization: bearer fresh\r\n"),
+            "{head}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_socket_opened_under_an_older_login_is_not_reused() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::{Message, handshake::server};
+        let dir = std::env::temp_dir().join(format!("agent-socket-relogin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |token: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"w"}}}}"#),
+            )
+            .unwrap();
+        };
+        write("first");
+        let login = Arc::new(login::Login::open(&path, None).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, mut upgrades) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    #[allow(clippy::result_large_err)] // The handshake callback's own signature.
+                    let record = |request: &server::Request, response| {
+                        let bearer = request.headers().get("authorization").cloned();
+                        let _ = seen.send(bearer.unwrap().to_str().unwrap().to_owned());
+                        Ok(response)
+                    };
+                    let mut socket = tokio_tungstenite::accept_hdr_async(stream, record)
+                        .await
+                        .unwrap();
+                    while let Some(Ok(Message::Text(_))) = socket.next().await {
+                        let event = concat!(
+                            "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",",
+                            "\"status\":\"completed\",\"output\":[],",
+                            "\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}",
+                        );
+                        socket.send(Message::text(event)).await.unwrap();
+                    }
+                });
+            }
+        });
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login.clone())
+            .unwrap()
+            .with_socket()
+            .unwrap();
+        let tools = none();
+        let request = || Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: Some(Chain {
+                bot: "b",
+                window: None,
+                tail: Box::new(|_| Items::empty()),
+            }),
+            route: None,
+        };
+        for _ in 0..2 {
+            provider
+                .complete(request(), |_| async { Ok(()) })
+                .await
+                .unwrap();
+        }
+        // The upgrade precedes each call's response, so it is already queued.
+        assert_eq!(upgrades.try_recv().unwrap(), "Bearer first");
+        assert!(upgrades.try_recv().is_err());
+        // Codex signed in again; the next call opens a new connection.
+        let refused = login.current().unwrap();
+        write("second");
+        assert!(login.reload(&refused).unwrap());
+        provider
+            .complete(request(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(upgrades.try_recv().unwrap(), "Bearer second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_gives_up_when_its_cache_expires_before_the_pool_opens() {
+        let provider = Provider::new(
+            Transport::new(0, 1).unwrap(),
+            Family::Anthropic,
+            "http://127.0.0.1:9",
+            None,
+        )
+        .unwrap();
+        // Closed for less than a park, so a call would wait it out.
+        let model = "claude-sonnet-5";
+        let pool = provider.pools.get(&Family::Anthropic.pool_key(model));
+        pool.limited(Some(Duration::from_millis(200)));
+        let tools = none();
+        let request = Request {
+            model,
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+            route: None,
+        };
+        let started = tokio::time::Instant::now();
+        let refresh = Refresh::default();
+        let expires = started + Duration::from_millis(50);
+        let error = provider
+            .keep_warm(request, &refresh, expires)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "provider_paced");
+        assert!(started.elapsed() < Duration::from_millis(200));
+        // Never sent, so a turn can still cancel it at no cost.
+        assert!(refresh.cancel());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_reports_when_it_was_sent_not_when_it_began_waiting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..n]);
+            }
+            let body = r#"{"type":"message","content":[],"usage":{"input_tokens":2,"cache_read_input_tokens":90,"output_tokens":0}}"#;
+            let _ = socket
+                .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes())
+                .await;
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None).unwrap();
+        let model = "claude-sonnet-5";
+        let pool = provider.pools.get(&Family::Anthropic.pool_key(model));
+        pool.limited(Some(Duration::from_millis(150)));
+        let tools = none();
+        let request = Request {
+            model,
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+            route: None,
+        };
+        let started = tokio::time::Instant::now();
+        let (usage, sent_at) = provider
+            .keep_warm(request, &Refresh::default(), started + CACHE_LIFETIME)
+            .await
+            .unwrap();
+        assert_eq!(usage.cached_input_tokens, 90);
+        // The cache's next deadline counts from the send, after the wait.
+        assert!(sent_at >= started + Duration::from_millis(150));
+    }
+
+    #[tokio::test]
+    async fn a_turn_keeps_the_first_routing_token_it_is_given() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (seen, mut heads) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for n in 1..=4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let _ = seen.send(String::from_utf8_lossy(&request).to_lowercase());
+                let body = concat!(
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                    "\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n",
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nx-codex-turn-state: t{n}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        let route = OnceLock::new();
+        let request = |route| Request {
+            model: "m",
+            instructions: "",
+            reasoning: None,
+            tools: &tools,
+            allow_tool_calls: true,
+            cache_key: None,
+            items: Items::empty(),
+            chain: None,
+            route,
+        };
+        let mut sent = Vec::new();
+        for slot in [Some(&route), Some(&route), Some(&route), None] {
+            provider
+                .complete(request(slot), |_| async { Ok(()) })
+                .await
+                .unwrap();
+            let head = heads.recv().await.unwrap();
+            sent.push(
+                head.split("\r\n")
+                    .find_map(|line| line.strip_prefix("x-codex-turn-state: "))
+                    .map(str::to_owned),
+            );
+        }
+        // Later tokens are ignored, and a call outside the turn sends none.
+        let t1 = Some("t1".to_owned());
+        assert_eq!(sent, [None, t1.clone(), t1, None]);
+        assert_eq!(route.get().map(String::as_str), Some("t1"));
+    }
+
+    #[tokio::test]
     async fn a_refused_login_is_reread_and_retried_only_when_the_file_changed() {
         let dir = std::env::temp_dir().join(format!("agent-relogin-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2077,6 +2826,7 @@ mod tests {
             allow_tool_calls: true,
             items: Items::empty(),
             chain: None,
+            route: None,
             cache_key: None,
         };
         // Refused, and the file still holds the refused token: final, and
@@ -2150,6 +2900,7 @@ mod tests {
             allow_tool_calls: true,
             items: Items::empty(),
             chain: None,
+            route: None,
             cache_key: None,
         };
         let call = provider.complete(request, |_| async { Ok(()) });
@@ -2196,6 +2947,7 @@ mod tests {
             allow_tool_calls: true,
             items: Items::empty(),
             chain: None,
+            route: None,
             cache_key: None,
         };
         let error = provider
@@ -2238,6 +2990,7 @@ mod tests {
                 allow_tool_calls: true,
                 items: Items::empty(),
                 chain: None,
+                route: None,
                 cache_key: None,
             };
             let error = provider
@@ -2271,6 +3024,7 @@ mod tests {
             allow_tool_calls: true,
             items: Items::empty(),
             chain: None,
+            route: None,
             cache_key: None,
         };
         let error = provider
@@ -2317,6 +3071,7 @@ mod tests {
             cache_key: None,
             items: Items::empty(),
             chain: None,
+            route: None,
         };
         let completion = provider
             .complete(request, |_| async { Ok(()) })

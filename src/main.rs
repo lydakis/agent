@@ -86,6 +86,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_output_tokens = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
+    let mut keep_warm = None;
+    let mut cache_hour = false;
     let mut context_bytes = None;
     let mut context_items = None;
     let mut note_turns = None;
@@ -174,6 +176,18 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                         ))?,
                 )
             }
+            "--cache-ttl" => {
+                cache_hour = match value.as_str() {
+                    "5m" => false,
+                    "1h" => true,
+                    _ => return fail_with("usage", "--cache-ttl needs 5m or 1h"),
+                }
+            }
+            "--keep-warm" => {
+                keep_warm = Some(value.parse::<u64>().ok().filter(|n| *n < 300).ok_or(
+                    Error::with("usage", "--keep-warm needs seconds below 300 (0 disables)"),
+                )?)
+            }
             "--idle-exit" => {
                 let seconds: u64 = value
                     .parse()
@@ -200,6 +214,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_pending_bytes,
         max_output_tokens,
         stall_timeout,
+        keep_warm,
+        cache_hour,
         idle_exit,
         context_bytes,
         context_items,

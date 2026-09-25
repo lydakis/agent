@@ -54,8 +54,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--instructions`.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
-- Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit` and
-  `--stall-timeout` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
+- Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,
+  `--stall-timeout`, and `--keep-warm` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope

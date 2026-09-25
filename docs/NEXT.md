@@ -705,6 +705,23 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     One daemon per user stays the default until a matched screen supports
     changing it. Placement, file copying, and transport remain with callers.
 
+42. Anthropic prompt-cache refreshes during long tool calls, measured before
+    kept. [Built](RUST_PROTOTYPE.md#keeping-the-anthropic-cache-warm):
+    `--keep-warm` (240 seconds by default) resends the last call with
+    `max_tokens: 0` while a tool runs. Anthropic recommends this over the
+    one-hour cache only on Fable 5.1 and Mythos 5.1. `--cache-ttl 1h` is
+    built, with one-hour writes priced at their own rate. A live check on
+    2026-09-25 (Sonnet 5 with adaptive thinking and effort) found both
+    accepted: each refresh read the whole prefix, with a signed thinking
+    block in history too, and carried the cache over a 330-second tool that
+    missed it completely with `--keep-warm 0`. Next, a matched long-tool task
+    with three arms: the five-minute cache alone (`--keep-warm 0`),
+    `--cache-ttl 1h`, and refreshes. Anthropic shares a cache across an
+    organization, so each arm needs bytes of its own, such as a nonce in its
+    instructions, or one arm's refreshes keep another's cache warm. Open: parked
+    `wait` turns, whose helpers can run past five minutes with no live task
+    to refresh them, and Bedrock.
+
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
 
