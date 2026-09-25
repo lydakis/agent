@@ -30,6 +30,8 @@ pub struct Report {
     pub paced_ms: u64,
     /// The HTTP send future was entered, even if the attempt was interrupted.
     pub dispatched: bool,
+    /// When it was entered: where a prompt cache's lifetime starts.
+    pub sent_at: Option<Instant>,
 }
 
 /// Pools keyed by model within one provider.

@@ -210,6 +210,12 @@ fn parse(args: &[String]) -> Result<Options> {
                         })?;
                         options.daemon_flags.push((flag.to_owned(), value));
                     }
+                    "--cache-ttl" => {
+                        if !matches!(value.as_str(), "5m" | "1h") {
+                            return fail_with("usage", "--cache-ttl needs 5m or 1h");
+                        }
+                        options.daemon_flags.push((flag.to_owned(), value));
+                    }
                     "--budget-tokens" => {
                         options.budget_tokens = Some(value.parse().map_err(|_| {
                             Error::with("usage", "--budget-tokens needs an integer")
@@ -441,6 +447,15 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
         }
     }
     for (flag, value) in &options.daemon_flags {
+        if flag == "--cache-ttl" {
+            let running = ready["limits"]["cache_ttl"].as_str().unwrap_or("no value");
+            if running != value {
+                differences.push(format!(
+                    "{flag}: requested {value} but daemon has {running}"
+                ));
+            }
+            continue;
+        }
         let key = match flag.as_str() {
             "--max-processes" => "processes",
             "--max-active" => "active",

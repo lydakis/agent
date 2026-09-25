@@ -250,7 +250,8 @@ Provider-reported usage records a durable `usage` event (with a per-model
 summarizer call, naming the summarizer's provider and model, and
 `cache_write_tokens` when Anthropic wrote input to its prompt cache: part of
 `input_tokens`, billed above the base rate, and kept only in the event since
-no budget or cache ratio needs it; a prompt-cache refresh's event carries
+no budget or cache ratio needs it, with `cache_write_1h_tokens` for the part
+cached for an hour; a prompt-cache refresh's event carries
 `purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
@@ -311,6 +312,7 @@ bound; the operating system is then the only limit.
 | `--max-output-tokens` | Generated tokens per model call, including reasoning. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--keep-warm` | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 disables. | 240 |
+| `--cache-ttl` | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
@@ -500,11 +502,15 @@ refreshes it instead. While a turn runs a tool, once the last call's cache has g
 `--keep-warm` seconds unread (240 by default), it sends that call's request
 again with `max_tokens: 0` and `stream: false`. That request generates
 nothing, bills a cache read, and restarts the cache's lifetime. It repeats
-until the tool finishes. A refresh the tool's result interrupts is dropped if
-it was not yet sent, and otherwise answered, so its cost is recorded.
+until the tool finishes. The lifetime is counted from when the call, or the
+last refresh, was sent. Each refresh runs as a task of its own: when the tool
+ends or the turn is interrupted, one not yet sent is dropped at no cost, and
+one already sent is answered, so its cost is recorded.
 Nothing else in the request differs, since the cache is keyed on everything it
-renders. A refresh is paced like a call, but gives up after 30 seconds
-waiting for its pool, since it would land after the cache expired. A refused
+renders. A refresh is paced and admitted like a call, but gives up after 30
+seconds waiting for its pool and startup admission together, since it would
+land after the cache expired. Usage is read per attempt, as for a call, when a
+server-side fallback served it. A refused
 refresh publishes a non-durable `keep_warm_failed` event and ends refreshes
 until the next model call, which pays the write it would have paid anyway.
 
@@ -520,7 +526,10 @@ not Anthropic's advice. During a running tool the next model call is certain,
 so each refresh costs a 0.1-times read of the conversation where expiry costs
 a 1.25-times rewrite; a ten-minute tool takes at most two. Whether it also
 beats the one-hour cache, which covers parked waits and gaps between turns
-but bills every write at twice the input rate, is not measured. The guidance
+but bills every write at twice the input rate, is not measured; `--cache-ttl
+1h` selects it for that comparison. Its writes are recorded apart, from
+Anthropic's per-lifetime split or, when a report has none, as the request
+asked. The guidance
 also lists the requests `max_tokens: 0` rejects: streaming, budgeted thinking
 (`thinking.type: "enabled"`), structured outputs, and forced tool choice. So
 older models with thinking on are not refreshed. Bedrock is also left out

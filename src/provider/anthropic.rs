@@ -28,17 +28,48 @@ enum Block {
 /// Input usage from a Messages `usage` object. Anthropic reports cache
 /// reads and cache writes outside input_tokens; count every processed input
 /// token, as the Responses family does, and keep reads and writes separately
-/// since each is billed at its own rate.
-pub(crate) fn usage(usage: &Value) -> Usage {
-    let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
-    let created = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+/// since each is billed at its own rate. `hour` says every cache marker of
+/// the request asked for an hour, for a report that does not split writes.
+pub(crate) fn usage(usage: &Value, hour: bool) -> Usage {
+    let (input, read, (created, hourly)) = tokens(usage, hour);
     Usage {
-        input_tokens: usage["input_tokens"].as_u64().unwrap_or(0) + read + created,
+        input_tokens: input,
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
         cached_input_tokens: read,
         cache_write_tokens: created,
+        cache_write_1h_tokens: hourly,
         models: Vec::new(),
     }
+}
+
+/// A whole message's usage: per attempt when a server-side fallback ran,
+/// as the stream's final usage is read.
+pub(crate) fn message_usage(report: &Value, hour: bool) -> Usage {
+    let mut state = State::new(hour);
+    state.usage = usage(report, hour);
+    if let Some(iterations) = report["iterations"].as_array() {
+        state.iterations(iterations);
+    }
+    state.usage
+}
+
+/// All input, cache reads, and cache writes with the hour-long part of them.
+fn tokens(usage: &Value, hour: bool) -> (u64, u64, (u64, u64)) {
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let (read, created) = (
+        count("cache_read_input_tokens"),
+        count("cache_creation_input_tokens"),
+    );
+    let hourly = match usage["cache_creation"]["ephemeral_1h_input_tokens"].as_u64() {
+        Some(hourly) => hourly.min(created),
+        None if hour => created,
+        None => 0,
+    };
+    (
+        count("input_tokens") + read + created,
+        read,
+        (created, hourly),
+    )
 }
 
 #[derive(Default)]
@@ -52,9 +83,17 @@ pub struct State {
     thinking_dropped: usize,
     fallbacks: Vec<(Option<String>, String)>,
     stop_details: Option<String>,
+    /// The request cached for an hour: see [`usage`].
+    hour: bool,
 }
 
 impl State {
+    pub fn new(hour: bool) -> Self {
+        Self {
+            hour,
+            ..Self::default()
+        }
+    }
     fn account(&mut self, len: usize) -> Result<()> {
         self.bytes += len;
         if self.bytes > MAX_OUTPUT {
@@ -75,7 +114,7 @@ impl State {
         }
         match event["type"].as_str() {
             Some("message_start") => {
-                self.usage = usage(&event["message"]["usage"]);
+                self.usage = usage(&event["message"]["usage"], self.hour);
                 self.saw_usage = true;
                 self.dropped(&event["message"]["input_transformations"]);
                 Ok(Frame::Quiet)
@@ -221,22 +260,22 @@ impl State {
         if !fallback {
             return;
         }
-        let tokens = |entry: &Value, key: &str| entry[key].as_u64().unwrap_or(0);
+        let count = |entry: &Value, key: &str| entry[key].as_u64().unwrap_or(0);
         let last = iterations.len() - 1;
         let models: Vec<ModelTokens> = iterations
             .iter()
             .enumerate()
-            .filter(|(index, entry)| *index == last || tokens(entry, "output_tokens") > 0)
+            .filter(|(index, entry)| *index == last || count(entry, "output_tokens") > 0)
             .map(|(_, entry)| {
-                let read = tokens(entry, "cache_read_input_tokens");
-                let written = tokens(entry, "cache_creation_input_tokens");
+                let (input, read, (written, hourly)) = tokens(entry, self.hour);
                 ModelTokens {
                     model: entry["model"].as_str().unwrap_or_default().to_owned(),
                     provider: None,
-                    input_tokens: tokens(entry, "input_tokens") + read + written,
-                    output_tokens: tokens(entry, "output_tokens"),
+                    input_tokens: input,
+                    output_tokens: count(entry, "output_tokens"),
                     cached_input_tokens: read,
                     cache_write_tokens: written,
+                    cache_write_1h_tokens: hourly,
                 }
             })
             .collect();
@@ -245,6 +284,7 @@ impl State {
             output_tokens: models.iter().map(|m| m.output_tokens).sum(),
             cached_input_tokens: models.iter().map(|m| m.cached_input_tokens).sum(),
             cache_write_tokens: models.iter().map(|m| m.cache_write_tokens).sum(),
+            cache_write_1h_tokens: models.iter().map(|m| m.cache_write_1h_tokens).sum(),
             models,
         };
         self.saw_usage = true;
@@ -399,9 +439,48 @@ mod tests {
                 output_tokens: 7,
                 cached_input_tokens: 3,
                 cache_write_tokens: 5,
+                cache_write_1h_tokens: 0,
                 models: Vec::new(),
             })
         );
+    }
+    /// A message's usage, as a refresh's is read, counts every attempt a
+    /// server-side fallback billed, as the stream's final usage does.
+    #[test]
+    fn a_whole_messages_usage_counts_each_billed_attempt() {
+        let report = json!({"input_tokens":0,"cache_read_input_tokens":9,"output_tokens":0,
+            "iterations":[
+                {"type":"message","model":"claude-opus-5-5","input_tokens":0,
+                 "cache_read_input_tokens":9,"cache_creation_input_tokens":0,"output_tokens":0},
+                {"type":"fallback_message","model":"claude-opus-4-8","input_tokens":2,
+                 "cache_read_input_tokens":0,"cache_creation_input_tokens":7,"output_tokens":0}]});
+        let usage = super::message_usage(&report, false);
+        assert_eq!(usage.models.len(), 1);
+        assert_eq!(usage.models[0].model, "claude-opus-4-8");
+        assert_eq!((usage.input_tokens, usage.cache_write_tokens), (9, 7));
+        let plain = super::message_usage(&json!({"cache_read_input_tokens":9}), false);
+        assert_eq!((plain.input_tokens, plain.cached_input_tokens), (9, 9));
+    }
+    /// Hour-long writes are read from the split when Anthropic reports one,
+    /// and otherwise follow what the request asked for.
+    #[test]
+    fn hour_long_cache_writes_are_kept_apart() {
+        let split = json!({"input_tokens":1,"cache_read_input_tokens":2,
+            "cache_creation_input_tokens":7,
+            "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":4}});
+        let plain = json!({"input_tokens":1,"cache_creation_input_tokens":7});
+        let hourly = |usage: &Value, hour| {
+            let usage = super::usage(usage, hour);
+            (
+                usage.input_tokens,
+                usage.cache_write_tokens,
+                usage.cache_write_1h_tokens,
+            )
+        };
+        assert_eq!(hourly(&split, false), (10, 7, 4));
+        assert_eq!(hourly(&split, true), (10, 7, 4));
+        assert_eq!(hourly(&plain, true), (8, 7, 7));
+        assert_eq!(hourly(&plain, false), (8, 7, 0));
     }
     #[test]
     fn dropped_thinking_is_counted_from_the_latest_report() {

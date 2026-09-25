@@ -183,6 +183,27 @@ class HarborAgentTest(unittest.TestCase):
         self.assertAlmostEqual(usage['gw/m'].cost_usd, 200 * 1e-6 + 200 * 1.25e-6 + 300 * 1e-7 + 50 * 1e-5)
         self.assertAlmostEqual(usage['gw/backup'].cost_usd, 100 * 2.5e-6 + 200 * 2e-6 + 50 * 2e-5)
 
+    def test_hour_long_cache_writes_are_priced_at_the_hour_rate(self):
+        rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5,
+                          'cache_creation_input_token_cost': 1.25e-6,
+                          'cache_creation_input_token_cost_above_1hr': 2e-6},
+                 'gw/plain': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5}}
+        for model, hour_rate in (('gw/m', 2e-6), ('gw/plain', 2e-6)):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as logs, \
+                    mock.patch.dict('litellm.model_cost', rates):
+                path = Path(logs, 'state.sqlite')
+                store(path, [('task', model, 'completed', 1000)])
+                with sqlite3.connect(path) as db:
+                    db.execute('CREATE TABLE events(id INTEGER PRIMARY KEY, bot TEXT, turn INT, kind TEXT, data TEXT)')
+                    db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                               (json.dumps({'input_tokens': 1000, 'output_tokens': 100, 'cached_input_tokens': 500,
+                                            'cache_write_tokens': 400, 'cache_write_1h_tokens': 300}),))
+                context = AgentContext()
+                self.agent(logs).populate_context_post_run(context)
+                write_rate = rates[model].get('cache_creation_input_token_cost', 1e-6)
+                self.assertAlmostEqual(context.model_usage[model].cost_usd,
+                                       100 * 1e-6 + 100 * write_rate + 300 * hour_rate + 500 * 1e-6 + 100 * 1e-5)
+
     def test_a_summary_is_priced_at_the_summarizers_provider_and_model(self):
         rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5},
                  'other/cheap': {'input_cost_per_token': 1e-7, 'output_cost_per_token': 1e-6,

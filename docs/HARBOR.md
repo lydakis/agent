@@ -77,7 +77,9 @@ the same model can drive each harness on the same tasks.
    computed from LiteLLM's price table, as Harbor's own adapters do. Cache
    reads are priced at the cache-read rate and Anthropic cache writes (the
    `cache_write_tokens` of each `usage` event) at the cache-write rate, as
-   Harbor's Claude Code adapter prices its steps. It is left
+   Harbor's Claude Code adapter prices its steps. The hour-long part
+   (`cache_write_1h_tokens`, under `--cache-ttl 1h`) is priced at the table's
+   one-hour write rate, or twice input when it has none. It is left
    empty when any model used is missing from the table, rather than reported low.
    Provider failures map to Harbor's retryable error types, for example
    `provider_http_429` to `ApiRateLimitError`, `provider_stream_failed` to

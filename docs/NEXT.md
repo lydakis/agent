@@ -711,9 +711,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `max_tokens: 0` while a tool runs. Anthropic recommends this over the
     one-hour cache only on Fable 5.1 and Mythos 5.1. Next, a live check that
     the API accepts the refresh with the request's thinking, effort, and
-    fallbacks. Then a one-hour cache option, with one-hour writes priced at
-    their own rate, and a matched long-tool task with three arms: the
-    five-minute cache alone, the one-hour cache, and refreshes. Open: parked
+    fallbacks. `--cache-ttl 1h` is built, with one-hour writes priced at
+    their own rate. Then a matched long-tool task with three arms: the
+    five-minute cache alone (`--keep-warm 0`), `--cache-ttl 1h`, and
+    refreshes. Open: parked
     `wait` turns, whose helpers can run past five minutes with no live task
     to refresh them, and Bedrock.
 

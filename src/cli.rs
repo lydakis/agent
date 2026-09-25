@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -186,6 +186,10 @@ fn print_flags(flags: &str) {
             "--keep-warm" => (
                 "SECONDS",
                 "Refresh an idle Anthropic prompt cache during a tool call after this long; default 240, 0 disables",
+            ),
+            "--cache-ttl" => (
+                "5m|1h",
+                "Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
             ),
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
             "--context-bytes" => ("N", "Maximum model context bytes"),

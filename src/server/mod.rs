@@ -345,6 +345,10 @@ pub struct Configuration {
     /// Seconds an Anthropic prompt cache may sit unread while a tool runs
     /// before it is refreshed; default 240, 0 disables.
     pub keep_warm: Option<u64>,
+    /// Anthropic prompt caches last an hour instead of five minutes; their
+    /// writes bill twice the input rate instead of 1.25 times, and no
+    /// refresh is sent. Responses providers are unaffected.
+    pub cache_hour: bool,
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
@@ -558,7 +562,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         }
         let provider = provider
             .with_stall_timeout(stall_timeout)?
-            .with_keep_warm(keep_warm)?;
+            .with_keep_warm(keep_warm)?
+            .with_cache_hour(config.cache_hour);
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
@@ -612,6 +617,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
             "stall_timeout_seconds":stall_timeout.as_secs(),
             "keep_warm_seconds":keep_warm.map_or(0, |after| after.as_secs()),
+            "cache_ttl":if config.cache_hour { "1h" } else { "5m" },
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
             "retain_turns":config.retain_turns},

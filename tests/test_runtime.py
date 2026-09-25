@@ -293,9 +293,10 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             # A cache refresh is the same request with no output and no stream.
             warm = request['max_tokens'] == 0
             assert request['model'] == 'synthetic-claude' and request['stream'] != warm
+            cache = getattr(self.server, 'cache_control', {'type': 'ephemeral'})
             for block in request.get('system', []):
-                assert block['text'] and block['cache_control'] == {'type': 'ephemeral'}
-            assert request['cache_control'] == {'type': 'ephemeral'}
+                assert block['text'] and block['cache_control'] == cache
+            assert request['cache_control'] == cache
             summary = request.get('system', [{}])[0].get('text') == 'Summarize.'
             history_uses_tools = any(b['type'] in ('tool_use', 'tool_result')
                                      for m in request['messages'] for b in m['content'])
@@ -379,7 +380,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
-            start = {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}
+            start = {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2,
+                               **getattr(self.server, 'start_usage', {})}}
             if getattr(self.server, 'report_drops', 0):
                 start['input_transformations'] = [{'type': 'thinking_dropped', 'message_index': 1, 'block_index': 0}
                                                   for _ in range(self.server.report_drops)]
@@ -487,6 +489,33 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
+
+    def test_an_interrupt_still_records_a_refresh_already_sent(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        model.warm_delay = 1.5
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='i1', prompt='shell:sleep 10')['result']['turn']
+        call = model.requests.get(timeout=5)
+        self.assertEqual(model.requests.get(timeout=5)['max_tokens'], 0)  # the refresh is in flight
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm'])
+        self.assertEqual(call['max_tokens'] > 0, True)
+
+    def test_an_hour_long_cache_is_marked_priced_apart_and_not_refreshed(self):
+        client, model, path = self.start(extra=('--keep-warm', '1', '--cache-ttl', '1h'))
+        model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
+        # A report without the per-lifetime split: every write is an hour's.
+        model.start_usage = {'cache_creation_input_tokens': 3}
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='h1', prompt='shell:sleep 1.5')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual([r['max_tokens'] > 0 for r in (model.requests.get(timeout=1),
+                                                         model.requests.get(timeout=1))], [True, True])
+        self.assertTrue(model.requests.empty())
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual([(u['cache_write_tokens'], u['cache_write_1h_tokens']) for u in usage], [(3, 3)] * 2)
 
     def test_a_short_tool_call_sends_no_refresh(self):
         client, model, path = self.start()
