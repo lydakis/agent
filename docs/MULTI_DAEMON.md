@@ -237,8 +237,15 @@ source's rows unchanged.
    N clones. Fan-out should serialize each event once and share the
    bytes, and live follower queues charge the same daemon-wide budget as
    observer pages. A follower that cannot be charged is closed the way a
-   full queue closes it today, and resumes by replay from its cursor. The
-   acceptance workload includes stopped live followers.
+   full queue closes it today, and resumes by replay from its cursor.
+   Bytes alone do not bound the publisher's work: `fan_out` snapshots and
+   visits every subscription on the bot and every `follow *` subscription
+   for each durable event, so idle followers that hold no bytes still add
+   commit-tail work per event. Follow admission therefore also has a
+   daemon-wide count limit, with `follow *` counted against it on every
+   bot's path, and a follow past the limit is refused with
+   `observer_busy`. The acceptance workload includes both stopped and
+   idle live followers.
 5. **A tool selection on `fork`.** An optional `tools` list, empty allowed,
    validated the way `create` validates it. Heterogeneous forks want this
    anyway. With it, "fork at the current node with no tools, ask it to
@@ -606,8 +613,16 @@ carrying it over.
    ids inside the payloads of the events the bundle carries, because
    `result` returns that data as it is: a finished turn's
    `turn_finished.data.checkpoint` (at `e1d413f`: `src/store/db.rs:2441`),
-   a steered turn's `into` and `node` (`src/store/db.rs:2178`), and a fork
-   event's `source`, `checkpoint`, and `node` (`src/store/db.rs:2865`).
+   a steered turn's `into` and `node` (`src/store/db.rs:2178`), a fork
+   event's `source`, `checkpoint`, and `node` (`src/store/db.rs:2865`),
+   and a `tool_completed` event's `node` and `note` (at `61c24e1`:
+   `src/store/db.rs:2325-2328`, `2405`). The last matters beyond
+   `result`: artifact reads from a fork authorize by finding that node in
+   the fork's lineage (`src/store/db.rs:3463-3483`), so a source node id
+   there would refuse a valid read from a local fork of the imported bot.
+   The rule is every node, turn, bot, and process id in a carried payload;
+   this list is today's instance of it, and a test walks every event kind
+   the bundle carries.
    Two ids cannot simply be rewritten:
    - Transcript text already holds turn ids in `TURN/CALL_ID/STREAM`
      artifact references and in `turn:` and `proc:` handles, and history is
@@ -873,7 +888,9 @@ carrying it over.
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
    `result` answers for imported turns, with the checkpoint and steer ids
-   rewritten to target ids, a fork from an older imported completion stops
+   rewritten to target ids, an artifact written before the move reads
+   from a local fork of the imported bot once artifacts may travel (step
+   3), a fork from an older imported completion stops
    at its imported checkpoint, a compacted bot's next turn sees the same
    summary and note, one whose note or summary quotes a handle or an
    artifact reference fails the import, prune and delete
