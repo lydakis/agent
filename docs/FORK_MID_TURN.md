@@ -96,13 +96,16 @@ round boundary. When no round has finished yet, it is the turn's prompt.
   worker. So each running turn keeps a boundary in a nullable
   `bots.closed` column. A turn sets it to its prompt when it starts. When it
   appends a model response, it moves it to the head before that response,
-  since the request that produced it had to answer every earlier call. Both
-  writes ride transactions that already exist, and finishing the turn
-  clears it. The fork reads the items after the boundary and picks the
-  newest one where every call since the boundary is answered. Once a
-  round's results are all in, that is the head itself, even while the next
-  model call is in flight. So finding and proving the fork point reads
-  only the newest round's items.
+  since the request that produced it had to answer every earlier call. When
+  it absorbs a batch of steers (`Database::absorb`, db.rs:2188), it moves
+  it to the batch's last item: absorbing happens only at a round boundary,
+  where every call is answered, and steers hold no calls. These writes ride
+  transactions that already exist, and finishing the turn clears it. The
+  fork reads the items after the boundary and picks the newest one where
+  every call since the boundary is answered. Once a round's results are
+  all in, that is the head itself, even while the next model call is in
+  flight. So finding and proving the fork point reads only the newest
+  round's items.
 - **Upgraded stores get a boundary without reading transcripts.** Waiting
   and paced turns are restored at open and may already hold many rounds.
   The migration that adds `bots.closed` sets each running turn's boundary
@@ -126,7 +129,13 @@ round boundary. When no round has finished yet, it is the turn's prompt.
   point's lineage. For the newest closed node the start is always in that
   lineage, because a start is a turn's first node and the fork point is at
   or after the running turn's prompt. Otherwise the fork keeps today's
-  rule.
+  rule. The fork's own first message still counts against the budget. When
+  the source's window sits so close to the budget that this message pushes
+  it over, the fork's first call picks a new start, and that call misses
+  the cache after the tools and system. That is the same reset the source
+  takes on its own next item, so the fork only brings it forward. We accept
+  it rather than keep headroom, which would move every bot's window earlier
+  and cost each bot the misses it avoids today.
 - **Consistency:** nodes are immutable, and the fork reads the head in one
   store operation, which the store serializes with the source's appends. The
   source can keep appending, and the fork is a clean snapshot.
@@ -212,7 +221,8 @@ live came from the wrong fork point, not from missing framing.
    start as section 1 describes. Scope process handles, and the artifacts
    processes store, to the bot that started them. Add store contract tests
    for a running turn, a parked turn, a turn with no finished round, a fork
-   while the next model call is in flight, a fork of oneself, a fork that
+   while the next model call is in flight, a fork after several batches of
+   steers that reads none of them, a fork of oneself, a fork that
    waits on an inherited `proc:N`, a fork that tries to read a large-output
    process's streams after it finishes, and a fork of a turn at
    `MAX_ROUNDS` whose validation reads only the newest round. Add the
@@ -232,8 +242,10 @@ live came from the wrong fork point, not from missing framing.
 - **Cache.** A fork's first call should read nearly all of the source's
   last request, which is its bounded context window, on Sonnet 5 and on
   ChatGPT. Include a source whose window has grown past three quarters of
-  its budget, where today's reset would move the start. The runs need a
-  nonce per arm, because Anthropic shares its cache across an organization.
+  its budget, where today's reset would move the start, and one within a
+  message of the budget, where the fork's own first message forces a reset.
+  Count how often the second happens. The runs need a nonce per arm,
+  because Anthropic shares its cache across an organization.
 - **Answer only: dispatch refusal versus `tool_choice: none`.** Compare
   cached tokens and extra rounds on both providers. Keep refusal unless
   `tool_choice` turns out to be cache-safe on a provider.
