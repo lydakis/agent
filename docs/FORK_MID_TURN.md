@@ -239,9 +239,10 @@ live came from the wrong fork point, not from missing framing.
    for a running turn, a parked turn, a turn with no finished round, a fork
    while the next model call is in flight, a fork after several batches of
    steers, a fork while a reasoning-only response waits to finish, a turn
-   that starts after a reasoning-only completion, where the default fork
-   picks what an explicit checkpoint would accept, a fork of oneself, a fork that waits on an inherited `proc:N`, and a fork that
-   tries to read a large-output process's streams after it finishes. Test
+   that starts after a reasoning-only completion (the default fork picks
+   what an explicit checkpoint would accept), a fork of oneself, a fork
+   that waits on an inherited `proc:N`, and a fork that tries to read a
+   large-output process's streams after it finishes. Test
    that a fork during a round with many large results, in a turn near
    `MAX_ROUNDS`, reads no transcript item. Add the upgrade test above.
 2. **Store and daemon:** add `allow` and the nullable `bots.allowed`, with
