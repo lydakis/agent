@@ -61,7 +61,11 @@ Costs behind the rule:
   context window, mostly from cache. That window is bounded by
   `--context-bytes` and `--context-items`, and compaction, not by the whole
   lineage. It is cheap per token, but every later call carries a window that
-  size too.
+  size too. Warm holds for the forks this note designs: the source's
+  instructions and the default fork point. A fork given its own
+  `--instructions` gets its own cache key (db.rs:2919-2949), and one at an
+  older `--checkpoint` may start from a different window, so both can start
+  cold. The cache run measures those separately.
 - **A fresh bot starts cold and small.** It pays for the brief only, and it
   doesn't share the source's blind spots. That is why reviews should start
   fresh.
@@ -267,7 +271,13 @@ live came from the wrong fork point, not from missing framing.
    that an absent `allow`, `[]`, and `null` inherit, allow nothing, and
    are refused, in the protocol and through `--allow`, and that bots from
    before the migration keep their tools.
-3. **Client:** the `bot_busy` hint and the preamble sentence.
+3. **Client and contract:** the `bot_busy` hint and the preamble
+   sentence. Update every place that says the default is the current head:
+   the `--checkpoint` help (src/cli.rs:135), the `fork` usage error
+   (src/client.rs:851), the protocol's `Fork` docs (src/server/mod.rs:67),
+   and the fork paragraph in RUST_PROTOTYPE.md (lines 880-887). Each should
+   say it is the head for an idle source and the newest closed node for a
+   running or parked one. Protocol tests assert both defaults.
 4. **App:** side chat forks with its chosen list, in a worktree it makes for
    all tools.
 
@@ -278,8 +288,10 @@ live came from the wrong fork point, not from missing framing.
   ChatGPT. Include a source whose window has grown past three quarters of
   its budget, where today's reset would move the start, and one within a
   message of the budget, where the fork's own first message forces a reset.
-  Count how often the second happens. The runs need a nonce per arm,
-  because Anthropic shares its cache across an organization.
+  Count how often the second happens. Measure separately a fork with its
+  own `--instructions` and one at an older `--checkpoint`. The runs need a
+  nonce per arm, because Anthropic shares its cache across an
+  organization.
 - **Answer only: dispatch refusal versus `tool_choice: none`.** Compare
   cached tokens and extra rounds on both providers. Keep refusal unless
   `tool_choice` turns out to be cache-safe on a provider.
