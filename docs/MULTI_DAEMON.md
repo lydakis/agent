@@ -304,6 +304,16 @@ operations. An implementation inventory must cover:
   bytes. References in any of these need an origin-aware resolution rule
   or explicit refusal, including references whose objects did not travel.
 
+The reference contract also covers values saved by clients outside the
+bundle, including checkpoints and history-node references. Keep their
+origin identity and provide qualified resolution or a documented refresh
+to target-local references. For a completed turn's saved checkpoint, a
+refresh can read `result` for its remapped turn; other saved nodes need a
+mapping or an explicit unsupported answer. Never reinterpret a source
+integer as a target-local id, even if it happens to name a valid node there.
+The receipt need not inline the entire node map, but the selected lookup
+or refresh path must work before clients use imported history.
+
 Use the storage codecs instead of copying encoded columns blindly:
 [`artifact::read` and `artifact::put`](../src/store/artifact.rs) handle
 artifact encoding, and large turn prompts are resolved through
@@ -345,6 +355,15 @@ release the fence on disconnect. New work after the cut must not leak into
 it. Avoid holding a long read transaction that pins the WAL fleet-wide.
 Bundles contain transcripts and tool output and belong in ignored storage.
 
+A consistent cut is not proof of a complete export. The source must bind
+an expected complete record set to that cut and, for a move, its nonce.
+Before publishing imported state, the destination verifies completion,
+record identities/counts, and contents through a manifest with digests or
+an equivalent validated format. Missing, unexpected, duplicated, or corrupt
+records refuse the whole import. This check includes every carried record
+class, not only transcript nodes or rows with foreign keys. Transport page
+order need not matter if the format verifies the same complete contents.
+
 Before committing an import, validate provider name/family, compaction
 provider, selected tools, name availability, and all effective per-turn
 models/workspaces. Map the bot's and unfinished turns' workspace paths;
@@ -383,11 +402,20 @@ The candidate move protocol has these ownership boundaries:
 | Receipt | Tombstone the source with destination lineage/instance, bot name/id, and mappings for every carried turn, finished or unfinished. |
 | Cancel after the cut | Require the destination's durable refusal of that nonce, issued only if it has not imported it. An unreachable destination leaves the source fenced; any operator override must state the duplicate-execution risk. |
 
-Tombstones answer submissions, old/new `wait`s, and `result` with
-`bot_moved` and the correct destination turn handle. Resolve already
-registered waiters too, and emit a durable `bot_moved` event for existing
-followers and reconnects. Ordinary delete cannot remove a moving bot or its
-tombstone; explicit expiry must state the routing guarantees it removes.
+Tombstones route supported bot queries and controls with `bot_moved`:
+submissions, `resume`, `follow`, old/new `wait`s, `result`, `interrupt`, and
+fork/history access. The route identifies the destination store and bot;
+operations naming a turn or node use the corresponding target reference
+or the refresh path above. Unsupported operations fail explicitly instead
+of presenting a stale local bot. Resolve already registered waiters too,
+and emit a durable `bot_moved` event for existing followers and reconnects.
+Clients follow that route: `follow` and `interrupt` currently inspect via
+`resume`, so both must handle a moved response there as well as on the
+later operation. Start replay with a target cursor, not a saved source
+cursor, and send cancellation to the remapped target turn. The caller
+connects to the destination; this adds no daemon-to-daemon forwarding.
+Ordinary delete cannot remove a moving bot or its tombstone; explicit
+expiry must state the routing guarantees it removes.
 After a destination restore, use the origin and move nonce to verify the
 imported bot before rebinding to a new instance and replaying from scratch.
 A backup predating import answers `moved_bot_missing`, not a same-named bot.
@@ -420,9 +448,11 @@ a time.
 | Gate | Acceptance cases |
 | --- | --- |
 | Restricted fork | Compare next request context against a local fork at the same checkpoint, including summary/note; preserve results, history ordinals, idempotency, older checkpoints, prune/delete, and imported-event visibility. Race submission and retention against paged export. Exercise every stated refusal. |
+| Bundle completeness | Drop a complete page from each carried record class; duplicate, truncate, or corrupt records; interrupt export before finalization. Each invalid bundle leaves no visible import. Exercise page reordering according to the chosen format. |
+| Saved client references | Save a completed turn's checkpoint, move the bot into a store with colliding node ids, then fork from that checkpoint through qualified resolution or refresh. Exercise saved history-node references and explicitly refused unsupported cases. |
 | References and ancestry | Use colliding source/target ids across every carried record and event kind. Read pre-import outputs from the imported bot and its later local fork. Resolve handles embedded in instructions, notes, summaries, artifacts, and process results, including after another import. Reject missing or ambiguous origins. |
 | Drain | Drain a multi-round turn, restart, release, and prove its prompt and every completed round appear exactly once with no tool replay. |
-| Move | Crash/retry at each ownership boundary; race cancel, delete, waits, and followers; rename at import; exceed target pending bounds; use skewed clocks and restores before/after import; restore the source from a pre-prepare backup and submit to both sides. Prove at most one side can continue and old handles route correctly. |
+| Move | Crash/retry at each ownership boundary; race cancel, delete, waits, and followers; rename at import; exceed target pending bounds; use skewed clocks and restores before/after import; restore the source from a pre-prepare backup and submit to both sides. Reconnect through the source and exercise the CLI resume/follow/interrupt flow, including cancellation of a moved queued or drained turn. Prove at most one side can continue and old handles route correctly. |
 | Group | Move a waiting parent with its child atomically; the child completes, the parent resumes, and subsequent parent/child communication uses the remapped identities. |
 
 Each phase needs bounded resource measurements on long histories as well
