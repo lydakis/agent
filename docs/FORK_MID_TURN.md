@@ -62,10 +62,14 @@ Costs behind the rule:
   `--context-bytes` and `--context-items`, and compaction, not by the whole
   lineage. It is cheap per token, but every later call carries a window that
   size too. Warm holds for the forks this note designs: the source's
-  instructions and the default fork point. A fork given its own
-  `--instructions` gets its own cache key (db.rs:2919-2949), and one at an
-  older `--checkpoint` may start from a different window, so both can start
-  cold. The cache run measures those separately.
+  instructions, the default fork point, and the model that warmed the
+  cache. A fork given its own `--instructions` gets its own cache key
+  (db.rs:2919-2949), and one at an older `--checkpoint` may start from a
+  different window, so both can start cold. A fork also copies the bot's
+  stored model, not a per-turn `--model` the running turn uses
+  (`turns.model`). A caller that ran the source's turn on another model
+  passes the same `--model` to the fork's first turn, or starts cold. The
+  cache run measures these cases separately.
 - **A fresh bot starts cold and small.** It pays for the brief only, and it
   doesn't share the source's blind spots. That is why reviews should start
   fresh.
@@ -289,7 +293,9 @@ live came from the wrong fork point, not from missing framing.
   its budget, where today's reset would move the start, and one within a
   message of the budget, where the fork's own first message forces a reset.
   Count how often the second happens. Measure separately a fork with its
-  own `--instructions` and one at an older `--checkpoint`. The runs need a
+  own `--instructions`, one at an older `--checkpoint`, and a fork of a
+  turn run with `--model`, with and without the same `--model` on the
+  fork's first turn. The runs need a
   nonce per arm, because Anthropic shares its cache across an
   organization.
 - **Answer only: dispatch refusal versus `tool_choice: none`.** Compare
