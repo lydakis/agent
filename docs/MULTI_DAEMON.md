@@ -888,9 +888,7 @@ carrying it over.
    new identity: the cross-store fork. Behavior tests: the imported bot's
    next turn sees the same context as a local fork at the same node,
    `result` answers for imported turns, with the checkpoint and steer ids
-   rewritten to target ids, an artifact written before the move reads
-   from a local fork of the imported bot once artifacts may travel (step
-   3), a fork from an older imported completion stops
+   rewritten to target ids, a fork from an older imported completion stops
    at its imported checkpoint, a compacted bot's next turn sees the same
    summary and note, one whose note or summary quotes a handle or an
    artifact reference fails the import, prune and delete
@@ -904,7 +902,8 @@ carrying it over.
    handle or artifact reference in the transcript, or a running process
    each fail the export or import explicitly.
 3. The alias decision for artifact references, with a test that reads one
-   written before the move, and store-qualified handles with import-time
+   written before the move, from the imported bot and from a local fork
+   of it, and store-qualified handles with import-time
    handle aliases, with a test that an imported bot's `wait` on a
    `turn:` and a `proc:` handle from before the move resolves at the
    destination, so that bots with retained tool output or delegation can
