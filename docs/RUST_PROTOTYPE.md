@@ -305,6 +305,7 @@ bound; the operating system is then the only limit.
 | Flag | Bounds | Default |
 | --- | --- | --- |
 | `--max-processes` | Child processes running at once, foreground or background. Waiting never counts. | 64 per logical CPU |
+| `--max-detached` | Detached shell commands still running, daemon-wide; exited ones are reaped and stop counting. Zero is unbounded. | 16 |
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
@@ -550,8 +551,14 @@ between turns may never be called again. The Responses cache needs none: the
 ChatGPT backend still read 7.4k of 7.7k tokens after a 20-minute gap, and it
 refuses `prompt_cache_retention: "24h"` with a 400.
 
-Every Anthropic request also opts into server-side fallbacks
-(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header).
+A bot created with `--fallbacks` (`create.fallbacks`, inherited by its forks)
+opts its Anthropic requests into server-side fallbacks
+(`fallbacks: "default"` with the `server-side-fallback-2026-07-01` beta header);
+other bots send neither, and a declined request ends their turn with
+`provider_refusal` as before. It is a bot's choice because a fallback answers
+with a model the caller did not pick and bills at that model's rate. The
+Harbor adapter asks for it, since a benchmark task is better finished on the
+recommended model than failed.
 The protocol described here is from Anthropic's documentation, read
 2026-09-25: [Refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)
 for the stream, the `usage.iterations` entries, billing and the replay rules,
@@ -1429,7 +1436,10 @@ command starts in a new session with stdin, stdout and stderr on
 for it, since such a file would hold output that never passed credential
 redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
 handle applies to it, so it outlives the turn and the daemon and is outside
-`--max-processes`; stopping it is the bot's job. It exists because Terminal-Bench
+`--max-processes`; stopping it is the bot's job. What does bound it is
+`--max-detached`: each detached child retains a slot until its async waiter
+reaps it on exit, and a new detach refuses with `detached_limit` while all
+slots are held. It exists because Terminal-Bench
 tasks that leave a server for the grader failed when the server died with its
 command. Turn cancellation requests the same kill for a
 foreground shell, but native file I/O or background commands can outlive the

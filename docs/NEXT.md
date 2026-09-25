@@ -704,6 +704,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     provisional phases. Their open design questions do not block observation.
     One daemon per user stays the default until a matched screen supports
     changing it. Placement, file copying, and transport remain with callers.
+42. Done: three follow-ups from the review of the 2026-09-25 merges. The
+    Responses prompt-cache key uses a store-instance namespace plus the
+    bot's id, not a per-daemon nonce. The durable lineage is drawn once at
+    store creation (schema 28); the namespace also binds it to the physical
+    file, so an idle-exit restart keeps cache affinity while a live copy
+    gets its own. Both values are announced in `ready`. This is cache routing,
+    not the full copy/restore cursor identity contract in MULTI_DAEMON.md.
+    Anthropic server-side fallbacks are a bot's choice
+    (`--fallbacks`, inherited by forks), off by default, because a fallback
+    answers with a model the caller did not pick; the Harbor adapter asks
+    for it. Detached shell commands are bounded by `--max-detached` (16)
+    and reaped as they exit, so they neither pile up nor linger as zombies.
 
 42. Anthropic prompt-cache refreshes during long tool calls, measured before
     kept. [Built](RUST_PROTOTYPE.md#keeping-the-anthropic-cache-warm):

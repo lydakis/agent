@@ -55,6 +55,7 @@ struct Options {
     /// own, or none with --no-compaction.
     compaction_instructions: Option<String>,
     compaction_model: Option<String>,
+    fallbacks: bool,
     after: i64,
     pretty: bool,
     new: bool,
@@ -96,6 +97,7 @@ fn parse(args: &[String]) -> Result<Options> {
         bot_id: None,
         compaction_instructions: Some(DEFAULT_COMPACTION_INSTRUCTIONS.to_owned()),
         compaction_model: None,
+        fallbacks: false,
         after: 0,
         pretty: false,
         new: false,
@@ -122,6 +124,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--new" => options.new = true,
             "--agents" => options.agents = true,
             "--no-compaction" => options.compaction_instructions = None,
+            "--fallbacks" => options.fallbacks = true,
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
@@ -191,6 +194,7 @@ fn parse(args: &[String]) -> Result<Options> {
                             })?)
                     }
                     "--max-processes"
+                    | "--max-detached"
                     | "--max-active"
                     | "--max-connecting"
                     | "--max-pending"
@@ -458,6 +462,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
         }
         let key = match flag.as_str() {
             "--max-processes" => "processes",
+            "--max-detached" => "detached",
             "--max-active" => "active",
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",
@@ -769,7 +774,7 @@ fn run(options: &Options) -> Result<i32> {
                 "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>(),
                 "created_by":created_by,"created_by_id":created_by_id,
                 "compaction_instructions":options.compaction_instructions,
-                "compaction_model":options.compaction_model}),
+                "compaction_model":options.compaction_model,"fallbacks":options.fallbacks}),
         )?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));

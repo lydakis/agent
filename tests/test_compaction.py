@@ -410,6 +410,46 @@ class CompactionTests(ModelFixture):
         summaries = {r['prompt_cache_key'] for r in bob if r['instructions'] == 'Summarize.'}
         self.assertEqual(len(calls), 1)
         self.assertEqual(summaries, {calls.copy().pop() + '-summary'})
+        # The key is the store's, not the daemon's: a restart keeps every
+        # bot's cache affinity, and it is announced in ready.
+        identity = client.ready['store']['identity']
+        self.assertTrue(all(k.startswith(identity + '-') for k in calls | set(keys.values())))
+        client.close()
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.addCleanup(client.close)
+        self.assertEqual(client.ready['store']['identity'], identity)
+        self.run_turn(client, 'Bob', 'again', 'small')
+        later = self.requests()
+        self.assertEqual({r['prompt_cache_key'] for r in later if r['instructions'] != 'Summarize.'}, calls)
+        # A live backup has the same durable lineage and bot IDs, but must
+        # not route a divergent conversation through the source's cache key.
+        copied = self.path / 'copy.sqlite'
+        source = sqlite3.connect(self.path / 'state.sqlite')
+        destination = sqlite3.connect(copied)
+        source.backup(destination)
+        source.close()
+        destination.close()
+        clone = Client(self.binary, copied, self.url,
+                       extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.addCleanup(clone.close)
+        self.assertEqual(clone.ready['store']['lineage'], client.ready['store']['lineage'])
+        self.assertNotEqual(clone.ready['store']['identity'], identity)
+        self.run_turn(clone, 'Bob', 'copy', 'small')
+        self.assertNotIn(self.requests()[0]['prompt_cache_key'], calls)
+        copied_identity = clone.ready['store']['identity']
+        clone.close()
+        replacement = self.path / 'replacement.sqlite'
+        source = sqlite3.connect(self.path / 'state.sqlite')
+        destination = sqlite3.connect(replacement)
+        source.backup(destination)
+        source.close()
+        destination.close()
+        os.replace(replacement, copied)
+        restored = Client(self.binary, copied, self.url,
+                          extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.addCleanup(restored.close)
+        self.assertNotEqual(restored.ready['store']['identity'], copied_identity)
         self.assertEqual({keys['Alice'], keys['Ann']}, calls)
         self.assertEqual(len({keys['Carol'], keys['Eve']} | calls), 3)
 

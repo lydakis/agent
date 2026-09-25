@@ -36,6 +36,8 @@ const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 86_400_000;
 /// Simultaneously running child processes, foreground or background.
 pub const DEFAULT_PROCESS_BUDGET: usize = 64;
+/// Detached commands still running at once, daemon-wide, unless configured.
+pub const DEFAULT_DETACHED_BUDGET: usize = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
@@ -140,6 +142,9 @@ pub struct Registry {
     /// Background commands accepted and waiting for a slot. The operating
     /// system never sees these, so only this count can bound them.
     pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// A permit stays with each detached child until its wait completes.
+    detached_slots: Arc<Semaphore>,
+    detached_budget: usize,
     credentials: Credentials,
     environment: Arc<Vec<(String, String)>>,
     /// Request encodings per (family, selection); see `encoded`.
@@ -342,6 +347,8 @@ impl Registry {
             slots: Arc::new(Semaphore::new(DEFAULT_PROCESS_BUDGET)),
             budget: DEFAULT_PROCESS_BUDGET,
             pending: Arc::default(),
+            detached_slots: Arc::new(Semaphore::new(DEFAULT_DETACHED_BUDGET)),
+            detached_budget: DEFAULT_DETACHED_BUDGET,
             credentials: Credentials::default(),
             environment: Arc::new(Vec::new()),
             encodings: Arc::default(),
@@ -383,8 +390,13 @@ impl Registry {
         }
         Ok(encoded)
     }
-    /// Exact occurrences of these values are redacted from tool results and the
-    /// named variables are removed from shell environments.
+    /// Bound on detached commands still running, daemon-wide; exited ones
+    /// are reaped and stop counting. Zero removes the bound.
+    pub fn with_detached_budget(mut self, budget: usize) -> Self {
+        self.detached_budget = budget.min(Semaphore::MAX_PERMITS);
+        self.detached_slots = Arc::new(Semaphore::new(self.detached_budget));
+        self
+    }
     /// Bound on simultaneously running child processes. Waiting never counts.
     /// Zero removes the bound; the operating system is then the only limit.
     pub fn with_process_budget(mut self, budget: usize) -> Self {
@@ -440,6 +452,8 @@ impl Registry {
     }
     /// Share a credential set that others may add to later, such as a login
     /// that is re-read while the daemon runs.
+    /// Exact occurrences of these values are redacted from tool results and the
+    /// named variables are removed from shell environments.
     pub fn with_credentials(mut self, credentials: Credentials) -> Self {
         self.credentials = credentials;
         self
@@ -944,8 +958,8 @@ fn sh(
 /// Start a command in a new session for a service that must outlive the
 /// turn and the daemon. Its output is discarded: a log the daemon wrote would
 /// bypass credential redaction, so a command that wants one redirects itself.
-/// No process slot, group kill, or handle applies to it; tokio reaps it if it
-/// exits while the daemon runs.
+/// No process slot, group kill, or handle applies to it. An async waiter
+/// reaps it on exit and releases its detached slot.
 #[cfg(unix)]
 fn detach(
     command: &str,
@@ -968,7 +982,28 @@ fn detach(
             Ok(())
         });
     }
-    let pid = process.spawn()?.id();
+    // Admission is atomic across concurrent turns. The child and its permit
+    // move into one waiter, so no reusable PID is polled after Tokio reaps it.
+    let permit = if registry.detached_budget == 0 {
+        None
+    } else {
+        Some(registry.detached_slots.clone().try_acquire_owned().map_err(|_| {
+            Error::with(
+                "detached_limit",
+                format!(
+                    "{} detached commands are still running, the daemon's bound (--max-detached {}); stop one first",
+                    registry.detached_budget - registry.detached_slots.available_permits(),
+                    registry.detached_budget
+                ),
+            )
+        })?)
+    };
+    let mut child = process.spawn()?;
+    let pid = child.id().ok_or(Error::new("shell_spawn_failed"))?;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = child.wait().await;
+    });
     Ok(Outcome::text(
         json!({"detached":true,"pid":pid}).to_string(),
     ))

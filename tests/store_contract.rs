@@ -36,6 +36,7 @@ fn binding() -> Binding<'static> {
         created_by_id: None,
         compaction_instructions: None,
         compaction_model: None,
+        fallbacks: false,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -338,6 +339,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                     family,
                     compaction_instructions: None,
                     compaction_model: None,
+                    fallbacks: false,
                     ..binding()
                 },
             )
@@ -445,6 +447,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                     family,
                     compaction_instructions: None,
                     compaction_model: None,
+                    fallbacks: false,
                     ..binding()
                 },
             )
@@ -993,6 +996,7 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
             tools: &tools,
             compaction_instructions: None,
             compaction_model: None,
+            fallbacks: false,
             ..binding()
         },
     )
@@ -1598,6 +1602,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             family: Family::Anthropic,
             compaction_instructions: None,
             compaction_model: None,
+            fallbacks: false,
             ..binding()
         },
     )
@@ -1943,6 +1948,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
                 family,
                 compaction_instructions: None,
                 compaction_model: None,
+                fallbacks: false,
                 ..binding()
             },
         )
@@ -5153,4 +5159,42 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
     assert_eq!(carol.cache_bot(), carol.id);
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_store_keeps_its_identity_and_forks_inherit_fallbacks() {
+    let dir = std::env::temp_dir().join(format!("agent-identity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.sqlite");
+    let identity = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let identity = db.store_identity().unwrap();
+        // Off unless the client asks; asked for, a fork with the same
+        // instructions and one with new instructions both keep it.
+        let plain = db.create("plain", None, binding()).unwrap().0;
+        assert!(!plain.fallbacks);
+        let mut asked = binding();
+        asked.fallbacks = true;
+        let bot = db.create("bot", None, asked).unwrap().0;
+        assert!(bot.fallbacks);
+        for (name, instructions) in [("same", None), ("other", Some("Other."))] {
+            let fork = Fork {
+                checkpoint: None,
+                workspace: None,
+                budget_tokens: None,
+                instructions,
+                created_by: None,
+                created_by_id: None,
+            };
+            assert!(db.fork("bot", name, fork).unwrap().0.fallbacks, "{name}");
+        }
+        identity
+    };
+    // The identity is the file's, not the process's or the open's.
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.store_identity().unwrap(), identity);
+    let other = Database::initialize(Connection::open(dir.join("other.sqlite")).unwrap()).unwrap();
+    assert_ne!(other.store_identity().unwrap(), identity);
+    drop((db, other));
+    std::fs::remove_dir_all(dir).unwrap();
 }

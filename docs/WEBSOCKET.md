@@ -246,7 +246,9 @@ each bot has its own connection, the bot's key goes as `session-id` on the
 upgrade, and every call on the connection carries it
 (`tests/test_responses_socket.py` checks both). A fork that keeps its
 source's instructions shares the source's key, since its first call repeats
-the source's prefix. The screen must still send the same key and header in
+the source's prefix. A copied SQLite store gets a distinct namespace from its
+physical file identity; reopening the same file keeps the namespace. The
+screen must still send the same key and header in
 both arms: a
 cache hit-rate gap alone could explain much of the latency difference, and it
 would be credited to the wrong change.

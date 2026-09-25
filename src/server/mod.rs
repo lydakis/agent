@@ -58,6 +58,9 @@ enum Command {
         /// the client's; without instructions the bot never compacts.
         compaction_instructions: Option<String>,
         compaction_model: Option<String>,
+        /// Anthropic server-side fallbacks for this bot; off unless asked.
+        #[serde(default)]
+        fallbacks: bool,
     },
     Resume {
         bot: String,
@@ -327,6 +330,8 @@ pub struct Configuration {
     pub providers: Vec<ProviderSpec>,
     /// Concurrent child processes; default 64 per logical CPU; zero unbounded.
     pub max_processes: Option<usize>,
+    /// Detached commands still running, daemon-wide; default 16; zero unbounded.
+    pub max_detached: Option<usize>,
     /// Turns with a live task (model call or foreground tool); default 4,096; zero unbounded.
     pub max_active: Option<usize>,
     /// Provider requests awaiting response headers; unbounded by default,
@@ -371,6 +376,7 @@ pub struct Configuration {
 #[derive(Clone, Copy)]
 pub struct Limits {
     pub processes: usize,
+    pub detached: usize,
     pub active: usize,
     pub connecting: usize,
     pub pending: usize,
@@ -396,6 +402,9 @@ impl Limits {
         let active = config.max_active.unwrap_or(4096);
         Limits {
             processes: config.max_processes.unwrap_or(64 * cpus),
+            detached: config
+                .max_detached
+                .unwrap_or(agent_runtime::tools::DEFAULT_DETACHED_BUDGET),
             active,
             connecting: config.max_connecting.unwrap_or(0),
             pending: config.max_pending.unwrap_or(0),
@@ -446,6 +455,8 @@ struct Service {
     handles: Handles,
     background_failures: mpsc::UnboundedSender<Error>,
     limits: Limits,
+    /// The store's identity, announced in `ready` and used for cache keys.
+    identity: u128,
     retain_turns: Option<usize>,
     /// Open client sessions, kept by the run loop for `stats`.
     sessions: usize,
@@ -607,11 +618,15 @@ pub async fn run(config: Configuration) -> Result<()> {
     let registry = registry
         .with_credentials(credentials)
         .with_environment(environment)
-        .with_process_budget(limits.processes);
+        .with_process_budget(limits.processes)
+        .with_detached_budget(limits.detached);
     let hub = Hub::default();
+    let lineage = store.op("store_identity", |db| db.store_identity()).await?;
+    let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
+        "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
-        "limits":{"processes":limits.processes,"active":limits.active,"connecting":limits.connecting,
+        "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
             "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
@@ -691,6 +706,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     }
     let mut service = Service {
         store,
+        identity,
         transport,
         providers: Arc::new(providers),
         registry,
@@ -995,6 +1011,7 @@ impl Service {
             bot,
             turn,
             store: self.store.clone(),
+            identity: self.identity,
             providers: self.providers.clone(),
             registry: self.registry.clone(),
             hub: self.hub.clone(),
@@ -1070,6 +1087,7 @@ impl Service {
                 created_by_id,
                 compaction_instructions,
                 compaction_model,
+                fallbacks,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
@@ -1135,6 +1153,7 @@ impl Service {
                                 created_by_id,
                                 compaction_instructions: compaction_instructions.as_deref(),
                                 compaction_model: compaction_model.as_deref(),
+                                fallbacks,
                             },
                         )
                     })
@@ -1801,6 +1820,7 @@ mod tests {
                         created_by_id: None,
                         compaction_instructions: None,
                         compaction_model: None,
+                        fallbacks: false,
                     },
                 )?;
                 let turn = db
@@ -1831,6 +1851,7 @@ mod tests {
         let (cancel, cancelled) = watch::channel(false);
         let mut service = Service {
             store: store.clone(),
+            identity: 0,
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
             registry: Registry::new("wait").unwrap(),
@@ -1840,6 +1861,7 @@ mod tests {
                 pending: 0,
                 pending_bytes: 0,
                 processes: 16,
+                detached: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,
@@ -1984,6 +2006,7 @@ mod tests {
             created_by_id: None,
             compaction_instructions: None,
             compaction_model: None,
+            fallbacks: false,
         };
         let turn = store
             .op("create", move |db| {
@@ -2013,6 +2036,7 @@ mod tests {
         .unwrap();
         let (output, writer) = Output::stdout();
         let mut service = Service {
+            identity: 0,
             store: store.clone(),
             transport,
             providers: Arc::new(HashMap::from([("openai".to_owned(), provider)])),
@@ -2023,6 +2047,7 @@ mod tests {
                 pending: 0,
                 pending_bytes: 0,
                 processes: 16,
+                detached: 16,
                 active: 1024,
                 connecting: 64,
                 connections: 11,

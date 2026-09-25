@@ -103,6 +103,28 @@ impl From<rusqlite::Error> for Error {
 }
 
 impl Store {
+    /// Cache namespace for this physical store file. The persisted lineage
+    /// survives a copy; the file identity keeps live copies from sharing a
+    /// provider cache lane while preserving affinity across daemon restarts.
+    pub fn instance_identity(&self, lineage: i64) -> Result<u128> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(self.path.as_path())?;
+            let mut input = [0u8; 24];
+            input[..8].copy_from_slice(&lineage.to_be_bytes());
+            input[8..16].copy_from_slice(&metadata.dev().to_be_bytes());
+            input[16..].copy_from_slice(&metadata.ino().to_be_bytes());
+            let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &input);
+            Ok(u128::from_be_bytes(hash.as_ref()[..16].try_into().unwrap()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = lineage;
+            crate::fail("store_platform_unsupported")
+        }
+    }
+
     /// Open the store and its publication stream. The worker publishes
     /// what each job committed, in commit order, before taking the next
     /// job; the stream is bounded, so a publisher that stops reading

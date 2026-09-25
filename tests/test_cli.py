@@ -275,6 +275,7 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', 'other=responses,http://127.0.0.1:1/v1'), '--provider other: not registered'),
                              (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
+                             (('--max-detached', '2'), '--max-detached'),
                              (('--max-pending', '5'), '--max-pending'),
                              (('--note-turns', '5'), '--note-turns'),
                              (('--retain-turns', '2'), '--retain-turns')):

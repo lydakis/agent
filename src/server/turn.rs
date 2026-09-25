@@ -129,24 +129,21 @@ fn item_chunks(
 }
 
 /// The Responses prompt-cache key for a bot's calls: the store id of the bot
-/// whose cache it shares (its own, or a fork's source) under a nonce drawn
-/// once per daemon, so bots of different stores (every Harbor
-/// container's first bot is id 1) never share a key. A restart costs each bot
-/// one cache miss. Summaries have their own prefix, so their own key.
-fn cache_key(bot: i64, summary: bool) -> String {
-    use std::hash::BuildHasher;
-    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let nonce = *NONCE.get_or_init(|| {
-        std::collections::hash_map::RandomState::new().hash_one(std::process::id())
-    });
+/// whose cache it shares (its own, or a fork's source) under the store's
+/// identity, so bots of different stores (every Harbor container's first
+/// bot is id 1) never share a key, and a daemon restart keeps every bot's
+/// cache affinity. Summaries have their own prefix, so their own key.
+fn cache_key(identity: u128, bot: i64, summary: bool) -> String {
     let suffix = if summary { "-summary" } else { "" };
-    format!("{nonce:016x}-{bot}{suffix}")
+    format!("{identity:032x}-{bot}{suffix}")
 }
 
 pub struct Turn {
     pub bot: String,
     pub turn: i64,
     pub store: Store,
+    /// The store's identity, for provider cache keys.
+    pub identity: u128,
     pub providers: Arc<HashMap<String, Provider>>,
     pub registry: Registry,
     pub hub: Hub,
@@ -203,6 +200,8 @@ struct Warm<'a> {
     reasoning: Option<&'a str>,
     tools: &'a serde_json::value::RawValue,
     context: &'a Context,
+    /// The call's fallback choice: a refresh renders the same request.
+    fallbacks: bool,
     after: std::time::Duration,
     /// When the cache was last read, by the call or a refresh.
     read_at: tokio::time::Instant,
@@ -994,6 +993,7 @@ impl Turn {
                     reasoning: record.reasoning.as_deref(),
                     tools: &tools,
                     context: &context,
+                    fallbacks: record.fallbacks,
                     after,
                     read_at,
                     stopped: false,
@@ -1097,7 +1097,11 @@ impl Turn {
         let prior_spent =
             std::time::Duration::from_millis(std::mem::take(&mut accounting.call_spent_ms));
         let paced_before = accounting.totals().1;
-        let cache_key = cache_key(record.cache_bot(), matches!(body, Body::Span(_)));
+        let cache_key = cache_key(
+            self.identity,
+            record.cache_bot(),
+            matches!(body, Body::Span(_)),
+        );
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context),
@@ -1112,6 +1116,7 @@ impl Turn {
                         reasoning: record.reasoning.as_deref(),
                         tools,
                         allow_tool_calls: matches!(body, Body::Window(_)),
+                        fallbacks: record.fallbacks,
                         cache_key: Some(&cache_key),
                         items,
                         chain: Some(self.chain(body)),
@@ -1362,6 +1367,7 @@ impl Turn {
         let (model, instructions) = (warm.model.to_owned(), warm.instructions.to_owned());
         let reasoning = warm.reasoning.map(str::to_owned);
         let tools = warm.tools.to_owned();
+        let fallbacks = warm.fallbacks;
         let items = self.items(warm.context);
         let sent = refresh.clone();
         let expires = warm.read_at + agent_runtime::provider::CACHE_LIFETIME;
@@ -1372,6 +1378,7 @@ impl Turn {
                 reasoning: reasoning.as_deref(),
                 tools: &tools,
                 allow_tool_calls: true,
+                fallbacks,
                 cache_key: None,
                 items,
                 chain: None,
@@ -1955,6 +1962,7 @@ mod tests {
                             created_by_id: None,
                             compaction_instructions: None,
                             compaction_model: None,
+                            fallbacks: false,
                         },
                     )?;
                     let turn = db
@@ -2016,6 +2024,7 @@ mod tests {
             .await;
         let (cancel, cancelled) = watch::channel(false);
         let task = Turn {
+            identity: 0,
             bot: "Bob".into(),
             turn,
             store: store.clone(),

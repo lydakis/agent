@@ -89,7 +89,8 @@ impl Refresh {
 /// Betas every Anthropic API request opts into: the thinking-binding check,
 /// dropping rather than failing on a mismatch (the drops are reported), and
 /// server-side fallbacks, which rerun a declined request on another model
-/// instead of ending the turn with a refusal. Bedrock takes only the first.
+/// instead of ending the turn with a refusal, which a bot opts into. Bedrock
+/// and bots that did not ask take only the first.
 const ANTHROPIC_BETAS: &str =
     "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01";
 const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
@@ -304,6 +305,8 @@ pub struct Request<'a> {
     pub tools: &'a RawValue,
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
+    /// Anthropic server-side fallbacks for a declined request; Bedrock has none.
+    pub fallbacks: bool,
     /// Groups calls that share a prefix for the Responses prompt cache. All
     /// bots share their leading instructions, so without a key their calls
     /// route by that prefix alone, pile onto the same cache machines and
@@ -668,7 +671,7 @@ impl Provider {
                         .reasoning
                         .filter(|_| !legacy_thinking(request.model))
                         .map(|level| json!({"effort":level})),
-                    fallbacks: (!self.bedrock).then_some("default"),
+                    fallbacks: (!self.bedrock && request.fallbacks).then_some("default"),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -738,7 +741,7 @@ impl Provider {
             .header("content-length", len)
             .header("accept", "application/json")
             .body(body);
-        let http = self.anthropic_headers(http, self.key.as_ref());
+        let http = self.anthropic_headers(http, self.key.as_ref(), request.fallbacks);
         if !refresh.send() {
             return fail("keep_warm_cancelled");
         }
@@ -803,10 +806,11 @@ impl Provider {
         &self,
         http: reqwest::RequestBuilder,
         key: Option<&String>,
+        fallbacks: bool,
     ) -> reqwest::RequestBuilder {
         let http = http.header("anthropic-version", "2023-06-01").header(
             "anthropic-beta",
-            if self.bedrock {
+            if self.bedrock || !fallbacks {
                 BEDROCK_BETAS
             } else {
                 ANTHROPIC_BETAS
@@ -931,7 +935,7 @@ impl Provider {
             .body(body);
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
-            (Family::Anthropic, key) => self.anthropic_headers(http, key),
+            (Family::Anthropic, key) => self.anthropic_headers(http, key, request.fallbacks),
             (Family::Responses, None) => http,
         };
         if let Some(account) = account {
@@ -1681,6 +1685,7 @@ mod tests {
                 reasoning: Some("high"),
                 tools: &none(),
                 allow_tool_calls: true,
+                fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -1710,6 +1715,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                fallbacks: true,
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
@@ -1722,6 +1728,25 @@ mod tests {
         assert!(text.contains("\"type\":\"adaptive\""));
         assert!(text.contains("\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}"));
         assert!(text.contains("\"fallbacks\":\"default\""));
+        // Off unless the bot asked: neither the field nor its beta header.
+        let plain = String::from_utf8(
+            provider
+                .prefix(&Request {
+                    model: "claude-sonnet-5",
+                    instructions: "",
+                    reasoning: None,
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    fallbacks: false,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                    route: None,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!plain.contains("fallbacks"), "{plain}");
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
         let legacy = provider
@@ -1731,6 +1756,7 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                fallbacks: true,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -1752,6 +1778,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -1776,6 +1803,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                fallbacks: false,
                 cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
@@ -1809,6 +1837,7 @@ mod tests {
                             reasoning: None,
                             tools,
                             allow_tool_calls: allow,
+                            fallbacks: false,
                             cache_key: None,
                             items: Items::empty(),
                             chain: None,
@@ -1889,6 +1918,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    fallbacks: false,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -1986,6 +2016,7 @@ mod tests {
                     reasoning: Some("high"),
                     tools: &none(),
                     allow_tool_calls: true,
+                    fallbacks: true,
                     cache_key: None,
                     items: Items::empty(),
                     chain: None,
@@ -2017,6 +2048,7 @@ mod tests {
             reasoning: Some("high"),
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2057,6 +2089,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2248,6 +2281,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2313,6 +2347,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                fallbacks: false,
                 cache_key: None,
                 items: Items::empty(),
                 chain: None,
@@ -2372,6 +2407,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2425,6 +2461,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2529,6 +2566,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: Some(Chain {
@@ -2623,6 +2661,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: Some(Chain {
@@ -2673,6 +2712,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2721,6 +2761,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2773,6 +2814,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
@@ -2824,6 +2866,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -2898,6 +2941,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -2945,6 +2989,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -2988,6 +3033,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                fallbacks: false,
                 items: Items::empty(),
                 chain: None,
                 route: None,
@@ -3022,6 +3068,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             items: Items::empty(),
             chain: None,
             route: None,
@@ -3068,6 +3115,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            fallbacks: false,
             cache_key: None,
             items: Items::empty(),
             chain: None,
