@@ -103,11 +103,19 @@ round boundary. When no round has finished yet, it is the turn's prompt.
   round's results are all in, that is the head itself, even while the next
   model call is in flight. So finding and proving the fork point reads
   only the newest round's items.
-- **Upgraded stores get a boundary once.** Waiting and paced turns are
-  restored at open and may already hold many rounds. The migration that
-  adds `bots.closed` walks each running turn once and stores its newest
-  closed node, so no fork has to fall back to a full scan. An upgrade test
-  covers a parked turn with several finished rounds.
+- **Upgraded stores get a boundary without reading transcripts.** Waiting
+  and paced turns are restored at open and may already hold many rounds.
+  The migration that adds `bots.closed` sets each running turn's boundary
+  to its prompt, which is one lookup in the `nodes_turn` index per turn.
+  The prompt is closed because `finish` answers every open call
+  (db.rs:2488), so a turn always starts on a closed head. A fork that
+  proves a newer closed node moves its source's boundary there, in the
+  transaction it already writes. So a turn from before the upgrade pays
+  one longer scan, bounded by `MAX_ROUNDS`, only when it is first forked.
+  An upgrade test opens a store with thousands of parked turns and checks
+  that open reads no items, then forks a parked turn with several finished
+  rounds twice and checks that the second fork reads only the newest
+  round.
 - **The fork keeps its source's window.** Today a fork's `context_start` is
   the carried compaction's cut, or NULL (db.rs:2978). The fork's first call
   then picks a new start at three quarters of the budget, which differs from
@@ -198,17 +206,17 @@ live came from the wrong fork point, not from missing framing.
 
 ## What changes, in order
 
-1. **Store:** record `bots.closed` each round and backfill it for running
-   turns, fork at the newest closed node when no checkpoint is given, and
-   report it in `forked`. Copy the source's window start as section 1
-   describes. Scope process handles, and the artifacts processes store, to
-   the bot that started them. Add store contract tests for a running turn,
-   a parked turn, a turn with no finished round, a fork while the next
-   model call is in flight, a fork of oneself, a fork that waits on an
-   inherited `proc:N`, a fork that tries to read a large-output process's
-   streams after it finishes, and a fork of a turn at `MAX_ROUNDS` whose
-   validation reads only the newest round. Add an upgrade test for a
-   parked turn with several finished rounds.
+1. **Store:** record `bots.closed` each round, and set it to the prompt of
+   each turn running at upgrade. Fork at the newest closed node when no
+   checkpoint is given, and report it in `forked`. Copy the source's window
+   start as section 1 describes. Scope process handles, and the artifacts
+   processes store, to the bot that started them. Add store contract tests
+   for a running turn, a parked turn, a turn with no finished round, a fork
+   while the next model call is in flight, a fork of oneself, a fork that
+   waits on an inherited `proc:N`, a fork that tries to read a large-output
+   process's streams after it finishes, and a fork of a turn at
+   `MAX_ROUNDS` whose validation reads only the newest round. Add the
+   upgrade test above.
 2. **Store and daemon:** add `allow` and the nullable `bots.allowed`, with
    refusal at dispatch. Test that the fork's first request repeats the
    source's last request byte for byte up to the source's newest item:
