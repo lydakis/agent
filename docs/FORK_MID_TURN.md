@@ -181,10 +181,18 @@ turn's prompt.
 - **Inherited process handles are unavailable.** A finished round can hold a
   background shell's `proc:N` result while that process still runs. Today
   `proc:N` resolves by process id store-wide, so a fork that waits on it gets
-  its source's result (NEXT.md item 39 names the same gap). Process handles
-  must be scoped to the bot that started them, and an inherited one answered
-  as unavailable, before this default ships. Peer `turn:BOT/N` handles name
-  another bot's turn and stay valid.
+  its source's result (NEXT.md item 39 names the same gap). A bot's `wait`
+  tool must resolve a `proc:N` only when the calling bot started that
+  process, and answer an inherited one as unavailable, before this default
+  ships. The tool path knows its caller, and each `processes` row records
+  its turn, whose bot is the owner, so no new handle format is needed. The
+  `wait` protocol op and `agent wait` keep resolving any `proc:N`, as
+  RUST_PROTOTYPE.md promises: their caller is a program, not a bot, and the
+  handle it was given is its capability. This is not a sandbox. A bot's
+  shell can reach the socket, as it can today, and `agent wait` inside a
+  shell tool is already refused. The scoping only stops a fork from
+  inheriting its source's results by accident. Tests cover both paths.
+  Peer `turn:BOT/N` handles name another bot's turn and stay valid.
 - **So is the output a process stores when it finishes.** `process_finish`
   (db.rs:2772) stores a background process's large streams under the call
   that started it. `authorize_artifact` (db.rs:3580) lets any branch whose
