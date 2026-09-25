@@ -18,10 +18,25 @@ mod socket;
 pub use pace::Report;
 pub use socket::Sockets;
 
-/// Encoded bytes one response may stream. A full 128,000-token Claude answer
-/// runs about 512 KiB of JSON-escaped text; the bound stays under the 1 MiB
-/// event cap so every stored item remains readable.
+/// JSON-encoded bytes one response may stream. A full 128,000-token Claude
+/// answer runs about 512 KiB; the bound stays under the 1 MiB event cap so
+/// every stored item and live event remains publishable and readable.
 pub const MAX_OUTPUT: usize = 768 * 1024;
+
+/// The bytes `text` takes as a JSON string body, as serde_json escapes it.
+/// Decoded text can grow up to sixfold when encoded, so output bounds count
+/// this rather than the decoded length.
+pub(crate) fn encoded_len(text: &str) -> usize {
+    text.len()
+        + text
+            .bytes()
+            .map(|b| match b {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 1,
+                0..=0x1f => 5,
+                _ => 0,
+            })
+            .sum::<usize>()
+}
 
 /// Concurrent streams one HTTP/2 connection may carry, as both current
 /// providers advertise in SETTINGS_MAX_CONCURRENT_STREAMS. Requests beyond
@@ -1191,6 +1206,18 @@ mod tests {
     use crate::codec::Family;
     fn none() -> Box<RawValue> {
         RawValue::from_string("[]".into()).unwrap()
+    }
+
+    #[test]
+    fn encoded_len_matches_serde_escaping() {
+        let text: String = (0u8..0x80)
+            .map(char::from)
+            .chain("é\u{2028}😀".chars())
+            .collect();
+        assert_eq!(
+            encoded_len(&text),
+            serde_json::to_string(&text).unwrap().len() - 2
+        );
     }
 
     #[test]

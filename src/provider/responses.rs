@@ -3,7 +3,7 @@
 //! those streamed as `response.output_item.done`, kept once and moved into the
 //! completion; the terminal output stands in only when none streamed. The
 //! ChatGPT Codex endpoint streams items and leaves the terminal output empty.
-use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of};
+use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of, encoded_len};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -25,6 +25,8 @@ struct Event<'a> {
 #[derive(Default)]
 pub struct State {
     text: String,
+    /// JSON-encoded bytes of the streamed text and reasoning summaries.
+    text_bytes: usize,
     thinking: usize,
     items: Vec<Bytes>,
     item_bytes: usize,
@@ -43,7 +45,8 @@ impl State {
         match event.kind {
             "response.output_text.delta" => {
                 let part = event.delta.ok_or(Error::new("missing_text_delta"))?;
-                if self.text.len() + self.thinking + part.len() > MAX_OUTPUT {
+                self.text_bytes += encoded_len(&part);
+                if self.text_bytes + self.thinking > MAX_OUTPUT {
                     return fail("output_limit");
                 }
                 self.text.push_str(&part);
@@ -51,8 +54,8 @@ impl State {
             }
             "response.reasoning_summary_text.delta" => {
                 let part = event.delta.ok_or(Error::new("missing_text_delta"))?;
-                self.thinking += part.len();
-                if self.text.len() + self.thinking > MAX_OUTPUT {
+                self.thinking += encoded_len(&part);
+                if self.text_bytes + self.thinking > MAX_OUTPUT {
                     return fail("output_limit");
                 }
                 Ok(Frame::Delta(Delta::Thinking(part.into_owned())))

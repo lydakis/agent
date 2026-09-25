@@ -538,7 +538,7 @@ or stringify the full conversation on each turn. Provider HTTP/TLS comes from
 transactions from [rusqlite](https://docs.rs/rusqlite/0.40.2/rusqlite/).
 
 Current limits: 8 MiB / 4,096 items of model context per request (stored
-history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB terminal provider output
+history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB JSON-encoded terminal provider output
 (a full 128,000-token answer, under the 1 MiB event cap), 2 MiB SSE frame,
 16 MiB response stream, 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
