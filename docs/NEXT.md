@@ -683,6 +683,19 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap, with a
     prompt cache key in both arms. Open: lanes to share a connection among
     bots, pacing without per-call headers, and HTTP after a failed upgrade.
+41. Several daemons, moving bots, and watching them: the
+    [provisional roadmap](MULTI_DAEMON.md) separates shared durability,
+    identity, admission, and execution-ownership contracts from later
+    mechanisms. Nothing is built. The next implementation is
+    [bounded observation within one daemon](MULTI_DAEMON.md#phase-1-bounded-observation-in-one-daemon):
+    a separate observer reader, bounded admission and output through socket
+    delivery, bounded live fan-out, and ordered replay handoffs. Behavior
+    tests and the predeclared CPU, memory, and tail-latency gates come before
+    summary reads and client digests. Store identity and multi-daemon clients
+    follow; cross-store forks, drain/move, and group moves remain separate
+    provisional phases. Their open design questions do not block observation.
+    One daemon per user stays the default until a matched screen supports
+    changing it. Placement, file copying, and transport remain with callers.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
