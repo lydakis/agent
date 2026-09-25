@@ -91,10 +91,17 @@ overwriting a live store's file in place is unsupported. The store runs
 in WAL mode, so the main file alone is not a restore boundary: after an
 unclean stop, a `-wal` file left beside it can hold committed frames that
 SQLite would replay into the restored file, bringing back turns, events,
-or move nonces the backup discarded. The helper therefore takes the
-owner lock (so no daemon has the store open), writes the backup as one
-self-contained file, removes the old `-wal` and `-shm`, and only then
-renames the backup over the store. Anything that must
+or move nonces the backup discarded. Deleting that WAL is no answer
+either: a crash between the delete and the rename would reopen the old
+store without its committed frames. So the helper takes the owner lock
+(so no daemon has the store open), writes the backup beside the store
+as one self-contained file and syncs it, then opens the old store and
+checkpoints its WAL fully into the main file with a truncating
+checkpoint, syncs, and only then renames the backup over the store and
+syncs the directory. A crash before the rename leaves the old store
+whole, since its committed frames are already in its main file; a
+crash after it leaves the restored store beside an empty WAL. Neither
+state replays frames into the wrong file or drops committed ones. Anything that must
 name exactly one store, such as a client's state key or a move's
 destination, uses the instance id. A block-level clone of a whole disk or
 machine keeps device, inode, and sidecar and is not detected either; both
@@ -629,7 +636,12 @@ carrying it over.
 3. **Renumbering at import.** Node, turn, bot, process, and event ids are
    per-store sequences, so import allocates fresh ones and rewrites every
    reference: parents, head, context start, note and compaction chains,
-   cuts, checkpoints, and each turn's `prompt_node`. It also rewrites the
+   cuts, checkpoints, each turn's `prompt_node`, and every other column
+   that holds one of those ids: `nodes.turn`, the unique link from a
+   turn to its prompt node (at `4e6b6bb`: `src/store/db.rs:407-411`),
+   while the lineage-local `turn_seq` stays as it is, and the `turn`
+   columns of `events`, `tools`, `processes`, `artifacts`, and
+   `retained_turns`. It also rewrites the
    ids inside the payloads of the events the bundle carries, because
    `result` returns that data as it is: a finished turn's
    `turn_finished.data.checkpoint` (at `e1d413f`: `src/store/db.rs:2441`),
@@ -930,7 +942,9 @@ carrying it over.
 
 1. Store identity, lineage and instance. Behavior tests: a restart keeps
    the instance, a restore through the helper over a store with an
-   uncheckpointed WAL keeps none of the discarded frames, and a copied
+   uncheckpointed WAL keeps none of the discarded frames, a crash
+   injected at each step of the helper leaves either the whole old store
+   or the whole restored one, and a copied
    store file, a restore through the helper,
    and a restore of a backup from an earlier instance each announce a new
    one.
@@ -978,7 +992,8 @@ carrying it over.
    source restart and resumes at the target
    under its mapped workspace and checked model, a drained turn that ran
    several rounds before the move has its prompt and each round in the
-   target transcript exactly once, and a move whose bot is
+   target transcript exactly once, including into a target whose turn ids
+   overlap the source's, with `history_nodes` naming target turns, and a move whose bot is
    awaited by a source parent is refused. A client `wait` registered
    before the move and one sent after the receipt are both answered with
    `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
