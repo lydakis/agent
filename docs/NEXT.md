@@ -689,8 +689,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     several daemons, and moving a bot to another machine. Nothing is built.
     All four share one first step, a store identity announced in `ready`,
     because every id the daemon hands out today is per store. The roadmap
-    orders them by how much new semantics each needs, starting with a read
-    of the compaction summary and a client-side digest. Moving a bot starts
+    orders them by how much new semantics each needs. After the identity,
+    the first step is a separate observer reader carrying every observe
+    read, so that watching never competes with the storage worker or the
+    context reader; the compaction-summary read and a client-side digest
+    come after it. Moving a bot starts
     as a cross-store fork before any move semantics. Placement, file copying,
     and network transport stay with callers and SSH, as the README's scope
     says.

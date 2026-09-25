@@ -598,9 +598,18 @@ carrying it over.
      a process result is looked up by id alone (`src/store/db.rs:2444`). An
      origin `proc:` handle that collides with a target process would
      resolve to that unrelated process, and an alias "for an imported bot"
-     has no bot to select it by. Handles need a store-qualified form before
-     imported transcripts can carry them. Until then, import refuses a bot
-     whose transcript holds handles, and names them.
+     has no bot to select it by. A store-qualified form, naming the
+     instance that issued the handle, makes that collision detectable but
+     does not make the handle resolve: the destination holds the copied
+     record under a new id, and no daemon asks another. So import also
+     writes an alias for each handle in the transcript, from the
+     origin-qualified handle to the local one: a `turn:` handle through
+     import's turn renumbering, a `proc:` handle to the carried process result. The
+     destination's handle lookup consults the aliases when a handle names
+     another instance. A handle whose record did not travel, such as a
+     child that stayed behind, fails the import with the handle named.
+     Until qualified handles and aliases exist, import refuses a bot whose
+     transcript holds handles, and names them.
    - Turn ordinals, which the `history` tool uses, are per lineage and
      survive unchanged.
 4. **Import checks the local configuration before accepting.** The target
@@ -669,10 +678,15 @@ carrying it over.
    and the imported bot's name and id. The name matters because import may
    use a new name to avoid a collision, and retrying the old name at the
    destination could reach a different bot. Import renumbers turns, so the
-   receipt also maps each unfinished source turn to its target turn id,
-   and the tombstone keeps that map. A waiter on `turn:BOT/N` then gets the
+   receipt also maps every carried source turn, finished or not, to its
+   target turn id, and the tombstone keeps that map. Import inserts the
+   turns in source order in one transaction on the only writer, so the
+   target ids form one consecutive run, and the map is the ordered source
+   ids plus the first target id. A waiter on `turn:BOT/N` then gets the
    target handle for its own turn in `bot_moved` and can resume its wait
-   there. A later request naming the bot, whether a submission or a `wait`
+   there, and `result` for a moved turn answers the same way, so a client
+   retrying after a reconnect can find a turn that finished before the
+   move. A later request naming the bot, whether a submission or a `wait`
    on one of its turn handles, is answered with the same `bot_moved`, never
    `bot_not_found`, a fresh bot, or a wait on a turn that will never
    finish. `wait` registers its waiters and then settles each handle from
@@ -804,8 +818,11 @@ carrying it over.
    handle or artifact reference in the transcript, or a running process
    each fail the export or import explicitly.
 3. The alias decision for artifact references, with a test that reads one
-   written before the move, and store-qualified handles, so that bots with
-   retained tool output or delegation can move. Until this step, the
+   written before the move, and store-qualified handles with import-time
+   handle aliases, with a test that an imported bot's `wait` on a
+   `turn:` and a `proc:` handle from before the move resolves at the
+   destination, so that bots with retained tool output or delegation can
+   move. Until this step, the
    first slice refuses every bot with a retained artifact, because a
    tool result always names its retained streams as `TURN/CALL_ID/STREAM`
    in the stored item (`src/server/turn.rs:1423-1440`).
@@ -822,7 +839,8 @@ carrying it over.
    awaited by a source parent is refused. A client `wait` registered
    before the move and one sent after the receipt are both answered with
    `bot_moved` carrying the target handle of the awaited turn, `bot_moved`
-   names a renamed destination bot, and a follower attached before the move
+   names a renamed destination bot, `result` on a turn that finished
+   before the move names its target handle, and a follower attached before the move
    receives the `bot_moved` event. A paced turn resumes at the target with a
    fresh per-call retry budget.
 7. Moving a parent together with the children it waits on.
@@ -853,7 +871,8 @@ the caller's job.
 - Should artifact references in an imported transcript resolve through an
   alias, or fail honestly? The alias keeps old tool results readable after a
   move. Failing keeps the store free of a translation layer. Handles are not
-  part of this choice: they need a store-qualified form either way.
+  part of this choice: they need a store-qualified form and an alias
+  either way, since delegation depends on waiting on them.
 - Should per-workspace daemons become a default for the app, or stay an
   opt-in for failure isolation? The one-versus-N screen should come first.
 - Does a model-written summary belong to the observer (a tool-less fork it
