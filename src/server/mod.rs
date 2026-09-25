@@ -179,6 +179,9 @@ pub struct ProviderSpec {
     pub chatgpt_login: bool,
     /// Carry Responses calls over WebSocket (family `responses-ws`).
     pub socket: bool,
+    /// A Bedrock endpoint with no key variable signs with SigV4 and the
+    /// AWS credential chain.
+    pub sigv4: bool,
 }
 impl ProviderSpec {
     /// How calls reach the provider, as `ready.providers` reports it.
@@ -189,7 +192,14 @@ impl ProviderSpec {
     /// variable is read only when named here or implied by a default endpoint.
     /// `chatgpt` at its default endpoint without a key variable uses Codex's
     /// saved ChatGPT login; the login never goes to a caller-chosen URL.
+    /// `bedrock` (Claude) and `bedrock-openai` default to Bedrock Mantle in
+    /// `AWS_REGION`, or `AWS_DEFAULT_REGION`; any Bedrock URL without a key
+    /// variable signs with SigV4, and one with a key variable sends it as a
+    /// Bedrock API key.
     pub fn parse(spec: &str) -> Result<Self> {
+        Self::parse_with(spec, &|name| std::env::var(name).ok())
+    }
+    fn parse_with(spec: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let (name, rest) = spec.split_once('=').unwrap_or((spec, ""));
         let mut fields = rest.split(',').filter(|s| !s.is_empty());
         let (family, url, key) = fields.next().map(|f| f.to_owned()).map_or_else(
@@ -219,8 +229,33 @@ impl ProviderSpec {
                 Some("OPENROUTER_API_KEY"),
             ),
             "chatgpt" => ("responses", "https://chatgpt.com/backend-api/codex", None),
+            "bedrock" => (
+                "anthropic",
+                "https://bedrock-mantle.{region}.api.aws/anthropic/v1",
+                None,
+            ),
+            "bedrock-openai" => (
+                "responses",
+                "https://bedrock-mantle.{region}.api.aws/openai/v1",
+                None,
+            ),
             _ => ("", "", None),
         };
+        let default_url = if default_url.contains("{region}") && url.is_none() {
+            let region = env("AWS_REGION")
+                .or_else(|| env("AWS_DEFAULT_REGION"))
+                .filter(|region| !region.is_empty())
+                .ok_or_else(|| {
+                    Error::with(
+                        "invalid_provider_spec",
+                        format!("{spec}: set AWS_REGION or give the endpoint URL"),
+                    )
+                })?;
+            default_url.replace("{region}", &region)
+        } else {
+            default_url.to_owned()
+        };
+        let default_url = default_url.as_str();
         let family = family.as_deref().unwrap_or(default_family);
         let (family, socket) = match family {
             "responses-ws" => ("responses", true),
@@ -240,7 +275,25 @@ impl ProviderSpec {
         if name.is_empty() || name.len() > 64 || split_model(&format!("{name}/x")).is_err() {
             return fail_with("invalid_provider_spec", spec);
         }
+        let parsed = reqwest::Url::parse(&url).ok();
+        let bedrock = parsed
+            .as_ref()
+            .and_then(agent_runtime::provider::aws::endpoint)
+            .is_some();
+        // Bedrock serves Responses over HTTP only.
+        if bedrock && socket {
+            return fail_with("invalid_provider_spec", spec);
+        }
+        // Every Bedrock request carries a signature or key and the whole
+        // conversation, so none leaves over cleartext.
+        if bedrock && parsed.is_some_and(|url| url.scheme() != "https") {
+            return Err(Error::with(
+                "invalid_provider_spec",
+                format!("{spec}: Bedrock endpoints need https"),
+            ));
+        }
         Ok(Self {
+            sigv4: bedrock && key_env.is_none(),
             chatgpt_login: name == "chatgpt" && key_env.is_none() && url == default_url,
             name: name.to_owned(),
             family,
@@ -479,9 +532,17 @@ pub async fn run(config: Configuration) -> Result<()> {
         if let Some(login) = login {
             provider = provider.with_login(login)?;
         }
-        if let Some(cap) = config.max_output_tokens
-            && spec.family == Family::Responses
-        {
+        let mut auth = None;
+        if spec.sigv4 {
+            let url =
+                reqwest::Url::parse(&spec.url).map_err(|_| Error::new("invalid_provider_url"))?;
+            let aws =
+                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone())).await?;
+            auth = Some(json!({"auth":"sigv4","region":aws.region(),
+                "credentials":aws.source()}));
+            provider = provider.with_aws(Arc::new(aws))?;
+        }
+        if let Some(cap) = config.max_output_tokens {
             provider = provider.with_max_output_tokens(cap)?;
         }
         if spec.socket {
@@ -491,11 +552,12 @@ pub async fn run(config: Configuration) -> Result<()> {
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
-        bindings.insert(
-            spec.name.clone(),
-            json!({"family":spec.family.name(),"url":spec.url,
-                "transport":spec.transport()}),
-        );
+        let mut binding = json!({"family":spec.family.name(),"url":spec.url,
+            "transport":spec.transport()});
+        if let Some(Value::Object(auth)) = auth {
+            binding.as_object_mut().expect("object").extend(auth);
+        }
+        bindings.insert(spec.name.clone(), binding);
     }
     if providers.is_empty() {
         return fail("no_providers");
@@ -1573,6 +1635,63 @@ mod tests {
             parsed.url,
             parsed.key_env,
         )
+    }
+
+    #[test]
+    fn bedrock_specs_default_to_mantle_in_the_aws_region_and_sign() {
+        let region = |name: &str| (name == "AWS_REGION").then(|| "us-east-1".to_owned());
+        let parse = |spec: &str| ProviderSpec::parse_with(spec, &region).unwrap();
+        let claude = parse("bedrock");
+        assert_eq!(claude.family, Family::Anthropic);
+        assert_eq!(
+            claude.url,
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1"
+        );
+        assert!(claude.sigv4 && claude.key_env.is_none());
+        let openai = parse("bedrock-openai");
+        assert_eq!(openai.family, Family::Responses);
+        assert_eq!(
+            openai.url,
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+        );
+        assert!(openai.sigv4);
+        // AWS_DEFAULT_REGION is the fallback name the AWS CLI also reads.
+        let fallback = |name: &str| (name == "AWS_DEFAULT_REGION").then(|| "eu-west-1".to_owned());
+        assert_eq!(
+            ProviderSpec::parse_with("bedrock", &fallback).unwrap().url,
+            "https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1"
+        );
+        let error = ProviderSpec::parse_with("bedrock", &|_| None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_provider_spec");
+        // Any Bedrock URL signs, runtime included; a key variable is sent as
+        // a Bedrock API key instead.
+        let runtime =
+            parse("br=anthropic,https://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1");
+        assert!(runtime.sigv4);
+        let keyed = parse(
+            "mantle=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK",
+        );
+        assert!(!keyed.sigv4);
+        assert_eq!(keyed.key_env.as_deref(), Some("AWS_BEARER_TOKEN_BEDROCK"));
+        assert!(!parse("anthropic").sigv4);
+        // Bedrock has no WebSocket transport.
+        assert!(
+            ProviderSpec::parse_with(
+                "b=responses-ws,https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+                &region
+            )
+            .is_err()
+        );
+        // Nor any cleartext one, signed or keyed.
+        for spec in [
+            "b=anthropic,http://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1",
+            "b=responses,http://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK",
+        ] {
+            let error = ProviderSpec::parse_with(spec, &region).err().unwrap();
+            assert_eq!(error.code, "invalid_provider_spec");
+        }
     }
 
     #[test]

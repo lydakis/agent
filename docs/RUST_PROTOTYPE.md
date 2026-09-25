@@ -94,9 +94,13 @@ environment keys never conflict; a stated provider must be registered with the
 same family and URL. Limit comparisons
 use effective values: `--idle-exit 0` disables idle exit, and positive context
 limits below 1,024 bytes or two items are raised to those minimums.
-Providers are selected explicitly with `--provider`, or implied by which of the
-well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`)
-are set. No other credential discovery happens. `--no-spawn` refuses to start a
+Providers are selected explicitly with `--provider`; otherwise by
+`AGENT_PROVIDER`, which holds the same specs separated by whitespace (a spec
+contains commas), such as `AGENT_PROVIDER="chatgpt bedrock"`; otherwise by which
+of the well-known key variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+`OPENROUTER_API_KEY`) are set. Like `AGENT_MODEL`, `AGENT_PROVIDER` is a default
+for starting a daemon: a running daemon is not checked against it, since every
+bot's shell inherits the daemon's environment. No other credential discovery happens. `--no-spawn` refuses to start a
 daemon. Default tools are `shell,read,write,edit,wait,history`; `note`, the
 carry-forward note, is in the universe and chosen per bot.
 
@@ -298,8 +302,8 @@ bound; the operating system is then the only limit.
 | `--max-active` | Turns with a live task: a model call in flight or a foreground tool. Parked turns never count. | 4,096 |
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
-| `--max-connecting` | Provider requests awaiting response headers. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--max-output-tokens` | Generated tokens per Responses call, including reasoning. Anthropic calls use the model's full output limit. | none |
+| `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
+| `--max-output-tokens` | Generated tokens per model call, including reasoning. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
@@ -332,8 +336,8 @@ A model reference is `PROVIDER/MODEL`. A provider spec is
 
 | Family | Protocol | Defaults |
 | --- | --- | --- |
-| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login |
-| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY` |
+| `responses` | OpenAI Responses API, streaming SSE | `openai` → `https://api.openai.com/v1`, `OPENAI_API_KEY`; `openrouter` → `https://openrouter.ai/api/v1`, `OPENROUTER_API_KEY`; `chatgpt` → `https://chatgpt.com/backend-api/codex`, Codex's ChatGPT login; `bedrock-openai` → `https://bedrock-mantle.$AWS_REGION.api.aws/openai/v1`, SigV4 |
+| `anthropic` | Anthropic Messages API, streaming SSE | `anthropic` → `https://api.anthropic.com/v1`, `ANTHROPIC_API_KEY`; `bedrock` → `https://bedrock-mantle.$AWS_REGION.api.aws/anthropic/v1`, SigV4 |
 
 The family `responses-ws` is the Responses API over a WebSocket per bot,
 continuing from the bot's previous response where it can; for example
@@ -347,6 +351,32 @@ variable is read only when it is named in the spec or implied by a default
 endpoint; a custom URL without a key field sends no credential. Compatibility
 requires the request fields and streaming subset implemented by this adapter;
 the family label alone does not establish support for an arbitrary gateway.
+
+Amazon Bedrock serves both families, so a Bedrock binding is a base URL and
+a way to authenticate; [BEDROCK.md](BEDROCK.md) records the survey and the
+choices. `bedrock` and `bedrock-openai` take the region from `AWS_REGION`, or
+`AWS_DEFAULT_REGION`, and fail at startup naming the spec when neither is set.
+Any `bedrock-mantle.{region}.api.aws` or `bedrock-runtime.{region}.amazonaws.com`
+URL without a key field signs every request with SigV4, for example
+`--provider br=anthropic,https://bedrock-runtime.us-west-2.amazonaws.com/anthropic/v1`
+with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
+its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
+`AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
+`AWS_PROFILE` or the default profile, SSO and assumed roles included, through
+`aws configure export-credentials`. Temporary keys are re-resolved in the
+background five minutes before they expire, at most every ten seconds, and
+once on a 401 or 403, which retries the call as `provider_login_refreshed`;
+Bedrock URLs must be https; the key id, secret and session token are
+redacted from tool output and, from the environment, kept out of shells. Mantle takes
+the body unsigned; runtime signs its SHA-256, so a runtime call reads its
+history from the store twice, once to digest it and once as it streams. A key field
+instead sends a Bedrock API key the family's own way, as
+`--provider b=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK`;
+short-term API keys last at most twelve hours and are read once. Bedrock has no
+WebSocket transport, so `responses-ws` is refused for it. Bedrock publishes no
+rate-limit headers, so its pools learn no allowance and are paced by refusals
+alone: a 429 naming no delay closes the pool for a second, doubling to 32 while
+refusals continue, until a call's stream completes.
 
 `--provider chatgpt` uses a ChatGPT plan instead of an API key. Codex's own
 source (openai/codex `15922a5`, read 2026-09-23) shows that, when signed in with
@@ -479,7 +509,8 @@ clients can price them per model; its totals are their sum. A refusal that
 survives the fallbacks still fails the turn with `provider_refusal`, with the
 models it switched to, the refusal category and any recommended retry model as
 its detail. Bedrock,
-Vertex and Foundry do not offer server-side fallback. Observed 2026-09-24:
+Vertex and Foundry do not offer server-side fallback, so Bedrock requests send
+neither the field nor its beta header. Observed 2026-09-24:
 `claude-sonnet-5`, `claude-haiku-4-5` and `claude-sonnet-4-5` accept the field,
 and `claude-opus-5-5`, `claude-opus-5` and `claude-fable-5-1` answer normally
 with it set; a live refusal was not reproduced, so the fallback path is covered
@@ -498,7 +529,8 @@ nothing until it is used ([rate limits](https://platform.claude.com/docs/en/api/
 read 2026-09-25). The 128,000 and 64,000 values for current models come from the
 [models overview](https://platform.claude.com/docs/en/about-claude/models/overview),
 read 2026-09-25; the older values are Anthropic's published figures for those
-models, not re-read on that date. Known legacy Claude ids (Haiku 4.5, 4.5 and
+models, not re-read on that date. Bedrock ids are read for the Claude model
+they name, and `--max-output-tokens` replaces the limit when set. Known legacy Claude ids (Haiku 4.5, 4.5 and
 older) instead get the budget form with 2,048, 8,192, or 16,384 tokens, kept
 below `max_tokens`, since current models reject budgets and older ones require
 them. Reasoning summaries and thinking stream as

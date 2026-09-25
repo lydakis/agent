@@ -102,6 +102,9 @@ running daemon is never reconfigured: a stated startup flag it does not match
 fails the command with `daemon_configuration_mismatch` naming the difference.
 Comparison uses effective limits: `--idle-exit 0` means disabled, and positive
 context limits are clamped to at least 1,024 bytes and two items.
+With no `--provider`, a started daemon takes `AGENT_PROVIDER` (the same specs,
+separated by whitespace), else the providers whose key variable is set; a
+running daemon is not checked against either.
 `run --model` names a new bot's model or an existing bot's turn model; the
 daemon has no model of its own, so a new bot needs `--model` or `AGENT_MODEL`.
 `AGENT_MODEL` is only a creation default. An existing bot uses its stored

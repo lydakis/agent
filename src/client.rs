@@ -250,18 +250,30 @@ fn parse(args: &[String]) -> Result<Options> {
         None => crate::client_path::default_socket(&options.store)?,
     };
     if options.providers.is_empty() {
-        // Well-known provider keys already in the environment select providers.
-        for (name, env) in [
-            ("anthropic", "ANTHROPIC_API_KEY"),
-            ("openai", "OPENAI_API_KEY"),
-            ("openrouter", "OPENROUTER_API_KEY"),
-        ] {
-            if std::env::var_os(env).is_some_and(|v| !v.is_empty()) {
-                options.providers.push(name.into());
-            }
-        }
+        options.providers = environment_providers(&|name| std::env::var(name).ok());
     }
     Ok(options)
+}
+
+/// The providers a daemon starts with when no `--provider` is given:
+/// `AGENT_PROVIDER`, `--provider` specs separated by whitespace since a spec
+/// holds commas; otherwise those whose well-known key variable is set. Like
+/// `AGENT_MODEL`, they are defaults: a running daemon is not checked against
+/// them, since every shell a bot runs inherits the daemon's environment.
+fn environment_providers(var: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let set = |name| var(name).filter(|value| !value.trim().is_empty());
+    if let Some(specs) = set("AGENT_PROVIDER") {
+        return specs.split_whitespace().map(str::to_owned).collect();
+    }
+    [
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+    ]
+    .into_iter()
+    .filter(|(_, key)| set(key).is_some())
+    .map(|(name, _)| name.to_owned())
+    .collect()
 }
 
 struct Connection {
@@ -409,16 +421,20 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             } else if running["family"] != requested.family.name()
                 || running["url"] != requested.url
                 || running["transport"] != requested.transport()
+                || (running["auth"] == "sigv4") != requested.sigv4
             {
+                let signed = |sigv4| if sigv4 { " signed with SigV4" } else { "" };
                 differences.push(format!(
-                    "--provider {}: requested {},{} over {} but daemon has {},{} over {}",
+                    "--provider {}: requested {},{} over {}{} but daemon has {},{} over {}{}",
                     requested.name,
                     requested.family.name(),
                     requested.url,
                     requested.transport(),
+                    signed(requested.sigv4),
                     running["family"].as_str().unwrap_or(""),
                     running["url"].as_str().unwrap_or(""),
-                    running["transport"].as_str().unwrap_or("")
+                    running["transport"].as_str().unwrap_or(""),
+                    signed(running["auth"] == "sigv4")
                 ));
             }
         }
@@ -493,7 +509,7 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
     if options.providers.is_empty() {
         return fail_with(
             "usage",
-            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, or NAME=FAMILY,URL,KEY_ENV) or export a provider key",
+            "no provider: pass --provider (anthropic, openai, openrouter, chatgpt, bedrock, bedrock-openai, or NAME=FAMILY,URL,KEY_ENV), set AGENT_PROVIDER, or export a provider key",
         );
     }
     if let Some(parent) = options.store.parent() {
@@ -1217,6 +1233,70 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_provider_names_the_providers_in_place_of_key_variables() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let keys = &[("ANTHROPIC_API_KEY", "k"), ("OPENAI_API_KEY", "k")];
+        assert_eq!(environment_providers(&env(keys)), ["anthropic", "openai"]);
+        assert_eq!(
+            environment_providers(&env(&[
+                (
+                    "AGENT_PROVIDER",
+                    " bedrock  b=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1\n"
+                ),
+                ("ANTHROPIC_API_KEY", "k"),
+            ])),
+            [
+                "bedrock",
+                "b=anthropic,https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1"
+            ]
+        );
+        assert_eq!(
+            environment_providers(&env(&[("AGENT_PROVIDER", " "), ("OPENAI_API_KEY", "k")])),
+            ["openai"]
+        );
+        assert!(environment_providers(&env(&[("OPENAI_API_KEY", "")])).is_empty());
+    }
+
+    /// A client asking for SigV4 must not attach to a daemon that sends a
+    /// Bedrock API key to the same URL, nor the other way round.
+    #[test]
+    fn attach_compares_how_a_bedrock_binding_authenticates() {
+        let url = "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1";
+        let args = |spec: &str| {
+            ["stats", "--store", "s", "--provider", spec]
+                .map(str::to_owned)
+                .to_vec()
+        };
+        let signed = parse(&args(&format!("b=anthropic,{url}"))).unwrap();
+        let keyed = parse(&args(&format!("b=anthropic,{url},BEDROCK_KEY"))).unwrap();
+        let ready = |auth: Option<&str>| {
+            let mut binding = json!({"family":"anthropic","url":url,"transport":"http"});
+            if let Some(auth) = auth {
+                binding["auth"] = json!(auth);
+            }
+            json!({"providers":{"b":binding}})
+        };
+        assert!(check_daemon(&signed, &ready(Some("sigv4"))).is_ok());
+        assert!(check_daemon(&keyed, &ready(None)).is_ok());
+        let refused = check_daemon(&signed, &ready(None)).unwrap_err();
+        assert_eq!(refused.code, "daemon_configuration_mismatch");
+        assert!(
+            refused
+                .detail
+                .unwrap()
+                .contains("over http signed with SigV4 but daemon has")
+        );
+        assert!(check_daemon(&keyed, &ready(Some("sigv4"))).is_err());
+    }
 
     #[test]
     fn readiness_preserves_buffered_events_and_allows_later_events() {

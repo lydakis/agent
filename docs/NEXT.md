@@ -335,6 +335,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
    fixed Anthropic output ceiling and the `legacy_thinking` name-prefix match
    with a small per-provider, per-model capability configuration. Preserve
    native provider state; do not force every family into identical semantics.
+   [Bedrock](BEDROCK.md) is now a binding: `bedrock` and `bedrock-openai`
+   sign with SigV4 through the AWS credential chain, and the two rules it
+   broke were fixed in place (Claude names are read inside Bedrock ids, and
+   `--max-output-tokens` reaches Anthropic's `max_tokens`). Both fixes are
+   still name- and flag-shaped; a per-model capability table would absorb
+   them. Live runs on 2026-09-25 carried every current feature over on
+   Mantle and runtime, for Claude and GPT-5.6, except server-side fallbacks,
+   which Bedrock refuses.
 18. Extend measured tools and recovery semantics, slow-reader and
     sustained-load tests. Profile CPU/allocations to explain regressions;
     compare matched revisions.

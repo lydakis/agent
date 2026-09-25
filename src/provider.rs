@@ -2,7 +2,7 @@
 //! encoding and SSE parsing. History items are streamed by reference.
 use crate::{Error, Result, codec::Family, fail, sse::Decoder};
 use bytes::Bytes;
-use futures_util::{StreamExt, stream};
+use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,6 +10,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
 mod anthropic;
+pub mod aws;
 pub mod login;
 pub mod pace;
 mod responses;
@@ -146,6 +147,11 @@ pub struct Provider {
     stall_timeout: Duration,
     /// Responses over WebSocket, one connection per bot, instead of HTTP.
     sockets: Option<Arc<Sockets>>,
+    /// Bedrock signs every request with SigV4 instead of sending a key.
+    aws: Option<Arc<aws::Aws>>,
+    /// A Bedrock endpoint, however it authenticates: it runs no server-side
+    /// fallbacks and serves no WebSocket.
+    bedrock: bool,
 }
 
 #[derive(Debug)]
@@ -198,20 +204,28 @@ pub struct ToolCall {
     pub call_id: String,
     pub arguments: String,
 }
-/// The conversation items of a request: a stream of pre-encoded,
-/// comma-separated items of known total length, so the body is never
-/// assembled in memory.
+pub type ItemStream = futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>;
+/// The conversation items of a request: pre-encoded, comma-separated items
+/// of known total length, read as a stream so the body is never assembled in
+/// memory. Each stream reads them from the start, so a signer that digests
+/// the body can read it once before it is sent.
 pub struct Items {
-    /// Exact byte length the stream will yield.
+    /// Exact byte length every stream yields.
     pub bytes: usize,
-    pub stream: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
+    open: Box<dyn Fn() -> ItemStream + Send + Sync>,
 }
 impl Items {
-    pub fn empty() -> Items {
+    pub fn new(bytes: usize, open: impl Fn() -> ItemStream + Send + Sync + 'static) -> Items {
         Items {
-            bytes: 0,
-            stream: stream::empty().boxed(),
+            bytes,
+            open: Box::new(open),
         }
+    }
+    pub fn empty() -> Items {
+        Items::new(0, || stream::empty().boxed())
+    }
+    pub fn stream(&self) -> ItemStream {
+        (self.open)()
     }
 }
 pub struct Request<'a> {
@@ -292,6 +306,7 @@ impl Provider {
             Family::Anthropic => "messages",
         };
         url.set_path(&format!("{}/{route}", url.path().trim_end_matches('/')));
+        let bedrock = aws::endpoint(&url).is_some();
         Ok(Self {
             transport,
             pools: Arc::new(pace::Pools::default()),
@@ -303,6 +318,8 @@ impl Provider {
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
             sockets: None,
+            aws: None,
+            bedrock,
         })
     }
     /// Model pool levels behind this provider, for `stats`.
@@ -319,7 +336,8 @@ impl Provider {
     /// Carry Responses calls over WebSocket, keeping one connection per bot
     /// so a call can continue from the bot's previous response.
     pub fn with_socket(mut self) -> Result<Self> {
-        if self.family != Family::Responses {
+        // Bedrock serves Responses over HTTP only.
+        if self.family != Family::Responses || self.bedrock {
             return fail("invalid_provider_transport");
         }
         self.sockets = Some(Sockets::new()?);
@@ -349,19 +367,28 @@ impl Provider {
     pub fn output_byte_estimate(&self, model: &str) -> Option<usize> {
         match self.family {
             Family::Responses => self.max_output_tokens,
-            Family::Anthropic => Some(anthropic_max_tokens(model)),
+            Family::Anthropic => Some(self.anthropic_max_tokens(model)),
         }
         .map(|tokens| (tokens as usize).saturating_mul(4))
+    }
+    /// Anthropic's `max_tokens`: `--max-output-tokens` when set, else the
+    /// model's full output limit.
+    fn anthropic_max_tokens(&self, model: &str) -> u32 {
+        self.max_output_tokens
+            .unwrap_or_else(|| anthropic_max_tokens(model))
     }
     /// How much longer this model's pool is closed by a rate limit, if it is.
     pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
         self.pools.get(&self.family.pool_key(model)).blocked_for()
     }
 
-    /// Bound generated tokens (including reasoning) for Responses calls.
-    /// Other families need their own budget validation and reject this option.
+    /// Bound generated tokens, reasoning included. Anthropic calls send it
+    /// as `max_tokens` in place of the model's full output limit, and need room for a thinking
+    /// budget of at least 1,024 tokens beside the answer. Bedrock deducts
+    /// input plus this bound from quota when a call starts, so a bound near
+    /// real output is throughput there.
     pub fn with_max_output_tokens(mut self, limit: u32) -> Result<Self> {
-        if self.family != Family::Responses || limit == 0 {
+        if limit == 0 || (self.family == Family::Anthropic && limit < 2048) {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
@@ -384,6 +411,21 @@ impl Provider {
             return fail("invalid_provider_account");
         }
         self.login = Some(login);
+        Ok(self)
+    }
+
+    /// Sign every request for this Bedrock endpoint with SigV4, in place of
+    /// a key; the URL must be an https Bedrock host of the same region and
+    /// service, since the signature and session token travel with it.
+    pub fn with_aws(mut self, aws: Arc<aws::Aws>) -> Result<Self> {
+        if aws::endpoint(&self.url) != Some((aws.region().to_owned(), aws.service()))
+            || self.url.scheme() != "https"
+            || self.key.is_some()
+            || self.login.is_some()
+        {
+            return fail("invalid_provider_auth");
+        }
+        self.aws = Some(aws);
         Ok(self)
     }
 
@@ -441,10 +483,13 @@ impl Provider {
             #[serde(skip_serializing_if = "Option::is_none")]
             output_config: Option<Value>,
             /// A request a safety classifier declines is rerun on the model
-            /// Anthropic recommends for that refusal category.
-            fallbacks: &'static str,
+            /// Anthropic recommends for that refusal category. Bedrock does
+            /// not run server-side fallbacks.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            fallbacks: Option<&'static str>,
         }
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
+        let max_tokens = self.anthropic_max_tokens(request.model);
         let (mut bytes, field) = match self.family {
             Family::Responses => (
                 serde_json::to_vec(&Responses {
@@ -467,7 +512,7 @@ impl Provider {
             Family::Anthropic => (
                 serde_json::to_vec(&Anthropic {
                     model: request.model,
-                    max_tokens: anthropic_max_tokens(request.model),
+                    max_tokens,
                     // An explicit breakpoint after the static prefix (tools
                     // and instructions) guarantees a read point for it.
                     system: (!request.instructions.is_empty()).then(|| {
@@ -488,7 +533,7 @@ impl Provider {
                                 "medium" => 8192,
                                 _ => 16384,
                             }
-                            .min(anthropic_max_tokens(request.model) - 1024);
+                            .min(max_tokens - 1024);
                             json!({"type":"enabled","budget_tokens":budget,
                                 "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         } else {
@@ -500,7 +545,7 @@ impl Provider {
                         .reasoning
                         .filter(|_| !legacy_thinking(request.model))
                         .map(|level| json!({"effort":level})),
-                    fallbacks: "default",
+                    fallbacks: (!self.bedrock).then_some("default"),
                 })?,
                 &b",\"messages\":["[..],
             ),
@@ -512,12 +557,9 @@ impl Provider {
 
     /// Content-Length avoids requiring provider support for chunked uploads;
     /// the items stream through without a whole-body copy.
-    fn body(&self, prefix: Vec<u8>, items: Items) -> (reqwest::Body, usize) {
+    fn body(&self, prefix: Bytes, items: &Items) -> (reqwest::Body, usize) {
         let len = prefix.len() + items.bytes + 2;
-        let framed = stream::iter([Ok(Bytes::from(prefix))])
-            .chain(items.stream)
-            .chain(stream::iter([Ok(Bytes::from_static(b"]}"))]));
-        (reqwest::Body::wrap_stream(framed), len)
+        (reqwest::Body::wrap_stream(framed(prefix, items)), len)
     }
 
     pub async fn complete<F, Fut>(&self, request: Request<'_>, delta: F) -> Result<Completion>
@@ -570,7 +612,7 @@ impl Provider {
         // ceiling on what the provider generates or bills, and the usage the
         // response reports corrects it.
         let pace = self.pools.get(&self.family.pool_key(request.model));
-        let prefix = self.prefix(&request)?;
+        let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
             input: ((prefix.len() + request.items.bytes) / 4) as u64,
             output: u64::from(self.max_output_tokens.unwrap_or(512)),
@@ -579,6 +621,16 @@ impl Provider {
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
         let admission = self.admit().await?;
+        // Bedrock Runtime signs the body's digest, so its items are read once
+        // to hash them and again as they stream; Mantle takes the body
+        // unsigned over TLS and reads it once. Hashed under admission, which
+        // already covers sending the body, so the extra read is bounded too.
+        let payload = match &self.aws {
+            Some(aws) if aws.signs_payload() => {
+                Some(aws::payload(framed(prefix.clone(), &request.items)).await?)
+            }
+            _ => None,
+        };
         if let Some(sockets) = &self.sockets {
             return self
                 .complete_socket(
@@ -593,7 +645,7 @@ impl Provider {
                 .await;
         }
         let cache_key = request.cache_key;
-        let (body, len) = self.body(prefix, request.items);
+        let (body, len) = self.body(prefix, &request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
         // A token can expire while pacing or waiting for admission. Read it
@@ -601,6 +653,10 @@ impl Provider {
         if let Some(login) = &self.login {
             *session = Some(login.current()?);
         }
+        let signer = match &self.aws {
+            Some(aws) => Some((aws, aws.current().await?)),
+            None => None,
+        };
         let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
         let account = session
             .as_ref()
@@ -621,7 +677,12 @@ impl Provider {
                 // model instead of ending the turn with a refusal.
                 let http = http.header("anthropic-version", "2023-06-01").header(
                     "anthropic-beta",
-                    "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01",
+                    match self.bedrock {
+                        true => "thinking-binding-controls-2026-08-01",
+                        false => {
+                            "thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01"
+                        }
+                    },
                 );
                 match key {
                     Some(key) => http.header("x-api-key", key),
@@ -637,6 +698,19 @@ impl Provider {
         // from prompt_cache_key (openai/codex 53446f9, core/src/client.rs).
         if let (Family::Responses, Some(key)) = (self.family, cache_key) {
             http = http.header("session-id", key);
+        }
+        // Signed last, at send time: the signature covers the moment it is made.
+        if let Some((aws, keys)) = &signer {
+            let payload = payload.as_deref().unwrap_or(aws::UNSIGNED_PAYLOAD);
+            for (name, value) in aws.sign(
+                keys,
+                "POST",
+                &self.url,
+                std::time::SystemTime::now(),
+                payload,
+            ) {
+                http = http.header(name, value);
+            }
         }
         reservation.dispatch();
         report.dispatched = true;
@@ -669,6 +743,17 @@ impl Provider {
                         ),
                     ),
                 });
+            }
+            // Expired or replaced AWS keys are re-resolved once, as a login is.
+            if matches!(status, 401 | 403)
+                && let Some((aws, keys)) = &signer
+                && aws.reload(keys).await?
+            {
+                reservation.settle(0);
+                return Err(Error::with(
+                    "provider_login_refreshed",
+                    body.detail.unwrap_or_else(|| format!("HTTP {status}")),
+                ));
             }
             let quota = status == 429 && body.quota;
             if !quota {
@@ -815,11 +900,16 @@ impl Provider {
             pace.limited(error.detail.as_deref().and_then(pace::named_delay));
         }
         result?;
-        parser.finish().inspect_err(|error| {
-            if error.code == "provider_rate_limited" {
-                pace.limited(error.detail.as_deref().and_then(pace::named_delay));
-            }
-        })
+        // Only a completed stream ends a refusal streak: a 200 can still end
+        // in an in-stream rate limit.
+        parser
+            .finish()
+            .inspect(|_| pace.accepted())
+            .inspect_err(|error| {
+                if error.code == "provider_rate_limited" {
+                    pace.limited(error.detail.as_deref().and_then(pace::named_delay));
+                }
+            })
     }
 }
 
@@ -841,7 +931,7 @@ impl Provider {
         &self,
         sockets: &Sockets,
         request: Request<'_>,
-        prefix: Vec<u8>,
+        prefix: Bytes,
         mut delta: F,
         report: &mut Report,
         (pace, mut reservation, estimate): (&pace::Pace, pace::Reservation<'_>, pace::Cost),
@@ -957,7 +1047,7 @@ impl Provider {
             Ok(()) => {
                 session.completed(parser.id(), key, ids);
                 reservation.settle_usage(report.usage.as_ref(), estimate);
-                parser.finish()
+                parser.finish().inspect(|_| pace.accepted())
             }
             Err(failure) => {
                 if let Some(headers) = failure.headers.as_deref() {
@@ -1001,7 +1091,21 @@ fn limit(pace: &pace::Pace, failure: &socket::Failure) {
 
 /// A `response.create` event: the request fields, the continuation if any,
 /// and the input. A socket message is whole, so the input is assembled here.
-async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Result<String> {
+/// A request body as it is sent: the prefix, the items and the close. Empty
+/// chunks (an empty context prefix, a batch of thinking-only items) are
+/// dropped: each would be an empty HTTP/2 DATA frame, which Bedrock answers
+/// with GOAWAY FRAME_SIZE_ERROR.
+fn framed(
+    prefix: Bytes,
+    items: &Items,
+) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
+    stream::iter([Ok(prefix)])
+        .chain(items.stream())
+        .chain(stream::iter([Ok(Bytes::from_static(b"]}"))]))
+        .filter(|chunk| std::future::ready(!matches!(chunk, Ok(bytes) if bytes.is_empty())))
+}
+
+async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<String> {
     let mut text = Vec::with_capacity(prefix.len() + items.bytes + 96);
     text.extend_from_slice(br#"{"type":"response.create","#);
     if let Some(previous) = previous {
@@ -1010,7 +1114,8 @@ async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Resu
         text.push(b',');
     }
     text.extend_from_slice(&prefix[1..]);
-    while let Some(chunk) = items.stream.next().await {
+    let mut stream = items.stream();
+    while let Some(chunk) = stream.next().await {
         text.extend_from_slice(&chunk.map_err(|error| Error {
             code: error.to_string(),
             detail: None,
@@ -1020,11 +1125,29 @@ async fn create(prefix: &[u8], previous: Option<&str>, mut items: Items) -> Resu
     String::from_utf8(text).map_err(|_| Error::new("invalid_item_encoding"))
 }
 
+/// The Claude model a Bedrock id names: `anthropic.claude-…` and a
+/// geographic or global profile such as `us.anthropic.claude-…` or
+/// `global.anthropic.claude-…` name `claude-…`. Other ids are unchanged.
+fn claude_model(model: &str) -> &str {
+    if let Some(name) = model.strip_prefix("anthropic.") {
+        return name;
+    }
+    model
+        .split_once('.')
+        .filter(|(profile, _)| {
+            !profile.is_empty() && profile.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        })
+        .and_then(|(_, rest)| rest.strip_prefix("anthropic."))
+        .unwrap_or(model)
+}
+
 /// The model's full output limit. A lower cap fails any answer that runs
 /// past it, and Anthropic counts only generated tokens against output rate
 /// limits, so the full limit costs nothing until it is used.
 /// https://platform.claude.com/docs/en/about-claude/models/overview
+/// Bedrock ids are read for the Claude model they name.
 fn anthropic_max_tokens(model: &str) -> u32 {
+    let model = claude_model(model);
     const LIMITS: [(&str, u32); 12] = [
         ("claude-haiku-4-5", 64_000),
         ("claude-opus-4-5", 64_000),
@@ -1049,6 +1172,7 @@ fn anthropic_max_tokens(model: &str) -> u32 {
 
 /// Model ids that predate adaptive thinking and still require a token budget.
 fn legacy_thinking(model: &str) -> bool {
+    let model = claude_model(model);
     [
         "claude-haiku-4-5",
         "claude-sonnet-4-5",
@@ -1240,6 +1364,11 @@ mod tests {
             ("claude-3-sonnet-20240229", 4_096),
             ("claude-3-opus-20240229", 4_096),
             ("claude-2.1", 4_096),
+            // Bedrock ids name the same models.
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", 64_000),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", 64_000),
+            ("global.anthropic.claude-sonnet-5", 128_000),
+            ("anthropic.claude-3-haiku-20240307-v1:0", 4_096),
         ] {
             assert_eq!(anthropic_max_tokens(model), limit, "{model}");
         }
@@ -1344,7 +1473,7 @@ mod tests {
         let responses = Provider::new(transport, Family::Responses, "http://h/v1/", None).unwrap();
         assert_eq!(responses.url.path(), "/v1/responses");
         assert!(responses.clone().with_max_output_tokens(0).is_err());
-        assert!(provider.with_max_output_tokens(2048).is_err());
+        assert!(provider.clone().with_max_output_tokens(2047).is_err());
         let responses = responses.with_max_output_tokens(2048).unwrap();
         let mut prefix = responses
             .prefix(&Request {
@@ -1411,6 +1540,191 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Bedrock ids name Claude models under a vendor prefix and, on runtime,
+    /// a geographic or global profile; capability rules read the model.
+    #[test]
+    fn bedrock_model_ids_follow_the_claude_model_they_name() {
+        for (id, legacy) in [
+            ("anthropic.claude-haiku-4-5", true),
+            ("us.anthropic.claude-haiku-4-5-20251001-v1:0", true),
+            ("global.anthropic.claude-sonnet-4-5-20250929-v1:0", true),
+            ("us-gov.anthropic.claude-3-7-sonnet-20250219-v1:0", true),
+            ("anthropic.claude-opus-5", false),
+            ("global.anthropic.claude-opus-5", false),
+            ("eu.anthropic.claude-sonnet-4-6", false),
+            ("claude-haiku-4-5", true),
+            ("claude-opus-5", false),
+        ] {
+            assert_eq!(legacy_thinking(id), legacy, "{id}");
+        }
+        assert_eq!(claude_model("openai.gpt-6-sol"), "openai.gpt-6-sol");
+        assert_eq!(
+            claude_model("US.anthropic.claude-x"),
+            "US.anthropic.claude-x"
+        );
+    }
+
+    /// An output cap reaches Anthropic calls as `max_tokens`, and a legacy
+    /// thinking budget stays inside it with room for the answer.
+    #[test]
+    fn anthropic_output_cap_bounds_max_tokens_and_thinking_budget() {
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+            None,
+        )
+        .unwrap()
+        .with_max_output_tokens(4096)
+        .unwrap();
+        assert_eq!(
+            provider.output_byte_estimate("claude-sonnet-5"),
+            Some(4096 * 4)
+        );
+        let body = |model: &str| {
+            let mut prefix = provider
+                .prefix(&Request {
+                    model,
+                    instructions: "i",
+                    reasoning: Some("high"),
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                })
+                .unwrap();
+            prefix.extend_from_slice(b"]}");
+            serde_json::from_slice::<Value>(&prefix).unwrap()
+        };
+        let legacy = body("us.anthropic.claude-haiku-4-5-20251001-v1:0");
+        assert_eq!(legacy["max_tokens"], 4096);
+        assert_eq!(legacy["thinking"]["budget_tokens"], 3072);
+        let current = body("anthropic.claude-opus-5");
+        assert_eq!(current["max_tokens"], 4096);
+        assert_eq!(current["thinking"]["type"], "adaptive");
+    }
+
+    #[test]
+    fn bedrock_bindings_refuse_websocket_cleartext_and_mismatched_signers() {
+        let transport = Transport::new(64, 1).unwrap();
+        let mantle = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+        let bedrock = || Provider::new(transport.clone(), Family::Responses, mantle, None).unwrap();
+        assert!(bedrock().with_socket().is_err());
+        let keys = || aws::Keys::new("AKIDEXAMPLE".into(), "secret".into(), None);
+        let signer = |region: &str, service| Arc::new(aws::Aws::fixed(region, service, keys()));
+        assert!(
+            bedrock()
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_ok()
+        );
+        assert!(
+            bedrock()
+                .with_aws(signer("us-west-2", "bedrock-mantle"))
+                .is_err()
+        );
+        assert!(bedrock().with_aws(signer("us-east-1", "bedrock")).is_err());
+        let cleartext = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "http://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            cleartext
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_err()
+        );
+        let keyed = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            mantle,
+            Some("k".into()),
+        )
+        .unwrap();
+        assert!(
+            keyed
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_err()
+        );
+        let first_party = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://api.openai.com/v1",
+            None,
+        )
+        .unwrap();
+        assert!(
+            first_party
+                .with_aws(signer("us-east-1", "bedrock-mantle"))
+                .is_err()
+        );
+    }
+
+    /// Bedrock runs no server-side fallbacks, so its requests do not ask for
+    /// them, whichever endpoint and however they authenticate.
+    #[test]
+    fn bedrock_requests_ask_for_no_server_side_fallbacks() {
+        let transport = Transport::new(64, 1).unwrap();
+        for (url, key) in [
+            (
+                "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1",
+                None,
+            ),
+            (
+                "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+                Some("k".to_owned()),
+            ),
+        ] {
+            let provider = Provider::new(transport.clone(), Family::Anthropic, url, key).unwrap();
+            let prefix = provider
+                .prefix(&Request {
+                    model: "anthropic.claude-sonnet-5",
+                    instructions: "i",
+                    reasoning: Some("high"),
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    cache_key: None,
+                    items: Items::empty(),
+                    chain: None,
+                })
+                .unwrap();
+            let text = String::from_utf8(prefix).unwrap();
+            assert!(!text.contains("fallbacks"), "{text}");
+            assert!(text.contains("\"block_binding\""), "{text}");
+        }
+    }
+
+    /// Bedrock serves both wire families this runtime already speaks, on two
+    /// endpoints with independent quotas, so each is an ordinary provider
+    /// binding: a base URL and the family's own key header. Nothing about the
+    /// four routes needs its own encoder.
+    #[test]
+    fn bedrock_routes_are_ordinary_base_urls_for_the_families_we_speak() {
+        let transport = Transport::new(64, 1).unwrap();
+        let route = |family, base: String| {
+            Provider::new(transport.clone(), family, &base, None)
+                .unwrap()
+                .url
+                .to_string()
+        };
+        for host in [
+            "https://bedrock-mantle.us-east-1.api.aws",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+        ] {
+            assert_eq!(
+                route(Family::Anthropic, format!("{host}/anthropic/v1")),
+                format!("{host}/anthropic/v1/messages")
+            );
+            assert_eq!(
+                route(Family::Responses, format!("{host}/openai/v1")),
+                format!("{host}/openai/v1/responses")
+            );
         }
     }
 
@@ -1516,6 +1830,64 @@ mod tests {
                 .with_stall_timeout(Duration::ZERO)
                 .is_err()
         );
+    }
+
+    /// A 200 whose stream ends in a rate limit is a refusal, not an accepted
+    /// call, so refusals of that kind still escalate the pool's block.
+    #[tokio::test]
+    async fn in_stream_refusals_escalate_although_the_status_was_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let _ = socket
+                    .write_all(concat!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":",
+                        "{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"Slow down.\"}}}\n\n",
+                    ).as_bytes())
+                    .await;
+            }
+        });
+        let provider =
+            Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None).unwrap();
+        let tools = none();
+        for expected in [1, 2] {
+            let request = Request {
+                model: "m",
+                instructions: "",
+                reasoning: None,
+                tools: &tools,
+                allow_tool_calls: true,
+                cache_key: None,
+                items: Items::empty(),
+                chain: None,
+            };
+            let error = provider
+                .complete(request, |_| async { Ok(()) })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "provider_rate_limited");
+            let left = provider.blocked_for("m").unwrap();
+            let seconds = left.as_secs_f64();
+            assert!(
+                seconds > expected as f64 - 0.5 && seconds <= expected as f64,
+                "{seconds}"
+            );
+            // Called while closed, the pool refuses without asking; after it
+            // reopens, the next refusal is the next step of the streak.
+            if expected == 1 {
+                tokio::time::sleep(left + Duration::from_millis(20)).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -1946,14 +2318,37 @@ mod tests {
             .map(|n| Bytes::from(Family::Responses.user_item(&format!("m{n}")).unwrap()))
             .collect();
         let joined = items.iter().map(Bytes::len).sum::<usize>() + items.len() - 1;
-        let prefix = b"{\"input\":[".to_vec();
+        let prefix = Bytes::from_static(b"{\"input\":[");
         let (_, len) = provider.body(
             prefix.clone(),
-            Items {
-                bytes: joined,
-                stream: stream::empty().boxed(),
-            },
+            &Items::new(joined, || stream::empty().boxed()),
         );
         assert_eq!(len, prefix.len() + joined + 2);
+    }
+
+    /// An empty chunk would go out as an empty HTTP/2 DATA frame, which
+    /// Bedrock answers by closing the connection. Every stream of the same
+    /// items reads the same bytes, so a digest matches the body sent.
+    #[tokio::test]
+    async fn bodies_carry_no_empty_chunk_and_read_the_same_every_time() {
+        let items = Items::new(9, || {
+            stream::iter(
+                ["", "{\"a\":1}", "", ",", ""].map(|c| Ok(Bytes::from_static(c.as_bytes()))),
+            )
+            .boxed()
+        });
+        for _ in 0..2 {
+            let chunks: Vec<Bytes> = framed(Bytes::from_static(b"{\"input\":["), &items)
+                .map(|chunk| chunk.unwrap())
+                .collect()
+                .await;
+            assert!(chunks.iter().all(|c| !c.is_empty()), "{chunks:?}");
+            assert_eq!(chunks.concat(), b"{\"input\":[{\"a\":1},]}");
+        }
+        let chunks: Vec<Bytes> = framed(Bytes::new(), &Items::empty())
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        assert_eq!(chunks, [Bytes::from_static(b"]}")]);
     }
 }
