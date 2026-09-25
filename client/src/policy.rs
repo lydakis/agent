@@ -27,7 +27,9 @@ Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an agen
 $AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
 To contact that creator, run \
 \"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \
-the identity check refuses a deleted creator or a replacement with the same name.";
+the identity check refuses a deleted creator or a replacement with the same name. \
+Your final reply already reaches whoever waits on your turn, so contact your creator only to ask something you need, \
+not to report results.";
 
 /// What human-facing clients tell a new bot's summarizer at compaction. The daemon has
 /// no such text; a bot created without any never compacts.

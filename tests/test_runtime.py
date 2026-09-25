@@ -1,4 +1,5 @@
 """Actual Rust process, disk recovery, provider transport, and tool loop."""
+import hashlib
 import http.server
 import json
 import os
@@ -251,8 +252,27 @@ class Model(http.server.BaseHTTPRequestHandler):
             pass
 
 
+def thinking_binding(request, before):
+    """What a synthetic signature binds to, as newer Claude models do: the
+    system prompt, the tool set, and every message before the block, minus
+    earlier thinking blocks and cache markers."""
+    def plain(value):
+        if isinstance(value, dict):
+            return {k: plain(v) for k, v in value.items() if k != 'cache_control'}
+        if isinstance(value, list):
+            return [plain(v) for v in value]
+        return value
+    messages = [{**m, 'content': [b for b in m['content'] if b['type'] not in ('thinking', 'redacted_thinking')]}
+                for m in before]
+    bound = [plain(request.get('system')), sorted(t['name'] for t in request.get('tools', [])), plain(messages)]
+    return 'sig:' + hashlib.sha256(json.dumps(bound, sort_keys=True).encode()).hexdigest()[:16]
+
+
 class AnthropicModel(http.server.BaseHTTPRequestHandler):
-    """Synthetic Anthropic Messages endpoint: thinking, text, tool_use, tool_result."""
+    """Synthetic Anthropic Messages endpoint: thinking, text, tool_use, tool_result.
+    With `bind_thinking` set on the server, signatures bind to the conversation
+    before them and a replayed block whose context changed is refused, as the
+    strict check does; `report_drops` makes it report dropped blocks instead."""
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, *_):
@@ -265,6 +285,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/messages'
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
+            assert self.headers.get('anthropic-beta') == 'thinking-binding-controls-2026-08-01'
+            if 'thinking' in request:
+                assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             assert request['model'] == 'synthetic-claude' and request['stream'] and request['max_tokens'] > 0
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == {'type': 'ephemeral'}
@@ -287,19 +310,41 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'
-            blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': 'sig-1'}]
+            signature = 'sig-1'
+            if getattr(self.server, 'bind_thinking', False):
+                for index, message in enumerate(request['messages']):
+                    for block in message['content']:
+                        if block['type'] == 'thinking' and block['signature'] != thinking_binding(
+                                request, request['messages'][:index]):
+                            self.server.binding_errors.append(index)
+                            body = json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error',
+                                'message': f'messages.{index}: The block is bound to a different conversation.'}}).encode()
+                            self.send_response(400)
+                            self.send_header('Content-Length', str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            self.wfile.flush()
+                            return
+                signature = thinking_binding(request, request['messages'])
+            blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
             if last['content'][0]['type'] == 'tool_result':
                 blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'end_turn'
             else:
                 user = last['content'][0]['text']
-                if user.startswith('tool:'):
+                if user == 'think-only':
+                    stop = 'end_turn'
+                elif user.startswith('tool:'):
                     blocks.append({'type': 'tool_use', 'id': 'toolu_1', 'name': 'echo', 'input': {'text': user[5:]}})
                     stop = 'tool_use'
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
-            events = [('message_start', {'message': {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}})]
+            start = {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2}}
+            if getattr(self.server, 'report_drops', 0):
+                start['input_transformations'] = [{'type': 'thinking_dropped', 'message_index': 1, 'block_index': 0}
+                                                  for _ in range(self.server.report_drops)]
+            events = [('message_start', {'message': start})]
             for index, block in enumerate(blocks):
                 start = {**block, 'thinking': ''} if block['type'] == 'thinking' else (
                     {**block, 'text': ''} if block['type'] == 'text' else {**block, 'input': {}})
@@ -359,7 +404,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(usage), 2)
         self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
-        self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized'})
+        self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
+                                             'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})
         self.assertEqual(first['output_config'], {'effort': 'low'})
         self.assertEqual(first['messages'], [{'role': 'user', 'content': [{'type': 'text', 'text': 'tool:shared'}]}])
         assistant = second['messages'][1]

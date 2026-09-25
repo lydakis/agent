@@ -175,6 +175,10 @@ class ResponsesSocketTests(unittest.TestCase):
             self.assertEqual(server.connections[0].get('openai-beta'), 'responses_websockets=2026-02-06')
             self.assertEqual({connection for connection, _ in requests}, {0})
             bodies = [body for _, body in requests]
+            # The bot's cache key rides the upgrade and every request.
+            key = server.connections[0].get('session-id')
+            self.assertTrue(key)
+            self.assertEqual({b.get('prompt_cache_key') for b in bodies}, {key})
             self.assertTrue(all(b['type'] == 'response.create' and 'stream' not in b for b in bodies))
             self.assertEqual([b.get('previous_response_id') for b in bodies],
                              [None, 'resp_1', 'resp_2', 'resp_3', None])

@@ -212,6 +212,7 @@ fn parse_completion_with_usage(
     }
     let usage = reported.clone();
     Ok(Completion {
+        thinking_dropped: 0,
         items,
         calls,
         usage,

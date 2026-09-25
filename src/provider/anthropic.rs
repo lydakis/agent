@@ -28,6 +28,7 @@ pub struct State {
     usage: Usage,
     saw_usage: bool,
     done: bool,
+    thinking_dropped: usize,
 }
 
 impl State {
@@ -61,6 +62,7 @@ impl State {
                     usage["input_tokens"].as_u64().unwrap_or(0) + read + created;
                 self.usage.cached_input_tokens = read;
                 self.saw_usage = true;
+                self.dropped(&event["message"]["input_transformations"]);
                 Ok(Frame::Quiet)
             }
             Some("content_block_start") => {
@@ -140,6 +142,9 @@ impl State {
                 if let Some(output) = event["usage"]["output_tokens"].as_u64() {
                     self.usage.output_tokens = output;
                 }
+                // Sent again after a server-side fallback.
+                self.dropped(&event["input_transformations"]);
+                self.dropped(&event["delta"]["input_transformations"]);
                 Ok(Frame::Quiet)
             }
             Some("message_stop") => {
@@ -153,6 +158,15 @@ impl State {
             // Sent to hold an idle stream open; it is not progress.
             Some("ping") => Ok(Frame::Keepalive),
             _ => Ok(Frame::Quiet), // content_block_stop, unknown metadata
+        }
+    }
+    /// The thinking blocks the request lost to the binding check.
+    fn dropped(&mut self, transformations: &Value) {
+        if let Some(list) = transformations.as_array() {
+            self.thinking_dropped = list
+                .iter()
+                .filter(|t| t["type"] == "thinking_dropped")
+                .count();
         }
     }
     pub fn usage(&self) -> Option<Usage> {
@@ -208,6 +222,7 @@ impl State {
         }
         let item = serde_json::to_vec(&json!({"role":"assistant","content":content}))?;
         Ok(Completion {
+            thinking_dropped: self.thinking_dropped,
             items: vec![Bytes::from(item)],
             calls,
             usage: self.saw_usage.then_some(self.usage),
@@ -256,6 +271,7 @@ mod tests {
         assert_eq!(item["content"][0]["signature"], "sig");
         assert_eq!(item["content"][2]["input"]["command"], "ls");
         assert_eq!(completion.calls[0].arguments, r#"{"command":"ls"}"#);
+        assert_eq!(completion.thinking_dropped, 0);
         assert_eq!(
             completion.usage,
             Some(Usage {
@@ -264,6 +280,21 @@ mod tests {
                 cached_input_tokens: 3
             })
         );
+    }
+    #[test]
+    fn dropped_thinking_is_counted_from_the_latest_report() {
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":1},"input_transformations":[{"type":"thinking_dropped","message_index":1,"block_index":0},{"type":"other"}]}}"#;
+        let text = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}"#;
+        let delta = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#;
+        let stop = r#"{"type":"message_stop"}"#;
+        let mut state = State::default();
+        feed(&mut state, &[start, text, delta, stop]);
+        assert_eq!(state.finish().unwrap().thinking_dropped, 1);
+        // After a fallback the delta repeats the whole list for the final request.
+        let fallback = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1},"input_transformations":[{"type":"thinking_dropped"},{"type":"thinking_dropped"}]}"#;
+        let mut state = State::default();
+        feed(&mut state, &[start, text, fallback, stop]);
+        assert_eq!(state.finish().unwrap().thinking_dropped, 2);
     }
     #[test]
     fn truncated_or_errored_streams_never_complete() {

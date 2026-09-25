@@ -62,7 +62,7 @@ fn stored(db: &mut Database, name: &str) -> Vec<Value> {
     let Some(window) = db.window(name, i64::MAX, i64::MAX).unwrap() else {
         return Vec::new();
     };
-    let joined = db.items_by_ids(&window.ids).unwrap();
+    let joined = db.items_by_ids(&window.ids, 0).unwrap();
     serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap()
 }
 fn result(output: &str) -> Outcome {
@@ -1712,7 +1712,7 @@ fn context_windows_start_at_turn_boundaries_and_move_with_hysteresis() {
     let all = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
     assert_eq!(all.ids.len(), 20);
     assert_eq!((all.omitted_items, all.omitted_turns), (0, 0));
-    let joined = db.items_by_ids(&all.ids).unwrap();
+    let joined = db.items_by_ids(&all.ids, 0).unwrap();
     assert_eq!(joined.len() as i64, all.item_bytes + 19);
     let parsed: Vec<Value> = serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap();
     assert_eq!(parsed[0]["content"][0]["text"], "p1");
@@ -1850,7 +1850,7 @@ fn history_preserves_content_beyond_the_preview() {
         .unwrap();
     db.finish(turn, None).unwrap();
     let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
-    let replay = db.items_by_ids(&window.ids).unwrap();
+    let replay = db.items_by_ids(&window.ids, 0).unwrap();
     let page = db.history_read("Bob", 1, 0, 65536).unwrap();
     assert!(page["text"].as_str().unwrap().contains("final fact"));
     // The reading view keeps reasoning summaries but excludes opaque state.
@@ -1882,7 +1882,7 @@ fn history_preserves_content_beyond_the_preview() {
     assert_eq!(records.len(), 3);
     assert_eq!(records[1]["summary"][0]["text"], "Résumé 🦀");
     assert_eq!(records[1]["type"], "reasoning");
-    assert_eq!(db.items_by_ids(&window.ids).unwrap(), replay);
+    assert_eq!(db.items_by_ids(&window.ids, 0).unwrap(), replay);
     assert!(
         String::from_utf8(replay)
             .unwrap()
@@ -1959,7 +1959,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             .unwrap();
         db.finish(turn, None).unwrap();
         let window = db.window(name, i64::MAX, i64::MAX).unwrap().unwrap();
-        let replay = db.items_by_ids(&window.ids).unwrap();
+        let replay = db.items_by_ids(&window.ids, 0).unwrap();
         assert!(replay.ends_with(item.as_bytes()));
         let mut joined = String::new();
         let mut offset = 0;
@@ -1985,7 +1985,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
         if !item.contains(['\r', '\n']) {
             assert_eq!(joined.lines().nth(1).unwrap(), item);
         }
-        assert_eq!(db.items_by_ids(&window.ids).unwrap(), replay);
+        assert_eq!(db.items_by_ids(&window.ids, 0).unwrap(), replay);
     }
 }
 
@@ -4341,7 +4341,7 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
             assert_eq!(view.covered, (1, 3));
             assert_eq!(view.prompts, expected);
             // Compaction leaves the original native items retrievable.
-            let raw = db.items_by_ids(&plan.ids).unwrap();
+            let raw = db.items_by_ids(&plan.ids, 0).unwrap();
             let items: Vec<Value> =
                 serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
             assert_eq!(items.len(), 6);
@@ -5057,4 +5057,85 @@ fn oversized_history_items_do_not_hide_the_rest_of_the_batch() {
         );
     }
     assert!(serde_json::to_vec(&batch).unwrap().len() < 768 * 1024);
+}
+
+const THINKING: &[u8] = br#"{"content":[{"type":"thinking","thinking":"plan","signature":"s"},{"type":"text","text":"answer"}],"role":"assistant"}"#;
+
+#[test]
+fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
+    let path =
+        std::env::temp_dir().join(format!("agent-cache-lineage-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+        let turn = db
+            .begin(
+                "Bob",
+                "r2",
+                "p2",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        db.append(turn, vec![Bytes::from_static(THINKING)], &[], None)
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE bots DROP COLUMN cache_bot; ALTER TABLE bots DROP COLUMN thinking_prefix;
+             ALTER TABLE bots DROP COLUMN thinking_floor; ALTER TABLE nodes DROP COLUMN thinking;
+             PRAGMA user_version=26;",
+        )
+        .unwrap();
+    }
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Stored thinking is measured once, so a request knows its stripped
+    // length before reading, and reads it back without the block.
+    let window = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    let stripped = agent_runtime::store::thinking_bytes(THINKING);
+    assert!(stripped > 0);
+    assert_eq!(
+        window.thinking.iter().map(|&t| t as usize).sum::<usize>(),
+        stripped
+    );
+    let full = db.items_by_ids(&window.ids, 0).unwrap();
+    let sent = db.items_by_ids(&window.ids, i64::MAX).unwrap();
+    assert_eq!(full.len() - sent.len(), stripped);
+    assert!(!String::from_utf8(sent).unwrap().contains("\"thinking\""));
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!((bob.cache_bot, bob.cache_bot()), (None, bob.id));
+    db.fork("Bob", "Alice", Fork::default()).unwrap();
+    db.fork("Alice", "Ann", Fork::default()).unwrap();
+    db.fork(
+        "Bob",
+        "Carol",
+        Fork {
+            instructions: Some("Other."),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    // Same instructions as the source: the same prefix, so the same cache.
+    db.fork(
+        "Bob",
+        "Dan",
+        Fork {
+            instructions: Some(&bob.instructions),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    for (name, cache) in [("Alice", bob.id), ("Ann", bob.id), ("Dan", bob.id)] {
+        assert_eq!(db.inspect(name).unwrap().cache_bot(), cache, "{name}");
+    }
+    let carol = db.inspect("Carol").unwrap();
+    assert_eq!(carol.cache_bot(), carol.id);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

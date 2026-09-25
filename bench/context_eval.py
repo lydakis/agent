@@ -19,6 +19,7 @@ Real model, real spend: a few cents per conversation on a cheap model.
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -32,27 +33,26 @@ from bench.targets import clean_env, file_hash  # noqa: E402
 ENDPOINTS = {'openai': ('responses', 'https://api.openai.com/v1', 'OPENAI_API_KEY'),
              'anthropic': ('anthropic', 'https://api.anthropic.com/v1', 'ANTHROPIC_API_KEY')}
 MARKER = '# reviewed: CASTOR-42'
+
+
+def client_policy(name):
+    """A string constant from client/src/policy.rs, read from the source so
+    the bench always runs with the text `agent run` gives."""
+    source = (Path(__file__).resolve().parents[1] / 'client/src/policy.rs').read_text()
+    match = re.search(rf'pub const {name}: &str = "((?:[^"\\]|\\.)*)";', source, re.S)
+    if not match:
+        raise SystemExit(f'client/src/policy.rs has no {name}')
+    return re.sub(r'\\\n\s*', '', match.group(1)).replace('\\"', '"')
+
+
 # The CLI's default instructions, so the agent is the one `agent run` gives.
-INSTRUCTIONS = ('You are a software engineering agent working in the current workspace. '
-                'Complete the requested task using the available tools, verify your work, and finish with a short summary. '
-                'To delegate a subtask to another agent with its own conversation, run '
-                '"$AGENT_BIN" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. '
-                'Continue an existing agent with "$AGENT_BIN" run --detach --bot NAME -- TASK. '
-                'Collect results with the wait tool on that handle; it returns the peer\'s status and final text. '
-                'Long commands can run with shell background=true and be collected the same way. '
-                'Blocking run/follow inside a shell tool is rejected. '
-                'Use "$AGENT_BIN" fork --source NAME --checkpoint N --bot NEW to branch an earlier checkpoint.')
+INSTRUCTIONS = client_policy('PREAMBLE')
 RULE = (f'Workspace convention, in force for every task in this conversation from now on: every file you '
         f'create must end with a final line that is exactly `{MARKER}`. Acknowledge in one sentence; do not '
         f'create anything yet.')
 CONDITIONS = {'omitted': ('16384', '256'), 'retained': (str(8 << 20), '4096')}
 # The CLI's default compaction text, so the summarizer is the one `agent run` gives.
-COMPACTION = ('You are summarizing the earlier part of an agent\'s conversation so the agent can continue '
-              'with the summary in place of those turns. Any earlier summary is given first; merge it with the new turns, do not restart. '
-              'Write, in order: the goal; every rule, constraint, or preference the user stated, verbatim where wording matters; '
-              'what is done, in progress, and blocked; key decisions and why; files read or changed; open questions; next steps. '
-              'Keep exact names, paths, commands, values, and error text. Omit chatter, repeated tool output, and anything superseded. '
-              'Reply with the summary only.')
+COMPACTION = client_policy('DEFAULT_COMPACTION_INSTRUCTIONS')
 
 
 def filler(n):

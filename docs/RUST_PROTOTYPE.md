@@ -417,8 +417,38 @@ discards provider-specific state such as thinking signatures.
 Anthropic requests carry a `cache_control` breakpoint after the instructions
 and top-level automatic caching for the growing history, so repeated prefixes
 are read from the provider cache once they exceed the model's minimum; the
-[live run](ANTHROPIC_SMOKE.md) records the effect. Responses caching needs no
-request change. Empty instructions omit the system block, since empty text
+[live run](ANTHROPIC_SMOKE.md) records the effect. Anthropic caches any
+byte-identical prefix, so a fork reads its source's cache with no key.
+Responses requests carry a `prompt_cache_key`, also sent as the `session-id`
+header that the ChatGPT backend routes on: a nonce drawn once per daemon plus
+the id of the bot whose cache the call shares. That is the bot's own id,
+except that a fork keeping its source's instructions shares the source's key,
+because its first call repeats the source's prefix. Summaries add `-summary`,
+since their prefix differs.
+
+Newer Claude models bind each replayed thinking block to the exact
+conversation before it (system prompt, tools, and earlier messages) and, for
+accounts created on or after 2026-08-31, reject a block whose earlier context
+changed. Anthropic requests therefore send a block only while the context in
+front of the window is the one it was written under. Each request
+fingerprints that context (the encoded pinned prefix and the window's first
+item); when the fingerprint differs from the bot's last, the window slid, a
+compaction or note landed, or a fork started from other instructions, and
+every node written before that request is sent without its thinking from
+then on. Removing a leading run of blocks is allowed; later blocks keep
+theirs. Summarizer requests carry no thinking, since their instructions
+differ. Each node records at write time how many bytes its thinking takes,
+so a request still knows its length before it reads the items it streams;
+the bot records the fingerprint and the first node still bound to it. This
+costs the reasoning in the stripped blocks once per change, which already
+invalidated the prompt cache from that point. Every Anthropic request opts
+into the check with the `thinking-binding-controls-2026-08-01` beta header
+and `thinking.block_binding.prefix_mismatch_behavior: drop_block`, so older
+accounts get the same check and a mismatch the runtime missed costs the
+dropped blocks rather than the turn. The response reports each drop in
+`input_transformations`; the runtime publishes the count as a non-durable
+`thinking_dropped` event, which should never appear. The synthetic endpoint
+in the tests refuses mismatches outright, as `error` would. Empty instructions omit the system block, since empty text
 cannot carry an Anthropic cache breakpoint; automatic caching remains enabled.
 
 `reasoning` (`low`, `medium`, `high`, `xhigh`, `max`) maps to Responses
@@ -740,7 +770,10 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
 `interrupt` work on the turn unchanged.
 
 - `reject` (default): `bot_busy` while a turn runs or is parked,
-  `active_agent_limit` when no slot is free. Nothing is written.
+  `active_agent_limit` when no slot is free. Nothing is written. The
+  `bot_busy` detail names the running turn and the ways past it (steer,
+  queue, or a fork to ask without interrupting), since a model calling
+  `agent run` does not discover them otherwise.
 - `queue`: the turn is a durable row that starts when the bot is free and a
   slot is open. The response reports `status`: `running` when it started at
   once, `queued` behind the bot's own work, or `ready` when only a slot is
@@ -1213,7 +1246,7 @@ The daemon registers `echo`, `shell`, `read`, `write`, `edit`, `wait`, and
 `history`; each bot is created with the subset it may call (`run --tools`),
 which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
-(unknown tool, invalid arguments, missing file, ambiguous edit, timeout, output
+(unknown tool, invalid arguments, missing file, ambiguous edit, output
 overflow) returns an error result to the model and the turn continues. Only a
 closed tool scheduler fails the turn. Allowed tools run without approval prompts.
 A store remains bound to its tool set; changing it requires a new store.
@@ -1234,8 +1267,21 @@ accepted command whose result is not yet recorded. stdout and stderr are each
 retained up to 1 MiB; beyond 64 KiB the model receives a head and tail with the
 omission stated and the full stream is stored as an artifact retrievable through
 the `artifact` operation. Results include separate output, exit code, and
-success status. Nonzero exit is a recorded tool result. Timeout and overflow kill
-the owned process group. Turn cancellation requests the same kill for a
+success status. Nonzero exit is a recorded tool result. A command's return,
+timeout, or overflow kills its owned process group, so a process it started
+with `&` does not outlive it; the tool description tells the model so. A
+timeout is a result, not an error: the output written before the kill, with
+`timed_out: true` and no exit code, since a long command's partial output is
+often what the model needs next. Background commands are killed when the
+daemon stops. `detach: true` is the way to leave a service running: the
+command starts in a new session with stdin, stdout and stderr on
+`/dev/null`, and the call returns its pid at once. The daemon writes no log
+for it, since such a file would hold output that never passed credential
+redaction; a command that wants its output redirects it to a file itself. No process slot, timeout, group kill, or
+handle applies to it, so it outlives the turn and the daemon and is outside
+`--max-processes`; stopping it is the bot's job. It exists because Terminal-Bench
+tasks that leave a server for the grader failed when the server died with its
+command. Turn cancellation requests the same kill for a
 foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays

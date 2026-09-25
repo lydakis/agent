@@ -14,7 +14,8 @@ Implemented 2026-09-19.
    run --detach --new --bot NAME` from the shell tool, collect with `wait`,
    background shells the same way, and that `AGENT_BOT`/`AGENT_BOT_ID` identify the bot itself
    and `AGENT_PARENT`/`AGENT_PARENT_ID` its creator. Calls to that creator use
-   `--bot-id` so a reused name cannot receive the work. The tool descriptions the daemon sends
+   `--bot-id` so a reused name cannot receive the work, and are for questions, not
+   results: `wait` already hands the creator the bot's final reply. The tool descriptions the daemon sends
    carry the rest. This is the CLI's default and only instruction text.
 2. **AGENTS.md files.** `~/.agent/AGENTS.md` first, then every `AGENTS.md`
    from the filesystem root down to the workspace, so the nearest file is

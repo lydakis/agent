@@ -383,6 +383,30 @@ class CompactionTests(ModelFixture):
             self.assertGreaterEqual(c['reclaimed_items'], 0)
             self.assertEqual(c['headroom_bytes'], c['input_limit']['bytes'] - c['context_after']['bytes'])
 
+    def test_prompt_cache_keys_follow_the_shared_prefix(self):
+        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        self.create(client)
+        self.create(client, bot='Eve')
+        # A fork with its source's instructions shares the source's prefix
+        # and so its key, as does a fork of that fork; new instructions or a
+        # new bot mean a new prefix and a key of their own.
+        client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
+        client.request('fork', source='Alice', bot='Ann', workspace=str(self.path))
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
+        keys = {}
+        for name in ('Alice', 'Ann', 'Carol', 'Eve'):
+            self.run_turn(client, name, name, 'small')
+            keys[name] = self.requests()[0]['prompt_cache_key']
+        for n in range(3):
+            self.run_turn(client, 'Bob', n, str(n) * 500)
+        bob = self.requests()
+        calls = {r['prompt_cache_key'] for r in bob if r['instructions'] != 'Summarize.'}
+        summaries = {r['prompt_cache_key'] for r in bob if r['instructions'] == 'Summarize.'}
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(summaries, {calls.copy().pop() + '-summary'})
+        self.assertEqual({keys['Alice'], keys['Ann']}, calls)
+        self.assertEqual(len({keys['Carol'], keys['Eve']} | calls), 3)
+
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
         client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
         self.create(client)
@@ -406,3 +430,102 @@ class CompactionTests(ModelFixture):
         self.assertEqual(second['input'][:-1], fork['input'][:-1])
         self.assertEqual(first['tools'], second['tools'])
         self.assertEqual(first['instructions'], second['instructions'])
+
+
+@skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
+class AnthropicThinkingBindingTests(ModelFixture):
+    """The endpoint refuses a replayed thinking block whose earlier context
+    changed, as newer Claude models do for enforced accounts."""
+    handler = AnthropicModel
+
+    def setUp(self):
+        super().setUp()
+        self.model.bind_thinking = True
+        self.model.binding_errors = []
+
+    def anthropic(self, extra):
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}, extra=extra)
+        self.addCleanup(client.close)
+        return client
+
+    def requests(self):
+        out = []
+        while not self.model.requests.empty():
+            out.append(self.model.requests.get())
+        return out
+
+    def turn(self, client, bot, request, prompt):
+        turn = client.request('submit', bot=bot, request_id=str(request), prompt=prompt)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+
+    @staticmethod
+    def thinking(message):
+        return sum(b['type'] == 'thinking' for b in message['content'])
+
+    def test_a_sliding_window_drops_thinking_bound_to_the_turns_it_left(self):
+        client = self.anthropic(('--context-bytes', '4096'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        for n in range(12):
+            self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 400)
+        requests = self.requests()
+        self.assertEqual(self.model.binding_errors, [])
+        assistants = [[self.thinking(m) for m in r['messages'] if m['role'] == 'assistant'] for r in requests]
+        # The window slid: some requests sent older answers without thinking,
+        # and answers written after the slide kept theirs.
+        self.assertTrue(any(0 in counts for counts in assistants))
+        self.assertTrue(any(counts and counts[-1] == 1 and 0 in counts for counts in assistants))
+
+    def test_summaries_and_the_compacted_window_carry_no_foreign_thinking(self):
+        client = self.anthropic(('--context-bytes', '8192', '--compact-at', '50'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low',
+                       compaction_instructions='Summarize.')
+        for n in range(8):
+            self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 500)
+        requests = self.requests()
+        self.assertEqual(self.model.binding_errors, [])
+        summaries = [r for r in requests if r['system'][0]['text'] == 'Summarize.']
+        self.assertTrue(summaries)
+        self.assertFalse(any(self.thinking(m) for r in summaries for m in r['messages']))
+
+    def test_a_fork_keeps_thinking_only_under_its_sources_instructions(self):
+        client = self.anthropic(('--context-bytes', '65536'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        for n in range(3):
+            self.turn(client, 'Bob', n, ('tool:' if n == 0 else f'{n}:') + 'x' * 100)
+        self.requests()
+        client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
+        self.turn(client, 'Alice', 'a', 'same')
+        alice = self.requests()[0]
+        self.turn(client, 'Carol', 'c', 'other')
+        carol = self.requests()[0]
+        self.assertEqual(self.model.binding_errors, [])
+        self.assertTrue(all(self.thinking(m) for m in alice['messages'] if m['role'] == 'assistant'))
+        self.assertFalse(any(self.thinking(m) for m in carol['messages']))
+
+    def test_an_answer_of_only_thinking_is_left_out_once_its_context_changes(self):
+        client = self.anthropic(('--context-bytes', '65536'))
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        self.turn(client, 'Bob', 0, 'think-only')
+        self.turn(client, 'Bob', 1, 'after')
+        bob = self.requests()[-1]
+        # Under unchanged context the answer goes back as it was written.
+        self.assertEqual([self.thinking(m) for m in bob['messages']], [0, 1, 0])
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), instructions='Other.')
+        self.turn(client, 'Carol', 'c', 'other')
+        carol = self.requests()[0]
+        self.assertEqual(self.model.binding_errors, [])
+        self.assertFalse(any(self.thinking(m) for m in carol['messages']))
+        self.assertEqual([m['role'] for m in carol['messages']], ['user', 'user', 'assistant', 'user'])
+
+    def test_thinking_the_provider_drops_is_reported_live(self):
+        client = self.anthropic(())
+        client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
+        self.turn(client, 'Bob', 0, 'kept')
+        self.model.report_drops = 2
+        self.turn(client, 'Bob', 1, 'dropped')
+        drops = [m for m in client.saved if m.get('event') == 'thinking_dropped']
+        self.assertEqual([(m['bot'], m['count'], m['durable']) for m in drops], [('Bob', 2, False)])

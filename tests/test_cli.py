@@ -135,6 +135,7 @@ class SocketAndCliTests(ModelFixture):
         refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
         self.assertEqual(refused.returncode, 1)
         self.assertIn('bot_busy', refused.stderr + refused.stdout)
+        self.assertIn('delivery steer', refused.stderr + refused.stdout)
         queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'queue', 'second').stdout)
         self.assertEqual(queued['status'], 'queued')

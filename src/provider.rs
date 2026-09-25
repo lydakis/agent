@@ -157,6 +157,9 @@ pub struct Completion {
     pub items: Vec<Bytes>,
     pub calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
+    /// Replayed thinking blocks the provider dropped because the history
+    /// before them changed. The runtime avoids this, so any is a bug.
+    pub thinking_dropped: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ToolCall {
@@ -188,6 +191,11 @@ pub struct Request<'a> {
     pub tools: &'a RawValue,
     /// Keep schemas needed to interpret history while disabling new calls.
     pub allow_tool_calls: bool,
+    /// Groups calls that share a prefix for the Responses prompt cache. All
+    /// bots share their leading instructions, so without a key their calls
+    /// route by that prefix alone, pile onto the same cache machines and
+    /// spill; the Messages API has no such field.
+    pub cache_key: Option<&'a str>,
     pub items: Items,
     /// Which bot is asking, and where the items sit in its history, so a
     /// socket provider can send only what the server has not seen.
@@ -376,6 +384,8 @@ impl Provider {
             tool_choice: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reasoning: Option<Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prompt_cache_key: Option<&'a str>,
         }
         #[derive(Serialize)]
         struct ToolChoice {
@@ -416,6 +426,7 @@ impl Provider {
                     reasoning: request
                         .reasoning
                         .map(|effort| json!({"effort":effort,"summary":"auto"})),
+                    prompt_cache_key: request.cache_key,
                 })?,
                 &b",\"input\":["[..],
             ),
@@ -443,9 +454,11 @@ impl Provider {
                                 "medium" => 8192,
                                 _ => 16384,
                             };
-                            json!({"type":"enabled","budget_tokens":budget})
+                            json!({"type":"enabled","budget_tokens":budget,
+                                "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         } else {
-                            json!({"type":"adaptive","display":"summarized"})
+                            json!({"type":"adaptive","display":"summarized",
+                                "block_binding":{"prefix_mismatch_behavior":"drop_block"}})
                         }
                     }),
                     output_config: request
@@ -543,6 +556,7 @@ impl Provider {
                 )
                 .await;
         }
+        let cache_key = request.cache_key;
         let (body, len) = self.body(prefix, request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -565,7 +579,11 @@ impl Provider {
         http = match (self.family, key) {
             (Family::Responses, Some(key)) => http.bearer_auth(key),
             (Family::Anthropic, key) => {
-                let http = http.header("anthropic-version", "2023-06-01");
+                // Opt every account into the thinking-binding check, dropping
+                // rather than failing on a mismatch; the drops are reported.
+                let http = http
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", "thinking-binding-controls-2026-08-01");
                 match key {
                     Some(key) => http.header("x-api-key", key),
                     None => http,
@@ -575,6 +593,11 @@ impl Provider {
         };
         if let Some(account) = account {
             http = http.header("chatgpt-account-id", account);
+        }
+        // The ChatGPT Codex endpoint takes cache affinity from this header, not
+        // from prompt_cache_key (openai/codex 53446f9, core/src/client.rs).
+        if let (Family::Responses, Some(key)) = (self.family, cache_key) {
+            http = http.header("session-id", key);
         }
         reservation.dispatch();
         report.dispatched = true;
@@ -789,7 +812,12 @@ impl Provider {
         F: FnMut(Delta) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let Request { items, chain, .. } = request;
+        let Request {
+            items,
+            chain,
+            cache_key,
+            ..
+        } = request;
         let (bot, window, tail) = match chain {
             Some(Chain { bot, window, tail }) => (Some(bot), window, Some(tail)),
             None => (None, None, None),
@@ -799,13 +827,17 @@ impl Provider {
         let mut session = match bot.and_then(|bot| sockets.take(bot)) {
             Some(session) => session,
             None => {
-                let mut headers = Vec::with_capacity(2);
+                let mut headers = Vec::with_capacity(3);
                 let bearer = self.key.as_ref().map(|key| format!("Bearer {key}"));
                 if let Some(bearer) = &bearer {
                     headers.push(("authorization", bearer.as_str()));
                 }
                 if let Some(account) = &self.account {
                     headers.push(("chatgpt-account-id", account.as_str()));
+                }
+                // Cache affinity, as on HTTP; the connection is the bot's own.
+                if let Some(key) = cache_key {
+                    headers.push(("session-id", key));
                 }
                 match sockets.connect(&self.url, &headers).await {
                     // The upgrade's headers predate this call, so they
@@ -1128,13 +1160,16 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
+        assert!(!text.contains("prompt_cache_key"));
         assert!(text.ends_with(",\"messages\":["));
         assert!(text.contains("\"type\":\"adaptive\""));
+        assert!(text.contains("\"block_binding\":{\"prefix_mismatch_behavior\":\"drop_block\"}"));
         assert_eq!(text.matches("\"cache_control\"").count(), 2);
         assert!(text.contains("\"effort\":\"low\""));
         let legacy = provider
@@ -1144,12 +1179,14 @@ mod tests {
                 reasoning: Some("low"),
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: None,
                 items: Items::empty(),
                 chain: None,
             })
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
         assert!(legacy.contains("\"budget_tokens\":2048"));
+        assert!(legacy.contains("\"prefix_mismatch_behavior\":\"drop_block\""));
         assert!(!legacy.contains("output_config"));
         assert!(!text.contains("budget_tokens"));
         let mut empty_prefix = provider
@@ -1159,6 +1196,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: None,
                 items: Items::empty(),
                 chain: None,
             })
@@ -1181,6 +1219,7 @@ mod tests {
                 reasoning: None,
                 tools: &none(),
                 allow_tool_calls: true,
+                cache_key: Some("k"),
                 items: Items::empty(),
                 chain: None,
             })
@@ -1188,6 +1227,7 @@ mod tests {
         prefix.extend_from_slice(b"]}");
         let body: Value = serde_json::from_slice(&prefix).unwrap();
         assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["prompt_cache_key"], "k");
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
     }
@@ -1211,6 +1251,7 @@ mod tests {
                             reasoning: None,
                             tools,
                             allow_tool_calls: allow,
+                            cache_key: None,
                             items: Items::empty(),
                             chain: None,
                         })
@@ -1314,6 +1355,7 @@ mod tests {
                 reasoning: None,
                 tools: &tools,
                 allow_tool_calls: true,
+                cache_key: None,
                 items: Items::empty(),
                 chain: None,
             },
@@ -1377,11 +1419,21 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            cache_key: None,
             items: Items::empty(),
             chain: None,
         };
-        let _ = provider.complete(request, |_| async { Ok(()) }).await;
+        let _ = provider
+            .complete(
+                Request {
+                    cache_key: Some("synthetic-key"),
+                    ..request
+                },
+                |_| async { Ok(()) },
+            )
+            .await;
         let head = head.await.unwrap();
+        assert!(head.contains("\r\nsession-id: synthetic-key\r\n"), "{head}");
         assert!(head.starts_with("post /responses "), "{head}");
         assert!(
             head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
@@ -1419,6 +1471,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            cache_key: None,
             items: Items::empty(),
             chain: None,
         };
@@ -1502,6 +1555,8 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
+            cache_key: None,
         };
         // Refused, and the file still holds the refused token: final, and
         // the detail names the file, never the token.
@@ -1573,6 +1628,8 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
+            cache_key: None,
         };
         let call = provider.complete(request, |_| async { Ok(()) });
         tokio::pin!(call);
@@ -1617,6 +1674,8 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
+            cache_key: None,
         };
         let error = provider
             .complete(request, |_| async { Ok(()) })
@@ -1657,6 +1716,8 @@ mod tests {
                 tools: &tools,
                 allow_tool_calls: true,
                 items: Items::empty(),
+                chain: None,
+                cache_key: None,
             };
             let error = provider
                 .complete(request, |_| async { Ok(()) })
@@ -1688,6 +1749,8 @@ mod tests {
             tools: &tools,
             allow_tool_calls: true,
             items: Items::empty(),
+            chain: None,
+            cache_key: None,
         };
         let error = provider
             .complete(request, |_| async { Ok(()) })
@@ -1730,6 +1793,7 @@ mod tests {
             reasoning: None,
             tools: &tools,
             allow_tool_calls: true,
+            cache_key: None,
             items: Items::empty(),
             chain: None,
         };

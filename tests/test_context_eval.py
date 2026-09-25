@@ -4,7 +4,7 @@ import queue
 import unittest
 from unittest.mock import patch
 
-from bench.context_eval import MARKER, context_state, page_rows, run_condition, summarize
+from bench.context_eval import COMPACTION, INSTRUCTIONS, MARKER, context_state, page_rows, run_condition, summarize
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
 
@@ -27,6 +27,14 @@ class PagedClient:
 
 
 class ContextEvalTests(unittest.TestCase):
+    def test_bots_get_the_clients_current_policy_text(self):
+        # Read from client/src/policy.rs, so an edit there reaches the bench.
+        self.assertTrue(INSTRUCTIONS.startswith('You are a software engineering agent'))
+        self.assertIn('contact your creator only to ask something you need', INSTRUCTIONS)
+        self.assertIn('"$AGENT_BIN" run --detach', INSTRUCTIONS)
+        self.assertTrue(COMPACTION.endswith('Reply with the summary only.'))
+        self.assertFalse(any('\\' in text or '\n' in text or '  ' in text for text in (INSTRUCTIONS, COMPACTION)))
+
     def test_history_beyond_first_page_and_short_byte_limited_pages(self):
         rows = [{'cursor': i, 'turn': 1, 'event': 'message', 'data': {}} for i in range(1, 257)]
         rows.append({'cursor': 257, 'turn': 14, 'event': 'tool_started', 'data': {'name': 'history'}})

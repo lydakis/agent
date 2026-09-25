@@ -82,10 +82,10 @@ impl Tool {
                 "properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}),
             ),
             Tool::Shell => (
-                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait.",
+                "Run a noninteractive /bin/sh command in the workspace. stdout and stderr are returned separately; each is truncated to a head and tail beyond 64 KiB, with the full output retained. Default timeout 120 s, maximum 600 s; a command that times out returns its output so far with timed_out. When the command returns or times out, every process it started is killed, so `cmd &` does not outlive it. With background=true the command is started and a proc handle is returned immediately; collect its result later with wait. A background command runs until it exits, times out, or the daemon stops. With detach=true the command starts in its own session and its pid is returned at once; nothing kills or tracks it, so it outlives the turn and the daemon. Its output is discarded unless the command redirects it to a file. Use detach for a server or service that must keep running, and stop it yourself with kill.",
                 json!({"type":"object","properties":{"command":{"type":"string"},
                 "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_MS},
-                "background":{"type":"boolean"}},
+                "background":{"type":"boolean"},"detach":{"type":"boolean"}},
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
@@ -229,6 +229,8 @@ pub enum Prepared {
         timeout_ms: u64,
         background: bool,
     },
+    /// A command in its own session, neither tracked nor killed.
+    Detach(String),
     /// Resolved by the runtime, never by the registry.
     History {
         turn: i64,
@@ -468,6 +470,8 @@ impl Registry {
             timeout_ms: u64,
             #[serde(default)]
             background: bool,
+            #[serde(default)]
+            detach: bool,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -543,8 +547,12 @@ impl Registry {
                     || args.command.len() > 16 * 1024
                     || args.command.contains('\0')
                     || !(1..=MAX_SHELL_TIMEOUT_MS).contains(&args.timeout_ms)
+                    || (args.detach && args.background)
                 {
                     return fail("invalid_shell_arguments");
+                }
+                if args.detach {
+                    return Ok(Prepared::Detach(args.command));
                 }
                 Prepared::Shell {
                     command: args.command,
@@ -649,6 +657,7 @@ impl Registry {
             Prepared::Shell {
                 background: true, ..
             } => fail("background_requires_runtime"),
+            Prepared::Detach(command) => detach(&command, workspace, self, environment),
             Prepared::Wait { .. } => fail("wait_requires_runtime"),
             Prepared::History { .. } => fail("history_requires_runtime"),
             Prepared::Note { .. } => fail("note_requires_runtime"),
@@ -662,7 +671,7 @@ impl Registry {
                     .acquire()
                     .await
                     .map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let (stdout, stderr, status) = shell(
+                let (stdout, stderr, exit) = shell(
                     &command,
                     workspace,
                     Duration::from_millis(timeout_ms),
@@ -670,7 +679,7 @@ impl Registry {
                     environment,
                 )
                 .await?;
-                Ok(self.shell_outcome(stdout, stderr, status))
+                Ok(self.shell_outcome(stdout, stderr, exit))
             }
             Prepared::Read {
                 source: ReadSource::Artifact { .. },
@@ -742,12 +751,7 @@ impl Registry {
 }
 
 impl Registry {
-    fn shell_outcome(
-        &self,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
-        status: std::process::ExitStatus,
-    ) -> Outcome {
+    fn shell_outcome(&self, stdout: Vec<u8>, stderr: Vec<u8>, exit: Exit) -> Outcome {
         let mut artifacts = Vec::new();
         let mut preview = |name: &'static str, bytes: Vec<u8>| {
             // Reuse the pipe buffer for ordinary UTF-8 output. Invalid
@@ -765,8 +769,14 @@ impl Registry {
             artifacts.push((name, text.into_bytes()));
             shown
         };
-        let output = json!({"stdout":preview("stdout", stdout),"stderr":preview("stderr", stderr),
-            "exit_code":status.code(),"success":status.success()})
+        let (stdout, stderr) = (preview("stdout", stdout), preview("stderr", stderr));
+        let output = match exit {
+            Exit::Status(status) => json!({"stdout":stdout,"stderr":stderr,
+                "exit_code":status.code(),"success":status.success()}),
+            // The output up to the kill is what a long command has to show.
+            Exit::TimedOut => json!({"stdout":stdout,"stderr":stderr,
+                "exit_code":null,"success":false,"timed_out":true}),
+        }
         .to_string();
         Outcome {
             output,
@@ -800,7 +810,7 @@ impl Registry {
                 };
                 drop(queued);
                 let _slot = slot.map_err(|_| Error::new("tool_scheduler_closed"))?;
-                let (stdout, stderr, status) = shell(
+                let (stdout, stderr, exit) = shell(
                     &command,
                     &workspace,
                     Duration::from_millis(timeout_ms),
@@ -808,7 +818,7 @@ impl Registry {
                     &environment,
                 )
                 .await?;
-                Ok(registry.shell_outcome(stdout, stderr, status))
+                Ok(registry.shell_outcome(stdout, stderr, exit))
             }
             .await;
             let _ = done.send(result);
@@ -890,16 +900,83 @@ fn truncate(text: &str) -> String {
     )
 }
 
-async fn bounded_read(mut pipe: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    (&mut pipe)
-        .take(ARTIFACT_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await?;
+/// Append a pipe's output to `bytes`, which keeps what arrived if the read
+/// is cancelled, as it is at a shell timeout.
+async fn bounded_read(pipe: &mut (impl AsyncRead + Unpin), bytes: &mut Vec<u8>) -> Result<()> {
+    let room = (ARTIFACT_BYTES + 1).saturating_sub(bytes.len());
+    pipe.take(room as u64).read_to_end(bytes).await?;
     if bytes.len() > ARTIFACT_BYTES {
         return fail("shell_output_limit");
     }
-    Ok(bytes)
+    Ok(())
+}
+
+/// How a shell command ended: on its own, or killed at its timeout.
+pub enum Exit {
+    Status(std::process::ExitStatus),
+    TimedOut,
+}
+
+/// `/bin/sh -c command` in the workspace, with the registry's environment and
+/// none of the credentials the daemon holds.
+#[cfg(unix)]
+fn sh(
+    command: &str,
+    workspace: &Path,
+    registry: &Registry,
+    environment: &[(String, String)],
+) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new("/bin/sh");
+    for name in registry.credentials.names() {
+        process.env_remove(name);
+    }
+    // A set AGENT_PARENT names this bot's creator and nothing else; a root
+    // bot must not pass on one the daemon itself was started with.
+    process.env_remove("AGENT_PARENT");
+    process.env_remove("AGENT_PARENT_ID");
+    for (name, value) in registry.environment.iter().chain(environment) {
+        process.env(name, value);
+    }
+    process.arg("-c").arg(command).current_dir(workspace);
+    process
+}
+
+/// Start a command in a new session for a service that must outlive the
+/// turn and the daemon. Its output is discarded: a log the daemon wrote would
+/// bypass credential redaction, so a command that wants one redirects itself.
+/// No process slot, group kill, or handle applies to it; tokio reaps it if it
+/// exits while the daemon runs.
+#[cfg(unix)]
+fn detach(
+    command: &str,
+    workspace: &Path,
+    registry: &Registry,
+    environment: &[(String, String)],
+) -> Result<Outcome> {
+    use std::process::Stdio;
+    let mut process = sh(command, workspace, registry, environment);
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and touches no parent state.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let pid = process.spawn()?.id();
+    Ok(Outcome::text(
+        json!({"detached":true,"pid":pid}).to_string(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn detach(_: &str, _: &Path, _: &Registry, _: &[(String, String)]) -> Result<Outcome> {
+    fail("shell_platform_unsupported")
 }
 
 #[cfg(unix)]
@@ -909,9 +986,9 @@ async fn shell(
     timeout: Duration,
     registry: &Registry,
     environment: &[(String, String)],
-) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
+) -> Result<(Vec<u8>, Vec<u8>, Exit)> {
     use std::process::Stdio;
-    use tokio::process::{Child, Command};
+    use tokio::process::Child;
     struct ProcessGroup {
         child: Child,
         group: i32,
@@ -927,21 +1004,7 @@ async fn shell(
             }
         }
     }
-    let mut process = Command::new("/bin/sh");
-    for name in registry.credentials.names() {
-        process.env_remove(name);
-    }
-    // A set AGENT_PARENT names this bot's creator and nothing else; a root
-    // bot must not pass on one the daemon itself was started with.
-    process.env_remove("AGENT_PARENT");
-    process.env_remove("AGENT_PARENT_ID");
-    for (name, value) in registry.environment.iter().chain(environment) {
-        process.env(name, value);
-    }
-    let child = process
-        .arg("-c")
-        .arg(command)
-        .current_dir(workspace)
+    let child = sh(command, workspace, registry, environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -950,23 +1013,25 @@ async fn shell(
         .spawn()?;
     let group = child.id().ok_or(Error::new("shell_spawn_failed"))? as i32;
     let mut owned = ProcessGroup { child, group };
-    let stdout = owned
+    let mut stdout = owned
         .child
         .stdout
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
-    let stderr = owned
+    let mut stderr = owned
         .child
         .stderr
         .take()
         .ok_or(Error::new("shell_pipe_failed"))?;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
     let result = tokio::time::timeout(timeout, async {
-        tokio::try_join!(bounded_read(stdout), bounded_read(stderr), async {
-            owned.child.wait().await.map_err(Error::from)
-        })
+        tokio::try_join!(
+            bounded_read(&mut stdout, &mut out),
+            bounded_read(&mut stderr, &mut err),
+            async { owned.child.wait().await.map_err(Error::from) }
+        )
     })
-    .await
-    .unwrap_or_else(|_| fail("shell_timeout"));
+    .await;
     // Finish cleanup before returning a timeout/overflow. Drop also covers
     // cancellation, with Tokio responsible for reaping its killed child.
     unsafe {
@@ -974,7 +1039,25 @@ async fn shell(
     }
     let _ = owned.child.wait().await;
     owned.group = 0;
-    result
+    match result {
+        Ok(result) => result.map(|(_, _, status)| (out, err, Exit::Status(status))),
+        Err(_) => {
+            // What the group wrote before it was killed is still in the pipes.
+            // A process that left the group may hold them open, so the drain
+            // is bounded too. Overflowing the output limit still fails the tool.
+            if let Ok(Err(error)) = tokio::time::timeout(Duration::from_millis(100), async {
+                tokio::try_join!(
+                    bounded_read(&mut stdout, &mut out),
+                    bounded_read(&mut stderr, &mut err)
+                )
+            })
+            .await
+            {
+                return Err(error);
+            }
+            Ok((out, err, Exit::TimedOut))
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -984,7 +1067,7 @@ async fn shell(
     _: Duration,
     _: &Registry,
     _: &[(String, String)],
-) -> Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
+) -> Result<(Vec<u8>, Vec<u8>, Exit)> {
     fail("shell_platform_unsupported")
 }
 

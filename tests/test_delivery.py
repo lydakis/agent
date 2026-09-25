@@ -254,7 +254,12 @@ class DeliveryTests(ModelFixture):
         client.request('create', bot='Bob', workspace=str(self.path))
         first = client.request('submit', bot='Bob', request_id='1', prompt='slow')['result']
         self.assertEqual(first['status'], 'running')
-        self.assertEqual(client.request('submit', bot='Bob', request_id='x', prompt='never')['error'], 'bot_busy')
+        refused = client.request('submit', bot='Bob', request_id='x', prompt='never')
+        self.assertEqual(refused['error'], 'bot_busy')
+        # The refusal names the running turn and every way past it.
+        self.assertIn(f"turn {first['turn']} is running", refused['detail'])
+        for way in ('delivery steer', 'queue', 'fork'):
+            self.assertIn(way, refused['detail'])
         self.assertEqual(client.request('submit', bot='Bob', request_id='x', prompt='never', delivery='later')['error'],
                          'invalid_delivery')
         second = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']
