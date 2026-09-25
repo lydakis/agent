@@ -84,7 +84,9 @@ top-level automatic caching. Two more turns on the Sonnet bot (turns 11 and
 earlier call. Anthropic reports cache reads and cache writes outside
 `input_tokens`; the adapter now counts every processed input token in
 `input_tokens` and keeps reads in `cached_input_tokens`, so budgets and turn
-accounting see the same totals on both families.
+accounting see the same totals on both families. Each `usage` event also
+carries writes as `cache_write_tokens` (added 2026-09-25), since Anthropic
+bills them above the base input rate.
 
 The same session forked the Sonnet bot at the tool result inside turn 1
 (node 5, before that turn's final answer) into a new bot, and one turn on the

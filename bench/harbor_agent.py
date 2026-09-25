@@ -251,7 +251,8 @@ class Agent(BaseInstalledAgent):
         # A call Anthropic's server-side fallback ran on another model is in
         # its turn's totals; move each attempt to the model that ran it.
         moved = set()
-        for turn_model, attempts in self._fallback_usage():
+        events = self._usage_events()
+        for turn_model, attempts in ((m, d['models']) for m, d in events if 'models' in d):
             provider = turn_model.split('/', 1)[0] + '/' if '/' in turn_model else ''
             moved.add(turn_model)
             for attempt in attempts:
@@ -260,21 +261,30 @@ class Agent(BaseInstalledAgent):
                     usage.n_input_tokens += sign * attempt['input_tokens']
                     usage.n_cache_tokens += sign * attempt['cached_input_tokens']
                     usage.n_output_tokens += sign * attempt['output_tokens']
+        # Cache writes are inside input tokens; they are priced above input.
+        writes: dict[str, int] = {}
+        for model, data in events:
+            provider = model.split('/', 1)[0] + '/' if '/' in model else ''
+            for attempt in data.get('models') or [data]:
+                key = provider + attempt['model'] if 'model' in attempt else model
+                writes[key] = writes.get(key, 0) + attempt.get('cache_write_tokens', 0)
         # A turn sticky routing served entirely elsewhere leaves nothing to price.
         for model in moved:
             usage = models[model]
             if not (usage.n_input_tokens or usage.n_cache_tokens or usage.n_output_tokens):
                 del models[model]
         if not models and (streamed := self._streamed_usage()):
-            models[self.model_name or 'unknown'] = ModelUsage(
+            model = self.model_name or 'unknown'
+            models[model] = ModelUsage(
                 n_input_tokens=streamed['input_tokens'],
                 n_cache_tokens=streamed['cached_input_tokens'],
                 n_output_tokens=streamed['output_tokens'],
             )
+            writes = {model: streamed['cache_write_tokens']}
         if not models:
             return
         for model, usage in models.items():
-            usage.cost_usd = self._cost(model, usage)
+            usage.cost_usd = self._cost(model, usage, writes.get(model, 0))
         costs = [usage.cost_usd for usage in models.values()]
         context.n_input_tokens = sum(u.n_input_tokens for u in models.values())
         context.n_cache_tokens = sum(u.n_cache_tokens for u in models.values())
@@ -310,18 +320,18 @@ class Agent(BaseInstalledAgent):
         except sqlite3.Error:
             return None
 
-    def _fallback_usage(self) -> list[tuple[str, list[dict[str, Any]]]]:
-        """Per-model attempts of each call a server-side fallback served, with
-        the model its turn is counted under, from the store's usage events."""
+    def _usage_events(self) -> list[tuple[str, dict[str, Any]]]:
+        """Every call's usage event in the store, with the model its turn is
+        counted under."""
         path = self.logs_dir / 'state.sqlite'
         if not path.is_file():
             return []
         try:
             with contextlib.closing(sqlite3.connect(path)) as db:
-                return [(model, json.loads(data)['models']) for model, data in db.execute(
+                return [(model, json.loads(data)) for model, data in db.execute(
                     "SELECT COALESCE(t.model,b.provider||'/'||b.model),e.data "
                     'FROM events e JOIN turns t ON t.id=e.turn JOIN bots b ON b.name=t.bot '
-                    "WHERE e.kind='usage' AND json_extract(e.data,'$.models') IS NOT NULL")]
+                    "WHERE e.kind='usage'")]
         except sqlite3.Error:
             return []
 
@@ -334,7 +344,7 @@ class Agent(BaseInstalledAgent):
         path = self.logs_dir / 'agent.jsonl'
         if not path.is_file():
             return None
-        keys = ('input_tokens', 'cached_input_tokens', 'output_tokens')
+        keys = ('input_tokens', 'cached_input_tokens', 'cache_write_tokens', 'output_tokens')
         totals = dict.fromkeys(keys, 0)
         seen = False
         for line in path.read_text().splitlines():
@@ -345,15 +355,16 @@ class Agent(BaseInstalledAgent):
             if event.get('event') == 'usage':
                 seen = True
                 for key in keys:
-                    totals[key] += event['data'][key]
+                    totals[key] += event['data'].get(key, 0)
         return totals if seen else None
 
     @staticmethod
-    def _cost(model: str, usage: ModelUsage) -> float | None:
+    def _cost(model: str, usage: ModelUsage, writes: int = 0) -> float | None:
         """Aggregate-token cost from LiteLLM's table, as Harbor's own adapters do.
 
-        Anthropic cache writes are billed above the base input rate, but the
-        turn record folds them into input tokens, so Anthropic cost is a floor.
+        `writes` of the uncached input tokens went to the prompt cache and are
+        billed at the model's cache-write rate (the 5-minute rate the runtime
+        requests), or as input when the table has none.
         """
         try:
             import litellm
@@ -365,5 +376,6 @@ class Agent(BaseInstalledAgent):
         rates = litellm.model_cost[key]
         uncached = usage.n_input_tokens - usage.n_cache_tokens
         cached_rate = rates.get('cache_read_input_token_cost') or rates['input_cost_per_token']
-        return (uncached * rates['input_cost_per_token'] + usage.n_cache_tokens * cached_rate
-                + usage.n_output_tokens * rates['output_cost_per_token'])
+        write_rate = rates.get('cache_creation_input_token_cost') or rates['input_cost_per_token']
+        return ((uncached - writes) * rates['input_cost_per_token'] + writes * write_rate
+                + usage.n_cache_tokens * cached_rate + usage.n_output_tokens * rates['output_cost_per_token'])

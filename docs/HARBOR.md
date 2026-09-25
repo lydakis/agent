@@ -72,7 +72,10 @@ the same model can drive each harness on the same tasks.
    They are grouped by model, so a delegated bot on another model is priced at
    its own rates, and so is each call Anthropic's server-side fallback ran on
    another model (the `models` split of its `usage` event). Cost is
-   computed from LiteLLM's price table, as Harbor's own adapters do. It is left
+   computed from LiteLLM's price table, as Harbor's own adapters do. Cache
+   reads are priced at the cache-read rate and Anthropic cache writes (the
+   `cache_write_tokens` of each `usage` event) at the cache-write rate, as
+   Harbor's Claude Code adapter prices its steps. It is left
    empty when any model used is missing from the table, rather than reported low.
    Provider failures map to Harbor's retryable error types, for example
    `provider_http_429` to `ApiRateLimitError`, `provider_stream_failed` to
@@ -146,9 +149,6 @@ variable is forwarded from the host). Keep job outputs under the ignored
 
 ## Gaps before publishing a comparison
 
-- **Anthropic cost is a lower bound.** Turn records fold cache writes into input
-  tokens, and Anthropic bills cache writes above the base input rate. Recording
-  cache-creation tokens separately would close this.
 - **Timeouts miss the call in flight.** Shutdown cancels the model call in
   progress at the timeout before the provider reports its usage, so those
   tokens are not counted even if the provider bills them.

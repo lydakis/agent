@@ -242,7 +242,10 @@ a process budget of two, because waiters hold nothing.
 ## Accounting and budgets
 
 Provider-reported usage records a durable `usage` event (with a per-model
-`models` split when a provider-side fallback ran another model), and the store keeps running
+`models` split when a provider-side fallback ran another model, and
+`cache_write_tokens` when Anthropic wrote input to its prompt cache: part of
+`input_tokens`, billed above the base rate, and kept only in the event since
+no budget or cache ratio needs it), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
 `input_tokens`, `cached_input_tokens`). Both report `cache_hit`, the share of

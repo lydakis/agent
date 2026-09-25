@@ -168,6 +168,11 @@ pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Input tokens written to the provider's prompt cache, which Anthropic
+    /// bills above the base input rate. Part of `input_tokens`, like cache
+    /// reads; zero for providers that do not bill writes.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
     /// The billed attempts, when a provider-side fallback ran more than one
     /// model for the call, so each can be priced at its model's rates. The
     /// totals above are their sum.
@@ -180,6 +185,11 @@ pub struct ModelTokens {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 #[derive(Debug)]
 pub struct Completion {
