@@ -175,6 +175,10 @@ class Model(http.server.BaseHTTPRequestHandler):
                 timeout, handles = user[6:].split(':', 1)
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
                            'arguments': json.dumps({'handles': handles.split(','), 'timeout_ms': int(timeout)})}]
+            elif user.startswith('detach:'):
+                text = ''
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'detach-1',
+                           'arguments': json.dumps({'command': user[7:], 'detach': True})}]
             elif user.startswith('shell:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
@@ -291,9 +295,14 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert self.path == '/v1/messages'
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
-            assert self.headers.get('anthropic-beta') == (
-                'thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01')
-            assert request['fallbacks'] == 'default'
+            # Server-side fallbacks are a bot's choice: the field and its beta
+            # header travel together, or not at all.
+            if 'fallbacks' in request:
+                assert request['fallbacks'] == 'default'
+                assert self.headers.get('anthropic-beta') == (
+                    'thinking-binding-controls-2026-08-01,server-side-fallback-2026-07-01')
+            else:
+                assert self.headers.get('anthropic-beta') == 'thinking-binding-controls-2026-08-01'
             if 'thinking' in request:
                 assert request['thinking']['block_binding'] == {'prefix_mismatch_behavior': 'drop_block'}
             # A cache refresh is the same request with no output and no stream.
@@ -534,7 +543,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_a_fallback_answer_replays_without_the_declined_attempt(self):
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low', fallbacks=True)
         turn = client.request('submit', bot='Bob', request_id='f1', prompt='fallback:kept')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
@@ -562,7 +571,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
 
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()
-        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low', fallbacks=True)
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:shared')['result']['turn']
         finished = client.finished(turn)
         self.assertEqual(finished['data']['status'], 'completed')
@@ -635,6 +644,37 @@ class ModelFixture(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class RuntimeTests(ModelFixture):
+    def test_detached_shell_releases_its_daemon_slot_after_exit(self):
+        client = self.client('shell', extra=('--max-detached', '1'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
+
+        def result(prompt, request_id):
+            turn = client.request('submit', bot='Bob', request_id=request_id,
+                                  prompt=prompt)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+            events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
+            completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
+            output = client.request('item', bot='Bob', node=completed['data']['node'])['result']['output']
+            return json.loads(output)
+
+        first = result('detach:exec sleep 30', 'first')
+        self.assertTrue(first['detached'])
+        pid = first['pid']
+        try:
+            self.assertEqual(result('detach:true', 'full')['error'], 'detached_limit')
+        finally:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(.01)
+        self.assertTrue(result('detach:true', 'free')['detached'])
+
     def test_shutdown_cancels_pending_retention_without_stdin_eof(self):
         client = self.client()
         client.request('create', bot='Big')

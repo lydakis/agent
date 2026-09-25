@@ -79,6 +79,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut socket = None;
     let mut providers = Vec::new();
     let mut max_processes = None;
+    let mut max_detached = None;
     let mut max_active = None;
     let mut max_connecting = None;
     let mut max_pending = None;
@@ -104,6 +105,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
             "--socket" => socket = Some(value.into()),
             "--provider" => providers.push(server::ProviderSpec::parse(value)?),
             "--max-processes"
+            | "--max-detached"
             | "--max-active"
             | "--max-connecting"
             | "--max-pending"
@@ -113,6 +115,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     .map_err(|_| Error::with("usage", format!("{flag} needs an integer")))?;
                 match flag.as_str() {
                     "--max-processes" => max_processes = Some(parsed),
+                    "--max-detached" => max_detached = Some(parsed),
                     "--max-active" => max_active = Some(parsed),
                     "--max-pending" => max_pending = Some(parsed),
                     "--max-pending-bytes" => max_pending_bytes = Some(parsed),
@@ -208,6 +211,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         socket,
         providers,
         max_processes,
+        max_detached,
         max_active,
         max_connecting,
         max_pending,

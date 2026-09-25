@@ -4159,3 +4159,80 @@ measurable cost. The first pair ran while the host was busier, which both
 binaries show. Validation of the reviewed tree: 121 Rust tests, 239 Python
 tests with 16 opt-in skips, strict Clippy and formatting. Captures:
 `.local/bench/slice-login2-*`.
+
+## Store identity, per-bot fallbacks, detached bound
+
+2026-09-25, local macOS arm64, release builds. Baseline `f6efb4c` (binary
+`03705a17`), candidate the working tree (`cab16ce1`): the Responses cache key
+under the store's identity instead of a per-daemon nonce, Anthropic server-side
+fallbacks as a per-bot option off by default, and detached shell commands
+bounded and reaped. On the screened path, which is Responses with echo tools,
+the change is one more column in the bot row and a boolean on the request.
+
+The 32-agent socket echo screen with all five tool schemas, four pairs of three
+measured runs each; pairs 1 and 2 ran baseline first, 3 and 4 candidate first:
+
+| Pair | Order | Daemon CPU s, baseline / candidate | Peak RSS MiB | Turn p95 ms |
+| --- | --- | ---: | ---: | ---: |
+| 1 | base, cand | 0.342 (0.341–0.364) / 0.385 (0.360–0.387) | 18.66 / 18.70 | 595.8 / 609.4 |
+| 2 | base, cand | 0.379 (0.378–0.402) / 0.418 (0.409–0.425) | 18.61 / 18.66 | 598.1 / 604.1 |
+| 3 | cand, base | 0.387 (0.352–0.387) / 0.365 (0.355–0.368) | 18.56 / 18.77 | 595.3 / 588.4 |
+| 4 | cand, base | 0.354 (0.350–0.377) / 0.377 (0.356–0.378) | 18.44 / 18.64 | 587.2 / 587.6 |
+
+Inconclusive rather than flat. The candidate's median CPU is higher in three
+pairs and lower in one, the run that went second is slower in three of four,
+and the baseline itself moved from 0.342 to 0.387 s across the session, so the
+order and host drift are of the same size as the difference. RSS and p95 are
+within noise. Nothing in the change runs per request on this path beyond
+copying a boolean and reading one more column, so no mechanism explains a real
+cost; a longer matched screen on a quiet host would settle it. Validation:
+121 Rust tests, 255 Python tests with 21 opt-in skips, strict Clippy and
+formatting. Captures: `.local/bench/slice-review-*`.
+
+## Detached-child ownership and copied-store cache namespace
+
+2026-09-25, local macOS arm64 on AC power. The pre-fix working-tree binary is
+`cab16ce1`; the reviewed fix is `90c235cd`. The copy/restart regression
+passed on the fixed binary after failing on the pre-fix binary. Detached
+children now keep an owned Tokio waiter and a permit until exit; the ready
+store identity and Responses cache keys bind the durable store lineage to the
+physical file identity. The hash is computed once at daemon startup.
+
+On the same 32-agent socket echo workload with all five tool schemas, each arm
+had one warmup and two measured runs. All measured runs finished 96 turns with
+no quality warnings. Medians within each arm:
+
+| Pair, order | Daemon CPU s, pre-fix / fixed | Peak daemon RSS MiB, pre-fix / fixed | Turn p95 ms, pre-fix / fixed |
+| --- | ---: | ---: | ---: |
+| 1, pre-fix then fixed | 0.351 / 0.354 | 18.59 / 18.79 | 645.6 / 628.4 |
+| 2, fixed then pre-fix | 0.386 / 0.341 | 18.90 / 18.74 | 672.3 / 618.6 |
+
+A second matched screen exercised the changed tool path: four bots each ran
+64 `detach:true` shell turns, with 256 detached results and 512 model calls
+checked per run. Two reversed-order pairs gave daemon CPU 1.468 / 1.329 s
+and 1.048 / 1.451 s, respectively, for pre-fix / fixed. Turn p95 was
+30.75 / 27.75 ms and 10.21 / 31.37 ms. The second pair's large shift in
+both binaries makes this screen inconclusive on cost; neither a speedup nor
+a stable regression is established. The implementation removes a PID sweep
+per detach, uses one bounded waiter per live detached child, and adds no work
+on ordinary model rounds beyond formatting the longer cache key. A quieter
+matched run would be needed for a strict non-regression claim.
+
+Captures: `.local/bench/slice-fix-{base,cand}-*` and
+`.local/bench/slice-fix-detach-results-long.json`; the synthetic detached
+screen is `.local/bench/slice-fix-detach-screen.py`. Validation: full Rust
+suite, relevant CLI/runtime/compaction/Harbor Python suite, strict Clippy,
+formatting, and diff checks. Cabal Linux amd64 also passed the focused
+detached-child test (job `cabal/01M3BF841C18Y5MNFTD9D30G65`, source
+`f6efb4c95415-dirty`, exit 0).
+
+After merging `02e79eb` (keep-warm refreshes and sticky routing), the same
+screen ran once more against that base (binary `78aa535b`) with the merged
+tree (`36a44102`), two pairs: daemon CPU 0.361 / 0.334 s and 0.344 / 0.315 s,
+peak RSS 18.72 / 18.89 and 18.80 / 18.81 MiB, turn p95 760.0 / 615.6 and
+609.4 / 606.3 ms, baseline first in both. The baseline's first pair held a
+noisy p95; nothing here is a speedup claim. A keep-warm refresh renders the
+bot's fallback choice exactly as its call did, so the cache it refreshes is
+the one the call wrote. Validation of the merged tree: 121 Rust tests, 264
+Python tests with 22 opt-in skips, strict Clippy and formatting.
+

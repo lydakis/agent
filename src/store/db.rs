@@ -71,6 +71,10 @@ pub struct Bot {
     pub thinking_prefix: Option<i64>,
     #[serde(skip)]
     pub thinking_floor: i64,
+    /// Anthropic server-side fallbacks: a declined request is rerun on the
+    /// model Anthropic recommends instead of failing the turn. The client's
+    /// choice at creation; forks inherit it.
+    pub fallbacks: bool,
 }
 impl Bot {
     /// The bot id that keys this bot's provider prompt cache.
@@ -108,6 +112,8 @@ pub struct Binding<'a> {
     /// client's; with no instructions the bot never compacts.
     pub compaction_instructions: Option<&'a str>,
     pub compaction_model: Option<&'a str>,
+    /// Anthropic server-side fallbacks for this bot.
+    pub fallbacks: bool,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -367,7 +373,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 27;
+    pub const SCHEMA: i32 = 28;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -456,13 +462,17 @@ impl Database {
                 compaction INTEGER REFERENCES compactions(node),
                 compaction_instructions TEXT, compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
-                thinking_floor INTEGER NOT NULL DEFAULT 0);
+                thinking_floor INTEGER NOT NULL DEFAULT 0,
+                fallbacks INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                identity INTEGER NOT NULL);
+            INSERT OR IGNORE INTO store VALUES (1,random());
             CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent);
             CREATE INDEX IF NOT EXISTS bots_head ON bots(head);
             CREATE INDEX IF NOT EXISTS bots_context_start ON bots(context_start);
@@ -664,9 +674,10 @@ impl Database {
             cache_bot: r.get(22)?,
             thinking_prefix: r.get(23)?,
             thinking_floor: r.get(24)?,
+            fallbacks: r.get::<_, i64>(25)? != 0,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -760,7 +771,7 @@ impl Database {
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -775,7 +786,8 @@ impl Database {
                 binding.created_by,
                 created_by_id,
                 binding.compaction_instructions,
-                binding.compaction_model
+                binding.compaction_model,
+                binding.fallbacks
             ],
         )?;
         // The event carries the list record's fields, so a follower can
@@ -1561,6 +1573,16 @@ impl Database {
         }
         Ok(out)
     }
+    /// Durable lineage, drawn at creation and copied with the database. The
+    /// daemon also binds it to the physical file for its cache namespace.
+    pub fn store_identity(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT identity FROM store WHERE singleton=1", [], |r| {
+                r.get(0)
+            })?)
+    }
+
     /// Bytes each node loses without its thinking blocks.
     pub fn thinking_of(&self, ids: &[i64]) -> Result<Vec<u32>> {
         let mut statement = self
@@ -2922,7 +2944,7 @@ impl Database {
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -2948,7 +2970,8 @@ impl Database {
                 (same_prefix && parent.thinking_floor <= checkpoint.map_or(0, |c| c + 1))
                     .then_some(parent.thinking_prefix)
                     .flatten(),
-                parent.thinking_floor
+                parent.thinking_floor,
+                parent.fallbacks
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -4163,6 +4186,20 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 26 -> 27: forks share their source's prompt cache key. Existing
         // bots keep their own, which the daemon renews at each start anyway.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN cache_bot INTEGER;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='fallbacks')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 27 -> 28: server-side fallbacks become a bot's choice, off unless
+        // asked for, and the store draws an identity once for cache keys.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN fallbacks INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE IF NOT EXISTS store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                identity INTEGER NOT NULL);
+             INSERT OR IGNORE INTO store VALUES (1,random());",
+        )?;
     }
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='thinking')",

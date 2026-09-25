@@ -184,7 +184,9 @@ class Agent(BaseInstalledAgent):
     def _command(self, instruction: str) -> str:
         if not self.model_name:
             raise ValueError('Model name is required, as PROVIDER/MODEL')
-        flags = ['--new', '--bot', BOT, '--agents', '--model', self.model_name]
+        # Benchmarks keep going past a declined Anthropic request on the
+        # model Anthropic recommends; a fleet opts in per bot.
+        flags = ['--new', '--bot', BOT, '--agents', '--fallbacks', '--model', self.model_name]
         for spec in self._providers:
             flags += ['--provider', spec]
         if self._reasoning:

@@ -38,7 +38,7 @@ class Client:
         self.reader = threading.Thread(target=read, daemon=True)
         self.reader.start()
         try:
-            self.receive(lambda m: m.get('event') == 'ready')
+            self.ready = self.receive(lambda m: m.get('event') == 'ready')
         except Exception:
             self.close(kill=True)
             raise

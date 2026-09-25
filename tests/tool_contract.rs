@@ -337,3 +337,83 @@ async fn detached_commands_run_in_their_own_session_and_write_only_where_told() 
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn detached_commands_are_bounded_and_reaped() {
+    let tools = Registry::new("shell").unwrap().with_detached_budget(2);
+    let dir = std::env::temp_dir().join(format!("agent-detach-bound-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let detach = |command: &str| {
+        tools
+            .prepare(
+                "shell",
+                &json!({"command":command,"detach":true}).to_string(),
+            )
+            .unwrap()
+    };
+    let mut pids = Vec::new();
+    for _ in 0..2 {
+        let output: Value = serde_json::from_str(
+            &tools
+                .execute(detach("exec sleep 30"), &dir, &[])
+                .await
+                .unwrap()
+                .output,
+        )
+        .unwrap();
+        pids.push(output["pid"].as_i64().unwrap() as i32);
+    }
+    // Two running: the bound refuses a third, as a tool error the model sees.
+    let error = tools.execute(detach("true"), &dir, &[]).await.unwrap_err();
+    assert_eq!(error.code, "detached_limit");
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("--max-detached 2"),
+        "{error:?}"
+    );
+    // One exits: its waiter reaps it without another detach, and releases
+    // its place. The test must not reap the child on the runtime's behalf.
+    unsafe {
+        libc::kill(pids[0], libc::SIGKILL);
+    }
+    for _ in 0..100 {
+        if unsafe { libc::kill(pids[0], 0) } != 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_ne!(unsafe { libc::kill(pids[0], 0) }, 0);
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pids[0], &mut status, libc::WNOHANG) },
+        -1
+    );
+    let output = tools
+        .execute(detach("true"), &dir, &[])
+        .await
+        .unwrap()
+        .output;
+    assert!(output.contains("\"detached\":true"), "{output}");
+    // Unbounded when asked.
+    let free = Registry::new("shell").unwrap().with_detached_budget(0);
+    for _ in 0..3 {
+        free.execute(
+            free.prepare(
+                "shell",
+                &json!({"command":"true","detach":true}).to_string(),
+            )
+            .unwrap(),
+            &dir,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+    unsafe {
+        libc::kill(pids[1], libc::SIGKILL);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

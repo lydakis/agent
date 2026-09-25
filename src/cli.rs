@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --agents --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -174,6 +174,7 @@ fn print_flags(flags: &str) {
                 "A new bot's tools; default shell,read,write,edit,wait,history",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
+            "--max-detached" => ("N", "Detached commands still running; 0 is unbounded"),
             "--max-active" => ("N", "Concurrent active turn limit; 0 is unbounded"),
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
@@ -216,6 +217,10 @@ fn print_flags(flags: &str) {
                 "A new bot's summarizer; default: its own model",
             ),
             "--no-compaction" => ("", "Create the bot without compaction"),
+            "--fallbacks" => (
+                "",
+                "A new bot's declined Anthropic requests rerun on the recommended model",
+            ),
             "--retain-turns" => ("N", "Automatically retain N turns' operational records"),
             _ => unreachable!("flag missing help"),
         };
@@ -281,6 +286,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--any"
                 | "--no-compaction"
                 | "--agents"
+                | "--fallbacks"
         ) {
             if inline.is_some() {
                 return fail_with("usage", format!("{flag} takes no value"));
@@ -356,6 +362,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--agents",
             "--reasoning",
             "--budget-tokens",
+            "--fallbacks",
         ]
         .iter()
         .any(|f| has(f))

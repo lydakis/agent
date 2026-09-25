@@ -121,7 +121,10 @@ harbor run -d terminal-bench/terminal-bench-2-1 -a strands -m anthropic/claude-f
 ```
 
 To run on a ChatGPT plan instead of an API key, sign in with `codex login` and
-name the model `chatgpt/MODEL`, using the id Codex's `/model` picker shows. The
+name the model `chatgpt/MODEL`, using the id Codex's `/model` picker shows. Every
+task bot is created with `--fallbacks`, so a declined Anthropic request finishes
+on the model Anthropic recommends instead of failing the task; a fleet opts in
+per bot. The
 adapter copies the access token and account id from Codex's `auth.json` into each
 task container, readable only by the agent user, and adds `--provider chatgpt`.
 The refresh and ID tokens stay on the host, and nothing is uploaded when a
