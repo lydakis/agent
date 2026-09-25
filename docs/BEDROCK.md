@@ -85,7 +85,7 @@ connection-start slot.
 | Responses over WebSocket | yes | **documented** unsupported on either endpoint | refused for Bedrock URLs |
 | Rate-limit headers for pacing | yes | **documented** absent | escalating refusal backoff instead |
 | Legacy thinking budgets by model name | yes | ids are vendor- and profile-prefixed | carried: `us.anthropic.claude-haiku-4-5…` reads as `claude-haiku-4-5` |
-| Output cap | Responses only | quota deducted up front | `--max-output-tokens` now reaches Anthropic as `max_tokens` |
+| Output cap | the model's full limit for Anthropic | quota deducted up front on runtime | per-model limit read inside Bedrock ids; `--max-output-tokens` overrides it |
 
 ## The gaps from the first survey, on current main
 
@@ -101,10 +101,14 @@ connection-start slot.
    model inside a Bedrock id, so a Haiku 4.5 id on Bedrock gets a budget and
    current models get adaptive thinking. Pool keys are left as given: geo and
    global profiles are separate quotas.
-3. **The fixed 32k `max_tokens`.** Still the default, but `--max-output-tokens`
-   now sets it, with a legacy thinking budget clamped to leave 1,024 tokens for
-   the answer. On both Bedrock endpoints the bound is charged against quota up
-   front, so it is the throughput knob.
+3. **The fixed 32k `max_tokens`.** Main now asks for each model's full output
+   limit (PR #15), read inside Bedrock ids, so Haiku 4.5 on Bedrock gets 64,000
+   rather than the 128,000 default. `--max-output-tokens` overrides it, with a
+   legacy thinking budget clamped to leave 1,024 tokens for the answer. On
+   Bedrock runtime `input + max_tokens` is deducted from quota when a call
+   starts (**documented**), so the full limit reserves up to 128,000 tokens
+   per call until usage settles; a fleet with a tight quota should set the cap
+   near real output. Anthropic's own API counts only generated tokens.
 4. **Twelve-hour tokens read once.** SigV4 through the chain replaces them:
    keys refresh themselves. A Bedrock API key in a key field still works and
    is still read once.

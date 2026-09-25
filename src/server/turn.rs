@@ -871,7 +871,7 @@ impl Turn {
                         accounting,
                         &tools,
                         &mut context,
-                        provider.output_byte_estimate(),
+                        provider.output_byte_estimate(model),
                     )
                     .await?
             {

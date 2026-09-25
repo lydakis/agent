@@ -19,8 +19,25 @@ mod socket;
 pub use pace::Report;
 pub use socket::Sockets;
 
-pub const MAX_OUTPUT: usize = 512 * 1024;
-const ANTHROPIC_MAX_TOKENS: u32 = 32_768;
+/// JSON-encoded bytes one response may stream. A full 128,000-token Claude
+/// answer runs about 512 KiB; the bound stays under the 1 MiB event cap so
+/// every stored item and live event remains publishable and readable.
+pub const MAX_OUTPUT: usize = 768 * 1024;
+
+/// The bytes `text` takes as a JSON string body, as serde_json escapes it.
+/// Decoded text can grow up to sixfold when encoded, so output bounds count
+/// this rather than the decoded length.
+pub(crate) fn encoded_len(text: &str) -> usize {
+    text.len()
+        + text
+            .bytes()
+            .map(|b| match b {
+                b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 1,
+                0..=0x1f => 5,
+                _ => 0,
+            })
+            .sum::<usize>()
+}
 
 /// Concurrent streams one HTTP/2 connection may carry, as both current
 /// providers advertise in SETTINGS_MAX_CONCURRENT_STREAMS. Requests beyond
@@ -347,12 +364,18 @@ impl Provider {
 
     /// Planning estimate only: tokens do not bound encoded JSON bytes.
     /// An unset Responses cap is unknown, not an invented output limit.
-    pub fn output_byte_estimate(&self) -> Option<usize> {
+    pub fn output_byte_estimate(&self, model: &str) -> Option<usize> {
         match self.family {
             Family::Responses => self.max_output_tokens,
-            Family::Anthropic => Some(self.max_output_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS)),
+            Family::Anthropic => Some(self.anthropic_max_tokens(model)),
         }
         .map(|tokens| (tokens as usize).saturating_mul(4))
+    }
+    /// Anthropic's `max_tokens`: `--max-output-tokens` when set, else the
+    /// model's full output limit.
+    fn anthropic_max_tokens(&self, model: &str) -> u32 {
+        self.max_output_tokens
+            .unwrap_or_else(|| anthropic_max_tokens(model))
     }
     /// How much longer this model's pool is closed by a rate limit, if it is.
     pub fn blocked_for(&self, model: &str) -> Option<std::time::Duration> {
@@ -360,7 +383,7 @@ impl Provider {
     }
 
     /// Bound generated tokens, reasoning included. Anthropic calls send it
-    /// as `max_tokens` in place of the default, and need room for a thinking
+    /// as `max_tokens` in place of the model's full output limit, and need room for a thinking
     /// budget of at least 1,024 tokens beside the answer. Bedrock deducts
     /// input plus this bound from quota when a call starts, so a bound near
     /// real output is throughput there.
@@ -464,7 +487,7 @@ impl Provider {
             fallbacks: Option<&'static str>,
         }
         let disable_tools = !request.allow_tool_calls && request.tools.get() != "[]";
-        let max_tokens = self.max_output_tokens.unwrap_or(ANTHROPIC_MAX_TOKENS);
+        let max_tokens = self.anthropic_max_tokens(request.model);
         let (mut bytes, field) = match self.family {
             Family::Responses => (
                 serde_json::to_vec(&Responses {
@@ -1116,6 +1139,35 @@ fn claude_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
+/// The model's full output limit. A lower cap fails any answer that runs
+/// past it, and Anthropic counts only generated tokens against output rate
+/// limits, so the full limit costs nothing until it is used.
+/// https://platform.claude.com/docs/en/about-claude/models/overview
+/// Bedrock ids are read for the Claude model they name.
+fn anthropic_max_tokens(model: &str) -> u32 {
+    let model = claude_model(model);
+    const LIMITS: [(&str, u32); 12] = [
+        ("claude-haiku-4-5", 64_000),
+        ("claude-opus-4-5", 64_000),
+        ("claude-sonnet-4-5", 64_000),
+        ("claude-sonnet-4-0", 64_000),
+        ("claude-sonnet-4-2025", 64_000),
+        ("claude-3-7-sonnet", 64_000),
+        ("claude-opus-4-1", 32_000),
+        ("claude-opus-4-0", 32_000),
+        ("claude-opus-4-2025", 32_000),
+        ("claude-3-5-", 8_192),
+        // Every other Claude 3 and Claude 2 model; order matters above.
+        ("claude-3-", 4_096),
+        ("claude-2", 4_096),
+    ];
+    // Claude 4.6 and every later model generate up to 128,000 tokens.
+    LIMITS
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map_or(128_000, |&(_, limit)| limit)
+}
+
 /// Model ids that predate adaptive thinking and still require a token budget.
 fn legacy_thinking(model: &str) -> bool {
     let model = claude_model(model);
@@ -1280,6 +1332,75 @@ mod tests {
     }
 
     #[test]
+    fn encoded_len_matches_serde_escaping() {
+        let text: String = (0u8..0x80)
+            .map(char::from)
+            .chain("é\u{2028}😀".chars())
+            .collect();
+        assert_eq!(
+            encoded_len(&text),
+            serde_json::to_string(&text).unwrap().len() - 2
+        );
+    }
+
+    #[test]
+    fn anthropic_requests_ask_for_the_models_full_output_limit() {
+        for (model, limit) in [
+            ("claude-sonnet-5", 128_000),
+            ("claude-opus-5-5", 128_000),
+            ("claude-sonnet-4-6", 128_000),
+            ("claude-opus-4-6", 128_000),
+            ("claude-haiku-4-5-20251001", 64_000),
+            ("claude-sonnet-4-5-20250929", 64_000),
+            ("claude-opus-4-5", 64_000),
+            ("claude-sonnet-4-20250514", 64_000),
+            ("claude-opus-4-1-20250805", 32_000),
+            ("claude-opus-4-20250514", 32_000),
+            ("claude-3-7-sonnet-20250219", 64_000),
+            ("claude-3-5-haiku-20241022", 8_192),
+            ("claude-3-haiku-20240307", 4_096),
+            ("claude-3-sonnet-20240229", 4_096),
+            ("claude-3-opus-20240229", 4_096),
+            ("claude-2.1", 4_096),
+            // Bedrock ids name the same models.
+            ("anthropic.claude-haiku-4-5-20251001-v1:0", 64_000),
+            ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", 64_000),
+            ("global.anthropic.claude-sonnet-5", 128_000),
+            ("anthropic.claude-3-haiku-20240307-v1:0", 4_096),
+        ] {
+            assert_eq!(anthropic_max_tokens(model), limit, "{model}");
+        }
+        let provider = Provider::new(
+            Transport::new(64, 1).unwrap(),
+            Family::Anthropic,
+            "https://api.example.test",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            provider.output_byte_estimate("claude-sonnet-5"),
+            Some(512_000)
+        );
+        // A budget must stay below max_tokens on small legacy models.
+        let mut prefix = provider
+            .prefix(&Request {
+                model: "claude-3-5-haiku-20241022",
+                instructions: "",
+                reasoning: Some("high"),
+                tools: &none(),
+                allow_tool_calls: true,
+                cache_key: None,
+                items: Items::empty(),
+                chain: None,
+            })
+            .unwrap();
+        prefix.extend_from_slice(b"]}");
+        let body: Value = serde_json::from_slice(&prefix).unwrap();
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["thinking"]["budget_tokens"], 7168);
+    }
+
+    #[test]
     fn request_prefix_streams_history_after_family_specific_fields() {
         let transport = Transport::new(64, 1).unwrap();
         let provider = Provider::new(
@@ -1323,6 +1444,8 @@ mod tests {
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
         assert!(legacy.contains("\"budget_tokens\":2048"));
+        assert!(legacy.contains("\"max_tokens\":64000"));
+        assert!(text.contains("\"max_tokens\":128000"));
         assert!(legacy.contains("\"prefix_mismatch_behavior\":\"drop_block\""));
         assert!(legacy.contains("\"fallbacks\":\"default\""));
         assert!(!legacy.contains("output_config"));
@@ -1456,7 +1579,10 @@ mod tests {
         .unwrap()
         .with_max_output_tokens(4096)
         .unwrap();
-        assert_eq!(provider.output_byte_estimate(), Some(4096 * 4));
+        assert_eq!(
+            provider.output_byte_estimate("claude-sonnet-5"),
+            Some(4096 * 4)
+        );
         let body = |model: &str| {
             let mut prefix = provider
                 .prefix(&Request {
