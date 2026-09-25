@@ -85,40 +85,51 @@ its caller says so in the message it sends.
 
 When `fork` gets no `--checkpoint` and the source's turn is running or
 parked, fork at the newest closed node instead of refusing. That is the
-newest node in the head's lineage with no unanswered call behind it: the last
-result of the newest fully answered round, or a steer message absorbed at a
-round boundary. When no round has finished yet, it is the turn's prompt.
+newest node in the head's lineage with no unanswered call behind it and no
+reasoning item left without its response: the last result of the newest
+fully answered round, a steer message absorbed at a round boundary, or a
+final answer not yet finished. When no round has finished yet, it is the
+turn's prompt.
 
-- **Cost: one round, via a per-round boundary.** Today `validate_fork_point`
+- **Cost: one column read, no transcript read.** Today `validate_fork_point`
   (db.rs:2827) walks back until it reaches a `checkpoints` row, and only a
-  finished turn writes one. On a running turn it would read every round
-  since the turn began, up to `MAX_ROUNDS` (200), on the store's serialized
-  worker. So each running turn keeps a boundary in a nullable
-  `bots.closed` column. A turn sets it to its prompt when it starts. When it
-  appends a model response, it moves it to the head before that response,
-  since the request that produced it had to answer every earlier call. When
-  it absorbs a batch of steers (`Database::absorb`, db.rs:2188), it moves
-  it to the batch's last item: absorbing happens only at a round boundary,
-  where every call is answered, and steers hold no calls. These writes ride
-  transactions that already exist, and finishing the turn clears it. The
-  fork reads the items after the boundary and picks the newest one where
-  every call since the boundary is answered. Once a round's results are
-  all in, that is the head itself, even while the next model call is in
-  flight. So finding and proving the fork point reads only the newest
-  round's items.
-- **Upgraded stores get a boundary without reading transcripts.** Waiting
-  and paced turns are restored at open and may already hold many rounds.
-  The migration that adds `bots.closed` sets each running turn's boundary
-  to its prompt, which is one lookup in the `nodes_turn` index per turn.
-  The prompt is closed because `finish` answers every open call
-  (db.rs:2488), so a turn always starts on a closed head. A fork that
-  proves a newer closed node moves its source's boundary there, in the
-  transaction it already writes. So a turn from before the upgrade pays
-  one longer scan, bounded by `MAX_ROUNDS`, only when it is first forked.
-  An upgrade test opens a store with thousands of parked turns and checks
-  that open reads no items, then forks a parked turn with several finished
-  rounds twice and checks that the second fork reads only the newest
-  round.
+  finished turn writes one. On a running turn it would parse every item
+  since the turn began: up to `MAX_ROUNDS` (200) rounds, each with as many
+  results as the model asked for, each as large as its tool allows, all on
+  the store's serialized worker. Stopping at the round's start would still
+  parse one whole round. So the store keeps the newest closed node of each
+  running turn in a nullable `bots.closed` column, and a default fork reads
+  it instead of scanning. Each write rides a transaction that already
+  exists:
+  - A turn sets it to its prompt when it starts. The prompt is closed
+    because `finish` answers every open call (db.rs:2488), so a turn always
+    starts on a closed head.
+  - Appending a model response with no calls moves it to the new head,
+    unless the response ends on a reasoning item, which stays unforkable
+    (`fork_point_splits_reasoning`). A response with calls leaves it where
+    it is.
+  - Committing a result (`tool_finish`) moves it to that result when the
+    turn has no call left open. A partial index on open `tools` rows makes
+    that check one index probe.
+  - Absorbing a batch of steers (`Database::absorb`, db.rs:2188) moves it to
+    the batch's last item. Absorbing happens only at a round boundary, and
+    steers hold no calls.
+  - Finishing the turn clears it.
+
+  Because every write keeps the column closed, the default path needs no
+  validation walk. Explicit `--checkpoint` forks keep today's validation.
+- **Turns running across the upgrade are refused, not guessed.** The
+  migration only adds the column, so opening an upgraded store reads no
+  transcript and writes no row. A waiting or paced turn restored at open
+  has no recorded boundary until its next write above: the end of its
+  current round, a steer batch, or a final answer. Until then a default
+  fork of it fails with `fork_point_unknown`, which names `--checkpoint`.
+  Guessing the prompt would repeat the failure seen live, a fork that
+  redoes the task. Finding the real node would take the transcript scan
+  this design avoids.
+  An upgrade test opens a store with thousands of parked turns, checks that
+  open reads no items, and checks that the refusal lifts at the turn's next
+  finished round.
 - **The fork keeps its source's window.** Today a fork's `context_start` is
   the carried compaction's cut, or NULL (db.rs:2978). The fork's first call
   then picks a new start at three quarters of the budget, which differs from
@@ -215,18 +226,18 @@ live came from the wrong fork point, not from missing framing.
 
 ## What changes, in order
 
-1. **Store:** record `bots.closed` each round, and set it to the prompt of
-   each turn running at upgrade. Fork at the newest closed node when no
+1. **Store:** keep `bots.closed` at each running turn's newest closed
+   node, with the partial index on open `tools` rows. Fork at it when no
    checkpoint is given, and report it in `forked`. Copy the source's window
    start as section 1 describes. Scope process handles, and the artifacts
    processes store, to the bot that started them. Add store contract tests
    for a running turn, a parked turn, a turn with no finished round, a fork
    while the next model call is in flight, a fork after several batches of
-   steers that reads none of them, a fork of oneself, a fork that
-   waits on an inherited `proc:N`, a fork that tries to read a large-output
-   process's streams after it finishes, and a fork of a turn at
-   `MAX_ROUNDS` whose validation reads only the newest round. Add the
-   upgrade test above.
+   steers, a fork while a reasoning-only response waits to finish, a fork
+   of oneself, a fork that waits on an inherited `proc:N`, and a fork that
+   tries to read a large-output process's streams after it finishes. Test
+   that a fork during a round with many large results, in a turn near
+   `MAX_ROUNDS`, reads no transcript item. Add the upgrade test above.
 2. **Store and daemon:** add `allow` and the nullable `bots.allowed`, with
    refusal at dispatch. Test that the fork's first request repeats the
    source's last request byte for byte up to the source's newest item:

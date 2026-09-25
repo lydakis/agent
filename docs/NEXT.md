@@ -725,14 +725,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 43. Forking a running bot. `fork` without a checkpoint refuses a bot whose
     turn is running, and a model has no way to find a closed node to fork
     at. [The design](FORK_MID_TURN.md) forks at the newest finished round,
-    found through a per-round boundary so it reads only that round, and
-    keeps the source's window start. It adds an optional allowed-tools list
-    checked at dispatch, which a fork inherits and can only narrow, so a
-    fork keeps its source's tool definitions and prompt cache. The daemon
-    and CLI add no text for the fork. Next, the store change with contract
-    tests, including process handles and their stored output scoped to the
-    bot that started them (item 39), then the list, then measurement of the cache and of the
-    fork-or-fresh rule in the preamble.
+    which the store keeps current per running turn so a fork reads no
+    transcript, and keeps the source's window start. It adds an optional
+    allowed-tools list checked at dispatch, which a fork inherits and can
+    only narrow, so a fork keeps its source's tool definitions and prompt
+    cache. The daemon and CLI add no text for the fork. Next, the store
+    change with contract tests, including process handles and their stored
+    output scoped to the bot that started them (item 39), then the list,
+    then measurement of the cache and of the fork-or-fresh rule in the
+    preamble.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
