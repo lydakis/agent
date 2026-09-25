@@ -625,7 +625,7 @@ impl Turn {
                 .saturating_add(usage.input_tokens)
                 .saturating_add(usage.output_tokens);
         }
-        let usage = completion.usage;
+        let usage = completion.usage.map(|usage| summarizer_usage(usage, model));
         let summary = completion_text(&completion.items);
         let invalid = if summary.len() > plan.summary_bytes {
             Some(Error::new("compaction_summary_limit"))
@@ -1118,6 +1118,7 @@ impl Turn {
             let usage = accounting.report.usage.take();
             if matches!(body, Body::Span(_)) {
                 if let Some(usage) = usage {
+                    let usage = summarizer_usage(usage, model);
                     self.store
                         .op("compaction_usage", move |db| {
                             db.compaction_usage(turn, Some(&usage))
@@ -1655,6 +1656,25 @@ fn failure(error: Error) -> Outcome {
         artifacts: Vec::new(),
         note: None,
     }
+}
+
+/// A summary is charged to the turn that needed it, but the summarizer may
+/// be another model; name it, as a fallback names its attempts, so the call
+/// is priced at that model's rates.
+fn summarizer_usage(
+    mut usage: agent_runtime::provider::Usage,
+    model: &str,
+) -> agent_runtime::provider::Usage {
+    if usage.models.is_empty() {
+        usage.models.push(agent_runtime::provider::ModelTokens {
+            model: model.to_owned(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+        });
+    }
+    usage
 }
 
 #[cfg(test)]

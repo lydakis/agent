@@ -174,8 +174,9 @@ pub struct Usage {
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u64,
     /// The billed attempts, when a provider-side fallback ran more than one
-    /// model for the call, so each can be priced at its model's rates. The
-    /// totals above are their sum.
+    /// model for the call, or the summarizer's model on a compaction call,
+    /// so each can be priced at its model's rates. The totals above are
+    /// their sum.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelTokens>,
 }
