@@ -1095,21 +1095,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     // explicit pruning can be reissued. Await drops before joining stdout.
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
-    // Admissions already queued are answered and their turns started, so
-    // shutdown ends those turns like any other running turn.
-    while !service.admissions.is_empty() {
-        let (session, output, id, result) = service.settle().await;
-        let _ = reply(
-            &mut service,
-            &mut sessions,
-            stdio_owner,
-            session,
-            &output,
-            id,
-            result,
-        )
-        .await;
-    }
+    answer_queued(&mut service, &mut sessions, stdio_owner).await;
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
     for active in std::mem::take(&mut service.active).into_values() {
@@ -2141,7 +2127,6 @@ impl Service {
                 {
                     return fail("stale_turn");
                 }
-                self.handles.forget(Waiter::Turn(turn));
                 let name = bot.clone();
                 let keep = self.retain_turns;
                 store
@@ -2155,6 +2140,9 @@ impl Service {
                         )
                     })
                     .await?;
+                // Only once the end commits: a refused one leaves the turn
+                // parked, and its wait must still wake it.
+                self.handles.forget(Waiter::Turn(turn));
                 self.ready_hint = true;
                 Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
             }
@@ -2210,6 +2198,28 @@ async fn commit_finish(
             },
         }
         backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Answer the admissions still queued at shutdown and start their turns, so
+/// shutdown ends those turns like any other running turn. A stdio owner that
+/// cannot take a reply within its timeout gets no more: the rest settle
+/// without waiting on it again.
+async fn answer_queued(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+) {
+    let mut stdout_lost = false;
+    while !service.admissions.is_empty() {
+        let (session, output, id, result) = service.settle().await;
+        if stdout_lost && session == 0 && stdio_owner {
+            continue;
+        }
+        // Only the stdio owner's reply can fail.
+        stdout_lost |= reply(service, sessions, stdio_owner, session, &output, id, result)
+            .await
+            .is_err();
     }
 }
 
@@ -3319,6 +3329,118 @@ mod tests {
         assert_eq!((bot.as_str(), *turn), ("Bob", bob), "due again");
         assert!(*at > now_ms() - 1000);
         assert!(service.storage_backoff > Duration::ZERO);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_interrupt_leaves_the_parked_turn_waiting_on_its_handle() {
+        let dir = scratch("parked-interrupt-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turns = running(&store, &["Bob".into(), "Zed".into()]).await;
+        let (bob, zed) = (turns[0].1, turns[1].1);
+        let handle = handles::Handle::Turn {
+            bot: "Zed".into(),
+            turn: zed,
+        }
+        .to_string();
+        let parked = handle.clone();
+        store
+            .call(move |db| {
+                let call = agent_runtime::provider::ToolCall {
+                    name: "wait".into(),
+                    call_id: "wait-1".into(),
+                    arguments: json!({"handles":[parked]}).to_string(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(bob, vec![item], std::slice::from_ref(&call), None)?;
+                db.tool_start(bob, &call)?;
+                db.suspend(bob, &call.call_id, &[parked], None, false, &[], None)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let (resume, mut resumed) = mpsc::unbounded_channel();
+        let mut service = bare_service(&store);
+        service.handles = Handles::new(resume);
+        service
+            .handles
+            .attach(
+                &store,
+                Waiter::Turn(bob),
+                &[handle],
+                None,
+                false,
+                Completion::Resume {
+                    bot: "Bob".into(),
+                    turn: bob,
+                },
+            )
+            .await;
+        refuse_bobs_finish(&path, true);
+        let output = Output::writer(tokio::io::sink());
+        let refused = service
+            .dispatch(
+                Command::Interrupt {
+                    bot: "Bob".into(),
+                    turn: bob,
+                },
+                0,
+                &output,
+                Value::Null,
+                Bound::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "storage_error");
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "waiting");
+        // The awaited turn ends: its wait still wakes the parked turn.
+        service
+            .handles
+            .turn_finished("Zed", zed, json!({"status":"completed"}));
+        assert_eq!(resumed.try_recv().ok(), Some(("Bob".into(), bob)));
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stdout_holds_up_shutdown_once_not_per_queued_reply() {
+        let dir = scratch("stalled-drain");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = bare_service(&store);
+        // A consumer that never reads: its queue fills and stays full.
+        let (stalled, _unread) = tokio::io::duplex(1);
+        let output = Output::writer(stalled);
+        for _ in 0..3 {
+            while output.try_send(json!({})).is_ok() {}
+            tokio::task::yield_now().await;
+        }
+        for id in 0..4 {
+            service.admissions.push_back(Admission {
+                session: 0,
+                output: output.clone(),
+                id: json!(id),
+                bound: Bound::default(),
+                pending: Pending::Settled(Ok(json!({}))),
+            });
+        }
+        let started = tokio::time::Instant::now();
+        answer_queued(&mut service, &mut HashMap::new(), true).await;
+        assert!(service.admissions.is_empty());
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(10),
+            "one reply's timeout, not one per admission: {waited:?}"
+        );
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

@@ -697,9 +697,11 @@ event adds at most a canonical workspace and a model reference. A lost group ans
 admissions with `storage_error`, starts no turn, and frees their slots. A
 fatal error, such as the store refusing a background command's result, exits
 through shutdown: queued admissions are answered first, and the turns they
-start end like any other running turn. A stdio owner whose output fails still
-exits at once, since no one is left to answer and a blocked write cannot be
-cancelled.
+start end like any other running turn. A stdio owner that cannot take one of
+those replies within its five-second timeout gets no more of them, so a
+stalled consumer delays shutdown once, not once per queued reply. A stdio
+owner whose output fails still exits at once, since no one is left to answer
+and a blocked write cannot be cancelled.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
