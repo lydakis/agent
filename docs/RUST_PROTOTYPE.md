@@ -1525,8 +1525,9 @@ Without them none of this runs and nothing is paid. `fork` takes the same
 fields. A bot keeps every gate it descends from: a fork keeps its source's,
 and a `create` or `fork` whose `created_by` names a bot adds that bot's.
 Each gate is kept to the new bot's tools, and gates with the same tag merge,
-keeping the shorter expiry. `resume`, `bots`, `created`, and `forked` report
-`gates`. The design and its reasoning are in [APPROVALS.md](APPROVALS.md).
+keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
+`fork` that would give it more fails with `gate_limit` and writes nothing.
+`resume`, `bots`, `created`, and `forked` report `gates`. The design and its reasoning are in [APPROVALS.md](APPROVALS.md).
 
 - **Announcement.** The commit that records a model response with gated
   calls also writes one `approval_requested` event for the round:
@@ -1555,7 +1556,8 @@ keeping the shorter expiry. `resume`, `bots`, `created`, and `forked` report
 - **Expiry.** With `approve_expire_ms`, a call still without that gate's
   verdict that long after it was announced is denied with "not reviewed:
   no verdict" (`tool_completed` carries `expired: true`), and the turn ends
-  `interrupted` with `approval_expired`.
+  `interrupted` with `approval_expired`. When a call has several gates, a
+  deny decides it only if it came before an open gate lapsed.
 - **Rounds.** A verdict is for the round as planned. When a call fails (an
   error result, a denial, or a command that did not succeed), every gated
   call of the round still to run is announced again in that call's

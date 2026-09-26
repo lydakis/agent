@@ -426,59 +426,6 @@ fn planned_calls(item: &[u8]) -> Vec<(Cow<'_, str>, &RawValue)> {
         .filter_map(|block| block.id.zip(block.input))
         .collect()
 }
-/// Up to `max` characters of a call's raw arguments, and whether more
-/// follow, decoding nothing past them.
-fn preview(arguments: &RawValue, max: usize) -> (String, bool) {
-    let raw = arguments.get();
-    if raw.starts_with('"') {
-        return string_prefix(raw, max);
-    }
-    let end = raw.char_indices().nth(max).map_or(raw.len(), |(i, _)| i);
-    (raw[..end].to_owned(), end < raw.len())
-}
-/// The first `max` characters of a JSON string literal, and whether more
-/// follow. The literal is valid JSON; a lone surrogate reads as U+FFFD.
-fn string_prefix(literal: &str, max: usize) -> (String, bool) {
-    fn hex(digits: &str) -> u32 {
-        u32::from_str_radix(digits.get(..4).unwrap_or_default(), 16).unwrap_or(0xFFFD)
-    }
-    let (mut out, mut count) = (String::new(), 0);
-    let mut chars = literal[1..].chars();
-    loop {
-        let c = match chars.next() {
-            None | Some('"') => return (out, false),
-            Some('\\') => match chars.next() {
-                Some('n') => '\n',
-                Some('t') => '\t',
-                Some('r') => '\r',
-                Some('b') => '\u{8}',
-                Some('f') => '\u{c}',
-                Some('u') => {
-                    let high = hex(chars.as_str());
-                    chars.nth(3);
-                    // A high surrogate pairs only with a low one right after it.
-                    let low = chars.as_str().strip_prefix("\\u").map_or(0, hex);
-                    let code =
-                        if (0xD800..0xDC00).contains(&high) && (0xDC00..0xE000).contains(&low) {
-                            chars.nth(5);
-                            0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
-                        } else {
-                            high
-                        };
-                    char::from_u32(code).unwrap_or('\u{FFFD}')
-                }
-                Some(c) => c,
-                None => return (out, false),
-            },
-            Some(c) => c,
-        };
-        if count == max {
-            return (out, true);
-        }
-        out.push(c);
-        count += 1;
-    }
-}
 /// The bounded request context: ordered node ids and exact item bytes.
 #[derive(Debug)]
 pub struct Window {
@@ -631,8 +578,15 @@ pub fn cache_hit(cached: i64, input: i64) -> f64 {
     }
     ((cached.max(0) as f64 / input as f64) * 1000.0).round() / 1000.0
 }
+/// Most gates one bot carries. Gates accumulate down a chain of forks and
+/// delegations, so the bound keeps every bot row, event, and request small.
+const MAX_GATES: usize = 8;
 /// A bot's gates as stored: none is NULL, so an ungated bot reads nothing.
+/// More than `MAX_GATES` is refused before anything is written.
 fn stored_gates(gates: &[Gate]) -> Result<Option<String>> {
+    if gates.len() > MAX_GATES {
+        return fail_with("gate_limit", MAX_GATES.to_string());
+    }
     Ok((!gates.is_empty())
         .then(|| serde_json::to_string(gates))
         .transpose()?)
@@ -2994,8 +2948,13 @@ impl Database {
         let request = self
             .request(turn, &call.call_id)?
             .ok_or(Error::new("invalid_tool_state"))?;
-        let expired = request.expires_ms().is_some_and(|at| now_ms >= at);
-        let gated = if let Some(denial) = request.denial() {
+        let lapse = request.expires_ms();
+        let expired = lapse.is_some_and(|at| now_ms >= at);
+        // Whichever came first decides: a deny, or an open gate's expiry.
+        let denial = request
+            .denial()
+            .filter(|d| lapse.is_none_or(|at| (d.at_ms.max(0) as u64) < at));
+        let gated = if let Some(denial) = denial {
             let tx = self.conn.savepoint()?;
             deny(
                 &tx,
@@ -3284,7 +3243,7 @@ impl Database {
                     calls
                         .into_iter()
                         .map(|(id, arguments)| {
-                            let (text, more) = preview(arguments, 2048);
+                            let (text, more) = crate::codec::json_preview(arguments, 2048);
                             (id.into_owned(), text, more)
                         })
                         .collect(),
@@ -5505,7 +5464,7 @@ mod tests {
     fn string_prefixes_decode_only_what_they_keep() {
         let prefix = |text: &str, max| {
             let literal = serde_json::to_string(text).unwrap();
-            string_prefix(&literal, max)
+            crate::codec::json_string_prefix(&literal, max)
         };
         assert_eq!(prefix("ab\"c\\d\n", 64), ("ab\"c\\d\n".into(), false));
         assert_eq!(prefix("abc", 3), ("abc".into(), false));
@@ -5513,7 +5472,10 @@ mod tests {
         assert_eq!(prefix("é😀x", 2), ("é😀".into(), true));
         // Escaped forms, surrogate pairs included, and a lone surrogate.
         assert_eq!(
-            string_prefix(r#""\u00e9\ud83d\ude00\/\t\ud800z\ud800\u0041\udc00""#, 64),
+            crate::codec::json_string_prefix(
+                r#""\u00e9\ud83d\ude00\/\t\ud800z\ud800\u0041\udc00""#,
+                64
+            ),
             ("é😀/\t\u{FFFD}z\u{FFFD}A\u{FFFD}".into(), false)
         );
     }
@@ -5525,7 +5487,7 @@ mod tests {
         let [(id, arguments)] = planned_calls(decoy).try_into().unwrap();
         assert_eq!(id, "c1");
         assert_eq!(
-            preview(arguments, 64),
+            crate::codec::json_preview(arguments, 64),
             (r#"{"command":"echo \"c2\""}"#.into(), false)
         );
         let message = br#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\"c2\""}]}"#;
@@ -5536,10 +5498,13 @@ mod tests {
         let ids: Vec<&str> = calls.iter().map(|(id, _)| id.as_ref()).collect();
         assert_eq!(ids, ["t1", "t2"]);
         assert_eq!(
-            preview(calls[1].1, 64),
+            crate::codec::json_preview(calls[1].1, 64),
             (r#"{"command":"ls"}"#.into(), false)
         );
-        assert_eq!(preview(calls[1].1, 4), ("{\"co".into(), true));
+        assert_eq!(
+            crate::codec::json_preview(calls[1].1, 4),
+            ("{\"co".into(), true)
+        );
         let text = br#"{"role":"user","content":"plain"}"#;
         assert!(planned_calls(text).is_empty());
     }

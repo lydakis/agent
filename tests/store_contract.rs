@@ -683,6 +683,92 @@ fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
     ));
 }
 
+/// Create `name` with one gate on `shell`, delegated by `creator`.
+fn gated_bot(
+    db: &mut Database,
+    name: &str,
+    tag: &str,
+    expire_ms: Option<u64>,
+    creator: Option<&Bot>,
+) -> Result<Bot> {
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms,
+    };
+    let binding = Binding {
+        tools: &tools,
+        gate: Some(&gate),
+        created_by: creator.map(|c| c.name.as_str()),
+        created_by_id: creator.map(|c| c.id),
+        ..binding()
+    };
+    Ok(db.create(name, Some("/synthetic"), binding)?.0)
+}
+
+#[test]
+fn gates_are_capped_before_a_bot_is_written() {
+    let mut db = db();
+    let mut creator = gated_bot(&mut db, "g0", "t0", None, None).unwrap();
+    for i in 1..8 {
+        creator = gated_bot(
+            &mut db,
+            &format!("g{i}"),
+            &format!("t{i}"),
+            None,
+            Some(&creator),
+        )
+        .unwrap();
+    }
+    assert_eq!(creator.gates.len(), 8);
+    let refused = gated_bot(&mut db, "g8", "t8", None, Some(&creator));
+    assert_eq!(
+        refused.err().map(|e| e.to_string()).as_deref(),
+        Some("gate_limit: 8")
+    );
+    // Nothing was written: the name is still free.
+    gated_bot(&mut db, "g8", "t8", None, None).unwrap();
+}
+
+#[test]
+fn an_expiry_that_came_first_beats_a_later_denial() {
+    let mut db = db();
+    let ann = gated_bot(&mut db, "Ann", "second", None, None).unwrap();
+    gated_bot(&mut db, "Bob", "manual", Some(1), Some(&ann)).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // The other gate may still deny, but `manual` lapsed first.
+    db.answer(Answer {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: Some("second"),
+        allow: false,
+        reason: Some("no"),
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, u64::MAX).unwrap(),
+        Gated::Expired
+    ));
+}
+
 #[test]
 fn a_call_larger_than_a_page_still_fills_one() {
     let mut db = db();

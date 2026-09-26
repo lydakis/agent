@@ -108,6 +108,61 @@ pub fn split_model(reference: &str) -> Result<(&str, &str)> {
     }
 }
 
+/// Up to `max` characters of a raw JSON value, and whether more follow,
+/// decoding nothing past them: a string's text, or any other value as is.
+pub fn json_preview(value: &serde_json::value::RawValue, max: usize) -> (String, bool) {
+    let raw = value.get();
+    if raw.starts_with('"') {
+        return json_string_prefix(raw, max);
+    }
+    let end = raw.char_indices().nth(max).map_or(raw.len(), |(i, _)| i);
+    (raw[..end].to_owned(), end < raw.len())
+}
+/// The first `max` characters of a JSON string literal, and whether more
+/// follow, decoding nothing past them. The literal may be cut short; a lone
+/// surrogate reads as U+FFFD.
+pub fn json_string_prefix(literal: &str, max: usize) -> (String, bool) {
+    fn hex(digits: &str) -> u32 {
+        u32::from_str_radix(digits.get(..4).unwrap_or_default(), 16).unwrap_or(0xFFFD)
+    }
+    let (mut out, mut count) = (String::new(), 0);
+    let mut chars = literal[1..].chars();
+    loop {
+        let c = match chars.next() {
+            None | Some('"') => return (out, false),
+            Some('\\') => match chars.next() {
+                Some('n') => '\n',
+                Some('t') => '\t',
+                Some('r') => '\r',
+                Some('b') => '\u{8}',
+                Some('f') => '\u{c}',
+                Some('u') => {
+                    let high = hex(chars.as_str());
+                    chars.nth(3);
+                    // A high surrogate pairs only with a low one right after it.
+                    let low = chars.as_str().strip_prefix("\\u").map_or(0, hex);
+                    let code =
+                        if (0xD800..0xDC00).contains(&high) && (0xDC00..0xE000).contains(&low) {
+                            chars.nth(5);
+                            0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                        } else {
+                            high
+                        };
+                    char::from_u32(code).unwrap_or('\u{FFFD}')
+                }
+                Some(c) => c,
+                None => return (out, false),
+            },
+            Some(c) => c,
+        };
+        if count == max {
+            return (out, true);
+        }
+        out.push(c);
+        count += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

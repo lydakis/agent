@@ -1023,6 +1023,8 @@ Where it differs from the design above:
 - An answer that arrives after its gate's expiry is refused with
   `approval_expired`, even when the turn has not yet denied the call, so a
   late allow cannot outrun the expiry.
+- A bot carries at most 8 gates; a `create` or `fork` past that fails with
+  `gate_limit`.
 
 Not built yet: the automatic approver (rules and Jev), with
 `serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`

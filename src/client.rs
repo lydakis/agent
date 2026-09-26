@@ -1405,20 +1405,89 @@ fn exit_code(data: &Value) -> i32 {
 }
 
 /// A call's arguments as one short line: the command or path when the
-/// tool has one.
+/// tool has one, marked when more follows. Arguments may be a preview cut
+/// short, so the field is read from as much of the text as there is.
 fn summary(name: &str, arguments: &str) -> String {
-    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
-    let text = match name {
-        "shell" => args["command"].as_str().unwrap_or(""),
-        "read" | "write" | "edit" => args["path"].as_str().unwrap_or(""),
-        _ => arguments,
+    let key = match name {
+        "shell" => "command",
+        "read" | "write" | "edit" => "path",
+        _ => "",
     };
-    text.lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take(200)
-        .collect()
+    let text = if key.is_empty() {
+        arguments.to_owned()
+    } else {
+        match serde_json::from_str::<Value>(arguments) {
+            Ok(args) => args[key].as_str().map(str::to_owned),
+            Err(_) => preview_field(arguments, key),
+        }
+        .unwrap_or_else(|| format!("[no {key} in the arguments shown]"))
+    };
+    let mut lines = text.lines();
+    let first: String = lines.next().unwrap_or("").chars().take(200).collect();
+    let rest = lines.count();
+    if rest > 0 {
+        format!("{first} … (+{rest} more lines)")
+    } else if first.len() < text.trim_end().len() {
+        format!("{first} …")
+    } else {
+        first
+    }
+}
+
+/// A top-level string field of JSON text that may be cut short, decoded as
+/// far as the text goes.
+fn preview_field(text: &str, key: &str) -> Option<String> {
+    let mut rest = text.trim_start().strip_prefix('{')?;
+    loop {
+        rest = rest.trim_start();
+        if !rest.starts_with('"') {
+            return None;
+        }
+        let end = value_end(rest)?;
+        let (name, _) = agent_runtime::codec::json_string_prefix(&rest[..end], usize::MAX);
+        rest = rest[end..].trim_start().strip_prefix(':')?.trim_start();
+        if name == key {
+            return rest
+                .starts_with('"')
+                .then(|| agent_runtime::codec::json_string_prefix(rest, usize::MAX).0);
+        }
+        rest = rest[value_end(rest)?..].trim_start().strip_prefix(',')?;
+    }
+}
+
+/// Where the JSON value at the start of `text` ends, or `None` when the
+/// text is cut before it does.
+fn value_end(text: &str) -> Option<usize> {
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for (i, c) in text.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => {
+                    quoted = false;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => quoted = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' | ',' if depth == 0 => return Some(i),
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Calls of one turn still waiting on a gate, as `approvals` lists them,
@@ -1555,6 +1624,32 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summaries_read_the_field_from_a_cut_preview_and_mark_what_is_hidden() {
+        let long = format!("{{\"content\":\"{}", "x".repeat(64));
+        assert_eq!(
+            summary("write", r#"{"path":"a \"b\".txt","content":"xx"#),
+            r#"a "b".txt"#
+        );
+        assert_eq!(summary("write", &long), "[no path in the arguments shown]");
+        assert_eq!(
+            summary(
+                "write",
+                r#"{"content":"{\"path\":\"fake\"}","path":"real"}"#
+            ),
+            "real"
+        );
+        assert_eq!(
+            summary(
+                "shell",
+                r#"{"timeout_ms":5,"nested":{"a":[1,"]"]},"command":"echo hi\nrm -r x"#
+            ),
+            "echo hi … (+1 more lines)"
+        );
+        assert_eq!(summary("shell", r#"{"command":"ls"}"#), "ls");
+        assert_eq!(summary("shell", r#"{"command":"ec"#), "ec");
+    }
 
     #[test]
     fn every_open_gate_gets_its_own_answer_command() {
