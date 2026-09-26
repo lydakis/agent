@@ -240,7 +240,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `write`) with `item` on that call's node.
   One event per round, not per call, and no extra commit.
 - **`answer` decides one request.**
-  `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"until_prior"?}`.
+  `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"until_prior"?,"lease"?}`.
   `request` is the number the call was announced with, and it changes each
   time the call is announced again. `tag` names the gate answered and may
   be left out when the call has one. The first answer to the current
@@ -277,8 +277,12 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   running. A takeover can bill a round twice: a holder suspended with a
   Jev request in flight loses the tag, the new holder sends the same
   round, and the old answer is refused when the old holder wakes. That is
-  bounded by the rounds in flight at the takeover. Any session can still
-  `answer`, which is how a person overrides.
+  bounded by the rounds in flight at the takeover. The refusal is a fence:
+  `serve_approvals` returns a `lease` number that changes at every
+  takeover, a serving approver sends it with each answer, and an answer
+  whose lease has ended gets `approvals_lost` and changes nothing, so a
+  woken holder cannot race its replacement. An answer with no `lease` is a
+  manual override, which is how a person answers over the approver.
 - **Every planned call of a round is announced at once,** so an approver
   judges them in parallel and can judge each in light of the others (a
   `write` of `run.sh` followed by `sh run.sh`). Execution stays in order,
@@ -355,8 +359,8 @@ lease, on the period its holder chose.
 | Mode | Gated tools | Who answers | Default |
 | --- | --- | --- | --- |
 | `full` | none | nobody; every allowed call runs | yes |
-| `auto` | `shell,write,edit,read` | the automatic approver | |
-| `manual` | `shell,write,edit,read` | a person, through the app or `agent answer`, or a program | |
+| `auto` | every tool except `history`, `wait`, `note`, `echo` | the automatic approver | |
+| `manual` | every tool except `history`, `wait`, `note`, `echo` | a person, through the app or `agent answer`, or a program | |
 
 - **Chosen per bot at creation.** `agent run --new --approval auto`, or
   `AGENT_APPROVAL=auto` in the environment, as `AGENT_MODEL` sets a model.
@@ -403,8 +407,13 @@ same module inside the app. It holds the `auto` tag with `serve_approvals`,
 so only one instance runs at a time, and answers in layers:
 
 1. **Daemon gate.** Only tools in a bot's `approve` list reach it. The
-   suggested list is `shell,write,edit,read`. `read` is gated because a
-   result is sent to the model provider in the next request: reading
+   modes gate every tool the bot has except four that touch only its own
+   store records: today that is `shell,write,edit,read`, and a tool added
+   later, such as one a caller registers, is gated without anyone
+   remembering to list it. The rules below know only the built-in tools,
+   so any other tool goes to the model with its name and arguments.
+   `read` is gated because a result is sent to the model provider in the
+   next request: reading
    `~/.ssh/id_ed25519` sends the key off the machine with no further call.
    `history`, `wait`, `note`, and `echo` touch only the bot's own store
    records and stay ungated.
@@ -420,8 +429,8 @@ so only one instance runs at a time, and answers in layers:
      `read` list below, and `authorized_keys`. A workspace that is a home
      directory would otherwise let a bot change its own keys unreviewed.
      The approver also remembers what each bot wrote this turn, so a
-     command that runs one of those files is judged with the file's
-     content in view.
+     command that runs one of those files is judged with the file's whole
+     content in view (next paragraph).
    - Every path is resolved on disk when the approver judges it, not read
      as text, so a symlink inside the workspace that points out of it
      counts as outside. An earlier call in the same round can change what
@@ -448,9 +457,9 @@ so only one instance runs at a time, and answers in layers:
      user). A `git` or `rg` found anywhere else, such as one an earlier
      command put in a writable directory on `PATH`, makes the command
      opaque. The lists name what is allowed, not what is not: `find` may
-     take `-name` and `-type` but not `-exec`, `-delete`, `-fprint`, `-fprintf`, or `-fls`, simply because they are
-     not listed; the same goes for `git diff --output`, `rg --pre`, and
-     `sort -o`. An unlisted flag, a redirect, `$(`, a backtick, or a
+     take `-name` and `-type` but not `-exec`, `-delete`, `-fprint`,
+     `-fprintf`, or `-fls`, simply because they are not listed; the same
+     goes for `git diff --output`, `rg --pre`, and `sort -o`. An unlisted flag, a redirect, `$(`, a backtick, or a
      variable makes the command opaque, and it goes on to the model. This
      is where Cursor's allowlist was bypassed; the approver does not try to
      parse more. Two read-only commands read more than the paths they
@@ -476,7 +485,11 @@ so only one instance runs at a time, and answers in layers:
        set, git goes to the model.
    - Commands that reach the approval channel itself (`agent answer`, the
      daemon's socket other than through `agent`, the store file) are denied
-     outright.
+     outright. So are `read`, `write`, and `edit` of the daemon's own
+     files (its store, `~/.agent/state.sqlite` by default, with its WAL,
+     and its socket), checked before the workspace rules: a workspace that
+     is a home directory contains them, and a read would hand other bots'
+     transcripts to the provider.
    - Delegation goes to the model with the task as the action. `agent run
      --bot NAME` hands work to an existing bot that may have no gate, so a
      task that asks for something this bot could not do unreviewed is
@@ -585,10 +598,15 @@ isolation.
 a long-lived bot's prompts outgrow that. The approver sends, in this
 order: the environment note, the root person's prompt for this turn, the
 current turn's prompt and its steers, each marked as a person's or a
-model's words, the planned and already allowed
-calls, and then earlier prompts newest first until a 16k-token budget is
-spent. If the first four alone do not fit, it does not call Jev; the call
-is unclear (step 4), with the reason "not reviewed: intent too long".
+model's words, the calls being judged, the calls already allowed, and then
+earlier prompts newest first until a 16k-token budget is spent. The calls
+being judged are sent whole, read with `item` when their preview was cut,
+and so is any file written this turn that one of them runs; only the
+already allowed calls are previewed, to 2,048 characters. If everything
+before the earlier prompts does not fit, it does not call Jev; the call is
+unclear (step 4), with the reason "not reviewed: intent too long". A
+command that runs a file too large to show is refused rather than judged
+on its first part.
 In the stored Harbor trials this never fires: across the 1,398 rounds that
 would reach Jev, the prompt plus every planned and already allowed call
 (each previewed to 2,048 characters) came to a median of about 4k
