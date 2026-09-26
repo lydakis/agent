@@ -510,14 +510,23 @@ minutes between two calls read only its 2.3k-token system and tools prefix
 from cache; the 6.8k-token conversation was written again at 1.25 times the
 input rate. The one-hour cache read all 9.0k, but it bills every write at
 twice the input rate, idle or not. The daemon keeps the five-minute cache and
-refreshes it instead. While a turn runs a tool, once the last call's cache has gone
-`--keep-warm` seconds unread (240 by default), it sends that call's request
-again with `max_tokens: 0` and `stream: false`. That request generates
-nothing, bills a cache read, and restarts the cache's lifetime. It repeats
-until the tool finishes. The lifetime is counted from when the call, or the
-last refresh, was sent. Each refresh runs as a task of its own: when the tool
-ends or the turn is interrupted, one not yet sent is dropped at no cost, and
-one already sent is answered, so its cost is recorded.
+refreshes it instead. While a turn's call streams its reply or a tool runs,
+once that call's cache has gone `--keep-warm` seconds unread (240 by
+default), it sends that call's request again with `max_tokens: 0` and
+`stream: false`. That request generates nothing, bills a cache read, and
+restarts the cache's lifetime. It repeats until the reply and then the tool
+finish. The lifetime is counted from when the call, or the last refresh, was
+sent, so a call still waiting for its pool or startup admission is not
+refreshed. Refreshing during the reply matters because a long one outlives the
+cache on its own: in the 2026-09-25 Sonnet 5 rerun, six replies of 32k to
+86k output tokens each took longer than five minutes, and the refresh sent
+when the next tool started found the prefix gone and wrote it again. Each
+refresh runs as a task of its own: one still unanswered when the reply ends
+carries into the tool that follows. When the tool ends, the next model round
+starts, or the turn ends or is interrupted, one not yet sent is dropped at no
+cost, and one already sent is answered, so its cost is recorded and counts
+toward the bot's budget before another call. A summary's call is not
+refreshed.
 Nothing else in the request differs, since the cache is keyed on everything it
 renders. A refresh is paced and admitted like a call, but gives up waiting
 for its pool and startup admission once the cache it would refresh has
@@ -534,9 +543,10 @@ this keep-alive over the one-hour cache for five-to-sixty-minute gaps only on
 Claude Fable 5.1 and Mythos 5.1, whose cache reads are nearly free (0.025
 times the input rate on Fable 5.1). For other models, it picks the one-hour
 cache for such gaps. Refreshing those models too is this runtime's inference,
-not Anthropic's advice. During a running tool the next model call is certain,
-so each refresh costs a 0.1-times read of the conversation where expiry costs
-a 1.25-times rewrite; a ten-minute tool takes at most two. Whether it also
+not Anthropic's advice. During a streaming reply or a running tool the next
+model call is certain, so each refresh costs a 0.1-times read of the
+conversation where expiry costs a 1.25-times rewrite; a ten-minute tool takes
+at most two. Whether it also
 beats the one-hour cache, which covers parked waits and gaps between turns
 but bills every write at twice the input rate, is not measured; `--cache-ttl
 1h` selects it for that comparison. Its writes are recorded apart, from
