@@ -151,10 +151,6 @@ impl Transport {
     pub fn connections(&self) -> usize {
         self.shards.len()
     }
-    /// Startup permits still available; none when the bound is off.
-    pub fn starting_permits(&self) -> usize {
-        self.starting.available_permits()
-    }
     /// The least-loaded shard. The counts are advisory: a concurrent lease
     /// may pick the same shard, which only costs balance, never correctness.
     fn lease(&self) -> (&reqwest::Client, Lease<'_>) {
@@ -183,8 +179,6 @@ pub struct Provider {
     family: Family,
     url: reqwest::Url,
     key: Option<String>,
-    /// ChatGPT workspace for a ChatGPT-login key, sent as `ChatGPT-Account-ID`.
-    account: Option<String>,
     /// A ChatGPT login re-read from its file, in place of a fixed key.
     login: Option<Arc<login::Login>>,
     max_output_tokens: Option<u32>,
@@ -394,7 +388,6 @@ impl Provider {
             family,
             url,
             key,
-            account: None,
             login: None,
             max_output_tokens: None,
             stall_timeout: STALL_TIMEOUT,
@@ -475,15 +468,6 @@ impl Provider {
             return fail("invalid_output_token_limit");
         }
         self.max_output_tokens = Some(limit);
-        Ok(self)
-    }
-
-    /// Name the ChatGPT workspace a ChatGPT-login access token acts for.
-    pub fn with_account(mut self, account: String) -> Result<Self> {
-        if self.family != Family::Responses || account.is_empty() {
-            return fail("invalid_provider_account");
-        }
-        self.account = Some(account);
         Ok(self)
     }
 
@@ -927,10 +911,7 @@ impl Provider {
             None => None,
         };
         let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
-        let account = session
-            .as_ref()
-            .map(|s| &s.account)
-            .or(self.account.as_ref());
+        let account = session.as_ref().map(|s| &s.account);
         let mut http = client
             .post(self.url.clone())
             .header("content-type", "application/json")
@@ -1225,7 +1206,7 @@ impl Provider {
                 if let Some(bearer) = &bearer {
                     headers.push(("authorization", bearer.as_str()));
                 }
-                if let Some(account) = login.map(|s| &s.account).or(self.account.as_ref()) {
+                if let Some(account) = login.map(|s| &s.account) {
                     headers.push(("chatgpt-account-id", account.as_str()));
                 }
                 // Cache affinity, as on HTTP; the connection is the bot's own.
@@ -2397,8 +2378,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_account_rides_with_the_key_on_every_request() {
+    async fn a_login_sends_its_token_and_account_on_every_request() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = std::env::temp_dir().join(format!("agent-login-headers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"tokens":{"access_token":"synthetic-token","account_id":"synthetic-account"}}"#,
+        )
+        .unwrap();
+        let login = Arc::new(login::Login::open(&path, None).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (seen, head) = tokio::sync::oneshot::channel();
@@ -2415,15 +2405,10 @@ mod tests {
                 .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
                 .await;
         });
-        let provider = Provider::new(
-            Transport::new(0, 1).unwrap(),
-            Family::Responses,
-            &url,
-            Some("synthetic-token".into()),
-        )
-        .unwrap()
-        .with_account("synthetic-account".into())
-        .unwrap();
+        let provider = Provider::new(Transport::new(0, 1).unwrap(), Family::Responses, &url, None)
+            .unwrap()
+            .with_login(login.clone())
+            .unwrap();
         let tools = none();
         let request = Request {
             model: "m",
@@ -2461,7 +2446,8 @@ mod tests {
         assert!(head.contains("\r\naccept: text/event-stream\r\n"), "{head}");
         assert!(head.contains("\r\nuser-agent: agent-runtime/"), "{head}");
         let anthropic = Provider::new(Transport::new(0, 1).unwrap(), Family::Anthropic, &url, None);
-        assert!(anthropic.unwrap().with_account("w".into()).is_err());
+        assert!(anthropic.unwrap().with_login(login).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

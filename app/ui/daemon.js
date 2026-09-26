@@ -10,7 +10,6 @@ window.Daemon = (() => {
     window.addEventListener('error', (e) => log(`error: ${e.message} @${e.filename}:${e.lineno}`));
     window.addEventListener('unhandledrejection', (e) => log(`rejection: ${e.reason?.message ?? e.reason}`));
     return {
-      mode: 'live',
       log,
       setup: () => invoke('setup'),
       policy: () => invoke('policy'),
@@ -169,7 +168,6 @@ window.Daemon = (() => {
   }
 
   return {
-    mode: 'demo',
     setup: async () => ({ socket: 'demo', model: 'openai/gpt-5.6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
     attach: async () => {

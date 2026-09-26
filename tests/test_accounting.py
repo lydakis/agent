@@ -6,7 +6,7 @@ import subprocess
 import time
 import unittest
 
-from bench.runtime_client import Client, serve_args
+from bench.runtime_client import serve_args
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
 

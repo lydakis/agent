@@ -67,9 +67,11 @@ async fn shell_timeout_and_output_overflow_are_bounded() {
 #[tokio::test]
 async fn known_credential_text_is_redacted_before_tool_result_serialization() {
     let sentinel = "synthetic-\"test-value";
+    let credentials = Credentials::default();
+    credentials.set("AGENT_TEST_FAKE_KEY", sentinel);
     let tools = Registry::new("echo,shell")
         .unwrap()
-        .exclude_credential("AGENT_TEST_FAKE_KEY", sentinel);
+        .with_credentials(credentials);
     let echo = tools
         .prepare("echo", &json!({"text":sentinel}).to_string())
         .unwrap();

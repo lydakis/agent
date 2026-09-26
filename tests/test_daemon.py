@@ -1,7 +1,6 @@
 """Daemon sessions: slow readers, replay lifecycle, shutdown, socket and file ownership."""
 import json
 import http.server
-import concurrent.futures
 import threading
 import os
 from pathlib import Path

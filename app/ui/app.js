@@ -104,7 +104,7 @@ function evict(t) {
     } else if (it.kind === 'history') {
       append({...it, forward: i >= hi ? true : i < lo ? false : it.forward});
     } else if (it.kind === 'tool' && (i < lo || i >= hi)) {
-      const {args, ...stub} = it; stub.kind = 'tool_stub'; count(t, stub, 1); append(stub);
+      const stub = {...it, kind: 'tool_stub'}; count(t, stub, 1); append(stub);
     } else for (let j = i; j < end; j++) append(source[j]);
     i = end;
   }
@@ -194,17 +194,6 @@ function forgetBot(name) {
 }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
-// Only the agent CLI's detached run yields the handle JSON a peer card already shows.
-// Each shell segment on its own: the executable must be the agent CLI, its first argument `run`,
-// and `--detach` among the rest before `--`. A command that merely prints those words does not count.
-const spawnsPeer = (command) => command.split(/[;|&\n]/).some((segment) => {
-  const tokens = segment.trim().split(/\s+/).map((t) => t.replace(/^["']|["']$/g, ''));
-  const exe = tokens[0] ?? '';
-  const isAgent = exe === '$AGENT_BIN' || exe === '${AGENT_BIN}' || exe === 'agent' || exe.endsWith('/agent');
-  if (!isAgent || tokens[1] !== 'run') return false;
-  const end = tokens.indexOf('--', 2);
-  return tokens.slice(2, end < 0 ? undefined : end).includes('--detach');
-});
 function tree() {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
@@ -303,7 +292,7 @@ async function onEvent(ev) {
       let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
       const tname = data.name ?? 'tool';
       const t = transcript(name);
-      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), args, background: tname === 'shell' && parsed.background === true, spawns: tname === 'shell' && spawnsPeer(String(parsed.command ?? '')), done: false, started: S.live ? Date.now() : 0, took: 0, turn };
+      const row = { kind: 'tool', from: t.callNode, callId: data.call_id, name: tname, summary: callSummary(tname, args), background: tname === 'shell' && parsed.background === true, done: false, started: S.live ? Date.now() : 0, took: 0, turn };
       let existing = null;
       for (let i = t.items.length - 1; i >= 0; i--) {
         const it = t.items[i]; if (it.turn !== turn) break;
@@ -311,7 +300,7 @@ async function onEvent(ev) {
       }
       if (existing) {
         row.from = existing.from ?? row.from;
-        if (data.arguments_truncated) { row.summary = existing.summary; row.background = existing.background; row.spawns = existing.spawns; }
+        if (data.arguments_truncated) { row.summary = existing.summary; row.background = existing.background; }
         Object.assign(existing, row); t.gen += 1; } else addItem(t, row);
       break;
     }
@@ -410,7 +399,7 @@ function applyWaitOrProc(name, item, call, node) {
 }
 function storedTool(name, callId, args) {
   let parsed = {}; try { parsed = JSON.parse(args) ?? {}; } catch (_) {}
-  return { kind: 'tool', name, callId, summary: callSummary(name, args), background: name === 'shell' && parsed.background === true, spawns: name === 'shell' && spawnsPeer(String(parsed.command ?? '')), done: true, started: 0, took: 0 };
+  return { kind: 'tool', name, callId, summary: callSummary(name, args), background: name === 'shell' && parsed.background === true, done: true, started: 0, took: 0 };
 }
 function entries(item) {
   const out = [];

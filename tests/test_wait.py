@@ -62,7 +62,7 @@ class WaitTests(ModelFixture):
         client.request('wait', handles=[handle])
         client.close()
         process = subprocess.Popen(
-            [str(self.binary), *serve_args(self.path / 'state.sqlite', self.url, 'echo,shell,wait')],
+            [str(self.binary), *serve_args(self.path / 'state.sqlite', self.url)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, env=clean_env())
         try:

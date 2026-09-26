@@ -38,8 +38,7 @@ def synthetic(profile, count):
 def export(store):
     with sqlite3.connect(Path(store).resolve().as_uri() + '?mode=ro', uri=True) as db:
         db.execute('BEGIN')
-        columns = {row[1] for row in db.execute('PRAGMA table_info(artifacts)')}
-        if 'raw_bytes' in columns and db.execute('SELECT EXISTS(SELECT 1 FROM artifacts WHERE raw_bytes>0)').fetchone()[0]:
+        if db.execute('SELECT EXISTS(SELECT 1 FROM artifacts WHERE raw_bytes>0)').fetchone()[0]:
             raise ValueError('corpus export requires raw artifacts; export decoded bytes through the artifact protocol first')
         for kind, query in (
                 ('node', 'SELECT item FROM nodes ORDER BY id'),

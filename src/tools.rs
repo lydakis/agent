@@ -441,15 +441,6 @@ impl Registry {
         self.environment = Arc::new(environment);
         self
     }
-    pub fn exclude_credentials(self, credentials: Vec<(String, String)>) -> Self {
-        for (name, value) in credentials {
-            self.credentials.set(&name, &value);
-        }
-        self
-    }
-    pub fn exclude_credential(self, name: &str, value: &str) -> Self {
-        self.exclude_credentials(vec![(name.into(), value.into())])
-    }
     /// Share a credential set that others may add to later, such as a login
     /// that is re-read while the daemon runs.
     /// Exact occurrences of these values are redacted from tool results and the

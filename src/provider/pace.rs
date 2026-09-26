@@ -553,42 +553,6 @@ pub fn named_delay(message: &str) -> Option<Duration> {
     go_duration(rest[..end].trim_end_matches('.'))
 }
 
-/// Seconds until an RFC 3339 instant such as `2026-09-16T23:30:00Z`, the
-/// form Anthropic's reset headers use; kept for reporting, not for blocking.
-#[allow(dead_code)]
-fn until_rfc3339(text: &str) -> Option<Duration> {
-    let text = text.trim();
-    let (date, time) = text.split_once('T')?;
-    let mut parts = date.split('-');
-    let (year, month, day): (i64, i64, i64) = (
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    );
-    let time = time.trim_end_matches('Z');
-    let time = time.split(['+', '-']).next()?;
-    let mut clock = time.split(':');
-    let (hour, minute): (i64, i64) = (clock.next()?.parse().ok()?, clock.next()?.parse().ok()?);
-    let second: f64 = clock.next()?.parse().ok()?;
-    // Days from civil, Howard Hinnant's algorithm.
-    let (y, m) = if month <= 2 {
-        (year - 1, month + 9)
-    } else {
-        (year, month - 3)
-    };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * m + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let target = days as f64 * 86_400.0 + hour as f64 * 3600.0 + minute as f64 * 60.0 + second;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs_f64();
-    Some(Duration::from_secs_f64((target - now).max(0.0)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,9 +852,6 @@ mod tests {
             Some(Duration::from_millis(2106))
         );
         assert_eq!(named_delay("no delay here"), None);
-        assert!(until_rfc3339("2000-01-01T00:00:00Z").unwrap().is_zero());
-        assert!(until_rfc3339("2999-01-01T00:00:00Z").unwrap() > Duration::from_secs(1 << 30));
-        assert!(until_rfc3339("not a time").is_none());
     }
 
     #[tokio::test(start_paused = true)]

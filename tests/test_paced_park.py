@@ -5,7 +5,6 @@ import sqlite3
 import time
 import unittest
 
-from bench.runtime_client import Client
 from tests.test_runtime import ModelFixture
 
 

@@ -33,7 +33,7 @@ function page(daemon = {}) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail: typeof renderTail === "function" ? renderTail : null };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
