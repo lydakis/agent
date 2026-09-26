@@ -304,12 +304,16 @@ class LongTaskRunnerTests(ModelFixture):
                     self.assertEqual(result['elisions'], 0)
                     self.assertGreaterEqual(result['compactions'], 1)
                     self.assertEqual(result['summarizer_calls'], result['compactions'])
-                # Each installed summary names its span and what it cost.
+                # Each installed summary names its span, how it was sent,
+                # and what it cost.
                 self.assertEqual(len(result['summaries']), result['compactions'])
                 for summary in result['summaries']:
                     self.assertEqual(summary['calls'], 1)
                     self.assertGreater(summary['span_bytes'], 0)
                     self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                    self.assertIn(summary['form'], ('copy', 'own'))
+                    self.assertEqual(summary['copied_items'] is None, summary['form'] == 'own')
+                    self.assertGreater(summary['estimate']['own'], 0)
                 self.assertEqual(sum(s['input_tokens'] for s in result['summaries']),
                                  result['summarizer_input_tokens'])
                 self.assertGreater(result['peak_input_tokens'], 0)

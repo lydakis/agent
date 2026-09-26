@@ -2075,7 +2075,9 @@ impl Database {
     }
     /// Record a compaction at the current head. The separate cut marks the
     /// context start; branches may independently summarize the same cut.
-    /// One transaction, published like any event.
+    /// One transaction, published like any event; `request`, how the
+    /// summary was asked for, goes on the event as it is.
+    #[allow(clippy::too_many_arguments)]
     pub fn compact(
         &mut self,
         name: &str,
@@ -2084,6 +2086,7 @@ impl Database {
         usage: Option<&Usage>,
         note_turns: usize,
         input_limit: super::ContextUsage,
+        request: Value,
     ) -> Result<Value> {
         let bot = self.inspect(name)?;
         if let Some(head) = bot.head
@@ -2240,7 +2243,8 @@ impl Database {
             "headroom_bytes":input_limit.bytes as i64 - after.bytes as i64,
             "headroom_items":input_limit.items as i64 - after.items as i64,
             "reclaimed_bytes":before.bytes - after.bytes,
-            "reclaimed_items":before.items - after.items});
+            "reclaimed_items":before.items - after.items,
+            "request":request});
         // Successful summaries and their accounting share one fsync/commit.
         if let Some(turn) = bot.running_turn {
             if let Some(usage) = usage {

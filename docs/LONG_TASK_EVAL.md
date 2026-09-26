@@ -159,8 +159,8 @@ verbatim tail takes the large task's view far below the 75% trigger, so
 `tests/test_long_task_eval.py` elides once and summarizes never. A bot
 without `read` stores no stubs, so in `large-summary` summaries make all
 the room (twice in the scripted run). That is the condition the summary
-copy is measured on, against a build that sends fresh requests; see
-[running it](#running-it).
+requests are measured on, against the build before them and one that sends
+only requests of their own; see [running it](#running-it).
 
 Scores come from the workspace and the event log, not the model's account
 of itself: hidden tests passed, every file under `vendor/` unchanged with
@@ -175,9 +175,10 @@ compactions, elisions, the view each model call was made under (its
 summary version and cut, and its elision floor), input, cached input, and output tokens for the model and the
 summarizer separately, summarizer latency from its send to the send of
 the model call it held back, and for each installed summary whether it was
-a catch-up step (always a request of its own, never a copy), the bytes it
-summarized and the view they came from, and its summarizer calls and
-tokens. Failed summaries are live-only events, so the
+a catch-up step, the bytes it summarized and the view they came from, how
+it was sent (a copy of the bot's call, with the window items copied, or a
+request of its own) with the runtime's estimate of each way, and its
+summarizer calls and tokens. Failed summaries are live-only events, so the
 runner collects them as they arrive. The workspace's own tools record
 each run of `tools/env-check`, `make check`, and the benchmark with its
 exit status and a digest of the workspace's files, dotfiles and bytecode
@@ -202,32 +203,39 @@ under `.local/long-task-eval/run/`, which git ignores. Each condition
 prints a one-line summary; the JSON file keeps every bot's scores and
 answer.
 
-The realistic-budget comparison runs four arms at once, so every arm sees
-the backend at the same time, five bots each. The runtime has one
-behavior, so the arm with fresh summary requests is a measurement build,
-never committed: the same commit with the copy's selection in `compact()`
-turned off, which sends every summary as the request of its own that a
-separate summarizer model and a catch-up step already use.
+The realistic-budget comparison runs its arms at once, so every arm sees
+the backend at the same time. The runtime has one behavior, so an arm with
+another way of sending summaries is a measurement build, never committed:
+the commit before the per-summary choice (`d9ecbcf`, which copies the
+bot's call whenever it fits), and the same commit as the other arms with
+the copy turned off in `compact()`, which sends every summary as a request
+of its own.
 
 ```sh
 git worktree add .local/copy-off HEAD
-perl -0pi -e 's/sent\.filter\(\|sent\| sent\.model == reference && !plan\.catch_up\)/sent.filter(|_| false)/' \
+perl -0pi -e 's/sent\.filter\(\|sent\| sent\.model == reference\)/sent.filter(|_| false)/' \
     .local/copy-off/src/server/turn.rs
 git -C .local/copy-off diff --stat    # 1 file changed, 1 insertion(+), 1 deletion(-)
 cargo build --release --bin agent --manifest-path .local/copy-off/Cargo.toml \
     --target-dir .local/copy-off/target
+git worktree add .local/always-copy d9ecbcf
+cargo build --release --bin agent --manifest-path .local/always-copy/Cargo.toml \
+    --target-dir .local/always-copy/target
 
-run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 5 "$@"; }
+run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 10 \
+    --context-bytes 131072 "$@"; }
 run --conditions large-compact --out .local/long-task-eval/large-compact.json &
-run --conditions large-full --out .local/long-task-eval/large-full.json &
-run --conditions large-summary --out .local/long-task-eval/large-summary-copy.json &
+run --conditions large-full --context-bytes 4194304 --out .local/long-task-eval/large-full.json &
+run --conditions large-summary --out .local/long-task-eval/large-summary-choice.json &
+run --conditions large-summary --binary .local/always-copy/target/release/agent \
+    --out .local/long-task-eval/large-summary-copy.json &
 run --conditions large-summary --binary .local/copy-off/target/release/agent \
-    --out .local/long-task-eval/large-summary-fresh.json &
+    --out .local/long-task-eval/large-summary-own.json &
 wait
 ```
 
-Each JSON file records its binary's digest, which tells the two
-`large-summary` arms apart. `--context-bytes N` gives every condition the
+Each JSON file records its binary's digest, which tells the `large-summary`
+arms apart. `--context-bytes N` gives every condition the
 run names the budget N instead of its own, for example to run the
 `large-` arms at 128 KiB beside a `large-full` run without it.
 
