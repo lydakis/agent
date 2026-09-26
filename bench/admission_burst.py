@@ -54,10 +54,13 @@ def burst(client, requests):
 
 
 def store_work(after, before):
-    """Store counters that moved between two `stats` snapshots."""
-    operations = {label: {key: after['operations'].get(label, {}).get(key, 0)
-                          - before['operations'].get(label, {}).get(key, 0)
-                          for key in ('count', 'queued_ms', 'ran_ms', 'answered_ms')}
+    """Store jobs counted between two `stats` snapshots, by label, and groups.
+
+    Only counts: `stats` reports cumulative times in whole milliseconds, and
+    the closing snapshot's own group commit falls inside the phase, so its
+    time could only be subtracted as another request's rounded time."""
+    operations = {label: after['operations'].get(label, {}).get('count', 0)
+                  - before['operations'].get(label, {}).get('count', 0)
                   for label in (*LABELS, 'counts')}
     groups = {key: after['groups'][key] - before['groups'][key] for key in ('count', 'jobs')}
     return operations, groups
@@ -86,9 +89,10 @@ def phase(client, process, model, send, turns=0):
     for reply, _ in replies:
         assert 'result' in reply, reply
     (own_operations, own_groups), (operations, groups) = store_work(before, base), store_work(after, before)
-    assert own_operations['counts']['count'] == 1 and own_groups == {'count': 1, 'jobs': 1}, own_groups
-    operations = {label: {key: value - own_operations[label][key] for key, value in keys.items()}
-                  for label, keys in operations.items() if label != 'counts'}
+    assert own_operations == {**dict.fromkeys(LABELS, 0), 'counts': 1, 'commit': 1}, own_operations
+    assert own_groups == {'count': 1, 'jobs': 1}, own_groups
+    operations = {label: count - own_operations[label]
+                  for label, count in operations.items() if label != 'counts'}
     groups = {key: value - own_groups[key] for key, value in groups.items()}
     return dict(requests=len(replies), elapsed_ms=elapsed,
                 reply_ms=percentiles([latency for _, latency in replies]),
@@ -149,7 +153,7 @@ def main():
         parser.error('use 1–64 bots and at least one measured repetition')
     args.out.mkdir(parents=True, exist_ok=False)
     binary = args.binary.resolve()
-    result = dict(schema='admission_burst_v1', binary_sha256=file_hash(binary),
+    result = dict(schema='admission_burst_v2', binary_sha256=file_hash(binary),
                   observed_at=datetime.now(timezone.utc).isoformat(),
                   observer_sha256=file_hash(Path(__file__)),
                   fixture_sha256=file_hash(Path(__file__).with_name('synthetic_model.py')),
