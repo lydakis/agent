@@ -780,8 +780,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `wait`. It has no rules, prompts, or model. It is oversight, not a
     sandbox. The Harbor tool mix (2026-09-26) sends 64 to 76% of rounds to
     Jev, about 1 to 2% of median trial time, and caps one Jev key at
-    roughly 26 to 31 `auto` rounds a second. Next: a labeled Jev run to set
-    the per-question thresholds.
+    roughly 26 to 31 `auto` rounds a second. A labeled Jev run on 341
+    calls (2026-09-26, $0.07) answered in 0.26 s median with no false
+    allows, but at the starting thresholds it refused 23% of benign calls;
+    tuned thresholds cut that sharply. Next: a labeled dangerous set to
+    measure false allows before thresholds are fixed.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

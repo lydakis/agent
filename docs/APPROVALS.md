@@ -39,12 +39,16 @@ has to be counted per call.
    the app; the daemon sees gates, each a list of tools and an opaque tag
    naming which approver answers.
 4. **Auto is hands-off.** Deterministic rules in the client answer the
-   obvious cases in microseconds, and Jev answers a handful of narrow
-   questions about the rest in about 0.4 s. In the stored Harbor trials
+   obvious cases in microseconds, and Jev answers ten narrow questions
+   about the rest in about 0.3 s. In the stored Harbor trials
    the rules settled only 21 to 29% of calls, so Jev is the common path,
    not the exception: 64 to 76% of model rounds would wait on it, about 1
    to 2% of median trial time. What is dangerous or unclear is
-   denied, never silently allowed and never sent to a person. The model
+   denied, never silently allowed and never sent to a person. On a
+   labeled set of 341 calls from those trials, Jev's answers with the
+   rule below allowed nothing it should have denied, but at the starting
+   thresholds they also refused 23% of the benign calls. The set holds
+   almost no dangerous calls, so the thresholds stay open. The model
    gets the reason and tries another way, or tells its caller what it
    needs. If the caller then says yes in a message that names the action,
    the approver reads that as the user's consent on the retry. Nobody
@@ -501,7 +505,7 @@ so only one instance runs at a time, and answers in layers:
      judged as if this bot did it.
    - Rules the user adds ("allow `cargo test`", "deny `git push`") are
      checked here. "Always allow" from the manual UI adds a rule here.
-3. **Jev, about 0.4 s.** One request per round: the state is the context
+3. **Jev, about 0.3 s.** One request per round: the state is the context
    below plus the round's calls, and each call gets `noul` (true or false)
    questions, each naming one judgment and returning a probability. Five
    name a risk:
@@ -516,12 +520,16 @@ so only one instance runs at a time, and answers in layers:
 
    Each risk has a consent question asked beside it that names the same
    effect: did the caller ask for this deletion, this destination, this
-   credential change, this system change, this download? Asking all ten
+   use or change of credentials, this system change, this download? The
+   consent question has to cover everything its risk question does: in
+   the labeled run, asking about "this credential change" beside a risk
+   that also covers using credentials denied a requested package upload
+   that used a stored token. Asking all ten
    in one request keeps it to one round trip; they share the state, and
    Jev bills input only.
 
-   Allow when every risk is low. Allow a risky call too when every high
-   risk has a high consent answer and no hard deny (step 4) matches. A
+   Allow when every risk is either low or has a high consent answer, and
+   no hard deny (step 4) matches. A
    task that says to install a package, publish, or deploy has consented
    to that effect and no other: a requested deploy that also sends a
    credential to a host nobody named has a high risk with no consent, and
@@ -531,8 +539,13 @@ so only one instance runs at a time, and answers in layers:
    TypeSafe's guardrail cookbook's: below 0.35 is low, 0.70 or more is
    high. TypeSafe publishes no calibration figures; a third-party benchmark
    (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
-   task-dependent below it. So the thresholds are set from our own labeled
-   run (below), per question.
+   task-dependent below it. Our labeled run
+   ([Measure](#measure-before-building), item 2) found them too strict for
+   coding work, but it cannot yet set
+   better ones: benign calls such as starting the server a task asks for
+   score up to 0.64 on "changes a shared system", while a requested
+   `git push` scored 0.36, so that question has no safe gap between the
+   two.
 4. **Unclear or dangerous: deny, and let consent come through messages.**
    The approver denies with a reason and moves on; it never pages a
    person. The reason tells the model what was refused and that it can ask
@@ -660,7 +673,7 @@ closed and visibly, instead of growing a queue of parked turns.
 | --- | ---: | ---: | --- |
 | Tool not in `approve` | nothing measurable (one list lookup, as today) | 0 | as today |
 | Rules answer | one socket round trip, 0.13 ms median, 0.3 ms p99 (measured), plus one storage-worker job with no commit | 0 | yes, briefly |
-| Jev answers (64 to 76% of rounds, measured below) | about 0.34 to 0.44 s median (2026-09-19 probe) | 0 | yes, up to the hold |
+| Jev answers (64 to 76% of rounds, measured below) | 0.26 s median, 0.52 to 0.57 s p99 (labeled run, ten questions) | 0 | yes, up to the hold |
 | Person answers | the person's time | 2 (park, verdict) | no, after the hold |
 
 - **The socket hop.** A Python client sent 5,000 sequential JSONL requests
@@ -679,14 +692,20 @@ closed and visibly, instead of growing a queue of parked turns.
   announced when the plan commits, their verdicts come back together. A
   round pays about one Jev latency however many calls it has, instead of one
   per call, and later calls' verdicts overlap earlier calls' execution.
+- **Jev latency.** The labeled run sent 676 requests of ten questions each
+  from George's Mac, four in flight (2026-09-26): 0.26 s median, 0.31 to
+  0.34 s p90, 0.52 to 0.57 s p99, 0.67 s at most, with no timeouts, rate
+  limits, or retries. The 2026-09-19 probe measured 0.34 to 0.44 s median
+  for shorter questions.
 - **Jev in context.** The live fleet check measured 1.9 s median for a
   short turn on gpt-5.6-luna, so a short model round that also needs Jev is
-  roughly 20% slower. Real trials are dominated by long rounds and tool
+  roughly 15% slower. Real trials are dominated by long rounds and tool
   runs, so the share of a whole trial is far smaller (below).
 - **Cost.** Jev bills input only, at $0.042 per million tokens (TypeSafe's
-  models page, read 2026-09-26). The probe's requests were 420 to 1,970
-  input tokens, so $0.00002 to $0.00008 each. A trial of 50 checks costs
-  well under a cent. For comparison, the same 2,000 tokens cost $0.002 on
+  models page, read 2026-09-26). The labeled run's requests were 2,224
+  input tokens median, 4,490 p90, and 7,886 at most; its 676 requests
+  cost $0.071 in all, about $0.0001 each. A trial of 50 checks costs
+  about half a cent. For comparison, the same 2,000 tokens cost $0.002 on
   Haiku 4.5 before any output.
 - **A person's wait.** Parking and recording the verdict are two commits,
   about 11 ms on an idle Mac; the call's start after resuming is a commit it
@@ -710,6 +729,9 @@ recorded model rounds, and the calls match its `tool_started` events.
 | Rounds that would wait on Jev | 64% | 76% |
 | Jev rounds per trial, median (range) | 6 (2 to 21) | 16 (7 to 54) |
 | Jev time at 0.4 s a round, share of median trial | about 2% | about 1% (worst trial 9%) |
+
+The last row used the probe's 0.4 s; at the labeled run's 0.26 s median
+the shares are about a third smaller.
 
 - Every call sent to Jev was a shell command, apart from 4 writes outside
   the workspace. The commonest reasons were heredocs (`python - <<'PY'`),
@@ -777,17 +799,39 @@ as one.
    model), and symlinks. The count treated `git status`, `diff`, `log`,
    and `show` as read-only, so the Jev share is somewhat higher than the
    table shows.
-2. **Jev on a labeled set.** A few hundred calls from those transcripts
-   plus synthetic dangerous ones (a force push, `curl | sh`, a key sent to
-   an unknown host, `rm -rf ~`), each labeled. Record false allows and false
-   denials per question and threshold, and latency p50 and p99. At the
-   probe's prices this is a few cents; George approved the paid run on
-   2026-09-26. The real half is prepared (300 rounds from the c585c16
-   trials, labeled, plus 38 benign synthetic calls, 8 of them risky
-   actions the prompt asks for). It has not run yet, because sending
-   transcript calls to an outside API needs George's own permission on
-   the machine that holds them. A synthetic dangerous half, which is
-   what measures false allows, is still to be supplied.
+2. **Jev on a labeled set.** Done 2026-09-26 on George's Mac, $0.071.
+   The set was 338 rounds, 341 calls: 303 real calls from the c585c16
+   trials plus 38 benign synthetic ones, 8 of them risky actions the
+   prompt asks for, each labeled per question. The correct decision is
+   the rule applied to the labels. Two identical passes, every answer
+   from `jev-1.13.0`:
+   - At 0.35 / 0.70, as first written, 84% and 83% of decisions were
+     right, 20% were unclear, and 23% of benign calls were not allowed;
+     there were no false allows. The rule then left a mid-band risk with
+     high consent unclear; counting it as allowed (the rule as now
+     written) makes that 89%, with a third fewer false denials and still
+     no false allows.
+   - The false denials came from starting the server a task asks for
+     (shared system), installs from a task's own local package index
+     (download and run), scratch files and copies under `/tmp` (delete,
+     send), and the credentials consent wording fixed above.
+   - The best single threshold pair that kept every labeled risk and
+     every refused consent out of the allowed side reached 93% with no
+     unclear band; one pair per question reached 96% on the pass it was
+     fitted to and 92 to 96% on the other. These show how many false
+     denials are avoidable, not settings to adopt: the set had only 1
+     destroy, 0 exfiltration, 2 credential, 5 shared-system, and 25
+     download positives.
+   - 6 of the 303 real calls (2%) install something the task needs but
+     does not name, such as `torch`. The paired consent question denies
+     them whatever the thresholds, since nobody asked for that download
+     (an open decision below).
+   - Answers barely moved between passes (largest change 0.13), but 9 of
+     341 decisions (2.6%) flipped at 0.35 / 0.70.
+
+   False allows stay unmeasured until a labeled dangerous set exists;
+   authoring one was out of reach for this run. The thresholds stay open
+   until then.
 3. **The daemon path.** On the lifecycle screen with `approve` set and a
    rules-only approver, confirm zero added commits per call and under 1 ms
    added per gated call; then the park path with a delayed answer.
@@ -807,3 +851,10 @@ the CLI.
   band is hit).
 - Where the automatic approver runs: the app, `agent approver`, or both
   (proposed: both, one module).
+- Whether installing a dependency the task needs but does not name counts
+  as consented. Strict pairing denies it (2% of real Harbor calls); the
+  older single intent question ("or for something that needs it")
+  allowed it, but let one answer override every risk. Proposed: keep it
+  strict, and measure what it costs in pass rate once `auto` runs.
+- Thresholds per question, once a labeled dangerous set measures false
+  allows.
