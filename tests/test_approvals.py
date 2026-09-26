@@ -364,22 +364,29 @@ class ApprovalCliTests(ModelFixture):
         self.assertEqual(json.loads(result.stdout)['results'][submitted['handle']]['status'], 'completed')
 
     def test_run_pretty_shows_what_a_call_would_do_before_its_command(self):
+        # The call's output would conceal what follows it; it is shown escaped.
         run = subprocess.Popen([str(self.binary), 'run', *self.common, '--new', '--bot', 'Bob', '--pretty',
-                                'shell:printf shown'], env={**clean_env(), 'AGENT_APPROVAL': 'manual'},
+                                "shell:printf 'shown\\033[8m'"], env={**clean_env(), 'AGENT_APPROVAL': 'manual'},
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=self.path)
         self.addCleanup(run.kill)
         lines = queue.Queue()
-        threading.Thread(target=lambda: [lines.put(line) for line in run.stdout], daemon=True).start()
+        reader = threading.Thread(target=lambda: [lines.put(line) for line in run.stdout], daemon=True)
+        reader.start()
         shown = ''
         while 'manual deny' not in shown:
             shown += lines.get(timeout=10)
-        self.assertIn('⏸ shell printf shown', shown)
+        self.assertIn("⏸ shell printf 'shown\\033[8m'", shown)
         self.assertIn('--call=shell-1 --request 1 --tag manual allow\n', shown)
         self.assertIn('--call=shell-1 --request 1 --tag manual deny\n', shown)
         turn = re.search(r'--turn (\d+)', shown)[1]
         self.agent('answer', '--store', str(self.store), '--bot', 'Bob', '--turn', turn, '--call', 'shell-1',
                    '--request', '1', 'allow')
         self.assertEqual(run.wait(timeout=30), 0, run.stderr.read())
+        reader.join(timeout=10)
+        while not lines.empty():
+            shown += lines.get()
+        self.assertIn('  shown\\u{1b}[8m\n', shown)
+        self.assertNotIn('\x1b', shown)
 
     def test_modes_are_validated_before_anything_is_created(self):
         auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False)

@@ -1275,9 +1275,12 @@ impl Renderer {
             target: target.to_owned(),
         }
     }
+    /// Dim text for a terminal. It resets every attribute first, so no
+    /// state left before it (concealed or invisible text) carries into what
+    /// it shows.
     fn dim(&self, text: &str) -> String {
         if self.color {
-            format!("\x1b[2m{text}\x1b[0m")
+            format!("\x1b[0;2m{text}\x1b[0m")
         } else {
             text.to_owned()
         }
@@ -1294,9 +1297,10 @@ impl Renderer {
             println!();
         }
         self.mode = mode;
+        let text = streamed(text);
         let mut stdout = std::io::stdout();
         let _ = match mode {
-            Mode::Thinking => write!(stdout, "{}", self.dim(text)),
+            Mode::Thinking => write!(stdout, "{}", self.dim(&text)),
             _ => write!(stdout, "{text}"),
         };
         let _ = stdout.flush();
@@ -1366,7 +1370,7 @@ impl Renderer {
                         .or_else(|| item["content"][0]["content"].as_str())
                         .unwrap_or("");
                     for line in preview(output).lines() {
-                        println!("{}", self.dim(&format!("  {line}")));
+                        println!("{}", self.dim(&format!("  {}", streamed(line))));
                     }
                 }
             }
@@ -1497,6 +1501,25 @@ fn visible(text: &str) -> String {
         }
     }
     shown
+}
+
+/// Streamed model text or tool output as a terminal should show it: line
+/// breaks and tabs kept, anything else a terminal acts on escaped, so it
+/// cannot hide or restyle what follows, such as a call awaiting approval.
+fn streamed(text: &str) -> std::borrow::Cow<'_, str> {
+    let kept = |c: char| c == '\n' || c == '\t' || !acted_on(c);
+    if text.chars().all(kept) {
+        return text.into();
+    }
+    let mut shown = String::with_capacity(text.len() + 16);
+    for c in text.chars() {
+        if kept(c) {
+            shown.push(c);
+        } else {
+            shown.extend(c.escape_default());
+        }
+    }
+    shown.into()
 }
 
 /// A character a terminal acts on rather than shows as it stands: a
@@ -1793,6 +1816,25 @@ mod tests {
             summary("read", r#"{"offset":1}"#),
             "[no path or artifact in the arguments shown]"
         );
+    }
+
+    #[test]
+    fn streamed_text_keeps_its_lines_and_escapes_what_a_terminal_acts_on() {
+        assert!(matches!(
+            streamed("plain\n\tindented"),
+            std::borrow::Cow::Borrowed("plain\n\tindented")
+        ));
+        // Concealing what follows, rewriting the line, and reordering it
+        // are all shown instead of done.
+        assert_eq!(
+            streamed("fake\u{1b}[8m\rreal\u{202e}\u{9b}\n"),
+            r"fake\u{1b}[8m\rreal\u{202e}\u{9b}".to_owned() + "\n"
+        );
+        let renderer = Renderer {
+            color: true,
+            ..Renderer::new(true, None, "")
+        };
+        assert_eq!(renderer.dim("x"), "\x1b[0;2mx\x1b[0m");
     }
 
     #[test]

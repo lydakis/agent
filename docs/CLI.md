@@ -98,7 +98,10 @@ while starting none; turns still running then end `interrupted` with
 
 `--pretty` is an explicit human view: rendered streams, tables for lists, and
 indented JSON for other results, including detached submission handles. It is
-rejected on commands with no output. Diagnostics go to stderr.
+rejected on commands with no output. Diagnostics go to stderr. Rendered model
+text and tool output keep their line breaks and tabs; any other character a
+terminal would act on is printed escaped, so a stream cannot hide or restyle a
+call waiting for approval.
 
 | Exit | Meaning |
 | --- | --- |
