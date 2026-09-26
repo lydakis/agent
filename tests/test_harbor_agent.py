@@ -155,7 +155,8 @@ class HarborAgentTest(unittest.TestCase):
                            (json.dumps({'input_tokens': 700, 'output_tokens': 50, 'cached_input_tokens': 100,
                                         'models': attempts}),))
                 db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
-                           (json.dumps({'input_tokens': 300, 'output_tokens': 50, 'cached_input_tokens': 400}),))
+                           (json.dumps({'input_tokens': 300, 'output_tokens': 50, 'cached_input_tokens': 400,
+                                        'served_model': 'm-2026-09-26'}),))
             counted(logs, 1000)
             context = AgentContext()
             self.agent(logs).populate_context_post_run(context)
@@ -170,11 +171,14 @@ class HarborAgentTest(unittest.TestCase):
                           usage['gw/backup'].n_output_tokens), (400, 100, 30))
         # Totals are unchanged; only the split moves.
         self.assertEqual((context.n_input_tokens, context.n_output_tokens), (1000, 100))
-        # The trial names what it asked for and every model that answered.
+        # The trial names what it asked for and every model that answered,
+        # as the provider named it: each attempt of a fallback, and the dated
+        # snapshot behind the requested name.
         self.assertEqual((context.metadata['requested_model'], context.metadata['served_calls'],
                           context.metadata['bot_settings']['task']['fallbacks']),
-                         ('gw/m', {'gw/m': 2, 'gw/backup': 1}, True))
+                         ('gw/m', {'gw/m': 1, 'gw/backup': 1, 'gw/m-2026-09-26': 1}, True))
         self.assertNotIn('unrecorded_input_tokens', context.metadata)
+        self.assertNotIn('unnamed_calls', context.metadata)
         self.assertEqual((short.metadata['served_calls'], short.metadata['unrecorded_input_tokens']),
                          (None, 500))
 
@@ -242,11 +246,19 @@ class HarborAgentTest(unittest.TestCase):
             with sqlite3.connect(path) as db:
                 db.execute('CREATE TABLE events(id INTEGER PRIMARY KEY, bot TEXT, turn INT, kind TEXT, data TEXT)')
                 db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
-                           (json.dumps({**summary, 'purpose': 'compaction', 'models': [summary]}),))
+                           (json.dumps({**summary, 'purpose': 'compaction', 'models': [summary],
+                                        'served_model': 'cheap-2026-09-26'}),))
+                db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
+                           (json.dumps({'input_tokens': 0, 'output_tokens': 0, 'cached_input_tokens': 0}),))
+            counted(logs, 400)
             context = AgentContext()
             self.agent(logs).populate_context_post_run(context)
         usage = context.model_usage
         self.assertEqual(sorted(usage), ['gw/m', 'other/cheap'])
+        # The summary answered on the summarizer's provider; a call the
+        # provider named no model for is counted apart.
+        self.assertEqual((context.metadata['served_calls'], context.metadata['unnamed_calls']),
+                         ({'other/cheap-2026-09-26': 1}, 1))
         self.assertAlmostEqual(usage['other/cheap'].cost_usd, 300 * 1e-7 + 100 * 2e-7 + 40 * 1e-6)
         self.assertEqual(usage['gw/m'].n_input_tokens, 600)
 
@@ -365,10 +377,12 @@ class HarborStoreTest(ModelFixture):
         self.assertEqual(list(context.model_usage), ['openai/synthetic-model'])
         self.assertEqual(context.metadata['bot_settings'],
                          {'task': {'reasoning': None, 'fallbacks': False}})
-        # The daemon's count and the stored usage events agree.
+        # The daemon's count and the stored usage events agree, and every
+        # call names the dated snapshot the test provider answers with.
         self.assertEqual(context.metadata['served_calls'],
-                         {'openai/synthetic-model': listed[0]['model_rounds']})
+                         {'openai/synthetic-model-2026-09-26': listed[0]['model_rounds']})
         self.assertNotIn('unrecorded_input_tokens', context.metadata)
+        self.assertNotIn('unnamed_calls', context.metadata)
 
     def test_a_deleted_helper_leaves_what_served_unknown(self):
         client = self.client()

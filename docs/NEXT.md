@@ -825,12 +825,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Next: a labeled dangerous set to
     measure false allows before thresholds are fixed.
-46. The model that answered. A usage event names a model other than the
-    requested one only when Anthropic's fallback splits a call or a
-    summarizer runs elsewhere. Keep the model each provider names in its
-    response, stored only when it differs from the requested name, so a task
-    comparison can show what served every call, as Claude Code's records
-    already do ([the gap](COMPARISON_CONTRACT.md#task-comparisons)).
+46. Done: the model that answered. Every `usage` event keeps
+    `served_model`, the model the provider named in its response
+    (Responses' `response.model`, Anthropic's `message.model`, and after a
+    fallback the last attempt's, with each attempt in `models`), so a
+    reroute or a snapshot behind the requested name shows, as Claude Code's
+    records already do. It is kept even when it matches the request, so a
+    call whose provider named no model stays distinguishable; the Harbor
+    adapter counts those as `unnamed_calls`. The name is read in place
+    during the parse and is one short string per event. Pricing stays on
+    the requested name, which the price table knows and a dated snapshot
+    may not ([the contract](COMPARISON_CONTRACT.md#task-comparisons)).
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

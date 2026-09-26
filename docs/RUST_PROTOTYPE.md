@@ -253,7 +253,9 @@ summarizer call, naming the summarizer's provider and model, and
 no budget or cache ratio needs it, with `cache_write_1h_tokens` for the part
 cached for an hour; `sent_ms`, when the request was sent in Unix-epoch
 milliseconds, so a cache miss can be set against the gap since the call before
-it; a prompt-cache refresh's event carries
+it; `served_model`, the model the provider named in its response, which can
+differ from the one requested (a dated snapshot, a reroute, and after a
+fallback the last attempt's); a prompt-cache refresh's event carries
 `purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,
