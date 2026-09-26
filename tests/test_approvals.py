@@ -10,7 +10,9 @@ import time
 import unittest
 
 from bench.targets import clean_env
-from tests.test_runtime import ODD_CALL_ID, ModelFixture
+from tests.test_elision import drain, encoded
+from tests.test_runtime import ODD_CALL_ID, ModelFixture, is_summary
+from tests.test_turn_compaction import all_events
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -320,6 +322,77 @@ class ApprovalTests(ModelFixture):
         self.assertTrue(self.tool_output(client, 'shell-1', bot='Dan')[0]['cancelled'])
         self.assertEqual(client.request('approvals')['result']['approvals'], [])
         self.assertEqual(self.answer(client, dan, 'shell-1', bot='Dan')['error'], 'stale_turn')
+
+    def park_and_allow(self, client, turn, calls, restart_at, extra, tools):
+        """Allow each call once its turn parks for it, restarting the daemon
+        while the call at `restart_at` waits. Returns the client in use."""
+        for n, call_id in enumerate(calls):
+            client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn
+                           and m['data'].get('approval'), timeout=30)
+            if n == restart_at:
+                client.close(kill=True)
+                client = self.client(tools, extra=extra)
+            self.assertEqual(self.answer(client, turn, call_id)['result']['pending'], [])
+        return client
+
+    def test_a_turn_parked_on_every_call_compacts_inside_itself_across_a_restart(self):
+        # Every shell call parks for its verdict while the turn outgrows its
+        # budget: stubs and summaries come between parks, and one park spans
+        # a restart. Each round runs once, with its allow.
+        extra = ('--approval-hold-ms', '0', '--context-bytes', '24576')
+        client = self.client('shell,read', extra=extra)
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       approve=['shell'], approver='manual', compaction_instructions='Summarize.')
+        rounds = 24
+        turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['turn']
+        calls = [f'long-{n}' for n in range(rounds)]
+        client = self.park_and_allow(client, turn, calls, rounds // 2, extra, 'shell,read')
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        self.assertIn(f'done after {rounds} rounds', json.dumps(answer))
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
+        events = all_events(client, 'Bob')
+        self.assertEqual([e['data']['call_id'] for e in events if e['event'] == 'tool_completed'],
+                         calls + ['long-read'])
+        started = [e['data'] for e in events if e['event'] == 'tool_started']
+        self.assertTrue(all([a['allow'] for a in s['approvals']] == [True] for s in started[:rounds]))
+        self.assertNotIn('approvals', started[-1])
+        # Summaries both before and after the restart, every cut inside the
+        # turn keeping its prompt, and none failed.
+        cursors = [e['cursor'] for e in events if e['event'] == 'compacted']
+        restart = next(e['cursor'] for e in events if e['event'] == 'turn_waiting'
+                       and e['data']['call_id'] == calls[rounds // 2])
+        self.assertTrue(any(c < restart for c in cursors) and any(c > restart for c in cursors), cursors)
+        self.assertTrue(all(e['data']['pinned'] for e in events if e['event'] == 'compacted'))
+        self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+        self.assertEqual(sum(is_summary(r) for r in requests), len(cursors))
+        self.assertEqual(client.request('approvals')['result']['approvals'], [])
+
+    def test_a_parked_calls_result_that_overflows_forces_a_summary_after_restart(self):
+        # Four small rounds, then a call whose result takes the turn past its
+        # budget. That call parks, the daemon restarts, and once allowed its
+        # result forces a summary of the earlier rounds before the next call.
+        extra = ('--approval-hold-ms', '0', '--context-bytes', '24576', '--compact-at', '99')
+        client = self.client('shell', extra=extra)
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       approve=['shell'], approver='manual', compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
+        client = self.park_and_allow(client, turn, [f'long-{n}' for n in range(5)], 4, extra, 'shell')
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        self.assertIn('done after 5 rounds', json.dumps(answer))
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
+        self.assertEqual(['summary' if is_summary(r) else 'work' for r in requests],
+                         ['work'] * 5 + ['summary', 'work'])
+        compacted = [e['data'] for e in all_events(client, 'Bob') if e['event'] == 'compacted']
+        self.assertEqual(len(compacted), 1)
+        self.assertTrue(compacted[0]['pinned'])
+        calls = [i['call_id'] for i in requests[-1]['input'] if i.get('type') == 'function_call']
+        self.assertEqual(calls, ['long-4'])
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')

@@ -25,6 +25,9 @@ pub struct ContextPrefix {
     /// Every prefix item includes its separating comma before the tail.
     pub bytes: bytes::Bytes,
     pub items: usize,
+    /// What cannot yield to the current turn: the summary, the note, and
+    /// the context note without its optional previews.
+    pub required: ContextUsage,
 }
 
 impl Window {
@@ -35,6 +38,7 @@ impl Window {
             self.note.as_ref(),
             self.omitted_items,
             self.omitted_turns,
+            self.omitted_in_turn,
             self.history,
             listed,
             prefix_budget,
@@ -49,7 +53,7 @@ impl CompactionView {
     /// Count each prompt once instead of repeatedly encoding the entire prefix.
     pub(crate) fn bound_prompt_bytes(&mut self, family: Family, budget: usize) -> Result<()> {
         let mut prompts = std::mem::take(&mut self.prompts);
-        let base = context_prefix(family, Some(self), None, 0, 0, false, &[], 0)?
+        let base = context_prefix(family, Some(self), None, 0, 0, 0, false, &[], 0)?
             .bytes
             .len();
         if base > budget {
@@ -62,7 +66,11 @@ impl CompactionView {
             base + serde_json::to_vec("\n\nUser messages from those turns, verbatim:")?.len() - 2;
         let mut costs = Vec::with_capacity(prompts.len());
         for (ordinal, prompt) in &prompts {
-            let size = serde_json::to_vec(&format!("\n{ordinal}: {prompt}"))?.len() - 2;
+            let size = if self.shows(*ordinal) {
+                serde_json::to_vec(&format!("\n{ordinal}: {prompt}"))?.len() - 2
+            } else {
+                0
+            };
             used += size;
             costs.push(size);
         }
@@ -82,6 +90,20 @@ impl CompactionView {
         self.prompts = prompts;
         Ok(())
     }
+    /// Whether the summary block lists a kept prompt: not the prompt of a
+    /// turn covered only in part, which the window carries whole.
+    fn shows(&self, ordinal: i64) -> bool {
+        !(self.partial && ordinal == self.covered.1)
+    }
+    /// What the summary stands for, as its header says.
+    fn coverage(&self) -> String {
+        let (from, to) = self.covered;
+        match (self.partial, from < to) {
+            (false, _) => format!("turns {from} to {to}"),
+            (true, true) => format!("turns {from} to {} and the start of turn {to}", to - 1),
+            (true, false) => format!("the start of turn {to}"),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -91,6 +113,7 @@ pub(crate) fn context_prefix(
     note: Option<&(i64, String)>,
     omitted_items: i64,
     omitted_turns: i64,
+    omitted_in_turn: i64,
     history: bool,
     listed: &[(i64, String)],
     prefix_budget: usize,
@@ -104,12 +127,19 @@ pub(crate) fn context_prefix(
     };
     if let Some(view) = compaction {
         let mut text = format!(
-            "[compaction summary, version {}, covering turns {} to {}]\n{}",
-            view.version, view.covered.0, view.covered.1, view.summary
+            "[compaction summary, version {}, covering {}]\n{}",
+            view.version,
+            view.coverage(),
+            view.summary
         );
-        if !view.prompts.is_empty() {
+        let mut shown = view
+            .prompts
+            .iter()
+            .filter(|(o, _)| view.shows(*o))
+            .peekable();
+        if shown.peek().is_some() {
             text.push_str("\n\nUser messages from those turns, verbatim:");
-            for (ordinal, prompt) in &view.prompts {
+            for (ordinal, prompt) in shown {
                 text.push_str(&format!("\n{ordinal}: {prompt}"));
             }
         }
@@ -122,20 +152,33 @@ pub(crate) fn context_prefix(
         )?);
     }
     let pinned_bytes = encoded.len();
+    let mut required = ContextUsage {
+        bytes: pinned_bytes,
+        items: count,
+    };
     let mut push = |mut item: Vec<u8>| {
         item.push(b',');
         encoded.extend_from_slice(&item);
         count += 1;
     };
-    if omitted_items > 0 {
+    if omitted_items > 0 || omitted_in_turn > 0 {
         // Bound the optional listing before trimming transcript turns. Its
         // allowance stays fixed while requests fit, preserving caching, and
         // shrinks only when the current turn needs the space.
         let encode = |listed: &[(i64, String)]| -> Result<Vec<u8>> {
-            let mut text = format!(
-                "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown."
-            );
-            if history {
+            let split = omitted_turns + 1;
+            let mut text = match (omitted_items > 0, omitted_in_turn > 0) {
+                (true, false) => format!(
+                    "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown."
+                ),
+                (true, true) => format!(
+                    "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages, and {omitted_in_turn} earlier messages of turn {split}, are not shown."
+                ),
+                (false, _) => format!(
+                    "[context note] {omitted_in_turn} earlier messages of turn {split} are not shown."
+                ),
+            };
+            if history && omitted_turns > 0 {
                 text.push_str(&format!(
                     " Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
                 ));
@@ -156,29 +199,43 @@ pub(crate) fn context_prefix(
             }
             family.user_item(&text)
         };
-        let mut item = encode(listed)?;
-        if pinned_bytes + item.len() >= prefix_budget && !listed.is_empty() {
-            // Probe the full listing first (its last entry can remove the
-            // older-turns footer). Proper nonempty prefixes grow monotonically.
-            // Binary search avoids quadratic re-encoding for large listings.
-            let (mut low, mut high) = (0, listed.len());
-            item = encode(&[])?;
-            while low + 1 < high {
-                let mid = low + (high - low) / 2;
-                let candidate = encode(&listed[..mid])?;
-                if pinned_bytes + candidate.len() < prefix_budget {
-                    low = mid;
-                    item = candidate;
-                } else {
-                    high = mid;
+        let bare = encode(&[])?;
+        required.bytes += bare.len() + 1;
+        required.items += 1;
+        let full = if listed.is_empty() {
+            None
+        } else {
+            Some(encode(listed)?)
+        };
+        let item = match full {
+            None => bare,
+            Some(full) if pinned_bytes + full.len() < prefix_budget => full,
+            Some(_) => {
+                // Probe the full listing first (its last entry can remove
+                // the older-turns footer). Proper nonempty prefixes grow
+                // monotonically. Binary search avoids quadratic re-encoding
+                // for large listings.
+                let (mut low, mut high) = (0, listed.len());
+                let mut item = bare;
+                while low + 1 < high {
+                    let mid = low + (high - low) / 2;
+                    let candidate = encode(&listed[..mid])?;
+                    if pinned_bytes + candidate.len() < prefix_budget {
+                        low = mid;
+                        item = candidate;
+                    } else {
+                        high = mid;
+                    }
                 }
+                item
             }
-        }
+        };
         push(item);
     }
     Ok(ContextPrefix {
         bytes: encoded.into(),
         items: count,
+        required,
     })
 }
 
@@ -247,6 +304,129 @@ pub fn thinking_bytes(item: &[u8]) -> usize {
     }
 }
 
+/// Bytes of a tool result's output its stub keeps from each end.
+const STUB_EXCERPT: usize = 256;
+/// A tool result gets a stub only when sending the stub instead saves at
+/// least this much, so an elided request never trades a small result for
+/// a pointer to it.
+pub const ELISION_MIN_SAVING: usize = 1024;
+
+/// What a request sends in place of a tool result below the bot's elision
+/// floor: a result for the same call that gives the output's size, the
+/// reference the read tool takes to return it whole, and its first and last
+/// bytes. Deterministic in its inputs, so the store writes it once beside
+/// the result and a request knows its length before reading it. `None` when
+/// it would not save `ELISION_MIN_SAVING` bytes over `item`, the stored result.
+pub fn stub(
+    family: Family,
+    call_id: &str,
+    output: &str,
+    node: i64,
+    item: usize,
+) -> Result<Option<Vec<u8>>> {
+    if output.len() < ELISION_MIN_SAVING + 2 * STUB_EXCERPT {
+        return Ok(None);
+    }
+    let mut head = STUB_EXCERPT;
+    while !output.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = output.len() - STUB_EXCERPT;
+    while !output.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let text = format!(
+        "[tool result elided from this request: {} bytes, retained in full. The read tool returns it with artifact \"result/{node}\". Its first and last bytes:]\n{}\n[...]\n{}",
+        output.len(),
+        &output[..head],
+        &output[tail..]
+    );
+    let stub = family.tool_result_item(call_id, &text)?;
+    Ok((stub.len() + ELISION_MIN_SAVING <= item).then_some(stub))
+}
+
+/// The family, call id and output of a stored tool result; `None` for any
+/// other item.
+pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Output {
+        #[serde(rename = "type")]
+        kind: String,
+        call_id: String,
+        output: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Message {
+        role: String,
+        content: Vec<Block>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Block {
+        #[serde(rename = "type")]
+        kind: String,
+        tool_use_id: String,
+        content: String,
+    }
+    if let Ok(result) = serde_json::from_slice::<Output>(item) {
+        return (result.kind == "function_call_output").then_some((
+            Family::Responses,
+            result.call_id,
+            result.output,
+        ));
+    }
+    let mut message = serde_json::from_slice::<Message>(item).ok()?;
+    let block = message.content.pop()?;
+    (message.role == "user" && message.content.is_empty() && block.kind == "tool_result")
+        .then_some((Family::Anthropic, block.tool_use_id, block.content))
+}
+
+/// Whether a stored item is a tool result, in either family: a Responses
+/// function call output, or a Messages user turn of tool result blocks.
+pub fn is_tool_result(item: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Item<'a> {
+        #[serde(borrow, rename = "type")]
+        kind: Option<std::borrow::Cow<'a, str>>,
+        #[serde(borrow)]
+        role: Option<std::borrow::Cow<'a, str>>,
+        #[serde(borrow)]
+        content: Option<&'a serde_json::value::RawValue>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Block<'a> {
+        #[serde(borrow, rename = "type")]
+        kind: std::borrow::Cow<'a, str>,
+    }
+    let Ok(item) = serde_json::from_slice::<Item<'_>>(item) else {
+        return false;
+    };
+    if item.kind.as_deref() == Some("function_call_output") {
+        return true;
+    }
+    item.role.as_deref() == Some("user")
+        && item
+            .content
+            .and_then(|c| serde_json::from_str::<Vec<Block<'_>>>(c.get()).ok())
+            .is_some_and(|blocks| {
+                !blocks.is_empty() && blocks.iter().all(|b| b.kind == "tool_result")
+            })
+}
+
+/// Whether a stored item is the model's own output, as opposed to a user
+/// message or a tool result.
+pub fn model_output(item: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Kind<'a> {
+        #[serde(borrow)]
+        role: Option<std::borrow::Cow<'a, str>>,
+        #[serde(borrow, rename = "type")]
+        kind: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<Kind<'_>>(item).is_ok_and(|item| {
+        item.role.as_deref() != Some("user") && item.kind.as_deref() != Some("function_call_output")
+    })
+}
+
 /// Stable pinned blocks retain their own Anthropic cache breakpoints.
 pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
     match family {
@@ -271,6 +451,7 @@ mod tests {
                 None,
                 6,
                 3,
+                0,
                 history,
                 &listed,
                 1 << 20,

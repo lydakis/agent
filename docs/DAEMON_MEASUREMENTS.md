@@ -4917,3 +4917,115 @@ answers each; in both, every started turn ends `interrupted` with
 Linux container with an injected sync delay; macOS, where a flush costs
 about 5.4 ms, is not measured. The burst uses one connection; many clients
 arrive interleaved, which the Python test exercises but no timing does.
+
+## Tool-result elision
+
+Store costs of [tool-result elision](RUST_PROTOTYPE.md#tool-result-elision),
+measured 2026-09-26 in a Linux cloud container with release builds of the
+branch and its base `afdd633`, run alternately, five runs each. The fixture is
+synthetic: one bot, one turn of 600 shell rounds, each result 600 short lines
+(about 12.5 KiB), so 1,201 transcript rows and 7.5 MB of items in a
+file-backed store. Medians:
+
+| Operation | Base | Branch |
+| --- | ---: | ---: |
+| Record a tool result (`tool_finish`, with commit) | 0.45 to 0.5 ms | 0.45 to 0.5 ms |
+| Window over the whole turn, nothing elided | 2.9 ms | 3.2 ms |
+| Window, results elided | n/a | 3.2 ms |
+| Read the window's items | 3.8 ms (7.5 MB) | 2.5 to 3.0 ms (2.46 MB) |
+| Plan the floor (reader) | n/a | 3 ms |
+| Move the floor (writer, with commit) | n/a | 0.8 to 1.1 ms |
+| Current-turn bytes for admission (`turn_usage`), results elided | n/a | 3 µs |
+
+Run-to-run spread was about 15%, so the window difference is not resolved at
+this sample size. Recording a result now also builds and stores its stub,
+inside the same transaction. Two earlier layouts were measured and rejected:
+computing savings from stub lengths inside the window walk cost about 30%,
+and joining stubs into every item read about 15%; the node savings column
+and a stub probe only for ids at or below the floor replaced them. A third
+summed savings with a walk wherever a span's bytes as sent were needed; the
+cumulative savings column made those one subtraction, and three reruns of
+the fixture with it matched the table above.
+
+Every window walk reads through the item overflow pages because the metadata
+columns follow the `item` BLOB. A covering index on the walk's columns, used
+with `INDEXED BY` because the planner does not choose it, cut the same walk in
+a Python `sqlite3` probe of the fixture store from 4.0 to 1.45 ms. That is a
+separate change, to be measured in the daemon first.
+
+Behavior is covered by `tests/test_elision.py` against scripted providers: a
+turn of 24 rounds of about 12 KiB each completes within a 64 KiB budget with
+every request under it, the newest result is never a stub, `read` returns an
+elided result, and a historical fork binds the floor at its checkpoint; two
+turns of ten such rounds in 32 KiB compact once, with the summarizer reading
+the first turn's stubs (without that, the stored span exceeded the budget
+and no summary was attempted); a turn that overflows while large answered
+results are still inside the keep target stubs them and completes (it
+ended with `context_limit` when the forced move kept that target); a bot
+without `read` never elides; on the Anthropic family, thinking stays bound
+under prefix enforcement across floor moves. A store test pages a result
+of one 80 KB line back whole in pieces. No live provider run was made for
+this change.
+
+`read` of `result/NODE` checks that the result is on the bot's lineage by
+walking parents from the head. The walk read each node's `depth`, which
+follows the item BLOB, so it paged through large results. Counting steps
+instead reads only `parent`. In a Python `sqlite3` probe on 2026-09-26 (one
+chain of 20,000 nodes, every other one a 12 KB result, warm cache, medians
+of seven), a check 1,000 nodes back took 1.9 ms before and 1.0 ms after, and
+10,000 back 22 and 9.7 ms. A turn now checks each result once; its later
+pages skip the walk.
+
+### Cuts inside a turn
+
+Store costs of [cuts inside a turn](RUST_PROTOTYPE.md#cuts-inside-a-turn),
+measured 2026-09-26 in the same container with release builds of the branch
+and its base `e1068c1`, run alternately, two runs each. The fixture is the
+600-round store above, elided with a 1 MiB tail, planned with a 512 KiB keep
+target in a 4 MiB envelope, both as one turn and as 600 turns of one round.
+
+| Operation | Base | Branch |
+| --- | ---: | ---: |
+| Plan, one turn (1,201 rows) | 3.2 to 3.6 ms, no cut found | 3.2 to 3.5 ms, cut inside the turn (1,117 rows summarized) |
+| Plan, 600 turns (2,400 rows) | 4.6 to 4.8 ms | 4.6 to 4.9 ms |
+| Record the compaction (writer, with commit) | 1.5 to 1.6 ms | 1.2 to 2.5 ms, one turn; 1.2 to 1.6 ms, 600 turns |
+| Window after the compaction | 147 to 168 µs, 600 turns | 86 to 90 µs, one turn; 135 to 174 µs, 600 turns |
+
+Planning walks the same rows either way; telling a round start from other
+items reads only the items at the candidate boundary, so the one-turn plan
+costs what the base spent finding no cut. The walk's cost is the item
+overflow pages noted above.
+
+Behavior is covered by `tests/test_turn_compaction.py`: one turn of 40
+rounds of about 11 KiB in a 24 KiB budget compacts at least three times
+inside the turn, runs each tool call once, keeps its prompt as the pinned
+item of every compaction, pairs every call with its result in every
+request, and finishes; on the Anthropic family with prefix-bound thinking
+enforced, a 30-round turn crosses at least two cuts with no binding error.
+Store contract tests cover the cut, the pinned prompt, the context note and
+summary header, a second cut in the same turn, a later cut that covers the
+turn whole, a historical fork from inside the split turn, and the schema 30
+migration. No live provider run was made for this change.
+
+Catch-up through an oversized turn, measured 2026-09-26 the same way
+against base `0280bca`, three alternating runs of 50 walks each. The
+fixture is the same 600 rounds without elision (7.5 MB), with a running
+turn, walked in pieces of 1,024 nodes toward a 1 MiB step:
+
+| Operation | Base | Branch |
+| --- | ---: | ---: |
+| Walk, one turn | 2.8 to 3.0 ms, then `compaction_span_limit` | 2.9 to 3.2 ms, then a step of 175 items ending at a round |
+| Walk, 600 turns | 3.9 to 4.7 ms | 3.7 to 4.1 ms |
+| Choose the step | 66 to 76 µs, one turn; 95 to 120 µs, 600 turns | 102 to 113 µs, one turn; 87 to 105 µs, 600 turns |
+
+The walk needs the depth of the newest prompt to tell the newest turn's
+rounds apart. Taking it from the running turn's prompt keeps the walk's
+output to the rows inside the budget; a first version that let every
+prompt leave SQLite made the 600-turn walk about 8% slower. Without a
+running turn, prompts leave SQLite only until the newest is found.
+Choosing a step reads two items at each candidate end, newest first, and
+stops at the first round start. Behavior is covered by the store contract
+tests `catch_up_through_a_turn_larger_than_the_budget_cuts_at_its_rounds`
+and `catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds`
+and by `test_a_round_that_overflows_before_compaction_is_due_forces_a_summary`,
+which fails on the base with `context_limit`.

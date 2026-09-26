@@ -65,8 +65,8 @@ class Client:
         self.process.stdin.flush()
         return self.receive(lambda m: m.get('id') == self.next_id)
 
-    def finished(self, turn):
-        return self.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn)
+    def finished(self, turn, timeout=5):
+        return self.receive(lambda m: m.get('event') == 'turn_finished' and m.get('turn') == turn, timeout)
 
     def close(self, kill=False):
         if self.process.poll() is None:

@@ -1551,7 +1551,7 @@ impl Service {
         // wake-up finds it running and is dropped; the claim also drops the
         // turn's lapse, which would otherwise wait out the gate's expiry.
         enum Claim {
-            Run(String, Waiting, bool),
+            Run(String, Box<Waiting>, bool),
             Later(String, Option<u64>),
             Stale,
         }
@@ -1560,7 +1560,7 @@ impl Service {
             .store
             .op("resume", move |db| match db.wake(&name, turn, due)? {
                 Wake::Resume => match db.resume(turn) {
-                    Ok((waiting, _, steers)) => Ok(Claim::Run(name, waiting, steers)),
+                    Ok((waiting, _, steers)) => Ok(Claim::Run(name, Box::new(waiting), steers)),
                     Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
                     Err(error) => Err(error),
                 },
@@ -1582,7 +1582,7 @@ impl Service {
         match claimed {
             Claim::Run(bot, waiting, steers) => {
                 self.wakes.cancel(turn);
-                self.spawn(bot, turn, Some(waiting), steers);
+                self.spawn(bot, turn, Some(*waiting), steers);
             }
             // Still parked: its next lapse may have moved, or gone.
             Claim::Later(bot, Some(at)) => self.wakes.set(at, bot, turn),
@@ -1714,6 +1714,7 @@ impl Service {
             approval_hold: self.approval_hold,
             steers,
             tokens: self.tokens.clone(),
+            read_results: Default::default(),
         };
         let keep = self.retain_turns;
         self.jobs.spawn(async move {
@@ -3740,7 +3741,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         store
             .call(move |db| {
-                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None)
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None, None)
                     .map(|_| ())
             })
             .await
@@ -4554,6 +4555,125 @@ mod tests {
             .await
             .unwrap();
         turn
+    }
+
+    /// Bob with one turn parked on the verdict for a gated `shell` call,
+    /// which the store holds as allowed.
+    async fn parked_on_verdict(store: &Store) -> i64 {
+        store
+            .call(|db| {
+                let tools = ["shell".to_owned()];
+                let gate = agent_runtime::store::Gate {
+                    tag: "manual".into(),
+                    tools: tools.to_vec(),
+                    expire_ms: None,
+                };
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &tools,
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                        gate: Some(&gate),
+                    },
+                )?;
+                let turn = db
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                let call = agent_runtime::provider::ToolCall {
+                    name: "shell".into(),
+                    call_id: "shell-1".into(),
+                    arguments: r#"{"command":"true"}"#.into(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                db.suspend_approval(turn, std::slice::from_ref(&call), now_ms(), None)?;
+                let answered = db.answer(agent_runtime::store::Decision {
+                    bot: "Bob",
+                    turn,
+                    call_id: "shell-1",
+                    request: 1,
+                    tag: None,
+                    allow: true,
+                    reason: None,
+                    by: Some("test"),
+                })?;
+                assert!(answered.resume);
+                Ok(turn)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_lost_verdict_wake_up_is_retried_until_the_turn_resumes() {
+        let dir = scratch("lost-verdict-wake");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turn = parked_on_verdict(&store).await;
+        let mut service = bare_service(&store);
+        service.registry = Registry::new("shell").unwrap();
+        // The answer committed, but the claim that resumes the turn is lost.
+        lose_bobs_status_changes(&path, true);
+        service.resume("Bob".into(), turn, false).await.unwrap();
+        assert!(service.active.is_empty());
+        // Still parked, with the allow stored.
+        let (status, listed) = store
+            .call(move |db| {
+                Ok((
+                    db.turn_status("Bob", turn)?,
+                    db.approvals(None, None, 0, 64)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "waiting");
+        assert_eq!(listed["approvals"], json!([]), "the call is decided");
+        lose_bobs_status_changes(&path, false);
+        let (bot, id, due) = service.wakes.pop().unwrap();
+        assert_eq!((bot.as_str(), id), ("Bob", turn));
+        service.resume(bot, id, due).await.unwrap();
+        assert!(service.active.contains_key("Bob"), "resumed");
+        let (bot, id, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, id, task, exit).await.unwrap();
+        // Missing providers make the resumed task fail without network I/O;
+        // it resumed once, after the retry.
+        store
+            .call(move |db| {
+                let events = db.events("Bob", 0, 256)?;
+                let resumed = events["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event"] == "turn_resumed")
+                    .count();
+                assert_eq!(resumed, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
