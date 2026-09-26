@@ -1,7 +1,9 @@
 # Approving tool calls: a manual approver and a fast automatic one
 
-Status: design note, 2026-09-26. Nothing here is built. Code facts are from
-lydakis/agent at b07080c. Peer facts were read on 2026-09-26 from the pages
+Status: design note, 2026-09-26. The daemon mechanism and manual answering
+are built; the automatic approver is not (see [Built so far](#built-so-far)).
+Code facts in the sections below are from lydakis/agent at b07080c, before
+any of it was built. Peer facts were read on 2026-09-26 from the pages
 linked in each section; blog claims are marked as claims. The latency figure
 for the socket hop and the tool mix were measured for this note; the Jev
 figures come from the 2026-09-19 probe in [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#jev-data-points-for-compaction).
@@ -269,7 +271,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `request` is the number the call was announced with, and it changes each
   time the call is announced again. `tag` names the gate answered and may
   be left out when the call has one. The first answer to the current
-  request wins, per gate. A second gets `approval_already_answered`; an
+  request wins, per gate. A second gets `approval_already_answered`, and
+  so does any answer after a deny, which decided the call already; an
   answer to an earlier
   request of the same call, computed before an earlier call failed, gets
   `approval_superseded` and changes nothing; an unknown call gets
@@ -940,6 +943,118 @@ as one.
    socket, against the same screen without `approve`; then the park path
    with a delayed answer, counting its commits, and a verdict that
    arrives while the turn is parked on an earlier `wait`.
+
+   Done in part 2026-09-26 with
+   [`bench.approval_overhead`](../bench/approval_overhead.py), before the
+   rules approver exists, so with no path resolution: the approver is the
+   screen itself, answering `allow` as soon as a call is announced
+   (`held`) or, with `--approval-hold-ms 0`, after the turn parks
+   (`parked`). Each turn is one synthetic `shell` call (`true`) and a
+   reply, on a fresh store, against the same turn ungated and against
+   main at `ddf3f8b`, with within-turn compaction; the build measured is
+   `973be14`, and the runs record both binaries' SHA-256. Medians of three
+   rotated runs of 200 sequential turns on one bot, on a 4-CPU Linux
+   x86_64 container (fsyncs counted in a separate pass under strace,
+   setup included):
+
+   | | main | ungated | held | parked |
+   |---|---:|---:|---:|---:|
+   | Turn latency p50 / p99, ms | 13.4 / 21.0 | 13.3 / 22.0 | 14.0 / 25.6 | 16.0 / 26.4 |
+   | Daemon CPU per turn, ms | 8.6 | 8.7 | 9.4 | 10.9 |
+   | Storage worker time per turn, ms | 7.7 | 7.7 | 8.3 | 10.3 |
+   | Store commits per turn | 11 | 11 | 12 | 17 |
+   | fsyncs per turn | 6.24 | 6.24 | 6.27 | 9.32 |
+   | Event bytes per turn | 1,071 | 1,071 | 1,331 | 1,539 |
+   | Store bytes per turn | 2,990 | 3,072 | 3,359 | 3,543 |
+   | Answer request and reply bytes per call | | | 240 | 240 |
+
+   - Ungated bots pay nothing: the same jobs, commits, and fsyncs as main,
+     and CPU, storage time, and latency within run-to-run spread (p50
+     12.6 to 13.6 ms in both). Six rotated runs of 32 bots at 100 turns
+     each agree: 266 turns/s against main's 260 (runs 255 to 287 against
+     257 to 274), 4.9 ms CPU per turn in both. The store's 82 bytes per
+     turn are the four empty b-trees of `approvals`, `approval_tags`, and
+     their indexes, 16 KiB whatever the turn count.
+   - A held call adds no durable commit. Its one added commit is the
+     answer's group, which writes nothing; the 0.03 fsyncs per turn are
+     WAL checkpoints that come sooner with the added event bytes. It adds
+     about 0.7 ms of daemon CPU and 0.5 ms of storage worker time per call
+     (the announcement, `approval_start` in place of `tool_start`, and
+     the answer), and about 0.7 ms at the median, the screen's own
+     answering round trip included: the daemon's announce-to-start
+     `waited_ms` is 1 to 2 ms.
+   - A parked call adds three durable commits (the park, the verdict, the
+     resume) and about 2.6 ms, the screen's reaction to `turn_waiting`
+     included.
+   - With 32 bots at 25 turns each, where commits group, the one
+     single-threaded screen answering every bot becomes the wait
+     (`waited_ms` median 37 ms held, 64 parked): 391 turns/s ungated
+     against main's 381, 292 held, 192 parked. The answers arrive spread
+     out, so fewer jobs share a group: 1.1 more commits and 0.5 more
+     fsyncs per turn held, 2.3 and 2.0 parked, and 0.9 ms more daemon CPU
+     per turn held.
+   - An earlier run at `7238c6c`, against main at `7e46c5f`, before the
+     review fixes and the merges with admission batching and within-turn
+     compaction, found the same: ungated equal to main, a held call no
+     durable commit, a parked one three.
+
+   Still to measure: the same with the rules approver and its path
+   resolution, over a socket rather than stdio, and a verdict that
+   arrives while the turn is parked on an earlier `wait` (covered by a
+   behavior test, not timed).
+
+## Built so far
+
+Built on 2026-09-26, documented in [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#tool-approval):
+
+- The daemon mechanism: gates on `create` and `fork` (`approve`, `approver`,
+  and `approve_expire_ms` for a gate's expiry), their inheritance, the
+  `approval_requested` event in the plan commit, `answer`, `approvals`,
+  verdicts on `tool_started` and as a denial result, the hold and the park,
+  expiry, and a new request for the rest of a round after a failure.
+  Ungated bots skip all of it.
+- Manual mode in the CLI: `--approval manual` or `AGENT_APPROVAL`,
+  `--approve`, `agent approvals`, `agent answer`, and the pending call
+  with its answering command in `run --pretty`. The CLI answers with
+  `by: "cli"`.
+- The daemon's cost, measured without an approver of its own
+  ([Measure](#measure-before-building), item 3).
+
+Where it differs from the design above:
+
+- A verdict that lands as the hold runs out and decides the call is taken
+  at once: the turn does not park. One that leaves a gate open is written
+  with the park.
+- `stats` reports `approval_requests`, the calls announced and not yet
+  started or denied, rather than counting pending gates.
+- A verdict committed for a parked turn just before a crash is picked up
+  at the next start, which checks every turn parked on a verdict once.
+- An answer that arrives after its gate's expiry is refused with
+  `approval_expired`, even when the turn has not yet denied the call, so a
+  late allow cannot outrun the expiry.
+- A bot carries at most 8 gates; a `create` or `fork` past that fails with
+  `gate_limit`.
+- `approvals` previews each top-level argument field on its own (2,048
+  characters, at most 8 fields), taken when the call is planned, rather
+  than the first 2,048 characters of the node's arguments; an Anthropic
+  `write` puts `content` before `path`, which a prefix would hide.
+- A `reason` goes only with a deny; an allow with one is refused with
+  `invalid_reason`.
+- Each `approvals` entry carries `allow`, and a denied or expired call's
+  `tool_completed` lists every verdict it got, so replay keeps an allow that
+  came before the deciding deny.
+- A round's announcement is split into several `approval_requested`
+  events when its calls take more than 256 KiB, so every event pages.
+- A turn parked on a `wait` or on a verdict ahead of another gated call
+  wakes and ends when that call lapses, rather than when the wait returns
+  or the verdict comes, and no call starts once a later one lapsed.
+
+Not built yet: the automatic approver (rules and Jev), with
+`serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`
+and the `path_changed` check; the `denials` counts; `from` and
+`AGENT_TURN`; and the app's cards. `--approval auto` is refused with
+`approval_mode_unsupported` until the approver exists, rather than
+creating bots whose gates nobody answers.
 
 ## Open decisions
 

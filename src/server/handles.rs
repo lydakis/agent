@@ -282,47 +282,7 @@ impl Handles {
             generation
         };
         for (text, parsed) in handles.iter().zip(parsed) {
-            let cached = self
-                .inner
-                .lock()
-                .unwrap()
-                .retained
-                .get(text)
-                .map(|r| r.value.clone());
-            let result = if let Some(cached) = cached {
-                Some((cached, true))
-            } else {
-                let result = match parsed {
-                    Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
-                    Ok(Handle::Turn { bot, turn }) => {
-                        match store
-                            .op("turn_outcome", move |db| db.turn_outcome(&bot, turn))
-                            .await
-                        {
-                            Ok(Some(outcome)) => Some((outcome, true)),
-                            Ok(None) => None,
-                            Err(error) => {
-                                Some((json!({"error":error.code,"detail":error.detail}), false))
-                            }
-                        }
-                    }
-                    Ok(Handle::Process(id)) => {
-                        match store
-                            .op("process_result", move |db| db.process_result(id))
-                            .await
-                        {
-                            Ok(None) => Some((json!({"error":"unknown_handle"}), false)),
-                            Ok(Some((_, Some(result)))) => Some((result, true)),
-                            Ok(Some((_, None))) => None,
-                            Err(error) => {
-                                Some((json!({"error":error.code,"detail":error.detail}), false))
-                            }
-                        }
-                    }
-                };
-                result.map(|(value, durable)| (Arc::new(value), durable))
-            };
-            if let Some((result, durable)) = result {
+            if let Some((result, durable)) = self.settled(store, text, parsed).await {
                 let mut inner = self.inner.lock().unwrap();
                 if inner
                     .waiters
@@ -365,6 +325,72 @@ impl Handles {
         }
     }
 
+    /// A handle's result if it has one: retained here, or found in the
+    /// store, where a result is durable before it reaches this registry.
+    /// The flag says whether it is durable rather than an error reading it.
+    async fn settled(
+        &self,
+        store: &Store,
+        text: &str,
+        parsed: Result<Handle>,
+    ) -> Option<(Arc<Value>, bool)> {
+        let cached = self
+            .inner
+            .lock()
+            .unwrap()
+            .retained
+            .get(text)
+            .map(|r| r.value.clone());
+        if let Some(cached) = cached {
+            return Some((cached, true));
+        }
+        let result = match parsed {
+            Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
+            Ok(Handle::Turn { bot, turn }) => {
+                match store
+                    .op("turn_outcome", move |db| db.turn_outcome(&bot, turn))
+                    .await
+                {
+                    Ok(Some(outcome)) => Some((outcome, true)),
+                    Ok(None) => None,
+                    Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
+                }
+            }
+            Ok(Handle::Process(id)) => {
+                match store
+                    .op("process_result", move |db| db.process_result(id))
+                    .await
+                {
+                    Ok(None) => Some((json!({"error":"unknown_handle"}), false)),
+                    Ok(Some((_, Some(result)))) => Some((result, true)),
+                    Ok(Some((_, None))) => None,
+                    Err(error) => Some((json!({"error":error.code,"detail":error.detail}), false)),
+                }
+            }
+        };
+        result.map(|(value, durable)| (Arc::new(value), durable))
+    }
+
+    /// Consume a parked turn's results when it resumes early, before every
+    /// handle resolved: those the registry has not seen yet are read from
+    /// the store, and the rest are reported pending.
+    pub async fn take_settled(
+        &self,
+        store: &Store,
+        turn: i64,
+        handles: &[String],
+    ) -> BTreeMap<String, Arc<Value>> {
+        let mut results = self.take(turn);
+        for handle in handles {
+            if !results.contains_key(handle) {
+                let found = self.settled(store, handle, Handle::parse(handle)).await;
+                let result = found.map_or_else(|| Arc::new(json!({"pending":true})), |(r, _)| r);
+                results.insert(handle.clone(), result);
+            }
+        }
+        results
+    }
+
     /// A request waiter for a client's `wait` op.
     pub fn request_waiter(&self) -> Waiter {
         let mut inner = self.inner.lock().unwrap();
@@ -391,6 +417,11 @@ impl Handles {
         (inner.waiters.len(), inner.retained.len())
     }
 
+    /// Resume a parked turn whose wake-up is not a handle: a verdict for
+    /// the call it parked on. The service checks it is still parked there.
+    pub fn wake(&self, bot: String, turn: i64) {
+        let _ = self.resume.send((bot, turn));
+    }
     /// Consume a parked turn's results when it resumes.
     pub fn take(&self, turn: i64) -> BTreeMap<String, Arc<Value>> {
         let mut inner = self.inner.lock().unwrap();

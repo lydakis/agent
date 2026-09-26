@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns";
+const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -27,7 +27,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "fork",
         usage: "fork --source NAME --bot NAME [--checkpoint NODE]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --pretty",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --pretty",
         startup: false,
     },
     Command {
@@ -70,6 +70,18 @@ const COMMANDS: &[Command] = &[
         name: "prune",
         usage: "prune --bot NAME --keep-turns N",
         flags: "--bot --keep-turns --pretty --no-spawn",
+        startup: true,
+    },
+    Command {
+        name: "approvals",
+        usage: "approvals [--bot NAME] [--tag TAG]",
+        flags: "--bot --tag --pretty --no-spawn",
+        startup: true,
+    },
+    Command {
+        name: "answer",
+        usage: "answer --bot NAME --turn TURN --call ID --request N [--tag TAG] [--reason TEXT] allow|deny",
+        flags: "--bot --turn --call --request --tag --reason --no-spawn",
         startup: true,
     },
     Command {
@@ -226,6 +238,25 @@ fn print_flags(flags: &str) {
                 "SECONDS",
                 "Let running turns finish for up to this long, starting none; default 0",
             ),
+            "--approval" => (
+                "MODE",
+                "A new bot's approval: full, manual, or auto; default AGENT_APPROVAL or full",
+            ),
+            "--approve" => (
+                "LIST",
+                "Tools whose calls need a verdict; default every tool but history, wait, note, echo",
+            ),
+            "--call" => ("ID", "The tool call to answer"),
+            "--request" => ("N", "The request number the call was announced with"),
+            "--tag" => (
+                "TAG",
+                "The gate to list or answer; default: the call's only gate",
+            ),
+            "--reason" => ("TEXT", "Why, shown to the model with a denial"),
+            "--approval-hold-ms" => (
+                "N",
+                "Wait this long for a verdict before parking the turn; default 2000",
+            ),
             _ => unreachable!("flag missing help"),
         };
         println!(
@@ -320,11 +351,12 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                     | "--budget-tokens"
                     | "--turn"
                     | "--checkpoint"
+                    | "--request"
             ) {
                 let max = match flag {
                     "--max-output-tokens" => u32::MAX as u64,
                     "--stall-timeout" => 86_400,
-                    "--turn" | "--checkpoint" | "--budget-tokens" => i64::MAX as u64,
+                    "--turn" | "--checkpoint" | "--budget-tokens" | "--request" => i64::MAX as u64,
                     _ => usize::MAX as u64,
                 };
                 if !value.parse::<u64>().is_ok_and(|n| n > 0 && n <= max) {
@@ -333,6 +365,12 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                         format!("{flag} needs a positive integer up to {max}"),
                     );
                 }
+            }
+            if flag == "--approval-hold-ms" && !value.parse::<u64>().is_ok_and(|n| n <= 3_600_000) {
+                return fail_with(
+                    "usage",
+                    "--approval-hold-ms needs milliseconds up to 3600000 (0 parks at once)",
+                );
             }
             if flag == "--keep-warm" && !value.parse::<u64>().is_ok_and(|n| n < 300) {
                 return fail_with("usage", "--keep-warm needs seconds below 300 (0 disables)");
@@ -357,7 +395,11 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             return fail_with("usage", format!("{a} conflicts with {b}"));
         }
     }
-    if !matches!(c.name, "run" | "wait") && positional != 0 {
+    if c.name == "answer" {
+        if positional != 1 {
+            return fail_with("usage", "answer needs one decision: allow or deny");
+        }
+    } else if !matches!(c.name, "run" | "wait") && positional != 0 {
         return fail_with("usage", format!("{} takes no positional arguments", c.name));
     }
     if c.name == "run"
@@ -370,13 +412,15 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--reasoning",
             "--budget-tokens",
             "--fallbacks",
+            "--approval",
+            "--approve",
         ]
         .iter()
         .any(|f| has(f))
     {
         return fail_with(
             "usage",
-            "instructions, reasoning, and budget are creation options; use --new",
+            "instructions, reasoning, budget, and approval are creation options; use --new",
         );
     }
     Ok(Some(out))

@@ -882,8 +882,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     does. A labeled Jev run on 341
     calls (2026-09-26, $0.07) answered in 0.26 s median with no false
     allows, but at the starting thresholds it refused 23% of benign calls;
-    tuned thresholds cut that sharply. Next: a labeled dangerous set to
-    measure false allows before thresholds are fixed.
+    tuned thresholds cut that sharply. Built (2026-09-26): the daemon
+    mechanism and `manual` mode with `agent approvals` and `agent answer`.
+    Next, parked on 2026-09-26 behind core work: within-turn compaction,
+    the storage failure, and admission batching have landed (#32, #33),
+    and so has the realistic-budget compaction eval (#37). Then the
+    rules-only `auto` approver with `serve_approvals`, then Jev, and a
+    labeled dangerous set to measure false allows before thresholds are
+    fixed.
 46. Done: the model that answered. Every `usage` event keeps
     `served_model`, the model the provider named in its response
     (Responses' `response.model`, Anthropic's `message.model`, and after a
