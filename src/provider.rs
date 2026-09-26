@@ -236,6 +236,12 @@ pub struct Usage {
     /// their sum.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelTokens>,
+    /// The model the provider named in its response, which can differ from
+    /// the one requested (a dated snapshot, a reroute, a fallback), so the
+    /// record shows what served the call. After a fallback it is the last
+    /// attempt's; `models` names each. Empty when the provider named none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub served_model: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ModelTokens {
@@ -803,7 +809,7 @@ impl Provider {
         }
         let message: Value = serde_json::from_slice(&body)
             .map_err(|_| Error::with("invalid_provider_response", "keep-warm body"))?;
-        let usage = anthropic::message_usage(&message["usage"], self.cache_hour);
+        let usage = anthropic::message_usage(&message, self.cache_hour);
         reservation.settle_usage(Some(&usage), estimate);
         pace.accepted();
         Ok((usage, sent_at))

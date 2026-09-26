@@ -87,7 +87,13 @@ impl State {
                 self.usage = value["response"]
                     .get("usage")
                     .filter(|v| !v.is_null())
-                    .map(parse_usage);
+                    .map(|usage| Usage {
+                        served_model: value["response"]["model"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
+                        ..parse_usage(usage)
+                    });
                 let detail = detail_of(&value)
                     .or_else(|| detail_of(&value["response"]))
                     .or_else(|| {
@@ -152,13 +158,20 @@ fn parse_completion_with_usage(
     struct Response<'a> {
         #[serde(default, borrow)]
         id: Option<Cow<'a, str>>,
+        /// The model that answered, which a dated snapshot or a reroute
+        /// can make differ from the one requested.
+        #[serde(default, borrow)]
+        model: Option<Cow<'a, str>>,
         status: &'a str,
         #[serde(borrow)]
         output: Vec<&'a RawValue>,
         usage: Option<Value>,
     }
     let response: Response<'_> = serde_json::from_str(raw.get())?;
-    *reported = response.usage.as_ref().map(parse_usage);
+    *reported = response.usage.as_ref().map(|usage| Usage {
+        served_model: response.model.map(Cow::into_owned).unwrap_or_default(),
+        ..parse_usage(usage)
+    });
     *id = response.id.map(Cow::into_owned);
     if response.status != "completed" {
         return fail("provider_incomplete");
@@ -259,7 +272,7 @@ mod tests {
         state
             .frame(br#"{"type":"response.output_text.delta","delta":"ok"}"#)
             .unwrap();
-        state.frame(br#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"reasoning","summary":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}}"#).unwrap();
+        state.frame(br#"{"type":"response.completed","response":{"model":"gpt-test-2026-09-26","status":"completed","output":[{"type":"reasoning","summary":[]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}}"#).unwrap();
         let completion = state.finish().unwrap();
         assert_eq!(completion.items.len(), 2);
         assert_eq!(
@@ -272,8 +285,15 @@ mod tests {
                 cache_write_1h_tokens: 0,
                 sent_ms: 0,
                 models: Vec::new(),
+                served_model: "gpt-test-2026-09-26".to_owned(),
             })
         );
+        // A response that failed after billing still names what ran.
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"response.incomplete","response":{"model":"gpt-test-2026-09-26","status":"incomplete","output":[],"usage":{"input_tokens":10,"output_tokens":2}}}"#)
+            .unwrap_err();
+        assert_eq!(state.usage().unwrap().served_model, "gpt-test-2026-09-26");
         let failed = State::default()
             .frame(br#"{"type":"response.failed","response":{"error":{"message":"quota"}}}"#)
             .unwrap_err();

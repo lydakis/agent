@@ -58,10 +58,11 @@ read, so the pair was run again as C. It is kept for Codex's failure causes.
 
 - Only Claude Code records the model the API reported for each response. No
   auxiliary model appears in its per-model usage. Codex records the model
-  once per turn, so a server-side reroute within a turn would not show. Ours
-  records the requested model, and names another only when Anthropic's
-  fallback splits a call or a summarizer answers on another model; neither
-  happened. See the gap in
+  once per turn, so a server-side reroute within a turn would not show. Ours,
+  at `c585c16` and `15d629c`, records the requested model, and names another
+  only when Anthropic's fallback splits a call or a summarizer answers on
+  another model; neither happened. Later builds record the model each
+  response names. See the gap in
   [COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons).
 - Each timed-out trial in B ended with a model call cut off before it
   reported anything, so which model served those three calls, and whether
@@ -223,8 +224,10 @@ the same model can drive each harness on the same tasks.
    fallbacks, since a delegated bot sets its own), so a comparison can check
    that both arms ran the same model the same way
    ([COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons)).
-   A call counts under the model it requested unless a fallback or summarizer
-   answered on another. Without a store copy only the task bot's streamed
+   A call counts under the model the provider named in its response, each
+   attempt of a fallback under its own, and a call whose provider named none
+   counts in `unnamed_calls` instead. Prices stay on the requested names,
+   which the price table knows and a dated snapshot may not. Without a store copy only the task bot's streamed
    calls are left, so `served_calls` is null and `bot_settings` absent.
    `served_calls` is also null when the daemon's own input count, saved by
    `agent stats` just before shutdown, exceeds the stored usage events, as
@@ -306,10 +309,12 @@ variable is forwarded from the host). Keep job outputs under the ignored
 
 ## Gaps before publishing a comparison
 
-- **Served model.** The daemon records the model it requested, not the one
-  the provider names in its response, so a reroute or snapshot change behind
-  the same name would not show. Codex's records have the same limit within a
-  turn; Claude Code's do not.
+- **Served model in older runs.** Agent builds through `095ff68`, which
+  include every matched run so far, record the model they requested, not the
+  one the provider names in its response, so a reroute or snapshot change
+  behind the same name would not show in those runs; later builds record the
+  named model. Codex's records name the model once per turn; Claude Code's
+  name it for each response.
 
 - **Timeouts miss the call in flight.** Shutdown cancels the model call in
   progress at the timeout before the provider reports its usage, so those
