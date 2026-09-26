@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{ContextPrefix, ContextUsage, Store, Window},
+    store::{Bot, ContextPrefix, ContextUsage, Gated, Store, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -29,6 +29,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
+    time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -162,6 +163,8 @@ pub struct Turn {
     pub compact_keep: usize,
     /// Continue a parked turn: record its wait results, then keep going.
     pub resume: bool,
+    /// How long a gated call waits live for its verdict before the turn parks.
+    pub approval_hold: Duration,
     /// A steer for this bot may be queued. Set by the service, cleared by
     /// the boundary before it reads, so unrelated bots never pay for one
     /// bot's pending steer.
@@ -269,6 +272,29 @@ enum Round {
     Parked,
     /// Parked on a closed pool until the given time.
     Paced(u64),
+    /// Parked on a verdict whose gate lapses at the given time.
+    Lapses(u64),
+}
+/// Why a round's calls stopped before the last one ran: the turn parked,
+/// on handles or a verdict, and is resumed by the service.
+enum Stop {
+    Parked,
+    /// Parked on a verdict; the service wakes it when a gate lapses.
+    Lapses(u64),
+}
+impl Stop {
+    fn round(self) -> Round {
+        match self {
+            Stop::Parked => Round::Parked,
+            Stop::Lapses(at) => Round::Lapses(at),
+        }
+    }
+}
+/// A gated call's fate once its verdict is in.
+enum Approval {
+    Run,
+    Denied,
+    Stop(Stop),
 }
 
 pub enum Exit {
@@ -381,6 +407,8 @@ impl Turn {
         let error = match result {
             Ok(Round::Parked) => return Exit::Parked,
             Ok(Round::Paced(resume_at_ms)) => return Exit::Paced(resume_at_ms),
+            // The park is committed; the service only keeps its wake-up.
+            Ok(Round::Lapses(at)) => return Exit::Paced(at),
             Ok(Round::Finished) => None,
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
@@ -891,24 +919,28 @@ impl Turn {
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 resume_window = !waiting.compaction;
             } else {
-                let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
-                let id = waiting.call_id;
-                self.store
-                    .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
-                    .await?;
-                // Calls that followed the wait in the same model response.
-                if self
+                // A verdict park resumes at its gated call, which has not
+                // started; a wait park first records the wait's result.
+                if !waiting.approval {
+                    let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
+                    let id = waiting.call_id;
+                    self.store
+                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .await?;
+                }
+                // Calls that followed in the same model response.
+                if let Some(stop) = self
                     .execute_calls(
                         waiting.pending,
                         &workspace,
                         &environment,
-                        &record.tools,
+                        &record,
                         None,
                         accounting.route.get().map(String::as_str),
                     )
                     .await?
                 {
-                    return Ok(Round::Parked);
+                    return Ok(stop.round());
                 }
             }
         }
@@ -1040,20 +1072,20 @@ impl Turn {
                     tokens: 0,
                     pending,
                 });
-            let parked = self
+            let stop = self
                 .execute_calls(
                     response.calls,
                     &workspace,
                     &environment,
-                    &record.tools,
+                    &record,
                     warm.as_mut(),
                     accounting.route.get().map(String::as_str),
                 )
                 .await?;
             let refreshed = warm.map_or(0, |warm| warm.tokens);
             record.tokens_used = record.tokens_used.saturating_add(refreshed);
-            if parked {
-                return Ok(Round::Parked);
+            if let Some(stop) = stop {
+                return Ok(stop.round());
             }
             self.absorb().await?;
         }
@@ -1585,17 +1617,25 @@ impl Turn {
         calls: Vec<ToolCall>,
         workspace: &std::path::Path,
         environment: &[(String, String)],
-        allowed: &[String],
+        record: &Bot,
         mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
-    ) -> Result<bool> {
-        let turn = self.turn;
+    ) -> Result<Option<Stop>> {
+        let (turn, allowed) = (self.turn, &record.tools);
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
-            let started = call.clone();
-            self.store
-                .op("tool_start", move |db| db.tool_start(turn, &started))
-                .await?;
+            if record.gated(&call.name) {
+                match self.approve(&call, &mut calls, route).await? {
+                    Approval::Run => {}
+                    Approval::Denied => continue,
+                    Approval::Stop(stop) => return Ok(Some(stop)),
+                }
+            } else {
+                let started = call.clone();
+                self.store
+                    .op("tool_start", move |db| db.tool_start(turn, &started))
+                    .await?;
+            }
             // A tool failure is a result the model can act on. Only the
             // scheduler closing is a runtime failure. The bot's selection is
             // enforced here, not only by what the model was shown.
@@ -1615,7 +1655,7 @@ impl Turn {
                         .await?
                     {
                         Some(outcome) => outcome,
-                        None => return Ok(true),
+                        None => return Ok(Some(Stop::Parked)),
                     }
                 }
                 Ok(Prepared::Shell {
@@ -1713,7 +1753,65 @@ impl Turn {
                 .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                 .await?;
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Wait for a gated call's verdict: live for the hold, then parked like
+    /// `wait`, holding no task and no slot. Answers wake the task through
+    /// the worker, so each check is one job and no commit.
+    async fn approve(
+        &self,
+        call: &ToolCall,
+        calls: &mut std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
+    ) -> Result<Approval> {
+        let turn = self.turn;
+        let hold = tokio::time::Instant::now() + self.approval_hold;
+        loop {
+            let (checked, now) = (call.clone(), now_ms());
+            let (notify, expires_ms) = match self
+                .store
+                .op("approval_start", move |db| {
+                    db.approval_start(turn, &checked, now)
+                })
+                .await?
+            {
+                Gated::Started => return Ok(Approval::Run),
+                Gated::Denied => return Ok(Approval::Denied),
+                Gated::Expired => return fail("approval_expired"),
+                Gated::Pending { notify, expires_ms } => (notify, expires_ms),
+            };
+            let lapse = expires_ms.map(|at| {
+                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now))
+            });
+            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
+            if tokio::time::Instant::now() < wake {
+                tokio::select! {
+                    () = notify.notified() => continue,
+                    () = tokio::time::sleep_until(wake) => {}
+                }
+            }
+            // A lapsed gate is judged by the next check.
+            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
+                continue;
+            }
+            let pending: Vec<ToolCall> = std::iter::once(call.clone())
+                .chain(calls.as_slice().iter().cloned())
+                .collect();
+            let route = route.map(str::to_owned);
+            let parked = self
+                .store
+                .op("suspend_approval", move |db| {
+                    db.suspend_approval(turn, &pending, now_ms(), route.as_deref())
+                })
+                .await?;
+            match parked {
+                // A verdict landed as the hold ran out.
+                None => continue,
+                Some(Some(at)) => return Ok(Approval::Stop(Stop::Lapses(at))),
+                Some(None) => return Ok(Approval::Stop(Stop::Parked)),
+            }
+        }
     }
 
     async fn history(
@@ -2130,6 +2228,7 @@ mod tests {
                             compaction_instructions: None,
                             compaction_model: None,
                             fallbacks: false,
+                            gate: None,
                         },
                     )?;
                     let turn = db
@@ -2215,6 +2314,7 @@ mod tests {
             compact_at: 75,
             compact_keep: 25,
             resume: false,
+            approval_hold: Duration::from_secs(2),
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),
         };

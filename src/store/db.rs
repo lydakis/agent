@@ -10,6 +10,8 @@ use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Notify;
 
 // Sharing tiny prompts adds an index entry without avoiding an overflow page.
 const PROMPT_SHARE_BYTES: usize = 4096;
@@ -75,8 +77,15 @@ pub struct Bot {
     /// model Anthropic recommends instead of failing the turn. The client's
     /// choice at creation; forks inherit it.
     pub fallbacks: bool,
+    /// Tools whose calls wait for a verdict, per approver tag. Fixed at
+    /// creation: a bot keeps every gate it descends from.
+    pub gates: Vec<Gate>,
 }
 impl Bot {
+    /// Whether a call of this tool waits for a verdict.
+    pub fn gated(&self, tool: &str) -> bool {
+        gated(&self.gates, tool)
+    }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
         self.cache_bot.unwrap_or(self.id)
@@ -94,6 +103,8 @@ pub struct Fork<'a> {
     pub budget_tokens: Option<u64>,
     pub created_by: Option<&'a str>,
     pub created_by_id: Option<i64>,
+    /// A gate the fork adds to the ones it inherits.
+    pub gate: Option<&'a Gate>,
 }
 /// Provider binding chosen at creation; immutable for the bot's lifetime.
 pub struct Binding<'a> {
@@ -112,6 +123,8 @@ pub struct Binding<'a> {
     pub compaction_model: Option<&'a str>,
     /// Anthropic server-side fallbacks for this bot.
     pub fallbacks: bool,
+    /// The bot's own gate; its creator's, if any, is added by the store.
+    pub gate: Option<&'a Gate>,
 }
 #[derive(Debug)]
 pub struct Started {
@@ -211,12 +224,188 @@ pub struct Waiting {
     /// the park keep going to the server that holds its cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// Parked on the verdict for `call_id`, which is the first of `pending`
+    /// and has not started; `deadline_ms` is its gates' expiry, if any.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approval: bool,
 }
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
         self.paced_since_ms
             .map_or(0, |since| epoch_ms().saturating_sub(since).max(0))
     }
+}
+/// A gate on a bot: calls to `tools` wait for a verdict from the approver
+/// `tag` names. The daemon stores and reports the tag and never reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Gate {
+    pub tag: String,
+    pub tools: Vec<String>,
+    /// A call still without this gate's verdict this long after it was
+    /// announced is denied, and its turn ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_ms: Option<u64>,
+}
+fn gated(gates: &[Gate], tool: &str) -> bool {
+    gates.iter().any(|g| g.tools.iter().any(|t| t == tool))
+}
+/// A new bot's gates: every gate it descends from plus its own, each kept to
+/// the bot's tools. Gates with the same tag merge, keeping the shorter expiry.
+pub fn merge_gates<'a>(gates: impl IntoIterator<Item = &'a Gate>, tools: &[String]) -> Vec<Gate> {
+    let mut merged: Vec<Gate> = Vec::new();
+    for gate in gates {
+        let kept = gate.tools.iter().filter(|t| tools.contains(t));
+        match merged.iter_mut().find(|g| g.tag == gate.tag) {
+            Some(existing) => {
+                for tool in kept {
+                    if !existing.tools.contains(tool) {
+                        existing.tools.push(tool.clone());
+                    }
+                }
+                existing.expire_ms = match (existing.expire_ms, gate.expire_ms) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            None => merged.push(Gate {
+                tag: gate.tag.clone(),
+                tools: kept.cloned().collect(),
+                expire_ms: gate.expire_ms,
+            }),
+        }
+    }
+    merged.retain(|g| !g.tools.is_empty());
+    merged
+}
+/// One gate's answer to one announcement of a call.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct Verdict {
+    tag: String,
+    allow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
+    at_ms: i64,
+}
+/// A gate a planned call needs, with the expiry it had when announced.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct CallGate {
+    tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expire_ms: Option<u64>,
+}
+/// A planned call's current announcement: the `approvals` row.
+struct Request {
+    id: i64,
+    request: i64,
+    announced_ms: i64,
+    gates: Vec<CallGate>,
+    verdicts: Vec<Verdict>,
+}
+impl Request {
+    /// The first deny wins; otherwise every gate needs an allow.
+    fn denial(&self) -> Option<&Verdict> {
+        self.verdicts.iter().find(|v| !v.allow)
+    }
+    fn unanswered(&self) -> impl Iterator<Item = &CallGate> {
+        self.gates
+            .iter()
+            .filter(|g| !self.verdicts.iter().any(|v| v.tag == g.tag))
+    }
+    fn decided(&self) -> bool {
+        self.denial().is_some() || self.unanswered().next().is_none()
+    }
+    /// When the earliest unanswered gate with an expiry lapses.
+    fn expires_ms(&self) -> Option<u64> {
+        self.unanswered()
+            .filter_map(|g| g.expire_ms)
+            .map(|ms| (self.announced_ms.max(0) as u64).saturating_add(ms))
+            .min()
+    }
+    fn approvals(&self, verdicts: &[&Verdict]) -> Value {
+        Value::Array(
+            verdicts
+                .iter()
+                .map(|v| {
+                    json!({"tag":v.tag,"by":v.by,
+                        "waited_ms":(v.at_ms - self.announced_ms).max(0)})
+                })
+                .collect(),
+        )
+    }
+}
+/// Verdicts for a running turn, held by the storage worker until a commit
+/// the turn makes anyway writes them: the call's start, its denial, or a
+/// park. `notify` wakes the turn's task once an answer is acknowledged.
+#[derive(Default)]
+struct Live {
+    notify: Arc<Notify>,
+    verdicts: HashMap<String, Vec<Verdict>>,
+}
+/// What a gated call does next, decided on the storage worker.
+pub enum Gated {
+    /// Every gate allowed it and it has started.
+    Started,
+    /// A gate denied it; the denial is its result.
+    Denied,
+    /// A gate's expiry passed without a verdict. The call is denied and the
+    /// turn must end.
+    Expired,
+    /// Still waiting. `notify` fires when an answer is acknowledged;
+    /// `expires_ms` is when the earliest gate lapses.
+    Pending {
+        notify: Arc<Notify>,
+        expires_ms: Option<u64>,
+    },
+}
+/// An `answer` from a client.
+pub struct Answer<'a> {
+    pub bot: &'a str,
+    pub turn: i64,
+    pub call_id: &'a str,
+    pub request: i64,
+    pub tag: Option<&'a str>,
+    pub allow: bool,
+    pub reason: Option<&'a str>,
+    pub by: Option<&'a str>,
+}
+/// What the service does after an answer commits: wake a live turn's task,
+/// or resume a turn parked on this call.
+pub struct Answered {
+    pub reply: Value,
+    pub notify: Option<Arc<Notify>>,
+    pub resume: bool,
+}
+/// Whether a tool result is a failure, which voids verdicts given for the
+/// rest of its round: an error, or a command that did not succeed.
+fn failed(output: &str) -> bool {
+    serde_json::from_str::<Value>(output).is_ok_and(|v| {
+        v.get("error").is_some_and(|e| !e.is_null())
+            || v.get("success") == Some(&Value::Bool(false))
+    })
+}
+/// The node among a round's items that holds a call: the quoted id appears
+/// in the item that plans it. A round's last item if none matches.
+fn call_node(items: &[(i64, Bytes)], call_id: &str) -> i64 {
+    let needle = format!("\"{call_id}\"");
+    let needle = needle.as_bytes();
+    items
+        .iter()
+        .find(|(_, item)| item.windows(needle.len()).any(|w| w == needle))
+        .or(items.last())
+        .map_or(0, |(id, _)| *id)
+}
+/// A planned call's arguments from its stored item, in either encoding.
+fn call_arguments(item: &Value, call_id: &str) -> Option<String> {
+    if item["type"] == "function_call" && item["call_id"] == call_id {
+        return item["arguments"].as_str().map(str::to_owned);
+    }
+    item["content"]
+        .as_array()?
+        .iter()
+        .find(|block| block["type"] == "tool_use" && block["id"] == call_id)
+        .map(|block| block["input"].to_string())
 }
 /// The bounded request context: ordered node ids and exact item bytes.
 #[derive(Debug)]
@@ -355,6 +544,8 @@ pub struct Database {
     /// A group was abandoned and `pending` not yet recounted from the rows;
     /// no job runs until a recount succeeds.
     pending_stale: bool,
+    /// Per running turn with a gated call: verdicts not yet written.
+    live: HashMap<i64, Live>,
 }
 
 /// The share of input tokens the provider served from its prompt cache,
@@ -364,6 +555,12 @@ pub fn cache_hit(cached: i64, input: i64) -> f64 {
         return 0.0;
     }
     ((cached.max(0) as f64 / input as f64) * 1000.0).round() / 1000.0
+}
+/// A bot's gates as stored: none is NULL, so an ungated bot reads nothing.
+fn stored_gates(gates: &[Gate]) -> Result<Option<String>> {
+    Ok((!gates.is_empty())
+        .then(|| serde_json::to_string(gates))
+        .transpose()?)
 }
 fn split_tools(joined: &str) -> Vec<String> {
     joined
@@ -381,7 +578,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 28;
+    pub const SCHEMA: i32 = 29;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -408,6 +605,7 @@ impl Database {
             pending: (0, 0),
             outcomes: Vec::new(),
             pending_stale: false,
+            live: HashMap::new(),
         })
     }
 
@@ -480,7 +678,7 @@ impl Database {
                 compaction_instructions TEXT, compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
                 thinking_floor INTEGER NOT NULL DEFAULT 0,
-                fallbacks INTEGER NOT NULL DEFAULT 0);
+                fallbacks INTEGER NOT NULL DEFAULT 0, gates TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -515,6 +713,10 @@ impl Database {
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
+            CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY, turn INTEGER NOT NULL REFERENCES turns(id),
+                call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
+                announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS approvals_call ON approvals(turn,call_id);
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
@@ -554,6 +756,7 @@ impl Database {
             pending: (0, 0),
             outcomes: Vec::new(),
             pending_stale: false,
+            live: HashMap::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -737,9 +940,19 @@ impl Database {
             thinking_prefix: r.get(23)?,
             thinking_floor: r.get(24)?,
             fallbacks: r.get::<_, i64>(25)? != 0,
+            gates: match r.get::<_, Option<String>>(26)? {
+                None => Vec::new(),
+                Some(text) => serde_json::from_str(&text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        26,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,gates";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -762,6 +975,19 @@ impl Database {
             _ => fail("creator_identity_required"),
         }
     }
+    /// The gates of the bot a client creates for, already validated: a bot
+    /// cannot create or fork its way out of its own gates.
+    fn creator_gates(conn: &Connection, creator: Option<i64>) -> Result<Vec<Gate>> {
+        let Some(id) = creator else {
+            return Ok(Vec::new());
+        };
+        let gates: Option<String> =
+            conn.query_row("SELECT gates FROM bots WHERE id=?", [id], |r| r.get(0))?;
+        Ok(match gates {
+            Some(text) => serde_json::from_str(&text)?,
+            None => Vec::new(),
+        })
+    }
     pub fn inspect(&self, name: &str) -> Result<Bot> {
         self.conn
             .query_row(
@@ -779,7 +1005,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by,created_by_id
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -798,7 +1024,10 @@ impl Database {
                 "input_tokens":r.get::<_, i64>(12)?,"cached_input_tokens":r.get::<_, i64>(13)?,
                 "cache_hit":cache_hit(r.get::<_, i64>(13)?, r.get::<_, i64>(12)?),
                 "created_by":r.get::<_, Option<String>>(15)?,
-                "created_by_id":r.get::<_, Option<i64>>(16)?});
+                "created_by_id":r.get::<_, Option<i64>>(16)?,
+                "gates":r.get::<_, Option<String>>(17)?
+                    .map(|gates| serde_json::from_str::<Value>(&gates)).transpose()?
+                    .unwrap_or_else(|| json!([]))});
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -829,11 +1058,21 @@ impl Database {
         if self.exists(name)? {
             return fail("bot_exists");
         }
+        if let Some(gate) = binding.gate
+            && gate.tools.iter().any(|t| !binding.tools.contains(t))
+        {
+            return fail("approve_not_in_tools");
+        }
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
+        let inherited = Self::creator_gates(&tx, created_by_id)?;
+        let gates = stored_gates(&merge_gates(
+            inherited.iter().chain(binding.gate),
+            binding.tools,
+        ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,fallbacks,gates) VALUES (?,?,NULL,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -849,14 +1088,18 @@ impl Database {
                 created_by_id,
                 binding.compaction_instructions,
                 binding.compaction_model,
-                binding.fallbacks
+                binding.fallbacks,
+                gates
             ],
         )?;
         // The event carries the list record's fields, so a follower can
         // seat a new bot without a request per creation.
-        let data = json!({"id":id,"provider":binding.provider,"model":binding.model,
+        let mut data = json!({"id":id,"provider":binding.provider,"model":binding.model,
             "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":binding.created_by,"created_by_id":created_by_id});
+        if let Some(gates) = &gates {
+            data["gates"] = serde_json::from_str(gates)?;
+        }
         let cursor = event(&tx, name, None, "created", data.clone())?;
         tx.commit()?;
         Ok((
@@ -2401,9 +2644,15 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
+        // Only a gated round keeps its items, to find each call's node.
+        let gated = calls.iter().any(|call| bot.gated(&call.name));
+        let mut written = Vec::new();
         for item in items {
             let id = node(&tx, head, &item)?;
             head = Some(id);
+            if gated {
+                written.push((id, item));
+            }
             let data = json!({"node":id});
             let cursor = event(&tx, &bot.name, Some(turn), "message", data.clone())?;
             entries.push(entry(cursor, &bot.name, Some(turn), "message", data));
@@ -2416,6 +2665,56 @@ impl Database {
                 "INSERT INTO tools VALUES (?,?,'planned')",
                 params![turn, call.call_id],
             )?;
+        }
+        // Every gated call of the round is announced in the commit that
+        // plans it, one event for the round.
+        if gated {
+            let announced_ms = epoch_ms();
+            let mut announced = Vec::new();
+            for call in calls {
+                let gates: Vec<CallGate> = bot
+                    .gates
+                    .iter()
+                    .filter(|g| g.tools.contains(&call.name))
+                    .map(|g| CallGate {
+                        tag: g.tag.clone(),
+                        expire_ms: g.expire_ms,
+                    })
+                    .collect();
+                if gates.is_empty() {
+                    continue;
+                }
+                let node = call_node(&written, &call.call_id);
+                let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
+                tx.prepare_cached(
+                    "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates) VALUES (?,?,?,?,1,?,?)",
+                )?
+                .execute(params![
+                    turn,
+                    call.call_id,
+                    call.name,
+                    node,
+                    announced_ms,
+                    serde_json::to_string(&gates)?
+                ])?;
+                announced.push(json!({"call_id":call.call_id,"request":1,
+                    "announced_ms":announced_ms,"gates":tags,"name":call.name,"node":node}));
+            }
+            let data = json!({"calls":announced});
+            let cursor = event(
+                &tx,
+                &bot.name,
+                Some(turn),
+                "approval_requested",
+                data.clone(),
+            )?;
+            entries.push(entry(
+                cursor,
+                &bot.name,
+                Some(turn),
+                "approval_requested",
+                data,
+            ));
         }
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
@@ -2475,9 +2774,7 @@ impl Database {
         {
             return fail("invalid_tool_state");
         }
-        let preview: String = call.arguments.chars().take(2048).collect();
-        let data = json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
-            "arguments_truncated":preview.len() < call.arguments.len()});
+        let data = started(call);
         let cursor = event(&tx, &bot.name, Some(turn), "tool_started", data.clone())?;
         tx.commit()?;
         Ok(entry(cursor, &bot.name, Some(turn), "tool_started", data))
@@ -2522,11 +2819,367 @@ impl Database {
         let data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
             "note":outcome.note.as_ref().map(|_| head)});
         let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
+        // Verdicts are for the round as planned: after a failure the gated
+        // calls still to run are announced again, in this same commit.
+        let reannounced = !bot.gates.is_empty()
+            && failed(&outcome.output)
+            && reannounce(&tx, &bot.name, turn, call_id)?;
         tx.commit()?;
+        if reannounced && let Some(live) = self.live.get_mut(&turn) {
+            live.verdicts.clear();
+        }
         Ok((
             item.into(),
             entry(cursor, &bot.name, Some(turn), "tool_completed", data),
         ))
+    }
+    /// A planned call's current request, with the verdicts the worker
+    /// holds for it and has not yet written.
+    fn request(&self, turn: i64, call_id: &str) -> Result<Option<Request>> {
+        let row = self
+            .conn
+            .prepare_cached(
+                "SELECT id,request,announced_ms,gates,verdicts FROM approvals WHERE turn=? AND call_id=?",
+            )?
+            .query_row(params![turn, call_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .optional()?;
+        let Some((id, request, announced_ms, gates, verdicts)) = row else {
+            return Ok(None);
+        };
+        let mut request = Request {
+            id,
+            request,
+            announced_ms,
+            gates: serde_json::from_str(&gates)?,
+            verdicts: verdicts
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        if let Some(held) = self
+            .live
+            .get(&turn)
+            .and_then(|live| live.verdicts.get(call_id))
+        {
+            request.verdicts.extend(held.iter().cloned());
+        }
+        Ok(Some(request))
+    }
+    /// Start a gated call once every gate allowed it, record its denial, or
+    /// say what it still waits for. Allows ride the call's `tool_start`
+    /// commit and a denial is its result, so a verdict adds no commit.
+    pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
+        let bot = self.active(turn)?;
+        let request = self
+            .request(turn, &call.call_id)?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let expired = request.expires_ms().is_some_and(|at| now_ms >= at);
+        let gated = if let Some(denial) = request.denial() {
+            let tx = self.conn.savepoint()?;
+            deny(
+                &tx,
+                &bot,
+                turn,
+                &call.call_id,
+                denial.reason.as_deref(),
+                request.approvals(&[denial]),
+                false,
+            )?;
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([request.id])?;
+            let reannounced = reannounce(&tx, &bot.name, turn, &call.call_id)?;
+            tx.commit()?;
+            if reannounced && let Some(live) = self.live.get_mut(&turn) {
+                live.verdicts.clear();
+            }
+            Gated::Denied
+        } else if request.unanswered().next().is_none() {
+            let tx = self.conn.savepoint()?;
+            if tx.execute(
+                "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
+                params![turn, call.call_id],
+            )? != 1
+            {
+                return fail("invalid_tool_state");
+            }
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([request.id])?;
+            let mut data = started(call);
+            data["approvals"] = request.approvals(&request.verdicts.iter().collect::<Vec<_>>());
+            event(&tx, &bot.name, Some(turn), "tool_started", data)?;
+            tx.commit()?;
+            Gated::Started
+        } else if expired {
+            // No approver answered in time: the daemon's fixed reason, and
+            // the turn ends, since nothing further in it could run.
+            let lapsed: Vec<Value> = request
+                .unanswered()
+                .map(|g| {
+                    json!({"tag":g.tag,"by":null,
+                        "waited_ms":(now_ms as i64 - request.announced_ms).max(0)})
+                })
+                .collect();
+            let tx = self.conn.savepoint()?;
+            deny(
+                &tx,
+                &bot,
+                turn,
+                &call.call_id,
+                Some("not reviewed: no verdict"),
+                Value::Array(lapsed),
+                true,
+            )?;
+            tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+                .execute([request.id])?;
+            tx.commit()?;
+            Gated::Expired
+        } else {
+            return Ok(Gated::Pending {
+                notify: self.live.entry(turn).or_default().notify.clone(),
+                expires_ms: request.expires_ms(),
+            });
+        };
+        if let Some(live) = self.live.get_mut(&turn) {
+            live.verdicts.remove(&call.call_id);
+        }
+        Ok(gated)
+    }
+    /// Park a running turn on a gated call's verdict: its task ends and it
+    /// holds no slot. The verdicts the worker holds are written with the
+    /// park. A verdict that landed as the hold ran out is taken instead:
+    /// `None` means the call is decided and the turn goes on.
+    pub fn suspend_approval(
+        &mut self,
+        turn: i64,
+        pending: &[ToolCall],
+        now_ms: u64,
+        route: Option<&str>,
+    ) -> Result<Option<Option<u64>>> {
+        let bot = self.active(turn)?;
+        let call = pending.first().ok_or(Error::new("invalid_tool_state"))?;
+        if bot.status != "running" {
+            return fail("invalid_tool_state");
+        }
+        let request = self
+            .request(turn, &call.call_id)?
+            .ok_or(Error::new("invalid_tool_state"))?;
+        let deadline_ms = request.expires_ms();
+        if request.decided() || deadline_ms.is_some_and(|at| now_ms >= at) {
+            return Ok(None);
+        }
+        let waiting = Waiting {
+            turn,
+            bot: bot.name.clone(),
+            call_id: call.call_id.clone(),
+            handles: Vec::new(),
+            deadline_ms,
+            any: false,
+            pending: pending.to_vec(),
+            paced_since_ms: None,
+            call_attempts: 0,
+            call_spent_ms: 0,
+            compaction: false,
+            route: route.map(str::to_owned),
+            approval: true,
+        };
+        let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
+        tx.execute(
+            "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
+            params![serde_json::to_string(&waiting)?, turn],
+        )?;
+        tx.execute("UPDATE bots SET status='waiting' WHERE name=?", [&bot.name])?;
+        let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms});
+        event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
+        tx.commit()?;
+        self.live.remove(&turn);
+        Ok(Some(deadline_ms))
+    }
+    /// Record one gate's verdict on the current request of a planned call.
+    /// A running turn's verdict is held by the worker and wakes its task;
+    /// a parked turn's is committed now, and resumes the turn only if it is
+    /// parked on this call and the call is now decided.
+    pub fn answer(&mut self, answer: Answer<'_>) -> Result<Answered> {
+        let owner: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT bot,status FROM turns WHERE id=?",
+                [answer.turn],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((_, status)) = owner.filter(|(owner, _)| owner == answer.bot) else {
+            return fail("turn_not_found");
+        };
+        if !matches!(status.as_str(), "running" | "waiting" | "paced") {
+            return fail("stale_turn");
+        }
+        let Some(mut request) = self.request(answer.turn, answer.call_id)? else {
+            return fail("no_pending_approval");
+        };
+        if answer.request < request.request {
+            return fail("approval_superseded");
+        }
+        if answer.request > request.request {
+            return fail("no_pending_approval");
+        }
+        let tag = match answer.tag {
+            Some(tag) => request
+                .gates
+                .iter()
+                .find(|g| g.tag == tag)
+                .ok_or(Error::new("no_pending_approval"))?
+                .tag
+                .clone(),
+            None if request.gates.len() == 1 => request.gates[0].tag.clone(),
+            None => {
+                let tags: Vec<&str> = request.gates.iter().map(|g| g.tag.as_str()).collect();
+                return fail_with("approval_tag_required", tags.join(","));
+            }
+        };
+        if request.verdicts.iter().any(|v| v.tag == tag) {
+            return fail("approval_already_answered");
+        }
+        let verdict = Verdict {
+            tag: tag.clone(),
+            allow: answer.allow,
+            reason: answer.reason.map(str::to_owned),
+            by: answer.by.map(str::to_owned),
+            at_ms: epoch_ms(),
+        };
+        request.verdicts.push(verdict.clone());
+        let pending: Vec<&str> = if request.denial().is_some() {
+            Vec::new()
+        } else {
+            request.unanswered().map(|g| g.tag.as_str()).collect()
+        };
+        let reply = json!({"bot":answer.bot,"turn":answer.turn,"call_id":answer.call_id,
+            "request":request.request,"tag":tag,
+            "decision":if answer.allow { "allow" } else { "deny" },"pending":pending});
+        if status == "running" {
+            let live = self.live.entry(answer.turn).or_default();
+            live.verdicts
+                .entry(answer.call_id.to_owned())
+                .or_default()
+                .push(verdict);
+            return Ok(Answered {
+                reply,
+                notify: Some(live.notify.clone()),
+                resume: false,
+            });
+        }
+        let tx = self.conn.savepoint()?;
+        tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE id=?")?
+            .execute(params![
+                serde_json::to_string(&request.verdicts)?,
+                request.id
+            ])?;
+        tx.commit()?;
+        let resume = status == "waiting"
+            && request.decided()
+            && self
+                .waiting(answer.turn)?
+                .is_some_and(|w| w.approval && w.call_id == answer.call_id);
+        Ok(Answered {
+            reply,
+            notify: None,
+            resume,
+        })
+    }
+    /// Planned calls still waiting on a gate, in announcement order, each
+    /// naming only its unanswered gates. One page is at most `limit` calls,
+    /// 256 KiB, and 1,024 requests read, so no single job builds a large list.
+    pub fn approvals(
+        &self,
+        bot: Option<&str>,
+        tag: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Value> {
+        const READ: usize = 1024;
+        if !(1..=256).contains(&limit) || after < 0 {
+            return fail("invalid_approval_page");
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts
+             FROM approvals a JOIN turns t ON t.id=a.turn
+             WHERE a.id>?1 AND (?2 IS NULL OR t.bot=?2) ORDER BY a.id LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![after, bot, READ as i64])?;
+        let (mut listed, mut bytes, mut read, mut last, mut more) =
+            (Vec::new(), 0, 0, after, false);
+        while let Some(r) = rows.next()? {
+            read += 1;
+            let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
+            let mut request = Request {
+                id,
+                request: r.get(6)?,
+                announced_ms: r.get(7)?,
+                gates: serde_json::from_str(&r.get::<_, String>(8)?)?,
+                verdicts: r
+                    .get::<_, Option<String>>(9)?
+                    .map(|v| serde_json::from_str(&v))
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
+            if let Some(held) = self
+                .live
+                .get(&turn)
+                .and_then(|live| live.verdicts.get(&call_id))
+            {
+                request.verdicts.extend(held.iter().cloned());
+            }
+            let open: Vec<&str> = if request.denial().is_some() {
+                Vec::new()
+            } else {
+                request.unanswered().map(|g| g.tag.as_str()).collect()
+            };
+            if open.is_empty() || tag.is_some_and(|tag| !open.contains(&tag)) {
+                last = id;
+                continue;
+            }
+            let node: i64 = r.get(5)?;
+            let item: Option<Vec<u8>> = self
+                .conn
+                .prepare_cached("SELECT item FROM nodes WHERE id=?")?
+                .query_row([node], |r| r.get(0))
+                .optional()?;
+            let arguments = item
+                .and_then(|item| serde_json::from_slice::<Value>(&item).ok())
+                .and_then(|item| call_arguments(&item, &call_id))
+                .unwrap_or_default();
+            let preview: String = arguments.chars().take(2048).collect();
+            let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+                "request":request.request,"announced_ms":request.announced_ms,
+                "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
+                "node":node,"arguments":preview,
+                "arguments_truncated":preview.len() < arguments.len()});
+            let size = crate::output::encoded_len(&entry)? + 1;
+            if listed.len() == limit || bytes + size > 256 * 1024 {
+                more = true;
+                break;
+            }
+            bytes += size;
+            listed.push(entry);
+            last = id;
+        }
+        let more = more || read == READ;
+        Ok(json!({"approvals":listed,"next_after":more.then_some(last)}))
+    }
+    /// Planned calls announced and not yet started or denied, for `stats`.
+    pub fn approval_requests(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM approvals")?
+            .query_row([], |r| r.get(0))?)
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
@@ -2609,12 +3262,16 @@ impl Database {
                 params![waiting.paced_elapsed_ms(), turn],
             )?;
         }
+        if !bot.gates.is_empty() {
+            tx.execute("DELETE FROM approvals WHERE turn=?", [turn])?;
+        }
         let code = error.map(|e| e.code.as_str());
         // Interrupted, by cause: a client's interrupt, the daemon shutting
-        // down around the turn, or a daemon that died with it running.
+        // down around the turn, a daemon that died with it running, or a
+        // gate that lapsed without a verdict.
         let status = if matches!(
             code,
-            Some("cancelled" | "daemon_shutdown" | "process_interrupted")
+            Some("cancelled" | "daemon_shutdown" | "process_interrupted" | "approval_expired")
         ) || (pending && code.is_none())
         {
             "interrupted"
@@ -2642,6 +3299,7 @@ impl Database {
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
+        self.live.remove(&turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
         Ok(entries)
     }
@@ -2694,8 +3352,11 @@ impl Database {
             call_spent_ms: 0,
             compaction: false,
             route: route.map(str::to_owned),
+            approval: false,
         };
         let tx = self.conn.savepoint()?;
+        // A verdict for a later call of the round waits in the store.
+        flush(&tx, turn, self.live.get(&turn))?;
         tx.execute(
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
@@ -2704,6 +3365,7 @@ impl Database {
         let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,"any":any});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_waiting", data.clone())?;
         tx.commit()?;
+        self.live.remove(&turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_waiting", data))
     }
     /// Park a running turn at its model-call boundary until `resume_at_ms`,
@@ -2738,8 +3400,10 @@ impl Database {
             call_spent_ms,
             compaction,
             route: route.map(str::to_owned),
+            approval: false,
         };
         let tx = self.conn.savepoint()?;
+        flush(&tx, turn, self.live.get(&turn))?;
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
             params![serde_json::to_string(&waiting)?, retries as i64, paced_ms as i64, turn],
@@ -2748,6 +3412,7 @@ impl Database {
         let data = json!({"resume_at_ms":resume_at_ms});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
+        self.live.remove(&turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after
@@ -2766,14 +3431,32 @@ impl Database {
     }
     /// A queued wake-up is valid only for the bot's current parked turn.
     /// Deleted bots and replaced turns are stale, not store failures.
+    /// A turn parked on a verdict wakes only once its call is decided or a
+    /// gate lapses, whichever of its wake-ups comes first.
     pub fn can_resume(&self, name: &str, turn: i64) -> Result<bool> {
-        Ok(self
+        let parked: Option<Option<bool>> = self
             .conn
             .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM bots
-                 WHERE name=? AND status IN ('waiting','paced') AND running_turn=?)",
+                "SELECT json_extract(t.waiting,'$.approval') FROM bots b JOIN turns t ON t.id=b.running_turn
+                 WHERE b.name=? AND b.status IN ('waiting','paced') AND b.running_turn=?",
             )?
-            .query_row(params![name, turn], |r| r.get(0))?)
+            .query_row(params![name, turn], |r| r.get(0))
+            .optional()?;
+        match parked {
+            None => Ok(false),
+            Some(Some(true)) => {
+                let Some(waiting) = self.waiting(turn)? else {
+                    return Ok(true);
+                };
+                Ok(self.request(turn, &waiting.call_id)?.is_none_or(|request| {
+                    request.decided()
+                        || request
+                            .expires_ms()
+                            .is_some_and(|at| epoch_ms().max(0) as u64 >= at)
+                }))
+            }
+            Some(_) => Ok(true),
+        }
     }
 
     /// Bring a parked turn back to running; the caller then records the wait
@@ -2989,8 +3672,14 @@ impl Database {
             budget_tokens,
             created_by,
             created_by_id,
+            gate,
         } = fork;
         let parent = self.inspect(source)?;
+        if let Some(gate) = gate
+            && gate.tools.iter().any(|t| !parent.tools.contains(t))
+        {
+            return fail("approve_not_in_tools");
+        }
         let checkpoint = match node {
             Some(node) => {
                 if !self.in_lineage(parent.head, node)? {
@@ -3017,8 +3706,14 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
+        // A fork keeps its source's gates and its creator's, and adds its own.
+        let inherited = Self::creator_gates(&tx, created_by_id)?;
+        let gates = stored_gates(&merge_gates(
+            parent.gates.iter().chain(&inherited).chain(gate),
+            &parent.tools,
+        ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,gates) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -3045,7 +3740,8 @@ impl Database {
                     .then_some(parent.thinking_prefix)
                     .flatten(),
                 parent.thinking_floor,
-                parent.fallbacks
+                parent.fallbacks,
+                gates
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -3076,10 +3772,13 @@ impl Database {
                 params![version, name],
             )?;
         }
-        let data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
+        let mut data = json!({"id":id,"source":source,"checkpoint":checkpoint,"node":checkpoint,
             "provider":parent.provider,"model":parent.model,
             "workspace":workspace,"status":"idle","running_turn":null,
             "created_by":created_by,"created_by_id":created_by_id});
+        if let Some(gates) = &gates {
+            data["gates"] = serde_json::from_str(gates)?;
+        }
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
         Ok((
@@ -3881,6 +4580,110 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A `tool_started` event's data: the call with its arguments previewed.
+fn started(call: &ToolCall) -> Value {
+    let preview: String = call.arguments.chars().take(2048).collect();
+    json!({"call_id":call.call_id,"name":call.name,"arguments":preview,
+        "arguments_truncated":preview.len() < call.arguments.len()})
+}
+/// A denied call's result, in the one commit a finished call makes. The
+/// daemon writes the code; the reason is the approver's.
+fn deny(
+    tx: &Connection,
+    bot: &Bot,
+    turn: i64,
+    call_id: &str,
+    reason: Option<&str>,
+    approvals: Value,
+    expired: bool,
+) -> Result<()> {
+    let output = json!({"error":"approval_denied","detail":reason}).to_string();
+    let item = bot.family()?.tool_result_item(call_id, &output)?;
+    if tx.execute(
+        "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='planned'",
+        params![turn, call_id],
+    )? != 1
+    {
+        return fail("invalid_tool_state");
+    }
+    let head = node(tx, bot.head, &item)?;
+    tx.execute(
+        "UPDATE bots SET head=? WHERE name=?",
+        params![head, bot.name],
+    )?;
+    let mut data = json!({"call_id":call_id,"node":head,"artifacts":[],"denied":true,
+        "approvals":approvals});
+    if expired {
+        data["expired"] = json!(true);
+    }
+    event(tx, &bot.name, Some(turn), "tool_completed", data)?;
+    Ok(())
+}
+/// Announce again every gated call of the turn still waiting to run, with
+/// a new request number and no verdicts, naming the call that failed.
+/// Answers computed for the old request are refused as superseded.
+fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<bool> {
+    let rows: Vec<(i64, String, String, i64, i64, String)> = tx
+        .prepare_cached(
+            "SELECT id,call_id,name,node,request,gates FROM approvals WHERE turn=? ORDER BY id",
+        )?
+        .query_map([turn], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let announced_ms = epoch_ms();
+    let mut calls = Vec::with_capacity(rows.len());
+    for (id, call_id, name, node, request, gates) in rows {
+        tx.prepare_cached(
+            "UPDATE approvals SET request=?,announced_ms=?,verdicts=NULL WHERE id=?",
+        )?
+        .execute(params![request + 1, announced_ms, id])?;
+        let gates: Vec<CallGate> = serde_json::from_str(&gates)?;
+        let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
+        calls.push(json!({"call_id":call_id,"request":request + 1,
+            "announced_ms":announced_ms,"gates":tags,"name":name,"node":node}));
+    }
+    event(
+        tx,
+        bot,
+        Some(turn),
+        "approval_requested",
+        json!({"calls":calls,"failed":failed}),
+    )?;
+    Ok(true)
+}
+/// Write the verdicts the worker holds for a turn into their requests, in
+/// the commit that parks the turn.
+fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
+    let Some(live) = live else {
+        return Ok(());
+    };
+    for (call_id, held) in live.verdicts.iter().filter(|(_, held)| !held.is_empty()) {
+        let stored: Option<String> = tx
+            .prepare_cached("SELECT verdicts FROM approvals WHERE turn=? AND call_id=?")?
+            .query_row(params![turn, call_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let mut verdicts: Vec<Verdict> = stored
+            .map(|v| serde_json::from_str(&v))
+            .transpose()?
+            .unwrap_or_default();
+        verdicts.extend(held.iter().cloned());
+        tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE turn=? AND call_id=?")?
+            .execute(params![serde_json::to_string(&verdicts)?, turn, call_id])?;
+    }
+    Ok(())
+}
 fn event(conn: &Connection, bot: &str, turn: Option<i64>, kind: &str, data: Value) -> Result<i64> {
     conn.prepare_cached("INSERT INTO events(bot,turn,kind,data) VALUES (?,?,?,?)")?
         .execute(params![bot, turn, kind, data.to_string()])?;
@@ -4274,6 +5077,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
                 identity INTEGER NOT NULL);
              INSERT OR IGNORE INTO store VALUES (1,random());",
         )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='gates')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 28 -> 29: tool approval. Existing bots have no gates; the
+        // approvals table is created with the rest of the schema.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN gates TEXT;")?;
     }
     if !conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='thinking')",

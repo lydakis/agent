@@ -75,6 +75,14 @@ struct Options {
     any: bool,
     /// `run --delivery`: what to do when the bot is busy.
     delivery: Option<String>,
+    /// A new bot's approval mode and gated tools.
+    approval: Option<String>,
+    approve: Option<String>,
+    /// `answer`: the call, its request number, the gate, and the reason.
+    call: Option<String>,
+    request: Option<i64>,
+    tag: Option<String>,
+    reason: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
@@ -115,6 +123,14 @@ fn parse(args: &[String]) -> Result<Options> {
         all: false,
         any: false,
         delivery: std::env::var("AGENT_DELIVERY").ok(),
+        approval: std::env::var("AGENT_APPROVAL")
+            .ok()
+            .filter(|mode| !mode.is_empty()),
+        approve: None,
+        call: None,
+        request: None,
+        tag: None,
+        reason: None,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
     };
@@ -151,6 +167,18 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--model" => options.model = Some(value),
                     "--delivery" => options.delivery = Some(value),
+                    "--approval" => options.approval = Some(value),
+                    "--approve" => options.approve = Some(value),
+                    "--call" => options.call = Some(value),
+                    "--request" => {
+                        options.request = Some(
+                            value
+                                .parse()
+                                .map_err(|_| Error::with("usage", "--request needs an integer"))?,
+                        )
+                    }
+                    "--tag" => options.tag = Some(value),
+                    "--reason" => options.reason = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
                         options.instructions =
@@ -217,7 +245,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--note-turns"
                     | "--compact-at"
                     | "--compact-keep"
-                    | "--retain-turns" => {
+                    | "--retain-turns"
+                    | "--approval-hold-ms" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -486,6 +515,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--compact-at" => "compact_at",
             "--compact-keep" => "compact_keep",
             "--retain-turns" => "retain_turns",
+            "--approval-hold-ms" => "approval_hold_ms",
             _ => continue,
         };
         let running = &ready["limits"][key];
@@ -640,6 +670,50 @@ fn created_by() -> Result<(Option<String>, Option<i64>)> {
     }
 }
 
+/// Tools the approval modes never gate: they touch only the bot's own
+/// store records.
+const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
+
+/// The gate a new bot asks for, as `create` or `fork` fields. The mode
+/// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
+/// `manual` gates --approve, or every tool the bot has but the four that
+/// touch only its own records, for a person or a program to answer.
+fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
+    match options.approval.as_deref().unwrap_or("full") {
+        "full" if options.approve.is_some() => fail_with(
+            "usage",
+            "--approve names tools for an approver; use --approval manual",
+        ),
+        "full" => Ok(json!({})),
+        "manual" => {
+            let approve: Vec<String> = match &options.approve {
+                Some(list) => list
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                None => tools
+                    .iter()
+                    .filter(|t| !UNGATED.contains(&t.as_str()))
+                    .cloned()
+                    .collect(),
+            };
+            if approve.is_empty() {
+                return Ok(json!({}));
+            }
+            Ok(json!({"approve":approve,"approver":"manual"}))
+        }
+        "auto" => fail_with(
+            "approval_mode_unsupported",
+            "auto needs the automatic approver, which is not built yet; use manual or full",
+        ),
+        mode => fail_with(
+            "usage",
+            format!("unknown approval mode {mode}; use full, manual, or auto"),
+        ),
+    }
+}
+
 fn unique(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -670,6 +744,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "result" => result(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
+        "approvals" => approvals(&options),
+        "answer" => answer(&options),
         "stats" => {
             let mut connection = ensure_existing_daemon(&options)?;
             let stats = connection.request("stats", json!({}))?;
@@ -776,16 +852,22 @@ fn run(options: &Options) -> Result<i32> {
             ))?;
         let instructions = composed_instructions(options, &workspace)?;
         let (created_by, created_by_id) = created_by()?;
-        connection.request(
-            "create",
-            json!({"bot":bot,"workspace":workspace,"model":model,
-                "instructions":instructions,"reasoning":options.reasoning,
-                "budget_tokens":options.budget_tokens,
-                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>(),
-                "created_by":created_by,"created_by_id":created_by_id,
-                "compaction_instructions":options.compaction_instructions,
-                "compaction_model":options.compaction_model,"fallbacks":options.fallbacks}),
-        )?;
+        let tools: Vec<String> = options
+            .tools
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
+            "instructions":instructions,"reasoning":options.reasoning,
+            "budget_tokens":options.budget_tokens,"tools":tools,
+            "created_by":created_by,"created_by_id":created_by_id,
+            "compaction_instructions":options.compaction_instructions,
+            "compaction_model":options.compaction_model,"fallbacks":options.fallbacks});
+        if let Value::Object(gate) = requested_gate(options, &tools)? {
+            create.as_object_mut().expect("object").extend(gate);
+        }
+        connection.request("create", create)?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     // Existing bots keep their model unless --model explicitly overrides it.
@@ -870,13 +952,20 @@ fn fork(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     // A fork inherits only the conversation; its turns name their own workspace.
     let (created_by, created_by_id) = created_by()?;
-    let result = connection.request(
-        "fork",
-        json!({"source":source,"checkpoint":checkpoint,"bot":bot,
-            "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-            "budget_tokens":options.budget_tokens,
-            "created_by":created_by,"created_by_id":created_by_id}),
-    )?;
+    let mut request = json!({"source":source,"checkpoint":checkpoint,"bot":bot,
+        "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
+        "budget_tokens":options.budget_tokens,
+        "created_by":created_by,"created_by_id":created_by_id});
+    // A fork keeps its source's tools and gates; its own gate adds to them.
+    if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
+        let state = connection.request("resume", json!({"bot":source}))?;
+        let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
+            .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
+        if let Value::Object(gate) = requested_gate(options, &tools)? {
+            request.as_object_mut().expect("object").extend(gate);
+        }
+    }
+    let result = connection.request("fork", request)?;
     print_json(&result, options.pretty)?;
     Ok(0)
 }
@@ -950,6 +1039,102 @@ fn wait(options: &Options) -> Result<i32> {
         enough && completed.all(|v| v.get("error").is_none_or(Value::is_null))
     });
     Ok(if clean { 0 } else { 1 })
+}
+
+/// Calls waiting for a verdict, paged through completely; JSON array or
+/// one line per call with the command that answers it.
+fn approvals(options: &Options) -> Result<i32> {
+    let mut connection = ensure_existing_daemon(options)?;
+    let mut after = json!(0);
+    let mut first = true;
+    if !options.pretty {
+        print!("[");
+    }
+    loop {
+        let page = connection.request(
+            "approvals",
+            json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":256}),
+        )?;
+        let calls = page["approvals"]
+            .as_array()
+            .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        for call in calls {
+            if options.pretty {
+                println!(
+                    "{} turn {} {} {}\n  waits for {} · agent answer --bot {} --turn {} --call {} --request {} allow|deny",
+                    call["bot"].as_str().unwrap_or(""),
+                    call["turn"],
+                    call["name"].as_str().unwrap_or(""),
+                    summary(
+                        call["name"].as_str().unwrap_or(""),
+                        call["arguments"].as_str().unwrap_or("")
+                    ),
+                    call["gates"]
+                        .as_array()
+                        .map(|gates| gates
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "))
+                        .unwrap_or_default(),
+                    call["bot"].as_str().unwrap_or(""),
+                    call["turn"],
+                    call["call_id"].as_str().unwrap_or(""),
+                    call["request"],
+                );
+            } else {
+                if !first {
+                    print!(",");
+                }
+                print!("{call}");
+                first = false;
+            }
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    if !options.pretty {
+        println!("]");
+    }
+    Ok(0)
+}
+
+/// Allow or deny one gated call. The request number is required, so a
+/// decision made on what a person saw cannot land on a call announced
+/// again since.
+fn answer(options: &Options) -> Result<i32> {
+    // The same kind of guard as the creator identity: it stops a bot's own
+    // shell from answering by accident, not a determined command.
+    if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
+        || std::env::var("AGENT_BOT").is_ok_and(|bot| !bot.is_empty())
+    {
+        return fail_with(
+            "answer_in_tool_shell",
+            "agent answer does not run inside a bot's tool shell",
+        );
+    }
+    let (Some(bot), Some(turn), Some(call), Some(request)) =
+        (&options.bot, options.turn, &options.call, options.request)
+    else {
+        return fail_with(
+            "usage",
+            "answer needs --bot, --turn, --call, and --request, as agent approvals lists them",
+        );
+    };
+    let decision = options.positional[0].as_str();
+    if !matches!(decision, "allow" | "deny") {
+        return fail_with("usage", "answer needs a decision: allow or deny");
+    }
+    let mut connection = ensure_existing_daemon(options)?;
+    let answered = connection.request(
+        "answer",
+        json!({"bot":bot,"turn":turn,"call_id":call,"request":request,"tag":options.tag,
+            "decision":decision,"reason":options.reason,"by":"cli"}),
+    )?;
+    print_json(&answered, false)?;
+    Ok(0)
 }
 
 /// A bot's turns, paged through completely; JSON array or a table.
@@ -1148,21 +1333,35 @@ impl Renderer {
             "tool_started" => {
                 self.flush();
                 let name = data["name"].as_str().unwrap_or("tool");
-                let args: Value = serde_json::from_str(data["arguments"].as_str().unwrap_or(""))
-                    .unwrap_or(Value::Null);
-                let summary = match name {
-                    "shell" => args["command"].as_str().unwrap_or("").to_owned(),
-                    "read" | "write" | "edit" => args["path"].as_str().unwrap_or("").to_owned(),
-                    _ => data["arguments"].as_str().unwrap_or("").to_owned(),
-                };
-                let summary: String = summary
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(200)
-                    .collect();
+                let summary = summary(name, data["arguments"].as_str().unwrap_or(""));
                 println!("{}", self.dim(&format!("▸ {name} {summary}")));
+            }
+            // A person answering from another terminal needs the command.
+            "approval_requested" => {
+                self.flush();
+                let bot = event["bot"].as_str().unwrap_or("");
+                for call in data["calls"].as_array().into_iter().flatten() {
+                    let gates = call["gates"]
+                        .as_array()
+                        .map(|gates| {
+                            gates
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "{}",
+                        self.dim(&format!(
+                            "⏸ {} waits for {gates} · agent answer --bot {bot} --turn {} --call {} --request {} allow|deny",
+                            call["name"].as_str().unwrap_or("tool"),
+                            event["turn"],
+                            call["call_id"].as_str().unwrap_or(""),
+                            call["request"],
+                        ))
+                    );
+                }
             }
             "tool_completed" => {
                 let bot = event["bot"].as_str().unwrap_or("");
@@ -1223,6 +1422,23 @@ fn exit_code(data: &Value) -> i32 {
     } else {
         1
     }
+}
+
+/// A call's arguments as one short line: the command or path when the
+/// tool has one.
+fn summary(name: &str, arguments: &str) -> String {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    let text = match name {
+        "shell" => args["command"].as_str().unwrap_or(""),
+        "read" | "write" | "edit" => args["path"].as_str().unwrap_or(""),
+        _ => arguments,
+    };
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// A bounded, readable slice of a tool result for the terminal.

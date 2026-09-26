@@ -37,6 +37,7 @@ fn binding() -> Binding<'static> {
         compaction_instructions: None,
         compaction_model: None,
         fallbacks: false,
+        gate: None,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -345,6 +346,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                     compaction_instructions: None,
                     compaction_model: None,
                     fallbacks: false,
+                    gate: None,
                     ..binding()
                 },
             )
@@ -453,6 +455,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                     compaction_instructions: None,
                     compaction_model: None,
                     fallbacks: false,
+                    gate: None,
                     ..binding()
                 },
             )
@@ -1003,6 +1006,7 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            gate: None,
             ..binding()
         },
     )
@@ -1600,6 +1604,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            gate: None,
             ..binding()
         },
     )
@@ -1946,6 +1951,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
                 compaction_instructions: None,
                 compaction_model: None,
                 fallbacks: false,
+                gate: None,
                 ..binding()
             },
         )

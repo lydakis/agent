@@ -788,8 +788,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     does. A labeled Jev run on 341
     calls (2026-09-26, $0.07) answered in 0.26 s median with no false
     allows, but at the starting thresholds it refused 23% of benign calls;
-    tuned thresholds cut that sharply. Next: a labeled dangerous set to
-    measure false allows before thresholds are fixed.
+    tuned thresholds cut that sharply. Built (2026-09-26): the daemon
+    mechanism and `manual` mode with `agent approvals` and `agent answer`.
+    Next: the rules-only `auto` approver with `serve_approvals`, then Jev,
+    and a labeled dangerous set to measure false allows before thresholds
+    are fixed.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

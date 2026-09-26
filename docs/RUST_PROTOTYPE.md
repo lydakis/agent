@@ -323,6 +323,7 @@ bound; the operating system is then the only limit.
 | `--compact-at` | Percent of either context envelope that triggers compaction. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
 | `--compact-keep` | Target percent of either context envelope kept verbatim as newest whole turns, reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
 | `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
+| `--approval-hold-ms` | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
@@ -781,6 +782,9 @@ own path from the turn. Example requests:
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
+{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-5.6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual"}
+{"id":22,"op":"approvals","bot":"Carol","limit":64}
+{"id":23,"op":"answer","bot":"Carol","turn":7,"call_id":"call_1","request":1,"decision":"deny","reason":"not on main","by":"cli"}
 {"id":12,"op":"shutdown"}
 {"id":21,"op":"shutdown","grace_ms":30000}
 ```
@@ -894,9 +898,11 @@ delivered only to live followers and carry `durable:false`, as do the `pruned`
 and `deleted` retention notices. Durable event kinds
 are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
-(with a 2 KiB argument preview), `tool_completed` (with retained artifact
-names), `turn_waiting` and `turn_resumed` (a parked turn's handles and its
-wake-up), `turn_paced` (a turn parked at its model-call boundary because its
+(with a 2 KiB argument preview, and `approvals` for a gated call),
+`tool_completed` (with retained artifact names; `denied` for a denied call),
+`approval_requested` (a round's gated calls, see [tool approval](#tool-approval)),
+`turn_waiting` and `turn_resumed` (a parked turn's handles, or the call whose
+verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
 provider's pool is closed by a rate limit, with `resume_at_ms`; it resumes
 through `turn_resumed` like a parked wait), `steered` (a steer's item joining
 the running turn), and
@@ -1467,7 +1473,8 @@ which is what its model is shown and what dispatch allows. The
 registry validates tool names and arguments before execution; a tool that fails
 (unknown tool, invalid arguments, missing file, ambiguous edit, output
 overflow) returns an error result to the model and the turn continues. Only a
-closed tool scheduler fails the turn. Allowed tools run without approval prompts.
+closed tool scheduler fails the turn. Allowed tools run without approval
+prompts unless the bot was created with a gate (see [tool approval](#tool-approval)).
 A store remains bound to its tool set; changing it requires a new store.
 
 `shell` runs a noninteractive `/bin/sh` command in the bot workspace with
@@ -1508,6 +1515,71 @@ foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
+
+### Tool approval
+
+A bot may be created with a gate: `approve`, the tools whose calls wait for a
+verdict; `approver`, an opaque tag naming who answers, which the daemon
+stores and reports but never reads; and optionally `approve_expire_ms`.
+Without them none of this runs and nothing is paid. `fork` takes the same
+fields. A bot keeps every gate it descends from: a fork keeps its source's,
+and a `create` or `fork` whose `created_by` names a bot adds that bot's.
+Each gate is kept to the new bot's tools, and gates with the same tag merge,
+keeping the shorter expiry. `resume`, `bots`, `created`, and `forked` report
+`gates`. The design and its reasoning are in [APPROVALS.md](APPROVALS.md).
+
+- **Announcement.** The commit that records a model response with gated
+  calls also writes one `approval_requested` event for the round:
+  `{"calls":[{"call_id","request","announced_ms","gates","name","node"}]}`.
+- **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?}`
+  records one gate's verdict on the call's current request; `tag` may be
+  left out when the call has one gate. The reply lists the gates still
+  `pending`. Errors: `no_pending_approval` (unknown call, request, or tag),
+  `approval_superseded` (an earlier request), `approval_already_answered`,
+  `approval_tag_required`, `stale_turn`, and `turn_not_found`.
+- **Verdicts.** A call needs an allow from every gate, and the first deny
+  denies it. An allow rides the call's `tool_started` commit, which gains
+  `approvals: [{tag, by, waited_ms}]`. A deny is the call's result,
+  `{"error":"approval_denied","detail":REASON}`, and its `tool_completed`
+  carries `denied: true`; the turn goes on.
+- **Hold, then park.** A verdict for a running turn is held by the storage
+  worker, which wakes the turn's task, until the call's start, its denial,
+  or a park writes it. A gated call waits live for `--approval-hold-ms`
+  (default 2,000; 0 parks at once), then its turn parks like `wait`: one
+  commit, `turn_waiting` with `approval: true`, no task, no active slot, and
+  it survives restart. A verdict for a parked turn is committed on arrival
+  and resumes the turn only if it parked on that call and the call is now
+  decided; a verdict for a call after a `wait` waits in the store.
+- **Expiry.** With `approve_expire_ms`, a call still without that gate's
+  verdict that long after it was announced is denied with "not reviewed:
+  no verdict" (`tool_completed` carries `expired: true`), and the turn ends
+  `interrupted` with `approval_expired`.
+- **Rounds.** A verdict is for the round as planned. When a call fails (an
+  error result, a denial, or a command that did not succeed), every gated
+  call of the round still to run is announced again in that call's
+  finishing commit, with the next `request` and `failed` naming the call.
+  Their earlier verdicts are dropped, and answers to the old request get
+  `approval_superseded`.
+- **Listing.** `{"op":"approvals","bot"?,"tag"?,"after"?,"limit"?}` lists
+  calls still waiting on a gate in announcement order, each naming only its
+  unanswered gates, with `expires_ms` and a 2 KiB argument preview. A page
+  holds at most `limit` (1 to 256, default 64) calls and 256 KiB;
+  `next_after` continues it. `stats` reports `approval_requests`, the calls
+  announced and not yet started or denied.
+- Interrupting a turn cancels its gated calls like any planned call.
+  Anything that reaches the socket can answer, a bot's own shell included:
+  this is oversight, not containment.
+
+The CLI turns a mode into a gate. `run --new --approval manual`, or
+`AGENT_APPROVAL=manual`, gates every tool of the new bot but `history`,
+`wait`, `note`, and `echo`, tagged `manual`; `--approve LIST` picks the
+tools instead, and `fork` takes both. `full`, the default, gates nothing.
+`auto` is refused with `approval_mode_unsupported` until the automatic
+approver exists. `agent approvals [--bot NAME] [--tag TAG]` lists pending
+calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
+[--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
+tool shell, and `run --pretty` prints each pending call with the command
+that answers it.
 
 ### Compaction
 

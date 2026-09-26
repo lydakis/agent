@@ -182,6 +182,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'detach-1',
                            'arguments': json.dumps({'command': user[7:], 'detach': True})}]
+            elif user.startswith('multi:'):
+                # One response planning several commands, in order.
+                text = ''
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'shell-{i + 1}',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})}
+                          for i, command in enumerate(user[6:].split('|'))]
+            elif user.startswith('waitshell:'):
+                # A wait, then a command, in one response.
+                text = ''
+                handle, _, command = user[10:].partition('|')
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': [handle]})},
+                          {'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})}]
             elif user.startswith('shell:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',

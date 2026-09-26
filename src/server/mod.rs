@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Binding, Bot, Delivery, Fork, Publication, Store, TurnOptions},
+    store::{Answer, Binding, Bot, Delivery, Fork, Gate, Publication, Store, TurnOptions},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -61,6 +61,11 @@ enum Command {
         /// Anthropic server-side fallbacks for this bot; off unless asked.
         #[serde(default)]
         fallbacks: bool,
+        /// A gate: tools whose calls wait for a verdict, the approver tag
+        /// that answers them, and how long a call may wait for it.
+        approve: Option<Vec<String>>,
+        approver: Option<String>,
+        approve_expire_ms: Option<u64>,
     },
     Resume {
         bot: String,
@@ -74,6 +79,10 @@ enum Command {
         budget_tokens: Option<u64>,
         created_by: Option<String>,
         created_by_id: Option<i64>,
+        /// A gate the fork adds to those it inherits.
+        approve: Option<Vec<String>>,
+        approver: Option<String>,
+        approve_expire_ms: Option<u64>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -161,6 +170,27 @@ enum Command {
         /// Answer on the first resolved handle; the rest are reported pending.
         #[serde(default)]
         any: bool,
+    },
+    /// One gate's verdict on the current request of a planned call.
+    Answer {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        request: i64,
+        tag: Option<String>,
+        /// `allow` or `deny`.
+        decision: String,
+        reason: Option<String>,
+        /// A label for audit, the client's choice; not verified.
+        by: Option<String>,
+    },
+    /// Planned calls waiting on a gate, in announcement order.
+    Approvals {
+        bot: Option<String>,
+        tag: Option<String>,
+        #[serde(default)]
+        after: i64,
+        limit: Option<usize>,
     },
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
@@ -375,6 +405,9 @@ pub struct Configuration {
     /// Prune every bot to this many turns' records after each of its turns
     /// finishes; none by default.
     pub retain_turns: Option<usize>,
+    /// Milliseconds a gated call waits live for its verdict before its turn
+    /// parks; default 2,000.
+    pub approval_hold_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -450,6 +483,35 @@ fn workspace(path: &str) -> Result<String> {
         .ok_or(Error::new("workspace_not_utf8"))?
         .into())
 }
+/// A client's own gate: tools whose calls wait for a verdict, and the tag
+/// of the approver that answers. Both or neither; the daemon never reads
+/// the tag.
+fn gate(
+    approve: Option<Vec<String>>,
+    approver: Option<String>,
+    expire_ms: Option<u64>,
+) -> Result<Option<Gate>> {
+    match (approve, approver) {
+        (None, None) if expire_ms.is_none() => Ok(None),
+        (Some(mut tools), Some(tag)) if !tools.is_empty() => {
+            name(&tag).map_err(|_| Error::new("invalid_approver"))?;
+            if expire_ms.is_some_and(|ms| ms == 0 || ms > 86_400_000) {
+                return fail("invalid_approve_expiry");
+            }
+            tools.sort();
+            tools.dedup();
+            Ok(Some(Gate {
+                tag,
+                tools,
+                expire_ms,
+            }))
+        }
+        _ => fail_with(
+            "invalid_gate",
+            "approve needs a nonempty tool list and an approver tag",
+        ),
+    }
+}
 struct Service {
     store: Store,
     transport: Arc<Transport>,
@@ -479,12 +541,14 @@ struct Service {
     ready_hint: bool,
     /// Provider-reported tokens since this daemon started, for `stats`.
     tokens: Arc<turn::TokenTotals>,
-    /// Turns parked on a rate-limited pool, by resume time. Each holds no
-    /// task and no slot; the run loop resumes them as they come due.
+    /// Turns parked on a rate-limited pool, by resume time, and turns
+    /// parked on a verdict, by when a gate lapses. Each holds no task and no
+    /// slot; the run loop resumes them as they come due.
     paced: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String, i64)>>,
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
+    approval_hold: Duration,
 }
 
 /// A bot's live turn: which turn, the task owning it, its cancel signal,
@@ -546,6 +610,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         Some(seconds) => Some(Duration::from_secs(seconds)),
         None => Some(agent_runtime::provider::KEEP_WARM),
     };
+    let approval_hold = Duration::from_millis(config.approval_hold_ms.unwrap_or(2000));
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let credentials = agent_runtime::tools::Credentials::default();
@@ -647,7 +712,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -657,7 +722,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "cache_ttl":if config.cache_hour { "1h" } else { "5m" },
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
-            "retain_turns":config.retain_turns},
+            "retain_turns":config.retain_turns,"approval_hold_ms":approval_hold.as_millis() as u64},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "durability":"sqlite_full","partial_text_durable":false});
@@ -712,6 +777,15 @@ pub async fn run(config: Configuration) -> Result<()> {
             paced_at_start.push((waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn));
             continue;
         }
+        // A verdict park wakes on an answer, which may have committed
+        // before the restart, or when a gate lapses: check both.
+        if waiting.approval {
+            if let Some(at) = waiting.deadline_ms {
+                paced_at_start.push((at, waiting.bot.clone(), waiting.turn));
+            }
+            paced_at_start.push((0, waiting.bot, waiting.turn));
+            continue;
+        }
         handles
             .attach(
                 &store,
@@ -749,6 +823,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         tokens: Arc::default(),
         paced: std::collections::BinaryHeap::new(),
         draining: false,
+        approval_hold,
     };
     for (at, bot, turn) in paced_at_start {
         service.paced.push(std::cmp::Reverse((at, bot, turn)));
@@ -1064,6 +1139,7 @@ impl Service {
             compact_at: self.limits.compact_at,
             compact_keep: self.limits.compact_keep,
             resume,
+            approval_hold: self.approval_hold,
             steers,
             tokens: self.tokens.clone(),
         };
@@ -1140,10 +1216,14 @@ impl Service {
                 compaction_instructions,
                 compaction_model,
                 fallbacks,
+                approve,
+                approver,
+                approve_expire_ms,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
+                let gate = gate(approve, approver, approve_expire_ms)?;
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;
@@ -1206,6 +1286,7 @@ impl Service {
                                 compaction_instructions: compaction_instructions.as_deref(),
                                 compaction_model: compaction_model.as_deref(),
                                 fallbacks,
+                                gate: gate.as_ref(),
                             },
                         )
                     })
@@ -1336,10 +1417,17 @@ impl Service {
                     .await
             }
             Command::Stats => {
-                let (waiting, running, queued, paced, pending_bytes) = store
+                let (waiting, running, queued, paced, pending_bytes, approvals) = store
                     .op("counts", |db| {
                         let (waiting, running, queued, paced) = db.counts()?;
-                        Ok((waiting, running, queued, paced, db.pending()?.1))
+                        Ok((
+                            waiting,
+                            running,
+                            queued,
+                            paced,
+                            db.pending()?.1,
+                            db.approval_requests()?,
+                        ))
                     })
                     .await?;
                 let (waiters, retained) = self.handles.stats();
@@ -1354,6 +1442,7 @@ impl Service {
                     "active_limit": self.limit_active,
                     "waiting_turns": waiting,
                     "paced_turns": paced,
+                    "approval_requests": approvals,
                     "queued_turns": queued,
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
@@ -1368,6 +1457,70 @@ impl Service {
                     "handles": {"waiters": waiters, "retained": retained},
                     "draining": self.draining,
                 }))
+            }
+            Command::Answer {
+                bot,
+                turn,
+                call_id,
+                request,
+                tag,
+                decision,
+                reason,
+                by,
+            } => {
+                let allow = match decision.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    _ => return fail_with("invalid_decision", "allow or deny"),
+                };
+                if call_id.is_empty() || call_id.len() > 256 {
+                    return fail("invalid_call_id");
+                }
+                if let Some(tag) = &tag {
+                    name(tag).map_err(|_| Error::new("invalid_approver"))?;
+                }
+                if reason.as_ref().is_some_and(|r| r.len() > 16 * 1024) {
+                    return fail("reason_limit");
+                }
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail("invalid_by");
+                }
+                let name = bot.clone();
+                let answered = store
+                    .op("answer", move |db| {
+                        db.answer(Answer {
+                            bot: &name,
+                            turn,
+                            call_id: &call_id,
+                            request,
+                            tag: tag.as_deref(),
+                            allow,
+                            reason: reason.as_deref(),
+                            by: by.as_deref(),
+                        })
+                    })
+                    .await?;
+                // The answer is durable or held by the worker by now; only
+                // then does the turn look for it.
+                if let Some(notify) = answered.notify {
+                    notify.notify_one();
+                }
+                if answered.resume {
+                    self.handles.wake(bot, turn);
+                }
+                Ok(answered.reply)
+            }
+            Command::Approvals {
+                bot,
+                tag,
+                after,
+                limit,
+            } => {
+                store
+                    .op("approvals", move |db| {
+                        db.approvals(bot.as_deref(), tag.as_deref(), after, limit.unwrap_or(64))
+                    })
+                    .await
             }
             Command::Wait {
                 handles,
@@ -1417,10 +1570,14 @@ impl Service {
                 budget_tokens,
                 created_by,
                 created_by_id,
+                approve,
+                approver,
+                approve_expire_ms,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
+                let gate = gate(approve, approver, approve_expire_ms)?;
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;
@@ -1437,6 +1594,7 @@ impl Service {
                                 budget_tokens,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
+                                gate: gate.as_ref(),
                             },
                         )
                     })
@@ -1898,6 +2056,7 @@ mod tests {
                         compaction_instructions: None,
                         compaction_model: None,
                         fallbacks: false,
+                        gate: None,
                     },
                 )?;
                 let turn = db
@@ -1977,6 +2136,7 @@ mod tests {
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
             draining: false,
+            approval_hold: Duration::from_secs(2),
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -2099,6 +2259,7 @@ mod tests {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            gate: None,
         };
         let turn = store
             .op("create", move |db| {
@@ -2174,6 +2335,7 @@ mod tests {
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
             draining: false,
+            approval_hold: Duration::from_secs(2),
         };
         let duplicate = service
             .dispatch(
@@ -2253,6 +2415,7 @@ mod tests {
                                 compaction_instructions: None,
                                 compaction_model: None,
                                 fallbacks: false,
+                                gate: None,
                             },
                         )?;
                         let turn = db

@@ -18,6 +18,7 @@ fn binding(family: Family) -> Binding<'static> {
         compaction_instructions: None,
         compaction_model: None,
         fallbacks: false,
+        gate: None,
     }
 }
 

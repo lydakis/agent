@@ -1,7 +1,9 @@
 # Approving tool calls: a manual approver and a fast automatic one
 
-Status: design note, 2026-09-26. Nothing here is built. Code facts are from
-lydakis/agent at b07080c. Peer facts were read on 2026-09-26 from the pages
+Status: design note, 2026-09-26. The daemon mechanism and manual answering
+are built; the automatic approver is not (see [Built so far](#built-so-far)).
+Code facts in the sections below are from lydakis/agent at b07080c, before
+any of it was built. Peer facts were read on 2026-09-26 from the pages
 linked in each section; blog claims are marked as claims. The latency figure
 for the socket hop and the tool mix were measured for this note; the Jev
 figures come from the 2026-09-19 probe in [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#jev-data-points-for-compaction).
@@ -940,6 +942,38 @@ as one.
    socket, against the same screen without `approve`; then the park path
    with a delayed answer, counting its commits, and a verdict that
    arrives while the turn is parked on an earlier `wait`.
+
+## Built so far
+
+Built on 2026-09-26, documented in [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#tool-approval):
+
+- The daemon mechanism: gates on `create` and `fork` (`approve`, `approver`,
+  and `approve_expire_ms` for a gate's expiry), their inheritance, the
+  `approval_requested` event in the plan commit, `answer`, `approvals`,
+  verdicts on `tool_started` and as a denial result, the hold and the park,
+  expiry, and a new request for the rest of a round after a failure.
+  Ungated bots skip all of it.
+- Manual mode in the CLI: `--approval manual` or `AGENT_APPROVAL`,
+  `--approve`, `agent approvals`, `agent answer`, and the pending call
+  with its answering command in `run --pretty`. The CLI answers with
+  `by: "cli"`.
+
+Where it differs from the design above:
+
+- A verdict that lands as the hold runs out and decides the call is taken
+  at once: the turn does not park. One that leaves a gate open is written
+  with the park.
+- `stats` reports `approval_requests`, the calls announced and not yet
+  started or denied, rather than counting pending gates.
+- A verdict committed for a parked turn just before a crash is picked up
+  at the next start, which checks every turn parked on a verdict once.
+
+Not built yet: the automatic approver (rules and Jev), with
+`serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`
+and the `path_changed` check; the `denials` counts; `from` and
+`AGENT_TURN`; and the app's cards. `--approval auto` is refused with
+`approval_mode_unsupported` until the approver exists, rather than
+creating bots whose gates nobody answers.
 
 ## Open decisions
 
