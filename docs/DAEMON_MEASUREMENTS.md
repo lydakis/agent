@@ -4751,8 +4751,9 @@ Changes:
   10 ms to one second, while its bot stays durably busy. Only shutdown stops
   the retries; the turn is then left for the next start, and the daemon exits
   with the error after draining the other completions. An interrupt during
-  the retries ends the turn as interrupted. A queued or paced turn the store
-  cannot start stays ready and is tried again with the same backoff.
+  the retries ends the turn as interrupted. A queued turn the store cannot
+  start stays ready, and a parked turn it cannot resume stays parked; each
+  is tried again with the same backoff.
 - `stats` counts jobs answered `storage_error` per operation and in total,
   so a refusal is visible without the daemon's stderr.
 

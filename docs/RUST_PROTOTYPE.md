@@ -683,8 +683,9 @@ back once their commit lands, faster than any client reads them, so an
 admission also waits when its session's output queue could not take what it
 and the admissions already queued for that session will send: each reply,
 and its event once for each way the session follows the bot (by name,
-through `*`, or as the stdio firehose). Events reach followers after the
-reply, from the publisher, so an answered admission's events keep their room
+through `*`, or as the stdio firehose). Events reach followers from the
+publisher, which runs apart from replies, so an admission's event can arrive
+before or after its reply; an answered admission's events keep their room
 until the publisher has delivered them. An admission that finds nothing
 queued still waits for those events when they and it would not fit
 together, so it cannot commit ahead of an overflow they cause; past that it
@@ -1495,8 +1496,9 @@ needs, and one optional policy composes them:
   stays durably busy and other bots go on; `stats` counts each refusal under
   the `finish` operation's `storage_errors`. An interrupt that arrives
   during the retries is honored: the next attempt ends the turn as
-  interrupted. A queued turn the store cannot start, or a paced turn it
-  cannot resume, stays ready and is tried again with the same backoff.
+  interrupted. A queued turn the store cannot start stays ready, and a
+  parked turn it cannot resume stays parked; each is tried again with the
+  same backoff.
   Only shutdown stops the retries:
   the turn stays running in the store, the next start ends it as
   interrupted, and the daemon exits with the storage error after draining

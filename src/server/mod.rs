@@ -1425,7 +1425,6 @@ impl Service {
             }
             pending => pending?,
         };
-        self.storage_backoff = Duration::ZERO;
         if pending {
             self.spawn(bot, turn, true, false);
         }
@@ -1591,6 +1590,9 @@ impl Service {
             // A slot opened, and a finish may promote the bot's next turn.
             self.ready_hint = true;
         }
+        if !matches!(exit, turn::Exit::Unresumed) {
+            self.storage_backoff = Duration::ZERO;
+        }
         match exit {
             turn::Exit::Finished(_) => {
                 // Interrupt may already have released the task's active slot.
@@ -1599,6 +1601,12 @@ impl Service {
             }
             turn::Exit::Paced(at) => self.paced.push(std::cmp::Reverse((at, bot, turn))),
             turn::Exit::Parked => {}
+            // The store refused its resume, so it is still parked: its
+            // wake-up comes due again after a backoff.
+            turn::Exit::Unresumed => {
+                let at = now_ms() + self.storage_retry().as_millis() as u64;
+                self.paced.push(std::cmp::Reverse((at, bot, turn)));
+            }
         }
         Ok(())
     }
@@ -3310,6 +3318,54 @@ mod tests {
         let std::cmp::Reverse((at, bot, turn)) = service.paced.peek().unwrap();
         assert_eq!((bot.as_str(), *turn), ("Bob", bob), "due again");
         assert!(*at > now_ms() - 1000);
+        assert!(service.storage_backoff > Duration::ZERO);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resume_the_store_refuses_leaves_the_turn_parked() {
+        let dir = scratch("resume-write-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        // The wake-up's check only reads, so it passes; the resume's own
+        // write is what the store refuses.
+        lose_bobs_status_changes(&path, true);
+        let mut service = admitting(&store, 1024);
+        service.resume("Bob".into(), bob).await.unwrap();
+        assert!(service.active.contains_key("Bob"), "the check passed");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.stats()["operations"]["resume"]["storage_errors"]
+            .as_u64()
+            .unwrap_or(0)
+            == 0
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "resume never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        lose_bobs_status_changes(&path, false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "paced", "still parked, not ended");
+        assert!(service.active.is_empty());
+        let std::cmp::Reverse((_, bot, turn)) = service.paced.peek().unwrap();
+        assert_eq!((bot.as_str(), *turn), ("Bob", bob), "due again");
         assert!(service.storage_backoff > Duration::ZERO);
         drop(service);
         drop(store);
