@@ -587,19 +587,21 @@ impl Turn {
     /// Elision at a round boundary: tool results the model has answered,
     /// older than the newest `compact_keep` percent of the budget, go to it
     /// as stubs from this request on. No model call; each result stays whole
-    /// in the store and the read tool returns it. Unless the window cannot
-    /// fit without it (`forced`), a move must save a sixteenth of the budget,
-    /// so a context of mostly other text does not rewrite its cached prefix
-    /// each round for a little room. Returns whether the floor moved.
+    /// in the store and the read tool returns it. A move must save a
+    /// sixteenth of the budget, so a context of mostly other text does not
+    /// rewrite its cached prefix each round for a little room. When the
+    /// window cannot fit without it (`forced`), every answered result goes,
+    /// whatever the keep target, and any saving counts. Returns whether the
+    /// floor moved.
     async fn elide(&self, prefix: usize, forced: bool) -> Result<bool> {
         let limit = self.input_limit();
-        let keep = (self.context_bytes / 100 * self.compact_keep)
-            .min(limit.bytes.saturating_sub(prefix) * self.compact_keep / self.compact_at)
-            .max(1) as i64;
-        let min_saving = if forced {
-            1
+        let (keep, min_saving) = if forced {
+            (0, 1)
         } else {
-            (self.context_bytes / 16) as i64
+            let keep = (self.context_bytes / 100 * self.compact_keep)
+                .min(limit.bytes.saturating_sub(prefix) * self.compact_keep / self.compact_at)
+                .max(1);
+            (keep as i64, (self.context_bytes / 16) as i64)
         };
         let bot = self.bot.clone();
         let Some(plan) = self
@@ -976,6 +978,9 @@ impl Turn {
         let mut model_rounds = context.model_rounds;
         // This bot's tools, encoded once per distinct selection and shared.
         let tools = self.registry.encoded(provider.family(), &record.tools)?;
+        // A stub names the `read` call that returns its result, so only a
+        // bot that has the tool elides.
+        let elides = record.tools.iter().any(|tool| tool == "read");
         // Steers submitted since the last boundary go in before this call.
         self.absorb().await?;
         while model_rounds < MAX_ROUNDS {
@@ -1009,7 +1014,7 @@ impl Turn {
                 // The current turn outgrew the budget: elide what the model
                 // has answered, then look again.
                 Err(error) if error.code == "context_limit" => {
-                    if !self.elide(0, true).await? {
+                    if !elides || !self.elide(0, true).await? {
                         return Err(error);
                     }
                     self.context(
@@ -1021,7 +1026,8 @@ impl Turn {
                 }
                 Err(error) => return Err(error),
             };
-            if !resuming
+            if elides
+                && !resuming
                 && self.elision_due(&context, output_bytes)
                 && self.elide(context.prefix.bytes.len(), false).await?
             {

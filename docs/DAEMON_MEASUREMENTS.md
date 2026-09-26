@@ -4732,6 +4732,10 @@ every request under it, the newest result is never a stub, `read` returns an
 elided result, and a historical fork binds the floor at its checkpoint; two
 turns of ten such rounds in 32 KiB compact once, with the summarizer reading
 the first turn's stubs (without that, the stored span exceeded the budget
-and no summary was attempted); on the Anthropic family, thinking stays
-bound under prefix enforcement across floor moves. No live provider run was
-made for this change.
+and no summary was attempted); a turn that overflows while large answered
+results are still inside the keep target stubs them and completes (it
+ended with `context_limit` when the forced move kept that target); a bot
+without `read` never elides; on the Anthropic family, thinking stays bound
+under prefix enforcement across floor moves. A store test pages a result
+of one 80 KB line back whole in pieces. No live provider run was made for
+this change.

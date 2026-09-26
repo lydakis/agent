@@ -91,7 +91,7 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -845,10 +845,42 @@ impl Registry {
 /// Number lines from a 1-based offset within the page budget. A single line
 /// beyond the budget is an explicit error rather than a silent cut.
 pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
-    let total = text.lines().count();
+    page(text.lines(), offset, limit)
+}
+
+/// The widest piece `page_pieces` numbers as a line.
+pub const PIECE_BYTES: usize = 4096;
+
+/// `page_lines` with every line longer than `PIECE_BYTES` split at
+/// character boundaries into numbered pieces, so a text with no byte-level
+/// reader, such as one stored tool result on a single line, pages whole.
+pub fn page_pieces(text: &str, offset: usize, limit: usize) -> Result<String> {
+    page(text.lines().flat_map(pieces), offset, limit)
+}
+
+fn pieces(line: &str) -> impl Iterator<Item = &str> + Clone {
+    let mut rest = Some(line);
+    std::iter::from_fn(move || {
+        let line = rest?;
+        if line.len() <= PIECE_BYTES {
+            rest = None;
+            return Some(line);
+        }
+        let (piece, tail) = line.split_at(boundary(line, PIECE_BYTES));
+        rest = Some(tail);
+        Some(piece)
+    })
+}
+
+fn page<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    offset: usize,
+    limit: usize,
+) -> Result<String> {
+    let total = lines.clone().count();
     let mut output = String::new();
     let mut shown = 0;
-    for (index, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+    for (index, line) in lines.enumerate().skip(offset - 1).take(limit) {
         // Reserve space for continuation/line-count notices. Check
         // lengths before copying a potentially multi-megabyte line.
         let prefix = format!("{:>6}\t", index + 1);

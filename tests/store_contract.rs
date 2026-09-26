@@ -5439,11 +5439,62 @@ fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
 }
 
 #[test]
-fn schema_29_writes_stubs_for_stored_results() {
+fn a_result_on_one_line_reads_back_whole_in_pieces() {
+    // A shell result is one JSON line, often longer than a read page.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let wide = format!("{}{}", "é".repeat(30_000), "z".repeat(50_000));
+    let (_, node) = exchange(&mut db, turn, "wide", &format!("short\n{wide}\nend"));
+    let mut read = Vec::new();
+    let mut offset = 1;
+    loop {
+        let page = db.result_lines("Bob", node, offset, 5000).unwrap();
+        assert!(page.len() < agent_runtime::tools::PREVIEW_BYTES);
+        let mut next = None;
+        for line in page.lines() {
+            match line.split_once('\t') {
+                Some((number, piece)) if number.trim().parse::<usize>().is_ok() => {
+                    read.push(piece.to_owned())
+                }
+                _ => {
+                    if let Some(n) = line.split("offset=").nth(1) {
+                        next = Some(n.trim_end_matches(']').parse::<usize>().unwrap());
+                    }
+                }
+            }
+        }
+        match next {
+            Some(n) => offset = n,
+            None => break,
+        }
+    }
+    assert_eq!(read.first().unwrap(), "short");
+    assert_eq!(read.last().unwrap(), "end");
+    let pieces = &read[1..read.len() - 1];
+    assert!(
+        pieces
+            .iter()
+            .all(|p| p.len() <= agent_runtime::tools::PIECE_BYTES)
+    );
+    assert_eq!(pieces.concat(), wide);
+}
+
+#[test]
+fn schema_29_adds_elision_without_rewriting_stored_results() {
     let path = std::env::temp_dir().join(format!("agent-stubs-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    // Every node's own and cumulative savings, and every stub, as written.
-    let recorded = |path: &std::path::Path| {
+    let savings = |path: &std::path::Path| {
         let conn = Connection::open(path).unwrap();
         let nodes: Vec<(i64, i64, i64)> = conn
             .prepare("SELECT id,elided,total_elided FROM nodes ORDER BY id")
@@ -5452,16 +5503,16 @@ fn schema_29_writes_stubs_for_stored_results() {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        let stubs: Vec<(i64, Vec<u8>)> = conn
-            .prepare("SELECT node,item FROM stubs ORDER BY node")
+        let stubs: Vec<i64> = conn
+            .prepare("SELECT node FROM stubs ORDER BY node")
             .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_map([], |r| r.get(0))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         (nodes, stubs)
     };
-    let expected = {
+    let old = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let turn = db
@@ -5477,20 +5528,11 @@ fn schema_29_writes_stubs_for_stored_results() {
             .turn;
         exchange(&mut db, turn, "small", "short");
         exchange(&mut db, turn, "large", &lines(0, 400));
-        exchange(&mut db, turn, "larger", &lines(0, 800));
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         drop(db);
-        recorded(&path)
+        savings(&path).0.iter().map(|n| n.0).collect::<Vec<_>>()
     };
-    assert_eq!(expected.1.len(), 2);
-    // Savings accumulate along the lineage, as byte totals do.
-    let (nodes, _) = &expected;
-    assert!(nodes.windows(2).all(|w| w[1].2 == w[0].2 + w[1].1));
-    assert_eq!(
-        nodes.last().unwrap().2,
-        nodes.iter().map(|n| n.1).sum::<i64>()
-    );
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -5500,19 +5542,38 @@ fn schema_29_writes_stubs_for_stored_results() {
         )
         .unwrap();
     }
-    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    assert_eq!(recorded(&path), expected);
+    // Opening reads no stored result: earlier results have no stub and no
+    // saving, and are always sent whole.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(db.inspect("Bob").unwrap().elision, None);
-    // A stub's saving is what sending it instead of its result saves.
-    let conn = Connection::open(&path).unwrap();
-    for (node, stub) in &expected.1 {
-        let (item, saves): (Vec<u8>, i64) = conn
-            .query_row("SELECT item,elided FROM nodes WHERE id=?", [node], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(saves as usize, item.len() - stub.len());
-    }
+    let (nodes, stubs) = savings(&path);
+    assert_eq!(nodes, old.iter().map(|&id| (id, 0, 0)).collect::<Vec<_>>());
+    assert!(stubs.is_empty());
+    // A result recorded after the migration gets its stub, and savings
+    // accumulate from there.
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "later", &lines(0, 400));
+    exchange(&mut db, turn, "last", "short");
+    let (nodes, stubs) = savings(&path);
+    assert_eq!(stubs.len(), 1);
+    let saved = nodes.iter().find(|n| n.0 == stubs[0]).unwrap().1;
+    assert!(saved > 0);
+    assert_eq!(nodes.last().unwrap().2, saved);
+    assert!(nodes.windows(2).all(|w| w[1].2 == w[0].2 + w[1].1));
+    // The floor moves over it and leaves the earlier result whole.
+    db.window("Bob", 1 << 20, 1 << 20).unwrap();
+    let plan = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    assert_eq!((plan.results, plan.saved_bytes), (1, saved));
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

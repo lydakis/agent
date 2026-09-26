@@ -121,14 +121,19 @@ class Model(http.server.BaseHTTPRequestHandler):
             elif user.startswith('long:'):
                 # One long task: a shell call a round, each result about
                 # 11 KiB, then a read of the first elided result, then done.
+                # `long:COUNTxLINES,...` sets each round's lines instead.
                 start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user')
                 calls = [i for i in request['input'][start:] if i.get('type') == 'function_call']
                 stubs = [i for i in request['input'] if i.get('type') == 'function_call_output'
                          and i['output'].startswith('[tool result elided')]
+                spec = user[5:]
+                sizes = ([600] * int(spec) if 'x' not in spec else
+                         [int(lines) for part in spec.split(',')
+                          for count, lines in [part.split('x')] for _ in range(int(count))])
                 text = ''
-                if len(calls) < int(user[5:]):
+                if len(calls) < len(sizes):
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{len(calls)}',
-                               'arguments': json.dumps({'command': f"seq -f 'round {len(calls)} line %g' 1 600",
+                               'arguments': json.dumps({'command': f"seq -f 'round {len(calls)} line %g' 1 {sizes[len(calls)]}",
                                                         'timeout_ms': 5000})}]
                 elif stubs and not any(c['name'] == 'read' for c in calls):
                     reference = re.search(r'artifact "(result/[0-9]+)"', stubs[0]['output']).group(1)
@@ -352,7 +357,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 return
             if not summary:
                 assert 'tool_choice' not in request
-            assert [t['name'] for t in request['tools']] == ['echo', 'shell']
+            assert [t['name'] for t in request['tools']][:2] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'

@@ -4075,7 +4075,7 @@ impl Database {
         let Some((_, _, output)) = super::context::tool_result(&item) else {
             return fail("result_not_found");
         };
-        crate::tools::page_lines(&output, offset, limit)
+        crate::tools::page_pieces(&output, offset, limit)
     }
     pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
         self.authorize_artifact(name, turn, call_id)?;
@@ -4618,8 +4618,10 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         [],
         |r| r.get::<_, bool>(0),
     )? {
-        // 28 -> 29: tool result stubs and versioned elision floors. Every
-        // stored result large enough gets the stub a new one is written with.
+        // 28 -> 29: tool result stubs and versioned elision floors, schema
+        // only. Results stored before have no stub and are always sent
+        // whole: a backfilled saving would change the cumulative total of
+        // every later node on its lineage, rewriting most of the store.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 item BLOB NOT NULL);
@@ -4630,47 +4632,6 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE nodes ADD COLUMN elided INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE nodes ADD COLUMN total_elided INTEGER NOT NULL DEFAULT 0;",
         )?;
-        migrate_stubs(conn)?;
-    }
-    Ok(())
-}
-/// Write the stub of every stored tool result that has one, reading only
-/// items long enough to need it, then each node's cumulative savings.
-fn migrate_stubs(conn: &Connection) -> Result<()> {
-    let mut saves = std::collections::HashMap::new();
-    {
-        let mut insert = conn.prepare("INSERT INTO stubs(node,item) VALUES (?,?)")?;
-        let mut select = conn.prepare("SELECT id,item FROM nodes WHERE length(item)>=?")?;
-        let mut rows = select.query([super::context::ELISION_MIN_SAVING as i64])?;
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let item: Vec<u8> = row.get(1)?;
-            let Some((family, call_id, output)) = super::context::tool_result(&item) else {
-                continue;
-            };
-            if let Some(stub) = super::context::stub(family, &call_id, &output, id, item.len())? {
-                insert.execute(params![id, stub])?;
-                saves.insert(id, (item.len() - stub.len()) as i64);
-            }
-        }
-    }
-    if saves.is_empty() {
-        return Ok(());
-    }
-    // Parents precede children, and id and parent sit ahead of the item in
-    // each row, so this pass reads no item. Only nonzero totals are held.
-    let mut totals = std::collections::HashMap::new();
-    let mut update = conn.prepare("UPDATE nodes SET elided=?,total_elided=? WHERE id=?")?;
-    let mut select = conn.prepare("SELECT id,parent FROM nodes ORDER BY id")?;
-    let mut rows = select.query([])?;
-    while let Some(row) = rows.next()? {
-        let (id, parent): (i64, Option<i64>) = (row.get(0)?, row.get(1)?);
-        let own = saves.get(&id).copied().unwrap_or(0);
-        let total = own + parent.and_then(|p| totals.get(&p).copied()).unwrap_or(0);
-        if total > 0 {
-            totals.insert(id, total);
-            update.execute(params![own, total, id])?;
-        }
     }
     Ok(())
 }
