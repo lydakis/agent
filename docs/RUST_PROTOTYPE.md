@@ -665,6 +665,20 @@ against writes the group lost. The outcomes it announced are dropped and the
 waiting-turn counts are recounted from the rows; if that recount fails, no
 job runs until one succeeds.
 
+Admissions (`create` and `submit`) reach that queue without the service
+awaiting each commit: it queues one and reads the next request, up to 32
+outstanding, so admissions that arrive together share a group, and one that
+arrives alone is queued at once and waits for nothing. Each is answered after
+its commit, in request order, and what followed the commit before (starting
+the turn, flagging a steer) happens as it is answered. Every other request
+waits until the queued admissions are answered. A submission told it may
+start a turn holds one `--max-active` slot until it is answered, so queued
+submissions never start more turns than the limit; when only promised slots
+stand between a submission and the limit, it waits too, since whether one
+frees up depends on how the earlier ones end. A burst therefore gets the
+answers it would get one request at a time. A lost group answers each of its
+admissions with `storage_error`, starts no turn, and frees their slots.
+
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
 references to these items with an explicit Content-Length. They do not rebuild

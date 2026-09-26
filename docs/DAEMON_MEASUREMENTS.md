@@ -4782,3 +4782,78 @@ kept none; which operation failed first for the three failed turns; and
 whether the host's disk was at zero at exactly those instants. The
 reproduction injects the error. A run on a nearly full disk image on macOS
 would settle the platform question.
+
+### Admission window
+
+Observed 2026-09-26 on a Linux x86_64 container (4 vCPUs), Rust 1.98.0,
+bundled SQLite. Baseline is `4260673`, this branch before the window (binary
+`a7e5561e…`); the candidate queues up to 32 admissions at once (binary
+`738cba82…`). The window-size builds are the candidate with only the
+constant changed. Slow storage uses the same `fsync` delay shim as
+[group commit](#group-commit).
+
+Before, the service awaited each `create` and `submit` commit before it read
+the next request, so admissions never shared a sync with each other; the
+[concurrent probe](#instrumented-operational-follow-up) saw replies arrive one
+commit apart. `bench.admission_burst` with 32 bots, builds alternating,
+medians of ten measured runs at native sync and eight at 2 ms:
+
+| Per phase | Serial, native | Window, native | Serial, 2 ms | Window, 2 ms |
+| --- | ---: | ---: | ---: | ---: |
+| 32 submissions at once, last reply | 37.3 ms | 5.2 ms | 113.8 ms | 7.5 ms |
+| Median reply | 13.0 ms | 4.8 ms | 49.1 ms | 7.2 ms |
+| Daemon CPU | 27.6 ms | 5.2 ms | 32.3 ms | 6.0 ms |
+| Write groups | 38 | 4 | 34 | 4 |
+| 32 creations at once, last reply | 15.8 ms | 4.1 ms | 90.2 ms | 6.5 ms |
+| Daemon CPU | 10.4 ms | 3.7 ms | 15.2 ms | 4.0 ms |
+| One submission alone, median / p99 | 1.25 / 2.34 ms | 1.26 / 2.75 ms | 5.69 / 11.37 ms | 5.72 / 11.23 ms |
+
+The burst rows' ranges do not overlap between builds. A submission that
+arrives alone is not delayed: its median and daemon CPU match, and its p99,
+the slowest of 32 samples per run, varies within the same range in both.
+Groups include the admitted turns' own start-up jobs.
+
+Window sizes, same bench, eight runs at native sync and six at 2 ms:
+
+| Window | Native: last reply / median | Groups | 2 ms: last reply / median | Daemon CPU at 2 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Serial | 41.2 / 13.9 ms | 38 | 114.4 / 48.6 ms | 30.8 ms |
+| 1 | 38.1 / 13.1 ms | 37 | 112.3 / 49.2 ms | 32.9 ms |
+| 4 | 12.3 / 5.2 ms | 11 | 30.7 / 15.0 ms | 16.4 ms |
+| 8 | 8.5 / 4.2 ms | 9.5 | 18.7 / 8.6 ms | 12.2 ms |
+| 16 | 5.9 / 3.1 ms | 5 | 12.2 / 5.3 ms | 7.1 ms |
+| 32 | 5.2 / 4.9 ms | 4 | 7.3 / 7.0 ms | 5.9 ms |
+
+A window of 16 answers half the burst after the first commit, so its median
+reply is the lowest; 32 answers the whole burst soonest with the least CPU,
+and its lead grows as syncs slow down. It also equals the storage worker's
+group limit and queue, so one full window fills one group. The default is 32.
+
+Sustained load, the group-commit screen above (64 bots resubmitting as each
+turn finishes, 200 ms model replies, 10 s measured), alternating pairs:
+
+| Injected sync | Serial turns/s | Window turns/s | Serial p50 / p95 ms | Window p50 / p95 ms | Jobs per commit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none | 305.6, 306.9 | 304.5, 306.0 | 208 / 219, 208 / 214 | 210 / 219, 209 / 216 | 2.8 → 3.9 |
+| 2 ms | 182.1, 185.1 | 266.0, 266.4 | 352 / 390, 342 / 386 | 237 / 267, 237 / 268 | 5.4 → 8.0 |
+| 10 ms | 56.9, 55.7 | 132.9, 129.7 | 1,113 / 1,252, 1,126 / 1,401 | 465 / 665, 493 / 674 | 5.2 → 12.4 |
+
+The serial baseline here runs 56 turns/s at 10 ms, not group commit's 37,
+because completions have since moved to the turn tasks. With no injected
+delay both stay at the model's ceiling of 320.
+
+Memory: idle RSS was 17.8 MiB for both, and after 32 one-at-a-time
+submissions 19.2 and 19.3 MiB with overlapping ranges. After the burst
+phases RSS was 20.5 MiB serial and 20.8 MiB windowed, ranges not
+overlapping. Up to 32 admissions and their replies now live at once; what
+holds the extra 0.3 MiB was not isolated.
+
+Ordering tests cover a shared commit answered in request order, a retry and
+busy work queued behind the admission they depend on, the active limit with
+a promised slot that goes unused, a lost group commit that starts nothing
+and frees its slots, an interrupt behind the admission it names, and four
+clients sending the same submission at once. Shutdown with queued
+admissions is covered by reading the code, not by a test. All of this is one
+Linux container with an injected sync delay; macOS, where a flush costs
+about 5.4 ms, is not measured. The burst uses one connection; many clients
+arrive interleaved, which the Python test exercises but no timing does.

@@ -252,6 +252,19 @@ impl Counters {
         })
     }
 }
+/// A queued job's answer, ready once its group's commit is known.
+pub struct Answer<T>(oneshot::Receiver<Result<T>>);
+impl<T> std::future::Future for Answer<T> {
+    type Output = Result<T>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<T>> {
+        std::pin::Pin::new(&mut self.0)
+            .poll(context)
+            .map(|answer| answer.unwrap_or_else(|_| Err(Error::new("storage_worker_failed"))))
+    }
+}
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Box<dyn Job>>,
@@ -545,12 +558,30 @@ impl Store {
     ) -> Result<T> {
         self.enqueue(label, Some(bot), operation).await
     }
+    /// Queue a job without waiting for its answer: returns once the worker's
+    /// queue holds it, so a caller can queue more before any of them commits.
+    /// Jobs run in the order they are queued.
+    pub async fn queue<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<Answer<T>> {
+        self.send(label, None, operation).await
+    }
     async fn enqueue<T: Send + 'static>(
         &self,
         label: &'static str,
         pruning_bot: Option<String>,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.send(label, pruning_bot, operation).await?.await
+    }
+    async fn send<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        pruning_bot: Option<String>,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<Answer<T>> {
         let (reply, receiver) = oneshot::channel();
         self.sender
             .send(Box::new(Queued {
@@ -568,9 +599,7 @@ impl Store {
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;
-        receiver
-            .await
-            .map_err(|_| Error::new("storage_worker_failed"))?
+        Ok(Answer(receiver))
     }
     /// Run a read on the reader connection, counted like any job. Only for
     /// reads whose result is bytes for a caller, never for decisions that

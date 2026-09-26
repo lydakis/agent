@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Binding, Bot, Delivery, Fork, Publication, Store, TurnOptions},
+    store::{Answer, Binding, Bot, Delivery, Fork, Publication, Started, Store, TurnOptions},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -32,6 +32,13 @@ use tokio::{
     task::JoinSet,
 };
 use turn::Turn;
+
+/// Most admissions (submissions and creations) whose commits may be pending
+/// at once. The service queues each with the storage worker and goes on to
+/// the next request, so admissions that arrive together share a commit; an
+/// idle one waits for no company. Anything else waits for those already
+/// queued, and they are answered in the order they arrived.
+const ADMISSION_WINDOW: usize = 32;
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -485,6 +492,55 @@ struct Service {
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
+    /// Admissions queued with the storage worker and not yet answered,
+    /// oldest first: the worker answers in queue order.
+    admissions: std::collections::VecDeque<Admission>,
+    /// Active slots promised to queued admissions told they may start a
+    /// turn; each is released when its admission is answered.
+    reserved: usize,
+}
+
+/// A queued admission and whom to answer.
+struct Admission {
+    session: u64,
+    output: Output,
+    id: Value,
+    pending: Pending,
+}
+enum Pending {
+    Submit {
+        bot: String,
+        request_id: String,
+        delivery: Delivery,
+        /// Holds one of `reserved`.
+        reserved: bool,
+        draining: bool,
+        answer: Answer<(i64, Started)>,
+        answered: Option<Result<(i64, Started)>>,
+    },
+    Create {
+        answer: Answer<Value>,
+        answered: Option<Result<Value>>,
+    },
+    /// Settled before queueing (a refused request), kept in line so replies
+    /// stay in request order.
+    Settled(Result<Value>),
+}
+
+/// Wait for the oldest admission's answer and keep it with the admission.
+/// Cancel-safe: the answer is stored in the same poll that receives it.
+/// Borrows only the queue, so the run loop can select on it.
+async fn arrived(admissions: &mut std::collections::VecDeque<Admission>) {
+    let front = admissions.front_mut().expect("an admission is queued");
+    match &mut front.pending {
+        Pending::Submit {
+            answer, answered, ..
+        } if answered.is_none() => *answered = Some(answer.await),
+        Pending::Create { answer, answered } if answered.is_none() => {
+            *answered = Some(answer.await)
+        }
+        _ => {}
+    }
 }
 
 /// A bot's live turn: which turn, the task owning it, its cancel signal,
@@ -749,6 +805,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         tokens: Arc::default(),
         paced: std::collections::BinaryHeap::new(),
         draining: false,
+        admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
+        reserved: 0,
     };
     for (at, bot, turn) in paced_at_start {
         service.paced.push(std::cmp::Reverse((at, bot, turn)));
@@ -786,7 +844,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // Idle means no client, no live turn, and no running command.
                 // Parked turns are durable and resume on the next start.
                 let running = service.store.op("running_processes", |db| db.running_processes()).await?;
-                if sessions.is_empty() && service.active.is_empty() && running == 0 {
+                if sessions.is_empty() && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
                     if last_activity.elapsed() >= idle_exit.unwrap() { break; }
                 } else {
                     last_activity = std::time::Instant::now();
@@ -808,6 +866,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                     service.resume(bot, turn).await?;
                 }
             }
+            // Queued admissions are answered as their commits land, in order.
+            _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
+                let (session, output, id, result) = service.settled();
+                reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+            }
             message = inbound.recv() => {
                 let Some(message) = message else { break };
                 last_activity = std::time::Instant::now();
@@ -826,31 +889,33 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     Inbound::Request(id, request) => {
                         let Some(output) = sessions.get(&id).cloned() else { continue };
+                        // Everything but an admission with room waits for the
+                        // admissions already queued, keeping request order.
+                        while service.must_settle(request.as_ref().ok().map(|r| &r.command)) {
+                            let (session, output, id, result) = service.settle().await;
+                            reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                        }
                         let (request_id, result, shutdown) = match request {
                             Ok(request) if request.id.is_u64() || request.id.as_str().is_some_and(|id| id.len() <= 128) => {
                                 let shutdown = match request.command {
                                     Command::Shutdown { grace_ms } => Some(grace_ms),
                                     _ => None,
                                 };
+                                let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
                                 let result = service.dispatch(request.command, id, &output, request.id.clone()).await;
                                 if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
+                                // A refused admission still answers after those queued before it.
+                                if admission && !service.admissions.is_empty() {
+                                    service.admissions.push_back(Admission { session: id, output, id: request.id, pending: Pending::Settled(result) });
+                                    continue;
+                                }
                                 (request.id, result, shutdown)
                             }
                             Ok(_) => (Value::Null, fail("invalid_request_id"), None),
                             Err(error) => (Value::Null, Err(error), None),
                         };
                         let shutdown = shutdown.filter(|_| result.is_ok());
-                        if id == 0 && stdio_owner {
-                            if !matches!(tokio::time::timeout(Duration::from_secs(5), output.respond(request_id, result)).await, Ok(Ok(()))) {
-                                return fail("output_closed");
-                            }
-                        } else if output.try_respond(request_id, result).is_err() {
-                            sessions.remove(&id);
-                            service.sessions = sessions.len();
-                            service.hub.close_session(id);
-                            service.handles.close_session(id);
-                            output.close();
-                        }
+                        reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
                         if let Some(grace_ms) = shutdown {
                             // A later shutdown can only bring the deadline closer.
                             let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
@@ -872,6 +937,21 @@ pub async fn run(config: Configuration) -> Result<()> {
     // explicit pruning can be reissued. Await drops before joining stdout.
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
+    // Admissions already queued are answered and their turns started, so
+    // shutdown ends those turns like any other running turn.
+    while !service.admissions.is_empty() {
+        let (session, output, id, result) = service.settle().await;
+        let _ = reply(
+            &mut service,
+            &mut sessions,
+            stdio_owner,
+            session,
+            &output,
+            id,
+            result,
+        )
+        .await;
+    }
     // Release every slot as it is cancelled: a turn interrupted earlier keeps
     // its first cause, and its dropped sender still stops a finish retry.
     for active in std::mem::take(&mut service.active).into_values() {
@@ -954,7 +1034,106 @@ fn validate_provider(
 
 impl Service {
     fn has_capacity(&self) -> bool {
-        !self.draining && (self.limit_active == 0 || self.active.len() < self.limit_active)
+        !self.draining
+            && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
+    }
+
+    /// Whether a request must wait for queued admissions to be answered
+    /// before it is handled. Only an admission may join them, and only while
+    /// the window has room and its capacity answer is the one the serial
+    /// order would give: with no slot left unpromised, whether one frees up
+    /// depends on how the queued admissions end.
+    fn must_settle(&self, command: Option<&Command>) -> bool {
+        if self.admissions.is_empty() {
+            return false;
+        }
+        match command {
+            Some(Command::Create { .. }) => self.admissions.len() >= ADMISSION_WINDOW,
+            Some(Command::Submit { .. }) => {
+                self.admissions.len() >= ADMISSION_WINDOW
+                    || (!self.draining
+                        && self.limit_active != 0
+                        && self.reserved > 0
+                        && self.active.len() + self.reserved >= self.limit_active)
+            }
+            _ => true,
+        }
+    }
+
+    /// Answer the oldest queued admission once its commit is known.
+    async fn settle(&mut self) -> (u64, Output, Value, Result<Value>) {
+        arrived(&mut self.admissions).await;
+        self.settled()
+    }
+    /// Answer the oldest admission, whose commit `arrived` has seen, applying
+    /// what the serial path did after its store call: start the turn, flag a
+    /// steer, release the reserved slot.
+    fn settled(&mut self) -> (u64, Output, Value, Result<Value>) {
+        let Admission {
+            session,
+            output,
+            id,
+            pending,
+        } = self.admissions.pop_front().expect("an admission is queued");
+        let result = match pending {
+            Pending::Submit {
+                bot,
+                request_id,
+                delivery,
+                reserved,
+                draining,
+                answered,
+                ..
+            } => {
+                self.reserved -= usize::from(reserved);
+                let answered = answered.expect("the submission was answered");
+                self.admitted(bot, request_id, delivery, draining, answered)
+            }
+            Pending::Create { answered, .. } => answered.expect("the creation was answered"),
+            Pending::Settled(result) => result,
+        };
+        (session, output, id, result)
+    }
+
+    /// After a submission's commit: start its turn if it runs now, and
+    /// make its reply.
+    fn admitted(
+        &mut self,
+        bot: String,
+        request_id: String,
+        delivery: Delivery,
+        draining: bool,
+        result: Result<(i64, Started)>,
+    ) -> Result<Value> {
+        // While draining no turn starts: `reject` work is refused for the
+        // next daemon, and queued work waits durably for it.
+        let (identity, started) = result.map_err(|error| match error.code.as_str() {
+            "active_agent_limit" if draining => Error::new("daemon_draining"),
+            _ => error,
+        })?;
+        let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
+        if started.fresh && started.status == "running" {
+            self.spawn(bot.clone(), started.turn, false, false);
+        }
+        // The running turn may have started after the steer was queued, from
+        // an admission answered in between.
+        if started.fresh
+            && started.status == "queued"
+            && delivery == Delivery::Steer
+            && let Some(active) = self.active.get(&bot)
+        {
+            active
+                .steers
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if started.status == "ready" {
+            self.ready_hint = true;
+        }
+        Ok(
+            json!({"bot":bot,"bot_id":identity,"turn":started.turn,"request_id":request_id,
+            "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
+            "handle":format!("turn:{bot}/{}", started.turn)}),
+        )
     }
 
     /// How long until the earliest paced turn is due.
@@ -1131,7 +1310,7 @@ impl Service {
         command: Command,
         session: u64,
         output: &Output,
-        request_id: Value,
+        id: Value,
     ) -> Result<Value> {
         let store = &self.store;
         match command {
@@ -1196,9 +1375,9 @@ impl Service {
                     }
                 }
                 let (provider, model) = (provider.to_owned(), model.to_owned());
-                let (created, event) = store
-                    .op("create", move |db| {
-                        db.create(
+                let answer = store
+                    .queue("create", move |db| {
+                        let (created, _event) = db.create(
                             &bot,
                             path.as_deref(),
                             Binding {
@@ -1215,11 +1394,20 @@ impl Service {
                                 compaction_model: compaction_model.as_deref(),
                                 fallbacks,
                             },
-                        )
+                        )?;
+                        Ok(serde_json::to_value(created)?)
                     })
                     .await?;
-                let _ = event;
-                Ok(serde_json::to_value(created)?)
+                self.admissions.push_back(Admission {
+                    session,
+                    output: output.clone(),
+                    id,
+                    pending: Pending::Create {
+                        answer,
+                        answered: None,
+                    },
+                });
+                Err(Error::new("deferred"))
             }
             Command::Turns { bot, after, limit } => {
                 store
@@ -1279,7 +1467,7 @@ impl Service {
                         Ok(deleted)
                     }
                     .await;
-                    retention_reply(session, &output, request_id, result).await;
+                    retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
             }
@@ -1319,7 +1507,7 @@ impl Service {
                         }
                     }
                     .await;
-                    retention_reply(session, &output, request_id, result).await;
+                    retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
             }
@@ -1403,7 +1591,7 @@ impl Service {
                         Completion::Respond {
                             session,
                             output: output.clone(),
-                            request: request_id,
+                            request: id,
                         },
                     )
                     .await;
@@ -1554,47 +1742,60 @@ impl Service {
                     delivery,
                     expected_turn,
                 };
+                // A slot is promised before the commit that may take it, so
+                // admissions queued together cannot start more turns than
+                // the limit allows.
                 let capacity = self.has_capacity();
+                let reserved = capacity && self.limit_active != 0;
+                self.reserved += usize::from(reserved);
+                // A steer arms the running turn inside its committing job,
+                // as `end_queued` does, so no round boundary before the
+                // answer finds it waiting behind a cleared flag.
+                let steers = self
+                    .active
+                    .get(&bot)
+                    .filter(|_| delivery == Delivery::Steer)
+                    .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
-                let draining = self.draining;
-                let (identity, started) = store
-                    .op("begin", move |db| {
+                let queued = store
+                    .queue("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
                         let started =
                             db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
                                 validate_provider(&providers, bot, model)
                             })?;
+                        if started.fresh
+                            && started.status == "queued"
+                            && let Some(steers) = &steers
+                        {
+                            steers.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         Ok((identity, started))
                     })
-                    .await
-                    // While draining no turn starts: `reject` work is refused
-                    // for the next daemon, and queued work waits durably for it.
-                    .map_err(|error| match error.code.as_str() {
-                        "active_agent_limit" if draining => Error::new("daemon_draining"),
-                        _ => error,
-                    })?;
-                let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
-                if started.fresh && started.status == "running" {
-                    self.spawn(bot.clone(), started.turn, false, false);
-                }
-                if started.fresh
-                    && started.status == "queued"
-                    && delivery == Delivery::Steer
-                    && let Some(active) = self.active.get(&bot)
-                {
-                    active
-                        .steers
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                if started.status == "ready" {
-                    self.ready_hint = true;
-                }
-                Ok(
-                    json!({"bot":bot,"bot_id":identity,"turn":started.turn,"request_id":request_id,
-                    "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
-                    "handle":format!("turn:{bot}/{}", started.turn)}),
-                )
+                    .await;
+                let answer = match queued {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        self.reserved -= usize::from(reserved);
+                        return Err(error);
+                    }
+                };
+                self.admissions.push_back(Admission {
+                    session,
+                    output: output.clone(),
+                    id,
+                    pending: Pending::Submit {
+                        bot,
+                        request_id,
+                        delivery,
+                        reserved,
+                        draining: self.draining,
+                        answer,
+                        answered: None,
+                    },
+                });
+                Err(Error::new("deferred"))
             }
             Command::Interrupt { bot, turn } => {
                 if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
@@ -1689,6 +1890,35 @@ async fn commit_finish(
         }
         backoff = (backoff * 2).min(Duration::from_secs(1));
     }
+}
+
+/// Answer a request: the stdio owner gets bounded backpressure, and losing
+/// it ends the daemon; a socket client that cannot take the reply is dropped.
+async fn reply(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+    session: u64,
+    output: &Output,
+    id: Value,
+    result: Result<Value>,
+) -> Result<()> {
+    if session == 0 && stdio_owner {
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), output.respond(id, result)).await,
+            Ok(Ok(()))
+        ) {
+            return fail("output_closed");
+        }
+    } else if output.try_respond(id, result).is_err() {
+        if sessions.remove(&session).is_some() {
+            service.sessions = sessions.len();
+            service.hub.close_session(session);
+            service.handles.close_session(session);
+        }
+        output.close();
+    }
+    Ok(())
 }
 
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
@@ -2018,6 +2248,8 @@ mod tests {
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
             draining: false,
+            admissions: std::collections::VecDeque::new(),
+            reserved: 0,
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -2215,43 +2447,15 @@ mod tests {
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
             draining: false,
+            admissions: std::collections::VecDeque::new(),
+            reserved: 0,
         };
-        let duplicate = service
-            .dispatch(
-                Command::Submit {
-                    bot: "Bob".into(),
-                    bot_id: None,
-                    request_id: "same".into(),
-                    prompt: "work".into(),
-                    workspace: None,
-                    model: None,
-                    delivery: None,
-                    expected_turn: None,
-                },
-                0,
-                &output,
-                Value::Null,
-            )
+        let duplicate = request(&mut service, submit("Bob", "same"), &output)
             .await
             .unwrap();
         assert_eq!(duplicate["turn"], turn);
         assert_eq!(duplicate["duplicate"], true);
-        let error = service
-            .dispatch(
-                Command::Submit {
-                    bot: "Other".into(),
-                    bot_id: None,
-                    request_id: "new".into(),
-                    prompt: "work".into(),
-                    workspace: None,
-                    model: None,
-                    delivery: None,
-                    expected_turn: None,
-                },
-                0,
-                &output,
-                Value::Null,
-            )
+        let error = request(&mut service, submit("Other", "new"), &output)
             .await
             .unwrap_err();
         assert_eq!(error.code, "active_agent_limit");
@@ -2312,6 +2516,62 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn submit(bot: &str, request_id: &str) -> Command {
+        Command::Submit {
+            bot: bot.into(),
+            bot_id: None,
+            request_id: request_id.into(),
+            prompt: "work".into(),
+            workspace: None,
+            model: None,
+            delivery: None,
+            expected_turn: None,
+        }
+    }
+    /// Take requests the way the run loop does: an admission with room joins
+    /// the queue, anything else first waits for those queued. Returns every
+    /// answer, in the order the loop would send them, with each request's
+    /// index as its id.
+    async fn requests(
+        service: &mut Service,
+        commands: Vec<Command>,
+        output: &Output,
+    ) -> Vec<(Value, Result<Value>)> {
+        let mut answers = Vec::new();
+        for (index, command) in commands.into_iter().enumerate() {
+            while service.must_settle(Some(&command)) {
+                let (_, _, id, result) = service.settle().await;
+                answers.push((id, result));
+            }
+            let admission = matches!(command, Command::Create { .. } | Command::Submit { .. });
+            let result = service.dispatch(command, 0, output, json!(index)).await;
+            if result.as_ref().is_err_and(|e| e.code == "deferred") {
+                continue;
+            }
+            if admission && !service.admissions.is_empty() {
+                service.admissions.push_back(Admission {
+                    session: 0,
+                    output: output.clone(),
+                    id: json!(index),
+                    pending: Pending::Settled(result),
+                });
+                continue;
+            }
+            answers.push((json!(index), result));
+        }
+        while !service.admissions.is_empty() {
+            let (_, _, id, result) = service.settle().await;
+            answers.push((id, result));
+        }
+        answers
+    }
+    async fn request(service: &mut Service, command: Command, output: &Output) -> Result<Value> {
+        requests(service, vec![command], output)
+            .await
+            .pop()
+            .unwrap()
+            .1
+    }
     /// Bots with one running turn each, bound to a provider the test service
     /// does not have, so their tasks finish at once without network I/O.
     async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
@@ -2392,6 +2652,8 @@ mod tests {
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
             draining: false,
+            admissions: std::collections::VecDeque::new(),
+            reserved: 0,
         }
     }
     /// Refuse Bob's completion the way a full disk refuses a commit: the
@@ -2507,6 +2769,276 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, "running", "the next start ends it as interrupted");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A service whose bots may start turns, bound to `openai`, whose
+    /// provider refuses connections: a started turn fails without traffic.
+    fn admitting(store: &Store, limit_active: usize) -> Service {
+        let mut service = bare_service(store);
+        let provider = Provider::new(
+            service.transport.clone(),
+            Family::Responses,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap();
+        service.providers = Arc::new(HashMap::from([("openai".to_owned(), provider)]));
+        service.limit_active = limit_active;
+        service
+    }
+    fn create(bot: &str, workspace: &Path) -> Command {
+        Command::Create {
+            bot: bot.into(),
+            workspace: Some(workspace.to_str().unwrap().into()),
+            model: Some("openai/synthetic".into()),
+            instructions: Some(String::new()),
+            reasoning: None,
+            budget_tokens: None,
+            tools: Some(Vec::new()),
+            created_by: None,
+            created_by_id: None,
+            compaction_instructions: None,
+            compaction_model: None,
+            fallbacks: false,
+        }
+    }
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    /// Hold the storage worker inside a job until the gate is fed, so the
+    /// jobs queued meanwhile join its group.
+    async fn hold(store: &Store) -> (Answer<()>, std::sync::mpsc::Sender<()>) {
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let held = store
+            .queue("hold", move |_| {
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (held, gate)
+    }
+
+    #[tokio::test]
+    async fn admissions_queued_together_share_one_commit_and_answer_in_order() {
+        let dir = scratch("admit-group");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let groups = |store: &Store| store.stats()["groups"]["count"].as_u64().unwrap();
+        let (held, gate) = hold(&store).await;
+        let before = groups(&store);
+        let bots = ["A", "B", "C", "D"];
+        let mut commands: Vec<Command> = bots.iter().map(|bot| create(bot, &dir)).collect();
+        commands.extend(bots.iter().map(|bot| submit(bot, "r1")));
+        // A retry of an admission still queued, and new work for a bot whose
+        // turn is still queued, see the writes queued before them.
+        commands.push(submit("A", "r1"));
+        commands.push(submit("A", "r2"));
+        let count = commands.len();
+        for (index, command) in commands.into_iter().enumerate() {
+            assert!(!service.must_settle(Some(&command)), "the window has room");
+            let deferred = service.dispatch(command, 0, &output, json!(index)).await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!(service.admissions.len(), count);
+        assert_eq!(service.reserved, 6, "every submission holds a slot");
+        assert!(
+            service.must_settle(Some(&Command::Interrupt {
+                bot: "A".into(),
+                turn: 1
+            })),
+            "anything else waits for queued admissions"
+        );
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        let mut answers = Vec::new();
+        while !service.admissions.is_empty() {
+            let (_, _, id, result) = service.settle().await;
+            answers.push((id, result));
+        }
+        assert_eq!(groups(&store) - before, 1, "one commit for all of them");
+        assert_eq!(
+            answers.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            (0..count).map(|index| json!(index)).collect::<Vec<_>>(),
+            "answered in request order"
+        );
+        for (_, created) in &answers[..4] {
+            assert!(created.is_ok());
+        }
+        let turns: Vec<_> = answers[4..8]
+            .iter()
+            .map(|(_, started)| {
+                let started = started.as_ref().unwrap();
+                assert_eq!(started["status"], "running");
+                assert_eq!(started["duplicate"], false);
+                started["turn"].clone()
+            })
+            .collect();
+        let retry = answers[8].1.as_ref().unwrap();
+        assert_eq!(retry["duplicate"], true);
+        assert_eq!(retry["turn"], turns[0]);
+        assert_eq!(answers[9].1.as_ref().unwrap_err().code, "bot_busy");
+        assert_eq!(
+            service.active.len(),
+            4,
+            "one turn started per fresh submission"
+        );
+        assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admissions_at_the_limit_answer_as_one_at_a_time_would() {
+        let dir = scratch("admit-limit");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 2);
+        let (output, _writer) = Output::stdout();
+        let created = requests(
+            &mut service,
+            ["A", "B", "C"]
+                .iter()
+                .map(|bot| create(bot, &dir))
+                .collect(),
+            &output,
+        )
+        .await;
+        assert!(created.iter().all(|(_, result)| result.is_ok()));
+        // Two slots: the retry promised one it does not take, so B still
+        // starts, and only C finds the daemon full.
+        let answers = requests(
+            &mut service,
+            vec![
+                submit("A", "r1"),
+                submit("A", "r1"),
+                submit("B", "r1"),
+                submit("C", "r1"),
+            ],
+            &output,
+        )
+        .await;
+        let results: Vec<_> = answers
+            .iter()
+            .map(|(_, result)| match result {
+                Ok(started) => format!("{} {}", started["status"], started["duplicate"]),
+                Err(error) => error.code.clone(),
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                "\"running\" false",
+                "\"running\" true",
+                "\"running\" false",
+                "active_agent_limit"
+            ]
+        );
+        let mut active: Vec<_> = service.active.keys().cloned().collect();
+        active.sort();
+        assert_eq!(active, ["A", "B"]);
+        assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_group_commit_fails_its_admissions_and_starts_nothing() {
+        let dir = scratch("admit-lost");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let created = requests(
+            &mut service,
+            vec![create("Alice", &dir), create("Bob", &dir)],
+            &output,
+        )
+        .await;
+        assert!(created.iter().all(|(_, result)| result.is_ok()));
+        // Bob's turn leaves a dangling deferred reference, so the group's
+        // COMMIT fails the way a full disk fails it: every job is lost.
+        let lose = |install: bool| {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(if install {
+                    "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                     CREATE TRIGGER lose_commit AFTER INSERT ON turns WHEN NEW.bot='Bob'
+                     BEGIN INSERT INTO child VALUES (1); END;"
+                } else {
+                    "DROP TRIGGER lose_commit;"
+                })
+                .unwrap()
+        };
+        lose(true);
+        let (held, gate) = hold(&store).await;
+        for (index, bot) in ["Alice", "Bob"].into_iter().enumerate() {
+            let deferred = service
+                .dispatch(submit(bot, "r1"), 0, &output, json!(index))
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!(service.reserved, 2);
+        gate.send(()).unwrap();
+        assert_eq!(held.await.unwrap_err().code, "storage_error");
+        for _ in 0..2 {
+            let (_, _, _, result) = service.settle().await;
+            assert_eq!(result.unwrap_err().code, "storage_error");
+        }
+        assert!(service.active.is_empty(), "no lost admission starts a turn");
+        assert_eq!(service.reserved, 0, "their slots are free again");
+        // Nothing of the lost group is durable: the retry is new work.
+        lose(false);
+        let retry = request(&mut service, submit("Alice", "r1"), &output)
+            .await
+            .unwrap();
+        assert_eq!(retry["duplicate"], false);
+        assert_eq!(retry["status"], "running");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_waits_for_the_admission_before_it() {
+        let dir = scratch("admit-interrupt");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        // The store is fresh, so the submission's turn is the first.
+        let answers = requests(
+            &mut service,
+            vec![
+                create("A", &dir),
+                submit("A", "r1"),
+                Command::Interrupt {
+                    bot: "A".into(),
+                    turn: 1,
+                },
+            ],
+            &output,
+        )
+        .await;
+        assert_eq!(answers[1].1.as_ref().unwrap()["turn"], 1);
+        let interrupted = answers[2].1.as_ref().unwrap();
+        assert_eq!(interrupted["interrupt_requested"], true);
+        assert!(
+            interrupted.get("queued").is_none(),
+            "it reached the started task, not a durable row behind its back"
+        );
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        let status = store.call(|db| db.turn_status("A", 1)).await.unwrap();
+        assert_eq!(status, "interrupted");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

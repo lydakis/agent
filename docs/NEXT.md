@@ -780,18 +780,26 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     admission wrote one), and a completion the store refuses is retried
     rather than ending the daemon. The original SQLite codes were never
     captured, so the cause stays an inference. Appends that store a reply
-    are not retried; a turn whose reply cannot be stored still fails. Next,
-    admission and creation: commits are about 82% of measured storage
+    are not retried; a turn whose reply cannot be stored still fails. Then
+    admission and creation, where commits were about 82% of measured storage
     execution (job and commit time on the storage worker, not task time or
-    daemon CPU), and the service awaits admission commits before handling
-    another request. Letting those jobs group needs a design for
-    capacity reservation, same-bot ordering, and item 21's guarantees. Client
-    acknowledgements, publication, and provider execution must stay after
-    commit. Also done: on macOS
-    the store sets `fullfsync` and `checkpoint_fullfsync`, because a plain
-    fsync there leaves commits in the drive cache. A flush costs about
-    5.4 ms on an M1 Max, paid once per group; the service loop above now
-    matters on a Mac as much as on slow Linux storage.
+    daemon CPU) and the service awaited each commit before reading the next
+    request. Now up to 32 admissions queue at once and share commits; each
+    is answered after its commit, in request order, and any other request
+    waits for them. A submission that may start a turn holds an active slot
+    until answered, so a burst gets the answers it would one at a time.
+    Acknowledgements, publication and provider execution stay after commit
+    ([measured](DAEMON_MEASUREMENTS.md#admission-window): 32 simultaneous
+    submissions answered in 5.2 ms instead of 37 ms, and 7.5 ms instead of
+    114 ms at a 2 ms sync, with a fifth of the daemon CPU; 64 sustained bots
+    at a 10 ms sync went from 56 to 131 turns per second; a lone admission
+    is unchanged). `stats` reports group sizes and each group's oldest wait,
+    the evidence a group work or byte budget would need; none is added.
+    Also done: on macOS the store sets `fullfsync` and
+    `checkpoint_fullfsync`, because a plain fsync there leaves commits in
+    the drive cache. A flush costs about 5.4 ms on an M1 Max, paid once per
+    group, so a Mac should resemble the injected-delay rows above; the
+    window has not been measured there.
 
 45. Approving tool calls. Every allowed call runs without a verdict today,
     and that stays the default. [The design](APPROVALS.md) adds two more
