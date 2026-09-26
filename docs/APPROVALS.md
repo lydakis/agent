@@ -951,45 +951,52 @@ as one.
    (`held`) or, with `--approval-hold-ms 0`, after the turn parks
    (`parked`). Each turn is one synthetic `shell` call (`true`) and a
    reply, on a fresh store, against the same turn ungated and against
-   main at 7e46c5f; the build measured is `7238c6c`, and both binaries
-   rebuild to the SHA-256 the runs recorded. Medians of three rotated
-   runs of 200 sequential turns on one bot, on a 4-CPU Linux container
-   (fsyncs counted in a separate pass under strace, setup included):
+   main at `ddf3f8b`, with within-turn compaction; the build measured is
+   `973be14`, and the runs record both binaries' SHA-256. Medians of three
+   rotated runs of 200 sequential turns on one bot, on a 4-CPU Linux
+   x86_64 container (fsyncs counted in a separate pass under strace,
+   setup included):
 
    | | main | ungated | held | parked |
    |---|---:|---:|---:|---:|
-   | Turn latency p50 / p99, ms | 12.3 / 20.5 | 11.7 / 18.5 | 13.2 / 19.0 | 15.0 / 22.3 |
-   | Daemon CPU per turn, ms | 7.4 | 7.3 | 7.8 | 9.1 |
-   | Store commits per turn | 11 | 11 | 12 | 18 |
-   | fsyncs per turn | 6.24 | 6.24 | 6.26 | 9.32 |
-   | Event bytes per turn | 1,071 | 1,071 | 1,318 | 1,526 |
-   | Store bytes per turn | 2,867 | 2,908 | 3,174 | 3,359 |
+   | Turn latency p50 / p99, ms | 13.4 / 21.0 | 13.3 / 22.0 | 14.0 / 25.6 | 16.0 / 26.4 |
+   | Daemon CPU per turn, ms | 8.6 | 8.7 | 9.4 | 10.9 |
+   | Storage worker time per turn, ms | 7.7 | 7.7 | 8.3 | 10.3 |
+   | Store commits per turn | 11 | 11 | 12 | 17 |
+   | fsyncs per turn | 6.24 | 6.24 | 6.27 | 9.32 |
+   | Event bytes per turn | 1,071 | 1,071 | 1,331 | 1,539 |
+   | Store bytes per turn | 2,990 | 3,072 | 3,359 | 3,543 |
    | Answer request and reply bytes per call | | | 240 | 240 |
 
    - Ungated bots pay nothing: the same jobs, commits, and fsyncs as main,
-     and CPU and latency within run-to-run spread. Six rotated runs of 32
-     bots at 100 turns each agree: 247 turns/s against main's 245, 5.0
-     ms CPU per turn against 5.1. The store's 41 bytes per turn are the
-     empty `approvals` table and index, 8 KiB whatever the turn count.
+     and CPU, storage time, and latency within run-to-run spread (p50
+     12.6 to 13.6 ms in both). Six rotated runs of 32 bots at 100 turns
+     each agree: 266 turns/s against main's 260 (runs 255 to 287 against
+     257 to 274), 4.9 ms CPU per turn in both. The store's 82 bytes per
+     turn are the four empty b-trees of `approvals`, `approval_tags`, and
+     their indexes, 16 KiB whatever the turn count.
    - A held call adds no durable commit. Its one added commit is the
-     answer's group, which writes nothing; the 0.015 fsyncs per turn are
-     WAL checkpoints that come sooner with the added event bytes. In two
-     further runs of 600 turns per arm, the storage worker spent about
-     0.15 ms more per call (the answer 0.08 ms, the announcement 0.07),
-     `approval_start` took what `tool_start` did, and daemon CPU per turn
-     moved less than it did between two runs of the same arm (0.7 ms).
-     Latency grows about 1 ms at the median, the screen's own answering
-     round trip included: the daemon's announce-to-start `waited_ms` is 1
-     to 2 ms.
+     answer's group, which writes nothing; the 0.03 fsyncs per turn are
+     WAL checkpoints that come sooner with the added event bytes. It adds
+     about 0.7 ms of daemon CPU and 0.5 ms of storage worker time per call
+     (the announcement, `approval_start` in place of `tool_start`, and
+     the answer), and about 0.7 ms at the median, the screen's own
+     answering round trip included: the daemon's announce-to-start
+     `waited_ms` is 1 to 2 ms.
    - A parked call adds three durable commits (the park, the verdict, the
-     resume) and about 3 ms, the screen's reaction to `turn_waiting`
+     resume) and about 2.6 ms, the screen's reaction to `turn_waiting`
      included.
    - With 32 bots at 25 turns each, where commits group, the one
      single-threaded screen answering every bot becomes the wait
-     (`waited_ms` about 50 ms held, 70 parked): 309 turns/s ungated, 258
-     held, 196 parked. The answers arrive spread out, so fewer jobs share
-     a group: 1.1 more commits and 0.45 more fsyncs per turn held, and
-     0.6 ms more daemon CPU per turn.
+     (`waited_ms` median 37 ms held, 64 parked): 391 turns/s ungated
+     against main's 381, 292 held, 192 parked. The answers arrive spread
+     out, so fewer jobs share a group: 1.1 more commits and 0.5 more
+     fsyncs per turn held, 2.3 and 2.0 parked, and 0.9 ms more daemon CPU
+     per turn held.
+   - An earlier run at `7238c6c`, against main at `7e46c5f`, before the
+     review fixes and the merges with admission batching and within-turn
+     compaction, found the same: ungated equal to main, a held call no
+     durable commit, a parked one three.
 
    Still to measure: the same with the rules approver and its path
    resolution, over a socket rather than stdio, and a verdict that
