@@ -26,8 +26,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "fork",
-        usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--instructions TEXT]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --instructions --instructions-file --agents --pretty",
+        usage: "fork --source NAME --bot NAME [--checkpoint NODE]",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --pretty",
         startup: false,
     },
     Command {
@@ -150,7 +150,7 @@ fn print_flags(flags: &str) {
             "--workspace" => ("DIR", "Select the working directory"),
             "--instructions" => (
                 "TEXT",
-                "A new bot's instructions (default: the built-in text); for fork, replace the source's",
+                "A new bot's instructions (default: the built-in text)",
             ),
             "--instructions-file" => ("FILE", "Read the instructions from a file"),
             "--agents" => (

@@ -287,6 +287,13 @@ class SocketAndCliTests(ModelFixture):
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
         self.assertEqual(stats.returncode, 2)
         self.assertIn('does not accept --model', stats.stderr)
+        # A fork is an exact copy of its source, so it takes no instructions.
+        for flag in ('--instructions', '--instructions-file', '--agents'):
+            args = (flag,) if flag == '--agents' else (flag, 'x')
+            fork = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Copy', *args,
+                              check=False)
+            self.assertEqual(fork.returncode, 2)
+            self.assertIn(f'does not accept {flag}', fork.stderr)
         self.assertEqual(attempt('--model', 'openai/synthetic-model').returncode, 0)
         self.assertEqual(json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)[0]['status'],
                          'completed')

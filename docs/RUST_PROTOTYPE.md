@@ -460,11 +460,11 @@ are read from the provider cache once they exceed the model's minimum; the
 [live run](ANTHROPIC_SMOKE.md) records the effect. Anthropic caches any
 byte-identical prefix, so a fork reads its source's cache with no key.
 Responses requests carry a `prompt_cache_key`, also sent as the `session-id`
-header that the ChatGPT backend routes on: a nonce drawn once per daemon plus
-the id of the bot whose cache the call shares. That is the bot's own id,
-except that a fork keeping its source's instructions shares the source's key,
-because its first call repeats the source's prefix. Summaries add `-summary`,
-since their prefix differs.
+header that the ChatGPT backend routes on: the store's identity plus the id
+of the bot whose cache the call shares. That is the bot's own id, except that
+a fork shares its source's key, because a fork copies its source's
+instructions and tools and so its first call repeats the source's prefix.
+Summaries add `-summary`, since their prefix differs.
 
 Within a turn, Responses calls over HTTP also return the ChatGPT backend's
 sticky-routing token. The backend sends `x-codex-turn-state` on a turn's
@@ -483,8 +483,8 @@ accounts created on or after 2026-08-31, reject a block whose earlier context
 changed. Anthropic requests therefore send a block only while the context in
 front of the window is the one it was written under. Each request
 fingerprints that context (the encoded pinned prefix and the window's first
-item); when the fingerprint differs from the bot's last, the window slid, a
-compaction or note landed, or a fork started from other instructions, and
+item); when the fingerprint differs from the bot's last, the window slid or a
+compaction or note landed, and
 every node written before that request is sent without its thinking from
 then on. Removing a leading run of blocks is allowed; later blocks keep
 theirs. Summarizer requests carry no thinking, since their instructions
@@ -732,7 +732,7 @@ own path from the turn. Example requests:
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
 {"id":7,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1"}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
-{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative","instructions":"Replaces the source's text for the fork only"}
+{"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
 {"id":10,"op":"unfollow","bot":"Bob"}
 {"id":11,"op":"bots","after":null,"limit":64}
@@ -881,9 +881,8 @@ stale child-to-parent submissions after name reuse. The record, the `created` an
 carry both; the two events also carry the record's list fields (`id`,
 `provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
 seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and
-clients, never authority. A fork keeps the source's binding and instructions
-unless `instructions` replaces the text for the new bot; the source is never
-changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
+clients, never authority. A fork keeps the source's binding, instructions,
+and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
 from any message in the source's history: `checkpoint` names a node id (every

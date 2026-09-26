@@ -865,7 +865,6 @@ fn fork(options: &Options) -> Result<i32> {
         json!({"source":source,"checkpoint":checkpoint,"bot":bot,
             "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
             "budget_tokens":options.budget_tokens,
-            "instructions":if options.agents { Some(composed_instructions(options, &workspace(options)?)?) } else { options.instructions.clone() },
             "created_by":created_by,"created_by_id":created_by_id}),
     )?;
     print_json(&result, options.pretty)?;

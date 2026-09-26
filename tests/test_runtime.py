@@ -939,6 +939,12 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(len(request['input']), 4)
         self.assertEqual(client.request('fork', source='Bob', checkpoint=99999, bot='nope',
                                         workspace=str(self.path))['error'], 'node_not_in_source_history')
+        # A fork is an exact copy of its source: it takes no instructions.
+        client.process.stdin.write(json.dumps({'id': 'copy', 'op': 'fork', 'source': 'Bob', 'bot': 'other',
+                                               'instructions': 'Other.'}) + '\n')
+        client.process.stdin.flush()
+        self.assertEqual(client.receive(lambda m: 'error' in m and m.get('id') is None)['error'], 'invalid_json')
+        self.assertEqual(client.request('resume', bot='other')['error'], 'bot_not_found')
 
     def test_turn_overrides_workspace_and_model_within_the_family(self):
         client = self.client('echo,shell')
