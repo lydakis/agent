@@ -1008,15 +1008,19 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut wakes = Wakes::default();
     let parked = store
         .op("waiting_turns", |db| {
-            let parked = db.waiting_turns()?;
-            let lapses = parked
-                .iter()
-                .map(|w| match w.approval || w.paced_since_ms.is_some() {
-                    true => Ok(None),
-                    false => db.next_lapse(w.turn),
+            // Every turn's lapse in one read, not one query per parked turn.
+            let lapses = db.lapses()?;
+            Ok(db
+                .waiting_turns()?
+                .into_iter()
+                .map(|w| {
+                    let lapse = match w.approval || w.paced_since_ms.is_some() {
+                        true => None,
+                        false => lapses.get(&w.turn).copied(),
+                    };
+                    (w, lapse)
                 })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(parked.into_iter().zip(lapses).collect::<Vec<_>>())
+                .collect::<Vec<_>>())
         })
         .await?;
     for (waiting, lapse) in parked {
@@ -4672,6 +4676,30 @@ mod tests {
             .await
             .unwrap();
         drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_early_resume_reads_results_the_registry_has_not_seen() {
+        let dir = scratch("early-resume-results");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = parked_on_verdict(&store).await;
+        // The first process's result committed, but its registry delivery
+        // had not run yet when the turn resumed; the second still runs.
+        let (done, running) = store
+            .call(move |db| {
+                let done = db.process_start(turn, "shell-1")?;
+                db.process_finish(done, &json!({"exit_code":0}), &[])?;
+                Ok((done, db.process_start(turn, "shell-2")?))
+            })
+            .await
+            .unwrap();
+        let handles = Handles::new(mpsc::unbounded_channel().0);
+        let names = [format!("proc:{done}"), format!("proc:{running}")];
+        let results = handles.take_settled(&store, turn, &names).await;
+        assert_eq!(*results[&names[0]], json!({"exit_code":0}));
+        assert_eq!(*results[&names[1]], json!({"pending":true}));
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

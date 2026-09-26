@@ -1299,12 +1299,10 @@ impl Turn {
                     // A later call's lapse can wake the wait before its
                     // handles resolve: those are reported pending, as the
                     // wait's own timeout reports them.
-                    let mut results = self.handles.take(turn);
-                    for handle in &waiting.handles {
-                        results
-                            .entry(handle.clone())
-                            .or_insert_with(|| Arc::new(json!({"pending":true})));
-                    }
+                    let results = self
+                        .handles
+                        .take_settled(&self.store, turn, &waiting.handles)
+                        .await;
                     let outcome = Outcome::text(wait_result(results).to_string());
                     let id = waiting.call_id.clone();
                     self.store

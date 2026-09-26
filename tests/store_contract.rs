@@ -923,6 +923,53 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
 }
 
 #[test]
+fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
+    let mut db = db();
+    let (turn, round) = lapsing_round(&mut db, &[("read", "r1"), ("write", "w1")]);
+    // The ungated call runs past the later call's lapse, then fails.
+    db.tool_start(turn, &round[0]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let failed = Outcome {
+        failed: true,
+        ..result("{}")
+    };
+    db.tool_finish(turn, "r1", &failed).unwrap();
+    // Announcing it again would restart its clock; its lapse ends the turn.
+    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    assert_eq!(page["approvals"][0]["request"], 1);
+    assert!(matches!(
+        db.approval_start(turn, &round[1], epoch_now()).unwrap(),
+        Gated::Expired
+    ));
+}
+
+#[test]
+fn every_parked_turns_lapse_is_read_at_once() {
+    let mut db = db();
+    let (turn, round) = lapsing_round(&mut db, &[("shell", "s1"), ("write", "w1")]);
+    let next = db.next_lapse(turn).unwrap().expect("w1 lapses");
+    // A running turn's lapse is its task's to watch.
+    assert!(db.lapses().unwrap().is_empty());
+    db.suspend_approval(turn, &round, epoch_now(), None)
+        .unwrap();
+    assert_eq!(db.lapses().unwrap(), [(turn, next)].into());
+    // An allow decides the only call that can lapse.
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "w1",
+        request: 1,
+        tag: Some("quick"),
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    })
+    .unwrap();
+    assert_eq!(db.next_lapse(turn).unwrap(), None);
+    assert!(db.lapses().unwrap().is_empty());
+}
+
+#[test]
 fn no_call_starts_once_a_later_call_lapsed() {
     let mut db = db();
     let (turn, round) = lapsing_round(&mut db, &[("read", "r1"), ("shell", "s1"), ("write", "w1")]);
@@ -1056,8 +1103,10 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
         }
     };
     let empty = json!({"approvals":[],"next_after":null});
-    // Answers held for a running turn leave the index when it parks.
+    // Answers held for a running turn are skipped unread, and leave the
+    // index when it parks.
     answer_all(&mut db, "a");
+    assert_eq!(db.approvals(None, Some("a"), 0, 64).unwrap(), empty);
     assert_eq!(
         db.suspend_approval(turn, &round, epoch_now(), None)
             .unwrap(),

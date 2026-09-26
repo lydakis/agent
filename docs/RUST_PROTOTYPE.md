@@ -1682,8 +1682,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   deny decides it only if it came before an open gate lapsed, and an allow
   on one moves the turn's wake-up to the next gate's lapse. A turn parked
   on a `wait` or on a verdict ahead of another gated call is woken when
-  that call lapses, and the lapse ends it: the wait returns what it has,
-  and a call still waiting ends with the rest of the round, as not run.
+  that call lapses, and the lapse ends it: the wait returns every result
+  stored by then and the rest as pending, and a call still waiting ends
+  with the rest of the round, as not run.
   No call starts, gated or not, once a later call of its round lapsed.
 - **Rounds.** A verdict is for the round as planned. When a call fails (an
   error result, a denial, or a command that did not succeed, as the tool
@@ -1691,7 +1692,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   call of the round still to run is announced again in that call's
   finishing commit, with the next `request` and `failed` naming the call.
   Their earlier verdicts are dropped, and answers to the old request get
-  `approval_superseded`.
+  `approval_superseded`. Not when one of them lapsed while the failing
+  call ran: a new request would restart its clock, so the round keeps its
+  requests and the lapse ends the turn at the next call.
 - **Listing.** `{"op":"approvals","bot"?,"tag"?,"after"?,"limit"?}` lists
   calls still waiting on a gate in announcement order, each naming only its
   unanswered gates, with `expires_ms` and `arguments`: the call's top-level
@@ -1705,7 +1708,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   only its running turn's calls, and one tag's only the calls still
   waiting on that tag, through an index of each call's tags: written with
   its announcement, and a tag taken out when its answer is stored (every
-  tag, for a deny). A page holds at most `limit` (1 to 256, default 64) calls and
+  tag, for a deny). An answer the storage worker still holds skips the
+  call's entry without reading its row. A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger (bounded by the 64 KiB
   call id and the previews, well inside a 1 MiB line); `next_after` continues
   it. Positions are never reused, and a call announced again takes a new

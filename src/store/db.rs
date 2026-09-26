@@ -369,6 +369,40 @@ impl Request {
 struct Live {
     notify: Arc<Notify>,
     verdicts: HashMap<String, Vec<Verdict>>,
+    /// The `(approval, tag)` index entries these verdicts answer, which a
+    /// tag's listing skips unread. Only the park that writes the verdicts
+    /// deletes the entries, so a crash loses neither.
+    answered: std::collections::HashSet<(i64, String)>,
+}
+/// One page of `approvals` as it fills.
+struct ApprovalPage {
+    listed: Vec<Value>,
+    bytes: usize,
+    limit: usize,
+    last: i64,
+    more: bool,
+}
+impl ApprovalPage {
+    /// Take the entry for the call at position `id`, or step past it when
+    /// it is not listed. False once the page is full, the entry left out.
+    fn add(&mut self, id: i64, entry: Option<Value>) -> Result<bool> {
+        let Some(entry) = entry else {
+            self.last = id;
+            return Ok(true);
+        };
+        // A page holds at least one call, so paging always advances.
+        let size = crate::output::encoded_len(&entry)? + 1;
+        if self.listed.len() == self.limit
+            || (!self.listed.is_empty() && self.bytes + size > 256 * 1024)
+        {
+            self.more = true;
+            return Ok(false);
+        }
+        self.bytes += size;
+        self.listed.push(entry);
+        self.last = id;
+        Ok(true)
+    }
 }
 /// What a wake-up for a parked turn finds.
 #[derive(Debug, PartialEq)]
@@ -3647,11 +3681,7 @@ impl Database {
         let bot = self.active(turn)?;
         // Every call before it is done, so a gate still undecided is a later
         // call's; once one lapsed, the turn ends before anything else starts.
-        if bot.gates.iter().any(|gate| gate.expire_ms.is_some())
-            && self
-                .next_lapse(turn)?
-                .is_some_and(|at| epoch_ms().max(0) as u64 >= at)
-        {
+        if expiring(&bot) && self.lapsed(turn, epoch_ms().max(0) as u64)? {
             return fail_with("approval_expired", "a later call's gate lapsed first");
         }
         let tx = self.conn.savepoint()?;
@@ -3676,6 +3706,13 @@ impl Database {
         let bot = self.active(turn)?;
         let family = bot.family()?;
         let item = family.tool_result_item(call_id, &outcome.output)?;
+        // Verdicts are for the round as planned: after a failure the gated
+        // calls still to run are announced again, in this same commit.
+        // Unless one of them lapsed while this call ran: a new request would
+        // restart its clock, and the lapse ends the turn at the next call.
+        let reannounce_rest = !bot.gates.is_empty()
+            && outcome.failed
+            && !(expiring(&bot) && self.lapsed(turn, epoch_ms().max(0) as u64)?);
         let tx = self.conn.savepoint()?;
         if tx.execute(
             "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'",
@@ -3729,13 +3766,11 @@ impl Database {
         let data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
             "note":outcome.note.as_ref().map(|_| head)});
         let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
-        // Verdicts are for the round as planned: after a failure the gated
-        // calls still to run are announced again, in this same commit.
-        let reannounced =
-            !bot.gates.is_empty() && outcome.failed && reannounce(&tx, &bot.name, turn, call_id)?;
+        let reannounced = reannounce_rest && reannounce(&tx, &bot.name, turn, call_id)?;
         tx.commit()?;
         if reannounced && let Some(live) = self.live_changed(turn) {
             live.verdicts.clear();
+            live.answered.clear();
         }
         Ok((
             item.into(),
@@ -3823,6 +3858,8 @@ impl Database {
             .denial()
             .filter(|d| lapse.is_none_or(|at| (d.at_ms.max(0) as u64) < at));
         let gated = if let Some(denial) = denial {
+            // As after a failure, a lapse already due keeps its request.
+            let reannounce_rest = !(expiring(&bot) && self.lapsed(turn, now_ms)?);
             let tx = self.conn.savepoint()?;
             deny(
                 &tx,
@@ -3836,15 +3873,16 @@ impl Database {
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
-            let reannounced = reannounce(&tx, &bot.name, turn, &call.call_id)?;
+            let reannounced = reannounce_rest && reannounce(&tx, &bot.name, turn, &call.call_id)?;
             tx.commit()?;
             if reannounced && let Some(live) = self.live_changed(turn) {
                 live.verdicts.clear();
+                live.answered.clear();
             }
             Gated::Denied
         } else if request.unanswered().next().is_none() {
             // Allowed, but a later call lapsed first: nothing more starts.
-            if self.next_lapse(turn)?.is_some_and(|at| now_ms >= at) {
+            if self.lapsed(turn, now_ms)? {
                 return Ok(Gated::Lapsed);
             }
             let tx = self.conn.savepoint()?;
@@ -3911,6 +3949,7 @@ impl Database {
         };
         if let Some(live) = self.live_changed(turn) {
             live.verdicts.remove(&call.call_id);
+            live.answered.retain(|(id, _)| *id != request.id);
         }
         Ok(gated)
     }
@@ -4043,6 +4082,13 @@ impl Database {
         if status == "running" {
             self.keep_live(answer.turn);
             let live = self.live.entry(answer.turn).or_default();
+            if answer.allow {
+                live.answered.insert((request.id, tag));
+            } else {
+                // A deny decides the call: no gate waits on it any more.
+                live.answered
+                    .extend(request.gates.iter().map(|g| (request.id, g.tag.clone())));
+            }
             live.verdicts
                 .entry(answer.call_id.to_owned())
                 .or_default()
@@ -4087,82 +4133,125 @@ impl Database {
         if !(1..=256).contains(&limit) || after < 0 {
             return fail("invalid_approval_page");
         }
-        // Only a bot's running turn has calls waiting, so one bot's listing
-        // starts from that turn instead of scanning every bot's calls, and
-        // one tag's listing reads only the calls still waiting on that tag.
-        let mut statement = match (bot, tag) {
-            (Some(_), _) => self.conn.prepare_cached(
-                "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
-                 FROM bots b JOIN approvals a ON a.turn=b.running_turn
-                 WHERE a.id>?1 AND b.name=?2 ORDER BY a.id LIMIT ?3",
-            )?,
-            (None, Some(_)) => self.conn.prepare_cached(
-                "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
-                 FROM approval_tags g JOIN approvals a ON a.id=g.approval JOIN turns t ON t.id=a.turn
-                 WHERE g.tag=?2 AND g.approval>?1 ORDER BY g.approval LIMIT ?3",
-            )?,
-            (None, None) => self.conn.prepare_cached(
-                "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
-                 FROM approvals a JOIN turns t ON t.id=a.turn
-                 WHERE a.id>?1 ORDER BY a.id LIMIT ?3",
-            )?,
+        let mut page = ApprovalPage {
+            listed: Vec::new(),
+            bytes: 0,
+            limit,
+            last: after,
+            more: false,
         };
-        let mut rows = statement.query(params![after, bot.or(tag), READ as i64])?;
-        let (mut listed, mut bytes, mut read, mut last, mut more) =
-            (Vec::new(), 0, 0, after, false);
-        while let Some(r) = rows.next()? {
-            read += 1;
-            let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
-            let mut request = Request {
-                id,
-                request: r.get(6)?,
-                announced_ms: r.get(7)?,
-                gates: serde_json::from_str(&r.get::<_, String>(8)?)?,
-                verdicts: r
-                    .get::<_, Option<String>>(9)?
-                    .map(|v| serde_json::from_str(&v))
-                    .transpose()?
-                    .unwrap_or_default(),
-            };
-            if let Some(held) = self
-                .live
-                .get(&turn)
-                .and_then(|live| live.verdicts.get(&call_id))
-            {
-                request.verdicts.extend(held.iter().cloned());
+        let mut read = 0;
+        match (bot, tag) {
+            // One tag's listing reads only the index entries for calls still
+            // waiting on that tag, and a call's row only when no verdict the
+            // worker holds has answered that tag already.
+            (None, Some(tag)) => {
+                let answered: std::collections::HashSet<i64> = self
+                    .live
+                    .values()
+                    .flat_map(|live| &live.answered)
+                    .filter(|(_, answered)| answered == tag)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let mut ids = self.conn.prepare_cached(
+                    "SELECT approval FROM approval_tags WHERE tag=?1 AND approval>?2 ORDER BY approval",
+                )?;
+                let mut call = self.conn.prepare_cached(
+                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
+                     FROM approvals a JOIN turns t ON t.id=a.turn WHERE a.id=?",
+                )?;
+                let mut rows = ids.query(params![tag, after])?;
+                while read < READ
+                    && let Some(r) = rows.next()?
+                {
+                    let id: i64 = r.get(0)?;
+                    // An entry skipped here costs an index read, not a row.
+                    let entry = match answered.contains(&id) {
+                        true => None,
+                        false => {
+                            read += 1;
+                            match call.query([id])?.next()? {
+                                Some(row) => self.waiting_call(row, Some(tag))?,
+                                None => None,
+                            }
+                        }
+                    };
+                    if !page.add(id, entry)? {
+                        break;
+                    }
+                }
             }
-            let open: Vec<&str> = if request.denial().is_some() {
-                Vec::new()
-            } else {
-                request.unanswered().map(|g| g.tag.as_str()).collect()
-            };
-            if open.is_empty() || tag.is_some_and(|tag| !open.contains(&tag)) {
-                last = id;
-                continue;
+            // Only a bot's running turn has calls waiting, so one bot's
+            // listing starts from that turn instead of scanning every bot's.
+            _ => {
+                let mut statement = match bot {
+                    Some(_) => self.conn.prepare_cached(
+                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
+                         FROM bots b JOIN approvals a ON a.turn=b.running_turn
+                         WHERE a.id>?1 AND b.name=?2 ORDER BY a.id LIMIT ?3",
+                    )?,
+                    None => self.conn.prepare_cached(
+                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
+                         FROM approvals a JOIN turns t ON t.id=a.turn
+                         WHERE a.id>?1 ORDER BY a.id LIMIT ?3",
+                    )?,
+                };
+                let mut rows = statement.query(params![after, bot, READ as i64])?;
+                while let Some(r) = rows.next()? {
+                    read += 1;
+                    let id: i64 = r.get(0)?;
+                    let entry = self.waiting_call(r, tag)?;
+                    if !page.add(id, entry)? {
+                        break;
+                    }
+                }
             }
-            let mut entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
-                "request":request.request,"announced_ms":request.announced_ms,
-                "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
-                "node":r.get::<_, i64>(5)?});
-            // The previews stored when the call was planned.
-            if let (Value::Object(entry), Value::Object(arguments)) = (
-                &mut entry,
-                serde_json::from_str::<Value>(&r.get::<_, String>(10)?)?,
-            ) {
-                entry.extend(arguments);
-            }
-            // A page holds at least one call, so paging always advances.
-            let size = crate::output::encoded_len(&entry)? + 1;
-            if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
-                more = true;
-                break;
-            }
-            bytes += size;
-            listed.push(entry);
-            last = id;
         }
-        let more = more || read == READ;
-        Ok(json!({"approvals":listed,"next_after":more.then_some(last)}))
+        let more = page.more || read == READ;
+        Ok(json!({"approvals":page.listed,"next_after":more.then_some(page.last)}))
+    }
+    /// A listed call's entry, or `None` when no gate (or not `tag`) still
+    /// waits on it.
+    fn waiting_call(&self, r: &rusqlite::Row<'_>, tag: Option<&str>) -> Result<Option<Value>> {
+        let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
+        let mut request = Request {
+            id,
+            request: r.get(6)?,
+            announced_ms: r.get(7)?,
+            gates: serde_json::from_str(&r.get::<_, String>(8)?)?,
+            verdicts: r
+                .get::<_, Option<String>>(9)?
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        if let Some(held) = self
+            .live
+            .get(&turn)
+            .and_then(|live| live.verdicts.get(&call_id))
+        {
+            request.verdicts.extend(held.iter().cloned());
+        }
+        let open: Vec<&str> = if request.denial().is_some() {
+            Vec::new()
+        } else {
+            request.unanswered().map(|g| g.tag.as_str()).collect()
+        };
+        if open.is_empty() || tag.is_some_and(|tag| !open.contains(&tag)) {
+            return Ok(None);
+        }
+        let mut entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+            "request":request.request,"announced_ms":request.announced_ms,
+            "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
+            "node":r.get::<_, i64>(5)?});
+        // The previews stored when the call was planned.
+        if let (Value::Object(entry), Value::Object(arguments)) = (
+            &mut entry,
+            serde_json::from_str::<Value>(&r.get::<_, String>(10)?)?,
+        ) {
+            entry.extend(arguments);
+        }
+        Ok(Some(entry))
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
     pub fn approval_requests(&self) -> Result<i64> {
@@ -4462,43 +4551,71 @@ impl Database {
             Some(_) => Wake::Resume,
         })
     }
+    /// Whether one of the turn's undecided gated calls has lapsed by `now_ms`.
+    fn lapsed(&self, turn: i64, now_ms: u64) -> Result<bool> {
+        Ok(self.next_lapse(turn)?.is_some_and(|at| now_ms >= at))
+    }
     /// When the turn's earliest undecided gated call lapses, if any does.
     pub fn next_lapse(&self, turn: i64) -> Result<Option<u64>> {
         // One read for the round. A call whose gates have no expiry never
         // lapses, so its row is not decoded.
         let mut statement = self.conn.prepare_cached(
-            "SELECT id,call_id,request,announced_ms,gates,verdicts FROM approvals
+            "SELECT turn,call_id,request,announced_ms,gates,verdicts,id FROM approvals
              WHERE turn=? AND instr(gates,'\"expire_ms\"')>0",
         )?;
         let mut rows = statement.query([turn])?;
         let mut lapse: Option<u64> = None;
         while let Some(r) = rows.next()? {
-            let call_id: String = r.get(1)?;
-            let mut request = Request {
-                id: r.get(0)?,
-                request: r.get(2)?,
-                announced_ms: r.get(3)?,
-                gates: serde_json::from_str(&r.get::<_, String>(4)?)?,
-                verdicts: r
-                    .get::<_, Option<String>>(5)?
-                    .map(|v| serde_json::from_str(&v))
-                    .transpose()?
-                    .unwrap_or_default(),
-            };
-            if let Some(held) = self
-                .live
-                .get(&turn)
-                .and_then(|live| live.verdicts.get(&call_id))
-            {
-                request.verdicts.extend(held.iter().cloned());
-            }
-            if !request.decided()
-                && let Some(at) = request.expires_ms()
-            {
+            if let Some(at) = self.lapse_of(r)? {
                 lapse = Some(lapse.map_or(at, |earlier| earlier.min(at)));
             }
         }
         Ok(lapse)
+    }
+    /// Every parked turn's next lapse in one read, for a restart to
+    /// schedule.
+    pub fn lapses(&self) -> Result<HashMap<i64, u64>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT a.turn,a.call_id,a.request,a.announced_ms,a.gates,a.verdicts,a.id
+             FROM turns t JOIN approvals a ON a.turn=t.id
+             WHERE t.status='waiting' AND instr(a.gates,'\"expire_ms\"')>0",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut lapses = HashMap::new();
+        while let Some(r) = rows.next()? {
+            if let Some(at) = self.lapse_of(r)? {
+                let turn: i64 = r.get(0)?;
+                lapses
+                    .entry(turn)
+                    .and_modify(|earlier: &mut u64| *earlier = (*earlier).min(at))
+                    .or_insert(at);
+            }
+        }
+        Ok(lapses)
+    }
+    /// When an announced call lapses, if it is undecided and can, counting
+    /// the verdicts the worker holds for it.
+    fn lapse_of(&self, r: &rusqlite::Row<'_>) -> Result<Option<u64>> {
+        let (turn, call_id): (i64, String) = (r.get(0)?, r.get(1)?);
+        let mut request = Request {
+            id: r.get(6)?,
+            request: r.get(2)?,
+            announced_ms: r.get(3)?,
+            gates: serde_json::from_str(&r.get::<_, String>(4)?)?,
+            verdicts: r
+                .get::<_, Option<String>>(5)?
+                .map(|v| serde_json::from_str(&v))
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        if let Some(held) = self
+            .live
+            .get(&turn)
+            .and_then(|live| live.verdicts.get(&call_id))
+        {
+            request.verdicts.extend(held.iter().cloned());
+        }
+        Ok((!request.decided()).then(|| request.expires_ms()).flatten())
     }
     /// Bring a parked turn back to running; the caller then records the wait
     /// result. Also answers whether a steer queued while it was parked.
@@ -5732,6 +5849,10 @@ fn deny(
     }
     event(tx, &bot.name, Some(turn), "tool_completed", data)?;
     Ok(())
+}
+/// Whether any of the bot's gates can lapse.
+fn expiring(bot: &Bot) -> bool {
+    bot.gates.iter().any(|gate| gate.expire_ms.is_some())
 }
 /// Index an announced call under each of its gates' tags, so a listing for
 /// one tag reads only the calls waiting on it. Deleting the call drops its
