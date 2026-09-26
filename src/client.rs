@@ -1404,15 +1404,20 @@ fn exit_code(data: &Value) -> i32 {
     }
 }
 
-/// A call's arguments as one short line: the command or path when the
-/// tool has one, marked when more follows. Arguments may be a preview cut
-/// short, so the field is read from as much of the text as there is.
-fn summary(name: &str, arguments: &str) -> String {
-    let key = match name {
+/// The argument that says what a call of this tool does, if it has one.
+fn summary_key(name: &str) -> &'static str {
+    match name {
         "shell" => "command",
         "read" | "write" | "edit" => "path",
         _ => "",
-    };
+    }
+}
+
+/// A started call's arguments as one short line: the command or path when
+/// the tool has one. Arguments may be a preview cut short, so the field is
+/// read from as much of the text as there is.
+fn summary(name: &str, arguments: &str) -> String {
+    let key = summary_key(name);
     let text = if key.is_empty() {
         arguments.to_owned()
     } else {
@@ -1422,12 +1427,20 @@ fn summary(name: &str, arguments: &str) -> String {
         }
         .unwrap_or_else(|| format!("[no {key} in the arguments shown]"))
     };
+    one_line(&text, false)
+}
+
+/// The first line of `text`, marked when more lines follow or it was cut.
+fn one_line(text: &str, cut: bool) -> String {
     let mut lines = text.lines();
     let first: String = lines.next().unwrap_or("").chars().take(200).collect();
     let rest = lines.count();
     if rest > 0 {
-        format!("{first} … (+{rest} more lines)")
-    } else if first.len() < text.trim_end().len() {
+        format!(
+            "{first} … (+{rest} more lines{})",
+            if cut { ", then cut" } else { "" }
+        )
+    } else if cut || first.len() < text.trim_end().len() {
         format!("{first} …")
     } else {
         first
@@ -1525,13 +1538,31 @@ fn pending(
     Ok(found)
 }
 
-/// A pending call's tool and what it would do, as `approvals` lists it.
+/// A pending call's tool and what it would do, from the fields `approvals`
+/// lists, each cut on its own.
 fn call_line(call: &Value) -> String {
     let name = call["name"].as_str().unwrap_or("tool");
-    format!(
-        "{name} {}",
-        summary(name, call["arguments"].as_str().unwrap_or(""))
-    )
+    let arguments = &call["arguments"];
+    let cut = |key: &str| {
+        call["arguments_cut"]
+            .as_array()
+            .is_some_and(|cut| cut.iter().any(|field| field == key))
+    };
+    let shown = match summary_key(name) {
+        _ if !arguments.is_object() => "[arguments are not a JSON object]".to_owned(),
+        "" => one_line(
+            &arguments.to_string(),
+            call["arguments_cut"]
+                .as_array()
+                .is_some_and(|cut| !cut.is_empty())
+                || call["arguments_omitted"].as_u64().unwrap_or(0) > 0,
+        ),
+        key => match arguments[key].as_str() {
+            Some(text) => one_line(text, cut(key)),
+            None => format!("[no {key} in the arguments]"),
+        },
+    };
+    format!("{name} {shown}")
 }
 
 /// One copyable command per gate a pending call still waits on, each
@@ -1652,9 +1683,58 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_call_shows_its_own_field_however_long_the_others_are() {
+        let line = |name: &str, fields: Value| {
+            let mut call = json!({"name":name,"arguments_cut":[],"arguments_omitted":0});
+            for (key, value) in fields.as_object().unwrap() {
+                call[key] = value.clone();
+            }
+            call_line(&call)
+        };
+        let content = "x".repeat(2048);
+        assert_eq!(
+            line(
+                "write",
+                json!({"arguments":{"content":content,"path":"a.txt"},"arguments_cut":["content"]})
+            ),
+            "write a.txt"
+        );
+        assert_eq!(
+            line(
+                "shell",
+                json!({"arguments":{"command":"echo hi\nrm x"},"arguments_cut":["command"]})
+            ),
+            "shell echo hi … (+1 more lines, then cut)"
+        );
+        assert_eq!(
+            line(
+                "shell",
+                json!({"arguments":{"command":"ls"},"arguments_cut":["command"]})
+            ),
+            "shell ls …"
+        );
+        assert_eq!(
+            line("edit", json!({"arguments":{"old":"a"}})),
+            "edit [no path in the arguments]"
+        );
+        assert_eq!(
+            line("shell", json!({"arguments":null})),
+            "shell [arguments are not a JSON object]"
+        );
+        assert_eq!(
+            line(
+                "echo",
+                json!({"arguments":{"text":"hi"},"arguments_omitted":1})
+            ),
+            r#"echo {"text":"hi"} …"#
+        );
+    }
+
+    #[test]
     fn every_open_gate_gets_its_own_answer_command() {
         let call = json!({"bot":"Bob","turn":7,"call_id":"c 1","request":2,
-            "gates":["manual","second"],"name":"shell","arguments":"{\"command\":\"ls\"}"});
+            "gates":["manual","second"],"name":"shell","arguments":{"command":"ls"},
+            "arguments_cut":[],"arguments_omitted":0});
         assert_eq!(call_line(&call), "shell ls");
         assert_eq!(
             answer_lines(&call),

@@ -12,7 +12,7 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Answer, Binding, Bot, Delivery, Fork, Gate, Publication, Store, TurnOptions},
+    store::{Answer, Binding, Bot, Delivery, Fork, Gate, Publication, Store, TurnOptions, Waiting},
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -778,9 +778,10 @@ pub async fn run(config: Configuration) -> Result<()> {
             continue;
         }
         // A verdict park wakes on an answer, which may have committed
-        // before the restart, or when a gate lapses: check both.
+        // before the restart, or when a gate lapses: check both, once when
+        // the gate has already lapsed.
         if waiting.approval {
-            if let Some(at) = waiting.deadline_ms {
+            if let Some(at) = waiting.deadline_ms.filter(|&at| at > now_ms()) {
                 paced_at_start.push((at, waiting.bot.clone(), waiting.turn));
             }
             paced_at_start.push((0, waiting.bot, waiting.turn));
@@ -1031,16 +1032,25 @@ impl Service {
     }
 
     async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
-        // A wake-up can outlive an interrupt, deletion, or reuse of the name.
-        // Check only its identity and state, without loading the full bot.
-        let pending = self
+        // A wake-up can outlive an interrupt, deletion, or reuse of the name,
+        // and one turn can get several (an answer and its gate's lapse). The
+        // job that checks its identity and state also claims it, so a later
+        // wake-up finds it running and is dropped.
+        let claimed = self
             .store
-            .op("can_resume", move |db| {
-                Ok(db.can_resume(&bot, turn)?.then_some(bot))
+            .op("resume", move |db| {
+                if !db.can_resume(&bot, turn)? {
+                    return Ok(None);
+                }
+                match db.resume(turn) {
+                    Ok((waiting, _, steers)) => Ok(Some((bot, waiting, steers))),
+                    Err(error) if error.code == "turn_not_waiting" => Ok(None),
+                    Err(error) => Err(error),
+                }
             })
             .await?;
-        if let Some(bot) = pending {
-            self.spawn(bot, turn, true, false);
+        if let Some((bot, waiting, steers)) = claimed {
+            self.spawn(bot, turn, Some(waiting), steers);
         }
         Ok(())
     }
@@ -1061,7 +1071,7 @@ impl Service {
             })
             .await
         {
-            Ok((_, steers)) => self.spawn(bot, turn, false, steers),
+            Ok((_, steers)) => self.spawn(bot, turn, None, steers),
             Err(error) if error.code == "bot_busy" => {}
             // A strict steer whose turn is over ends as stale, like any
             // other queued turn that cannot start; an already-ended row is
@@ -1107,7 +1117,7 @@ impl Service {
     }
 
     /// Run a turn as a task: fresh after submission, or resuming a parked one.
-    fn spawn(&mut self, bot: String, turn: i64, resume: bool, steers: bool) {
+    fn spawn(&mut self, bot: String, turn: i64, resumed: Option<Waiting>, steers: bool) {
         let (cancel, cancelled) = watch::channel(None);
         self.next_task += 1;
         let task_id = self.next_task;
@@ -1138,7 +1148,7 @@ impl Service {
             note_turns: self.limits.note_turns,
             compact_at: self.limits.compact_at,
             compact_keep: self.limits.compact_keep,
-            resume,
+            resumed,
             approval_hold: self.approval_hold,
             steers,
             tokens: self.tokens.clone(),
@@ -1479,6 +1489,10 @@ impl Service {
                 if let Some(tag) = &tag {
                     name(tag).map_err(|_| Error::new("invalid_approver"))?;
                 }
+                // The model sees a denial's reason; an allow has no use for one.
+                if allow && reason.is_some() {
+                    return fail_with("invalid_reason", "only a deny carries a reason");
+                }
                 if reason.as_ref().is_some_and(|r| r.len() > 16 * 1024) {
                     return fail("reason_limit");
                 }
@@ -1726,7 +1740,7 @@ impl Service {
                     })?;
                 let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
                 if started.fresh && started.status == "running" {
-                    self.spawn(bot.clone(), started.turn, false, false);
+                    self.spawn(bot.clone(), started.turn, None, false);
                 }
                 if started.fresh
                     && started.status == "queued"
@@ -2476,7 +2490,7 @@ mod tests {
         // Missing providers make the real turn tasks finish without network I/O.
         // Their durable completion must not depend on the service reaping them.
         for (bot, turn) in &turns {
-            service.spawn(bot.clone(), *turn, false, false);
+            service.spawn(bot.clone(), *turn, None, false);
         }
         let mut results = Vec::new();
         while let Some(result) = service.jobs.join_next().await {
@@ -2504,6 +2518,132 @@ mod tests {
             }
         }
         assert_eq!(terminal, turns.len(), "one terminal event per turn");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_parked_turn_woken_twice_resumes_once() {
+        let dir = std::env::temp_dir().join(format!("agent-double-wake-{}", std::process::id()));
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = store
+            .op("park", |db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic-model",
+                        instructions: "test",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                        gate: None,
+                    },
+                )?;
+                let turn = db
+                    .begin(
+                        "Bob",
+                        "first",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                let call = agent_runtime::provider::ToolCall {
+                    name: "wait".into(),
+                    call_id: "wait-1".into(),
+                    arguments: r#"{"handles":["proc:1"]}"#.into(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                db.tool_start(turn, &call)?;
+                db.suspend(
+                    turn,
+                    &call.call_id,
+                    &["proc:1".into()],
+                    None,
+                    false,
+                    &[],
+                    None,
+                )?;
+                Ok(turn)
+            })
+            .await
+            .unwrap();
+        let mut service = Service {
+            identity: 0,
+            store: store.clone(),
+            transport: Transport::new(64, 1).unwrap(),
+            providers: Arc::new(HashMap::new()),
+            registry: Registry::new("wait").unwrap(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
+                processes: 16,
+                detached: 16,
+                active: 1024,
+                connecting: 64,
+                connections: 11,
+                context_bytes: 8 << 20,
+                context_items: 4096,
+                note_turns: 48,
+                compact_at: 75,
+                compact_keep: 25,
+            },
+            retain_turns: None,
+            sessions: 0,
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1024,
+            active: HashMap::new(),
+            next_task: 0,
+            jobs: JoinSet::new(),
+            replays: JoinSet::new(),
+            retention: JoinSet::new(),
+            ready_hint: false,
+            tokens: Arc::default(),
+            paced: std::collections::BinaryHeap::new(),
+            draining: false,
+            approval_hold: Duration::from_secs(2),
+        };
+        // Both wake-ups are handled before the first task runs at all, as
+        // with a restart's wake-ups for a gate that lapsed while it was down.
+        service.resume("Bob".into(), turn).await.unwrap();
+        service.resume("Bob".into(), turn).await.unwrap();
+        assert_eq!(service.jobs.len(), 1, "one task for the turn");
+        let task = service.active["Bob"].task;
+        // Missing providers make the resumed task fail without network I/O.
+        let (bot, id, finished, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        assert_eq!(finished, task);
+        service.complete(bot, id, finished, exit).await.unwrap();
+        assert!(service.active.is_empty());
+        store
+            .call(move |db| {
+                assert_eq!(db.turn_status("Bob", turn)?, "failed");
+                let events = db.events("Bob", 0, 256)?;
+                let resumed = events["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event"] == "turn_resumed")
+                    .count();
+                assert_eq!(resumed, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

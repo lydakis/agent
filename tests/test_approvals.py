@@ -65,13 +65,15 @@ class ApprovalTests(ModelFixture):
         # Pending calls list their arguments from the planned item.
         [pending] = client.request('approvals', bot='Bob')['result']['approvals']
         self.assertEqual((pending['call_id'], pending['gates'], pending['request']), ('shell-1', ['manual'], 1))
-        self.assertEqual(json.loads(pending['arguments'])['command'], 'printf hi')
+        self.assertEqual((pending['arguments'], pending['arguments_cut'], pending['arguments_omitted']),
+                         ({'command': 'printf hi', 'timeout_ms': 2000}, [], 0))
         self.assertEqual(client.request('stats')['result']['approval_requests'], 1)
         # A wrong request number, tag, or call changes nothing.
         self.assertEqual(self.answer(client, turn, 'shell-1', request=2)['error'], 'no_pending_approval')
         self.assertEqual(self.answer(client, turn, 'shell-1', tag='auto')['error'], 'no_pending_approval')
         self.assertEqual(self.answer(client, turn, 'nope')['error'], 'no_pending_approval')
         self.assertEqual(self.answer(client, turn, 'shell-1', decision='maybe')['error'], 'invalid_decision')
+        self.assertEqual(self.answer(client, turn, 'shell-1', reason='fine')['error'], 'invalid_reason')
         answered = self.answer(client, turn, 'shell-1')['result']
         self.assertEqual((answered['decision'], answered['pending']), ('allow', []))
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -150,6 +152,29 @@ class ApprovalTests(ModelFixture):
         self.answer(client, turn, 'shell-2', request=2)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         self.assertEqual(self.tool_output(client, 'shell-2')[1]['stdout'], 'second')
+
+    def test_a_gate_lapses_from_its_announcement_not_when_its_call_comes_up(self):
+        # An ungated command outlasts the gate on the call after it, so that
+        # call is past its expiry when it comes up and is judged at once.
+        client = self.gated(approve=['echo'], approve_expire_ms=300)
+        turn = client.request('submit', bot='Bob', request_id='t', prompt='shellecho:sleep 1|hi')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_completed' and m.get('turn') == turn
+                       and m['data']['call_id'] == 'shell-1')
+        ran = time.monotonic()
+        finished = client.finished(turn)
+        self.assertEqual((finished['data']['status'], finished['data']['error']), ('interrupted', 'approval_expired'))
+        self.assertLess(finished['_received_at'] - ran, 0.2)
+
+    def test_a_successful_call_whose_output_reads_as_a_failure_keeps_the_rounds_verdicts(self):
+        # Echoed text is the call's output, not its status.
+        client = self.gated(approve=['shell'])
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt='echoshell:{"success":false,"error":"x"}|printf second')['result']['turn']
+        self.announced(client, turn)
+        self.answer(client, turn, 'shell-1')
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'shell-1')[1]['stdout'], 'second')
+        self.assertEqual([e['request'] for c in self.events(client, turn, 'approval_requested') for e in c['calls']], [1])
 
     def test_a_verdict_for_a_later_call_waits_while_the_turn_waits_on_a_handle(self):
         client = self.gated()

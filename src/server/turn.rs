@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{Bot, ContextPrefix, ContextUsage, Gated, Store, Window},
+    store::{Bot, ContextPrefix, ContextUsage, Gated, Store, Waiting, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -161,8 +161,9 @@ pub struct Turn {
     /// Compaction threshold and verbatim tail, as percentages of the budget.
     pub compact_at: usize,
     pub compact_keep: usize,
-    /// Continue a parked turn: record its wait results, then keep going.
-    pub resume: bool,
+    /// The park this task continues, already claimed by the service: record
+    /// its wait results, then keep going.
+    pub resumed: Option<Waiting>,
     /// How long a gated call waits live for its verdict before the turn parks.
     pub approval_hold: Duration,
     /// A steer for this bot may be queued. Set by the service, cleared by
@@ -898,20 +899,10 @@ impl Turn {
             environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
         }
         let mut resume_window = false;
-        if self.resume {
-            let (waiting, _, steers) =
-                match self.store.op("resume", move |db| db.resume(turn)).await {
-                    Ok(resumed) => resumed,
-                    Err(error) if error.code == "turn_not_waiting" => return Ok(Round::Parked),
-                    Err(error) => return Err(error),
-                };
-            if steers {
-                // Queued while parked: absorbed at the first boundary below.
-                self.steers.store(true, Relaxed);
-            }
+        if let Some(waiting) = &self.resumed {
             // The park did not end the turn, so neither does its route.
-            if let Some(route) = waiting.route {
-                let _ = accounting.route.set(route);
+            if let Some(route) = &waiting.route {
+                let _ = accounting.route.set(route.clone());
             }
             // Only a pool park continues the same model call's retry budget.
             if waiting.paced_since_ms.is_some() {
@@ -923,7 +914,7 @@ impl Turn {
                 // started; a wait park first records the wait's result.
                 if !waiting.approval {
                     let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
-                    let id = waiting.call_id;
+                    let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                         .await?;
@@ -931,7 +922,7 @@ impl Turn {
                 // Calls that followed in the same model response.
                 if let Some(stop) = self
                     .execute_calls(
-                        waiting.pending,
+                        waiting.pending.clone(),
                         None,
                         &workspace,
                         &environment,
@@ -1023,11 +1014,14 @@ impl Turn {
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
             let gated = calls.iter().any(|call| record.gated(&call.name));
+            // Taken before the commit that stamps the gates' announcement,
+            // so a gate's first lapse is never counted late.
+            let planned = tokio::time::Instant::now();
             let announced = match self
                 .store
                 .op("append", move |db| {
                     let entries = db.append(turn, items, &calls, usage.as_ref())?;
-                    Ok((entries, gated.then(|| db.verdicts_for(turn))))
+                    Ok((entries, gated.then(|| (db.verdicts_for(turn), planned))))
                 })
                 .await
             {
@@ -1618,13 +1612,14 @@ impl Turn {
     /// Run planned calls in order. Returns true when a wait parked the turn;
     /// the calls after it are stored with the parked state.
     /// Run a round's calls in order. `announced` is set when this round
-    /// announced gated calls: the first of them waits for a verdict before
-    /// its first check, since none can be older than the announcement.
+    /// announced gated calls, with the time its commit began: the first of
+    /// them waits for a verdict before its first check, since none can be
+    /// older than the announcement.
     #[allow(clippy::too_many_arguments)]
     async fn execute_calls(
         &self,
         calls: Vec<ToolCall>,
-        mut announced: Option<Arc<Notify>>,
+        mut announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         workspace: &std::path::Path,
         environment: &[(String, String)],
         record: &Bot,
@@ -1730,6 +1725,7 @@ impl Turn {
                         output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
                         artifacts: Vec::new(),
                         note: Some(text),
+                        failed: false,
                     };
                     // Clearing is always permitted. Nonempty notes must fit
                     // before they become a mandatory prefix on future turns.
@@ -1776,7 +1772,7 @@ impl Turn {
         &self,
         call: &ToolCall,
         calls: &mut std::vec::IntoIter<ToolCall>,
-        announced: Option<Arc<Notify>>,
+        announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         record: &Bot,
         route: Option<&str>,
     ) -> Result<Approval> {
@@ -1784,16 +1780,16 @@ impl Turn {
         let hold = tokio::time::Instant::now() + self.approval_hold;
         // Announced by this round's own commit, so any verdict comes later
         // and wakes this wait: check after waiting, not before. The gates'
-        // expiry counts from about now; the check judges the stored time.
-        let mut first = announced.map(|notify| {
+        // expiry counts from that commit, however long the calls before
+        // this one ran; the check judges the stored time.
+        let mut first = announced.map(|(notify, at)| {
             let expire_ms = record
                 .gates
                 .iter()
                 .filter(|gate| gate.tools.contains(&call.name))
                 .filter_map(|gate| gate.expire_ms)
                 .min();
-            let lapse = expire_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
-            (notify, lapse)
+            (notify, expire_ms.map(|ms| at + Duration::from_millis(ms)))
         });
         loop {
             let (notify, lapse) = match first.take() {
@@ -2176,6 +2172,7 @@ fn failure(error: Error) -> Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
         note: None,
+        failed: true,
     }
 }
 
@@ -2349,7 +2346,7 @@ mod tests {
             note_turns: 48,
             compact_at: 75,
             compact_keep: 25,
-            resume: false,
+            resumed: None,
             approval_hold: Duration::from_secs(2),
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),

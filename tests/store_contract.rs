@@ -75,6 +75,7 @@ fn result(output: &str) -> Outcome {
         output: output.into(),
         artifacts: Vec::new(),
         note: None,
+        failed: false,
     }
 }
 
@@ -659,8 +660,9 @@ fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
         panic!("{listed:?}")
     };
     assert_eq!(second["call_id"], "s2");
-    assert_eq!(second["arguments"], r#"{"command":"ls"}"#);
-    assert_eq!(second["arguments_truncated"], false);
+    assert_eq!(second["arguments"], json!({"command":"ls"}));
+    assert_eq!(second["arguments_cut"], json!([]));
+    assert_eq!(second["arguments_omitted"], 0);
     assert_eq!(
         second["node"].as_i64(),
         first["node"].as_i64().map(|n| n + 1)
@@ -770,6 +772,39 @@ fn an_expiry_that_came_first_beats_a_later_denial() {
 }
 
 #[test]
+fn a_long_field_hides_no_other_in_a_listing() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    // Keys sort, so the long field comes first, as `content` does before
+    // `path` in an Anthropic `write`.
+    let arguments = json!({"aaa":"x".repeat(5000),"command":"ls"}).to_string();
+    let item = json!({"type":"function_call","id":"fc_1","call_id":"s1",
+        "name":"shell","arguments":arguments});
+    let call = ToolCall {
+        name: "shell".into(),
+        call_id: "s1".into(),
+        arguments,
+    };
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        &[call],
+        None,
+    )
+    .unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let [listed] = &page["approvals"].as_array().unwrap()[..] else {
+        panic!("{page}")
+    };
+    assert_eq!(listed["arguments"]["command"], "ls");
+    assert_eq!(
+        listed["arguments"]["aaa"].as_str().map(str::len),
+        Some(2048)
+    );
+    assert_eq!(listed["arguments_cut"], json!(["aaa"]));
+}
+
+#[test]
 fn a_call_larger_than_a_page_still_fills_one() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
@@ -842,6 +877,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
         note: None,
+        failed: false,
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -4411,6 +4447,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             output: "{}".into(),
             artifacts: Vec::new(),
             note: Some(text.to_owned()),
+            failed: false,
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();

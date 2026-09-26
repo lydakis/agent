@@ -1534,7 +1534,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `{"calls":[{"call_id","request","announced_ms","gates","name","node"}]}`.
 - **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?}`
   records one gate's verdict on the call's current request; `tag` may be
-  left out when the call has one gate. The reply lists the gates still
+  left out when the call has one gate, and `reason` goes only with a deny
+  (`invalid_reason` otherwise). The reply lists the gates still
   `pending`. Errors: `no_pending_approval` (unknown call, request, or tag),
   `approval_superseded` (an earlier request), `approval_already_answered`,
   `approval_expired` (the gate's expiry has passed, even if the turn has
@@ -1554,20 +1555,28 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   and resumes the turn only if it parked on that call and the call is now
   decided; a verdict for a call after a `wait` waits in the store.
 - **Expiry.** With `approve_expire_ms`, a call still without that gate's
-  verdict that long after it was announced is denied with "not reviewed:
-  no verdict" (`tool_completed` carries `expired: true`), and the turn ends
+  verdict that long after it was announced, however long the calls before
+  it ran, is denied with "not reviewed: no verdict" (`tool_completed`
+  carries `expired: true`), and the turn ends
   `interrupted` with `approval_expired`. When a call has several gates, a
   deny decides it only if it came before an open gate lapsed.
 - **Rounds.** A verdict is for the round as planned. When a call fails (an
-  error result, a denial, or a command that did not succeed), every gated
+  error result, a denial, or a command that did not succeed, as the tool
+  reports it rather than as its output reads), every gated
   call of the round still to run is announced again in that call's
   finishing commit, with the next `request` and `failed` naming the call.
   Their earlier verdicts are dropped, and answers to the old request get
   `approval_superseded`.
 - **Listing.** `{"op":"approvals","bot"?,"tag"?,"after"?,"limit"?}` lists
   calls still waiting on a gate in announcement order, each naming only its
-  unanswered gates, with `expires_ms` and a 2,048-character argument
-  preview. A page holds at most `limit` (1 to 256, default 64) calls and
+  unanswered gates, with `expires_ms` and `arguments`: the call's top-level
+  fields, each cut to 2,048 characters on its own, so a long `content`
+  hides no `path`. A string keeps its text; a longer other value becomes
+  its JSON text so far. `arguments_cut` names the fields cut short and
+  `arguments_omitted` counts those left out (past 8, repeated, or with a
+  name over 128 bytes); `arguments` is null when they are not a JSON
+  object, which no tool accepts. The previews are taken once, when the
+  call is planned, so a listing reads no item. A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger; `next_after` continues
   it. `stats` reports `approval_requests`, the calls
   announced and not yet started or denied.

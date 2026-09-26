@@ -377,25 +377,15 @@ pub struct Answered {
     pub notify: Option<Arc<Notify>>,
     pub resume: bool,
 }
-/// Whether a tool result is a failure, which voids verdicts given for the
-/// rest of its round: an error, or a command that did not succeed.
-fn failed(output: &str) -> bool {
-    serde_json::from_str::<Value>(output).is_ok_and(|v| {
-        v.get("error").is_some_and(|e| !e.is_null())
-            || v.get("success") == Some(&Value::Bool(false))
-    })
-}
 /// The fields of a stored item that say which calls it plans, in either
 /// encoding: a Responses `function_call`, or an Anthropic message's
-/// `tool_use` blocks. Everything else is skipped, and arguments stay raw.
+/// `tool_use` blocks. Everything else is skipped.
 #[derive(serde::Deserialize)]
 struct Plans<'a> {
     #[serde(rename = "type", default, borrow)]
     kind: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     call_id: Option<Cow<'a, str>>,
-    #[serde(default, borrow)]
-    arguments: Option<&'a RawValue>,
     #[serde(default, borrow)]
     content: Option<&'a RawValue>,
 }
@@ -405,17 +395,15 @@ struct PlansBlock<'a> {
     kind: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     id: Option<Cow<'a, str>>,
-    #[serde(default, borrow)]
-    input: Option<&'a RawValue>,
 }
-/// The calls a stored item plans, each with its raw arguments: a Responses
-/// call's arguments string, or an Anthropic tool use's input.
-fn planned_calls(item: &[u8]) -> Vec<(Cow<'_, str>, &RawValue)> {
+/// The ids of the calls a stored item plans: a Responses call's `call_id`,
+/// or each Anthropic tool use's `id`.
+fn planned_calls(item: &[u8]) -> Vec<Cow<'_, str>> {
     let Ok(item) = serde_json::from_slice::<Plans>(item) else {
         return Vec::new();
     };
     if item.kind.as_deref() == Some("function_call") {
-        return item.call_id.zip(item.arguments).into_iter().collect();
+        return item.call_id.into_iter().collect();
     }
     item.content
         .filter(|content| content.get().starts_with('['))
@@ -423,7 +411,7 @@ fn planned_calls(item: &[u8]) -> Vec<(Cow<'_, str>, &RawValue)> {
         .unwrap_or_default()
         .into_iter()
         .filter(|block| block.kind.as_deref() == Some("tool_use"))
-        .filter_map(|block| block.id.zip(block.input))
+        .filter_map(|block| block.id)
         .collect()
 }
 /// The bounded request context: ordered node ids and exact item bytes.
@@ -745,7 +733,7 @@ impl Database {
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
             CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
-                announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT);
+                announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS approvals_call ON approvals(turn,call_id);
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
@@ -2690,7 +2678,7 @@ impl Database {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if gated {
-                for (call_id, _) in planned_calls(&item) {
+                for call_id in planned_calls(&item) {
                     planned.insert(call_id.into_owned(), id);
                 }
             }
@@ -2727,8 +2715,11 @@ impl Database {
                 }
                 let node = planned.get(&call.call_id).copied().unwrap_or(0);
                 let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
+                // What the call would do, bounded per field, read once here
+                // so a listing reads no item and a long value hides no other.
+                let arguments = crate::codec::field_previews(&call.arguments, 8, 2048);
                 tx.prepare_cached(
-                    "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates) VALUES (?,?,?,?,1,?,?)",
+                    "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates,arguments) VALUES (?,?,?,?,1,?,?,?)",
                 )?
                 .execute(params![
                     turn,
@@ -2736,7 +2727,8 @@ impl Database {
                     call.name,
                     node,
                     announced_ms,
-                    serde_json::to_string(&gates)?
+                    serde_json::to_string(&gates)?,
+                    arguments.to_string()
                 ])?;
                 announced.push(json!({"call_id":call.call_id,"request":1,
                     "announced_ms":announced_ms,"gates":tags,"name":call.name,"node":node}));
@@ -2862,9 +2854,8 @@ impl Database {
         let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
         // Verdicts are for the round as planned: after a failure the gated
         // calls still to run are announced again, in this same commit.
-        let reannounced = !bot.gates.is_empty()
-            && failed(&outcome.output)
-            && reannounce(&tx, &bot.name, turn, call_id)?;
+        let reannounced =
+            !bot.gates.is_empty() && outcome.failed && reannounce(&tx, &bot.name, turn, call_id)?;
         tx.commit()?;
         if reannounced && let Some(live) = self.live_changed(turn) {
             live.verdicts.clear();
@@ -3190,16 +3181,13 @@ impl Database {
             return fail("invalid_approval_page");
         }
         let mut statement = self.conn.prepare_cached(
-            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts
+            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
              FROM approvals a JOIN turns t ON t.id=a.turn
              WHERE a.id>?1 AND (?2 IS NULL OR t.bot=?2) ORDER BY a.id LIMIT ?3",
         )?;
         let mut rows = statement.query(params![after, bot, READ as i64])?;
         let (mut listed, mut bytes, mut read, mut last, mut more) =
             (Vec::new(), 0, 0, after, false);
-        // Previews of the calls in the last item read: an Anthropic item
-        // plans every call of its round, so it is read and scanned once.
-        let mut previews: (i64, Vec<(String, String, bool)>) = (0, Vec::new());
         while let Some(r) = rows.next()? {
             read += 1;
             let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
@@ -3230,34 +3218,17 @@ impl Database {
                 last = id;
                 continue;
             }
-            let node: i64 = r.get(5)?;
-            if previews.0 != node {
-                let item: Option<Vec<u8>> = self
-                    .conn
-                    .prepare_cached("SELECT item FROM nodes WHERE id=?")?
-                    .query_row([node], |r| r.get(0))
-                    .optional()?;
-                let calls = item.as_deref().map(planned_calls).unwrap_or_default();
-                previews = (
-                    node,
-                    calls
-                        .into_iter()
-                        .map(|(id, arguments)| {
-                            let (text, more) = crate::codec::json_preview(arguments, 2048);
-                            (id.into_owned(), text, more)
-                        })
-                        .collect(),
-                );
-            }
-            let (arguments, truncated) = previews
-                .1
-                .iter()
-                .find(|(id, ..)| *id == call_id)
-                .map_or(("", false), |(_, text, more)| (text.as_str(), *more));
-            let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
+            let mut entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
                 "request":request.request,"announced_ms":request.announced_ms,
                 "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
-                "node":node,"arguments":arguments,"arguments_truncated":truncated});
+                "node":r.get::<_, i64>(5)?});
+            // The previews stored when the call was planned.
+            if let (Value::Object(entry), Value::Object(arguments)) = (
+                &mut entry,
+                serde_json::from_str::<Value>(&r.get::<_, String>(10)?)?,
+            ) {
+                entry.extend(arguments);
+            }
             // A page holds at least one call, so paging always advances.
             let size = crate::output::encoded_len(&entry)? + 1;
             if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
@@ -5484,27 +5455,12 @@ mod tests {
     fn planned_calls_are_found_by_their_ids_not_their_bytes() {
         // A Responses item whose own item id is another call's id.
         let decoy = br#"{"type":"function_call","id":"c2","call_id":"c1","name":"shell","arguments":"{\"command\":\"echo \\\"c2\\\"\"}"}"#;
-        let [(id, arguments)] = planned_calls(decoy).try_into().unwrap();
-        assert_eq!(id, "c1");
-        assert_eq!(
-            crate::codec::json_preview(arguments, 64),
-            (r#"{"command":"echo \"c2\""}"#.into(), false)
-        );
+        assert_eq!(planned_calls(decoy), ["c1"]);
         let message = br#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\"c2\""}]}"#;
         assert!(planned_calls(message).is_empty());
-        // An Anthropic message plans every tool use it holds; input is JSON as is.
+        // An Anthropic message plans every tool use it holds.
         let anthropic = br#"{"role":"assistant","content":[{"type":"text","text":"\"t2\""},{"type":"tool_use","id":"t1","name":"read","input":{"path":"t2"}},{"type":"tool_use","id":"t2","name":"shell","input":{"command":"ls"}}]}"#;
-        let calls = planned_calls(anthropic);
-        let ids: Vec<&str> = calls.iter().map(|(id, _)| id.as_ref()).collect();
-        assert_eq!(ids, ["t1", "t2"]);
-        assert_eq!(
-            crate::codec::json_preview(calls[1].1, 64),
-            (r#"{"command":"ls"}"#.into(), false)
-        );
-        assert_eq!(
-            crate::codec::json_preview(calls[1].1, 4),
-            ("{\"co".into(), true)
-        );
+        assert_eq!(planned_calls(anthropic), ["t1", "t2"]);
         let text = br#"{"role":"user","content":"plain"}"#;
         assert!(planned_calls(text).is_empty());
     }

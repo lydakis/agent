@@ -309,6 +309,9 @@ pub struct Outcome {
     pub artifacts: Vec<(&'static str, Vec<u8>)>,
     /// A carry-forward note to record with this result; empty text clears.
     pub note: Option<String>,
+    /// The call failed: an error, or a command that did not succeed. Set by
+    /// whoever ran it, never read back from the output's text.
+    pub failed: bool,
 }
 impl Outcome {
     pub fn text(output: String) -> Self {
@@ -316,6 +319,7 @@ impl Outcome {
             output,
             artifacts: Vec::new(),
             note: None,
+            failed: false,
         }
     }
 }
@@ -775,18 +779,24 @@ impl Registry {
             shown
         };
         let (stdout, stderr) = (preview("stdout", stdout), preview("stderr", stderr));
-        let output = match exit {
-            Exit::Status(status) => json!({"stdout":stdout,"stderr":stderr,
-                "exit_code":status.code(),"success":status.success()}),
+        let (output, success) = match exit {
+            Exit::Status(status) => (
+                json!({"stdout":stdout,"stderr":stderr,
+                    "exit_code":status.code(),"success":status.success()}),
+                status.success(),
+            ),
             // The output up to the kill is what a long command has to show.
-            Exit::TimedOut => json!({"stdout":stdout,"stderr":stderr,
-                "exit_code":null,"success":false,"timed_out":true}),
-        }
-        .to_string();
+            Exit::TimedOut => (
+                json!({"stdout":stdout,"stderr":stderr,
+                    "exit_code":null,"success":false,"timed_out":true}),
+                false,
+            ),
+        };
         Outcome {
-            output,
+            output: output.to_string(),
             artifacts,
             note: None,
+            failed: !success,
         }
     }
 

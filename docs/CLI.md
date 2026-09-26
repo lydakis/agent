@@ -68,7 +68,7 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   gate still open. `answer --bot NAME --turn TURN --call ID --request N
   [--tag TAG] [--reason TEXT] allow|deny` records one gate's verdict; `--tag`
   may be left out when the call has one gate, and a denial's `--reason` is
-  what the model sees. `answer` refuses to run inside a bot's own tool shell
+  what the model sees (an allow takes none). `answer` refuses to run inside a bot's own tool shell
   (`answer_in_tool_shell`). `run --pretty` and `follow --pretty` print the
   same commands when a call waits.
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,

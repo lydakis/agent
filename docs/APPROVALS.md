@@ -1025,6 +1025,12 @@ Where it differs from the design above:
   late allow cannot outrun the expiry.
 - A bot carries at most 8 gates; a `create` or `fork` past that fails with
   `gate_limit`.
+- `approvals` previews each top-level argument field on its own (2,048
+  characters, at most 8 fields), taken when the call is planned, rather
+  than the first 2,048 characters of the node's arguments; an Anthropic
+  `write` puts `content` before `path`, which a prefix would hide.
+- A `reason` goes only with a deny; an allow with one is refused with
+  `invalid_reason`.
 
 Not built yet: the automatic approver (rules and Jev), with
 `serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`

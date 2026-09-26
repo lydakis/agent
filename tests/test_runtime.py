@@ -203,6 +203,22 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
                            'arguments': json.dumps({'command': user[6:], 'timeout_ms': 2000})}]
+            elif user.startswith('shellecho:'):
+                # A command, then an echo, in one response.
+                text = ''
+                command, _, echoed = user[10:].partition('|')
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})},
+                          {'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
+                           'arguments': json.dumps({'text': echoed})}]
+            elif user.startswith('echoshell:'):
+                # An echo, then a command, in one response.
+                text = ''
+                echoed, _, command = user[10:].partition('|')
+                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
+                           'arguments': json.dumps({'text': echoed})},
+                          {'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})}]
             elif user.startswith('oddshell:'):
                 # A long call id a shell would read as syntax.
                 text = ''
