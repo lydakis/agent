@@ -230,7 +230,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                            'arguments': json.dumps({'text': getattr(self.server, 'note_text', user[5:])})}]
             elif user == 'large-call-id':
                 text = ''
-                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 210000,
+                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 65536,
                            'arguments': json.dumps({'text': 'ok'})}]
             else:
                 text = getattr(self.server, 'reply_text', 'reply:' + user)
@@ -1307,7 +1307,8 @@ class RuntimeTests(ModelFixture):
     def test_large_event_replay_pages_preserve_all_events_and_service_liveness(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        for index in range(3):
+        # Call ids at the 64 KiB bound, enough of them to need several pages.
+        for index in range(12):
             turn = client.request('submit', bot='Bob', request_id=str(index), prompt='large-call-id')['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         cursor, events, nonempty_pages = 0, [], 0
@@ -1323,9 +1324,9 @@ class RuntimeTests(ModelFixture):
             nonempty_pages += 1
         self.assertGreater(nonempty_pages, 1)
         self.assertEqual(len({e['cursor'] for e in events}), len(events))
-        self.assertEqual(sum(e['event'] == 'tool_started' for e in events), 3)
-        self.assertEqual(sum(e['event'] == 'tool_completed' for e in events), 3)
-        self.assertEqual(sum(e['event'] == 'turn_finished' for e in events), 3)
+        self.assertEqual(sum(e['event'] == 'tool_started' for e in events), 12)
+        self.assertEqual(sum(e['event'] == 'tool_completed' for e in events), 12)
+        self.assertEqual(sum(e['event'] == 'turn_finished' for e in events), 12)
         self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'completed')
 
     def test_distinct_store_files_do_not_collide_and_symlink_resume_is_exact(self):

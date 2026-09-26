@@ -25,6 +25,12 @@ pub use socket::Sockets;
 /// every stored item and live event remains publishable and readable.
 pub const MAX_OUTPUT: usize = 768 * 1024;
 
+/// JSON-encoded bytes one tool call id may take. Real ids run tens of bytes;
+/// the bound keeps every call listable and answerable: its approval entry
+/// and answer fit a 1 MiB line, and the printed `agent answer` command
+/// passes it as one argument under Linux's 128 KiB limit.
+pub const MAX_CALL_ID: usize = 64 * 1024;
+
 /// The bytes `text` takes as a JSON string body, as serde_json escapes it.
 /// Decoded text can grow up to sixfold when encoded, so output bounds count
 /// this rather than the decoded length.

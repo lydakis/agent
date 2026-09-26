@@ -301,7 +301,8 @@ enum Approval {
 pub enum Exit {
     Finished(Option<Error>),
     Parked,
-    /// Parked on a rate-limited pool; the service resumes it at this time.
+    /// Parked on a rate-limited pool, or on a verdict whose gate lapses;
+    /// the service resumes it at this time unless something resumes it first.
     Paced(u64),
 }
 
@@ -1795,11 +1796,14 @@ impl Turn {
             let (notify, lapse) = match first.take() {
                 Some(first) => first,
                 None => {
-                    let (checked, now) = (call.clone(), now_ms());
+                    // The job reads the clock when it judges, and the lapse
+                    // is measured from a fresh read, so time spent queued for
+                    // the worker moves neither.
+                    let checked = call.clone();
                     match self
                         .store
                         .op("approval_start", move |db| {
-                            db.approval_start(turn, &checked, now)
+                            db.approval_start(turn, &checked, now_ms())
                         })
                         .await?
                     {
@@ -1810,7 +1814,7 @@ impl Turn {
                             notify,
                             expires_ms.map(|at| {
                                 tokio::time::Instant::now()
-                                    + Duration::from_millis(at.saturating_sub(now))
+                                    + Duration::from_millis(at.saturating_sub(now_ms()))
                             }),
                         ),
                     }

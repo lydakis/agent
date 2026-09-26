@@ -2,7 +2,8 @@
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
 use super::{
-    Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
+    Completion, Delta, Frame, MAX_CALL_ID, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of,
+    encoded_len,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -365,7 +366,10 @@ impl State {
                     };
                     let parsed: Value = serde_json::from_str(&arguments)
                         .map_err(|_| Error::new("invalid_tool_arguments"))?;
-                    if id.is_empty() || calls.iter().any(|c| c.call_id == id) {
+                    if id.is_empty()
+                        || encoded_len(&id) > MAX_CALL_ID
+                        || calls.iter().any(|c| c.call_id == id)
+                    {
                         return fail("invalid_tool_call_id");
                     }
                     calls.push(ToolCall {
@@ -405,6 +409,27 @@ mod tests {
             }
         }
         deltas
+    }
+    #[test]
+    fn a_tool_use_id_over_the_bound_fails() {
+        for (id, code) in [
+            ("c".repeat(MAX_CALL_ID), None),
+            ("c".repeat(MAX_CALL_ID + 1), Some("invalid_tool_call_id")),
+        ] {
+            let mut state = State::default();
+            let start = json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"tool_use","id":id,"name":"shell","input":{}}});
+            feed(
+                &mut state,
+                &[
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+                    &start.to_string(),
+                    r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}"#,
+                    r#"{"type":"message_stop"}"#,
+                ],
+            );
+            assert_eq!(state.finish().err().map(|e| e.code).as_deref(), code);
+        }
     }
     #[test]
     fn thinking_text_and_tool_use_become_one_native_assistant_item() {
