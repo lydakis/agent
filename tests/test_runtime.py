@@ -432,9 +432,16 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Transfer-Encoding', 'chunked')
             self.end_headers()
-            for kind, body in events:
+            # A long reply: the first answer streams its start, then pauses
+            # this long before the rest, as a long generation does.
+            generating = getattr(self.server, 'generate_delay', 0)
+            self.server.generate_delay = 0
+            for index, (kind, body) in enumerate(events):
                 frame = f'event: {kind}\ndata: {json.dumps({"type": kind, **body})}\n\n'.encode()
                 self.wfile.write(f'{len(frame):x}\r\n'.encode() + frame + b'\r\n')
+                if index == 0 and generating:
+                    self.wfile.flush()
+                    time.sleep(generating)
             self.wfile.write(b'0\r\n\r\n')
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -482,6 +489,41 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u for u in usage if u.get('purpose') == 'keep_warm'], [
             {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm'}] * 2)
         self.assertEqual(len(usage), 4)
+
+    def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        model.generate_delay = 2.5
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='g1', prompt='long')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not model.requests.empty():
+            requests.append(model.requests.get())
+        # Refreshed once a second while the reply streamed, never after it
+        # ended; each is the call's own request with no output and no stream.
+        call, warms = requests[0], requests[1:]
+        self.assertEqual(len(warms), 2)
+        for warm in warms:
+            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual([u.get('purpose') for u in usage], ['keep_warm', 'keep_warm', None])
+
+    def test_a_refresh_in_flight_when_the_reply_ends_carries_into_the_tool(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        model.generate_delay = 1.5
+        model.warm_delay = 1
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low')
+        turn = client.request('submit', bot='Bob', request_id='g2', prompt='shell:true')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not model.requests.empty():
+            requests.append(model.requests.get())
+        # The refresh sent a second into the reply is still unanswered when
+        # the reply and then the tool end: it is answered and recorded once,
+        # and nothing is sent after the tool.
+        self.assertEqual([r['max_tokens'] == 0 for r in requests], [False, True, False])
+        usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
     def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
         client, model, path = self.start(extra=('--keep-warm', '1'))

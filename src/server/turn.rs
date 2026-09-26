@@ -235,8 +235,12 @@ struct Accounting {
     parked_until: u64,
     /// Persist the call's phase with its existing park transaction.
     compaction: bool,
-    /// A prompt-cache refresh in flight while a tool runs.
+    /// A prompt-cache refresh in flight while a reply streams or a tool runs.
     refresh: Option<Pending>,
+    /// When the last call's cache was last read by a refresh sent while the
+    /// reply streamed, and whether one was refused.
+    warm_read_at: Option<tokio::time::Instant>,
+    warm_stopped: bool,
     /// The provider's sticky-routing token for this turn's model calls.
     route: std::sync::OnceLock<String>,
 }
@@ -978,11 +982,16 @@ impl Turn {
                 }
                 return Ok(Round::Finished);
             }
-            // The cache's lifetime runs from the sending of the call that read it.
+            // The cache's lifetime runs from the sending of the call that
+            // read it, or of a refresh sent while its reply streamed.
             let read_at = accounting
                 .report
                 .sent_at
                 .unwrap_or_else(tokio::time::Instant::now);
+            let read_at = accounting
+                .warm_read_at
+                .map_or(read_at, |refreshed| refreshed.max(read_at));
+            let stopped = accounting.warm_stopped;
             let pending = &mut accounting.refresh;
             let mut warm = provider
                 .keep_warm_after(model, record.reasoning.as_deref())
@@ -996,7 +1005,7 @@ impl Turn {
                     fallbacks: record.fallbacks,
                     after,
                     read_at,
-                    stopped: false,
+                    stopped,
                     tokens: 0,
                     pending,
                 });
@@ -1102,14 +1111,20 @@ impl Turn {
             record.cache_bot(),
             matches!(body, Body::Span(_)),
         );
+        // A summary's cache is its own and read once; only the turn's call
+        // is refreshed while it streams.
+        let warm_after = match body {
+            Body::Window(_) => provider.keep_warm_after(model, record.reasoning.as_deref()),
+            Body::Span(_) => None,
+        };
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context),
                 Body::Span(plan) => self.span_items(plan).await?,
             };
             accounting.begin(attempt > 0);
-            let result = provider
-                .complete_accounted(
+            (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
+            let call = provider.complete_accounted(
                     ModelRequest {
                         model,
                         instructions,
@@ -1134,8 +1149,32 @@ impl Turn {
                         )
                     },
                     &mut accounting.report,
-                )
-                .await;
+                );
+            let result = match (warm_after, body) {
+                (Some(after), Body::Window(context)) => {
+                    let mut warm = Warm {
+                        provider,
+                        model,
+                        instructions,
+                        reasoning: record.reasoning.as_deref(),
+                        tools,
+                        context,
+                        fallbacks: record.fallbacks,
+                        after,
+                        read_at: tokio::time::Instant::now(),
+                        stopped: false,
+                        tokens: 0,
+                        pending: &mut accounting.refresh,
+                    };
+                    let result = self.stream_warm(call, &mut warm).await;
+                    accounting.warm_read_at = Some(warm.read_at);
+                    accounting.warm_stopped = warm.stopped;
+                    let refreshed = warm.tokens;
+                    record.tokens_used = record.tokens_used.saturating_add(refreshed);
+                    result?
+                }
+                _ => call.await,
+            };
             let error = match result {
                 Ok(completion) => {
                     if let Some(usage) = &completion.usage {
@@ -1301,6 +1340,43 @@ impl Turn {
         Ok(())
     }
 
+    /// Await a model call, refreshing its own prompt cache each time the
+    /// cache has sat unread for `after`: a reply that streams for longer
+    /// than the cache lives would otherwise let the prefix it read expire
+    /// before the next call. A refresh still in flight when the reply ends
+    /// is left in `warm.pending`, for the tool run or the turn's end to
+    /// settle.
+    async fn stream_warm<T>(
+        &self,
+        call: impl std::future::Future<Output = T>,
+        warm: &mut Warm<'_>,
+    ) -> Result<T> {
+        tokio::pin!(call);
+        loop {
+            if warm.stopped {
+                return Ok(call.await);
+            }
+            if warm.pending.is_none() {
+                tokio::select! {
+                    biased;
+                    result = &mut call => return Ok(result),
+                    () = tokio::time::sleep_until(warm.read_at + warm.after) => {}
+                }
+                *warm.pending = Some(self.refresh(warm));
+            }
+            let refreshed = {
+                let task = &mut warm.pending.as_mut().expect("a refresh in flight").task;
+                tokio::select! {
+                    biased;
+                    result = &mut call => return Ok(result),
+                    joined = task => joined.unwrap_or_else(|_| fail("keep_warm_lost")),
+                }
+            };
+            *warm.pending = None;
+            self.refreshed(warm, refreshed).await?;
+        }
+    }
+
     /// Run a prepared tool, refreshing the last model call's prompt cache
     /// each time it has sat unread for `after`. The outer error is the
     /// runtime's; the inner one is the tool's result.
@@ -1415,8 +1491,9 @@ impl Turn {
             .tokens
             .saturating_add(usage.input_tokens)
             .saturating_add(usage.output_tokens);
-        // The refresh's own read, from when it was sent.
-        warm.read_at = sent_at;
+        // The refresh's own read, from when it was sent. One carried over
+        // from an earlier call can be older than this call's own read.
+        warm.read_at = warm.read_at.max(sent_at);
         self.record_refresh(usage).await
     }
 

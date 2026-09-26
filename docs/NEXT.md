@@ -726,7 +726,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     2026-09-25 (Sonnet 5 with adaptive thinking and effort) found both
     accepted: each refresh read the whole prefix, with a signed thinking
     block in history too, and carried the cache over a 330-second tool that
-    missed it completely with `--keep-warm 0`. Next, a matched long-tool task
+    missed it completely with `--keep-warm 0`. The 2026-09-25 Sonnet 5 rerun
+    found six replies that streamed past five minutes on their own, so a
+    refresh now also runs while a reply streams. Next, a matched long-tool task
     with three arms: the five-minute cache alone (`--keep-warm 0`),
     `--cache-ttl 1h`, and refreshes. Anthropic shares a cache across an
     organization, so each arm needs bytes of its own, such as a nonce in its
