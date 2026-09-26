@@ -69,6 +69,9 @@ Default output is machine-readable JSON. `run` and `follow` stream one JSON
 object per line. Snapshot commands return compact JSON objects; `ls` and `turns`
 return arrays. `interrupt` and `shutdown` return no stdout on success.
 `shutdown` returns once the daemon process has exited and its store is closed.
+`shutdown --grace SECONDS` first lets running turns finish for up to that long
+while starting none; turns still running then end `interrupted` with
+`daemon_shutdown`.
 
 `--pretty` is an explicit human view: rendered streams, tables for lists, and
 indented JSON for other results, including detached submission handles. It is

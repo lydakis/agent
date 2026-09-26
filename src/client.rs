@@ -21,7 +21,8 @@ use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 const DEFAULT_INSTRUCTIONS: &str = agent_client::policy::PREAMBLE;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-/// Shutdown drains each client and the event publisher under 5 s bounds.
+/// Shutdown drains each client and the event publisher under 5 s bounds,
+/// after any grace period the caller gave running turns.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn startup_remaining(deadline: Instant) -> Result<Duration> {
@@ -63,6 +64,8 @@ struct Options {
     detach: bool,
     no_spawn: bool,
     timeout_ms: Option<u64>,
+    /// `shutdown --grace`: seconds running turns may take to finish.
+    grace: u64,
     budget_tokens: Option<u64>,
     turn: Option<i64>,
     keep_turns: Option<usize>,
@@ -105,6 +108,7 @@ fn parse(args: &[String]) -> Result<Options> {
         detach: false,
         no_spawn: false,
         timeout_ms: None,
+        grace: 0,
         budget_tokens: None,
         turn: None,
         keep_turns: None,
@@ -186,6 +190,11 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.keep_turns = Some(value.parse().ok().filter(|n| *n > 0).ok_or(
                             Error::with("usage", "--keep-turns needs a positive integer"),
                         )?)
+                    }
+                    "--grace" => {
+                        options.grace = value
+                            .parse()
+                            .map_err(|_| Error::with("usage", "--grace needs seconds"))?
                     }
                     "--timeout-ms" => {
                         options.timeout_ms =
@@ -674,8 +683,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
                 .as_u64()
                 .and_then(|pid| i32::try_from(pid).ok())
                 .ok_or(Error::new("daemon_protocol_mismatch"))?;
-            connection.request("shutdown", json!({}))?;
-            await_exit(pid)?;
+            connection.request("shutdown", json!({"grace_ms": options.grace * 1000}))?;
+            await_exit(pid, SHUTDOWN_TIMEOUT + Duration::from_secs(options.grace))?;
             Ok(0)
         }
         _ => fail("usage"),
@@ -683,10 +692,11 @@ pub fn main(args: Vec<String>) -> Result<i32> {
 }
 
 /// Return once the daemon process is gone, so a caller may copy or reopen
-/// the store: it answers shutdown before it cancels active turns, commits
-/// their records and closes the database. An unreaped zombie counts as gone.
-fn await_exit(pid: i32) -> Result<()> {
-    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+/// the store: it answers shutdown before it lets running turns finish within
+/// the grace period, cancels the rest, commits their records and closes the
+/// database. An unreaped zombie counts as gone.
+fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
     let running = || {
         // SAFETY: signal 0 only checks that the process exists.
         let exists = unsafe { libc::kill(pid, 0) } == 0

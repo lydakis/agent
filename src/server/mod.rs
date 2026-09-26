@@ -169,7 +169,13 @@ enum Command {
         after: Option<String>,
         limit: Option<usize>,
     },
-    Shutdown,
+    /// Stop the daemon. With `grace_ms`, running turns first get up to that
+    /// long to finish while nothing new starts; whatever still runs is then
+    /// cancelled with `daemon_shutdown`.
+    Shutdown {
+        #[serde(default)]
+        grace_ms: u64,
+    },
 }
 pub struct ProviderSpec {
     pub name: String,
@@ -476,6 +482,9 @@ struct Service {
     /// Turns parked on a rate-limited pool, by resume time. Each holds no
     /// task and no slot; the run loop resumes them as they come due.
     paced: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String, i64)>>,
+    /// Shutting down with a grace period: running turns go on, no turn
+    /// starts, and accepted submissions wait durably for the next start.
+    draining: bool,
 }
 
 /// A bot's live turn: which turn, the task owning it, its cancel signal,
@@ -484,7 +493,8 @@ struct Service {
 struct Active {
     turn: i64,
     task: u64,
-    cancel: watch::Sender<bool>,
+    /// Set to the error the cancelled turn ends with.
+    cancel: watch::Sender<Option<&'static str>>,
     steers: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -623,7 +633,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -724,6 +734,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         ready_hint: true,
         tokens: Arc::default(),
         paced: std::collections::BinaryHeap::new(),
+        draining: false,
     };
     for (at, bot, turn) in paced_at_start {
         service.paced.push(std::cmp::Reverse((at, bot, turn)));
@@ -735,7 +746,14 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut last_activity = std::time::Instant::now();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    // A shutdown's grace deadline: running turns may finish until then. The
+    // placeholder only fills the disabled select arm, never polled.
+    let mut drain_until: Option<tokio::time::Instant> = None;
+    let undrained = tokio::time::Instant::now();
     loop {
+        if service.draining && service.active.is_empty() {
+            break;
+        }
         // Computed before the select so its arms borrow the service freely.
         let (paced_due, paced_delay) = (service.paced.peek().is_some(), service.paced_delay());
         tokio::select! {
@@ -749,6 +767,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
+            _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
             _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
                 // Idle means no client, no live turn, and no running command.
                 // Parked turns are durable and resume on the next start.
@@ -793,16 +812,20 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     Inbound::Request(id, request) => {
                         let Some(output) = sessions.get(&id).cloned() else { continue };
-                        let (request_id, result, shutting_down) = match request {
+                        let (request_id, result, shutdown) = match request {
                             Ok(request) if request.id.is_u64() || request.id.as_str().is_some_and(|id| id.len() <= 128) => {
-                                let shutting_down = matches!(request.command, Command::Shutdown);
+                                let shutdown = match request.command {
+                                    Command::Shutdown { grace_ms } => Some(grace_ms),
+                                    _ => None,
+                                };
                                 let result = service.dispatch(request.command, id, &output, request.id.clone()).await;
                                 if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
-                                (request.id, result, shutting_down)
+                                (request.id, result, shutdown)
                             }
-                            Ok(_) => (Value::Null, fail("invalid_request_id"), false),
-                            Err(error) => (Value::Null, Err(error), false),
+                            Ok(_) => (Value::Null, fail("invalid_request_id"), None),
+                            Err(error) => (Value::Null, Err(error), None),
                         };
+                        let shutdown = shutdown.filter(|_| result.is_ok());
                         if id == 0 && stdio_owner {
                             if !matches!(tokio::time::timeout(Duration::from_secs(5), output.respond(request_id, result)).await, Ok(Ok(()))) {
                                 return fail("output_closed");
@@ -814,11 +837,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                             service.handles.close_session(id);
                             output.close();
                         }
-                        if shutting_down {
-                            // The socket writer is a task on this runtime. Give
-                            // it time to acknowledge shutdown before exiting.
-                            let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
-                            break;
+                        if let Some(grace_ms) = shutdown {
+                            // A later shutdown can only bring the deadline closer.
+                            let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+                            drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
+                            service.draining = true;
+                            if grace_ms == 0 || service.active.is_empty() {
+                                // The socket writer is a task on this runtime. Give
+                                // it time to acknowledge shutdown before exiting.
+                                let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
+                                break;
+                            }
                         }
                     }
                 }
@@ -830,7 +859,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
     for active in service.active.values() {
-        let _ = active.cancel.send(true);
+        let _ = active.cancel.send(Some(turn::SHUTDOWN));
     }
     while let Some(result) = service.jobs.join_next().await {
         let (bot, turn, task, exit) = result.map_err(|_| Error::new("turn_task_failed"))?;
@@ -901,7 +930,7 @@ fn validate_provider(
 
 impl Service {
     fn has_capacity(&self) -> bool {
-        self.limit_active == 0 || self.active.len() < self.limit_active
+        !self.draining && (self.limit_active == 0 || self.active.len() < self.limit_active)
     }
 
     /// How long until the earliest paced turn is due.
@@ -990,7 +1019,7 @@ impl Service {
 
     /// Run a turn as a task: fresh after submission, or resuming a parked one.
     fn spawn(&mut self, bot: String, turn: i64, resume: bool, steers: bool) {
-        let (cancel, cancelled) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(None);
         self.next_task += 1;
         let task_id = self.next_task;
         // The job that started this turn said whether a steer waits for it;
@@ -1312,6 +1341,7 @@ impl Service {
                     "store": store.stats(),
                     "tokens": self.tokens.snapshot(),
                     "handles": {"waiters": waiters, "retained": retained},
+                    "draining": self.draining,
                 }))
             }
             Command::Wait {
@@ -1494,6 +1524,7 @@ impl Service {
                 let capacity = self.has_capacity();
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
+                let draining = self.draining;
                 let (identity, started) = store
                     .op("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
@@ -1503,7 +1534,13 @@ impl Service {
                             })?;
                         Ok((identity, started))
                     })
-                    .await?;
+                    .await
+                    // While draining no turn starts: `reject` work is refused
+                    // for the next daemon, and queued work waits durably for it.
+                    .map_err(|error| match error.code.as_str() {
+                        "active_agent_limit" if draining => Error::new("daemon_draining"),
+                        _ => error,
+                    })?;
                 let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
                 if started.fresh && started.status == "running" {
                     self.spawn(bot.clone(), started.turn, false, false);
@@ -1528,7 +1565,7 @@ impl Service {
             }
             Command::Interrupt { bot, turn } => {
                 if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
-                    if active.cancel.send(true).is_ok() {
+                    if active.cancel.send(Some(turn::INTERRUPTED)).is_ok() {
                         return Ok(json!({"interrupt_requested":true,"turn":turn}));
                     }
                     // The task exited but its JoinSet result has not been reaped.
@@ -1543,7 +1580,8 @@ impl Service {
                     .await
                     .unwrap_or_default();
                 if matches!(status.as_str(), "queued" | "ready") {
-                    self.end_queued(bot, turn, Error::new("cancelled")).await?;
+                    self.end_queued(bot, turn, Error::new(turn::INTERRUPTED))
+                        .await?;
                     return Ok(json!({"interrupt_requested":true,"turn":turn,"queued":true}));
                 }
                 if self.active.contains_key(&bot) {
@@ -1569,7 +1607,7 @@ impl Service {
                             db,
                             &name,
                             turn,
-                            Some(&Error::new("cancelled")),
+                            Some(&Error::new(turn::INTERRUPTED)),
                             keep,
                         )
                     })
@@ -1577,7 +1615,12 @@ impl Service {
                 self.ready_hint = true;
                 Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
             }
-            Command::Shutdown => Ok(json!({"shutting_down":true})),
+            Command::Shutdown { grace_ms } => {
+                if grace_ms > 86_400_000 {
+                    return fail("invalid_timeout");
+                }
+                Ok(json!({"shutting_down":true}))
+            }
         }
     }
 }
@@ -1841,7 +1884,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let (cancel, cancelled) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(None);
         let mut service = Service {
             store: store.clone(),
             identity: 0,
@@ -1884,6 +1927,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
+            draining: false,
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -2061,7 +2105,7 @@ mod tests {
                         Active {
                             turn,
                             task: 0,
-                            cancel: watch::channel(false).0,
+                            cancel: watch::channel(None).0,
                             steers: Arc::default(),
                         },
                     )
@@ -2074,6 +2118,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
+            draining: false,
         };
         let duplicate = service
             .dispatch(
