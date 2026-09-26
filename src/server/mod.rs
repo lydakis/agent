@@ -2307,6 +2307,7 @@ mod tests {
             ready_hint: false,
             tokens: Arc::default(),
             paced: std::collections::BinaryHeap::new(),
+            draining: false,
         };
         // Missing providers make the real turn tasks finish without network I/O.
         // Their durable completion must not depend on the service reaping them.

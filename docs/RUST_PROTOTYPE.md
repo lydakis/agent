@@ -852,19 +852,29 @@ does not, and each is one op:
   job count and its time queued versus time running (whether the worker or
   the disk is the bottleneck; jobs on the storage reader are counted the
   same way under their operation), the same per operation under `operations`
-  (each store method's count, queued and ran totals, slowest run, and two
-  fourteen-bucket latency histograms, `ran` and `queued`, over the
-  log-spaced bounds in `buckets_us`, so a controller can see which jobs
-  make the tail and how often), and the handle registry's size. The
-  `commit` operation counts the worker's group commits, and its `ran` time
-  is the COMMIT with its sync, so jobs per commit and the time spent
-  syncing are both readable. Other operations' `ran` times exclude the
-  sync, which they included before group commit. `agent stats
-  [--pretty]`. Store sizes use the canonical database path established at
-  open, including when the caller used a symlink. The counters cost three
-  clock reads and one short lock per storage job, and allocate only the
-  first time an operation is seen. Stats copies the operation records under
-  that lock, then derives totals and builds JSON outside it. `draining` is
+  (each store method's count, queued, ran and answered totals, slowest run
+  and slowest answer, and three fourteen-bucket latency histograms, `ran`,
+  `queued` and `answered`, over the log-spaced bounds in `buckets_us`, so a
+  controller can see which jobs make the tail and how often), and the
+  handle registry's size. `answered` runs from queueing to the caller's
+  answer: for a write it includes the wait for the rest of its group and
+  the group's commit, which a cheap job pays when it shares a group with
+  costly ones; for a read it is queued plus ran. The `commit` operation
+  counts the worker's group commits, and its `ran` time is the COMMIT with
+  its sync, so jobs per commit and the time spent syncing are both
+  readable. Other operations' `ran` times exclude the sync, which they
+  included before group commit. `groups` counts answered write groups,
+  including any that could not begin: their jobs, a histogram of sizes over
+  `size_bounds` (up to 1, 2, 4, 8, 16 and 32 jobs), and a latency histogram
+  of each group's oldest job from queueing to its answer, with the slowest.
+  A job whose group could not begin counts its whole wait as queued and
+  zero as ran. `agent stats [--pretty]`. Store sizes use the canonical
+  database path established at open, including when the caller used a
+  symlink. The counters cost three clock reads per job, three per group, and
+  one short lock per group (per job on the reader), taken just before the
+  group's callers are answered; they allocate only the first time an
+  operation is seen. Stats copies the records under that lock, then derives
+  totals and builds JSON outside it. `draining` is
   true while a shutdown's grace period runs. The totals and
   histograms describe the same snapshot; time totals are summed before
   rounding to milliseconds.

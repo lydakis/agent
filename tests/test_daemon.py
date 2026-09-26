@@ -130,8 +130,17 @@ class DaemonTests(ModelFixture):
             self.assertIn(label, operations, sorted(operations))
             self.assertEqual(sum(operations[label]['ran']), operations[label]['count'])
             self.assertEqual(sum(operations[label]['queued']), operations[label]['count'])
-            self.assertGreaterEqual(operations[label]['slowest_ms'], 0)
+            self.assertEqual(sum(operations[label]['answered']), operations[label]['count'])
+            self.assertGreaterEqual(operations[label]['slowest_answered_ms'], operations[label]['slowest_ms'])
         self.assertEqual(sum(o['count'] for o in operations.values()), stats['store']['jobs'])
+        # Every write group is counted once, by size and by its oldest job's
+        # wait from queueing to its answer.
+        groups = stats['store']['groups']
+        self.assertEqual(groups['size_bounds'], [1, 2, 4, 8, 16, 32])
+        self.assertEqual(sum(groups['sizes']), groups['count'])
+        self.assertEqual(sum(groups['oldest']), groups['count'])
+        self.assertGreaterEqual(groups['count'], operations['commit']['count'])
+        self.assertGreaterEqual(groups['jobs'], groups['count'])
         self.assertEqual(stats['handles'], {'waiters': 0, 'retained': 0})
 
     def test_stats_count_shared_transport_once_across_providers(self):
