@@ -3257,6 +3257,7 @@ impl Database {
                 serde_json::to_string(&request.verdicts)?,
                 request.id
             ])?;
+        untag_answered(&tx, request.id, std::slice::from_ref(&verdict))?;
         tx.commit()?;
         let resume = status == "waiting"
             && request.decided()
@@ -3286,7 +3287,7 @@ impl Database {
         }
         // Only a bot's running turn has calls waiting, so one bot's listing
         // starts from that turn instead of scanning every bot's calls, and
-        // one tag's listing reads only the calls that tag gates.
+        // one tag's listing reads only the calls still waiting on that tag.
         let mut statement = match (bot, tag) {
             (Some(_), _) => self.conn.prepare_cached(
                 "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
@@ -4866,11 +4867,9 @@ fn deny(
     event(tx, &bot.name, Some(turn), "tool_completed", data)?;
     Ok(())
 }
-/// Announce again every gated call of the turn still waiting to run, with
-/// a new request number and no verdicts, naming the call that failed.
-/// Answers computed for the old request are refused as superseded.
 /// Index an announced call under each of its gates' tags, so a listing for
-/// one tag reads only that tag's calls. Deleting the call drops its tags.
+/// one tag reads only the calls waiting on it. Deleting the call drops its
+/// tags.
 fn tag_approval(tx: &Connection, approval: i64, gates: &[CallGate]) -> Result<()> {
     let mut insert =
         tx.prepare_cached("INSERT OR IGNORE INTO approval_tags(approval,tag) VALUES (?,?)")?;
@@ -4879,6 +4878,23 @@ fn tag_approval(tx: &Connection, approval: i64, gates: &[CallGate]) -> Result<()
     }
     Ok(())
 }
+/// Drop a call from the index of each tag these stored verdicts answer, or
+/// from every tag once one of them denies it: no gate waits on it there.
+fn untag_answered(tx: &Connection, approval: i64, verdicts: &[Verdict]) -> Result<()> {
+    if verdicts.iter().any(|v| !v.allow) {
+        tx.prepare_cached("DELETE FROM approval_tags WHERE approval=?")?
+            .execute([approval])?;
+        return Ok(());
+    }
+    let mut delete = tx.prepare_cached("DELETE FROM approval_tags WHERE approval=? AND tag=?")?;
+    for verdict in verdicts {
+        delete.execute(params![approval, verdict.tag])?;
+    }
+    Ok(())
+}
+/// Announce again every gated call of the turn still waiting to run, with
+/// a new request number and no verdicts, naming the call that failed.
+/// Answers computed for the old request are refused as superseded.
 fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<bool> {
     let rows: Vec<(i64, String, String, i64, i64, String, String)> = tx
         .prepare_cached(
@@ -4960,18 +4976,23 @@ fn flush(tx: &Connection, turn: i64, live: Option<&Live>) -> Result<()> {
         return Ok(());
     };
     for (call_id, held) in live.verdicts.iter().filter(|(_, held)| !held.is_empty()) {
-        let stored: Option<String> = tx
-            .prepare_cached("SELECT verdicts FROM approvals WHERE turn=? AND call_id=?")?
-            .query_row(params![turn, call_id], |r| r.get(0))
+        let Some((id, stored)) = tx
+            .prepare_cached("SELECT id,verdicts FROM approvals WHERE turn=? AND call_id=?")?
+            .query_row(params![turn, call_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })
             .optional()?
-            .flatten();
+        else {
+            continue;
+        };
         let mut verdicts: Vec<Verdict> = stored
             .map(|v| serde_json::from_str(&v))
             .transpose()?
             .unwrap_or_default();
         verdicts.extend(held.iter().cloned());
-        tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE turn=? AND call_id=?")?
-            .execute(params![serde_json::to_string(&verdicts)?, turn, call_id])?;
+        tx.prepare_cached("UPDATE approvals SET verdicts=? WHERE id=?")?
+            .execute(params![serde_json::to_string(&verdicts)?, id])?;
+        untag_answered(tx, id, held)?;
     }
     Ok(())
 }

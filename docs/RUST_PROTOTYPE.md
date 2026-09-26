@@ -1678,9 +1678,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   name over 128 bytes); `arguments` is null when they are not a JSON
   object, which no tool accepts. The previews are taken once, when the
   call is planned, so a listing reads no item. One bot's listing reads
-  only its running turn's calls, and one tag's only the calls that tag
-  gates, through an index of each call's tags written with its
-  announcement. A page holds at most `limit` (1 to 256, default 64) calls and
+  only its running turn's calls, and one tag's only the calls still
+  waiting on that tag, through an index of each call's tags: written with
+  its announcement, and a tag taken out when its answer is stored (every
+  tag, for a deny). A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger (bounded by the 64 KiB
   call id and the previews, well inside a 1 MiB line); `next_after` continues
   it. Positions are never reused, and a call announced again takes a new

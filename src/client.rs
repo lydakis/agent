@@ -1336,9 +1336,11 @@ impl Renderer {
             "thinking_delta" => self.print(Mode::Thinking, event["text"].as_str().unwrap_or("")),
             "tool_started" => {
                 self.flush();
-                let name = data["name"].as_str().unwrap_or("tool");
-                let summary = summary(name, data["arguments"].as_str().unwrap_or(""));
-                println!("{}", self.dim(&format!("▸ {name} {summary}")));
+                let line = tool_line(
+                    data["name"].as_str().unwrap_or("tool"),
+                    data["arguments"].as_str().unwrap_or(""),
+                );
+                println!("{}", self.dim(&line));
             }
             // A person answering from another terminal needs to see what
             // each call would do, then the command. The event names the
@@ -1453,6 +1455,12 @@ fn summary_field(
 /// A started call's arguments as one short line: the command or path when
 /// the tool has one. Arguments may be a preview cut short, so the field is
 /// read from as much of the text as there is.
+/// A started call as `run --pretty` shows it. The name is the model's too:
+/// a call to a tool that does not exist still starts, and fails after.
+fn tool_line(name: &str, arguments: &str) -> String {
+    format!("▸ {} {}", visible(name), summary(name, arguments))
+}
+
 fn summary(name: &str, arguments: &str) -> String {
     let keys = summary_keys(name);
     let text = if keys.is_empty() {
@@ -1659,7 +1667,7 @@ fn call_line(call: &Value) -> String {
         })
         .unwrap_or_else(|missing| format!("[no {missing} in the arguments]")),
     };
-    format!("{name} {shown}")
+    format!("{} {shown}", visible(name))
 }
 
 /// One copyable command per gate a pending call still waits on, each
@@ -1831,6 +1839,15 @@ mod tests {
             summary("read", r#"{"offset":1}"#),
             "[no path or artifact in the arguments shown]"
         );
+    }
+
+    #[test]
+    fn a_tool_name_is_shown_escaped() {
+        // An unfinished OSC would swallow what prints next.
+        let name = "\u{1b}]0;x";
+        assert_eq!(tool_line(name, "{}"), r"▸ \u{1b}]0;x {}");
+        let call = json!({"name": name, "arguments": {"a": 1}});
+        assert_eq!(call_line(&call), r#"\u{1b}]0;x {"a":1}"#);
     }
 
     #[test]

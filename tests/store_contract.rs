@@ -988,6 +988,93 @@ fn a_tag_listing_reads_only_that_tags_calls() {
 }
 
 #[test]
+fn a_tag_listing_reads_no_call_that_tag_answered() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = |tag: &str| Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms: None,
+    };
+    let (a, b) = (gate("a"), gate("b"));
+    let ann = db
+        .create(
+            "Ann",
+            Some("/synthetic"),
+            Binding {
+                tools: &tools,
+                gate: Some(&a),
+                ..binding()
+            },
+        )
+        .unwrap()
+        .0;
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            gate: Some(&b),
+            created_by: Some(&ann.name),
+            created_by_id: Some(ann.id),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // As many calls as one listing page reads: each of them left in the
+    // index would fill the page with calls it then skips.
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = (0..1024)
+        .map(|i| shell_call(&format!("fc_{i}"), &format!("s{i}"), "true"))
+        .unzip();
+    db.append(turn, items, &round, None).unwrap();
+    let answer_all = |db: &mut Database, tag| {
+        for call in &round {
+            db.answer(Decision {
+                bot: "Bob",
+                turn,
+                call_id: &call.call_id,
+                request: 1,
+                tag: Some(tag),
+                allow: true,
+                reason: None,
+                by: Some("test"),
+            })
+            .unwrap();
+        }
+    };
+    let empty = json!({"approvals":[],"next_after":null});
+    // Answers held for a running turn leave the index when it parks.
+    answer_all(&mut db, "a");
+    assert_eq!(
+        db.suspend_approval(turn, &round, epoch_now(), None)
+            .unwrap(),
+        Some(None)
+    );
+    assert_eq!(db.approvals(None, Some("a"), 0, 64).unwrap(), empty);
+    assert_eq!(
+        db.approvals(None, Some("b"), 0, 64).unwrap()["approvals"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    // Answers stored for a parked turn leave it at once.
+    answer_all(&mut db, "b");
+    assert_eq!(db.approvals(None, Some("b"), 0, 64).unwrap(), empty);
+}
+
+#[test]
 fn a_long_field_hides_no_other_in_a_listing() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
