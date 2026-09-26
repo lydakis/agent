@@ -259,12 +259,18 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   written. So it never offers a gate that would only fail with
   `approval_already_answered`, and a call answered by `auto` stays
   visible to `manual` until a person answers too. `stats` counts pending
-  gates the same way.
+  gates the same way. It pages: each reply holds at most a limit the
+  caller sets and at most 256 KiB, in announcement order, with a cursor
+  for the next page, so a fleet with a pending call per bot stays under
+  the socket's 1 MiB response cap and no single worker job builds a large
+  list.
 - **One session serves a tag's approvals.** `serve_approvals
   {"tag","lease_ms"}` hands a session the pending requests whose gates
   include that tag and then streams only new `approval_requested` events
-  for them, from the same worker job, so nothing falls between the list
-  and the stream. At most one session holds a tag; a second is refused
+  for them. The first worker job fixes the point where the stream starts;
+  the pending requests before that point come in pages like `approvals`,
+  and everything after it arrives on the stream, so nothing falls between
+  the list and the stream. At most one session holds a tag; a second is refused
   with `approvals_served`. The holder keeps the tag by sending an answer or
   a `renew` at least every `lease_ms`, a period it chooses (`agent
   approver` renews every second on a 5 s lease). A holder that goes quiet
@@ -308,8 +314,9 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   allow depended on resolving a path and an earlier call of the round
   could change files.
 - **Allow rides `tool_start`.** The call starts as today, and its
-  `tool_started` event gains `"approval":{"by","waited_ms"}`. No extra
-  commit.
+  `tool_started` event gains `"approvals":[{"tag","by","waited_ms"}]`, one
+  entry per gate, so a replay shows which approver allowed which gate. No
+  extra commit.
 - **Deny is a result.** One commit, the same one a finished call makes,
   records `{"error":"approval_denied","detail":REASON}` as the call's result
   and a `tool_completed` event with `"denied":true`. REASON is the
@@ -454,16 +461,16 @@ so only one instance runs at a time, and answers in layers:
      the tool shell's `PATH`, to an executable outside the workspace that
      the user cannot write, in a directory the user cannot write, or to
      one the environment note trusts (a Homebrew prefix is owned by the
-     user). A `git` or `rg` found anywhere else, such as one an earlier
+     user). An `rg` or `find` found anywhere else, such as one an earlier
      command put in a writable directory on `PATH`, makes the command
      opaque. The lists name what is allowed, not what is not: `find` may
      take `-name` and `-type` but not `-exec`, `-delete`, `-fprint`,
      `-fprintf`, or `-fls`, simply because they are not listed; the same
-     goes for `git diff --output`, `rg --pre`, and `sort -o`. An unlisted flag, a redirect, `$(`, a backtick, or a
-     variable makes the command opaque, and it goes on to the model. This
-     is where Cursor's allowlist was bypassed; the approver does not try to
-     parse more. Two read-only commands read more than the paths they
-     name:
+     goes for `rg --pre` and `sort -o`. An unlisted flag, a redirect, `$(`,
+     a backtick, or a variable makes the command opaque, and it goes on to
+     the model. This is where Cursor's allowlist was bypassed; the approver
+     does not try to parse more. Two kinds of command need more than
+     that:
      - A recursive search (`grep -r`, `rg`) prints every file it reaches,
        so a `.env` or key file inside the workspace goes out with the
        results. It is allowed only with an include glob that cannot match
@@ -473,16 +480,14 @@ so only one instance runs at a time, and answers in layers:
        `--no-config` or when that variable is unset in the tool shell's
        environment. The approver is started with the same environment as
        the daemon (the CLI starts both), so it checks its own.
-     - `git status`, `diff`, `log`, and `show` run programs named in git
-       config: `core.fsmonitor`, external diff drivers, and textconv
-       filters. Git counts as read-only only while its effective config
-       sets none of `core.fsmonitor`, `diff.external`, `diff.*.command`,
-       `diff.*.textconv`, `include.path`, or `includeIf.*`. The approver
-       asks git itself (`git config --get-regexp` in that directory, with
-       the tool shell's environment), which covers every scope: system,
-       global, repository, worktree, and `GIT_CONFIG_*` variables. It
-       caches the answer by those files' modification times; if any key is
-       set, git goes to the model.
+     - Git is not on the read-only list at all. Even `git status` and
+       `git diff` can run programs: `core.fsmonitor`, external diff
+       drivers and `GIT_EXTERNAL_DIFF`, textconv and clean filters chosen
+       by `.gitattributes`, and hooks such as `post-index-change` when the
+       index is refreshed. `git diff` and `git show` also print the
+       contents of any tracked file, a changed `.env` included, without
+       naming it. Each could be checked, but the list keeps growing. Git
+       commands go to the model.
    - Commands that reach the approval channel itself (`agent answer`, the
      daemon's socket other than through `agent`, the store file) are denied
      outright. So are `read`, `write`, and `edit` of the daemon's own
@@ -620,7 +625,12 @@ its classifier's misses come from misjudging consent, and a delegation
 chain is where consent is easiest to fake.
 
 **Where the key lives.** The approver process holds the Jev key, so it is
-not in the environment the bots' shells inherit. That is all it gets. A
+not in the environment the bots' shells inherit. When the CLI starts the
+daemon and the approver together, it starts the daemon with the Jev key's
+variable removed and passes it only to the approver; the daemon also adds
+that variable to the set it already strips from tool environments, as it
+does for provider keys, in case it was started some other way. That is
+all it gets. A
 tool running as the same OS user can still read it: on Linux through
 `/proc/PID/environ` of the approver, or from wherever the key is stored.
 The daemon's provider keys are exposed the same way today. Protecting
@@ -763,7 +773,10 @@ as one.
 1. **Tool mix, no model calls.** Done 2026-09-26 (the table in
    Performance): 64 to 76% of rounds would wait on Jev, about 1 to 2% of
    median trial time. It also found the three gaps now closed in the rules:
-   recursive search, git's config-run programs, and symlinks.
+   recursive search, git's config-run programs (git now goes to the
+   model), and symlinks. The count treated `git status`, `diff`, `log`,
+   and `show` as read-only, so the Jev share is somewhat higher than the
+   table shows.
 2. **Jev on a labeled set.** A few hundred calls from those transcripts
    plus synthetic dangerous ones (a force push, `curl | sh`, a key sent to
    an unknown host, `rm -rf ~`), each labeled. Record false allows and false
