@@ -572,6 +572,15 @@ test('app creation carries shared compaction policy and seats its response', asy
   assert.equal(created.compaction_instructions,'summary policy');assert.equal(p.S.bots.get('Bob').id,7);
 });
 
+test('app creation fails when the workspace policy cannot be composed', async () => {
+  const sent=[];
+  const p=page({policy:async()=>{throw 'instructions_unreadable: cannot read /synthetic/AGENTS.md: invalid utf-8';},
+    request:async(op,q)=>{sent.push([op,q]);return{name:q.bot,id:7,head:null};}});
+  p.setRender(()=>{});p.S.session=1;p.S.config={workspace:'/synthetic',tools:[]};
+  await assert.rejects(p.submit('/new Bob test/model'),e=>e.startsWith('instructions_unreadable: '));
+  assert.equal(sent.length,0);assert.equal(p.S.bots.has('Bob'),false);
+});
+
 test('completed Responses and Anthropic thoughts retain observed thinking duration', async () => {
   for(const item of [{type:'reasoning',summary:[{type:'summary_text',text:'reason'}]},
     {role:'assistant',content:[{type:'thinking',thinking:'reason'},{type:'text',text:'answer'}]}]) {

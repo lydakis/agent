@@ -920,7 +920,8 @@ async function submit(text) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
     const m = model || S.config?.model; if (!m) throw new Error('model_required: NAME PROVIDER/MODEL, or set AGENT_MODEL');
-    // Composed now, so an AGENTS.md edited since the window opened reaches this bot.
+    // Composed now, so an AGENTS.md edited since the window opened reaches this bot. One that
+    // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
     const session = S.session;
     const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
