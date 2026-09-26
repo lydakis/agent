@@ -435,6 +435,40 @@ class DeliveryTests(ModelFixture):
             request = self.model.requests.get()
             self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 8192)
 
+    def test_a_steer_with_no_room_beside_a_note_goes_in_once_the_note_is_cleared(self):
+        # The steer arrives while the model is asked; beside the bot's large
+        # note it does not fit at the next boundary. The model then clears
+        # the note, and the steer goes in at the boundary after that,
+        # before the answer, rather than failing when the turn ends.
+        client = self.client('echo,note', extra=('--context-bytes', '8192'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
+        self.model.note_text = 'N' * 3500
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        self.assertEqual(client.finished(noted)['data']['status'], 'completed')
+        del self.model.note_text
+        while not self.model.requests.empty():
+            self.model.requests.get()
+        self.model.call_script = [('echo', {'text': 'a'}), ('note', {'text': ''})]
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='2', prompt='script')['result']['turn']
+        self.model.requests.get(timeout=5)
+        correction = 'steer:' + 'x' * 2500
+        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        outcome = client.finished(steer)['data']
+        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        carries = [any(i.get('role') == 'user' and i['content'][0]['text'] == correction for i in r['input'])
+                   for r in requests]
+        # Asked after the echo without it, after the note is cleared with it.
+        self.assertEqual(carries, [False, True])
+
     def test_context_note_lists_how_omitted_turns_began(self):
         prompts = [f'Task {n}: ' + f'{n}' * 700 for n in range(1, 8)]
         # The note names the history tool only to a bot that has it.

@@ -165,6 +165,20 @@ class Model(http.server.BaseHTTPRequestHandler):
                     text = f'done after {done} rounds'
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
+            elif user == 'script' and getattr(self.server, 'call_script', None):
+                # One call a round from `call_script`, then an answer.
+                start = max(n for n, i in enumerate(request['input'])
+                            if i.get('role') == 'user' and i['content'][0]['text'] == 'script')
+                done = sum(i.get('type') == 'function_call' for i in request['input'][start:])
+                text = ''
+                if done < len(self.server.call_script):
+                    name, arguments = self.server.call_script[done]
+                    output = [{'type': 'function_call', 'name': name, 'call_id': f'script-{done}',
+                               'arguments': json.dumps(arguments)}]
+                else:
+                    text = 'done'
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',

@@ -1018,8 +1018,9 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   back through the same overflow, elision, and compaction steps before the
   model call. A steer that does not fit stays queued, and later steers do
   not overtake it. Once elision or a summary makes room in the running
-  turn, the same boundary tries it again, so a correction reaches a long
-  task that compacts; one still queued when the turn ends starts as its
+  turn, the same boundary tries it again, and so does a later boundary
+  whose view sends less ahead of the turn, a note cleared or shrunk, so a
+  correction reaches a long task that compacts; one still queued when the turn ends starts as its
   own turn when the line moves (a strict steer, which names that turn,
   fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent

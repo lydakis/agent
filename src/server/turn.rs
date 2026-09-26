@@ -1091,8 +1091,9 @@ impl Turn {
         // A stub names the `read` call that returns its result, so only a
         // bot that has the tool elides.
         let elides = record.tools.iter().any(|tool| tool == "read");
-        // Whether a steer the turn had no room for is still queued.
-        let mut capped = false;
+        // What went ahead of the turn when a steer stayed queued for lack
+        // of room, while one is still queued.
+        let mut capped = None;
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
@@ -1186,7 +1187,7 @@ impl Turn {
             // A steer the turn had no room for is tried again once elision
             // or a summary makes some, and so is one that arrived while this
             // boundary summarized.
-            if capped && made_room {
+            if capped.is_some() && made_room {
                 self.steers.store(true, Relaxed);
             }
             if self.absorb(&context.prefix, &mut capped).await? {
@@ -1215,7 +1216,7 @@ impl Turn {
                     .await?
                 {
                     Overflow::Fits(_) => {
-                        if capped {
+                        if capped.is_some() {
                             self.steers.store(true, Relaxed);
                         }
                         resume_window = resuming;
@@ -1326,19 +1327,27 @@ impl Turn {
     /// recorded so far, while they fit beside what the view sends `ahead` of
     /// the turn. The worker publishes each batch and answers the steers'
     /// waiters. One atomic read when nothing is waiting; the flag clears
-    /// before the read, so a steer landing during it is seen next. Returns
-    /// whether any went in; `capped` says whether one stayed queued for lack
-    /// of room, and is left alone when nothing was waiting.
-    async fn absorb(&self, ahead: &ContextPrefix, capped: &mut bool) -> Result<bool> {
-        if !self.steers.swap(false, Relaxed) {
-            return Ok(false);
-        }
-        let (mut steered, mut stayed) = (false, false);
-        let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
+    /// before the read, so a steer landing during it is seen next. A steer
+    /// that stayed queued for lack of room is tried again once less goes
+    /// ahead, a note cleared or shrunk. Returns whether any went in;
+    /// `capped` holds what went ahead when one stayed queued, and is left
+    /// alone when nothing was tried.
+    async fn absorb(
+        &self,
+        ahead: &ContextPrefix,
+        capped: &mut Option<ContextUsage>,
+    ) -> Result<bool> {
         let reserved = ContextUsage {
             bytes: ahead.bytes.len(),
             items: ahead.items,
         };
+        let shrunk =
+            capped.is_some_and(|at| reserved.bytes < at.bytes || reserved.items < at.items);
+        if !self.steers.swap(false, Relaxed) && !shrunk {
+            return Ok(false);
+        }
+        let (mut steered, mut stayed) = (false, false);
+        let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
         let mut through = None;
         loop {
             let absorbed = self
@@ -1356,7 +1365,7 @@ impl Turn {
                 break;
             }
         }
-        *capped = stayed;
+        *capped = stayed.then_some(reserved);
         Ok(steered)
     }
 
