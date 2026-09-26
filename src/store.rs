@@ -528,6 +528,21 @@ mod tests {
         assert_eq!(rows(&store).await, [4]);
     }
 
+    #[tokio::test]
+    async fn both_connections_flush_the_drive_when_they_sync() {
+        let store = scratch_store("fullfsync").await;
+        let writer = store
+            .call(|db| Ok((db.pragma("fullfsync"), db.pragma("checkpoint_fullfsync"))))
+            .await
+            .unwrap();
+        assert_eq!(writer, (1, 1));
+        let reader = store
+            .read("pragma", |db| Ok(db.pragma("checkpoint_fullfsync")))
+            .await
+            .unwrap();
+        assert_eq!(reader, 1);
+    }
+
     #[test]
     fn live_counter_snapshots_reconcile_totals_and_histograms() {
         let (sender, _receiver) = mpsc::channel(1);

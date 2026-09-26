@@ -759,9 +759,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     loop needs a job's result to decide, not its sync; answering it when
     the job has run and holding client replies and publication for the
     commit would let them group, but the ordering guarantees of item 21
-    and completion's busy state need a design first. Open: `PRAGMA
-    fullfsync` on macOS, where `synchronous=FULL` is a plain fsync that
-    does not flush the drive cache; grouped, the flush is paid per group.
+    and completion's busy state need a design first. Also done: on macOS
+    the store sets `fullfsync` and `checkpoint_fullfsync`, because a plain
+    fsync there leaves commits in the drive cache. A flush costs about
+    5.4 ms on an M1 Max, paid once per group; the service loop above now
+    matters on a Mac as much as on slow Linux storage.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

@@ -384,10 +384,14 @@ impl Database {
     pub const RETENTION_PIECE: usize = 4;
 
     /// A second connection that only reads. The writer owns the file, its
-    /// lock, migration, and recovery; this one sees each job's commit once
-    /// it is done and never takes the write lock.
+    /// lock, migration, and recovery; this one sees a job's writes once that
+    /// job is answered and never takes the write lock. It can still run the
+    /// checkpoint SQLite makes when the last connection closes, so it syncs
+    /// checkpoints the way the writer does.
     pub fn reader(conn: Connection) -> Result<Self> {
-        conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-2048;")?;
+        conn.execute_batch(
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
+        )?;
         Ok(Self {
             conn,
             pending_limits: (0, 0),
@@ -397,8 +401,12 @@ impl Database {
     }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
+        // On macOS a plain fsync leaves writes in the drive's cache, so FULL
+        // survives a power cut only with F_FULLFSYNC, which SQLite sends when
+        // these are on. Elsewhere they change nothing.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -4494,5 +4502,11 @@ impl Database {
     /// The connection itself, for tests that stage what no store method does.
     pub(crate) fn connection(&mut self) -> &mut Connection {
         &mut self.conn
+    }
+    /// One integer pragma as this connection has it.
+    pub(crate) fn pragma(&self, name: &str) -> i64 {
+        self.conn
+            .pragma_query_value(None, name, |r| r.get(0))
+            .unwrap()
     }
 }

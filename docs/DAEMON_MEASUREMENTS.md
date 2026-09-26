@@ -4290,9 +4290,30 @@ savepoints in one group. The candidate's own additions per job are one
 `try_recv` and holding the answer until the commit; this screen does not
 attribute the difference.
 
-Not established: real slow hardware, macOS (where `synchronous=FULL` is a
-plain fsync unless `PRAGMA fullfsync` is set, a separate decision), tool
-turns, or more than 64 bots. The per-operation `ran` times in `stats` no
+Not established: real slow hardware, the daemon on macOS, tool turns, or
+more than 64 bots.
+
+**macOS flush.** The same change turns on `PRAGMA fullfsync` and
+`checkpoint_fullfsync`. Without them the bundled SQLite syncs with a plain
+`fsync`, which on macOS does not flush the drive cache, so `synchronous=FULL`
+was not power-loss durable there. A microbenchmark on an M1 Max (internal
+APFS SSD, AC power, rusqlite 0.40.2 with bundled SQLite 3.53.2, WAL, one job
+= a 600-byte insert and a counter update, median of three rotated 3 s
+rounds; observed 2026-09-26, source and table in the project's shared
+files) gives the price:
+
+| Strategy | Jobs/s |
+| --- | ---: |
+| Plain fsync, one job per commit (before) | 11,600 |
+| F_FULLFSYNC, one job per commit | 184 |
+| F_FULLFSYNC, savepoint groups of 8 / 32 | 1,280 / 5,090 |
+
+A flush is about 5.4 ms, so an idle Mac pays that per commit: a shell turn of
+about six commits takes about 30 ms longer. Under load the flush is shared by
+the group. Linux ignores both pragmas; the Linux screens above are unchanged.
+A store test checks that the writer carries both pragmas and the reader,
+which can run the checkpoint when the last connection closes, carries
+`checkpoint_fullfsync`. The per-operation `ran` times in `stats` no
 longer include the sync; the new `commit` operation carries it.
 Validation: 182 Rust tests, including two for grouped commits that fail
 when grouping or the rollback answer is removed; 264

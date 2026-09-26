@@ -1022,7 +1022,10 @@ racing on `bot_busy`.
 SQLite WAL with `synchronous=FULL`, committed in groups (see Core ownership),
 stores bot metadata and provider binding,
 immutable history nodes, turns, completed checkpoints, tool intents/results,
-retained tool artifacts, and durable event cursors. The store allows one owning
+retained tool artifacts, and durable event cursors. On macOS a plain fsync
+leaves writes in the drive's cache, so both connections also set `fullfsync`
+and `checkpoint_fullfsync`: every commit and checkpoint is an F_FULLFSYNC and
+survives a power cut. Other platforms ignore both. The store allows one owning
 process. A second owner fails before it can mark the first owner's work
 interrupted. Ownership uses the canonical database path with an appended
 `.owner-lock` suffix; symlinks resolve to the same lock and hard-linked database
