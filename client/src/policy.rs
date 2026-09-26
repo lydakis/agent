@@ -15,13 +15,10 @@ use std::path::{Path, PathBuf};
 /// for the prompt cache to matter.
 pub const MAX_INSTRUCTIONS: usize = 60 * 1024;
 
-pub const PREAMBLE: &str = "You are a software engineering agent working in the current workspace. \
-Complete the requested task using the available tools, verify your work, and finish with a short summary. \
-To delegate a subtask to another agent with its own conversation, run \
+pub const PREAMBLE: &str = "To delegate a subtask to another agent with its own conversation, run \
 \"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \
-Long commands can run with shell background=true and be collected the same way. \
 Blocking run/follow inside a shell tool is rejected. \
 Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an agent from an earlier point in its history. \
 $AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
