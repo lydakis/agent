@@ -82,8 +82,8 @@ read, so the pair was run again as C. It is kept for Codex's failure causes.
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | A | Agent | 14/15 | $1.34 | $0.089 | 81.8% | 17.8k | 94 s | 162 s |
 | A | Codex | 8/15 | $2.90 | $0.193 | 94.5% | 22.7k | 128 s | 440 s |
-| B | Agent | 12/15 | $15.06 | $1.00 | 95.2% | 66.5k | 320 s | 589 s |
-| B | Claude Code | 13/15 | $10.71 | $0.714 | 95.7% | 49.4k | 293 s | 539 s |
+| B | Agent | 12/15 | ≥ $15.06 | ≥ $1.00 | 95.2% | 66.5k | 320 s | 589 s |
+| B | Claude Code | 13/15 | ≥ $10.71 | ≥ $0.714 | 95.7% | 49.4k | 293 s | 539 s |
 | C | Agent | 8/10 | $1.13 | $0.113 | 84.3% | 20.9k | 84 s | 196 s |
 | C | Codex | 5/10 | $1.99 | $0.198 | 95.4% | 20.7k | 113 s | 492 s |
 | – | Codex | 5/10 | $1.47 | $0.147 | 93.2% | 19.0k | 114 s | 491 s |
@@ -98,6 +98,13 @@ B, and the table uses the harness records for both:
 - Claude Code was stopped before writing its result in its timed-out trial,
   so Harbor rebuilt the trial from its trajectory at 4.37M input tokens and
   $3.21. Its transcripts hold 5.59M, about $3.56; Harbor's total is $10.36.
+
+Both B costs are lower bounds. A timeout cuts off the model call in flight
+before the provider reports its usage; ours does not count that call (see
+[the gaps](#gaps-before-publishing-a-comparison)), and Claude Code's
+transcripts log finished messages, so most likely do not either (inferred).
+B has three timed-out trials, two ours and one Claude Code's; A and C have
+none.
 
 Nearly all uncached input on Sonnet is cache writes (99.9% on both sides).
 Cached share, uncached input and times are over the trials Harbor recorded.
@@ -134,7 +141,7 @@ On the ChatGPT plan, the Agent arms passed more trials than Codex at 46% and
 57% of its cost a trial, but the pass-rate gap comes from Codex's process
 lifetime on the two server tasks: counting model errors only, A is 1 against
 2 and C is 2 against 2. On Sonnet 5, Claude Code passed one more trial at
-about 29% less a trial, and the difference is on schemelike.
+about 29% less recorded cost a trial, and the difference is on schemelike.
 
 ## What other harnesses report
 

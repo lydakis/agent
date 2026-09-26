@@ -297,8 +297,11 @@ produces.
 - **Released when the message is written**, not when the response ends,
   since the assembled copy is dropped once sent.
 - **Every send takes its size**, continuations included, from one FIFO
-  budget, so a flood of small sends cannot starve a full one. A send larger
-  than the whole budget waits for all of it and goes alone.
+  budget, so a flood of small sends cannot starve a full one. The daemon
+  refuses to start with a budget below `--context-bytes`, and a send larger
+  than the whole budget, which only instructions and tools can make, fails
+  its call with an explicit error instead of queueing for bytes that can
+  never be granted. The bound holds without exception.
 - **Waiting is pacing, not a stall**, like the startup permit of
   `--max-connecting`, so the stall guard does not end a turn that is only
   queued.
