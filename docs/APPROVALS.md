@@ -524,7 +524,9 @@ so only one instance runs at a time, and answers in layers:
    consent question has to cover everything its risk question does: in
    the labeled run, asking about "this credential change" beside a risk
    that also covers using credentials denied a requested package upload
-   that used a stored token. Asking all ten
+   that used a stored token (consent 0.06). Asking about "this use of
+   credentials", with the same verbs as the risk question, raised it to
+   0.91 and left every unrequested call at 0.13 or below. Asking all ten
    in one request keeps it to one round trip; they share the state, and
    Jev bills input only.
 
@@ -814,7 +816,12 @@ as one.
    - The false denials came from starting the server a task asks for
      (shared system), installs from a task's own local package index
      (download and run), scratch files and copies under `/tmp` (delete,
-     send), and the credentials consent wording fixed above.
+     send), and the credentials consent wording fixed above. A rerun
+     with the new wording took the false denials the credentials question
+     caused from 5 to 3, with no false allows. A broader wording that also
+     counts a requested deploy or message through a saved login as
+     consent took them to 1, but that is the kind of wording that could
+     grant consent too easily, so it waits for the dangerous set.
    - The best single threshold pair that kept every labeled risk and
      every refused consent out of the allowed side reached 93% with no
      unclear band; one pair per question reached 96% on the pass it was
