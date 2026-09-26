@@ -314,10 +314,15 @@ class Agent(BaseInstalledAgent):
                                 for key in ('model_rounds', 'retries', 'paced_ms')}
             context.metadata['status'] = [t['status'] for t in turns if t['bot'] == BOT]
             context.metadata['bots'] = len({t['bot'] for t in turns})
+            # A bot the task delegated to chose its own settings.
+            context.metadata['bot_settings'] = {
+                t['bot']: {'reasoning': t['reasoning'], 'fallbacks': bool(t['fallbacks'])}
+                for t in turns}
         # Two arms asking for one model are matched only if both ran it, so
-        # say what was asked, what ran, and that task bots may fall back.
+        # say what was asked and what answered. Without the store only the
+        # task bot's stream is left, so what answered is unknown.
         context.metadata = {**(context.metadata or {}), 'requested_model': self.model_name,
-                            'served_calls': served, 'fallbacks': True}
+                            'served_calls': served if turns else None}
 
     def _store_turns(self) -> list[dict[str, Any]] | None:
         """Every turn in the store copied after the daemon exited, or None when
@@ -336,7 +341,7 @@ class Agent(BaseInstalledAgent):
                 return [dict(row) for row in db.execute(
                     "SELECT t.bot,COALESCE(t.model,b.provider||'/'||b.model) AS model,t.status,"
                     't.input_tokens,t.cached_input_tokens,t.output_tokens,'
-                    't.model_rounds,t.retries,t.paced_ms '
+                    't.model_rounds,t.retries,t.paced_ms,b.reasoning,b.fallbacks '
                     'FROM turns t JOIN bots b ON b.name=t.bot ORDER BY t.id')]
         except sqlite3.Error:
             return None

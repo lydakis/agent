@@ -131,10 +131,14 @@ it asked for and what actually answered, each from that harness's own records:
 - **Fallback policy as configured.** Our adapter creates task bots with
   `--fallbacks`, so a declined Anthropic request finishes on the model
   Anthropic recommends; the flag does nothing on the OpenAI or ChatGPT
-  providers. Each baseline's flags or settings come from its adapter's source
-  at the pinned Harbor version. The record also says whether any fallback
-  call happened.
-- **Everything else that shapes the work:** reasoning effort, concurrency,
+  providers. A bot the task delegates to sets its own, and the trial
+  metadata's `bot_settings` records each counted bot's choice. Each
+  baseline's flags or settings come from its adapter's source at the pinned
+  Harbor version. The record also says whether any fallback call happened.
+- **Reasoning effort for every agent that makes calls,** delegated bots and
+  subagents included, not only the one the benchmark starts. Ours is in
+  `bot_settings`.
+- **Everything else that shapes the work:** concurrency,
   timeouts, harness and Harbor versions, dataset and task names, the Agent
   commit, and the run window. Both arms run together, and a baseline is
   always rerun, never reused.

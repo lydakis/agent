@@ -37,12 +37,15 @@ class Environment:
 def store(path, turns):
     """The columns of a store's bots and turns that accounting reads."""
     with sqlite3.connect(path) as db:
-        db.execute('CREATE TABLE bots(name TEXT, provider TEXT, model TEXT)')
+        db.execute('CREATE TABLE bots(name TEXT, provider TEXT, model TEXT, reasoning TEXT, '
+                   'fallbacks INT)')
         db.execute('CREATE TABLE turns(id INTEGER PRIMARY KEY, bot TEXT, model TEXT, status TEXT, '
                    'input_tokens INT, cached_input_tokens INT, output_tokens INT, '
                    'model_rounds INT, retries INT, paced_ms INT)')
-        db.executemany('INSERT INTO bots VALUES (?,?,?)',
-                       {(t[0], 'gw', 'm') for t in turns})
+        # The task bot as the adapter creates it; others as a model might.
+        db.executemany('INSERT INTO bots VALUES (?,?,?,?,?)',
+                       {(t[0], 'gw', 'm', *(('high', 1) if t[0] == 'task' else (None, 0)))
+                        for t in turns})
         db.executemany('INSERT INTO turns(bot,model,status,input_tokens,cached_input_tokens,'
                        'output_tokens,model_rounds,retries,paced_ms) VALUES (?,?,?,?,?,?,2,1,5)',
                        [(bot, model, status, n, n // 2, n // 10) for bot, model, status, n in turns])
@@ -124,8 +127,10 @@ class HarborAgentTest(unittest.TestCase):
         self.assertAlmostEqual(context.cost_usd, usage['gw/m'].cost_usd + usage['gw/small'].cost_usd)
         self.assertEqual(context.metadata, {'model_rounds': 6, 'retries': 3, 'paced_ms': 15,
                                             'status': ['completed', 'interrupted'], 'bots': 2,
-                                            'requested_model': 'gw/m', 'served_calls': {},
-                                            'fallbacks': True})
+                                            'bot_settings': {
+                                                'task': {'reasoning': 'high', 'fallbacks': True},
+                                                'helper': {'reasoning': None, 'fallbacks': False}},
+                                            'requested_model': 'gw/m', 'served_calls': {}})
         self.assertIsNone(unpriced.cost_usd)
         self.assertEqual(unpriced.n_output_tokens, 300)
 
@@ -156,7 +161,7 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual((context.n_input_tokens, context.n_output_tokens), (1000, 100))
         # The trial names what it asked for and every model that answered.
         self.assertEqual((context.metadata['requested_model'], context.metadata['served_calls'],
-                          context.metadata['fallbacks']),
+                          context.metadata['bot_settings']['task']['fallbacks']),
                          ('gw/m', {'gw/m': 2, 'gw/backup': 1}, True))
 
     def test_cache_writes_are_priced_at_the_write_rate(self):
@@ -296,6 +301,9 @@ class HarborAgentTest(unittest.TestCase):
             self.agent(logs).populate_context_post_run(context)
         self.assertEqual((context.n_input_tokens, context.n_cache_tokens, context.n_output_tokens),
                          (200, 80, 14))
+        # The stream is the task bot's alone, so what served delegated bots,
+        # and how they were set up, is unknown rather than absent.
+        self.assertEqual(context.metadata, {'requested_model': 'gw/m', 'served_calls': None})
 
     def test_streamed_usage_keeps_each_calls_model_split(self):
         rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5},
@@ -340,6 +348,8 @@ class HarborStoreTest(ModelFixture):
         self.assertEqual((context.n_input_tokens, context.n_output_tokens, context.metadata['status']),
                          (listed[0]['input_tokens'], listed[0]['output_tokens'], ['completed']))
         self.assertEqual(list(context.model_usage), ['openai/synthetic-model'])
+        self.assertEqual(context.metadata['bot_settings'],
+                         {'task': {'reasoning': None, 'fallbacks': False}})
 
 
 if __name__ == '__main__':

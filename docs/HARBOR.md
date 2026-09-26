@@ -24,8 +24,9 @@ All runs used Harbor 0.23.0 with Docker on an Apple silicon Mac, the
 `terminal-bench/terminal-bench-2-1` dataset (digest `sha256:7d7bdc1c…`), and
 the tasks kv-store-grpc, pypi-server, schemelike-metacircular-eval,
 torch-tensor-parallelism and write-compressor. Two trials ran at a time, with
-no Harbor retries, a 2,400-second agent timeout, and high reasoning on every
-arm. The arms of each pair started within a second of each other. The
+no Harbor retries, a 2,400-second agent timeout, and high reasoning for each
+harness's task agent; C's delegated bots differ, as noted below. The arms of
+each pair started within a second of each other. The
 ChatGPT-plan arms of both harnesses used the same plan login, so their cost is
 what the same tokens would cost on the API. Every arm is priced at the same
 list rates, and each cost Harbor recorded reproduces from its token counts.
@@ -47,11 +48,11 @@ read, so the pair was run again as C. It is kept for Codex's failure causes.
 
 | Run | Arm | Calls | Served, as recorded | Fallback configured | Fallback calls |
 | --- | --- | ---: | --- | --- | ---: |
-| A | Agent | 172 | gpt-6-sol | `--fallbacks`, inert on ChatGPT | 0 |
+| A | Agent | 172 | gpt-6-sol | `--fallbacks` on the task bot, inert on ChatGPT | 0 |
 | A | Codex | 227 | gpt-6-sol, per turn | none | not recorded |
-| B | Agent | 390 | claude-sonnet-5 | `--fallbacks` | 0 |
+| B | Agent | 390 | claude-sonnet-5 | `--fallbacks` on the task bot | 0 |
 | B | Claude Code | 266 | claude-sonnet-5, per response | `--fallback-model` not set | 0 |
-| C | Agent | 161 | gpt-6-sol | `--fallbacks`, inert on ChatGPT | 0 |
+| C | Agent | 161 | gpt-6-sol | `--fallbacks` on the task bot, inert on ChatGPT | 0 |
 | C | Codex | 163 | gpt-6-sol, per turn | none | not recorded |
 | – | Codex | 128 | gpt-6-sol, per turn | none | not recorded |
 
@@ -69,9 +70,11 @@ read, so the pair was run again as C. It is kept for Codex's failure causes.
   not; whether Claude Code opts into Anthropic's fallback on its own does not
   show in its records.
 - B's Agent calls include 9 cache refreshes during long tool calls. C's
-  include 28 from four bots the task bot delegated to; those bots ran with no
-  reasoning level set, so at the provider's default, while the task bot ran
-  at high.
+  include 28 from four bots the task bot delegated to. Those bots set no
+  reasoning level or fallbacks, so 17% of C's Agent calls ran at the
+  provider's default reasoning while everything else on both sides ran at
+  high. C is matched on reasoning for the task agents only, and its Agent
+  cost and outcome include those calls.
 
 ### Outcomes
 
@@ -205,10 +208,13 @@ the same model can drive each harness on the same tasks.
    empty when any model used is missing from the table, rather than reported low.
    The trial's metadata records the requested model, `served_calls` (billed
    calls per model, fallbacks and delegated bots included) and
-   `fallbacks: true`, so a comparison can check that both arms ran the same
-   model ([COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons)).
+   `bot_settings` (each counted bot's reasoning level and whether it takes
+   fallbacks, since a delegated bot sets its own), so a comparison can check
+   that both arms ran the same model the same way
+   ([COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons)).
    A call counts under the model it requested unless a fallback or summarizer
-   answered on another.
+   answered on another. Without a store copy only the task bot's streamed
+   calls are left, so `served_calls` is null and `bot_settings` absent.
    Provider failures map to Harbor's retryable error types, for example
    `provider_http_429` to `ApiRateLimitError`, `provider_stream_failed` to
    `NetworkConnectionError` and `provider_http_401` to `AgentAuthenticationError`.
@@ -252,7 +258,7 @@ To run on a ChatGPT plan instead of an API key, sign in with `codex login` and
 name the model `chatgpt/MODEL`, using the id Codex's `/model` picker shows. Every
 task bot is created with `--fallbacks`, so a declined Anthropic request finishes
 on the model Anthropic recommends instead of failing the task; a fleet opts in
-per bot. The
+per bot, and so does a bot the task delegates to. The
 adapter copies the access token and account id from Codex's `auth.json` into each
 task container, readable only by the agent user, and adds `--provider chatgpt`.
 The refresh and ID tokens stay on the host, and nothing is uploaded when a

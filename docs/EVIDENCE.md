@@ -71,8 +71,8 @@ more turns is not here, because its work changes with its speed; it is under
 Whether a model driven by this harness finishes real tasks, at what full cost,
 and why it fails. Matched runs on five Terminal-Bench 2.1 tasks under Harbor
 0.23.0, both arms of each pair started within a second of each other, with
-the same reasoning effort, concurrency and timeout. Each arm's served models
-and fallback policy are recorded as
+the same concurrency and timeout and high reasoning for each task agent.
+Each arm's served models and fallback policy are recorded as
 [COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons) requires;
 the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
 
@@ -85,13 +85,19 @@ the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
 | ChatGPT plan, gpt-6-sol, 2026-09-26 | Agent `15d629c` | 8/10 | $0.113 | 84.3% | 0, 2, 0 |
 | | Codex 0.156.1 | 5/10 | $0.198 | 95.4% | 3, 2, 0 |
 
-- **Served models.** Every arm ran only the model it requested, and no arm
-  made a fallback call. The records differ in depth: Claude Code's name the
-  model the API reported for each response, Codex's name the model once per
-  turn, and ours name the requested model unless a fallback or summarizer
-  answered. Our `--fallbacks` acts only on Anthropic requests, so it was live
-  only in the Sonnet run; Claude Code ran without `--fallback-model`, and
-  Harbor's Codex adapter has no fallback option.
+- **Served models.** Each arm's records show only the model it requested,
+  and no fallback call. What that shows differs by record: Claude Code's
+  name the model the API reported for each response, so its arm ran that
+  model; Codex's name the model once per turn, and ours name the requested
+  model unless a fallback or summarizer answered, so a provider-side reroute
+  in those arms would not show. Our task bots' `--fallbacks` acts only on
+  Anthropic requests, so it was live only in the Sonnet run; Claude Code ran
+  without `--fallback-model`, and Harbor's Codex adapter has no fallback
+  option.
+- **Reasoning in the 2026-09-26 run.** Our task bot delegated 28 of the
+  arm's 161 calls to four bots that set no reasoning level, so they ran at
+  the provider's default; every other call on both sides ran at high. That
+  run is matched on reasoning for the task agents only.
 - **Codex's losses are mostly its process lifetime.** In 12 of Codex's 17
   failures across these runs and one unmatched run, the model started the
   server the task needs and its own checks passed, but the server was gone
