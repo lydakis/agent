@@ -1142,6 +1142,15 @@ impl Turn {
                 },
                 Err(error) => return Err(error),
             };
+            // Steers go in before this call, measured against what this
+            // view sends ahead of the turn: its summary, pinned context, and
+            // notes, a note a tool wrote this round included. One that goes
+            // in sends the view back through the overflow, elision, and
+            // compaction steps.
+            if self.absorb(&context.prefix, &mut capped).await? {
+                resume_window = resuming;
+                continue;
+            }
             if elides
                 && !resuming
                 && self.elision_due(&context, output_bytes)
@@ -1174,21 +1183,15 @@ impl Turn {
                     Compaction::Skipped => {}
                 }
             }
-            // Steers go in before this call, within what the view leaves
-            // beside its summary and notes: those queued before the turn
-            // started or resumed, or during this boundary, and one the turn
-            // had no room for once elision or a summary makes some. The view
-            // is then built again through the same overflow, elision, and
-            // compaction steps.
+            // A steer the turn had no room for is tried again once elision
+            // or a summary makes some, and so is one that arrived while this
+            // boundary summarized.
             if capped && made_room {
                 self.steers.store(true, Relaxed);
             }
-            if let Some(absorbed) = self.absorb(&context.prefix).await? {
-                capped = absorbed.capped;
-                if absorbed.steered {
-                    resume_window = resuming;
-                    continue;
-                }
+            if self.absorb(&context.prefix, &mut capped).await? {
+                resume_window = resuming;
+                continue;
             }
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
@@ -1246,11 +1249,7 @@ impl Turn {
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard.
-                if self
-                    .absorb(&context.prefix)
-                    .await?
-                    .is_some_and(|absorbed| absorbed.steered)
-                {
+                if self.absorb(&context.prefix, &mut capped).await? {
                     continue;
                 }
                 return Ok(Round::Finished);
@@ -1293,24 +1292,22 @@ impl Turn {
             if parked {
                 return Ok(Round::Parked);
             }
-            // Steers submitted during the round go in ahead of the next
-            // view, beside what this call sent ahead of the turn.
-            if let Some(absorbed) = self.absorb(&context.prefix).await? {
-                capped = absorbed.capped;
-            }
         }
         fail("tool_round_limit")
     }
 
     /// The round boundary: queued steers become user items after everything
-    /// recorded so far. The worker publishes each batch and answers the
-    /// steers' waiters. One atomic read when nothing is waiting; the flag
-    /// clears before the read, so a steer landing during it is seen next.
-    async fn absorb(&self, ahead: &ContextPrefix) -> Result<Option<Steered>> {
+    /// recorded so far, while they fit beside what the view sends `ahead` of
+    /// the turn. The worker publishes each batch and answers the steers'
+    /// waiters. One atomic read when nothing is waiting; the flag clears
+    /// before the read, so a steer landing during it is seen next. Returns
+    /// whether any went in; `capped` says whether one stayed queued for lack
+    /// of room, and is left alone when nothing was waiting.
+    async fn absorb(&self, ahead: &ContextPrefix, capped: &mut bool) -> Result<bool> {
         if !self.steers.swap(false, Relaxed) {
-            return Ok(None);
+            return Ok(false);
         }
-        let mut out = Steered::default();
+        let (mut steered, mut stayed) = (false, false);
         let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
         let reserved = ContextUsage {
             bytes: ahead.bytes.len(),
@@ -1325,15 +1322,16 @@ impl Turn {
                 })
                 .await?;
             through = absorbed.next_through;
-            out.steered |= !absorbed.outcomes.is_empty();
-            out.capped |= absorbed.capped;
+            steered |= !absorbed.outcomes.is_empty();
+            stayed |= absorbed.capped;
             // Release the batch before loading another; new arrivals beyond
             // the initial snapshot wait for the next model-round boundary.
             if through.is_none() {
                 break;
             }
         }
-        Ok(Some(out))
+        *capped = stayed;
+        Ok(steered)
     }
 
     /// One model call with retries. Each attempt streams the same immutable
@@ -2275,14 +2273,6 @@ impl Context {
             w.unsummarized.with_prefix(&self.prefix)
         })
     }
-}
-
-/// What a boundary's absorb found, when steers were waiting: whether some
-/// went in, and whether one stayed queued because the turn had no room.
-#[derive(Default)]
-struct Steered {
-    steered: bool,
-    capped: bool,
 }
 
 /// How a summary attempt ended: recorded, parked on its pool until the

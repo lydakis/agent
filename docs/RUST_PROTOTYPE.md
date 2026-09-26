@@ -1013,11 +1013,9 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   encoded steer stay within three quarters of `--context-bytes` and
   `--context-items`, the target the window itself keeps, so a burst of
   large steers cannot make the running turn exceed its context and fail
-  with `context_limit`. Steers that arrive during a round are measured
-  against what the round's call sent ahead of the turn; at a turn's first
-  boundary, for steers that arrive while a boundary summarizes, and for a
-  retry, the view is built first, and a steer that goes in sends it back
-  through the same overflow, elision, and compaction steps before the
+  with `context_limit`. A boundary builds the view first, so a note a tool
+  wrote during the round counts, and a steer that goes in sends the view
+  back through the same overflow, elision, and compaction steps before the
   model call. A steer that does not fit stays queued, and later steers do
   not overtake it. Once elision or a summary makes room in the running
   turn, the same boundary tries it again, so a correction reaches a long

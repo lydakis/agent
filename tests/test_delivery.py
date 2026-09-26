@@ -413,6 +413,28 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(refused)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.tool_output(client, 'Plain', 'note-1'))['error'], 'tool_not_available')
 
+    def test_a_steer_is_measured_against_a_note_written_in_the_same_round(self):
+        # The steer arrives while the model is asked; the model's answer
+        # writes a large carry-forward note. Beside that note the steer does
+        # not fit, though it would have beside the request that was sent.
+        client = self.client('echo,note', extra=('--context-bytes', '8192'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
+        self.model.note_text = 'N' * 3500
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        self.model.requests.get(timeout=5)
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:' + 'x' * 2000,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+            self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 8192)
+
     def test_context_note_lists_how_omitted_turns_began(self):
         prompts = [f'Task {n}: ' + f'{n}' * 700 for n in range(1, 8)]
         # The note names the history tool only to a bot that has it.
