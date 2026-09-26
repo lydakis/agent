@@ -29,6 +29,7 @@ def convert(rows):
 '''
 HALF_EVEN = SOLUTION.format(rounding='ROUND_HALF_EVEN')
 TRUNCATING = SOLUTION.format(rounding='ROUND_DOWN')
+BROKEN = 'def convert(rows):\n    raise NotImplementedError\n'
 
 
 def shell(root, command):
@@ -73,8 +74,9 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(holders, [Path('tools/.seed')])
 
     def test_a_run_that_kept_every_fact_scores_clean(self):
-        shell(self.root, 'make quick; tools/migrate; tools/migrate --status')
+        shell(self.root, 'tools/env-check; make quick; tools/migrate; tools/migrate --status')
         (self.root / 'ledger/convert.py').write_text(HALF_EVEN)
+        shell(self.root, 'make check; make bench')
         events = [started(1, 'tools/env-check'), started(2, 'make quick'), started(3, 'tools/migrate'),
                   {'cursor': 4, 'event': 'compacted', 'data': {'version': 40}},
                   started(5, 'tools/migrate --status'), started(6, 'make check'), started(7, 'make bench')]
@@ -124,7 +126,7 @@ class LongTaskScoreTests(unittest.TestCase):
                   started(4, 'make quick'), started(5, 'tools/migrate')]
         result = score(self.root, self.facts, events, 'Tests pass.')
         self.assertFalse(result['correct'] or result['vendor_intact'] or result['reported_throughput'])
-        self.assertFalse(result['env_check_before_edits'] or result['make_check_after_last_edit']
+        self.assertFalse(result['env_check_before_edits'] or result['make_check_on_final_files']
                          or result['followed_workflow'])
         self.assertEqual((result['make_quick_runs'], result['make_quick_calls_after_first_compaction']), (2, 1))
         self.assertEqual(result['migrations_applied'], 2)
@@ -132,32 +134,40 @@ class LongTaskScoreTests(unittest.TestCase):
                          {'make quick': 1, 'tools/migrate': 1})
         self.assertIsNotNone(result['hidden_failure'])
 
-    def test_the_required_commands_count_only_in_the_order_the_task_gives(self):
-        shell(self.root, 'tools/migrate')
-        (self.root / 'ledger/convert.py').write_text(HALF_EVEN)
+    def test_the_required_steps_count_only_when_they_ran_in_the_order_the_task_gives(self):
         number = f"throughput: {self.facts['throughput']} rows/s."
-        edit = lambda cursor: {'cursor': cursor, 'event': 'tool_started',
-                               'data': {'call_id': f'w{cursor}', 'name': 'write', 'arguments': '{}'}}
-        # The number read from where the benchmark keeps it, not printed by
-        # `make bench`, is not reported.
-        read_seed = score(self.root, self.facts, [started(1, 'tools/env-check'), edit(2),
-                                                  started(3, 'make check'), started(4, 'cat tools/.seed')], number)
-        self.assertFalse(read_seed['reported_throughput'] or read_seed['make_bench_after_check'])
-        # The restriction checked only after an edit, and the checks run
-        # before the last one, do not follow the task.
-        late = score(self.root, self.facts, [started(1, "cat > notes.txt <<'EOF'\nx\nEOF"),
-                                             started(2, 'tools/env-check'), started(3, 'make check'),
-                                             started(4, 'make bench'), started(5, 'sed -i s/x/y/ notes.txt')],
-                     number)
-        self.assertTrue(late['reported_throughput'])
-        self.assertFalse(late['env_check_before_edits'] or late['make_check_after_last_edit']
-                         or late['followed_workflow'])
-        # Read-only looks and discarded output are not edits.
-        kept = score(self.root, self.facts, [started(1, 'cat ledger/convert.py'), started(2, 'tools/env-check'),
-                                             edit(3), started(4, 'tools/migrate --status'),
-                                             started(5, 'make check 2>&1 >/dev/null'), started(6, 'make bench')],
-                     number)
-        self.assertTrue(kept['followed_workflow'], kept)
+
+        def run(*steps):
+            self.setUp()
+            for step in steps:
+                if step in (HALF_EVEN, TRUNCATING, BROKEN):
+                    (self.root / 'ledger/convert.py').write_text(step)
+                else:
+                    shell(self.root, step)
+            return score(self.root, self.facts, [], number)
+
+        clean = run('tools/env-check', 'tools/migrate', HALF_EVEN, 'make check', 'make bench')
+        self.assertTrue(clean['followed_workflow'] and clean['reported_throughput'], clean)
+        # The number read from where the benchmark keeps it is not reported.
+        seed = run('tools/env-check', 'tools/migrate', HALF_EVEN, 'make check', 'cat tools/.seed')
+        self.assertFalse(seed['reported_throughput'] or seed['bench_after_check'])
+        # Naming a step does not run it.
+        named = run('cat tools/env-check', 'tools/migrate', HALF_EVEN, 'make check', 'make bench')
+        self.assertFalse(named['env_check_before_edits'] or named['followed_workflow'])
+        # The restriction checked only after a change.
+        late = run('tools/migrate', 'tools/env-check', HALF_EVEN, 'make check', 'make bench')
+        self.assertFalse(late['env_check_before_edits'] or late['followed_workflow'])
+        # A failing check, or one run before the last change, does not
+        # clear the benchmark that follows it.
+        failed = run('tools/env-check', 'tools/migrate', BROKEN, 'make check', 'make bench')
+        self.assertTrue(failed['reported_throughput'])
+        self.assertFalse(failed['make_check_on_final_files'] or failed['followed_workflow'])
+        stale = run('tools/env-check', 'tools/migrate', TRUNCATING, 'make check', HALF_EVEN, 'make bench')
+        self.assertFalse(stale['make_check_on_final_files'] or stale['followed_workflow'])
+        # And a benchmark before the check does not follow it.
+        early = run('tools/env-check', 'tools/migrate', HALF_EVEN, 'make bench', 'make check')
+        self.assertTrue(early['make_check_on_final_files'])
+        self.assertFalse(early['bench_after_check'] or early['followed_workflow'])
 
     def test_a_steer_counts_only_once_it_reached_the_task(self):
         self.assertEqual(steer_outcome({'turn': 9}, {'status': 'steered', 'into': 1}), 'steered')
