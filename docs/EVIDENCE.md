@@ -72,10 +72,10 @@ more turns is not here, because its work changes with its speed; it is under
   answering round trip included); one answered after its turn parks adds
   three durable commits and about 3 ms (9.32 fsyncs a turn, 15.0 ms). With
   one screen answering 32 bots, the screen becomes the wait: 309 turns a
-  second ungated, 258 held, 196 parked. Linux x86_64 container, the
-  approval build before its review fixes and the merge with admission
-  batching, against `7e46c5f`, 2026-09-26; macOS and the automatic
-  approver's own cost are not measured.
+  second ungated, 258 held, 196 parked. Linux x86_64 container, `7238c6c`
+  (before the review fixes and the merge with admission batching) against
+  `7e46c5f`, 2026-09-26; both binaries rebuild to the SHA-256 the runs
+  recorded. macOS and the automatic approver's own cost are not measured.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB

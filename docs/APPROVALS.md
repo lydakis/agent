@@ -951,9 +951,10 @@ as one.
    (`held`) or, with `--approval-hold-ms 0`, after the turn parks
    (`parked`). Each turn is one synthetic `shell` call (`true`) and a
    reply, on a fresh store, against the same turn ungated and against
-   main at 7e46c5f. Medians of three rotated runs of 200 sequential turns
-   on one bot, on a 4-CPU Linux container (fsyncs counted in a separate
-   pass under strace, setup included):
+   main at 7e46c5f; the build measured is `7238c6c`, and both binaries
+   rebuild to the SHA-256 the runs recorded. Medians of three rotated
+   runs of 200 sequential turns on one bot, on a 4-CPU Linux container
+   (fsyncs counted in a separate pass under strace, setup included):
 
    | | main | ungated | held | parked |
    |---|---:|---:|---:|---:|
