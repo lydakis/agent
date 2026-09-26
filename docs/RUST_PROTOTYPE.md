@@ -1247,9 +1247,10 @@ fork inherits the lineage, not the start; its first request computes its own
 window over the shared history.
 
 When turns are omitted, the request begins with one user item:
-`[context note] N earlier turn(s) with M messages are not shown. Use the
-history tool with a turn number from 1 to N to read any of them.` followed,
-newest first, by the ordinal and the first line (up to 120 bytes) of each
+`[context note] N earlier turn(s) with M messages are not shown.` When the
+bot has the `history` tool, the note adds `Use the history tool with a turn
+number from 1 to N to read any of them.` It then lists,
+newest first, the ordinal and the first line (up to 120 bytes) of each
 omitted turn's prompt, at most `--note-turns` of them (default 48, 0 lists
 none), and a line naming the older turns the list left out. The optional
 listing is additionally bounded so pinned context plus the listing targets at

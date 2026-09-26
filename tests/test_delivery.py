@@ -415,10 +415,11 @@ class DeliveryTests(ModelFixture):
 
     def test_context_note_lists_how_omitted_turns_began(self):
         prompts = [f'Task {n}: ' + f'{n}' * 700 for n in range(1, 8)]
-        for note_turns, listing in (('3', True), ('0', False)):
+        # The note names the history tool only to a bot that has it.
+        for note_turns, listing, tools in (('3', True, ['echo', 'history']), ('0', False, ['echo'])):
             with self.subTest(note_turns=note_turns):
                 client = self.client(extra=('--context-bytes', '2048', '--note-turns', note_turns))
-                client.request('create', bot=f'Bob{note_turns}', workspace=str(self.path))
+                client.request('create', bot=f'Bob{note_turns}', workspace=str(self.path), tools=tools)
                 for n, prompt in enumerate(prompts):
                     turn = client.request('submit', bot=f'Bob{note_turns}', request_id=str(n), prompt=prompt)['result']['turn']
                     self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -427,7 +428,7 @@ class DeliveryTests(ModelFixture):
                     last = self.model.requests.get()
                 note = last['input'][0]['content'][0]['text']
                 self.assertTrue(note.startswith('[context note] '))
-                self.assertIn('Use the history tool', note)
+                self.assertEqual('Use the history tool' in note, 'history' in tools)
                 if listing:
                     lines = note.split('\n')
                     self.assertTrue(lines[0].endswith('How they began, newest first:'))

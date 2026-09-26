@@ -35,6 +35,7 @@ impl Window {
             self.note.as_ref(),
             self.omitted_items,
             self.omitted_turns,
+            self.history,
             listed,
             prefix_budget,
         )
@@ -48,7 +49,7 @@ impl CompactionView {
     /// Count each prompt once instead of repeatedly encoding the entire prefix.
     pub(crate) fn bound_prompt_bytes(&mut self, family: Family, budget: usize) -> Result<()> {
         let mut prompts = std::mem::take(&mut self.prompts);
-        let base = context_prefix(family, Some(self), None, 0, 0, &[], 0)?
+        let base = context_prefix(family, Some(self), None, 0, 0, false, &[], 0)?
             .bytes
             .len();
         if base > budget {
@@ -83,12 +84,14 @@ impl CompactionView {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn context_prefix(
     family: Family,
     compaction: Option<&CompactionView>,
     note: Option<&(i64, String)>,
     omitted_items: i64,
     omitted_turns: i64,
+    history: bool,
     listed: &[(i64, String)],
     prefix_budget: usize,
 ) -> Result<ContextPrefix> {
@@ -130,9 +133,13 @@ pub(crate) fn context_prefix(
         // shrinks only when the current turn needs the space.
         let encode = |listed: &[(i64, String)]| -> Result<Vec<u8>> {
             let mut text = format!(
-                "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown. \
-                 Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
+                "[context note] {omitted_turns} earlier turn(s) with {omitted_items} messages are not shown."
             );
+            if history {
+                text.push_str(&format!(
+                    " Use the history tool with a turn number from 1 to {omitted_turns} to read any of them."
+                ));
+            }
             if !listed.is_empty() {
                 text.push_str(" How they began, newest first:");
                 for (ordinal, opening) in listed {
@@ -253,6 +260,32 @@ pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_context_note_names_the_history_tool_only_for_bots_that_have_it() {
+        let listed = [(2, "Second task".to_owned())];
+        let note = |history| {
+            let prefix = context_prefix(
+                Family::Responses,
+                None,
+                None,
+                6,
+                3,
+                history,
+                &listed,
+                1 << 20,
+            )
+            .unwrap();
+            String::from_utf8(prefix.bytes.to_vec()).unwrap()
+        };
+        let with = note(true);
+        assert!(with.contains("3 earlier turn(s) with 6 messages are not shown."));
+        assert!(with.contains("Use the history tool with a turn number from 1 to 3"));
+        let without = note(false);
+        assert!(without.contains("3 earlier turn(s) with 6 messages are not shown."));
+        assert!(!without.contains("history"), "{without}");
+        assert!(without.contains("How they began, newest first:\\n2: Second task"));
+    }
 
     #[test]
     fn thinking_is_removed_only_from_assistant_items() {

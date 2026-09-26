@@ -229,6 +229,9 @@ pub struct Window {
     pub unsummarized: super::ContextUsage,
     pub omitted_items: i64,
     pub omitted_turns: i64,
+    /// Whether the bot may call the history tool, so the context note names
+    /// it only when it can.
+    pub history: bool,
     /// The bot's carry-forward note: its version node and text.
     pub note: Option<(i64, String)>,
     /// The bot's current compaction, if any.
@@ -906,6 +909,7 @@ impl Database {
             before: i64,
             turn_seq: i64,
             unsummarized: super::ContextUsage,
+            history: bool,
             note: Option<(i64, String)>,
             compaction: Option<(i64, String, String, i64, i64)>,
         }
@@ -916,7 +920,8 @@ impl Database {
                     s.id,COALESCE(s.depth,0),COALESCE(p.total_bytes,0),COALESCE(s.turn_seq,1),
                     COALESCE(h.total_bytes,0)-COALESCE(cp.total_bytes,0),
                     COALESCE(h.depth,0)-COALESCE(cp.depth,0),
-                    note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to
+                    note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
+                    instr(','||b.tools||',',',history,')>0
              FROM bots b LEFT JOIN nodes h ON h.id=b.head
              LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
              LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
@@ -938,6 +943,7 @@ impl Database {
                         bytes: r.get::<_, i64>(8)? as usize,
                         items: r.get::<_, i64>(9)? as usize,
                     },
+                    history: r.get(17)?,
                     note: r
                         .get::<_, Option<i64>>(10)?
                         .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(11)?)) })
@@ -1061,6 +1067,7 @@ impl Database {
             unsummarized: state.unsummarized,
             omitted_items: start_depth - 1,
             omitted_turns: turn_seq - 1,
+            history: state.history,
             note: state.note,
             compaction,
         }))
@@ -1554,6 +1561,7 @@ impl Database {
             note.as_ref(),
             omitted,
             turns,
+            bot.tools.iter().any(|tool| tool == "history"),
             &listed,
             input_limit.bytes * 2 / 3,
         )?;
@@ -1726,10 +1734,10 @@ impl Database {
         note_override: Option<&(i64, String)>,
     ) -> Result<(Family, super::ContextUsage)> {
         let (family, bytes, items) = self.turn_usage(name, turn)?;
-        let (omitted, turns, note) = self
+        let (omitted, turns, history, note) = self
             .conn
             .prepare_cached(
-                "SELECT s.depth-1,s.turn_seq-1,n.node,n.text
+                "SELECT s.depth-1,s.turn_seq-1,instr(','||b.tools||',',',history,')>0,n.node,n.text
              FROM bots b JOIN nodes s ON s.turn=?2 LEFT JOIN notes n ON n.node=b.note
              WHERE b.name=?1 AND b.running_turn=?2",
             )?
@@ -1737,8 +1745,9 @@ impl Database {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
-                    r.get::<_, Option<i64>>(2)?
-                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get::<_, String>(3)?)) })
+                    r.get::<_, bool>(2)?,
+                    r.get::<_, Option<i64>>(3)?
+                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get::<_, String>(4)?)) })
                         .transpose()?,
                 ))
             })?;
@@ -1748,6 +1757,7 @@ impl Database {
             note_override.or(note.as_ref()),
             omitted,
             turns,
+            history,
             &[],
             0,
         )?;
