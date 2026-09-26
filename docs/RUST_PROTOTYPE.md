@@ -1521,7 +1521,9 @@ usable; history tells the model to inspect current state before retrying.
 A bot may be created with a gate: `approve`, the tools whose calls wait for a
 verdict; `approver`, an opaque tag naming who answers, which the daemon
 stores and reports but never reads; and optionally `approve_expire_ms`.
-Without them none of this runs and nothing is paid. `fork` takes the same
+`approve` may name no more tools than the daemon registers (`invalid_gate`
+otherwise); a gate's tools must be among the new bot's own
+(`approve_not_in_tools`). Without them none of this runs and nothing is paid. `fork` takes the same
 fields. A bot keeps every gate it descends from: a fork keeps its source's,
 and a `create` or `fork` whose `created_by` names a bot adds that bot's.
 Each gate is kept to the new bot's tools, and gates with the same tag merge,

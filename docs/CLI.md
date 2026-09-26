@@ -70,7 +70,9 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   may be left out when the call has one gate, and a denial's `--reason` is
   what the model sees (an allow takes none). `answer` refuses to run inside a bot's own tool shell
   (`answer_in_tool_shell`). `run --pretty` and `follow --pretty` print the
-  same commands when a call waits.
+  same commands when a call waits. A printed command carries `--store` or
+  `--socket`, as absolute paths, whenever the daemon it came from is not
+  the default one, so it answers that daemon from any shell.
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,
   `--stall-timeout`, and `--keep-warm` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.

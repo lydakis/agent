@@ -485,14 +485,23 @@ fn workspace(path: &str) -> Result<String> {
 }
 /// A client's own gate: tools whose calls wait for a verdict, and the tag
 /// of the approver that answers. Both or neither; the daemon never reads
-/// the tag.
+/// the tag. A list longer than the `known` tools is refused before it is
+/// sorted, so its cost is bounded by the registry, not the request.
 fn gate(
     approve: Option<Vec<String>>,
     approver: Option<String>,
     expire_ms: Option<u64>,
+    known: usize,
 ) -> Result<Option<Gate>> {
     match (approve, approver) {
         (None, None) if expire_ms.is_none() => Ok(None),
+        (Some(tools), _) if tools.len() > known => fail_with(
+            "invalid_gate",
+            format!(
+                "approve names {} tools; the daemon has {known}",
+                tools.len()
+            ),
+        ),
         (Some(mut tools), Some(tag)) if !tools.is_empty() => {
             name(&tag).map_err(|_| Error::new("invalid_approver"))?;
             if expire_ms.is_some_and(|ms| ms == 0 || ms > 86_400_000) {
@@ -1233,7 +1242,12 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
-                let gate = gate(approve, approver, approve_expire_ms)?;
+                let gate = gate(
+                    approve,
+                    approver,
+                    approve_expire_ms,
+                    self.registry.tool_count(),
+                )?;
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;
@@ -1591,7 +1605,12 @@ impl Service {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
-                let gate = gate(approve, approver, approve_expire_ms)?;
+                let gate = gate(
+                    approve,
+                    approver,
+                    approve_expire_ms,
+                    self.registry.tool_count(),
+                )?;
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;

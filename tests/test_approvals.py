@@ -208,6 +208,9 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(client.request('create', bot='Fay', approve=['read'], approver='manual')['error'],
                          'approve_not_in_tools')
         self.assertEqual(client.request('create', bot='Fay', approve=['shell'])['error'], 'invalid_gate')
+        # A list longer than the daemon's tools is refused before any work on it.
+        self.assertEqual(client.request('create', bot='Fay', approve=['shell'] * 20000,
+                                        approver='manual')['error'], 'invalid_gate')
         turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf both')['result']['turn']
         [call] = self.announced(client, turn)
         self.assertEqual(call['gates'], ['manual', 'second'])
@@ -274,7 +277,8 @@ class ApprovalCliTests(ModelFixture):
             time.sleep(.05)
         [call] = pending
         pretty = self.agent('approvals', '--store', str(self.store), '--pretty').stdout
-        self.assertIn(f"agent answer --bot Bob --turn {submitted['turn']} --call shell-1 --request 1", pretty)
+        self.assertIn(f"agent answer --store {shlex.quote(str(self.store))} --bot Bob "
+                      f"--turn {submitted['turn']} --call shell-1 --request 1", pretty)
         self.assertIn('printf ok', pretty)
         inside = self.agent('answer', '--store', str(self.store), '--bot', 'Bob', '--turn', str(call['turn']),
                             '--call', 'shell-1', '--request', '1', 'allow', check=False,
@@ -298,8 +302,9 @@ class ApprovalCliTests(ModelFixture):
         self.assertEqual([c['call_id'] for c in pending], [ODD_CALL_ID])
         pretty = self.agent('approvals', '--store', str(self.store), '--pretty').stdout
         [line] = [line for line in pretty.splitlines() if ' · agent answer ' in line]
-        command = line.split(' · ', 1)[1].replace(
-            'agent answer', f'{shlex.quote(str(self.binary))} answer --store {shlex.quote(str(self.store))}', 1)
+        # The command names this store, so it reaches this daemon as printed.
+        self.assertIn(f'agent answer --store {shlex.quote(str(self.store))} --bot', line)
+        command = line.split(' · ', 1)[1].replace('agent answer', f'{shlex.quote(str(self.binary))} answer', 1)
         pasted = subprocess.run(['bash', '-c', command.replace('allow|deny', 'allow')], cwd=self.path,
                                 env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertEqual(pasted.returncode, 0, pasted.stderr)

@@ -456,6 +456,10 @@ impl Registry {
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|t| t.name()).collect()
     }
+    /// How many tools this registry holds: the most any selection can name.
+    pub fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools.iter().map(|t| t.schema()).collect()
     }

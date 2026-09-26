@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -86,6 +86,9 @@ struct Options {
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
+    /// The `--store` and `--socket` flags, shell-quoted, that reach this
+    /// daemon from any shell; empty when both are the defaults.
+    target: String,
 }
 
 fn parse(args: &[String]) -> Result<Options> {
@@ -133,6 +136,7 @@ fn parse(args: &[String]) -> Result<Options> {
         reason: None,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
+        target: String::new(),
     };
     let mut iter = args.iter();
     let mut socket = None;
@@ -282,10 +286,12 @@ fn parse(args: &[String]) -> Result<Options> {
         }
     }
     let explicit_store = store.is_some();
+    let home_store = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agent").join("state.sqlite"));
     options.store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
         Some(store) => store,
-        None => std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".agent").join("state.sqlite"))
+        None => home_store
+            .clone()
             .ok_or(Error::with("usage", "set --store, AGENT_STORE, or HOME"))?,
     };
     options.socket = match socket.or_else(|| {
@@ -298,6 +304,7 @@ fn parse(args: &[String]) -> Result<Options> {
         Some(socket) => socket,
         None => crate::client_path::default_socket(&options.store)?,
     };
+    options.target = target(&options.store, &options.socket, home_store.as_deref());
     if options.providers.is_empty() {
         options.providers = environment_providers(&|name| std::env::var(name).ok());
     }
@@ -888,7 +895,7 @@ fn run(options: &Options) -> Result<i32> {
         .ok_or(Error::new("daemon_protocol_mismatch"))?;
     let after = submitted["cursor"].as_i64().map(|c| c - 1).unwrap_or(0);
     connection.request("follow", json!({"bot":bot,"after":after}))?;
-    let mut renderer = Renderer::new(options.pretty, Some(turn));
+    let mut renderer = Renderer::new(options.pretty, Some(turn), &options.target);
     if options.pretty {
         eprintln!(
             "agent: {bot} turn {turn}{} in {workspace}",
@@ -909,7 +916,7 @@ fn follow(options: &Options) -> Result<i32> {
         // connection ends: the fleet controller's view.
         let mut connection = Connection::connect(&options.socket)?;
         connection.request("follow", json!({"bot":"*","after":options.after}))?;
-        let mut renderer = Renderer::new(options.pretty, None);
+        let mut renderer = Renderer::new(options.pretty, None, &options.target);
         loop {
             let event = connection.next_event()?;
             renderer.event(&mut connection, &event)?;
@@ -926,7 +933,7 @@ fn follow(options: &Options) -> Result<i32> {
     let state = connection.request("resume", json!({"bot":bot}))?;
     let turn = state["running_turn"].as_i64();
     connection.request("follow", json!({"bot":bot,"after":options.after}))?;
-    let mut renderer = Renderer::new(options.pretty, turn);
+    let mut renderer = Renderer::new(options.pretty, turn, &options.target);
     loop {
         let event = connection.next_event()?;
         if let Some(code) = renderer.event(&mut connection, &event)? {
@@ -1066,7 +1073,7 @@ fn approvals(options: &Options) -> Result<i32> {
                     call["turn"],
                     call_line(call)
                 );
-                for line in answer_lines(call) {
+                for line in answer_lines(call, &options.target) {
                     println!("{line}");
                 }
             } else {
@@ -1250,16 +1257,19 @@ struct Renderer {
     mode: Mode,
     turn: Option<i64>,
     usage: (u64, u64, u64),
+    /// The daemon's flags for the answer commands it prints.
+    target: String,
 }
 
 impl Renderer {
-    fn new(pretty: bool, turn: Option<i64>) -> Self {
+    fn new(pretty: bool, turn: Option<i64>, target: &str) -> Self {
         Self {
             pretty,
             color: pretty && std::io::stdout().is_terminal(),
             mode: Mode::Idle,
             turn,
             usage: (0, 0, 0),
+            target: target.to_owned(),
         }
     }
     fn dim(&self, text: &str) -> String {
@@ -1338,7 +1348,7 @@ impl Renderer {
                     .collect();
                 for call in pending(connection, bot, event["turn"].as_i64(), &wanted)? {
                     println!("{}", self.dim(&format!("⏸ {}", call_line(&call))));
-                    for line in answer_lines(&call) {
+                    for line in answer_lines(&call, &self.target) {
                         println!("{}", self.dim(&line));
                     }
                 }
@@ -1456,15 +1466,20 @@ fn one_line(text: &str, cut: bool) -> String {
 fn visible(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control()
-            || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
+        if acted_on(c) {
             shown.extend(c.escape_default());
         } else {
             shown.push(c);
         }
     }
     shown
+}
+
+/// A character a terminal acts on rather than shows as it stands: a
+/// control character, or a bidirectional mark or override.
+fn acted_on(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// A top-level string field of JSON text that may be cut short, decoded as
@@ -1586,8 +1601,9 @@ fn call_line(call: &Value) -> String {
 }
 
 /// One copyable command per gate a pending call still waits on, each
-/// naming its gate, since a call with several gates needs `--tag`.
-fn answer_lines(call: &Value) -> Vec<String> {
+/// naming its gate, since a call with several gates needs `--tag`, and the
+/// daemon, since ids mean nothing in another store.
+fn answer_lines(call: &Value, target: &str) -> Vec<String> {
     call["gates"]
         .as_array()
         .into_iter()
@@ -1595,7 +1611,7 @@ fn answer_lines(call: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(|tag| {
             format!(
-                "  waits for {tag} · agent answer --bot {} --turn {} --call {} --request {} --tag {} allow|deny",
+                "  waits for {tag} · agent answer{target} --bot {} --turn {} --call {} --request {} --tag {} allow|deny",
                 shell_word(call["bot"].as_str().unwrap_or("")),
                 call["turn"],
                 shell_word(call["call_id"].as_str().unwrap_or("")),
@@ -1606,15 +1622,50 @@ fn answer_lines(call: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The flags that reach this daemon from any shell, for commands printed
+/// for a person to run: none when the store and socket are the defaults.
+fn target(store: &Path, socket: &Path, home_store: Option<&Path>) -> String {
+    let mut flags = String::new();
+    if home_store != Some(store) {
+        flags.push_str(" --store ");
+        flags.push_str(&shell_path(store));
+    }
+    if crate::client_path::default_socket(store).ok().as_deref() != Some(socket) {
+        flags.push_str(" --socket ");
+        flags.push_str(&shell_path(socket));
+    }
+    flags
+}
+
+/// A path as one shell word, made absolute so it holds from any directory;
+/// bytes that are not UTF-8 are written as escapes.
+fn shell_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(text) = path.to_str() {
+        return shell_word(text);
+    }
+    let mut word = String::from("$'");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/._-".contains(&byte) {
+            word.push(byte as char);
+        } else {
+            word.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    word.push('\'');
+    word
+}
+
 /// A value as one shell word, for a command a person copies: bare when it
 /// is plainly safe, single-quoted otherwise, and ANSI-C quoted when it has
-/// control characters, which would otherwise reach the terminal raw.
+/// characters a terminal would act on, which would otherwise reach it raw.
 fn shell_word(value: &str) -> String {
     let plain = |c: char| c.is_ascii_alphanumeric() || "_-.,:/@%+=".contains(c);
     if !value.is_empty() && value.chars().all(plain) {
         return value.to_owned();
     }
-    if !value.chars().any(char::is_control) {
+    if !value.chars().any(acted_on) {
         return format!("'{}'", value.replace('\'', r"'\''"));
     }
     let mut word = String::from("$'");
@@ -1624,7 +1675,7 @@ fn shell_word(value: &str) -> String {
                 word.push('\\');
                 word.push(c);
             }
-            c if c.is_control() => {
+            c if acted_on(c) => {
                 for byte in c.encode_utf8(&mut [0; 4]).bytes() {
                     word.push_str(&format!("\\x{byte:02x}"));
                 }
@@ -1765,10 +1816,35 @@ mod tests {
             "arguments_cut":[],"arguments_omitted":0});
         assert_eq!(call_line(&call), "shell ls");
         assert_eq!(
-            answer_lines(&call),
+            answer_lines(&call, ""),
             [
                 "  waits for manual · agent answer --bot Bob --turn 7 --call 'c 1' --request 2 --tag manual allow|deny",
                 "  waits for second · agent answer --bot Bob --turn 7 --call 'c 1' --request 2 --tag second allow|deny",
+            ]
+        );
+    }
+
+    #[test]
+    fn printed_commands_name_a_daemon_that_is_not_the_default() {
+        let home = Path::new("/home/a/.agent/state.sqlite");
+        let other = Path::new("/tmp/x y/state.sqlite");
+        let socket = |store| crate::client_path::default_socket(store).unwrap();
+        assert_eq!(target(home, &socket(home), Some(home)), "");
+        assert_eq!(
+            target(other, &socket(other), Some(home)),
+            " --store '/tmp/x y/state.sqlite'"
+        );
+        assert_eq!(
+            target(home, Path::new("/run/a.sock"), Some(home)),
+            " --socket /run/a.sock"
+        );
+        // Without HOME there is no default store to leave out.
+        assert!(target(home, &socket(home), None).starts_with(" --store /home/a/"));
+        let call = json!({"bot":"Bob","turn":7,"call_id":"c1","request":1,"gates":["manual"]});
+        assert_eq!(
+            answer_lines(&call, " --store /s"),
+            [
+                "  waits for manual · agent answer --store /s --bot Bob --turn 7 --call c1 --request 1 --tag manual allow|deny"
             ]
         );
     }
@@ -1781,6 +1857,8 @@ mod tests {
         assert_eq!(shell_word("$(touch x)"), "'$(touch x)'");
         assert_eq!(shell_word("it's"), r"'it'\''s'");
         assert_eq!(shell_word("a\nb'\x1b"), r"$'a\x0ab\'\x1b'");
+        // A bidi override would reorder the flags printed after it.
+        assert_eq!(shell_word("a\u{202e}b"), r"$'a\xe2\x80\xaeb'");
     }
 
     #[test]
