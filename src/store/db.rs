@@ -2873,6 +2873,12 @@ impl Database {
         }
         Ok(Some(request))
     }
+    /// What wakes a turn when a verdict for one of its calls arrives. Taken
+    /// in the job that announces the calls, so the turn can wait for a
+    /// verdict before its first check instead of checking an empty request.
+    pub fn verdicts_for(&mut self, turn: i64) -> Arc<Notify> {
+        self.live.entry(turn).or_default().notify.clone()
+    }
     /// Start a gated call once every gate allowed it, record its denial, or
     /// say what it still waits for. Allows ride the call's `tool_start`
     /// commit and a denial is its result, so a verdict adds no commit.

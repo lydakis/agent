@@ -31,7 +31,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub const MAX_ROUNDS: usize = 200;
 /// The error a cancelled turn ends with, sent on its cancel channel: a
@@ -932,6 +932,7 @@ impl Turn {
                 if let Some(stop) = self
                     .execute_calls(
                         waiting.pending,
+                        None,
                         &workspace,
                         &environment,
                         &record,
@@ -1021,26 +1022,29 @@ impl Turn {
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
-            match self
+            let gated = calls.iter().any(|call| record.gated(&call.name));
+            let announced = match self
                 .store
                 .op("append", move |db| {
-                    db.append(turn, items, &calls, usage.as_ref())
+                    let entries = db.append(turn, items, &calls, usage.as_ref())?;
+                    Ok((entries, gated.then(|| db.verdicts_for(turn))))
                 })
                 .await
             {
-                Ok(entries) => {
+                Ok((entries, verdicts)) => {
                     let nodes: Vec<i64> = entries
                         .iter()
                         .filter(|entry| entry["event"] == "message")
                         .filter_map(|entry| entry["data"]["node"].as_i64())
                         .collect();
                     provider.recorded(&self.bot, &nodes);
+                    verdicts
                 }
                 Err(error) => {
                     self.failed_usage(response.usage.clone()).await?;
                     return Err(error);
                 }
-            }
+            };
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard.
@@ -1075,6 +1079,7 @@ impl Turn {
             let stop = self
                 .execute_calls(
                     response.calls,
+                    announced,
                     &workspace,
                     &environment,
                     &record,
@@ -1612,9 +1617,14 @@ impl Turn {
 
     /// Run planned calls in order. Returns true when a wait parked the turn;
     /// the calls after it are stored with the parked state.
+    /// Run a round's calls in order. `announced` is set when this round
+    /// announced gated calls: the first of them waits for a verdict before
+    /// its first check, since none can be older than the announcement.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_calls(
         &self,
         calls: Vec<ToolCall>,
+        mut announced: Option<Arc<Notify>>,
         workspace: &std::path::Path,
         environment: &[(String, String)],
         record: &Bot,
@@ -1625,7 +1635,10 @@ impl Turn {
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             if record.gated(&call.name) {
-                match self.approve(&call, &mut calls, route).await? {
+                match self
+                    .approve(&call, &mut calls, announced.take(), record, route)
+                    .await?
+                {
                     Approval::Run => {}
                     Approval::Denied => continue,
                     Approval::Stop(stop) => return Ok(Some(stop)),
@@ -1763,27 +1776,50 @@ impl Turn {
         &self,
         call: &ToolCall,
         calls: &mut std::vec::IntoIter<ToolCall>,
+        announced: Option<Arc<Notify>>,
+        record: &Bot,
         route: Option<&str>,
     ) -> Result<Approval> {
         let turn = self.turn;
         let hold = tokio::time::Instant::now() + self.approval_hold;
+        // Announced by this round's own commit, so any verdict comes later
+        // and wakes this wait: check after waiting, not before. The gates'
+        // expiry counts from about now; the check judges the stored time.
+        let mut first = announced.map(|notify| {
+            let expire_ms = record
+                .gates
+                .iter()
+                .filter(|gate| gate.tools.contains(&call.name))
+                .filter_map(|gate| gate.expire_ms)
+                .min();
+            let lapse = expire_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+            (notify, lapse)
+        });
         loop {
-            let (checked, now) = (call.clone(), now_ms());
-            let (notify, expires_ms) = match self
-                .store
-                .op("approval_start", move |db| {
-                    db.approval_start(turn, &checked, now)
-                })
-                .await?
-            {
-                Gated::Started => return Ok(Approval::Run),
-                Gated::Denied => return Ok(Approval::Denied),
-                Gated::Expired => return fail("approval_expired"),
-                Gated::Pending { notify, expires_ms } => (notify, expires_ms),
+            let (notify, lapse) = match first.take() {
+                Some(first) => first,
+                None => {
+                    let (checked, now) = (call.clone(), now_ms());
+                    match self
+                        .store
+                        .op("approval_start", move |db| {
+                            db.approval_start(turn, &checked, now)
+                        })
+                        .await?
+                    {
+                        Gated::Started => return Ok(Approval::Run),
+                        Gated::Denied => return Ok(Approval::Denied),
+                        Gated::Expired => return fail("approval_expired"),
+                        Gated::Pending { notify, expires_ms } => (
+                            notify,
+                            expires_ms.map(|at| {
+                                tokio::time::Instant::now()
+                                    + Duration::from_millis(at.saturating_sub(now))
+                            }),
+                        ),
+                    }
+                }
             };
-            let lapse = expires_ms.map(|at| {
-                tokio::time::Instant::now() + Duration::from_millis(at.saturating_sub(now))
-            });
             let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
             if tokio::time::Instant::now() < wake {
                 tokio::select! {

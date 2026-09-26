@@ -943,6 +943,57 @@ as one.
    with a delayed answer, counting its commits, and a verdict that
    arrives while the turn is parked on an earlier `wait`.
 
+   Done in part 2026-09-26 with
+   [`bench.approval_overhead`](../bench/approval_overhead.py), before the
+   rules approver exists, so with no path resolution: the approver is the
+   screen itself, answering `allow` as soon as a call is announced
+   (`held`) or, with `--approval-hold-ms 0`, after the turn parks
+   (`parked`). Each turn is one synthetic `shell` call (`true`) and a
+   reply, on a fresh store, against the same turn ungated and against
+   main at 7e46c5f. Medians of three rotated runs of 200 sequential turns
+   on one bot, on a 4-CPU Linux container (fsyncs counted in a separate
+   pass under strace, setup included):
+
+   | | main | ungated | held | parked |
+   |---|---:|---:|---:|---:|
+   | Turn latency p50 / p99, ms | 12.3 / 20.5 | 11.7 / 18.5 | 13.2 / 19.0 | 15.0 / 22.3 |
+   | Daemon CPU per turn, ms | 7.4 | 7.3 | 7.8 | 9.1 |
+   | Store commits per turn | 11 | 11 | 12 | 18 |
+   | fsyncs per turn | 6.24 | 6.24 | 6.26 | 9.32 |
+   | Event bytes per turn | 1,071 | 1,071 | 1,318 | 1,526 |
+   | Store bytes per turn | 2,867 | 2,908 | 3,174 | 3,359 |
+   | Answer request and reply bytes per call | | | 240 | 240 |
+
+   - Ungated bots pay nothing: the same jobs, commits, and fsyncs as main,
+     and CPU and latency within run-to-run spread. Six rotated runs of 32
+     bots at 100 turns each agree: 247 turns/s against main's 245, 5.0
+     ms CPU per turn against 5.1. The store's 41 bytes per turn are the
+     empty `approvals` table and index, 8 KiB whatever the turn count.
+   - A held call adds no durable commit. Its one added commit is the
+     answer's group, which writes nothing; the 0.015 fsyncs per turn are
+     WAL checkpoints that come sooner with the added event bytes. In two
+     further runs of 600 turns per arm, the storage worker spent about
+     0.15 ms more per call (the answer 0.08 ms, the announcement 0.07),
+     `approval_start` took what `tool_start` did, and daemon CPU per turn
+     moved less than it did between two runs of the same arm (0.7 ms).
+     Latency grows about 1 ms at the median, the screen's own answering
+     round trip included: the daemon's announce-to-start `waited_ms` is 1
+     to 2 ms.
+   - A parked call adds three durable commits (the park, the verdict, the
+     resume) and about 3 ms, the screen's reaction to `turn_waiting`
+     included.
+   - With 32 bots at 25 turns each, where commits group, the one
+     single-threaded screen answering every bot becomes the wait
+     (`waited_ms` about 50 ms held, 70 parked): 309 turns/s ungated, 258
+     held, 196 parked. The answers arrive spread out, so fewer jobs share
+     a group: 1.1 more commits and 0.45 more fsyncs per turn held, and
+     0.6 ms more daemon CPU per turn.
+
+   Still to measure: the same with the rules approver and its path
+   resolution, over a socket rather than stdio, and a verdict that
+   arrives while the turn is parked on an earlier `wait` (covered by a
+   behavior test, not timed).
+
 ## Built so far
 
 Built on 2026-09-26, documented in [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#tool-approval):
@@ -957,6 +1008,8 @@ Built on 2026-09-26, documented in [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#tool-ap
   `--approve`, `agent approvals`, `agent answer`, and the pending call
   with its answering command in `run --pretty`. The CLI answers with
   `by: "cli"`.
+- The daemon's cost, measured without an approver of its own
+  ([Measure](#measure-before-building), item 3).
 
 Where it differs from the design above:
 

@@ -751,6 +751,22 @@ One warmup and three measured fresh stores are the default. Run builds sequentia
 in both orders with the same durability settings. This measures a completion
 burst, not steady-state capacity; pair it with the streaming and lifecycle screens.
 
+## Tool approval overhead
+
+```sh
+.local/venv/bin/python -m bench.approval_overhead --before .local/before --after .local/target/release/agent --out .local/bench/approvals --fsync
+```
+
+Each turn is one synthetic `shell` call and a reply, on a fresh store per run.
+Arms: ungated (on both binaries), `held` (the screen answers `allow` on the
+announcement, inside the hold), and `parked` (`--approval-hold-ms 0`, answered
+after the park). The screen is the approver, so gated latency includes its own
+answering round trip. It records store jobs and commits per turn, storage worker
+time by job, daemon CPU, latency, event bytes, live store bytes after a clean
+close, and answer bytes; `--fsync` adds one pass per arm counting fsyncs under
+strace, setup included. Arms rotate across `--rounds`. Results are in
+[APPROVALS.md](APPROVALS.md#measure-before-building), item 3.
+
 ## Mixed-workload soak
 
 ```sh
