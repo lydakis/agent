@@ -338,7 +338,7 @@ impl Request {
 /// Verdicts for a running turn, held by the storage worker until a commit
 /// the turn makes anyway writes them: the call's start, its denial, or a
 /// park. `notify` wakes the turn's task once an answer is acknowledged.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Live {
     notify: Arc<Notify>,
     verdicts: HashMap<String, Vec<Verdict>>,
@@ -618,6 +618,9 @@ pub struct Database {
     pending_stale: bool,
     /// Per running turn with a gated call: verdicts not yet written.
     live: HashMap<i64, Live>,
+    /// Each turn's `live` entry as it was before the current group changed
+    /// it, so a group that fails to commit puts held verdicts back.
+    live_before: HashMap<i64, Option<Live>>,
 }
 
 /// The share of input tokens the provider served from its prompt cache,
@@ -678,6 +681,7 @@ impl Database {
             outcomes: Vec::new(),
             pending_stale: false,
             live: HashMap::new(),
+            live_before: HashMap::new(),
         })
     }
 
@@ -829,6 +833,7 @@ impl Database {
             outcomes: Vec::new(),
             pending_stale: false,
             live: HashMap::new(),
+            live_before: HashMap::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -890,6 +895,7 @@ impl Database {
         if self.pending_stale {
             self.abandon_group()?;
         }
+        self.live_before.clear();
         self.conn.prepare_cached("BEGIN")?.execute([])?;
         Ok(())
     }
@@ -904,6 +910,7 @@ impl Database {
             return fail("storage_group_rolled_back");
         }
         self.conn.prepare_cached("COMMIT")?.execute([])?;
+        self.live_before.clear();
         Ok(())
     }
     /// Forget a group that did not commit: roll back whatever is still
@@ -912,6 +919,12 @@ impl Database {
     pub fn abandon_group(&mut self) -> Result<()> {
         self.outcomes.clear();
         self.pending_stale = true;
+        for (turn, before) in self.live_before.drain() {
+            match before {
+                Some(live) => self.live.insert(turn, live),
+                None => self.live.remove(&turn),
+            };
+        }
         if self.in_group() {
             self.conn.prepare_cached("ROLLBACK")?.execute([])?;
         }
@@ -2899,7 +2912,7 @@ impl Database {
             && failed(&outcome.output)
             && reannounce(&tx, &bot.name, turn, call_id)?;
         tx.commit()?;
-        if reannounced && let Some(live) = self.live.get_mut(&turn) {
+        if reannounced && let Some(live) = self.live_changed(turn) {
             live.verdicts.clear();
         }
         Ok((
@@ -2953,6 +2966,26 @@ impl Database {
     pub fn verdicts_for(&mut self, turn: i64) -> Arc<Notify> {
         self.live.entry(turn).or_default().notify.clone()
     }
+    /// Note a turn's held verdicts before this group first changes them.
+    fn keep_live(&mut self, turn: i64) {
+        if !self.live_before.contains_key(&turn) {
+            self.live_before.insert(turn, self.live.get(&turn).cloned());
+        }
+    }
+    /// A turn's held verdicts, to change once this group has noted them.
+    fn live_changed(&mut self, turn: i64) -> Option<&mut Live> {
+        if self.live.contains_key(&turn) {
+            self.keep_live(turn);
+        }
+        self.live.get_mut(&turn)
+    }
+    /// Drop a turn's held verdicts: they were written, or the turn ended.
+    fn forget_live(&mut self, turn: i64) {
+        if self.live.contains_key(&turn) {
+            self.keep_live(turn);
+            self.live.remove(&turn);
+        }
+    }
     /// Start a gated call once every gate allowed it, record its denial, or
     /// say what it still waits for. Allows ride the call's `tool_start`
     /// commit and a denial is its result, so a verdict adds no commit.
@@ -2977,7 +3010,7 @@ impl Database {
                 .execute([request.id])?;
             let reannounced = reannounce(&tx, &bot.name, turn, &call.call_id)?;
             tx.commit()?;
-            if reannounced && let Some(live) = self.live.get_mut(&turn) {
+            if reannounced && let Some(live) = self.live_changed(turn) {
                 live.verdicts.clear();
             }
             Gated::Denied
@@ -3027,7 +3060,7 @@ impl Database {
                 expires_ms: request.expires_ms(),
             });
         };
-        if let Some(live) = self.live.get_mut(&turn) {
+        if let Some(live) = self.live_changed(turn) {
             live.verdicts.remove(&call.call_id);
         }
         Ok(gated)
@@ -3080,7 +3113,7 @@ impl Database {
         let data = json!({"call_id":call.call_id,"approval":true,"deadline_ms":deadline_ms});
         event(&tx, &bot.name, Some(turn), "turn_waiting", data)?;
         tx.commit()?;
-        self.live.remove(&turn);
+        self.forget_live(turn);
         Ok(Some(deadline_ms))
     }
     /// Record one gate's verdict on the current request of a planned call.
@@ -3152,6 +3185,7 @@ impl Database {
             "request":request.request,"tag":tag,
             "decision":if answer.allow { "allow" } else { "deny" },"pending":pending});
         if status == "running" {
+            self.keep_live(answer.turn);
             let live = self.live.entry(answer.turn).or_default();
             live.verdicts
                 .entry(answer.call_id.to_owned())
@@ -3183,7 +3217,8 @@ impl Database {
     }
     /// Planned calls still waiting on a gate, in announcement order, each
     /// naming only its unanswered gates. One page is at most `limit` calls,
-    /// 256 KiB, and 1,024 requests read, so no single job builds a large list.
+    /// 256 KiB (or the one call, when it alone is larger), and 1,024
+    /// requests read, so no single job builds a large list.
     pub fn approvals(
         &self,
         bot: Option<&str>,
@@ -3264,8 +3299,9 @@ impl Database {
                 "request":request.request,"announced_ms":request.announced_ms,
                 "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
                 "node":node,"arguments":arguments,"arguments_truncated":truncated});
+            // A page holds at least one call, so paging always advances.
             let size = crate::output::encoded_len(&entry)? + 1;
-            if listed.len() == limit || bytes + size > 256 * 1024 {
+            if listed.len() == limit || (!listed.is_empty() && bytes + size > 256 * 1024) {
                 more = true;
                 break;
             }
@@ -3401,7 +3437,7 @@ impl Database {
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
-        self.live.remove(&turn);
+        self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
         Ok(entries)
     }
@@ -3467,7 +3503,7 @@ impl Database {
         let data = json!({"call_id":call_id,"handles":handles,"deadline_ms":deadline_ms,"any":any});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_waiting", data.clone())?;
         tx.commit()?;
-        self.live.remove(&turn);
+        self.forget_live(turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_waiting", data))
     }
     /// Park a running turn at its model-call boundary until `resume_at_ms`,
@@ -3514,7 +3550,7 @@ impl Database {
         let data = json!({"resume_at_ms":resume_at_ms});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_paced", data.clone())?;
         tx.commit()?;
-        self.live.remove(&turn);
+        self.forget_live(turn);
         Ok(entry(cursor, &bot.name, Some(turn), "turn_paced", data))
     }
     /// Every parked turn, on handles or on a pool, for re-registration after

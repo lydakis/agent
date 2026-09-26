@@ -1,8 +1,11 @@
 """Tool approval: gated calls wait for an answer, run or are denied, and park."""
 import json
 import os
+import queue
+import re
 import shlex
 import subprocess
+import threading
 import time
 import unittest
 
@@ -279,6 +282,23 @@ class ApprovalCliTests(ModelFixture):
         self.assertFalse((self.path / 'pwned').exists())
         result = self.agent('wait', '--store', str(self.store), submitted['handle'])
         self.assertEqual(json.loads(result.stdout)['results'][submitted['handle']]['status'], 'completed')
+
+    def test_run_pretty_shows_what_a_call_would_do_before_its_command(self):
+        run = subprocess.Popen([str(self.binary), 'run', *self.common, '--new', '--bot', 'Bob', '--pretty',
+                                'shell:printf shown'], env={**clean_env(), 'AGENT_APPROVAL': 'manual'},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=self.path)
+        self.addCleanup(run.kill)
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(line) for line in run.stdout], daemon=True).start()
+        shown = ''
+        while 'agent answer' not in shown:
+            shown += lines.get(timeout=10)
+        self.assertIn('⏸ shell printf shown', shown)
+        self.assertIn('--call shell-1 --request 1 --tag manual allow|deny', shown)
+        turn = re.search(r'--turn (\d+)', shown)[1]
+        self.agent('answer', '--store', str(self.store), '--bot', 'Bob', '--turn', turn, '--call', 'shell-1',
+                   '--request', '1', 'allow')
+        self.assertEqual(run.wait(timeout=30), 0, run.stderr.read())
 
     def test_modes_are_validated_before_anything_is_created(self):
         auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False)

@@ -3,8 +3,8 @@ use agent_runtime::{
     codec::Family,
     provider::{ToolCall, Usage},
     store::{
-        Answer, Binding, Bot, CompactionPlan, Database, Delivery, Fork, Gate, Gated, Planning,
-        TurnOptions,
+        Answer, Answered, Binding, Bot, CompactionPlan, Database, Delivery, Fork, Gate, Gated,
+        Planning, TurnOptions,
     },
     tools::Outcome,
 };
@@ -594,56 +594,65 @@ fn tool_results_and_cursor_events_commit_together() {
     );
 }
 
-#[test]
-fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
-    let mut db = db();
+/// A running turn of Bob, whose `shell` calls wait on a `manual` gate.
+fn gated_turn(db: &mut Database, expire_ms: Option<u64>) -> i64 {
     let tools = ["shell".to_owned()];
     let gate = Gate {
         tag: "manual".into(),
         tools: vec!["shell".into()],
-        expire_ms: Some(1),
+        expire_ms,
     };
-    db.create(
+    let binding = Binding {
+        tools: &tools,
+        gate: Some(&gate),
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), binding).unwrap();
+    db.begin(
         "Bob",
-        Some("/synthetic"),
-        Binding {
-            tools: &tools,
-            gate: Some(&gate),
-            ..binding()
-        },
+        "request",
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
     )
-    .unwrap();
-    let turn = db
-        .begin(
-            "Bob",
-            "request",
-            "work",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap()
-        .turn;
-    // The first item's own id is the second call's id.
-    let item = |id: &str, call_id: &str, command: &str| -> Bytes {
-        serde_json::to_vec(&json!({"type":"function_call","id":id,"call_id":call_id,
-            "name":"shell","arguments":json!({"command":command}).to_string()}))
-        .unwrap()
-        .into()
-    };
-    let call = |call_id: &str, command: &str| ToolCall {
+    .unwrap()
+    .turn
+}
+/// A shell call and the Responses item, with its own item id, planning it.
+fn shell_call(item_id: &str, call_id: &str, command: &str) -> (Bytes, ToolCall) {
+    let arguments = json!({"command":command}).to_string();
+    let item = json!({"type":"function_call","id":item_id,"call_id":call_id,
+        "name":"shell","arguments":arguments});
+    let call = ToolCall {
         name: "shell".into(),
         call_id: call_id.into(),
-        arguments: json!({"command":command}).to_string(),
+        arguments,
     };
-    let calls = [call("s1", "true"), call("s2", "ls")];
-    db.append(
+    (serde_json::to_vec(&item).unwrap().into(), call)
+}
+fn allow(db: &mut Database, turn: i64, call_id: &str) -> Result<Answered> {
+    db.answer(Answer {
+        bot: "Bob",
         turn,
-        vec![item("s2", "s1", "true"), item("fc_2", "s2", "ls")],
-        &calls,
-        None,
-    )
-    .unwrap();
+        call_id,
+        request: 1,
+        tag: None,
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    })
+}
+
+#[test]
+fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, Some(1));
+    // The first item's own id is the second call's id.
+    let (first, s1) = shell_call("s2", "s1", "true");
+    let (second, s2) = shell_call("fc_2", "s2", "ls");
+    db.append(turn, vec![first, second], &[s1.clone(), s2], None)
+        .unwrap();
     let listed = db.approvals(Some("Bob"), None, 0, 64).unwrap();
     let listed = listed["approvals"].as_array().unwrap();
     let [first, second] = &listed[..] else {
@@ -659,16 +668,7 @@ fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
     // An answer after the gate's expiry is refused, even before the turn
     // gets to deny the call for it.
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let late = db.answer(Answer {
-        bot: "Bob",
-        turn,
-        call_id: "s1",
-        request: 1,
-        tag: None,
-        allow: true,
-        reason: None,
-        by: Some("test"),
-    });
+    let late = allow(&mut db, turn, "s1");
     assert_eq!(
         late.err().map(|e| e.to_string()).as_deref(),
         Some("approval_expired")
@@ -678,8 +678,51 @@ fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
         .unwrap()
         .as_millis() as u64;
     assert!(matches!(
-        db.approval_start(turn, &calls[0], now_ms).unwrap(),
+        db.approval_start(turn, &s1, now_ms).unwrap(),
         Gated::Expired
+    ));
+}
+
+#[test]
+fn a_call_larger_than_a_page_still_fills_one() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", &"h".repeat(300 * 1024), "true");
+    db.append(turn, vec![item], &[call], None).unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    assert_eq!(page["approvals"].as_array().unwrap().len(), 1);
+    assert!(page["next_after"].is_null());
+}
+
+#[test]
+fn held_verdicts_follow_the_group_that_holds_them() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    // An allow held for a running turn goes with a group that fails to
+    // commit: its approver was told the answer failed.
+    db.begin_group().unwrap();
+    assert!(allow(&mut db, turn, "s1").unwrap().notify.is_some());
+    db.abandon_group().unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Pending { .. }
+    ));
+    // One that committed survives a later group that consumed it and failed.
+    db.begin_group().unwrap();
+    allow(&mut db, turn, "s1").unwrap();
+    db.commit_group().unwrap();
+    db.begin_group().unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
+    ));
+    db.abandon_group().unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
     ));
 }
 

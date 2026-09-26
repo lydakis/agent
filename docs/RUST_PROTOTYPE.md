@@ -1564,9 +1564,10 @@ keeping the shorter expiry. `resume`, `bots`, `created`, and `forked` report
   `approval_superseded`.
 - **Listing.** `{"op":"approvals","bot"?,"tag"?,"after"?,"limit"?}` lists
   calls still waiting on a gate in announcement order, each naming only its
-  unanswered gates, with `expires_ms` and a 2 KiB argument preview. A page
-  holds at most `limit` (1 to 256, default 64) calls and 256 KiB;
-  `next_after` continues it. `stats` reports `approval_requests`, the calls
+  unanswered gates, with `expires_ms` and a 2,048-character argument
+  preview. A page holds at most `limit` (1 to 256, default 64) calls and
+  256 KiB, or the one call when it alone is larger; `next_after` continues
+  it. `stats` reports `approval_requests`, the calls
   announced and not yet started or denied.
 - Interrupting a turn cancels its gated calls like any planned call.
   Anything that reaches the socket can answer, a bot's own shell included:

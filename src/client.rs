@@ -1061,27 +1061,14 @@ fn approvals(options: &Options) -> Result<i32> {
         for call in calls {
             if options.pretty {
                 println!(
-                    "{} turn {} {} {}\n  waits for {} · agent answer --bot {} --turn {} --call {} --request {} allow|deny",
+                    "{} turn {} {}",
                     call["bot"].as_str().unwrap_or(""),
                     call["turn"],
-                    call["name"].as_str().unwrap_or(""),
-                    summary(
-                        call["name"].as_str().unwrap_or(""),
-                        call["arguments"].as_str().unwrap_or("")
-                    ),
-                    call["gates"]
-                        .as_array()
-                        .map(|gates| gates
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_default(),
-                    shell_word(call["bot"].as_str().unwrap_or("")),
-                    call["turn"],
-                    shell_word(call["call_id"].as_str().unwrap_or("")),
-                    call["request"],
+                    call_line(call)
                 );
+                for line in answer_lines(call) {
+                    println!("{line}");
+                }
             } else {
                 if !first {
                     print!(",");
@@ -1336,32 +1323,24 @@ impl Renderer {
                 let summary = summary(name, data["arguments"].as_str().unwrap_or(""));
                 println!("{}", self.dim(&format!("▸ {name} {summary}")));
             }
-            // A person answering from another terminal needs the command.
+            // A person answering from another terminal needs to see what
+            // each call would do, then the command. The event names the
+            // calls; the listing has their arguments. A call it no longer
+            // lists was decided already.
             "approval_requested" => {
                 self.flush();
                 let bot = event["bot"].as_str().unwrap_or("");
-                for call in data["calls"].as_array().into_iter().flatten() {
-                    let gates = call["gates"]
-                        .as_array()
-                        .map(|gates| {
-                            gates
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        })
-                        .unwrap_or_default();
-                    println!(
-                        "{}",
-                        self.dim(&format!(
-                            "⏸ {} waits for {gates} · agent answer --bot {} --turn {} --call {} --request {} allow|deny",
-                            call["name"].as_str().unwrap_or("tool"),
-                            shell_word(bot),
-                            event["turn"],
-                            shell_word(call["call_id"].as_str().unwrap_or("")),
-                            call["request"],
-                        ))
-                    );
+                let wanted: Vec<&str> = data["calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call["call_id"].as_str())
+                    .collect();
+                for call in pending(connection, bot, event["turn"].as_i64(), &wanted)? {
+                    println!("{}", self.dim(&format!("⏸ {}", call_line(&call))));
+                    for line in answer_lines(&call) {
+                        println!("{}", self.dim(&line));
+                    }
                 }
             }
             "tool_completed" => {
@@ -1442,6 +1421,71 @@ fn summary(name: &str, arguments: &str) -> String {
         .collect()
 }
 
+/// Calls of one turn still waiting on a gate, as `approvals` lists them,
+/// in the order given.
+fn pending(
+    connection: &mut Connection,
+    bot: &str,
+    turn: Option<i64>,
+    call_ids: &[&str],
+) -> Result<Vec<Value>> {
+    let mut found: Vec<Value> = Vec::new();
+    let mut after = json!(0);
+    while !after.is_null() && found.len() < call_ids.len() {
+        let page = connection.request("approvals", json!({"bot":bot,"after":after,"limit":256}))?;
+        found.extend(
+            page["approvals"]
+                .as_array()
+                .ok_or(Error::new("daemon_protocol_mismatch"))?
+                .iter()
+                .filter(|call| {
+                    call["turn"].as_i64() == turn
+                        && call["call_id"]
+                            .as_str()
+                            .is_some_and(|id| call_ids.contains(&id))
+                })
+                .cloned(),
+        );
+        after = page["next_after"].clone();
+    }
+    found.sort_by_key(|call| {
+        call_ids
+            .iter()
+            .position(|id| call["call_id"].as_str() == Some(*id))
+    });
+    Ok(found)
+}
+
+/// A pending call's tool and what it would do, as `approvals` lists it.
+fn call_line(call: &Value) -> String {
+    let name = call["name"].as_str().unwrap_or("tool");
+    format!(
+        "{name} {}",
+        summary(name, call["arguments"].as_str().unwrap_or(""))
+    )
+}
+
+/// One copyable command per gate a pending call still waits on, each
+/// naming its gate, since a call with several gates needs `--tag`.
+fn answer_lines(call: &Value) -> Vec<String> {
+    call["gates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|tag| {
+            format!(
+                "  waits for {tag} · agent answer --bot {} --turn {} --call {} --request {} --tag {} allow|deny",
+                shell_word(call["bot"].as_str().unwrap_or("")),
+                call["turn"],
+                shell_word(call["call_id"].as_str().unwrap_or("")),
+                call["request"],
+                shell_word(tag),
+            )
+        })
+        .collect()
+}
+
 /// A value as one shell word, for a command a person copies: bare when it
 /// is plainly safe, single-quoted otherwise, and ANSI-C quoted when it has
 /// control characters, which would otherwise reach the terminal raw.
@@ -1511,6 +1555,20 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_open_gate_gets_its_own_answer_command() {
+        let call = json!({"bot":"Bob","turn":7,"call_id":"c 1","request":2,
+            "gates":["manual","second"],"name":"shell","arguments":"{\"command\":\"ls\"}"});
+        assert_eq!(call_line(&call), "shell ls");
+        assert_eq!(
+            answer_lines(&call),
+            [
+                "  waits for manual · agent answer --bot Bob --turn 7 --call 'c 1' --request 2 --tag manual allow|deny",
+                "  waits for second · agent answer --bot Bob --turn 7 --call 'c 1' --request 2 --tag second allow|deny",
+            ]
+        );
+    }
 
     #[test]
     fn shell_words_keep_ids_one_argument() {
