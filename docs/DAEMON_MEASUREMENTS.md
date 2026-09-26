@@ -4690,3 +4690,216 @@ the diagnostic binary is
 `05d13ff8b530e4325e2810dbed19f0bb7b642581f5a50342b67cf0dc2b74f8ad`.
 Ignored evidence under `.local/sqlite-diagnostics/` includes both binaries,
 test logs, the admission driver and captures, and all four `mixed-*` results.
+
+### Disk-full cause and containment
+
+On 2026-09-26 a read-only inspection of a copy of the failed attempt's store,
+the probe's own records and the host's system log on the same macOS arm64
+host found the likely cause: the volume ran out of space. Nothing was
+changed on that host. The facts, with times relative to the attempt's first
+run directory:
+
+- The volume had been in macOS's very-low-disk state for about ten minutes,
+  with roughly 140–250 MB free. At +2.165 s the system log records another
+  process's SQLite WAL write failing with `ENOSPC`, the only one that hour,
+  22 ms after the commit that recorded the three `storage_error` completions.
+  Free space was back near 3 GB by +11.7 s; what freed it was not identified.
+  The captured and repeat series ran later, with about 2.9 GB free.
+- The store copy passed `integrity_check`. Its WAL holds 39 valid commits,
+  six uncommitted frames of the next group (the fifth turn's completion), and
+  the 24-byte header of a seventh frame whose data was never written. That
+  cut matches SQLite's frame append failing on the data write as the WAL grew.
+  A process kill would have to land in the same microsecond window to leave it.
+- Commit 38 admitted the fifth turn and recorded the other three turns'
+  failures. Commit 39 changed nothing logically but rewrote 16 pages that
+  admissions touch with unchanged contents, consistent with admission jobs
+  rolling back to their savepoints inside a group that still committed. That
+  is an inference from page contents.
+- Only one measured run's store was affected; 27 of its 32 submissions never
+  committed. The probe saw `runtime exited before expected response`. On that
+  build a completion that failed to commit returned an error through the
+  service loop, and the daemon exited, closing every connection. Stderr went
+  to `/dev/null` and the exit status was not recorded.
+
+Two code paths turn a full disk into that pattern. Both were reproduced on a
+Linux container, on this branch before the changes below (`8724f22`), with an
+`LD_PRELOAD` shim that makes writes fail with `ENOSPC` while a flag file
+exists. One mode refuses only writes that would grow a regular file, like a
+full volume; the other refuses every regular-file write. Each run used 32
+socket clients submitting at once to a gated synthetic provider.
+
+- Group commit runs each job in a savepoint. SQLite keeps the pages a
+  savepoint changes so it can roll back alone, and past 64 KiB it spills them
+  to a temporary file. Every admission that starts a turn crossed that line.
+  Traced opens counted one temporary file per such admission, 8 of 8, and none
+  on the build before group commit, `2d03ac2`. With growth refused, all 32
+  admissions failed with `storage_error: sqlite_primary=13 sqlite_extended=13`
+  (`SQLITE_FULL`), and every refused write was to those temporary files.
+- With every write refused for 0.5 s as the held replies were released, the
+  daemon exited with status 1 and `agent: storage_error: sqlite_primary=13
+  sqlite_extended=13`. All 32 turns were left `running`, and the next start
+  ended them `interrupted` with `process_interrupted`, discarding replies the
+  provider had already sent. The store passed `integrity_check`.
+
+Changes:
+
+- The writer sets `temp_store=MEMORY`. A job's savepoint journal stays in
+  memory and is freed when the job ends, bounded by the pages one job
+  changes. Refused growth now fails admissions only at the COMMIT's WAL
+  append, still as `SQLITE_FULL`. No temporary files were opened.
+- A completion that fails to commit is submitted again, with backoff from
+  10 ms to one second, while its bot stays durably busy. Only shutdown stops
+  the retries; the turn is then left for the next start, and the daemon exits
+  with the error after draining the other completions. An interrupt during
+  the retries ends the turn as interrupted. A queued turn the store cannot
+  start stays ready, and a parked turn it cannot resume stays parked; each
+  is tried again with the same backoff.
+- `stats` counts jobs answered `storage_error` per operation and in total,
+  so a refusal is visible without the daemon's stderr.
+
+On the changed build, the same 0.5 s refusal left the daemon running. All 32
+turns ended `failed` with `storage_error` and `sqlite_primary=13`, delivered
+as terminal events. Each completion was refused six times in that half
+second, counted as 192 `finish` storage errors in `stats`, and committed on
+the first retry after writes were accepted; three runs gave the same counts. Their replies were still lost: the jobs that append a reply are
+not retried, so a turn whose reply cannot be stored fails. Integrity checks
+passed.
+
+Sequential admission cost, 256 bots each receiving one held turn, eight
+alternating runs per build, native container sync:
+
+| Median per admission | `8724f22` | `temp_store=MEMORY` |
+| --- | ---: | ---: |
+| `begin` job execution | 451 µs | 164 µs |
+| Submit round trip | 1.45 ms | 1.26 ms |
+| Daemon CPU | 1.09 ms | 0.98 ms |
+| Daemon RSS after admission | 27.2 MiB | 27.2 MiB |
+
+These come from one Linux container. Creating a temporary file costs more on
+some filesystems, so macOS needs its own measurement. The per-group counter
+change measured flat in a 320,000-job no-op microbenchmark: median
+2.66 versus 2.57 µs per job, with overlapping ranges.
+
+A review asked whether an in-memory journal lets one retention job hold a
+turn's artifacts in memory. It does not hold them: a freed large value's
+overflow pages are not journaled. One completion pruning 16, 64 and 160
+turns of one near-1 MiB artifact each (14, 57 and 142 MiB stored) raised the
+daemon's peak RSS by 3.0–3.3, 3.3–3.7 and 3.3–4.0 MiB, with or without the
+journal in memory (one or two runs each, same container). What the journal holds is every table and
+index page the job rewrites: pruning 5,000 extra 300-byte event rows raised
+the peak by 4.8 MiB in memory against 3.0 MiB spilling to a file, one run
+each. Since
+completion retention used to prune a whole backlog in one job, it now removes
+one piece of at most four turns per completion, like explicit pruning. A
+build that raised SQLite's spill threshold to 1 MiB instead answered that
+5,000-row prune with `SQLITE_FULL` on a disk with 26 GB free, cause not
+found, so it was dropped.
+
+Still unproven: the SQLite codes of the original failure, since that build
+kept none; which operation failed first for the three failed turns; and
+whether the host's disk was at zero at exactly those instants. The
+reproduction injects the error. A run on a nearly full disk image on macOS
+would settle the platform question.
+
+### Admission window
+
+Observed 2026-09-26 on a Linux x86_64 container (4 vCPUs), Rust 1.98.0,
+bundled SQLite. Baseline is `4260673`, this branch before the window (binary
+`a7e5561e…`); the candidate queues up to 32 admissions at once (binary
+`738cba82…`). The window-size builds are the candidate with only the
+constant changed. Slow storage uses the same `fsync` delay shim as
+[group commit](#group-commit).
+
+Before, the service awaited each `create` and `submit` commit before it read
+the next request, so admissions never shared a sync with each other; the
+[concurrent probe](#instrumented-operational-follow-up) saw replies arrive one
+commit apart. `bench.admission_burst` with 32 bots, builds alternating,
+medians of ten measured runs at native sync and eight at 2 ms:
+
+| Per phase | Serial, native | Window, native | Serial, 2 ms | Window, 2 ms |
+| --- | ---: | ---: | ---: | ---: |
+| 32 submissions at once, last reply | 47.1 ms | 5.3 ms | 131.1 ms | 7.9 ms |
+| Median reply | 19.6 ms | 5.0 ms | 57.9 ms | 7.6 ms |
+| Daemon CPU | 36.6 ms | 13.4 ms | 43.6 ms | 13.8 ms |
+| Write groups | 37 | 4 | 35 | 4.5 |
+| 32 creations at once, last reply | 21.2 ms | 4.3 ms | 105.7 ms | 6.6 ms |
+| Daemon CPU | 12.2 ms | 3.5 ms | 20.8 ms | 3.9 ms |
+| One submission alone, median / p99 | 1.67 / 2.97 ms | 1.61 / 3.72 ms | 6.46 / 12.80 ms | 6.52 / 13.04 ms |
+
+The burst rows' ranges do not overlap between builds. A submission that
+arrives alone is not delayed: its median, its daemon CPU, and its p99 (the
+slowest of 32 samples per run) vary within the same range in both builds.
+A phase ends once its turns have reached the model, for CPU and store work
+alike, so both count every submitted turn's start-up wherever it falls:
+groups count 128 write jobs for 32 submissions, each admission and its
+turn's three start-up jobs. The bench leaves out its own closing `stats`
+request, which is a storage job too.
+
+An earlier run ended CPU at the last reply and counted the closing `stats`
+job. The windowed build starts its turns only as it replies, so that
+boundary left out most of their start-up and credited the window with a
+fivefold CPU saving on submissions (27.6 against 5.2 ms). Counted to the
+same end, the saving is about threefold: 2.7 times at native sync and 3.2
+at 2 ms. That run's container was quieter: its burst took 37.3 and 5.2 ms,
+and a lone submission 1.25 ms.
+
+Window sizes, same bench, eight runs at native sync and six at 2 ms:
+
+| Window | Native: last reply / median | Groups | 2 ms: last reply / median | Daemon CPU at 2 ms |
+| --- | ---: | ---: | ---: | ---: |
+| Serial | 45.7 / 16.4 ms | 37 | 126.8 / 57.0 ms | 45.1 ms |
+| 1 | 48.1 / 15.9 ms | 38 | 122.9 / 56.4 ms | 44.1 ms |
+| 4 | 16.0 / 6.5 ms | 12 | 35.1 / 18.0 ms | 22.0 ms |
+| 8 | 9.7 / 4.7 ms | 7 | 18.8 / 9.2 ms | 17.6 ms |
+| 16 | 6.7 / 3.7 ms | 5.5 | 12.2 / 5.7 ms | 14.7 ms |
+| 32 | 5.4 / 4.8 ms | 4 | 7.1 / 6.6 ms | 16.3 ms |
+
+A window of 16 answers half the burst after the first commit, so its median
+reply is the lowest; 32 answers the whole burst soonest, and its lead grows
+as syncs slow down. From 8 up, daemon CPU ranges overlap at both sync
+speeds; what remains is mostly the turns' own start-up. 32 also equals the
+storage worker's group limit and queue, so one full window fills one group.
+The default is 32.
+
+Sustained load, the group-commit screen above (64 bots resubmitting as each
+turn finishes, 200 ms model replies, 10 s measured), alternating pairs:
+
+| Injected sync | Serial turns/s | Window turns/s | Serial p50 / p95 ms | Window p50 / p95 ms | Jobs per commit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none | 305.6, 306.9 | 304.5, 306.0 | 208 / 219, 208 / 214 | 210 / 219, 209 / 216 | 2.8 → 3.9 |
+| 2 ms | 182.1, 185.1 | 266.0, 266.4 | 352 / 390, 342 / 386 | 237 / 267, 237 / 268 | 5.4 → 8.0 |
+| 10 ms | 56.9, 55.7 | 132.9, 129.7 | 1,113 / 1,252, 1,126 / 1,401 | 465 / 665, 493 / 674 | 5.2 → 12.4 |
+
+The serial baseline here runs 56 turns/s at 10 ms, not group commit's 37,
+because completions have since moved to the turn tasks. With no injected
+delay both stay at the model's ceiling of 320.
+
+Memory: idle RSS was 17.8 MiB for both, and after 32 one-at-a-time
+submissions 19.2 and 19.3 MiB with overlapping ranges. After the burst
+phases RSS was 20.5 MiB serial and 20.8 MiB windowed, ranges not
+overlapping. Up to 32 admissions and their replies now live at once; what
+holds the extra 0.3 MiB was not isolated.
+
+A creation's reply repeats its instructions and compaction instructions,
+64 KiB each at most. In a unit test without the check below, 32 such
+replies sent back to back overflowed a session's 2 MiB output queue
+(`output_lagged`), which closes a socket session after its bots were
+created. An admission now waits when its session's queue could not take
+its reply, and its event once for each way the session follows the bot,
+with those already promised to that session. With both texts at 64 KiB, 13
+share a window on a session that follows none of the bots, 11 on one that
+follows them one way, and 9 on one that follows them both by name and
+through `*`. On the burst above, where replies are small, the check changed
+nothing measurable: five runs each, last reply 5.11 ms before and 5.14 ms
+after for submissions, 4.41 and 4.29 ms for creations.
+
+Ordering tests cover a shared commit answered in request order, a retry and
+busy work queued behind the admission they depend on, the active limit with
+a promised slot that goes unused, a lost group commit that starts nothing
+and frees its slots, an interrupt behind the admission it names, large
+creations that must fit their session's output queue, and four clients
+sending the same submission at once. Shutdown with queued
+admissions is covered by reading the code, not by a test. All of this is one
+Linux container with an injected sync delay; macOS, where a flush costs
+about 5.4 ms, is not measured. The burst uses one connection; many clients
+arrive interleaved, which the Python test exercises but no timing does.

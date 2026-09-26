@@ -269,6 +269,8 @@ enum Round {
     Parked,
     /// Parked on a closed pool until the given time.
     Paced(u64),
+    /// The store refused to resume it (a full disk, say): still parked.
+    Unresumed,
 }
 
 pub enum Exit {
@@ -276,11 +278,14 @@ pub enum Exit {
     Parked,
     /// Parked on a rate-limited pool; the service resumes it at this time.
     Paced(u64),
+    /// Still parked because the store refused its resume; the service
+    /// wakes it again after a backoff.
+    Unresumed,
 }
 
 /// Completion as one storage job: the terminal event, the outcome its
-/// waiters get, and retention, in that order. The worker publishes all of
-/// it after the job commits.
+/// waiters get, and retention, all or nothing, so a failed completion can
+/// be submitted again. The worker publishes all of it after the job commits.
 pub struct Finished;
 
 impl Finished {
@@ -291,17 +296,20 @@ impl Finished {
         error: Option<&Error>,
         keep: Option<usize>,
     ) -> Result<()> {
-        db.finish(turn, error)?;
-        let outcome = db
-            .turn_outcome(bot, turn)?
-            .ok_or_else(|| Error::new("stale_turn"))?;
+        let outcome = db.atomic(|db| {
+            db.finish(turn, error)?;
+            let outcome = db
+                .turn_outcome(bot, turn)?
+                .ok_or_else(|| Error::new("stale_turn"))?;
+            // A later steer may already be terminal, placing this completion
+            // outside retention: the outcome is captured above, and the
+            // turn's own records are kept so its terminal event is published.
+            if let Some(keep) = keep {
+                db.prune_except(bot, keep, Some(turn))?;
+            }
+            Ok(outcome)
+        })?;
         db.announce(bot, turn, outcome);
-        // A later steer may already be terminal, placing this completion
-        // outside retention: the outcome is captured above, and the turn's
-        // own records are kept so its terminal event is published.
-        if let Some(keep) = keep {
-            db.prune_except(bot, keep, Some(turn))?;
-        }
         Ok(())
     }
 }
@@ -381,6 +389,7 @@ impl Turn {
         let error = match result {
             Ok(Round::Parked) => return Exit::Parked,
             Ok(Round::Paced(resume_at_ms)) => return Exit::Paced(resume_at_ms),
+            Ok(Round::Unresumed) => return Exit::Unresumed,
             Ok(Round::Finished) => None,
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
@@ -875,6 +884,9 @@ impl Turn {
                 match self.store.op("resume", move |db| db.resume(turn)).await {
                     Ok(resumed) => resumed,
                     Err(error) if error.code == "turn_not_waiting" => return Ok(Round::Parked),
+                    // Nothing committed, so the park stands and its wake-up
+                    // is tried again rather than ending the turn.
+                    Err(error) if error.code == "storage_error" => return Ok(Round::Unresumed),
                     Err(error) => return Err(error),
                 };
             if steers {

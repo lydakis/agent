@@ -526,3 +526,47 @@ class WaitTests(ModelFixture):
                 page = recovered.request('artifact', bot='Bob', turn=fresh, call_id='bg-1',
                                          stream='stdout', offset=69996, limit=4)['result']
                 self.assertEqual((page['text'], page['total_bytes'], page['done']), ('0000', 70000, True))
+
+    def test_a_fatal_storage_failure_still_answers_admissions_queued_before_it(self):
+        database = self.path / 'state.sqlite'
+        client = self.client('echo,shell,wait')
+        for bot in ('Bob', 'Carol'):
+            client.request('create', bot=bot, workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg',
+                                 prompt="bg:while [ ! -f release ]; do sleep .01; done; printf done > marker")['result']['turn']
+        self.assertEqual(client.finished(started)['data']['status'], 'completed')
+        with sqlite3.connect(database) as db:
+            db.execute("CREATE TRIGGER reject_completion BEFORE UPDATE OF result ON processes BEGIN "
+                       "SELECT RAISE(ABORT, 'synthetic write failure'); END")
+        # Hold the write lock: the failing result queues first and a full
+        # window of admissions behind it. A group holds 32 jobs, so the last
+        # admission commits after the failure is already known.
+        lock = sqlite3.connect(database, isolation_level=None)
+        lock.execute('BEGIN IMMEDIATE')
+        try:
+            (self.path / 'release').touch()
+            deadline = time.monotonic() + 5
+            while not (self.path / 'marker').exists():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.01)
+            time.sleep(.2)
+            lines = [{'id': f'create-{n}', 'op': 'create', 'bot': f'New{n}', 'workspace': str(self.path),
+                      'model': client.model, 'instructions': client.instructions, 'tools': client.tools}
+                     for n in range(31)]
+            lines.append({'id': 'submit', 'op': 'submit', 'bot': 'Carol', 'request_id': 'late', 'prompt': 'hi'})
+            client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
+            client.process.stdin.flush()
+            time.sleep(.2)
+        finally:
+            lock.execute('ROLLBACK')
+            lock.close()
+        self.assertEqual(client.process.wait(timeout=10), 1)
+        for line in lines:
+            reply = client.receive(lambda m, id=line['id']: m.get('id') == id)
+            self.assertIn('result', reply)
+        # The submission's turn started, and shutdown ended it like any
+        # running turn instead of leaving it for the next start to find.
+        with sqlite3.connect(database) as db:
+            status = db.execute("SELECT status FROM turns WHERE request_id='late'").fetchone()[0]
+            self.assertEqual(status, 'interrupted')
+            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE name LIKE 'New%'").fetchone()[0], 31)
