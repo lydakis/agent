@@ -1786,12 +1786,14 @@ impl Turn {
         // Announced by this round's own commit, so any verdict comes later
         // and wakes this wait: check after waiting, not before. The gates'
         // expiry counts from that commit, however long the calls before
-        // this one ran; the check judges the stored time.
+        // this one ran; the check judges the stored time. A later call's
+        // gate lapsing first ends the turn, so it wakes this wait too.
         let mut first = announced.map(|(notify, at)| {
+            let round = std::iter::once(call).chain(calls.as_slice());
             let expire_ms = record
                 .gates
                 .iter()
-                .filter(|gate| gate.tools.contains(&call.name))
+                .filter(|gate| round.clone().any(|c| gate.tools.contains(&c.name)))
                 .filter_map(|gate| gate.expire_ms)
                 .min();
             (notify, expire_ms.map(|ms| at + Duration::from_millis(ms)))
@@ -1814,6 +1816,12 @@ impl Turn {
                         Gated::Started => return Ok(Approval::Run),
                         Gated::Denied => return Ok(Approval::Denied),
                         Gated::Expired => return fail("approval_expired"),
+                        Gated::Lapsed => {
+                            return Err(Error::with(
+                                "approval_expired",
+                                "a later call's gate lapsed first",
+                            ));
+                        }
                         Gated::Pending { notify, expires_ms } => (
                             notify,
                             expires_ms.map(|at| {

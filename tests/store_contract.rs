@@ -4,7 +4,7 @@ use agent_runtime::{
     provider::{ToolCall, Usage},
     store::{
         Answered, Binding, Bot, CompactionPlan, Database, Decision, Delivery, Fork, Gate, Gated,
-        Planning, TurnOptions,
+        Planning, TurnOptions, Wake,
     },
     tools::Outcome,
 };
@@ -768,6 +768,93 @@ fn an_expiry_that_came_first_beats_a_later_denial() {
     assert!(matches!(
         db.approval_start(turn, &call, u64::MAX).unwrap(),
         Gated::Expired
+    ));
+}
+
+#[test]
+fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "write".to_owned()];
+    let gate = |tag: &str, tool: &str, expire_ms| Gate {
+        tag: tag.into(),
+        tools: vec![tool.into()],
+        expire_ms,
+    };
+    let (slow, quick) = (
+        gate("slow", "shell", None),
+        gate("quick", "write", Some(50)),
+    );
+    let create = |db: &mut Database, name, gate, creator: Option<&Bot>| {
+        let binding = Binding {
+            tools: &tools,
+            gate: Some(gate),
+            created_by: creator.map(|c| c.name.as_str()),
+            created_by_id: creator.map(|c| c.id),
+            ..binding()
+        };
+        db.create(name, Some("/synthetic"), binding).unwrap().0
+    };
+    let ann = create(&mut db, "Ann", &slow, None);
+    create(&mut db, "Bob", &quick, Some(&ann));
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // The first call waits on a gate with no expiry; the second one's lapses.
+    let (first, s1) = shell_call("fc_1", "s1", "true");
+    let arguments = json!({"path":"note.txt","content":"x"}).to_string();
+    let second = json!({"type":"function_call","id":"fc_2","call_id":"w1",
+        "name":"write","arguments":arguments});
+    let w1 = ToolCall {
+        name: "write".into(),
+        call_id: "w1".into(),
+        arguments,
+    };
+    let round = [s1.clone(), w1];
+    db.append(
+        turn,
+        vec![first, serde_json::to_vec(&second).unwrap().into()],
+        &round,
+        None,
+    )
+    .unwrap();
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let Gated::Pending {
+        expires_ms: Some(lapse),
+        ..
+    } = db.approval_start(turn, &s1, now_ms()).unwrap()
+    else {
+        panic!("the first call waits until the second call's gate lapses")
+    };
+    // Parked on the first call, the turn wakes when the second one lapses.
+    assert_eq!(
+        db.suspend_approval(turn, &round, now_ms(), None).unwrap(),
+        Some(Some(lapse))
+    );
+    assert!(matches!(
+        db.wake("Bob", turn, true).unwrap(),
+        Wake::Later(Some(at)) if at == lapse
+    ));
+    while now_ms() < lapse {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(matches!(db.wake("Bob", turn, true).unwrap(), Wake::Resume));
+    db.resume(turn).unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &s1, now_ms()).unwrap(),
+        Gated::Lapsed
     ));
 }
 

@@ -260,6 +260,29 @@ class ApprovalTests(ModelFixture):
         self.assertEqual([(a['tag'], a['by'], a['allow']) for a in completed['approvals']],
                          [('manual', None, False)])
 
+    def test_a_later_calls_lapse_ends_a_turn_waiting_on_an_earlier_verdict(self):
+        for hold in ('2000', '50'):
+            with self.subTest(hold=hold):
+                self.setUp()
+                # The shell gate never lapses; the echo gate after it does.
+                client = self.gated(extra=('--approval-hold-ms', hold))
+                client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['echo'],
+                               approver='second', approve_expire_ms=300)
+                turn = client.request('submit', bot='Carol', request_id='t',
+                                      prompt='shellecho:touch first|hi')['result']['turn']
+                announced = time.monotonic()
+                finished = client.finished(turn)
+                self.assertEqual((finished['data']['status'], finished['data']['error']),
+                                 ('interrupted', 'approval_expired'))
+                self.assertLess(finished['_received_at'] - announced, 1.5)
+                # Neither call ran, and the one waiting was not denied.
+                for call_id in ('shell-1', 'echo-1'):
+                    self.assertTrue(self.tool_output(client, call_id, bot='Carol')[0]['cancelled'])
+                self.assertFalse((self.path / 'first').exists())
+                self.assertEqual(len(self.events(client, turn, 'turn_waiting', bot='Carol')),
+                                 1 if hold == '50' else 0)
+                client.close()
+
     def test_a_gate_lapses_on_time_while_its_turn_waits_on_a_handle(self):
         client = self.gated(approve_expire_ms=300)
         client.request('create', bot='Alice', workspace=str(self.path))

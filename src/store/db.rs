@@ -368,8 +368,13 @@ pub enum Gated {
     /// A gate's expiry passed without a verdict. The call is denied and the
     /// turn must end.
     Expired,
+    /// A later call of the round lapsed while this one waited: it would be
+    /// denied when reached, so the turn ends now, with this call and the
+    /// rest recorded as not run.
+    Lapsed,
     /// Still waiting. `notify` fires when an answer is acknowledged;
-    /// `expires_ms` is when the earliest gate lapses.
+    /// `expires_ms` is when the earliest gate of the round's undecided
+    /// calls lapses.
     Pending {
         notify: Arc<Notify>,
         expires_ms: Option<u64>,
@@ -3071,9 +3076,15 @@ impl Database {
             tx.commit()?;
             Gated::Expired
         } else {
+            // This call's own gates are still open, so a lapse already due
+            // is a later call's.
+            let lapse = self.next_lapse(turn)?;
+            if lapse.is_some_and(|at| now_ms >= at) {
+                return Ok(Gated::Lapsed);
+            }
             return Ok(Gated::Pending {
                 notify: self.live.entry(turn).or_default().notify.clone(),
-                expires_ms: request.expires_ms(),
+                expires_ms: lapse,
             });
         };
         if let Some(live) = self.live_changed(turn) {
@@ -3100,8 +3111,12 @@ impl Database {
         let request = self
             .request(turn, &call.call_id)?
             .ok_or(Error::new("invalid_tool_state"))?;
-        let deadline_ms = request.expires_ms();
-        if request.decided() || deadline_ms.is_some_and(|at| now_ms >= at) {
+        if request.decided() {
+            return Ok(None);
+        }
+        // Woken at the round's first lapse, this call's or a later one's.
+        let deadline_ms = self.next_lapse(turn)?;
+        if deadline_ms.is_some_and(|at| now_ms >= at) {
             return Ok(None);
         }
         let waiting = Waiting {
@@ -3591,16 +3606,17 @@ impl Database {
         let now = epoch_ms().max(0) as u64;
         Ok(match parked {
             None => Wake::Stale,
+            // Parked on a verdict: an answer that decided the call, or the
+            // round's first lapse, resumes it.
             Some((Some(true), _)) => {
                 let Some(waiting) = self.waiting(turn)? else {
                     return Ok(Wake::Resume);
                 };
                 match self.request(turn, &waiting.call_id)? {
-                    Some(request)
-                        if !request.decided() && request.expires_ms().is_none_or(|at| now < at) =>
-                    {
-                        Wake::Later(request.expires_ms())
-                    }
+                    Some(request) if !request.decided() => match self.next_lapse(turn)? {
+                        Some(at) if now >= at => Wake::Resume,
+                        later => Wake::Later(later),
+                    },
                     _ => Wake::Resume,
                 }
             }

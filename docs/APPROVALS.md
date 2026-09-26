@@ -1036,8 +1036,9 @@ Where it differs from the design above:
   came before the deciding deny.
 - A round's announcement is split into several `approval_requested`
   events when its calls take more than 256 KiB, so every event pages.
-- A turn parked on a `wait` ahead of a gated call wakes and ends when that
-  call lapses, rather than when the wait returns.
+- A turn parked on a `wait` or on a verdict ahead of another gated call
+  wakes and ends when that call lapses, rather than when the wait returns
+  or the verdict comes.
 
 Not built yet: the automatic approver (rules and Jev), with
 `serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`

@@ -1654,8 +1654,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `interrupted` with `approval_expired`. When a call has several gates, a
   deny decides it only if it came before an open gate lapsed, and an allow
   on one moves the turn's wake-up to the next gate's lapse. A turn parked
-  on a `wait` ahead of a gated call is woken when that call lapses, and
-  the lapse ends it; the wait returns what it has.
+  on a `wait` or on a verdict ahead of another gated call is woken when
+  that call lapses, and the lapse ends it: the wait returns what it has,
+  and a call still waiting ends with the rest of the round, as not run.
 - **Rounds.** A verdict is for the round as planned. When a call fails (an
   error result, a denial, or a command that did not succeed, as the tool
   reports it rather than as its output reads), every gated
