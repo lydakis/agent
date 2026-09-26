@@ -5631,9 +5631,12 @@ fn compaction_counts_and_summarizes_stubs_under_the_elision_floor() {
         items: 256,
     };
     assert!(raw > limit.bytes as i64 && unsummarized < limit.bytes as i64);
-    let summarized = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+    // Keeping the whole current turn cuts at its prompt.
+    let (_, current, _) = db.turn_usage("Bob", turn).unwrap();
+    let summarized = compaction_plan(&db, "Bob", current as i64, 64 << 10, 256)
         .unwrap()
         .unwrap();
+    assert_eq!(summarized.pinned, None);
     assert!(!summarized.catch_up);
     assert_eq!(summarized.covered, (1, 1));
     assert_eq!(summarized.elided, window.elided);
@@ -5660,4 +5663,196 @@ fn compaction_counts_and_summarizes_stubs_under_the_elision_floor() {
     assert_eq!(window.unsummarized.bytes as i64, window.item_bytes);
     let (_, bytes, _) = db.turn_usage("Bob", turn).unwrap();
     assert_eq!(bytes as i64, window.item_bytes);
+}
+
+/// The request prefix a window's view renders, as JSON items.
+fn prefix_items(window: &agent_runtime::store::Window) -> Vec<Value> {
+    let prefix = window.prefix(&[], usize::MAX).unwrap().bytes;
+    let prefix = &prefix[..prefix.len().saturating_sub(1)];
+    serde_json::from_slice(&[b"[", prefix, b"]"].concat()).unwrap()
+}
+
+#[test]
+fn a_cut_inside_the_running_turn_keeps_its_prompt_ahead_of_the_tail() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls = Vec::new();
+    for n in 0..6 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    // Keeping one byte cuts at the newest round that follows a result.
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.cut, plan.pinned), (calls[5].0, Some(prompt)));
+    assert_eq!(plan.covered, (1, 2));
+    assert_eq!(
+        plan.prompts
+            .iter()
+            .map(|(o, p)| (*o, p.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "p1"), (2, "long task")]
+    );
+    // The span ends with a completed exchange: every call has its result.
+    assert_eq!(*plan.ids.last().unwrap(), calls[4].1);
+    let span: Vec<Value> = {
+        let items = db.items_by_ids(&plan.ids, i64::MAX, 0).unwrap();
+        serde_json::from_slice(&[b"[", &items[..], b"]"].concat()).unwrap()
+    };
+    let ids = |kind: &str| -> Vec<String> {
+        span.iter()
+            .filter(|i| i["type"] == kind)
+            .map(|i| i["call_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("function_call"), ids("function_call_output"));
+    let event = db
+        .compact("Bob", &plan, "summary one", None, 0, limit)
+        .unwrap();
+    assert_eq!(event["data"]["pinned"], json!(prompt));
+    let first = db.inspect("Bob").unwrap().compaction.unwrap();
+    // The turn's prompt goes whole, ahead of the tail from the cut.
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, calls[5].0]);
+    assert_eq!(window.omitted_turns, 1);
+    // Turn one's two messages, and all of turn two's before the cut but
+    // its prompt.
+    assert_eq!(window.omitted_items, 2);
+    assert_eq!(window.omitted_in_turn as usize, plan.ids.len() - 3);
+    let items = sent(&db, &window);
+    assert_eq!(items[0]["content"][0]["text"], "long task");
+    assert_eq!(window.unsummarized.bytes as i64, window.item_bytes);
+    let (_, bytes, count) = db.turn_usage("Bob", turn).unwrap();
+    assert_eq!((bytes as i64, count), (window.item_bytes, window.ids.len()));
+    // The summary says it covers the start of this turn, and lists only
+    // the earlier turns' prompts.
+    let view = prefix_items(&window)[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(view.starts_with(&format!(
+        "[compaction summary, version {first}, covering turns 1 to 1 and the start of turn 2]"
+    )));
+    assert!(view.contains("\n1: p1") && !view.contains("long task"));
+    assert_eq!(
+        prefix_items(&window)[1]["content"][0]["text"],
+        "[context note] 1 earlier turn(s) with 2 messages, and 10 earlier messages of turn 2, are not shown."
+    );
+
+    // A second cut in the same turn summarizes from the first, keeping
+    // the same prompt in view.
+    for n in 6..9 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)));
+    }
+    let second = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((second.cut, second.pinned), (calls[8].0, Some(prompt)));
+    assert_eq!(second.covered, (2, 2));
+    assert_eq!(second.ids.first(), Some(&calls[5].0));
+    assert_eq!(second.previous_summary.as_deref(), Some("summary one"));
+    db.compact("Bob", &second, "summary two", None, 0, limit)
+        .unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+
+    // The next turn's window still starts at the cut with its prompt, and
+    // a cut at that turn's own prompt covers the earlier one whole.
+    converse(&mut db, "Bob", 3);
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, calls[8].0]);
+    let third = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.pinned, None);
+    assert_eq!(third.covered, (2, 2));
+    db.compact("Bob", &third, "summary three", None, 0, limit)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.omitted_turns, 2);
+    let view = prefix_items(&window)[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(view.contains("covering turns 1 to 2]"));
+    assert!(view.contains("\n1: p1\n2: long task"));
+
+    // A fork from between the two cuts in turn two binds the first, and
+    // sees the prompt ahead of its cut as the source did.
+    db.fork(
+        "Bob",
+        "Branch",
+        Fork {
+            checkpoint: Some(calls[7].1),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Branch").unwrap().compaction, Some(first));
+    let window = db.window("Branch", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, calls[5].0]);
+    assert_eq!(*window.ids.last().unwrap(), calls[7].1);
+}
+
+#[test]
+fn schema_30_adds_the_prompt_a_cut_inside_a_turn_keeps() {
+    let path = std::env::temp_dir().join(format!("agent-pinned-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=6 {
+            converse(&mut db, "Bob", n);
+        }
+        let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let limit = agent_runtime::store::ContextUsage {
+            bytes: 4096,
+            items: 256,
+        };
+        db.compact("Bob", &plan, "summary", None, 0, limit).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX compactions_pinned; ALTER TABLE compactions DROP COLUMN pinned;
+             PRAGMA user_version=29;",
+        )
+        .unwrap();
+    // Every earlier cut is a turn's prompt: none keeps one.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let pinned: Vec<Option<i64>> = Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT pinned FROM compactions")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(pinned, vec![None]);
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!((window.omitted_turns, window.omitted_in_turn), (5, 0));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

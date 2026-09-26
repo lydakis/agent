@@ -4739,3 +4739,34 @@ without `read` never elides; on the Anthropic family, thinking stays bound
 under prefix enforcement across floor moves. A store test pages a result
 of one 80 KB line back whole in pieces. No live provider run was made for
 this change.
+
+### Cuts inside a turn
+
+Store costs of [cuts inside a turn](RUST_PROTOTYPE.md#cuts-inside-a-turn),
+measured 2026-09-26 in the same container with release builds of the branch
+and its base `e1068c1`, run alternately, two runs each. The fixture is the
+600-round store above, elided with a 1 MiB tail, planned with a 512 KiB keep
+target in a 4 MiB envelope, both as one turn and as 600 turns of one round.
+
+| Operation | Base | Branch |
+| --- | ---: | ---: |
+| Plan, one turn (1,201 rows) | 3.2 to 3.6 ms, no cut found | 3.2 to 3.5 ms, cut inside the turn (1,117 rows summarized) |
+| Plan, 600 turns (2,400 rows) | 4.6 to 4.8 ms | 4.6 to 4.9 ms |
+| Record the compaction (writer, with commit) | 1.5 to 1.6 ms | 1.2 to 2.5 ms, one turn; 1.2 to 1.6 ms, 600 turns |
+| Window after the compaction | 147 to 168 µs, 600 turns | 86 to 90 µs, one turn; 135 to 174 µs, 600 turns |
+
+Planning walks the same rows either way; telling a round start from other
+items reads only the items at the candidate boundary, so the one-turn plan
+costs what the base spent finding no cut. The walk's cost is the item
+overflow pages noted above.
+
+Behavior is covered by `tests/test_turn_compaction.py`: one turn of 40
+rounds of about 11 KiB in a 24 KiB budget compacts at least three times
+inside the turn, runs each tool call once, keeps its prompt as the pinned
+item of every compaction, pairs every call with its result in every
+request, and finishes; on the Anthropic family with prefix-bound thinking
+enforced, a 30-round turn crosses at least two cuts with no binding error.
+Store contract tests cover the cut, the pinned prompt, the context note and
+summary header, a second cut in the same turn, a later cut that covers the
+turn whole, a historical fork from inside the split turn, and the schema 30
+migration. No live provider run was made for this change.

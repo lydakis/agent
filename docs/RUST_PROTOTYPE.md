@@ -1085,7 +1085,9 @@ Schema 29 adds [tool-result elision](#tool-result-elision) without reading
 stored items: results recorded before it have no stub and are always sent
 whole. A backfilled saving would change the cumulative savings of every
 later node on its lineage, rewriting most of the store at open. Every bot
-starts with no elision floor.
+starts with no elision floor. Schema 30 adds the prompt a [cut inside a
+turn](#cuts-inside-a-turn) keeps; earlier cuts are all at a turn's prompt,
+so none needs one.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1333,7 +1335,7 @@ the `context_window` capability. Version 20 repairs previously blocked
 `uncertain` bots once, appending missing tool results without rewriting original
 history. If operational tool records were pruned, repair reconstructs unanswered
 calls from the interrupted turn's durable transcript. Stores are schema version
-29; supported migrations run at open. Store initialization and migration run in one
+30; supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -1577,9 +1579,11 @@ its raw results.
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
 model call, when the effective view since the last summary reaches
-`--compact-at` percent of either envelope, the daemon summarizes everything older than the newest whole turns
-that hold `--compact-keep` percent verbatim, limited by the room left after
-pinned context. The item dimension can choose the cut even when small messages
+`--compact-at` percent of either envelope, the daemon summarizes everything
+older than the newest boundary whose tail holds `--compact-keep` percent
+verbatim, limited by the room left after pinned context. A boundary is a
+turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), the first
+output of a model round that follows a tool result. The item dimension can choose the cut even when small messages
 have barely consumed the byte budget. The summary is one model call
 under the bot's compaction instructions, with tool calls disabled, to the bot's own
 model or the `compaction_model` the client named at creation (same family;
@@ -1738,6 +1742,40 @@ stored history is unbounded with a per-request context window, and versioned
 summaries compact that window as described above.
 
 CLI syntax, option scope, output, and exit conventions: [CLI.md](CLI.md).
+
+### Cuts inside a turn
+
+One long task can outgrow the budget inside a single submitted turn, even
+with its results [elided](#tool-result-elision): its own calls, messages,
+and stubs keep growing. So the newest turn offers more boundaries than its
+prompt: every model round after a completed tool exchange. The newest
+boundary whose tail reaches the keep target wins, whether a prompt or a
+round, so compaction leaves about `--compact-keep` percent verbatim however
+the view is split into turns; a turn smaller than that is never cut. The
+summarizer reads the span up to the cut, which ends with a whole exchange:
+every call in it has its result, and the tail begins with the model's
+next output, so no call is separated from its result on either side.
+
+The turn's prompt stays in view whole. The compaction records it as the
+version's `pinned` node, and while the window starts at that cut, the
+request carries the prompt as its first item after the pinned context,
+then the items from the cut. The summary header says `covering turns A to
+B and the start of turn C`, or `covering the start of turn C`, and its
+list of verbatim user messages leaves out turn C's prompt, which follows
+in full; the list keeps it for when a later compaction covers the whole
+turn. The context note counts the messages it leaves out of turn C
+separately from earlier turns. A second cut in the same turn summarizes
+from the first, merging the previous summary, and keeps the same prompt.
+Once the turn has ended, a later cut at a turn's prompt covers it whole.
+The turn keeps running for its clients throughout: events, steers,
+approvals, and its checkpoint are unchanged; only what the next request
+carries differs. Admission for steers, notes, and `history` results counts
+the turn from its prompt and cut, as the window does. A historical fork
+binds the version at or before its checkpoint and restores its cut, so a
+fork from inside a split turn sees that prompt and the tail from the cut.
+Steers absorbed before the cut are summarized with the rounds around them,
+as a covered turn's steers are. Schema 30 adds the `pinned` column; every
+earlier cut is a turn's prompt, so none has one.
 
 ### Compaction and prompt-cache reuse
 

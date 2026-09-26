@@ -122,8 +122,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # One long task: a shell call a round, each result about
                 # 11 KiB, then a read of the first elided result, then done.
                 # `long:COUNTxLINES,...` sets each round's lines instead.
+                # Progress is the newest call since the prompt: a cut inside
+                # the turn summarizes older rounds but keeps the prompt.
                 start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user')
                 calls = [i for i in request['input'][start:] if i.get('type') == 'function_call']
+                done = max((int(c['call_id'][5:]) + 1 for c in calls if c['call_id'][5:].isdigit()), default=0)
                 stubs = [i for i in request['input'] if i.get('type') == 'function_call_output'
                          and i['output'].startswith('[tool result elided')]
                 spec = user[5:]
@@ -131,16 +134,16 @@ class Model(http.server.BaseHTTPRequestHandler):
                          [int(lines) for part in spec.split(',')
                           for count, lines in [part.split('x')] for _ in range(int(count))])
                 text = ''
-                if len(calls) < len(sizes):
-                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{len(calls)}',
-                               'arguments': json.dumps({'command': f"seq -f 'round {len(calls)} line %g' 1 {sizes[len(calls)]}",
+                if done < len(sizes):
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{done}',
+                               'arguments': json.dumps({'command': f"seq -f 'round {done} line %g' 1 {sizes[done]}",
                                                         'timeout_ms': 5000})}]
                 elif stubs and not any(c['name'] == 'read' for c in calls):
                     reference = re.search(r'artifact "(result/[0-9]+)"', stubs[0]['output']).group(1)
                     output = [{'type': 'function_call', 'name': 'read', 'call_id': 'long-read',
                                'arguments': json.dumps({'artifact': reference})}]
                 else:
-                    text = f'done after {len(calls)} calls'
+                    text = f'done after {done} rounds'
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
@@ -401,17 +404,19 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
             prompt = next((b['text'] for m in request['messages'] if m['role'] == 'user'
                            for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
-            if prompt:
+            if prompt and not summary:
                 # The Messages form of the long task: shell rounds, then done.
                 start = max(n for n, m in enumerate(request['messages'])
                             if any(b['type'] == 'text' and b['text'] == prompt for b in m['content']))
-                calls = sum(b['type'] == 'tool_use' for m in request['messages'][start:] for b in m['content'])
+                calls = max((int(b['id'][11:]) + 1 for m in request['messages'][start:]
+                             for b in m['content'] if b['type'] == 'tool_use'
+                             and b['id'].startswith('toolu_long_')), default=0)
                 if calls < int(prompt[5:]):
                     blocks.append({'type': 'tool_use', 'id': f'toolu_long_{calls}', 'name': 'shell',
                                    'input': {'command': f"seq -f 'round {calls} line %g' 1 600"}})
                     stop = 'tool_use'
                 else:
-                    blocks.append({'type': 'text', 'text': f'done after {calls} calls'})
+                    blocks.append({'type': 'text', 'text': f'done after {calls} rounds'})
                     stop = 'end_turn'
             elif last['content'][0]['type'] == 'tool_result':
                 blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})

@@ -106,6 +106,10 @@ task-quality evaluation decide how far down the list to go.
    decisions, open items, facts with their turn numbers) preserves more than
    prose and lets the model fetch a source turn by ordinal. Concurrent forks
    share completed summaries rather than each paying for the same prefix.
+   Since 2026-09-26 a summary can also [cut inside the running
+   turn](RUST_PROTOTYPE.md#cuts-inside-a-turn), at a round after a
+   completed tool exchange, keeping that turn's prompt whole ahead of the
+   tail, so one long task can compact several times before it ends.
 
 Prior art to read before building, with what to take from each: Prime
 Agent's compaction (summary plus retained originals, rebuilding context from

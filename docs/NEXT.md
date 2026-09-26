@@ -542,24 +542,29 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     unsummarized-span query is gone from the turn loop. Performance evidence is
     recorded in [the matched screen](DAEMON_MEASUREMENTS.md#effective-context-budgeting).
     Within-turn reclamation remains item 34.
-34. Compaction inside a running turn. Cuts land only at submitted-turn
-    starts and the window must hold the whole current turn, so one long
+34. Compaction inside a running turn. Cuts landed only at submitted-turn
+    starts and the window had to hold the whole current turn, so one long
     autonomous task with many tool rounds in a single turn reached
-    `context_limit`. First slice done: [deterministic tool-result
-    elision](RUST_PROTOTYPE.md#tool-result-elision) (schema 29). Answered
+    `context_limit`. Two slices done. [Deterministic tool-result
+    elision](RUST_PROTOTYPE.md#tool-result-elision) (schema 29): answered
     results below a versioned floor go as stubs with their size, excerpts,
     and a `result/NODE` read reference; the store keeps every result whole,
     no call is split from its result, and forks bind the floor at their
     checkpoint. It runs before compaction at the same thresholds, and when
-    the current turn alone overflows. Store costs are in [the
-    measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). Next, a cut
-    at any completed tool exchange within the turn, the turn's prompt kept
-    verbatim, the turn still running for everyone outside, for turns whose
-    own words and small results outgrow the window. Also open: every window
-    walk traverses the item overflow pages because the metadata columns sit
-    after `item`; a covering index cut a probe of the walk from 4.0 to
-    1.45 ms, to be measured in the daemon before adopting. (From Astra
-    Pro's compaction review.)
+    the current turn alone overflows. Then [cuts inside a
+    turn](RUST_PROTOTYPE.md#cuts-inside-a-turn) (schema 30): the summary
+    cut may land at any model round after a completed tool exchange in the
+    newest turn, with that turn's prompt kept whole ahead of the tail and
+    the turn still running for its clients. Store costs of both are in
+    [the measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). Still
+    open: when one turn overflows even after a forced elision, the round
+    fails with `context_limit` rather than forcing a summary; steers
+    absorbed before an in-turn cut are summarized, not kept verbatim like
+    the prompt; and every window and planning walk traverses the item
+    overflow pages because the metadata columns sit after `item`, where a
+    covering index cut a probe of the walk from 4.0 to 1.45 ms, to be
+    measured in the daemon before adopting. The evaluation of both slices
+    on one task is item 36. (From Astra Pro's compaction review.)
 35. Thinking-prefix compatibility. Anthropic binds preserved thinking to
     the request prefix on newer accounts; a compaction rewrites that prefix
     and the summarizer replays native items under other instructions. Read
