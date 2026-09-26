@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{ContextPrefix, ContextUsage, Store, Window},
+    store::{Bot, ContextPrefix, ContextUsage, Gated, Store, Waiting, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -24,13 +24,15 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    ops::ControlFlow,
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
+    time::Duration,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub const MAX_ROUNDS: usize = 200;
 /// The error a cancelled turn ends with, sent on its cancel channel: a
@@ -160,8 +162,11 @@ pub struct Turn {
     /// Compaction threshold and verbatim tail, as percentages of the budget.
     pub compact_at: usize,
     pub compact_keep: usize,
-    /// Continue a parked turn: record its wait results, then keep going.
-    pub resume: bool,
+    /// The park this task continues, already claimed by the service: record
+    /// its wait results, then keep going.
+    pub resumed: Option<Waiting>,
+    /// How long a gated call waits live for its verdict before the turn parks.
+    pub approval_hold: Duration,
     /// A steer for this bot may be queued. Set by the service, cleared by
     /// the boundary before it reads, so unrelated bots never pay for one
     /// bot's pending steer.
@@ -269,18 +274,37 @@ enum Round {
     Parked,
     /// Parked on a closed pool until the given time.
     Paced(u64),
-    /// The store refused to resume it (a full disk, say): still parked.
-    Unresumed,
+    /// Parked on a verdict whose gate lapses at the given time.
+    Lapses(u64),
+}
+/// Why a round's calls stopped before the last one ran: the turn parked,
+/// on handles or a verdict, and is resumed by the service.
+enum Stop {
+    Parked,
+    /// Parked on a verdict or a wait; the service wakes it when a gate lapses.
+    Lapses(u64),
+}
+impl Stop {
+    fn round(self) -> Round {
+        match self {
+            Stop::Parked => Round::Parked,
+            Stop::Lapses(at) => Round::Lapses(at),
+        }
+    }
+}
+/// A gated call's fate once its verdict is in.
+enum Approval {
+    Run,
+    Denied,
+    Stop(Stop),
 }
 
 pub enum Exit {
     Finished(Option<Error>),
     Parked,
-    /// Parked on a rate-limited pool; the service resumes it at this time.
+    /// Parked on a rate-limited pool, or on a verdict whose gate lapses;
+    /// the service resumes it at this time unless something resumes it first.
     Paced(u64),
-    /// Still parked because the store refused its resume; the service
-    /// wakes it again after a backoff.
-    Unresumed,
 }
 
 /// Completion as one storage job: the terminal event, the outcome its
@@ -389,7 +413,8 @@ impl Turn {
         let error = match result {
             Ok(Round::Parked) => return Exit::Parked,
             Ok(Round::Paced(resume_at_ms)) => return Exit::Paced(resume_at_ms),
-            Ok(Round::Unresumed) => return Exit::Unresumed,
+            // The park is committed; the service only keeps its wake-up.
+            Ok(Round::Lapses(at)) => return Exit::Paced(at),
             Ok(Round::Finished) => None,
             Err(error) => {
                 self.handles.forget(Waiter::Turn(self.turn));
@@ -879,23 +904,10 @@ impl Turn {
             environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
         }
         let mut resume_window = false;
-        if self.resume {
-            let (waiting, _, steers) =
-                match self.store.op("resume", move |db| db.resume(turn)).await {
-                    Ok(resumed) => resumed,
-                    Err(error) if error.code == "turn_not_waiting" => return Ok(Round::Parked),
-                    // Nothing committed, so the park stands and its wake-up
-                    // is tried again rather than ending the turn.
-                    Err(error) if error.code == "storage_error" => return Ok(Round::Unresumed),
-                    Err(error) => return Err(error),
-                };
-            if steers {
-                // Queued while parked: absorbed at the first boundary below.
-                self.steers.store(true, Relaxed);
-            }
+        if let Some(waiting) = &self.resumed {
             // The park did not end the turn, so neither does its route.
-            if let Some(route) = waiting.route {
-                let _ = accounting.route.set(route);
+            if let Some(route) = &waiting.route {
+                let _ = accounting.route.set(route.clone());
             }
             // Only a pool park continues the same model call's retry budget.
             if waiting.paced_since_ms.is_some() {
@@ -903,24 +915,38 @@ impl Turn {
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 resume_window = !waiting.compaction;
             } else {
-                let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
-                let id = waiting.call_id;
-                self.store
-                    .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
-                    .await?;
-                // Calls that followed the wait in the same model response.
-                if self
+                // A verdict park resumes at its gated call, which has not
+                // started; a wait park first records the wait's result.
+                if !waiting.approval {
+                    // A later call's lapse can wake the wait before its
+                    // handles resolve: those are reported pending, as the
+                    // wait's own timeout reports them.
+                    let mut results = self.handles.take(turn);
+                    for handle in &waiting.handles {
+                        results
+                            .entry(handle.clone())
+                            .or_insert_with(|| Arc::new(json!({"pending":true})));
+                    }
+                    let outcome = Outcome::text(wait_result(results).to_string());
+                    let id = waiting.call_id.clone();
+                    self.store
+                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .await?;
+                }
+                // Calls that followed in the same model response.
+                if let Some(stop) = self
                     .execute_calls(
-                        waiting.pending,
+                        waiting.pending.clone(),
+                        None,
                         &workspace,
                         &environment,
-                        &record.tools,
+                        &record,
                         None,
                         accounting.route.get().map(String::as_str),
                     )
                     .await?
                 {
-                    return Ok(Round::Parked);
+                    return Ok(stop.round());
                 }
             }
         }
@@ -1001,26 +1027,32 @@ impl Turn {
             let items = response.items;
             let calls: Vec<ToolCall> = response.calls.clone();
             let usage = response.usage.clone();
-            match self
+            let gated = calls.iter().any(|call| record.gated(&call.name));
+            // Taken before the commit that stamps the gates' announcement,
+            // so a gate's first lapse is never counted late.
+            let planned = tokio::time::Instant::now();
+            let announced = match self
                 .store
                 .op("append", move |db| {
-                    db.append(turn, items, &calls, usage.as_ref())
+                    let entries = db.append(turn, items, &calls, usage.as_ref())?;
+                    Ok((entries, gated.then(|| (db.verdicts_for(turn), planned))))
                 })
                 .await
             {
-                Ok(entries) => {
+                Ok((entries, verdicts)) => {
                     let nodes: Vec<i64> = entries
                         .iter()
                         .filter(|entry| entry["event"] == "message")
                         .filter_map(|entry| entry["data"]["node"].as_i64())
                         .collect();
                     provider.recorded(&self.bot, &nodes);
+                    verdicts
                 }
                 Err(error) => {
                     self.failed_usage(response.usage.clone()).await?;
                     return Err(error);
                 }
-            }
+            };
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard.
@@ -1052,20 +1084,21 @@ impl Turn {
                     tokens: 0,
                     pending,
                 });
-            let parked = self
+            let stop = self
                 .execute_calls(
                     response.calls,
+                    announced,
                     &workspace,
                     &environment,
-                    &record.tools,
+                    &record,
                     warm.as_mut(),
                     accounting.route.get().map(String::as_str),
                 )
                 .await?;
             let refreshed = warm.map_or(0, |warm| warm.tokens);
             record.tokens_used = record.tokens_used.saturating_add(refreshed);
-            if parked {
-                return Ok(Round::Parked);
+            if let Some(stop) = stop {
+                return Ok(stop.round());
             }
             self.absorb().await?;
         }
@@ -1592,22 +1625,39 @@ impl Turn {
 
     /// Run planned calls in order. Returns true when a wait parked the turn;
     /// the calls after it are stored with the parked state.
+    /// Run a round's calls in order. `announced` is set when this round
+    /// announced gated calls, with the time its commit began: the first of
+    /// them waits for a verdict before its first check, since none can be
+    /// older than the announcement.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_calls(
         &self,
         calls: Vec<ToolCall>,
+        mut announced: Option<(Arc<Notify>, tokio::time::Instant)>,
         workspace: &std::path::Path,
         environment: &[(String, String)],
-        allowed: &[String],
+        record: &Bot,
         mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
-    ) -> Result<bool> {
-        let turn = self.turn;
+    ) -> Result<Option<Stop>> {
+        let (turn, allowed) = (self.turn, &record.tools);
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
-            let started = call.clone();
-            self.store
-                .op("tool_start", move |db| db.tool_start(turn, &started))
-                .await?;
+            if record.gated(&call.name) {
+                match self
+                    .approve(&call, &mut calls, announced.take(), record, route)
+                    .await?
+                {
+                    Approval::Run => {}
+                    Approval::Denied => continue,
+                    Approval::Stop(stop) => return Ok(Some(stop)),
+                }
+            } else {
+                let started = call.clone();
+                self.store
+                    .op("tool_start", move |db| db.tool_start(turn, &started))
+                    .await?;
+            }
             // A tool failure is a result the model can act on. Only the
             // scheduler closing is a runtime failure. The bot's selection is
             // enforced here, not only by what the model was shown.
@@ -1626,8 +1676,8 @@ impl Turn {
                         .park(&call.call_id, handles, timeout_ms, any, &mut calls, route)
                         .await?
                     {
-                        Some(outcome) => outcome,
-                        None => return Ok(true),
+                        ControlFlow::Continue(outcome) => outcome,
+                        ControlFlow::Break(stop) => return Ok(Some(stop)),
                     }
                 }
                 Ok(Prepared::Shell {
@@ -1689,6 +1739,7 @@ impl Turn {
                         output: json!({"bytes":text.len(),"cleared":text.is_empty()}).to_string(),
                         artifacts: Vec::new(),
                         note: Some(text),
+                        failed: false,
                     };
                     // Clearing is always permitted. Nonempty notes must fit
                     // before they become a mandatory prefix on future turns.
@@ -1725,7 +1776,99 @@ impl Turn {
                 .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
                 .await?;
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    /// Wait for a gated call's verdict: live for the hold, then parked like
+    /// `wait`, holding no task and no slot. Answers wake the task through
+    /// the worker, so each check is one job and no commit.
+    async fn approve(
+        &self,
+        call: &ToolCall,
+        calls: &mut std::vec::IntoIter<ToolCall>,
+        announced: Option<(Arc<Notify>, tokio::time::Instant)>,
+        record: &Bot,
+        route: Option<&str>,
+    ) -> Result<Approval> {
+        let turn = self.turn;
+        let hold = tokio::time::Instant::now() + self.approval_hold;
+        // Announced by this round's own commit, so any verdict comes later
+        // and wakes this wait: check after waiting, not before. The gates'
+        // expiry counts from that commit, however long the calls before
+        // this one ran; the check judges the stored time. A later call's
+        // gate lapsing first ends the turn, so it wakes this wait too.
+        let mut first = announced.map(|(notify, at)| {
+            let round = std::iter::once(call).chain(calls.as_slice());
+            let expire_ms = record
+                .gates
+                .iter()
+                .filter(|gate| round.clone().any(|c| gate.tools.contains(&c.name)))
+                .filter_map(|gate| gate.expire_ms)
+                .min();
+            (notify, expire_ms.map(|ms| at + Duration::from_millis(ms)))
+        });
+        loop {
+            let (notify, lapse) = match first.take() {
+                Some(first) => first,
+                None => {
+                    // The job reads the clock when it judges, and the lapse
+                    // is measured from a fresh read, so time spent queued for
+                    // the worker moves neither.
+                    let checked = call.clone();
+                    match self
+                        .store
+                        .op("approval_start", move |db| {
+                            db.approval_start(turn, &checked, now_ms())
+                        })
+                        .await?
+                    {
+                        Gated::Started => return Ok(Approval::Run),
+                        Gated::Denied => return Ok(Approval::Denied),
+                        Gated::Expired => return fail("approval_expired"),
+                        Gated::Lapsed => {
+                            return Err(Error::with(
+                                "approval_expired",
+                                "a later call's gate lapsed first",
+                            ));
+                        }
+                        Gated::Pending { notify, expires_ms } => (
+                            notify,
+                            expires_ms.map(|at| {
+                                tokio::time::Instant::now()
+                                    + Duration::from_millis(at.saturating_sub(now_ms()))
+                            }),
+                        ),
+                    }
+                }
+            };
+            let wake = lapse.map_or(hold, |lapse| lapse.min(hold));
+            if tokio::time::Instant::now() < wake {
+                tokio::select! {
+                    () = notify.notified() => continue,
+                    () = tokio::time::sleep_until(wake) => {}
+                }
+            }
+            // A lapsed gate is judged by the next check.
+            if lapse.is_some_and(|lapse| tokio::time::Instant::now() >= lapse) {
+                continue;
+            }
+            let pending: Vec<ToolCall> = std::iter::once(call.clone())
+                .chain(calls.as_slice().iter().cloned())
+                .collect();
+            let route = route.map(str::to_owned);
+            let parked = self
+                .store
+                .op("suspend_approval", move |db| {
+                    db.suspend_approval(turn, &pending, now_ms(), route.as_deref())
+                })
+                .await?;
+            match parked {
+                // A verdict landed as the hold ran out.
+                None => continue,
+                Some(Some(at)) => return Ok(Approval::Stop(Stop::Lapses(at))),
+                Some(None) => return Ok(Approval::Stop(Stop::Parked)),
+            }
+        }
     }
 
     async fn history(
@@ -1789,12 +1932,12 @@ impl Turn {
         any: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
-    ) -> Result<Option<Outcome>> {
+    ) -> Result<ControlFlow<Stop, Outcome>> {
         for text in &handles {
             match Handle::parse(text) {
-                Err(error) => return Ok(Some(failure(error))),
+                Err(error) => return Ok(ControlFlow::Continue(failure(error))),
                 Ok(Handle::Turn { bot, turn }) if bot == self.bot && turn == self.turn => {
-                    return Ok(Some(failure(Error::with(
+                    return Ok(ControlFlow::Continue(failure(Error::with(
                         "invalid_handle",
                         "a turn cannot wait on itself",
                     ))));
@@ -1807,7 +1950,10 @@ impl Turn {
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
         let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
         let route = route.map(str::to_owned);
-        self.store
+        // A gated call after the wait still lapses on time: the service
+        // wakes the turn then, and the lapse ends it.
+        let lapse = self
+            .store
             .op("suspend", move |db| {
                 db.suspend(
                     turn,
@@ -1817,7 +1963,8 @@ impl Turn {
                     any,
                     &pending,
                     route.as_deref(),
-                )
+                )?;
+                db.next_lapse(turn)
             })
             .await?;
         self.handles
@@ -1833,7 +1980,7 @@ impl Turn {
                 },
             )
             .await;
-        Ok(None)
+        Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
     }
 
     /// Start a command now; its result is retrievable through a proc handle
@@ -2054,6 +2201,7 @@ fn failure(error: Error) -> Outcome {
         output: json!({"error":error.code,"detail":error.detail}).to_string(),
         artifacts: Vec::new(),
         note: None,
+        failed: true,
     }
 }
 
@@ -2142,6 +2290,7 @@ mod tests {
                             compaction_instructions: None,
                             compaction_model: None,
                             fallbacks: false,
+                            gate: None,
                         },
                     )?;
                     let turn = db
@@ -2226,7 +2375,8 @@ mod tests {
             note_turns: 48,
             compact_at: 75,
             compact_keep: 25,
-            resume: false,
+            resumed: None,
+            approval_hold: Duration::from_secs(2),
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),
         };

@@ -3,7 +3,9 @@
 //! those streamed as `response.output_item.done`, kept once and moved into the
 //! completion; the terminal output stands in only when none streamed. The
 //! ChatGPT Codex endpoint streams items and leaves the terminal output empty.
-use super::{Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of, encoded_len};
+use super::{
+    Completion, Delta, Frame, MAX_OUTPUT, ToolCall, Usage, detail_of, encoded_len, valid_call_id,
+};
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
 use serde::Deserialize;
@@ -212,7 +214,7 @@ fn parse_completion_with_usage(
             Some("function_call") => {
                 let call: ToolCall = serde_json::from_value(item)?;
                 if calls.iter().any(|c: &ToolCall| c.call_id == call.call_id)
-                    || call.call_id.is_empty()
+                    || !valid_call_id(&call.call_id)
                 {
                     return fail("invalid_tool_call_id");
                 }
@@ -250,6 +252,8 @@ fn parse_usage(usage: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::MAX_CALL_ID;
+    use serde_json::json;
     #[test]
     fn inconsistent_terminal_text_and_duplicate_tool_ids_fail() {
         let text = RawValue::from_string(r#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"wrong"}]}]}"#.into()).unwrap();
@@ -261,6 +265,21 @@ mod tests {
 
         let calls = RawValue::from_string(r#"{"status":"completed","output":[{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"},{"type":"function_call","name":"echo","call_id":"x","arguments":"{}"}]}"#.into()).unwrap();
         assert!(parse_completion(&calls, "").is_err());
+    }
+    #[test]
+    fn a_call_id_over_the_bound_fails_by_its_encoded_size() {
+        let completion = |id: &str| {
+            let call = json!({"type":"function_call","name":"echo","call_id":id,"arguments":"{}"});
+            let raw = json!({"status":"completed","output":[call]}).to_string();
+            parse_completion(&RawValue::from_string(raw).unwrap(), "")
+        };
+        assert!(completion(&"c".repeat(MAX_CALL_ID)).is_ok());
+        // Each control character encodes as six bytes. A NUL would end the
+        // id in a printed command, naming another call.
+        let escaped = "\u{1}".repeat(MAX_CALL_ID / 6 + 1);
+        for id in ["c".repeat(MAX_CALL_ID + 1), escaped, "x\0y".into()] {
+            assert_eq!(completion(&id).unwrap_err().code, "invalid_tool_call_id");
+        }
     }
     #[test]
     fn reasoning_summaries_stream_and_usage_is_extracted() {

@@ -18,6 +18,7 @@ fn binding(family: Family) -> Binding<'static> {
         compaction_instructions: None,
         compaction_model: None,
         fallbacks: false,
+        gate: None,
     }
 }
 
@@ -236,6 +237,7 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
                 output: "preview".into(),
                 artifacts: vec![("stdout", data.as_bytes().to_vec())],
                 note: None,
+                failed: false,
             },
         )
         .unwrap();

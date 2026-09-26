@@ -95,6 +95,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut compact_at = None;
     let mut compact_keep = None;
     let mut retain_turns = None;
+    let mut approval_hold_ms = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -167,6 +168,18 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     Error::with("usage", "--retain-turns needs a positive integer"),
                 )?)
             }
+            "--approval-hold-ms" => {
+                approval_hold_ms = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n <= 3_600_000)
+                        .ok_or(Error::with(
+                            "usage",
+                            "--approval-hold-ms needs milliseconds up to 3600000 (0 parks at once)",
+                        ))?,
+                )
+            }
             "--stall-timeout" => {
                 stall_timeout = Some(
                     value
@@ -227,5 +240,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         compact_at,
         compact_keep,
         retain_turns,
+        approval_hold_ms,
     })
 }

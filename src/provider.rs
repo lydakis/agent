@@ -25,6 +25,20 @@ pub use socket::Sockets;
 /// every stored item and live event remains publishable and readable.
 pub const MAX_OUTPUT: usize = 768 * 1024;
 
+/// JSON-encoded bytes one tool call id may take. Real ids run tens of bytes;
+/// the bound keeps every call listable and answerable: its approval entry
+/// and answer fit a 1 MiB line, and the printed `agent answer` command
+/// passes it as one argument under Linux's 128 KiB limit.
+pub const MAX_CALL_ID: usize = 64 * 1024;
+
+/// Whether a provider's tool call id can name its call everywhere: not
+/// empty, within `MAX_CALL_ID`, and free of NUL, which no command-line
+/// argument can carry, so a printed `agent answer` command would name a
+/// different call cut short at it.
+pub(crate) fn valid_call_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains('\0') && encoded_len(id) <= MAX_CALL_ID
+}
+
 /// The bytes `text` takes as a JSON string body, as serde_json escapes it.
 /// Decoded text can grow up to sixfold when encoded, so output bounds count
 /// this rather than the decoded length.

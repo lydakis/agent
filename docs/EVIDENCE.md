@@ -1,7 +1,8 @@
 # Current evidence
 
 Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
-updated at `095ff68` for admission batching and disk-full containment. This
+updated at `095ff68` for admission batching and disk-full containment, and
+by the change that built tool approval for its cost. This
 is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -62,6 +63,20 @@ more turns is not here, because its work changes with its speed; it is under
   with only `temp_store=MEMORY` added (the line `4260673` landed),
   2026-09-26; macOS, where creating a file may cost more, is not measured.
   [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
+- **Tool approval.** One synthetic `shell` call per turn, 200 turns on one
+  bot, medians of three rotated runs, with the screen itself answering
+  `allow`. An ungated bot pays nothing: the same commits and fsyncs as main
+  (11 and 6.24 a turn), p50 11.7 against 12.3 ms, and 247 against 245
+  turns a second over 32 bots. A call answered within the hold adds no
+  durable commit and about 1 ms at the median (13.2 ms, the screen's
+  answering round trip included); one answered after its turn parks adds
+  three durable commits and about 3 ms (9.32 fsyncs a turn, 15.0 ms). With
+  one screen answering 32 bots, the screen becomes the wait: 309 turns a
+  second ungated, 258 held, 196 parked. Linux x86_64 container, `7238c6c`
+  (before the review fixes and the merge with admission batching) against
+  `7e46c5f`, 2026-09-26; both binaries rebuild to the SHA-256 the runs
+  recorded. macOS and the automatic approver's own cost are not measured.
+  [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB
   and 24.9 s, opencode 927 MiB and 14.4 s, Claude Code 6,494 MiB and 23.8 s.
@@ -234,4 +249,6 @@ Reconnects, retention, overload, compaction and recovery.
   it per operation, but no run has recorded it.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
-- Multi-daemon operation, approvals, and concurrent tool calls: designs only.
+- Tool approval on macOS, and at the current build.
+- Multi-daemon operation, the automatic approver (rules and Jev), and
+  concurrent tool calls: designs only.

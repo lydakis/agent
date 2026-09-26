@@ -1,7 +1,8 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`turns`, `result`, `rm`, `prune`, `stats`, `shutdown`, and `serve`. All named
+`turns`, `result`, `rm`, `prune`, `approvals`, `answer`, `stats`, `shutdown`,
+and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
 Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
@@ -54,9 +55,32 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   of its source, instructions included.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
+- `run --new --approval MODE` and `fork --approval MODE` choose whether a
+  new bot's tool calls wait for a verdict: `full` runs every allowed call (no
+  gate), `manual` waits for an answer from any client, and `auto` is refused
+  with `approval_mode_unsupported` until an automatic approver exists.
+  Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
+  picks the gated tools and must name at least one; the default is every
+  tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
+  creator's ([APPROVALS.md](APPROVALS.md)).
+- `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
+  With `--pretty`, each call shows what it would do (every line of its
+  command, terminal controls escaped) and, for each gate still
+  open, two whole commands, one that allows and one that denies, so a
+  pasted line never carries a verdict its reader did not pick. The call id
+  is written `--call=ID`, so an id that starts with `--` stays the value. `answer --bot NAME --turn TURN --call ID --request N
+  [--tag TAG] [--reason TEXT] allow|deny` records one gate's verdict; `--tag`
+  may be left out when the call has one gate, and a denial's `--reason` is
+  what the model sees (an allow takes none). `answer` refuses to run inside a bot's own tool shell
+  (`answer_in_tool_shell`). `run --pretty` and `follow --pretty` print the
+  same commands when a call waits. A printed command carries `--store` or
+  `--socket`, as absolute paths, whenever the daemon it came from is not
+  the default one, so it answers that daemon from any shell.
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,
   `--stall-timeout`, and `--keep-warm` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
+  `--approval-hold-ms` is milliseconds: how long a gated call waits live for
+  its verdict before its turn parks (default 2,000; 0 parks at once).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope
 for both client commands and `serve`. Keep that registry, the implementation,
@@ -75,7 +99,10 @@ while starting none; turns still running then end `interrupted` with
 
 `--pretty` is an explicit human view: rendered streams, tables for lists, and
 indented JSON for other results, including detached submission handles. It is
-rejected on commands with no output. Diagnostics go to stderr.
+rejected on commands with no output. Diagnostics go to stderr. Rendered model
+text and tool output keep their line breaks and tabs; any other character a
+terminal would act on is printed escaped, so a stream cannot hide or restyle a
+call waiting for approval.
 
 | Exit | Meaning |
 | --- | --- |
@@ -97,8 +124,8 @@ Every client command accepts `--store` and `--socket`. Client store selection is
 wins; otherwise `AGENT_SOCKET` applies unless `--store` was explicit. Without a
 socket override, the socket is derived from the selected store.
 
-`run` may start the daemon. `stats`, `turns`, `result`, `rm`, and `prune` may
-restart it only for an existing store. These commands accept the startup
+`run` may start the daemon. `stats`, `turns`, `result`, `rm`, `prune`,
+`approvals`, and `answer` may restart it only for an existing store. These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match

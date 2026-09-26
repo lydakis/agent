@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, IsTerminal, Read, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -75,9 +75,20 @@ struct Options {
     any: bool,
     /// `run --delivery`: what to do when the bot is busy.
     delivery: Option<String>,
+    /// A new bot's approval mode and gated tools.
+    approval: Option<String>,
+    approve: Option<String>,
+    /// `answer`: the call, its request number, the gate, and the reason.
+    call: Option<String>,
+    request: Option<i64>,
+    tag: Option<String>,
+    reason: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
+    /// The `--store` and `--socket` flags, shell-quoted, that reach this
+    /// daemon from any shell; empty when both are the defaults.
+    target: String,
 }
 
 fn parse(args: &[String]) -> Result<Options> {
@@ -115,8 +126,17 @@ fn parse(args: &[String]) -> Result<Options> {
         all: false,
         any: false,
         delivery: std::env::var("AGENT_DELIVERY").ok(),
+        approval: std::env::var("AGENT_APPROVAL")
+            .ok()
+            .filter(|mode| !mode.is_empty()),
+        approve: None,
+        call: None,
+        request: None,
+        tag: None,
+        reason: None,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
+        target: String::new(),
     };
     let mut iter = args.iter();
     let mut socket = None;
@@ -151,6 +171,18 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--model" => options.model = Some(value),
                     "--delivery" => options.delivery = Some(value),
+                    "--approval" => options.approval = Some(value),
+                    "--approve" => options.approve = Some(value),
+                    "--call" => options.call = Some(value),
+                    "--request" => {
+                        options.request = Some(
+                            value
+                                .parse()
+                                .map_err(|_| Error::with("usage", "--request needs an integer"))?,
+                        )
+                    }
+                    "--tag" => options.tag = Some(value),
+                    "--reason" => options.reason = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
                         options.instructions =
@@ -217,7 +249,8 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--note-turns"
                     | "--compact-at"
                     | "--compact-keep"
-                    | "--retain-turns" => {
+                    | "--retain-turns"
+                    | "--approval-hold-ms" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
@@ -253,10 +286,12 @@ fn parse(args: &[String]) -> Result<Options> {
         }
     }
     let explicit_store = store.is_some();
+    let home_store = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agent").join("state.sqlite"));
     options.store = match store.or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from)) {
         Some(store) => store,
-        None => std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join(".agent").join("state.sqlite"))
+        None => home_store
+            .clone()
             .ok_or(Error::with("usage", "set --store, AGENT_STORE, or HOME"))?,
     };
     options.socket = match socket.or_else(|| {
@@ -269,6 +304,7 @@ fn parse(args: &[String]) -> Result<Options> {
         Some(socket) => socket,
         None => crate::client_path::default_socket(&options.store)?,
     };
+    options.target = target(&options.store, &options.socket, home_store.as_deref());
     if options.providers.is_empty() {
         options.providers = environment_providers(&|name| std::env::var(name).ok());
     }
@@ -486,6 +522,7 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--compact-at" => "compact_at",
             "--compact-keep" => "compact_keep",
             "--retain-turns" => "retain_turns",
+            "--approval-hold-ms" => "approval_hold_ms",
             _ => continue,
         };
         let running = &ready["limits"][key];
@@ -640,6 +677,53 @@ fn created_by() -> Result<(Option<String>, Option<i64>)> {
     }
 }
 
+/// Tools the approval modes never gate: they touch only the bot's own
+/// store records.
+const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
+
+/// The gate a new bot asks for, as `create` or `fork` fields. The mode
+/// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
+/// `manual` gates --approve, or every tool the bot has but the four that
+/// touch only its own records, for a person or a program to answer.
+fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
+    match options.approval.as_deref().unwrap_or("full") {
+        "full" if options.approve.is_some() => fail_with(
+            "usage",
+            "--approve names tools for an approver; use --approval manual",
+        ),
+        "full" => Ok(json!({})),
+        "manual" => {
+            let approve: Vec<String> = match &options.approve {
+                Some(list) => list
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                None => tools
+                    .iter()
+                    .filter(|t| !UNGATED.contains(&t.as_str()))
+                    .cloned()
+                    .collect(),
+            };
+            match approve.is_empty() {
+                // Asked to gate nothing: refused rather than run ungated.
+                true if options.approve.is_some() => fail_with("usage", "--approve names no tools"),
+                // A bot with only ungated tools has nothing to wait for.
+                true => Ok(json!({})),
+                false => Ok(json!({"approve":approve,"approver":"manual"})),
+            }
+        }
+        "auto" => fail_with(
+            "approval_mode_unsupported",
+            "auto needs the automatic approver, which is not built yet; use manual or full",
+        ),
+        mode => fail_with(
+            "usage",
+            format!("unknown approval mode {mode}; use full, manual, or auto"),
+        ),
+    }
+}
+
 fn unique(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -670,6 +754,8 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "result" => result(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
+        "approvals" => approvals(&options),
+        "answer" => answer(&options),
         "stats" => {
             let mut connection = ensure_existing_daemon(&options)?;
             let stats = connection.request("stats", json!({}))?;
@@ -776,16 +862,22 @@ fn run(options: &Options) -> Result<i32> {
             ))?;
         let instructions = composed_instructions(options, &workspace)?;
         let (created_by, created_by_id) = created_by()?;
-        connection.request(
-            "create",
-            json!({"bot":bot,"workspace":workspace,"model":model,
-                "instructions":instructions,"reasoning":options.reasoning,
-                "budget_tokens":options.budget_tokens,
-                "tools":options.tools.split(',').filter(|t| !t.is_empty()).collect::<Vec<_>>(),
-                "created_by":created_by,"created_by_id":created_by_id,
-                "compaction_instructions":options.compaction_instructions,
-                "compaction_model":options.compaction_model,"fallbacks":options.fallbacks}),
-        )?;
+        let tools: Vec<String> = options
+            .tools
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
+            "instructions":instructions,"reasoning":options.reasoning,
+            "budget_tokens":options.budget_tokens,"tools":tools,
+            "created_by":created_by,"created_by_id":created_by_id,
+            "compaction_instructions":options.compaction_instructions,
+            "compaction_model":options.compaction_model,"fallbacks":options.fallbacks});
+        if let Value::Object(gate) = requested_gate(options, &tools)? {
+            create.as_object_mut().expect("object").extend(gate);
+        }
+        connection.request("create", create)?;
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     // Existing bots keep their model unless --model explicitly overrides it.
@@ -806,7 +898,7 @@ fn run(options: &Options) -> Result<i32> {
         .ok_or(Error::new("daemon_protocol_mismatch"))?;
     let after = submitted["cursor"].as_i64().map(|c| c - 1).unwrap_or(0);
     connection.request("follow", json!({"bot":bot,"after":after}))?;
-    let mut renderer = Renderer::new(options.pretty, Some(turn));
+    let mut renderer = Renderer::new(options.pretty, Some(turn), &options.target);
     if options.pretty {
         eprintln!(
             "agent: {bot} turn {turn}{} in {workspace}",
@@ -827,7 +919,7 @@ fn follow(options: &Options) -> Result<i32> {
         // connection ends: the fleet controller's view.
         let mut connection = Connection::connect(&options.socket)?;
         connection.request("follow", json!({"bot":"*","after":options.after}))?;
-        let mut renderer = Renderer::new(options.pretty, None);
+        let mut renderer = Renderer::new(options.pretty, None, &options.target);
         loop {
             let event = connection.next_event()?;
             renderer.event(&mut connection, &event)?;
@@ -844,7 +936,7 @@ fn follow(options: &Options) -> Result<i32> {
     let state = connection.request("resume", json!({"bot":bot}))?;
     let turn = state["running_turn"].as_i64();
     connection.request("follow", json!({"bot":bot,"after":options.after}))?;
-    let mut renderer = Renderer::new(options.pretty, turn);
+    let mut renderer = Renderer::new(options.pretty, turn, &options.target);
     loop {
         let event = connection.next_event()?;
         if let Some(code) = renderer.event(&mut connection, &event)? {
@@ -870,13 +962,20 @@ fn fork(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     // A fork inherits only the conversation; its turns name their own workspace.
     let (created_by, created_by_id) = created_by()?;
-    let result = connection.request(
-        "fork",
-        json!({"source":source,"checkpoint":checkpoint,"bot":bot,
-            "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
-            "budget_tokens":options.budget_tokens,
-            "created_by":created_by,"created_by_id":created_by_id}),
-    )?;
+    let mut request = json!({"source":source,"checkpoint":checkpoint,"bot":bot,
+        "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
+        "budget_tokens":options.budget_tokens,
+        "created_by":created_by,"created_by_id":created_by_id});
+    // A fork keeps its source's tools and gates; its own gate adds to them.
+    if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
+        let state = connection.request("resume", json!({"bot":source}))?;
+        let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
+            .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
+        if let Value::Object(gate) = requested_gate(options, &tools)? {
+            request.as_object_mut().expect("object").extend(gate);
+        }
+    }
+    let result = connection.request("fork", request)?;
     print_json(&result, options.pretty)?;
     Ok(0)
 }
@@ -950,6 +1049,89 @@ fn wait(options: &Options) -> Result<i32> {
         enough && completed.all(|v| v.get("error").is_none_or(Value::is_null))
     });
     Ok(if clean { 0 } else { 1 })
+}
+
+/// Calls waiting for a verdict, paged through completely; JSON array or
+/// one line per call with the command that answers it.
+fn approvals(options: &Options) -> Result<i32> {
+    let mut connection = ensure_existing_daemon(options)?;
+    let mut after = json!(0);
+    let mut first = true;
+    if !options.pretty {
+        print!("[");
+    }
+    loop {
+        let page = connection.request(
+            "approvals",
+            json!({"bot":options.bot,"tag":options.tag,"after":after,"limit":256}),
+        )?;
+        let calls = page["approvals"]
+            .as_array()
+            .ok_or(Error::new("daemon_protocol_mismatch"))?;
+        for call in calls {
+            if options.pretty {
+                println!(
+                    "{} turn {} {}",
+                    call["bot"].as_str().unwrap_or(""),
+                    call["turn"],
+                    call_line(call)
+                );
+                for line in answer_lines(call, &options.target) {
+                    println!("{line}");
+                }
+            } else {
+                if !first {
+                    print!(",");
+                }
+                print!("{call}");
+                first = false;
+            }
+        }
+        after = page["next_after"].clone();
+        if after.is_null() {
+            break;
+        }
+    }
+    if !options.pretty {
+        println!("]");
+    }
+    Ok(0)
+}
+
+/// Allow or deny one gated call. The request number is required, so a
+/// decision made on what a person saw cannot land on a call announced
+/// again since.
+fn answer(options: &Options) -> Result<i32> {
+    // The same kind of guard as the creator identity: it stops a bot's own
+    // shell from answering by accident, not a determined command.
+    if std::env::var("AGENT_SHELL_CONTEXT").as_deref() == Ok("1")
+        || std::env::var("AGENT_BOT").is_ok_and(|bot| !bot.is_empty())
+    {
+        return fail_with(
+            "answer_in_tool_shell",
+            "agent answer does not run inside a bot's tool shell",
+        );
+    }
+    let (Some(bot), Some(turn), Some(call), Some(request)) =
+        (&options.bot, options.turn, &options.call, options.request)
+    else {
+        return fail_with(
+            "usage",
+            "answer needs --bot, --turn, --call, and --request, as agent approvals lists them",
+        );
+    };
+    let decision = options.positional[0].as_str();
+    if !matches!(decision, "allow" | "deny") {
+        return fail_with("usage", "answer needs a decision: allow or deny");
+    }
+    let mut connection = ensure_existing_daemon(options)?;
+    let answered = connection.request(
+        "answer",
+        json!({"bot":bot,"turn":turn,"call_id":call,"request":request,"tag":options.tag,
+            "decision":decision,"reason":options.reason,"by":"cli"}),
+    )?;
+    print_json(&answered, false)?;
+    Ok(0)
 }
 
 /// A bot's turns, paged through completely; JSON array or a table.
@@ -1078,21 +1260,27 @@ struct Renderer {
     mode: Mode,
     turn: Option<i64>,
     usage: (u64, u64, u64),
+    /// The daemon's flags for the answer commands it prints.
+    target: String,
 }
 
 impl Renderer {
-    fn new(pretty: bool, turn: Option<i64>) -> Self {
+    fn new(pretty: bool, turn: Option<i64>, target: &str) -> Self {
         Self {
             pretty,
             color: pretty && std::io::stdout().is_terminal(),
             mode: Mode::Idle,
             turn,
             usage: (0, 0, 0),
+            target: target.to_owned(),
         }
     }
+    /// Dim text for a terminal. It resets every attribute first, so no
+    /// state left before it (concealed or invisible text) carries into what
+    /// it shows.
     fn dim(&self, text: &str) -> String {
         if self.color {
-            format!("\x1b[2m{text}\x1b[0m")
+            format!("\x1b[0;2m{text}\x1b[0m")
         } else {
             text.to_owned()
         }
@@ -1109,9 +1297,10 @@ impl Renderer {
             println!();
         }
         self.mode = mode;
+        let text = streamed(text);
         let mut stdout = std::io::stdout();
         let _ = match mode {
-            Mode::Thinking => write!(stdout, "{}", self.dim(text)),
+            Mode::Thinking => write!(stdout, "{}", self.dim(&text)),
             _ => write!(stdout, "{text}"),
         };
         let _ = stdout.flush();
@@ -1148,21 +1337,28 @@ impl Renderer {
             "tool_started" => {
                 self.flush();
                 let name = data["name"].as_str().unwrap_or("tool");
-                let args: Value = serde_json::from_str(data["arguments"].as_str().unwrap_or(""))
-                    .unwrap_or(Value::Null);
-                let summary = match name {
-                    "shell" => args["command"].as_str().unwrap_or("").to_owned(),
-                    "read" | "write" | "edit" => args["path"].as_str().unwrap_or("").to_owned(),
-                    _ => data["arguments"].as_str().unwrap_or("").to_owned(),
-                };
-                let summary: String = summary
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(200)
-                    .collect();
+                let summary = summary(name, data["arguments"].as_str().unwrap_or(""));
                 println!("{}", self.dim(&format!("▸ {name} {summary}")));
+            }
+            // A person answering from another terminal needs to see what
+            // each call would do, then the command. The event names the
+            // calls; the listing has their arguments. A call it no longer
+            // lists was decided already.
+            "approval_requested" => {
+                self.flush();
+                let bot = event["bot"].as_str().unwrap_or("");
+                let wanted: Vec<&str> = data["calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| call["call_id"].as_str())
+                    .collect();
+                for call in pending(connection, bot, event["turn"].as_i64(), &wanted)? {
+                    println!("{}", self.dim(&format!("⏸ {}", call_line(&call))));
+                    for line in answer_lines(&call, &self.target) {
+                        println!("{}", self.dim(&line));
+                    }
+                }
             }
             "tool_completed" => {
                 let bot = event["bot"].as_str().unwrap_or("");
@@ -1174,7 +1370,7 @@ impl Renderer {
                         .or_else(|| item["content"][0]["content"].as_str())
                         .unwrap_or("");
                     for line in preview(output).lines() {
-                        println!("{}", self.dim(&format!("  {line}")));
+                        println!("{}", self.dim(&format!("  {}", streamed(line))));
                     }
                 }
             }
@@ -1225,6 +1421,341 @@ fn exit_code(data: &Value) -> i32 {
     }
 }
 
+/// The arguments that say what a call of this tool does, if it has any:
+/// the first is shown bare, a later one after its name. A `read` names a
+/// file or another call's artifact.
+fn summary_keys(name: &str) -> &'static [&'static str] {
+    match name {
+        "shell" => &["command"],
+        "read" => &["path", "artifact"],
+        "write" | "edit" => &["path"],
+        _ => &[],
+    }
+}
+
+/// The first of `keys` that `field` finds, labeled when it is not the
+/// first, or what is missing.
+fn summary_field(
+    keys: &[&str],
+    mut field: impl FnMut(&str) -> Option<String>,
+) -> std::result::Result<String, String> {
+    keys.iter()
+        .enumerate()
+        .find_map(|(index, key)| {
+            field(key).map(|text| match index {
+                0 => text,
+                _ => format!("{key} {text}"),
+            })
+        })
+        .ok_or_else(|| keys.join(" or "))
+}
+
+/// A started call's arguments as one short line: the command or path when
+/// the tool has one. Arguments may be a preview cut short, so the field is
+/// read from as much of the text as there is.
+fn summary(name: &str, arguments: &str) -> String {
+    let keys = summary_keys(name);
+    let text = if keys.is_empty() {
+        arguments.to_owned()
+    } else {
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        summary_field(keys, |key| match &parsed {
+            Some(args) => args[key].as_str().map(str::to_owned),
+            None => preview_field(arguments, key),
+        })
+        .unwrap_or_else(|missing| format!("[no {missing} in the arguments shown]"))
+    };
+    one_line(&text, false)
+}
+
+/// The first line of `text`, marked when more lines follow or it was cut,
+/// with anything a terminal would act on shown escaped instead.
+fn one_line(text: &str, cut: bool) -> String {
+    let mut lines = text.lines();
+    let first: String = lines.next().unwrap_or("").chars().take(200).collect();
+    let rest = lines.count();
+    let cut = cut || (rest == 0 && first.len() < text.trim_end().len());
+    let first = visible(&first);
+    if rest > 0 {
+        format!(
+            "{first} … (+{rest} more lines{})",
+            if cut { ", then cut" } else { "" }
+        )
+    } else if cut {
+        format!("{first} …")
+    } else {
+        first
+    }
+}
+
+/// Every line of a pending call's field, each escaped: a later line of a
+/// command runs too, so whoever allows it must see it. The field is the
+/// listing's preview, at most 2,048 characters, which bounds the display;
+/// a field cut short ends marked.
+fn every_line(text: &str, cut: bool) -> String {
+    let mut shown = text.lines().map(visible).collect::<Vec<_>>().join("\n  │ ");
+    if cut {
+        shown.push_str(" …");
+    }
+    shown
+}
+
+/// Model-written text as a terminal should show it: control characters
+/// and bidirectional overrides escaped, so a call cannot clear the screen
+/// or reorder what the person reads before they allow it.
+fn visible(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        if acted_on(c) {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+/// Streamed model text or tool output as a terminal should show it: line
+/// breaks and tabs kept, anything else a terminal acts on escaped, so it
+/// cannot hide or restyle what follows, such as a call awaiting approval.
+fn streamed(text: &str) -> std::borrow::Cow<'_, str> {
+    let kept = |c: char| c == '\n' || c == '\t' || !acted_on(c);
+    if text.chars().all(kept) {
+        return text.into();
+    }
+    let mut shown = String::with_capacity(text.len() + 16);
+    for c in text.chars() {
+        if kept(c) {
+            shown.push(c);
+        } else {
+            shown.extend(c.escape_default());
+        }
+    }
+    shown.into()
+}
+
+/// A character a terminal acts on rather than shows as it stands: a
+/// control character, or a bidirectional mark or override.
+fn acted_on(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// A top-level string field of JSON text that may be cut short, decoded as
+/// far as the text goes.
+fn preview_field(text: &str, key: &str) -> Option<String> {
+    let mut rest = text.trim_start().strip_prefix('{')?;
+    loop {
+        rest = rest.trim_start();
+        if !rest.starts_with('"') {
+            return None;
+        }
+        let end = value_end(rest)?;
+        let (name, _) = agent_runtime::codec::json_string_prefix(&rest[..end], usize::MAX);
+        rest = rest[end..].trim_start().strip_prefix(':')?.trim_start();
+        if name == key {
+            return rest
+                .starts_with('"')
+                .then(|| agent_runtime::codec::json_string_prefix(rest, usize::MAX).0);
+        }
+        rest = rest[value_end(rest)?..].trim_start().strip_prefix(',')?;
+    }
+}
+
+/// Where the JSON value at the start of `text` ends, or `None` when the
+/// text is cut before it does.
+fn value_end(text: &str) -> Option<usize> {
+    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
+    for (i, c) in text.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => {
+                    quoted = false;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => quoted = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' | ',' if depth == 0 => return Some(i),
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Calls of one turn still waiting on a gate, as `approvals` lists them,
+/// in the order given.
+fn pending(
+    connection: &mut Connection,
+    bot: &str,
+    turn: Option<i64>,
+    call_ids: &[&str],
+) -> Result<Vec<Value>> {
+    let mut found: Vec<Value> = Vec::new();
+    let mut after = json!(0);
+    while !after.is_null() && found.len() < call_ids.len() {
+        let page = connection.request("approvals", json!({"bot":bot,"after":after,"limit":256}))?;
+        found.extend(
+            page["approvals"]
+                .as_array()
+                .ok_or(Error::new("daemon_protocol_mismatch"))?
+                .iter()
+                .filter(|call| {
+                    call["turn"].as_i64() == turn
+                        && call["call_id"]
+                            .as_str()
+                            .is_some_and(|id| call_ids.contains(&id))
+                })
+                .cloned(),
+        );
+        after = page["next_after"].clone();
+    }
+    found.sort_by_key(|call| {
+        call_ids
+            .iter()
+            .position(|id| call["call_id"].as_str() == Some(*id))
+    });
+    Ok(found)
+}
+
+/// A pending call's tool and what it would do, from the fields `approvals`
+/// lists, each cut on its own.
+fn call_line(call: &Value) -> String {
+    let name = call["name"].as_str().unwrap_or("tool");
+    let arguments = &call["arguments"];
+    let cut = |key: &str| {
+        call["arguments_cut"]
+            .as_array()
+            .is_some_and(|cut| cut.iter().any(|field| field == key))
+    };
+    let shown = match summary_keys(name) {
+        _ if !arguments.is_object() => "[arguments are not a JSON object]".to_owned(),
+        [] => one_line(
+            &arguments.to_string(),
+            call["arguments_cut"]
+                .as_array()
+                .is_some_and(|cut| !cut.is_empty())
+                || call["arguments_omitted"].as_u64().unwrap_or(0) > 0,
+        ),
+        keys => summary_field(keys, |key| {
+            arguments[key]
+                .as_str()
+                .map(|text| every_line(text, cut(key)))
+        })
+        .unwrap_or_else(|missing| format!("[no {missing} in the arguments]")),
+    };
+    format!("{name} {shown}")
+}
+
+/// One copyable command per gate a pending call still waits on, each
+/// naming its gate, since a call with several gates needs `--tag`, and the
+/// daemon, since ids mean nothing in another store.
+fn answer_lines(call: &Value, target: &str) -> Vec<String> {
+    call["gates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .flat_map(|tag| {
+            // One whole command per verdict: a placeholder such as
+            // `allow|deny` would run as a pipeline that allows. The id goes
+            // after `=`, so one that starts with `--` is still its value.
+            let command = format!(
+                "agent answer{target} --bot {} --turn {} --call={} --request {} --tag {}",
+                shell_word(call["bot"].as_str().unwrap_or("")),
+                call["turn"],
+                shell_word(call["call_id"].as_str().unwrap_or("")),
+                call["request"],
+                shell_word(tag),
+            );
+            [
+                format!("  waits for {tag}"),
+                format!("    {command} allow"),
+                format!("    {command} deny"),
+            ]
+        })
+        .collect()
+}
+
+/// The flags that reach this daemon from any shell, for commands printed
+/// for a person to run: none when the store and socket are the defaults.
+fn target(store: &Path, socket: &Path, home_store: Option<&Path>) -> String {
+    let mut flags = String::new();
+    if home_store != Some(store) {
+        flags.push_str(" --store ");
+        flags.push_str(&shell_path(store));
+    }
+    if crate::client_path::default_socket(store).ok().as_deref() != Some(socket) {
+        flags.push_str(" --socket ");
+        flags.push_str(&shell_path(socket));
+    }
+    flags
+}
+
+/// A path as one shell word, made absolute so it holds from any directory;
+/// bytes that are not UTF-8 are written as escapes.
+fn shell_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Some(text) = path.to_str() {
+        return shell_word(text);
+    }
+    let mut word = String::from("$'");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/._-".contains(&byte) {
+            word.push(byte as char);
+        } else {
+            word.push_str(&format!("\\x{byte:02x}"));
+        }
+    }
+    word.push('\'');
+    word
+}
+
+/// A value as one shell word, for a command a person copies: bare when it
+/// is plainly safe, single-quoted otherwise, and ANSI-C quoted when it has
+/// characters a terminal would act on, which would otherwise reach it raw.
+fn shell_word(value: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-.,:/@%+=".contains(c);
+    if !value.is_empty() && value.chars().all(plain) {
+        return value.to_owned();
+    }
+    if !value.chars().any(acted_on) {
+        return format!("'{}'", value.replace('\'', r"'\''"));
+    }
+    let mut word = String::from("$'");
+    for c in value.chars() {
+        match c {
+            '\\' | '\'' => {
+                word.push('\\');
+                word.push(c);
+            }
+            c if acted_on(c) => {
+                for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                    word.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    word.push('\'');
+    word
+}
+
 /// A bounded, readable slice of a tool result for the terminal.
 fn preview(output: &str) -> String {
     let text = match serde_json::from_str::<Value>(output) {
@@ -1264,6 +1795,194 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summaries_read_the_field_from_a_cut_preview_and_mark_what_is_hidden() {
+        let long = format!("{{\"content\":\"{}", "x".repeat(64));
+        assert_eq!(
+            summary("write", r#"{"path":"a \"b\".txt","content":"xx"#),
+            r#"a "b".txt"#
+        );
+        assert_eq!(summary("write", &long), "[no path in the arguments shown]");
+        assert_eq!(
+            summary(
+                "write",
+                r#"{"content":"{\"path\":\"fake\"}","path":"real"}"#
+            ),
+            "real"
+        );
+        assert_eq!(
+            summary(
+                "shell",
+                r#"{"timeout_ms":5,"nested":{"a":[1,"]"]},"command":"echo hi\nrm -r x"#
+            ),
+            "echo hi … (+1 more lines)"
+        );
+        assert_eq!(summary("shell", r#"{"command":"ls"}"#), "ls");
+        assert_eq!(summary("shell", r#"{"command":"ec"#), "ec");
+        // A read names a file or another call's artifact.
+        assert_eq!(
+            summary("read", r#"{"artifact":"3/call_1/stdout","offset":1}"#),
+            "artifact 3/call_1/stdout"
+        );
+        assert_eq!(summary("read", r#"{"path":"a.txt"}"#), "a.txt");
+        assert_eq!(
+            summary("read", r#"{"offset":1}"#),
+            "[no path or artifact in the arguments shown]"
+        );
+    }
+
+    #[test]
+    fn streamed_text_keeps_its_lines_and_escapes_what_a_terminal_acts_on() {
+        assert!(matches!(
+            streamed("plain\n\tindented"),
+            std::borrow::Cow::Borrowed("plain\n\tindented")
+        ));
+        // Concealing what follows, rewriting the line, and reordering it
+        // are all shown instead of done.
+        assert_eq!(
+            streamed("fake\u{1b}[8m\rreal\u{202e}\u{9b}\n"),
+            r"fake\u{1b}[8m\rreal\u{202e}\u{9b}".to_owned() + "\n"
+        );
+        let renderer = Renderer {
+            color: true,
+            ..Renderer::new(true, None, "")
+        };
+        assert_eq!(renderer.dim("x"), "\x1b[0;2mx\x1b[0m");
+    }
+
+    #[test]
+    fn a_pending_call_shows_its_own_field_however_long_the_others_are() {
+        let line = |name: &str, fields: Value| {
+            let mut call = json!({"name":name,"arguments_cut":[],"arguments_omitted":0});
+            for (key, value) in fields.as_object().unwrap() {
+                call[key] = value.clone();
+            }
+            call_line(&call)
+        };
+        let content = "x".repeat(2048);
+        assert_eq!(
+            line(
+                "write",
+                json!({"arguments":{"content":content,"path":"a.txt"},"arguments_cut":["content"]})
+            ),
+            "write a.txt"
+        );
+        assert_eq!(
+            line(
+                "shell",
+                json!({"arguments":{"command":"echo hi\nrm x"},"arguments_cut":["command"]})
+            ),
+            "shell echo hi\n  │ rm x …"
+        );
+        // A long first line hides nothing after it either.
+        let long = format!("echo {}; rm x", "a".repeat(300));
+        assert_eq!(
+            line("shell", json!({"arguments":{"command":long}})),
+            format!("shell {long}")
+        );
+        assert_eq!(
+            line(
+                "shell",
+                json!({"arguments":{"command":"ls"},"arguments_cut":["command"]})
+            ),
+            "shell ls …"
+        );
+        assert_eq!(
+            line("edit", json!({"arguments":{"old":"a"}})),
+            "edit [no path in the arguments]"
+        );
+        assert_eq!(
+            line(
+                "read",
+                json!({"arguments":{"artifact":"3/call_1/stdout","offset":1}})
+            ),
+            "read artifact 3/call_1/stdout"
+        );
+        assert_eq!(
+            line("read", json!({"arguments":{"offset":1}})),
+            "read [no path or artifact in the arguments]"
+        );
+        assert_eq!(
+            line("shell", json!({"arguments":null})),
+            "shell [arguments are not a JSON object]"
+        );
+        // What a terminal would act on is shown, not sent to it.
+        assert_eq!(
+            line(
+                "shell",
+                json!({"arguments":{"command":"\u{1b}[2Jrm x\r\u{202e}txt.exe"}})
+            ),
+            r"shell \u{1b}[2Jrm x\r\u{202e}txt.exe"
+        );
+        assert_eq!(
+            line(
+                "echo",
+                json!({"arguments":{"text":"hi"},"arguments_omitted":1})
+            ),
+            r#"echo {"text":"hi"} …"#
+        );
+    }
+
+    #[test]
+    fn every_open_gate_gets_its_own_answer_command() {
+        let call = json!({"bot":"Bob","turn":7,"call_id":"c 1","request":2,
+            "gates":["manual","second"],"name":"shell","arguments":{"command":"ls"},
+            "arguments_cut":[],"arguments_omitted":0});
+        assert_eq!(call_line(&call), "shell ls");
+        assert_eq!(
+            answer_lines(&call, ""),
+            [
+                "  waits for manual",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag manual allow",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag manual deny",
+                "  waits for second",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag second allow",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag second deny",
+            ]
+        );
+        // An id that reads as a flag is still the value of `--call`.
+        let flag = json!({"bot":"Bob","turn":7,"call_id":"--help","request":1,"gates":["manual"]});
+        assert_eq!(
+            answer_lines(&flag, "")[1],
+            "    agent answer --bot Bob --turn 7 --call=--help --request 1 --tag manual allow"
+        );
+    }
+
+    #[test]
+    fn printed_commands_name_a_daemon_that_is_not_the_default() {
+        let home = Path::new("/home/a/.agent/state.sqlite");
+        let other = Path::new("/tmp/x y/state.sqlite");
+        let socket = |store| crate::client_path::default_socket(store).unwrap();
+        assert_eq!(target(home, &socket(home), Some(home)), "");
+        assert_eq!(
+            target(other, &socket(other), Some(home)),
+            " --store '/tmp/x y/state.sqlite'"
+        );
+        assert_eq!(
+            target(home, Path::new("/run/a.sock"), Some(home)),
+            " --socket /run/a.sock"
+        );
+        // Without HOME there is no default store to leave out.
+        assert!(target(home, &socket(home), None).starts_with(" --store /home/a/"));
+        let call = json!({"bot":"Bob","turn":7,"call_id":"c1","request":1,"gates":["manual"]});
+        assert_eq!(
+            answer_lines(&call, " --store /s")[2],
+            "    agent answer --store /s --bot Bob --turn 7 --call=c1 --request 1 --tag manual deny"
+        );
+    }
+
+    #[test]
+    fn shell_words_keep_ids_one_argument() {
+        assert_eq!(shell_word("call_Ab-9.x"), "call_Ab-9.x");
+        assert_eq!(shell_word(""), "''");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("$(touch x)"), "'$(touch x)'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("a\nb'\x1b"), r"$'a\x0ab\'\x1b'");
+        // A bidi override would reorder the flags printed after it.
+        assert_eq!(shell_word("a\u{202e}b"), r"$'a\xe2\x80\xaeb'");
+    }
 
     #[test]
     fn agent_provider_names_the_providers_in_place_of_key_variables() {

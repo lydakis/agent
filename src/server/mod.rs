@@ -12,7 +12,10 @@ use agent_runtime::{
     fail, fail_with,
     output::{self, Output},
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Answer, Binding, Bot, Delivery, Fork, Publication, Started, Store, TurnOptions},
+    store::{
+        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, Publication, Started, Store,
+        TurnOptions, Waiting, Wake,
+    },
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -167,6 +170,11 @@ enum Command {
         /// Anthropic server-side fallbacks for this bot; off unless asked.
         #[serde(default)]
         fallbacks: bool,
+        /// A gate: tools whose calls wait for a verdict, the approver tag
+        /// that answers them, and how long a call may wait for it.
+        approve: Option<Vec<String>>,
+        approver: Option<String>,
+        approve_expire_ms: Option<u64>,
     },
     Resume {
         bot: String,
@@ -180,6 +188,10 @@ enum Command {
         budget_tokens: Option<u64>,
         created_by: Option<String>,
         created_by_id: Option<i64>,
+        /// A gate the fork adds to those it inherits.
+        approve: Option<Vec<String>>,
+        approver: Option<String>,
+        approve_expire_ms: Option<u64>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -267,6 +279,27 @@ enum Command {
         /// Answer on the first resolved handle; the rest are reported pending.
         #[serde(default)]
         any: bool,
+    },
+    /// One gate's verdict on the current request of a planned call.
+    Answer {
+        bot: String,
+        turn: i64,
+        call_id: String,
+        request: i64,
+        tag: Option<String>,
+        /// `allow` or `deny`.
+        decision: String,
+        reason: Option<String>,
+        /// A label for audit, the client's choice; not verified.
+        by: Option<String>,
+    },
+    /// Planned calls waiting on a gate, in announcement order.
+    Approvals {
+        bot: Option<String>,
+        tag: Option<String>,
+        #[serde(default)]
+        after: i64,
+        limit: Option<usize>,
     },
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
@@ -481,6 +514,9 @@ pub struct Configuration {
     /// Prune every bot to this many turns' records after each of its turns
     /// finishes; none by default.
     pub retain_turns: Option<usize>,
+    /// Milliseconds a gated call waits live for its verdict before its turn
+    /// parks; default 2,000.
+    pub approval_hold_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -556,6 +592,44 @@ fn workspace(path: &str) -> Result<String> {
         .ok_or(Error::new("workspace_not_utf8"))?
         .into())
 }
+/// A client's own gate: tools whose calls wait for a verdict, and the tag
+/// of the approver that answers. Both or neither; the daemon never reads
+/// the tag. A list longer than the `known` tools is refused before it is
+/// sorted, so its cost is bounded by the registry, not the request.
+fn gate(
+    approve: Option<Vec<String>>,
+    approver: Option<String>,
+    expire_ms: Option<u64>,
+    known: usize,
+) -> Result<Option<Gate>> {
+    match (approve, approver) {
+        (None, None) if expire_ms.is_none() => Ok(None),
+        (Some(tools), _) if tools.len() > known => fail_with(
+            "invalid_gate",
+            format!(
+                "approve names {} tools; the daemon has {known}",
+                tools.len()
+            ),
+        ),
+        (Some(mut tools), Some(tag)) if !tools.is_empty() => {
+            name(&tag).map_err(|_| Error::new("invalid_approver"))?;
+            if expire_ms.is_some_and(|ms| ms == 0 || ms > 86_400_000) {
+                return fail("invalid_approve_expiry");
+            }
+            tools.sort();
+            tools.dedup();
+            Ok(Some(Gate {
+                tag,
+                tools,
+                expire_ms,
+            }))
+        }
+        _ => fail_with(
+            "invalid_gate",
+            "approve needs a nonempty tool list and an approver tag",
+        ),
+    }
+}
 struct Service {
     store: Store,
     transport: Arc<Transport>,
@@ -585,12 +659,15 @@ struct Service {
     ready_hint: bool,
     /// Provider-reported tokens since this daemon started, for `stats`.
     tokens: Arc<turn::TokenTotals>,
-    /// Turns parked on a rate-limited pool, by resume time. Each holds no
-    /// task and no slot; the run loop resumes them as they come due.
-    paced: std::collections::BinaryHeap<std::cmp::Reverse<(u64, String, i64)>>,
+    /// Turns parked on a rate-limited pool, by resume time, turns parked
+    /// on a verdict, by when a gate lapses, and wake-ups the store lost, by
+    /// when they are tried again. Each holds no task and no slot; the run
+    /// loop resumes them as they come due.
+    wakes: Wakes,
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
+    approval_hold: Duration,
     /// Admissions queued with the storage worker and not yet answered,
     /// oldest first: the worker answers in queue order.
     admissions: std::collections::VecDeque<Admission>,
@@ -606,6 +683,48 @@ struct Service {
     /// publisher has not passed them, or a follow is still replaying toward
     /// them. Each keeps its room in its session's queue.
     unpublished: std::collections::VecDeque<Unpublished>,
+}
+
+/// Parked turns' wake times, at most one per turn: a turn that parks again
+/// replaces its time, and one resumed or ended another way drops it, so an
+/// answered verdict leaves no day-long lapse behind.
+#[derive(Default)]
+struct Wakes {
+    due: std::collections::BTreeSet<(u64, i64)>,
+    /// Per turn: its time, its bot, and whether the wake is the turn's own
+    /// time coming due rather than a retried answer or resolved handle.
+    turns: HashMap<i64, (u64, String, bool)>,
+}
+
+impl Wakes {
+    fn set(&mut self, at: u64, bot: String, turn: i64) {
+        self.retry(at, bot, turn, true);
+    }
+
+    /// A wake-up the store lost, tried again at `at` as it first came.
+    fn retry(&mut self, at: u64, bot: String, turn: i64, due: bool) {
+        if let Some((old, _, _)) = self.turns.insert(turn, (at, bot, due)) {
+            self.due.remove(&(old, turn));
+        }
+        self.due.insert((at, turn));
+    }
+
+    fn cancel(&mut self, turn: i64) {
+        if let Some((at, _, _)) = self.turns.remove(&turn) {
+            self.due.remove(&(at, turn));
+        }
+    }
+
+    fn next(&self) -> Option<u64> {
+        self.due.first().map(|&(at, _)| at)
+    }
+
+    fn pop(&mut self) -> Option<(String, i64, bool)> {
+        let (_, turn) = self.due.pop_first()?;
+        self.turns
+            .remove(&turn)
+            .map(|(_, bot, due)| (bot, turn, due))
+    }
 }
 
 struct Unpublished {
@@ -725,6 +844,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         Some(seconds) => Some(Duration::from_secs(seconds)),
         None => Some(agent_runtime::provider::KEEP_WARM),
     };
+    let approval_hold = Duration::from_millis(config.approval_hold_ms.unwrap_or(2000));
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let credentials = agent_runtime::tools::Credentials::default();
@@ -826,7 +946,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -836,7 +956,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             "cache_ttl":if config.cache_hour { "1h" } else { "5m" },
             "context_bytes":limits.context_bytes,"context_items":limits.context_items,
             "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
-            "retain_turns":config.retain_turns},
+            "retain_turns":config.retain_turns,"approval_hold_ms":approval_hold.as_millis() as u64},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "durability":"sqlite_full","partial_text_durable":false});
@@ -885,11 +1005,38 @@ pub async fn run(config: Configuration) -> Result<()> {
     let mut publisher = tokio::spawn(publish(publications, hub.clone(), handles.clone()));
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
-    let mut paced_at_start = Vec::new();
-    for waiting in store.op("waiting_turns", |db| db.waiting_turns()).await? {
+    let mut wakes = Wakes::default();
+    let parked = store
+        .op("waiting_turns", |db| {
+            let parked = db.waiting_turns()?;
+            let lapses = parked
+                .iter()
+                .map(|w| match w.approval || w.paced_since_ms.is_some() {
+                    true => Ok(None),
+                    false => db.next_lapse(w.turn),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(parked.into_iter().zip(lapses).collect::<Vec<_>>())
+        })
+        .await?;
+    for (waiting, lapse) in parked {
         if waiting.paced_since_ms.is_some() {
-            paced_at_start.push((waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn));
+            wakes.set(waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn);
             continue;
+        }
+        // A verdict park wakes on an answer, which may have committed
+        // before the restart, or when a gate lapses: check now as an answer
+        // would, and keep the lapse unless it has already passed.
+        if waiting.approval {
+            if let Some(at) = waiting.deadline_ms.filter(|&at| at > now_ms()) {
+                wakes.set(at, waiting.bot.clone(), waiting.turn);
+            }
+            handles.wake(waiting.bot, waiting.turn);
+            continue;
+        }
+        // A gated call later in the round ends the turn when it lapses.
+        if let Some(at) = lapse {
+            wakes.set(at, waiting.bot.clone(), waiting.turn);
         }
         handles
             .attach(
@@ -926,17 +1073,15 @@ pub async fn run(config: Configuration) -> Result<()> {
         // Queued turns that survived a restart start as capacity allows.
         ready_hint: true,
         tokens: Arc::default(),
-        paced: std::collections::BinaryHeap::new(),
+        wakes,
         draining: false,
+        approval_hold,
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
         storage_backoff: Duration::ZERO,
         ready_retry_at: None,
         unpublished: std::collections::VecDeque::new(),
     };
-    for (at, bot, turn) in paced_at_start {
-        service.paced.push(std::cmp::Reverse((at, bot, turn)));
-    }
     let idle_exit = config
         .idle_exit
         .filter(|_| config.socket.is_some())
@@ -957,7 +1102,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 break;
             }
             // Computed before the select so its arms borrow the service freely.
-            let (paced_due, paced_delay) = (service.paced.peek().is_some(), service.paced_delay());
+            let (wake_due, wake_delay) = (service.wakes.next().is_some(), service.wake_delay());
             let ready_retry = service.ready_retry_at;
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
@@ -982,7 +1127,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                 }
                 Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
-                    service.resume(bot, turn).await?;
+                    service.resume(bot, turn, false).await?;
                 }
                 // One queued turn per iteration, so requests interleave with a
                 // long backlog; resumes hold no slot and are not starved because
@@ -993,11 +1138,13 @@ pub async fn run(config: Configuration) -> Result<()> {
                 _ = tokio::time::sleep_until(ready_retry.unwrap_or_else(tokio::time::Instant::now)), if ready_retry.is_some() => {
                     service.ready_retry_at = None;
                 }
-                // A paced turn comes due: resume it like any parked turn, capacity
-                // permitting; a stale entry (interrupted, deleted) is dropped.
-                _ = tokio::time::sleep(paced_delay), if paced_due && service.has_capacity() => {
-                    if let Some(std::cmp::Reverse((_, bot, turn))) = service.paced.pop() {
-                        service.resume(bot, turn).await?;
+                // A parked turn's time comes due (a pool reopens, a gate lapses,
+                // a lost wake-up is retried): resume it like any parked turn,
+                // capacity permitting; a stale entry (deleted, or its name
+                // reused) is dropped.
+                _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
+                    if let Some((bot, turn, due)) = service.wakes.pop() {
+                        service.resume(bot, turn, due).await?;
                     }
                 }
                 // Queued admissions are answered as their commits land, in order.
@@ -1364,7 +1511,7 @@ impl Service {
             let steered = self.admissions.iter().any(|admission| {
                 matches!(&admission.pending, Pending::Submit { bot: queued, delivery: Delivery::Steer, .. } if *queued == bot)
             });
-            self.spawn(bot.clone(), started.turn, false, steered);
+            self.spawn(bot.clone(), started.turn, None, steered);
         }
         // The running turn may have started after the steer was queued, from
         // an admission answered in between.
@@ -1387,34 +1534,60 @@ impl Service {
         )
     }
 
-    /// How long until the earliest paced turn is due.
-    fn paced_delay(&self) -> Duration {
-        self.paced
-            .peek()
-            .map(|std::cmp::Reverse((at, _, _))| Duration::from_millis(at.saturating_sub(now_ms())))
+    /// How long until the earliest parked turn is due.
+    fn wake_delay(&self) -> Duration {
+        self.wakes
+            .next()
+            .map(|at| Duration::from_millis(at.saturating_sub(now_ms())))
             .unwrap_or(Duration::MAX)
     }
 
-    async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
-        // A wake-up can outlive an interrupt, deletion, or reuse of the name.
-        // Check only its identity and state, without loading the full bot.
-        let check = bot.clone();
-        let pending = match self
+    /// `due` marks a wake-up from the turn's own time rather than an
+    /// answer or a resolved handle.
+    async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
+        // A wake-up can outlive an interrupt, deletion, or reuse of the name,
+        // and one turn can get several (a restart's check and an answer). The
+        // job that checks its identity and state also claims it, so a later
+        // wake-up finds it running and is dropped; the claim also drops the
+        // turn's lapse, which would otherwise wait out the gate's expiry.
+        enum Claim {
+            Run(String, Waiting, bool),
+            Later(String, Option<u64>),
+            Stale,
+        }
+        let name = bot.clone();
+        let claimed = match self
             .store
-            .op("can_resume", move |db| db.can_resume(&check, turn))
+            .op("resume", move |db| match db.wake(&name, turn, due)? {
+                Wake::Resume => match db.resume(turn) {
+                    Ok((waiting, _, steers)) => Ok(Claim::Run(name, waiting, steers)),
+                    Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
+                    Err(error) => Err(error),
+                },
+                Wake::Later(at) => Ok(Claim::Later(name, at)),
+                Wake::Stale => Ok(Claim::Stale),
+            })
             .await
         {
             // A lost group (a full disk, say) leaves the turn parked: the
-            // wake-up comes due again after a backoff, as a paced one does.
+            // same wake-up comes due again after a backoff.
             Err(error) if error.code == "storage_error" => {
                 let at = now_ms() + self.storage_retry().as_millis() as u64;
-                self.paced.push(std::cmp::Reverse((at, bot, turn)));
+                self.wakes.retry(at, bot, turn, due);
                 return Ok(());
             }
-            pending => pending?,
+            claimed => claimed?,
         };
-        if pending {
-            self.spawn(bot, turn, true, false);
+        self.storage_backoff = Duration::ZERO;
+        match claimed {
+            Claim::Run(bot, waiting, steers) => {
+                self.wakes.cancel(turn);
+                self.spawn(bot, turn, Some(waiting), steers);
+            }
+            // Still parked: its next lapse may have moved, or gone.
+            Claim::Later(bot, Some(at)) => self.wakes.set(at, bot, turn),
+            Claim::Later(_, None) => self.wakes.cancel(turn),
+            Claim::Stale => {}
         }
         Ok(())
     }
@@ -1458,7 +1631,7 @@ impl Service {
             })
             .await
         {
-            Ok((_, steers)) => self.spawn(bot, turn, false, steers),
+            Ok((_, steers)) => self.spawn(bot, turn, None, steers),
             Err(error) if error.code == "bot_busy" => {}
             // Nothing was written: the turn is still ready.
             Err(error) if error.code == "storage_error" => return Err(error),
@@ -1506,7 +1679,7 @@ impl Service {
     }
 
     /// Run a turn as a task: fresh after submission, or resuming a parked one.
-    fn spawn(&mut self, bot: String, turn: i64, resume: bool, steers: bool) {
+    fn spawn(&mut self, bot: String, turn: i64, resumed: Option<Waiting>, steers: bool) {
         let (cancel, cancelled) = watch::channel(None);
         self.next_task += 1;
         let task_id = self.next_task;
@@ -1537,7 +1710,8 @@ impl Service {
             note_turns: self.limits.note_turns,
             compact_at: self.limits.compact_at,
             compact_keep: self.limits.compact_keep,
-            resume,
+            resumed,
+            approval_hold: self.approval_hold,
             steers,
             tokens: self.tokens.clone(),
         };
@@ -1578,23 +1752,19 @@ impl Service {
             // A slot opened, and a finish may promote the bot's next turn.
             self.ready_hint = true;
         }
-        if !matches!(exit, turn::Exit::Unresumed) {
-            self.storage_backoff = Duration::ZERO;
-        }
+        self.storage_backoff = Duration::ZERO;
         match exit {
             turn::Exit::Finished(_) => {
                 // Interrupt may already have released the task's active slot.
                 // Finishing still promotes queued work in that case.
                 self.ready_hint = true;
             }
-            turn::Exit::Paced(at) => self.paced.push(std::cmp::Reverse((at, bot, turn))),
-            turn::Exit::Parked => {}
-            // The store refused its resume, so it is still parked: its
-            // wake-up comes due again after a backoff.
-            turn::Exit::Unresumed => {
-                let at = now_ms() + self.storage_retry().as_millis() as u64;
-                self.paced.push(std::cmp::Reverse((at, bot, turn)));
+            // A wake-up may already have claimed the turn again.
+            turn::Exit::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
+                self.wakes.set(at, bot, turn)
             }
+            turn::Exit::Paced(_) => {}
+            turn::Exit::Parked => {}
         }
         Ok(())
     }
@@ -1622,10 +1792,19 @@ impl Service {
                 compaction_instructions,
                 compaction_model,
                 fallbacks,
+                approve,
+                approver,
+                approve_expire_ms,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
+                let gate = gate(
+                    approve,
+                    approver,
+                    approve_expire_ms,
+                    self.registry.tool_count(),
+                )?;
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;
@@ -1689,6 +1868,7 @@ impl Service {
                                 compaction_instructions: compaction_instructions.as_deref(),
                                 compaction_model: compaction_model.as_deref(),
                                 fallbacks,
+                                gate: gate.as_ref(),
                             },
                         )?;
                         Ok((serde_json::to_value(created)?, event["cursor"].as_i64()))
@@ -1830,10 +2010,17 @@ impl Service {
                     .await
             }
             Command::Stats => {
-                let (waiting, running, queued, paced, pending_bytes) = store
+                let (waiting, running, queued, paced, pending_bytes, approvals) = store
                     .op("counts", |db| {
                         let (waiting, running, queued, paced) = db.counts()?;
-                        Ok((waiting, running, queued, paced, db.pending()?.1))
+                        Ok((
+                            waiting,
+                            running,
+                            queued,
+                            paced,
+                            db.pending()?.1,
+                            db.approval_requests()?,
+                        ))
                     })
                     .await?;
                 let (waiters, retained) = self.handles.stats();
@@ -1848,6 +2035,7 @@ impl Service {
                     "active_limit": self.limit_active,
                     "waiting_turns": waiting,
                     "paced_turns": paced,
+                    "approval_requests": approvals,
                     "queued_turns": queued,
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
@@ -1862,6 +2050,74 @@ impl Service {
                     "handles": {"waiters": waiters, "retained": retained},
                     "draining": self.draining,
                 }))
+            }
+            Command::Answer {
+                bot,
+                turn,
+                call_id,
+                request,
+                tag,
+                decision,
+                reason,
+                by,
+            } => {
+                let allow = match decision.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    _ => return fail_with("invalid_decision", "allow or deny"),
+                };
+                if call_id.is_empty() {
+                    return fail("invalid_call_id");
+                }
+                if let Some(tag) = &tag {
+                    name(tag).map_err(|_| Error::new("invalid_approver"))?;
+                }
+                // The model sees a denial's reason; an allow has no use for one.
+                if allow && reason.is_some() {
+                    return fail_with("invalid_reason", "only a deny carries a reason");
+                }
+                if reason.as_ref().is_some_and(|r| r.len() > 16 * 1024) {
+                    return fail("reason_limit");
+                }
+                if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
+                    return fail("invalid_by");
+                }
+                let name = bot.clone();
+                let answered = store
+                    .op("answer", move |db| {
+                        db.answer(Decision {
+                            bot: &name,
+                            turn,
+                            call_id: &call_id,
+                            request,
+                            tag: tag.as_deref(),
+                            allow,
+                            reason: reason.as_deref(),
+                            by: by.as_deref(),
+                        })
+                    })
+                    .await?;
+                // The answer is durable or held by the worker by now; only
+                // then does the turn look for it.
+                if let Some(notify) = answered.notify {
+                    notify.notify_one();
+                }
+                if answered.resume {
+                    self.handles.wake(bot, turn);
+                }
+                Ok(answered.reply)
+            }
+            Command::Approvals {
+                bot,
+                tag,
+                after,
+                limit,
+            } => {
+                store
+                    .op("approvals", move |db| {
+                        db.approvals(bot.as_deref(), tag.as_deref(), after, limit.unwrap_or(64))
+                    })
+                    .await
             }
             Command::Wait {
                 handles,
@@ -1911,10 +2167,19 @@ impl Service {
                 budget_tokens,
                 created_by,
                 created_by_id,
+                approve,
+                approver,
+                approve_expire_ms,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
+                let gate = gate(
+                    approve,
+                    approver,
+                    approve_expire_ms,
+                    self.registry.tool_count(),
+                )?;
                 name(&bot)?;
                 if let Some(creator) = &created_by {
                     name(creator)?;
@@ -1931,6 +2196,7 @@ impl Service {
                                 budget_tokens,
                                 created_by: created_by.as_deref(),
                                 created_by_id,
+                                gate: gate.as_ref(),
                             },
                         )
                     })
@@ -2145,8 +2411,9 @@ impl Service {
                     })
                     .await?;
                 // Only once the end commits: a refused one leaves the turn
-                // parked, and its wait must still wake it.
+                // parked, and its wait or lapse must still wake it.
                 self.handles.forget(Waiter::Turn(turn));
+                self.wakes.cancel(turn);
                 self.ready_hint = true;
                 Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
             }
@@ -2511,6 +2778,7 @@ mod tests {
                         compaction_instructions: None,
                         compaction_model: None,
                         fallbacks: false,
+                        gate: None,
                     },
                 )?;
                 let turn = db
@@ -2588,8 +2856,9 @@ mod tests {
             retention: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
-            paced: std::collections::BinaryHeap::new(),
+            wakes: Wakes::default(),
             draining: false,
+            approval_hold: Duration::from_secs(2),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
@@ -2719,6 +2988,7 @@ mod tests {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            gate: None,
         };
         let turn = store
             .op("create", move |db| {
@@ -2792,8 +3062,9 @@ mod tests {
             retention: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
-            paced: std::collections::BinaryHeap::new(),
+            wakes: Wakes::default(),
             draining: false,
+            approval_hold: Duration::from_secs(2),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
@@ -2833,7 +3104,7 @@ mod tests {
         // Missing providers make the real turn tasks finish without network I/O.
         // Their durable completion must not depend on the service reaping them.
         for (bot, turn) in &turns {
-            service.spawn(bot.clone(), *turn, false, false);
+            service.spawn(bot.clone(), *turn, None, false);
         }
         let mut results = Vec::new();
         while let Some(result) = service.jobs.join_next().await {
@@ -2951,6 +3222,7 @@ mod tests {
                                 compaction_instructions: None,
                                 compaction_model: None,
                                 fallbacks: false,
+                                gate: None,
                             },
                         )?;
                         let turn = db
@@ -3004,8 +3276,9 @@ mod tests {
             retention: JoinSet::new(),
             ready_hint: false,
             tokens: Arc::default(),
-            paced: std::collections::BinaryHeap::new(),
+            wakes: Wakes::default(),
             draining: false,
+            approval_hold: Duration::from_secs(2),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
@@ -3053,7 +3326,7 @@ mod tests {
         refuse_bobs_finish(&path, true);
         let mut service = bare_service(&store);
         for (bot, turn) in &turns {
-            service.spawn(bot.clone(), *turn, false, false);
+            service.spawn(bot.clone(), *turn, None, false);
         }
         // Alice finishes while Bob's completion keeps failing; nothing ends
         // the daemon, and Bob stays durably busy.
@@ -3142,7 +3415,7 @@ mod tests {
         refuse(true);
         let mut service = bare_service(&store);
         service.retain_turns = Some(1);
-        service.spawn("Bob".into(), last, false, false);
+        service.spawn("Bob".into(), last, None, false);
         finish_errors(&store, 2).await;
         let status = || {
             let store = store.clone();
@@ -3177,7 +3450,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         refuse_bobs_finish(&path, true);
         let mut service = bare_service(&store);
-        service.spawn("Bob".into(), bob, false, false);
+        service.spawn("Bob".into(), bob, None, false);
         finish_errors(&store, 2).await;
         assert!(
             service.active["Bob"].cancel(turn::INTERRUPTED),
@@ -3240,6 +3513,7 @@ mod tests {
                         compaction_instructions: None,
                         compaction_model: None,
                         fallbacks: false,
+                        gate: None,
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -3323,22 +3597,23 @@ mod tests {
                         compaction_instructions: None,
                         compaction_model: None,
                         fallbacks: false,
+                        gate: None,
                     },
                 )
                 .map(|_| ())
             })
             .await
             .unwrap();
-        let (resumed, ()) = tokio::join!(service.resume("Bob".into(), bob), async {
+        let (resumed, ()) = tokio::join!(service.resume("Bob".into(), bob, false), async {
             gate.send(()).unwrap();
         });
         resumed.unwrap();
         assert_eq!(held.await.unwrap_err().code, "storage_error");
         assert_eq!(lost.await.unwrap_err().code, "storage_error");
         assert!(service.active.is_empty());
-        let std::cmp::Reverse((at, bot, turn)) = service.paced.peek().unwrap();
-        assert_eq!((bot.as_str(), *turn), ("Bob", bob), "due again");
-        assert!(*at > now_ms() - 1000);
+        let (at, bot, due) = service.wakes.turns[&bob].clone();
+        assert_eq!((bot.as_str(), due), ("Bob", false), "due again, as it came");
+        assert!(at > now_ms() - 1000);
         assert!(service.storage_backoff > Duration::ZERO);
         drop(service);
         drop(store);
@@ -3470,36 +3745,32 @@ mod tests {
             })
             .await
             .unwrap();
-        // The wake-up's check only reads, so it passes; the resume's own
-        // write is what the store refuses.
+        // The claim's own write is what the store refuses.
         lose_bobs_status_changes(&path, true);
         let mut service = admitting(&store, 1024);
-        service.resume("Bob".into(), bob).await.unwrap();
-        assert!(service.active.contains_key("Bob"), "the check passed");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while store.stats()["operations"]["resume"]["storage_errors"]
-            .as_u64()
-            .unwrap_or(0)
-            == 0
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "resume never failed"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        service.resume("Bob".into(), bob, true).await.unwrap();
+        assert!(service.active.is_empty(), "nothing claimed");
+        let status = || {
+            let store = store.clone();
+            async move {
+                store
+                    .call(move |db| db.turn_status("Bob", bob))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status().await, "paced", "still parked, not ended");
+        assert!(service.storage_backoff > Duration::ZERO);
+        let (bot, turn, due) = service.wakes.pop().unwrap();
+        assert_eq!((bot.as_str(), turn, due), ("Bob", bob, true), "due again");
+        // Once the store takes writes again, the same wake-up resumes it.
         lose_bobs_status_changes(&path, false);
+        service.resume(bot, turn, due).await.unwrap();
+        assert!(service.active.contains_key("Bob"));
+        assert_eq!(service.storage_backoff, Duration::ZERO);
         let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
         service.complete(bot, turn, task, exit).await.unwrap();
-        let status = store
-            .call(move |db| db.turn_status("Bob", bob))
-            .await
-            .unwrap();
-        assert_eq!(status, "paced", "still parked, not ended");
-        assert!(service.active.is_empty());
-        let std::cmp::Reverse((_, bot, turn)) = service.paced.peek().unwrap();
-        assert_eq!((bot.as_str(), *turn), ("Bob", bob), "due again");
-        assert!(service.storage_backoff > Duration::ZERO);
+        assert_eq!(status().await, "failed", "the provider was missing");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -3515,7 +3786,7 @@ mod tests {
         refuse_bobs_finish(&path, true);
         let mut service = bare_service(&store);
         let bob = turns[0].1;
-        service.spawn("Bob".into(), bob, false, false);
+        service.spawn("Bob".into(), bob, None, false);
         // An interrupt that lands first keeps its cause; shutdown releasing
         // the slot still stops the retries.
         assert!(service.active["Bob"].cancel(turn::INTERRUPTED));
@@ -3565,6 +3836,9 @@ mod tests {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            approve: None,
+            approver: None,
+            approve_expire_ms: None,
         }
     }
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -4246,6 +4520,111 @@ mod tests {
         service.complete(bot, turn, task, exit).await.unwrap();
         let status = store.call(|db| db.turn_status("A", 1)).await.unwrap();
         assert_eq!(status, "interrupted");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Bob with one turn parked on a `wait` for a process that never ends.
+    async fn parked_on_wait(store: &Store) -> i64 {
+        let turn = running(store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                let call = agent_runtime::provider::ToolCall {
+                    name: "wait".into(),
+                    call_id: "wait-1".into(),
+                    arguments: r#"{"handles":["proc:1"]}"#.into(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                db.tool_start(turn, &call)?;
+                db.suspend(
+                    turn,
+                    &call.call_id,
+                    &["proc:1".into()],
+                    None,
+                    false,
+                    &[],
+                    None,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        turn
+    }
+
+    #[tokio::test]
+    async fn a_parked_turn_woken_twice_resumes_once_and_drops_its_lapse() {
+        let dir = scratch("double-wake");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = parked_on_wait(&store).await;
+        let mut service = bare_service(&store);
+        service.registry = Registry::new("wait").unwrap();
+        // Parked with a day-long lapse, then woken twice (a restart's check
+        // and an answer) before the first task runs at all.
+        service
+            .complete(
+                "Bob".into(),
+                turn,
+                0,
+                Ok(turn::Exit::Paced(now_ms() + 86_400_000)),
+            )
+            .await
+            .unwrap();
+        service.resume("Bob".into(), turn, false).await.unwrap();
+        service.resume("Bob".into(), turn, false).await.unwrap();
+        assert_eq!(service.jobs.len(), 1, "one task for the turn");
+        assert_eq!(service.wakes.next(), None, "the claim dropped the lapse");
+        let task = service.active["Bob"].task;
+        // Missing providers make the resumed task fail without network I/O.
+        let (bot, id, finished, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        assert_eq!(finished, task);
+        service.complete(bot, id, finished, exit).await.unwrap();
+        assert!(service.active.is_empty());
+        store
+            .call(move |db| {
+                assert_eq!(db.turn_status("Bob", turn)?, "failed");
+                let events = db.events("Bob", 0, 256)?;
+                let resumed = events["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event"] == "turn_resumed")
+                    .count();
+                assert_eq!(resumed, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_handle_wake_up_is_retried_as_a_handle_wake_up() {
+        let dir = scratch("lost-handle-wake");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turn = parked_on_wait(&store).await;
+        let mut service = bare_service(&store);
+        service.registry = Registry::new("wait").unwrap();
+        // The wait's handle resolved, but the claim's write is lost.
+        lose_bobs_status_changes(&path, true);
+        service.resume("Bob".into(), turn, false).await.unwrap();
+        assert!(service.active.is_empty());
+        lose_bobs_status_changes(&path, false);
+        // Its own time would find no lapse and leave it parked for good;
+        // the retry resumes it as the handle did.
+        let (bot, id, due) = service.wakes.pop().unwrap();
+        assert_eq!((bot.as_str(), id, due), ("Bob", turn, false));
+        service.resume(bot, id, due).await.unwrap();
+        assert!(service.active.contains_key("Bob"), "resumed");
+        let (bot, id, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, id, task, exit).await.unwrap();
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

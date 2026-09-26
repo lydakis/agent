@@ -192,7 +192,8 @@ and host isolation remain caller responsibilities.
 Keep one policy boundary before tool execution, carrying bot, session, turn,
 tool-call identity, tool name, and arguments. The first policy allows registered
 tools. Leave room for allow/deny/request-input decisions without building an
-approval UI or a policy language now. Report the effective policy on inspection;
+approval UI or a policy language now. Tool approval ([APPROVALS.md](APPROVALS.md))
+builds on this boundary as per-bot gates; full access stays the default. Report the effective policy on inspection;
 future requests and answers must remain scoped to the originating tool call.
 Full access does not disable argument validation, cancellation, resource limits,
 or secret-safe event handling. It does not bypass host or provider restrictions

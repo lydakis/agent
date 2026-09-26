@@ -16,6 +16,9 @@ import unittest
 from bench.targets import clean_env
 from bench.runtime_client import Client, serve_args
 
+# Longer than 256 bytes, with text a shell would run if pasted unquoted.
+ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
+
 
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -183,17 +186,52 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'detach-1',
                            'arguments': json.dumps({'command': user[7:], 'detach': True})}]
+            elif user.startswith('multi:'):
+                # One response planning several commands, in order.
+                text = ''
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'shell-{i + 1}',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})}
+                          for i, command in enumerate(user[6:].split('|'))]
+            elif user.startswith('waitshell:'):
+                # A wait, then a command, in one response.
+                text = ''
+                handle, _, command = user[10:].partition('|')
+                output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
+                           'arguments': json.dumps({'handles': [handle]})},
+                          {'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})}]
             elif user.startswith('shell:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
                            'arguments': json.dumps({'command': user[6:], 'timeout_ms': 2000})}]
+            elif user.startswith('shellecho:'):
+                # A command, then an echo, in one response.
+                text = ''
+                command, _, echoed = user[10:].partition('|')
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})},
+                          {'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
+                           'arguments': json.dumps({'text': echoed})}]
+            elif user.startswith('echoshell:'):
+                # An echo, then a command, in one response.
+                text = ''
+                echoed, _, command = user[10:].partition('|')
+                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
+                           'arguments': json.dumps({'text': echoed})},
+                          {'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
+                           'arguments': json.dumps({'command': command, 'timeout_ms': 2000})}]
+            elif user.startswith('oddshell:'):
+                # A long call id a shell would read as syntax.
+                text = ''
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': ODD_CALL_ID,
+                           'arguments': json.dumps({'command': user[9:], 'timeout_ms': 2000})}]
             elif user.startswith('tool:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',
                            'arguments': json.dumps({'text': getattr(self.server, 'note_text', user[5:])})}]
             elif user == 'large-call-id':
                 text = ''
-                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 210000,
+                output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 65536,
                            'arguments': json.dumps({'text': 'ok'})}]
             else:
                 text = getattr(self.server, 'reply_text', 'reply:' + user)
@@ -1338,7 +1376,8 @@ class RuntimeTests(ModelFixture):
     def test_large_event_replay_pages_preserve_all_events_and_service_liveness(self):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
-        for index in range(3):
+        # Call ids at the 64 KiB bound, enough of them to need several pages.
+        for index in range(12):
             turn = client.request('submit', bot='Bob', request_id=str(index), prompt='large-call-id')['result']['turn']
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         cursor, events, nonempty_pages = 0, [], 0
@@ -1354,9 +1393,9 @@ class RuntimeTests(ModelFixture):
             nonempty_pages += 1
         self.assertGreater(nonempty_pages, 1)
         self.assertEqual(len({e['cursor'] for e in events}), len(events))
-        self.assertEqual(sum(e['event'] == 'tool_started' for e in events), 3)
-        self.assertEqual(sum(e['event'] == 'tool_completed' for e in events), 3)
-        self.assertEqual(sum(e['event'] == 'turn_finished' for e in events), 3)
+        self.assertEqual(sum(e['event'] == 'tool_started' for e in events), 12)
+        self.assertEqual(sum(e['event'] == 'tool_completed' for e in events), 12)
+        self.assertEqual(sum(e['event'] == 'turn_finished' for e in events), 12)
         self.assertEqual(client.request('resume', bot='Bob')['result']['status'], 'completed')
 
     def test_distinct_store_files_do_not_collide_and_symlink_resume_is_exact(self):

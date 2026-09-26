@@ -2,7 +2,10 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, TurnOptions},
+    store::{
+        Answered, Binding, Bot, CompactionPlan, Database, Decision, Delivery, Fork, Gate, Gated,
+        Planning, TurnOptions, Wake,
+    },
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -37,6 +40,7 @@ fn binding() -> Binding<'static> {
         compaction_instructions: None,
         compaction_model: None,
         fallbacks: false,
+        gate: None,
     }
 }
 /// Compaction planning as a turn runs it: a catch-up walk goes in pieces.
@@ -71,6 +75,7 @@ fn result(output: &str) -> Outcome {
         output: output.into(),
         artifacts: Vec::new(),
         note: None,
+        failed: false,
     }
 }
 
@@ -345,6 +350,7 @@ fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
                     compaction_instructions: None,
                     compaction_model: None,
                     fallbacks: false,
+                    gate: None,
                     ..binding()
                 },
             )
@@ -453,6 +459,7 @@ fn restart_repairs_unanswered_tools_once_including_previously_blocked_bots() {
                     compaction_instructions: None,
                     compaction_model: None,
                     fallbacks: false,
+                    gate: None,
                     ..binding()
                 },
             )
@@ -588,6 +595,478 @@ fn tool_results_and_cursor_events_commit_together() {
     );
 }
 
+/// A running turn of Bob, whose `shell` calls wait on a `manual` gate.
+fn gated_turn(db: &mut Database, expire_ms: Option<u64>) -> i64 {
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["shell".into()],
+        expire_ms,
+    };
+    let binding = Binding {
+        tools: &tools,
+        gate: Some(&gate),
+        ..binding()
+    };
+    db.create("Bob", Some("/synthetic"), binding).unwrap();
+    db.begin(
+        "Bob",
+        "request",
+        "work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    )
+    .unwrap()
+    .turn
+}
+/// A shell call and the Responses item, with its own item id, planning it.
+fn shell_call(item_id: &str, call_id: &str, command: &str) -> (Bytes, ToolCall) {
+    let arguments = json!({"command":command}).to_string();
+    let item = json!({"type":"function_call","id":item_id,"call_id":call_id,
+        "name":"shell","arguments":arguments});
+    let call = ToolCall {
+        name: "shell".into(),
+        call_id: call_id.into(),
+        arguments,
+    };
+    (serde_json::to_vec(&item).unwrap().into(), call)
+}
+fn allow(db: &mut Database, turn: i64, call_id: &str) -> Result<Answered> {
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id,
+        request: 1,
+        tag: None,
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    })
+}
+
+#[test]
+fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, Some(1));
+    // The first item's own id is the second call's id.
+    let (first, s1) = shell_call("s2", "s1", "true");
+    let (second, s2) = shell_call("fc_2", "s2", "ls");
+    db.append(turn, vec![first, second], &[s1.clone(), s2], None)
+        .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let listed = listed["approvals"].as_array().unwrap();
+    let [first, second] = &listed[..] else {
+        panic!("{listed:?}")
+    };
+    assert_eq!(second["call_id"], "s2");
+    assert_eq!(second["arguments"], json!({"command":"ls"}));
+    assert_eq!(second["arguments_cut"], json!([]));
+    assert_eq!(second["arguments_omitted"], 0);
+    assert_eq!(
+        second["node"].as_i64(),
+        first["node"].as_i64().map(|n| n + 1)
+    );
+    // An answer after the gate's expiry is refused, even before the turn
+    // gets to deny the call for it.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let late = allow(&mut db, turn, "s1");
+    assert_eq!(
+        late.err().map(|e| e.to_string()).as_deref(),
+        Some("approval_expired")
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(matches!(
+        db.approval_start(turn, &s1, now_ms).unwrap(),
+        Gated::Expired
+    ));
+}
+
+/// Create `name` with one gate on `shell`, delegated by `creator`.
+fn gated_bot(
+    db: &mut Database,
+    name: &str,
+    tag: &str,
+    expire_ms: Option<u64>,
+    creator: Option<&Bot>,
+) -> Result<Bot> {
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: tag.into(),
+        tools: vec!["shell".into()],
+        expire_ms,
+    };
+    let binding = Binding {
+        tools: &tools,
+        gate: Some(&gate),
+        created_by: creator.map(|c| c.name.as_str()),
+        created_by_id: creator.map(|c| c.id),
+        ..binding()
+    };
+    Ok(db.create(name, Some("/synthetic"), binding)?.0)
+}
+
+#[test]
+fn gates_are_capped_before_a_bot_is_written() {
+    let mut db = db();
+    let mut creator = gated_bot(&mut db, "g0", "t0", None, None).unwrap();
+    for i in 1..8 {
+        creator = gated_bot(
+            &mut db,
+            &format!("g{i}"),
+            &format!("t{i}"),
+            None,
+            Some(&creator),
+        )
+        .unwrap();
+    }
+    assert_eq!(creator.gates.len(), 8);
+    let refused = gated_bot(&mut db, "g8", "t8", None, Some(&creator));
+    assert_eq!(
+        refused.err().map(|e| e.to_string()).as_deref(),
+        Some("gate_limit: 8")
+    );
+    // Nothing was written: the name is still free.
+    gated_bot(&mut db, "g8", "t8", None, None).unwrap();
+}
+
+#[test]
+fn an_expiry_that_came_first_beats_a_later_denial() {
+    let mut db = db();
+    let ann = gated_bot(&mut db, "Ann", "second", None, None).unwrap();
+    gated_bot(&mut db, "Bob", "manual", Some(1), Some(&ann)).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // The other gate may still deny, but `manual` lapsed first.
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: Some("second"),
+        allow: false,
+        reason: Some("no"),
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, u64::MAX).unwrap(),
+        Gated::Expired
+    ));
+}
+
+#[test]
+fn a_deny_decides_the_call_and_later_answers_are_refused() {
+    let mut db = db();
+    let ann = gated_bot(&mut db, "Ann", "second", None, None).unwrap();
+    gated_bot(&mut db, "Bob", "manual", None, Some(&ann)).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let long = "y".repeat(16 * 1024);
+    let answer = |db: &mut Database, tag, allow, reason| {
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: "s1",
+            request: 1,
+            tag: Some(tag),
+            allow,
+            reason,
+            by: Some("test"),
+        })
+    };
+    let denied = answer(&mut db, "manual", false, Some("no")).unwrap();
+    assert_eq!(denied.reply["pending"], json!([]));
+    // Neither verdict nor reason is kept once the call is denied.
+    for (allow, reason) in [(true, None), (false, Some(long.as_str()))] {
+        let late = answer(&mut db, "second", allow, reason);
+        assert_eq!(
+            late.err().map(|e| e.to_string()).as_deref(),
+            Some("approval_already_answered")
+        );
+    }
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Denied
+    ));
+}
+
+#[test]
+fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "write".to_owned()];
+    let gate = |tag: &str, tool: &str, expire_ms| Gate {
+        tag: tag.into(),
+        tools: vec![tool.into()],
+        expire_ms,
+    };
+    let (slow, quick) = (
+        gate("slow", "shell", None),
+        gate("quick", "write", Some(50)),
+    );
+    let create = |db: &mut Database, name, gate, creator: Option<&Bot>| {
+        let binding = Binding {
+            tools: &tools,
+            gate: Some(gate),
+            created_by: creator.map(|c| c.name.as_str()),
+            created_by_id: creator.map(|c| c.id),
+            ..binding()
+        };
+        db.create(name, Some("/synthetic"), binding).unwrap().0
+    };
+    let ann = create(&mut db, "Ann", &slow, None);
+    create(&mut db, "Bob", &quick, Some(&ann));
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // The first call waits on a gate with no expiry; the second one's lapses.
+    let (first, s1) = shell_call("fc_1", "s1", "true");
+    let arguments = json!({"path":"note.txt","content":"x"}).to_string();
+    let second = json!({"type":"function_call","id":"fc_2","call_id":"w1",
+        "name":"write","arguments":arguments});
+    let w1 = ToolCall {
+        name: "write".into(),
+        call_id: "w1".into(),
+        arguments,
+    };
+    let round = [s1.clone(), w1];
+    db.append(
+        turn,
+        vec![first, serde_json::to_vec(&second).unwrap().into()],
+        &round,
+        None,
+    )
+    .unwrap();
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let Gated::Pending {
+        expires_ms: Some(lapse),
+        ..
+    } = db.approval_start(turn, &s1, now_ms()).unwrap()
+    else {
+        panic!("the first call waits until the second call's gate lapses")
+    };
+    // Parked on the first call, the turn wakes when the second one lapses.
+    assert_eq!(
+        db.suspend_approval(turn, &round, now_ms(), None).unwrap(),
+        Some(Some(lapse))
+    );
+    assert!(matches!(
+        db.wake("Bob", turn, true).unwrap(),
+        Wake::Later(Some(at)) if at == lapse
+    ));
+    while now_ms() < lapse {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(matches!(db.wake("Bob", turn, true).unwrap(), Wake::Resume));
+    db.resume(turn).unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &s1, now_ms()).unwrap(),
+        Gated::Lapsed
+    ));
+}
+
+#[test]
+fn a_long_field_hides_no_other_in_a_listing() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    // Keys sort, so the long field comes first, as `content` does before
+    // `path` in an Anthropic `write`.
+    let arguments = json!({"aaa":"x".repeat(5000),"command":"ls"}).to_string();
+    let item = json!({"type":"function_call","id":"fc_1","call_id":"s1",
+        "name":"shell","arguments":arguments});
+    let call = ToolCall {
+        name: "shell".into(),
+        call_id: "s1".into(),
+        arguments,
+    };
+    db.append(
+        turn,
+        vec![serde_json::to_vec(&item).unwrap().into()],
+        &[call],
+        None,
+    )
+    .unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let [listed] = &page["approvals"].as_array().unwrap()[..] else {
+        panic!("{page}")
+    };
+    assert_eq!(listed["arguments"]["command"], "ls");
+    assert_eq!(
+        listed["arguments"]["aaa"].as_str().map(str::len),
+        Some(2048)
+    );
+    assert_eq!(listed["arguments_cut"], json!(["aaa"]));
+}
+
+#[test]
+fn a_round_of_long_call_ids_is_announced_in_events_that_page() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let planned: Vec<(Bytes, ToolCall)> = (1..=12)
+        .map(|n| {
+            shell_call(
+                &format!("fc_{n}"),
+                &format!("{n:02}{}", "c".repeat(60 << 10)),
+                "true",
+            )
+        })
+        .collect();
+    let (items, calls): (Vec<Bytes>, Vec<ToolCall>) = planned.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    // Every event pages, and together they announce each call once, in order.
+    let (mut announced, mut events, mut after) = (Vec::new(), 0, 0);
+    loop {
+        let page = db.events("Bob", after, 256).unwrap();
+        let page_events = page["events"].as_array().unwrap();
+        if page_events.is_empty() {
+            break;
+        }
+        for event in page_events
+            .iter()
+            .filter(|e| e["event"] == "approval_requested")
+        {
+            events += 1;
+            for call in event["data"]["calls"].as_array().unwrap() {
+                announced.push(call["call_id"].as_str().unwrap().to_owned());
+            }
+        }
+        after = page["next_cursor"].as_i64().unwrap();
+    }
+    assert!(events > 1, "one event would be over the page bound");
+    assert_eq!(
+        announced,
+        calls.iter().map(|c| c.call_id.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let planned: Vec<(Bytes, ToolCall)> = (1..=4)
+        .map(|n| shell_call(&format!("fc_{n}"), &format!("s{n}"), "true"))
+        .collect();
+    let (items, calls): (Vec<Bytes>, Vec<ToolCall>) = planned.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    allow(&mut db, turn, "s1").unwrap();
+    allow(&mut db, turn, "s2").unwrap();
+    // A caller pages past the answered calls to s3.
+    let page = db.approvals(Some("Bob"), None, 0, 1).unwrap();
+    assert_eq!(page["approvals"][0]["call_id"], "s3");
+    let after = page["next_after"].as_i64().unwrap();
+    // Then s1 fails, and s2 needs a verdict again.
+    assert!(matches!(
+        db.approval_start(turn, &calls[0], 0).unwrap(),
+        Gated::Started
+    ));
+    let failed = Outcome {
+        failed: true,
+        ..result("{}")
+    };
+    db.tool_finish(turn, "s1", &failed).unwrap();
+    let mut seen = Vec::new();
+    let mut after = json!(after);
+    while let Some(from) = after.as_i64() {
+        let page = db.approvals(Some("Bob"), None, from, 1).unwrap();
+        for call in page["approvals"].as_array().unwrap() {
+            seen.push((call["call_id"].clone(), call["request"].clone()));
+        }
+        after = page["next_after"].clone();
+    }
+    assert_eq!(
+        seen,
+        [
+            (json!("s2"), json!(2)),
+            (json!("s3"), json!(2)),
+            (json!("s4"), json!(2))
+        ]
+    );
+}
+
+#[test]
+fn a_call_larger_than_a_page_still_fills_one() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", &"h".repeat(300 * 1024), "true");
+    db.append(turn, vec![item], &[call], None).unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    assert_eq!(page["approvals"].as_array().unwrap().len(), 1);
+    assert!(page["next_after"].is_null());
+}
+
+#[test]
+fn held_verdicts_follow_the_group_that_holds_them() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    // An allow held for a running turn goes with a group that fails to
+    // commit: its approver was told the answer failed.
+    db.begin_group().unwrap();
+    assert!(allow(&mut db, turn, "s1").unwrap().notify.is_some());
+    db.abandon_group().unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Pending { .. }
+    ));
+    // One that committed survives a later group that consumed it and failed.
+    db.begin_group().unwrap();
+    allow(&mut db, turn, "s1").unwrap();
+    db.commit_group().unwrap();
+    db.begin_group().unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
+    ));
+    db.abandon_group().unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Started
+    ));
+}
+
 #[test]
 fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     let mut db = db();
@@ -618,6 +1097,7 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
             ("stderr", "\"\né🙂".repeat(100_000).into_bytes()),
         ],
         note: None,
+        failed: false,
     };
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
@@ -1004,6 +1484,7 @@ fn tool_selection_migration_rejects_unknown_policy_without_changing_data() {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            gate: None,
             ..binding()
         },
     )
@@ -1601,6 +2082,7 @@ fn anthropic_forks_check_the_whole_tool_batch_after_a_checkpoint() {
             compaction_instructions: None,
             compaction_model: None,
             fallbacks: false,
+            gate: None,
             ..binding()
         },
     )
@@ -1947,6 +2429,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
                 compaction_instructions: None,
                 compaction_model: None,
                 fallbacks: false,
+                gate: None,
                 ..binding()
             },
         )
@@ -4263,6 +4746,7 @@ fn carry_forward_notes_are_versioned_by_result_node_and_forks_bind_by_checkpoint
             output: "{}".into(),
             artifacts: Vec::new(),
             note: Some(text.to_owned()),
+            failed: false,
         };
         let (_, entry) = db.tool_finish(turn, &call.call_id, &outcome).unwrap();
         let version = entry["data"]["note"].as_i64().unwrap();

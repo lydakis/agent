@@ -391,6 +391,11 @@ impl Handles {
         (inner.waiters.len(), inner.retained.len())
     }
 
+    /// Resume a parked turn whose wake-up is not a handle: a verdict for
+    /// the call it parked on. The service checks it is still parked there.
+    pub fn wake(&self, bot: String, turn: i64) {
+        let _ = self.resume.send((bot, turn));
+    }
     /// Consume a parked turn's results when it resumes.
     pub fn take(&self, turn: i64) -> BTreeMap<String, Arc<Value>> {
         let mut inner = self.inner.lock().unwrap();
