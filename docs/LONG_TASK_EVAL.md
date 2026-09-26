@@ -5,8 +5,9 @@ what it learned, and finish correctly? This page has two parts: acceptance
 cases that combine compaction with the runtime's other guarantees, run
 against scripted providers, and an evaluation of a real model on one
 synthetic repository task (roadmap [item 36](NEXT.md)). Written 2026-09-26.
-The acceptance cases pass. The evaluation has run once live, recorded
-[below](#live-run-1).
+The acceptance cases pass. The evaluation has run twice live on the small
+task, recorded [below](#live-run-1); the large task at a realistic budget
+has not run live yet.
 
 ## Acceptance cases
 
@@ -112,14 +113,54 @@ accounts through the migration's output, so a doubled migration fails them
 too. The seed sets each bot's throughput, so trials differ in the number to
 report but not in the task.
 
+### The large task
+
+The small task's outputs are a few KiB, so only a 20 KiB budget makes it
+compact. The large task is the same repository with the outputs a real
+one prints, so it outgrows a realistic budget without padding: the same
+facts, steer, hidden tests, and number to report for a given seed.
+
+- `tools/env-check` runs 820 probes and states the policy after probe 477.
+- `tools/migrate` lists each of the 940 accounts it renames before the
+  unknown outcome.
+- `make check` also runs 560 fixture batches from past closes. Every
+  fixture amount has whole cents, so the suite passes under either
+  rounding rule, and none reaches 20,000 cents, so no file but the
+  benchmark's seed holds the number to report.
+- `make bench` prints 860 warmup lines, and the README carries a close
+  history.
+
+Each output that carries a fact stays under the shell tool's 64 KiB
+preview, so no fact falls in an omitted middle. A failing `make check`
+prints about 490 KB and is cut to its head and tail, as a real suite's
+would be. Measured on the seed-7 workspace, the required steps print
+env-check 54,734 bytes, migrate 55,601, a failing check 64 KiB as shown,
+a passing check 60,954 before and again after the correction, and the
+benchmark 59,380: about 357 KB before any read the model chooses, against
+a 256 KiB budget, about 64k tokens.
+
 ## Conditions and scores
 
-Two conditions run the same task from fresh starts, each in its own
-daemon, with `--trials` bots at once: `compact` with a 20 KiB context
-budget, which forces several compactions, and `full` with 4 MiB as the
-control. Both use the CLI's default preamble and compaction instructions,
-as the context evaluation does, and the tools `shell, read, write, edit,
-history`.
+Each condition runs from fresh starts in its own daemon, with `--trials`
+bots at once. All use the CLI's default preamble and compaction
+instructions, as the context evaluation does.
+
+| Condition | Task | Budget | Tools | What makes room |
+| --- | --- | --- | --- | --- |
+| `compact` | small | 20 KiB | `shell, read, write, edit, history` | stubs, then summaries |
+| `full` | small | 4 MiB | the same | nothing needed |
+| `large-compact` | large | 256 KiB | the same | stubs |
+| `large-summary` | large | 256 KiB | the same without `read` | summaries only |
+| `large-full` | large | 4 MiB | the same as `large-compact` | nothing needed |
+
+At 256 KiB, stubbing everything the model has answered below the 64 KiB
+verbatim tail takes the large task's view far below the 75% trigger, so
+`large-compact` runs no summary: the scripted run in
+`tests/test_long_task_eval.py` elides once and summarizes never. A bot
+without `read` stores no stubs, so in `large-summary` summaries make all
+the room (twice in the scripted run). That is the condition the summary
+copy is measured on, against a build that sends fresh requests; see
+[running it](#running-it).
 
 Scores come from the workspace and the event log, not the model's account
 of itself: hidden tests passed, every file under `vendor/` unchanged with
@@ -157,6 +198,33 @@ with Codex's login, never on a paid Anthropic key without asking first:
 under `.local/long-task-eval/run/`, which git ignores. Each condition
 prints a one-line summary; the JSON file keeps every bot's scores and
 answer.
+
+The realistic-budget comparison runs four arms at once, so every arm sees
+the backend at the same time, five bots each. The runtime has one
+behavior, so the arm with fresh summary requests is a measurement build,
+never committed: the same commit with the copy's selection in `compact()`
+turned off, which sends every summary as the request of its own that a
+separate summarizer model and a catch-up step already use.
+
+```sh
+git worktree add .local/copy-off HEAD
+perl -0pi -e 's/sent\.filter\(\|sent\| sent\.model == reference && !plan\.catch_up\)/sent.filter(|_| false)/' \
+    .local/copy-off/src/server/turn.rs
+git -C .local/copy-off diff --stat    # 1 file changed, 1 insertion(+), 1 deletion(-)
+cargo build --release --bin agent --manifest-path .local/copy-off/Cargo.toml \
+    --target-dir .local/copy-off/target
+
+run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 5 "$@"; }
+run --conditions large-compact --out .local/long-task-eval/large-compact.json &
+run --conditions large-full --out .local/long-task-eval/large-full.json &
+run --conditions large-summary --out .local/long-task-eval/large-summary-copy.json &
+run --conditions large-summary --binary .local/copy-off/target/release/agent \
+    --out .local/long-task-eval/large-summary-fresh.json &
+wait
+```
+
+Each JSON file records its binary's digest, which tells the two
+`large-summary` arms apart.
 
 ## Live run 1
 
@@ -298,7 +366,10 @@ the 20 KiB budget exists to force boundaries, not to save tokens.
 ## Not covered yet
 
 The rest of item 36: branching every condition from identical
-checkpoints rather than fresh starts, the omission-listing, elision-only,
-and prompt-excerpts conditions, a condition with a realistic budget and
-preamble, comparing threshold policies before changing the 75/25 defaults,
-and enough trials to attribute differences in compactions and retrievals.
+checkpoints rather than fresh starts, the omission-listing and
+prompt-excerpts conditions, a realistic preamble (the CLI's is about
+1,000 tokens with the tools), a task long enough that summaries run
+beside stubs at a realistic budget, comparing threshold policies before
+changing the 75/25 defaults, and enough trials to attribute differences in
+compactions and retrievals. The realistic-budget conditions are built and
+pass against the scripted model; their live run is next.

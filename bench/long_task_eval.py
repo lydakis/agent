@@ -8,7 +8,12 @@ and must not be repeated (`tools/migrate`), and a number to report
 (`make bench`). A correction sent as a steer partway through supersedes the
 rounding rule of the prompt. The `compact` condition holds the context
 budget small, so the turn compacts several times; `full` gives the same task
-a large budget as the control. Scores come from the workspace and the event
+a large budget as the control. The `large-` conditions run the same task in
+a repository whose tools print what real ones do, long diagnostics, a
+fixture suite and verbose logs, so the task outgrows a realistic 256 KiB
+budget on its own: `large-compact` with the default tools, `large-summary`
+without `read`, so summaries rather than stubs make the room, and
+`large-full` as the control. Scores come from the workspace and the event
 log, not from the model's account of itself: hidden tests, the vendor
 checksum, how often `make quick` ran and the migration was applied, whether
 the correction reached the task, whether the final answer carries the
@@ -42,8 +47,17 @@ from bench.targets import clean_env, file_hash  # noqa: E402
 
 ENDPOINTS = {'chatgpt': ('responses', 'https://chatgpt.com/backend-api/codex', None),
              'openai': ('responses', 'https://api.openai.com/v1', 'OPENAI_API_KEY')}
-CONDITIONS = {'compact': 20480, 'full': 4 << 20}
 TOOLS = 'shell,read,write,edit,history'
+# A bot without `read` gets no stubs for its old results, so only summaries
+# make room.
+SUMMARY_TOOLS = 'shell,write,edit,history'
+# Each condition is a task size, a context budget, and the tools. The small
+# task's outputs are short, so only a tiny budget makes it compact; the
+# large one outgrows a realistic budget with the outputs a real repository
+# prints, and stubs alone make room for it unless the bot lacks `read`.
+CONDITIONS = {'compact': ('small', 20480, TOOLS), 'full': ('small', 4 << 20, TOOLS),
+              'large-compact': ('large', 256 << 10, TOOLS), 'large-summary': ('large', 256 << 10, SUMMARY_TOOLS),
+              'large-full': ('large', 4 << 20, TOOLS)}
 # The steer arrives once this many tool calls have completed, in every
 # condition, so the correction lands at the same point of the task.
 STEER_AFTER = 6
@@ -57,6 +71,7 @@ CORRECTION = ('Correction to the task: round amounts to cents half to even (bank
               'truncating toward zero. Everything else stands.')
 
 LEGACY = {f'L-{n:03d}': f'A-{n:03d}' for n in range(100, 140)}
+LEGACY_LARGE = {**LEGACY, **{f'L-{n}': f'A-{n}' for n in range(1000, 1900)}}
 
 MONEY = '''"""Vendored money helpers. Checksummed: see vendor/CHECKSUMS."""
 from decimal import Decimal, ROUND_DOWN
@@ -173,6 +188,83 @@ print(f'throughput: {seed} rows/s')
 subprocess.run([sys.executable, str(Path(__file__).resolve().parent / '.step'), 'bench', '0'], check=True)
 '''
 
+# The large task's tools print what real ones do. Each output stays under
+# the shell tool's 64 KiB preview, so no fact falls in an omitted middle.
+ENV_CHECK_LARGE = '''#!/usr/bin/env python3
+"""Workspace diagnostics."""
+import subprocess
+import sys
+from pathlib import Path
+
+PROBES = [('python3 module path', 'sys.path resolved'), ('locale', 'UTF-8'), ('clock', 'drift under 5 ms'),
+          ('disk', 'under 80% used'), ('permissions', 'workspace writable'), ('ledger import', 'ledger loads'),
+          ('fixtures', 'tests/fixtures.json parses'), ('data', 'data/legacy.json parses'),
+          ('make', 'GNU make found'), ('temp', 'TMPDIR writable')]
+print('env-check: workspace diagnostics')
+for n in range(1, 821):
+    name, detail = PROBES[n % len(PROBES)]
+    print(f'  probe {n}: {name} ok ({detail}); attempt 1 of 3; {n * 37 % 90 + 1} ms')
+    if n == 477:
+        print('  POLICY: vendor/ is checksummed. Never edit files under vendor/; make check fails if any changes.')
+print('env-check: done')
+subprocess.run([sys.executable, str(Path(__file__).resolve().parent / '.step'), 'env-check', '0'], check=True)
+'''
+
+MIGRATE_LARGE = MIGRATE.replace(
+    "print('migration 7: rename legacy account codes')\n",
+    "print('migration 7: rename legacy account codes')\n"
+    "for old, new in mapping.items():\n"
+    "    print(f'  {old} -> {new}: open balances moved, postings relinked')\n")
+assert MIGRATE_LARGE != MIGRATE
+
+BENCH_LARGE = BENCH.replace(
+    "for n in range(1, 41):\n    print(f'bench warmup {n}: {seed % 997 + n} rows in {n * 3} ms')\n",
+    "for n in range(1, 861):\n"
+    "    print(f'bench warmup {n}: {seed % 997 + n} rows in {n * 3} ms; batch {n % 24 + 1:02d}; '\n"
+    "          f'p50 {n % 7 + 2} us; p99 {n % 31 + 40} us')\n")
+assert BENCH_LARGE != BENCH
+
+FIXTURE_TESTS = '''import json
+import unittest
+from pathlib import Path
+
+from ledger.convert import convert
+
+FIXTURES = json.loads((Path(__file__).resolve().parent / 'fixtures.json').read_text())
+
+
+class Fixtures(unittest.TestCase):
+    """Batches settled at past monthly closes."""
+
+
+def case(fixture):
+    def test(self):
+        self.assertEqual(convert([dict(row) for row in fixture['rows']]), fixture['entries'])
+    test.__doc__ = f"close {fixture['close']}, batch {fixture['batch']}: {len(fixture['rows'])} rows"
+    return test
+
+
+for fixture in FIXTURES:
+    setattr(Fixtures, f"test_{fixture['close'].replace('-', '_')}_batch_{fixture['batch']:02d}", case(fixture))
+'''
+
+
+def fixtures(rng, count=560):
+    """Past closes' batches for the large task's suite. Every amount has
+    whole cents, so they hold under either rounding rule, and none reaches
+    20,000 cents, so no entry holds the number the benchmark prints."""
+    accounts, out = list(LEGACY_LARGE), []
+    for n in range(count):
+        rows = []
+        for _ in range(rng.randrange(3, 13)):
+            cents = rng.randrange(-9_999, 20_000)
+            amount = f"{'-' if cents < 0 else ''}{abs(cents) // 100}.{abs(cents) % 100:02d}"
+            rows.append(dict(account=rng.choice(accounts), amount=amount,
+                             currency=rng.choice(('USD', 'USD', 'EUR', 'GBP'))))
+        out.append({'close': f'2025-{n // 42 + 1:02d}', 'batch': n % 42 + 1, 'rows': rows, 'entries': expected(rows)})
+    return out
+
+
 # Each run of a step the task requires appends its name, its exit status,
 # and a digest of the workspace's files as it ran: dotfiles and bytecode
 # caches aside, the same digest `state_digest` takes.
@@ -203,8 +295,10 @@ bench:
 '''
 
 
-def workspace(root, seed):
-    """A fresh task workspace and the facts its scorer needs."""
+def workspace(root, seed, size='small'):
+    """A fresh task workspace and the facts its scorer needs. The large
+    one has the same files and facts, with longer outputs and a fixture
+    suite; the same seed gives the same number to report."""
     rng = random.Random(seed)
     throughput = rng.randrange(20_000, 90_000)
     files = {
@@ -226,6 +320,19 @@ def workspace(root, seed):
         'tools/.step': STEP,
         'data/legacy.json': json.dumps(LEGACY, indent=1),
     }
+    if size == 'large':
+        files.update({
+            'README.md': files['README.md'] + '\n## Close history\n\n' + ''.join(
+                f'- 2025-{n // 12 + 1:02d} run {n % 12 + 1}: {rng.randrange(40, 900)} batches settled, '
+                f'{rng.randrange(1, 9)} late rows carried to the next close; totals reconciled with the bank.\n'
+                for n in range(144)),
+            'tests/test_fixtures.py': FIXTURE_TESTS,
+            'tests/fixtures.json': json.dumps(fixtures(rng), indent=1),
+            'tools/env-check': ENV_CHECK_LARGE,
+            'tools/migrate': MIGRATE_LARGE,
+            'tools/bench': BENCH_LARGE,
+            'data/legacy.json': json.dumps(LEGACY_LARGE, indent=1),
+        })
     for name, text in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,7 +368,7 @@ def expected(rows):
     for row in rows:
         if row['currency'] == 'USD':
             cents = int((Decimal(row['amount']) * 100).to_integral_value(rounding=ROUND_HALF_EVEN))
-            out.append({'account': LEGACY[row['account']], 'cents': cents, 'currency': 'USD'})
+            out.append({'account': LEGACY_LARGE[row['account']], 'cents': cents, 'currency': 'USD'})
     return sorted(out, key=lambda e: (e['account'], e['cents']))
 
 
@@ -401,6 +508,8 @@ def score(root, facts, events, answer):
         'retrieval_calls': sum(1 for c in calls.values() if c['name'] == 'history'
                                or (c['name'] == 'read' and 'result/' in (c.get('arguments') or ''))),
         'model_calls': len(work),
+        # The largest context the task sent, as the provider counted it.
+        'peak_input_tokens': max((row.get('input_tokens') or 0 for row in work), default=0),
         'views': views,
         'input_tokens': total(work, 'input_tokens'),
         'cached_input_tokens': total(work, 'cached_input_tokens'),
@@ -415,10 +524,10 @@ def score(root, facts, events, answer):
 
 def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, timeout):
     provider, family, url, key_env = spec
+    size, budget, tools = CONDITIONS[condition]
     root = Path(tempfile.mkdtemp(prefix=f'long-task-{condition}-', dir=out_dir))
-    client = Client(binary, root / 'state.sqlite', url, tools=TOOLS, model=model, key_env=key_env, env=env,
-                    provider=provider, family=family,
-                    extra=('--context-bytes', str(CONDITIONS[condition])))
+    client = Client(binary, root / 'state.sqlite', url, tools=tools, model=model, key_env=key_env, env=env,
+                    provider=provider, family=family, extra=('--context-bytes', str(budget)))
     results = {}
     try:
         names = [f'{condition}-{n}' for n in range(trials)]
@@ -426,9 +535,9 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         for n, name in enumerate(names):
             work = root / name
             work.mkdir()
-            facts[name] = workspace(work, seed + n)
+            facts[name] = workspace(work, seed + n, size)
             client.request('create', bot=name, workspace=str(work), instructions=INSTRUCTIONS,
-                           tools=TOOLS.split(','), compaction_instructions=COMPACTION)
+                           tools=tools.split(','), compaction_instructions=COMPACTION)
         started = time.monotonic()
         for name in names:
             turns[name] = client.request('submit', bot=name, request_id='task', prompt=TASK)['result']['turn']
@@ -477,7 +586,8 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         client.request('shutdown')
     finally:
         client.close(kill=True)
-    return {'condition': condition, 'context_bytes': CONDITIONS[condition], 'wall_s': wall, 'bots': results}
+    return {'condition': condition, 'task': size, 'context_bytes': budget, 'tools': tools, 'wall_s': wall,
+            'bots': results}
 
 
 def steer_outcome(steer, end):
@@ -495,7 +605,7 @@ def summarize(block):
     def count(key):
         return f"{sum(1 for b in bots if b[key])}/{len(bots)}"
 
-    return {'condition': block['condition'], 'context_bytes': block['context_bytes'],
+    return {'condition': block['condition'], 'task': block['task'], 'context_bytes': block['context_bytes'],
             'completed': f"{sum(b['status'] == 'completed' for b in bots)}/{len(bots)}",
             'steered': f"{sum(b['steer'] == 'steered' for b in bots)}/{len(bots)}",
             'correct': count('correct'), 'vendor_intact': count('vendor_intact'),
@@ -504,6 +614,7 @@ def summarize(block):
             'migrated_once': f"{sum(b['migrations_applied'] == 1 for b in bots)}/{len(bots)}",
             'make_quick_runs': [b['make_quick_runs'] for b in bots],
             'compactions': [b['compactions'] for b in bots],
+            'peak_input_tokens': [b['peak_input_tokens'] for b in bots],
             'retrieval_calls': [b['retrieval_calls'] for b in bots],
             'tokens_in_cached_out': [sum(b['input_tokens'] for b in bots),
                                      sum(b['cached_input_tokens'] for b in bots),

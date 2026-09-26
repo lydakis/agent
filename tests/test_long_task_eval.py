@@ -32,6 +32,10 @@ TRUNCATING = SOLUTION.format(rounding='ROUND_DOWN')
 BROKEN = 'def convert(rows):\n    raise NotImplementedError\n'
 
 
+# The shell tool's preview, PREVIEW_BYTES in src/tools.rs.
+PREVIEW = 64 * 1024
+
+
 def shell(root, command):
     return subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, env=clean_env())
 
@@ -49,6 +53,13 @@ class LongTaskScoreTests(unittest.TestCase):
         self.facts = workspace(self.root, 7)
 
     def test_the_workspace_reports_each_fact_only_when_asked(self):
+        for size in ('small', 'large'):
+            with self.subTest(size=size):
+                self.setUp()
+                self.facts = workspace(self.root, 7, size)
+                self.check_facts()
+
+    def check_facts(self):
         self.assertIn('Never edit files under vendor/', shell(self.root, 'tools/env-check').stdout)
         quick = shell(self.root, 'make quick')
         self.assertNotEqual(quick.returncode, 0)
@@ -72,6 +83,29 @@ class LongTaskScoreTests(unittest.TestCase):
         holders = [p.relative_to(self.root) for p in self.root.rglob('*')
                    if p.is_file() and str(self.facts['throughput']).encode() in p.read_bytes()]
         self.assertEqual(holders, [Path('tools/.seed')])
+
+    def test_the_large_task_outgrows_a_realistic_budget_with_every_fact_in_view(self):
+        # The same seed gives the same number to report at either size.
+        self.setUp()
+        large = workspace(self.root, 7, 'large')
+        self.assertEqual(large['throughput'], self.facts['throughput'])
+        (self.root / 'ledger/convert.py').write_text(TRUNCATING)
+        steps = {step: shell(self.root, step) for step in ('tools/env-check', 'tools/migrate', 'make check',
+                                                           'make bench')}
+        # Each output that carries a fact fits the shell tool's preview, so
+        # no fact lands in an omitted middle.
+        for step in ('tools/env-check', 'tools/migrate', 'make bench'):
+            self.assertLess(len(steps[step].stdout.encode()), PREVIEW, step)
+        self.assertIn('outcome is unknown', steps['tools/migrate'].stdout)
+        # The fixture suite passes under either rounding rule once migrated.
+        self.assertEqual(steps['make check'].returncode, 0, steps['make check'].stdout[-2000:])
+        (self.root / 'ledger/convert.py').write_text(HALF_EVEN)
+        self.assertEqual(shell(self.root, 'make check').returncode, 0)
+        self.assertGreater(steps['make check'].stdout.count(' ... ok'), 500)
+        # What the required steps print, less than the preview each, takes
+        # more room than the realistic budget alone.
+        printed = sum(min(len(done.stdout.encode()), PREVIEW) for done in steps.values())
+        self.assertGreater(printed, long_task_eval.CONDITIONS['large-compact'][1] * 3 // 4)
 
     def test_a_run_that_kept_every_fact_scores_clean(self):
         shell(self.root, 'tools/env-check; make quick; tools/migrate; tools/migrate --status')
@@ -200,6 +234,12 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(steer_outcome(None, None), 'not sent: fewer tool calls')
 
 
+# A scripted agent that does the task right.
+SCRIPT = ('tools/env-check', 'make quick', 'tools/migrate', 'tools/migrate --status',
+          f"cat > ledger/convert.py <<'EOF'\n{TRUNCATING}EOF", 'make check',
+          f"cat > ledger/convert.py <<'EOF'\n{HALF_EVEN}EOF", 'make check', 'tools/env-check', 'make bench')
+
+
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class LongTaskRunnerTests(ModelFixture):
     def test_the_runner_steers_compacts_and_scores_a_scripted_agent(self):
@@ -207,13 +247,10 @@ class LongTaskRunnerTests(ModelFixture):
         # correction after STEER_AFTER results, see the turn through its
         # compactions, and score it from the workspace and the events.
         self.model.task_step = 0
-        self.model.task_script = [
-            'tools/env-check', 'make quick', 'tools/migrate', 'tools/migrate --status',
-            f"cat > ledger/convert.py <<'EOF'\n{TRUNCATING}EOF", 'make check',
-            f"cat > ledger/convert.py <<'EOF'\n{HALF_EVEN}EOF", 'make check', 'tools/env-check', 'make bench']
+        self.model.task_script = list(SCRIPT)
         spec = ('openai', 'responses', self.url, None)
         with patch.object(long_task_eval, 'COMPACTION', 'Summarize.'), \
-                patch.dict(long_task_eval.CONDITIONS, {'compact': 8192}):
+                patch.dict(long_task_eval.CONDITIONS, {'compact': ('small', 8192, long_task_eval.TOOLS)}):
             block = run_condition(self.binary, spec, 'synthetic-model', 'compact', 1, self.path, clean_env(), 7,
                                   timeout=60)
         result = block['bots']['compact-0']
@@ -238,3 +275,32 @@ class LongTaskRunnerTests(ModelFixture):
                    if any(i.get('role') == 'user' and i['content'][0]['text'] == CORRECTION for i in r['input'])]
         # Absorbed at the first round boundary after the sixth result.
         self.assertIn(steered[0], (STEER_AFTER, STEER_AFTER + 1))
+
+    def test_at_the_realistic_budget_stubs_make_room_unless_the_bot_lacks_read(self):
+        # The large task outgrows 256 KiB. With `read`, stubbing answered
+        # results alone makes room, so no summary runs; without it,
+        # summaries must, which is what the copy is measured on.
+        spec = ('openai', 'responses', self.url, None)
+        for condition in ('large-compact', 'large-summary'):
+            with self.subTest(condition=condition):
+                self.model.task_step = 0
+                self.model.task_script = list(SCRIPT)
+                with patch.object(long_task_eval, 'COMPACTION', 'Summarize.'):
+                    block = run_condition(self.binary, spec, 'synthetic-model', condition, 1, self.path,
+                                          clean_env(), 7, timeout=60)
+                self.assertEqual(block['context_bytes'], 256 << 10)
+                result = block['bots'][f'{condition}-0']
+                self.assertEqual(result['status'], 'completed', result)
+                self.assertEqual(result['steer'], 'steered')
+                self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'],
+                                result)
+                self.assertTrue(result['followed_workflow'], result)
+                self.assertEqual(result['compaction_failures'], [])
+                if condition == 'large-compact':
+                    self.assertGreaterEqual(result['elisions'], 1)
+                    self.assertEqual(result['compactions'], 0)
+                else:
+                    self.assertEqual(result['elisions'], 0)
+                    self.assertGreaterEqual(result['compactions'], 1)
+                    self.assertEqual(result['summarizer_calls'], result['compactions'])
+                self.assertGreater(result['peak_input_tokens'], 0)
