@@ -808,6 +808,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Next: a labeled dangerous set to
     measure false allows before thresholds are fixed.
+46. The model that answered. A usage event names a model other than the
+    requested one only when Anthropic's fallback splits a call or a
+    summarizer runs elsewhere. Keep the model each provider names in its
+    response, stored only when it differs from the requested name, so a task
+    comparison can show what served every call, as Claude Code's records
+    already do ([the gap](COMPARISON_CONTRACT.md#task-comparisons)).
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

@@ -69,13 +69,42 @@ more turns is not here, because its work changes with its speed; it is under
 ## Task effectiveness
 
 Whether a model driven by this harness finishes real tasks, at what full cost,
-and why it fails. Matched runs on five Terminal-Bench 2.1 tasks under Harbor,
-both arms of each pair run together. Each arm's served models and fallback
-policy are recorded as [COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons)
-requires; the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
+and why it fails. Matched runs on five Terminal-Bench 2.1 tasks under Harbor
+0.23.0, both arms of each pair started within a second of each other, with
+the same reasoning effort, concurrency and timeout. Each arm's served models
+and fallback policy are recorded as
+[COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons) requires;
+the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
 
-TASK_TABLE
+| Run | Arm | Passed | Cost a trial | Cached input | Failures: harness, model, timeout |
+| --- | --- | ---: | ---: | ---: | --- |
+| ChatGPT plan, gpt-6-sol, 2026-09-25 | Agent `c585c16` | 14/15 | $0.089 | 81.8% | 0, 1, 0 |
+| | Codex 0.156.1 | 8/15 | $0.193 | 94.5% | 5, 2, 0 |
+| Sonnet 5, 2026-09-25 | Agent `c585c16` | 12/15 | $1.00 | 95.2% | 0, 1, 2 |
+| | Claude Code 2.1.282 | 13/15 | $0.714 | 95.7% | 0, 1, 1 |
+| ChatGPT plan, gpt-6-sol, 2026-09-26 | Agent `15d629c` | 8/10 | $0.113 | 84.3% | 0, 2, 0 |
+| | Codex 0.156.1 | 5/10 | $0.198 | 95.4% | 3, 2, 0 |
 
+- **Served models.** Every arm ran only the model it requested, and no arm
+  made a fallback call. The records differ in depth: Claude Code's name the
+  model the API reported for each response, Codex's name the model once per
+  turn, and ours name the requested model unless a fallback or summarizer
+  answered. Our `--fallbacks` acts only on Anthropic requests, so it was live
+  only in the Sonnet run; Claude Code ran without `--fallback-model`, and
+  Harbor's Codex adapter has no fallback option.
+- **Codex's losses are mostly its process lifetime.** In 12 of Codex's 17
+  failures across these runs and one unmatched run, the model started the
+  server the task needs and its own checks passed, but the server was gone
+  when the tests ran. That is a harness difference on server tasks, not model
+  quality: counting only model errors, the ChatGPT arms are 1 against 2 and
+  2 against 2.
+- **Sonnet 5.** Claude Code passed one more task and cost about 29% less a
+  trial; the difference is on schemelike, where all three timeouts fell.
+- **Cost is full cost.** Harbor's token counts and costs match each harness's
+  own records except for two timed-out trials, corrected in the table from
+  those records: ours on Sonnet, which Harbor never graded or priced, and
+  Claude Code's, which Harbor rebuilt from a partial trajectory. ChatGPT-plan
+  costs are what the same tokens cost on the API.
 - **Cache on the ChatGPT plan.** Our calls missed the prompt cache at the same
   rate as Codex's from the third call on (9.0% against 10.5%), and no miss
   lined up with anything the runtime does. Misses follow short gaps, which

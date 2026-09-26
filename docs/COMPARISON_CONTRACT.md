@@ -124,8 +124,10 @@ it asked for and what actually answered, each from that harness's own records:
 - **Served models**, with the calls each answered. Ours come from the trial
   metadata's `served_calls`, which counts every billed attempt, including
   provider-side fallbacks, delegated bots and summarizers. Codex's come from
-  its session rollout. Claude Code's come from its per-model usage, which
-  includes any auxiliary model it calls.
+  its session rollout, which names the model once per turn. Claude Code's come
+  from its per-message usage, which names the model the API reported for each
+  response, and its per-model totals, which include any auxiliary model it
+  calls.
 - **Fallback policy as configured.** Our adapter creates task bots with
   `--fallbacks`, so a declined Anthropic request finishes on the model
   Anthropic recommends; the flag does nothing on the OpenAI or ChatGPT
@@ -142,5 +144,7 @@ for the task work, or the difference is stated beside the numbers.
 
 Gap: the daemon knows a call's served model only when a provider-side fallback
 splits it (Anthropic's `iterations`) or a summarizer ran on another model. It
-does not read the model a provider names in its response, so a change of
-snapshot behind the same model name would not show.
+does not read the model a provider names in its response, so a reroute or a
+change of snapshot behind the same model name would not show. Codex's
+per-turn record has the same limit within a turn. Of the three, only Claude
+Code's record says which model answered each response.
