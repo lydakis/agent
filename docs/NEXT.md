@@ -778,9 +778,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     the plan commit, the verdict rides the call's start or its denial, and a
     verdict that has not arrived within a short hold parks the turn like
     `wait`. It has no rules, prompts, or model. It is oversight, not a
-    sandbox. First, count the tool mix in the Harbor transcripts to see
-    how many rounds would reach Jev; then a labeled Jev run, which is paid
-    and waits for George.
+    sandbox. The Harbor tool mix (2026-09-26) sends 64 to 76% of rounds to
+    Jev, about 1 to 2% of median trial time, and caps one Jev key at
+    roughly 26 to 31 `auto` rounds a second. Next: a labeled Jev run to set
+    the per-question thresholds.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

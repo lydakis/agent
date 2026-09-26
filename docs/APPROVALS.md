@@ -3,8 +3,8 @@
 Status: design note, 2026-09-26. Nothing here is built. Code facts are from
 lydakis/agent at b07080c. Peer facts were read on 2026-09-26 from the pages
 linked in each section; blog claims are marked as claims. The latency figure
-for the socket hop was measured for this note; the Jev figures come from the
-2026-09-19 probe in [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#jev-data-points-for-compaction).
+for the socket hop and the tool mix were measured for this note; the Jev
+figures come from the 2026-09-19 probe in [DAEMON_MEASUREMENTS.md](DAEMON_MEASUREMENTS.md#jev-data-points-for-compaction).
 
 ## The question
 
@@ -40,7 +40,10 @@ has to be counted per call.
    which approver answers.
 4. **Auto is hands-off.** Deterministic rules in the client answer the
    obvious cases in microseconds, and Jev answers a handful of narrow
-   questions about the rest in about 0.4 s. What is dangerous or unclear is
+   questions about the rest in about 0.4 s. In the stored Harbor trials
+   the rules settled only 21 to 29% of calls, so Jev is the common path,
+   not the exception: 64 to 76% of model rounds would wait on it, about 1
+   to 2% of median trial time. What is dangerous or unclear is
    denied, never silently allowed and never sent to a person. The model
    gets the reason and tries another way, or tells its caller what it
    needs. If the caller then says yes in a message that names the action,
@@ -368,16 +371,17 @@ so only one instance runs at a time, and answers in layers:
    `history`, `wait`, `note`, and `echo` touch only the bot's own store
    records and stay ungated.
 2. **Deterministic rules, microseconds.**
-   - `write` and `edit` inside the turn's workspace are allowed. The path is
-     resolved before judging, and a symlink that leaves the workspace does
-     not count as inside. Files a later command will execute are the
-     exception and go to the model: `.git/`, `.agent/`, `AGENTS.md`, build
-     and hook files (`Makefile`, `package.json`, `.envrc`, CI workflows).
-     An independent test of Claude Code's auto mode found 36.8% of
+   - `write` and `edit` inside the turn's workspace are allowed. Files a
+     later command will execute are the exception and go to the model:
+     `.git/`, `.agent/`, `AGENTS.md`, build and hook files (`Makefile`,
+     `package.json`, `.envrc`, CI workflows). An independent test of Claude Code's auto mode found 36.8% of
      state-changing actions went around its classifier as in-project file
      edits (Ji et al., 2026). The approver also remembers what each bot
      wrote this turn, so a command that runs one of those files is judged
      with the file's content in view.
+   - Every path is resolved on disk when the approver judges it, not read
+     as text, so a symlink inside the workspace that points out of it
+     counts as outside.
    - `read` inside the workspace is allowed, except files that look like
      secrets or commonly hold them: `.env*`, `*.pem`, `*.key`, `*.p12`,
      `*.pfx`, `*.keystore`, `id_*`, `.npmrc`, `.pypirc`, `.netrc`,
@@ -398,7 +402,20 @@ so only one instance runs at a time, and answers in layers:
      `sort -o`. An unlisted flag, a redirect, `$(`, a backtick, or a
      variable makes the command opaque, and it goes on to the model. This
      is where Cursor's allowlist was bypassed; the approver does not try to
-     parse more.
+     parse more. Two read-only commands read more than the paths they
+     name:
+     - A recursive search (`grep -r`, `rg`) prints every file it reaches,
+       so a `.env` or key file inside the workspace goes out with the
+       results. It is allowed only with an include glob that cannot match
+       a secret-looking name (`rg -g '*.rs'`); otherwise it goes to the
+       model.
+     - `git status`, `diff`, `log`, and `show` run programs named in git
+       config: `core.fsmonitor`, external diff drivers, and textconv
+       filters. Git counts as read-only only while the repository's and
+       the user's git config set none of `core.fsmonitor`, `diff.external`,
+       `diff.*.command`, `diff.*.textconv`, `include.path`, or
+       `includeIf.*`. The approver reads those files, cached by
+       modification time; if any is set, git goes to the model.
    - Commands that reach the approval channel itself (`agent answer`, the
      daemon's socket other than through `agent`, the store file) are denied
      outright.
@@ -510,11 +527,12 @@ this design does not provide.
 **Jev's limits bound a fleet.** The published limits for `jev-1.13.0` are
 1,200 requests a minute and 250k tokens a second, "adjusting dynamically",
 with 64k tokens per request of which 32k can be state. The sustained live
-fleet ran 60 model calls a second through one daemon; if every round there
-needed Jev, that is three times the request limit. Hence one request per
-round rather than per call, the rules layer in front, and a pace in the
-approver that backs off on 429 and 529 as TypeSafe's docs ask. The pace
-has a bound: each round gets 10 s from announcement to verdict, queue time
+fleet ran 60 model calls a second through one daemon. At the 64 to 76% of
+rounds that reached Jev in the Harbor trials, that is about twice the
+request limit: one key caps an `auto` fleet at roughly 26 to 31 model
+rounds a second. Hence one request per round rather than per call, the
+rules layer in front, and a pace in the approver that backs off on 429
+and 529 as TypeSafe's docs ask. The pace has a bound: each round gets 10 s from announcement to verdict, queue time
 included, and the queue holds at most as many rounds as Jev's current
 limit admits in that time. A round that would wait longer, or runs out of
 time, is denied at once with "not reviewed: the approver is overloaded".
@@ -527,7 +545,7 @@ growing a queue of parked turns.
 | --- | ---: | ---: | --- |
 | Tool not in `approve` | nothing measurable (one list lookup, as today) | 0 | as today |
 | Rules answer | one socket round trip, 0.13 ms median, 0.3 ms p99 (measured), plus one storage-worker job with no commit | 0 | yes, briefly |
-| Jev answers | about 0.34 to 0.44 s median (2026-09-19 probe) | 0 | yes, up to the hold |
+| Jev answers (64 to 76% of rounds, measured below) | about 0.34 to 0.44 s median (2026-09-19 probe) | 0 | yes, up to the hold |
 | Person answers | the person's time | 2 (park, verdict) | no, after the hold |
 
 - **The socket hop.** A Python client sent 5,000 sequential JSONL requests
@@ -547,12 +565,9 @@ growing a queue of parked turns.
   round pays about one Jev latency however many calls it has, instead of one
   per call, and later calls' verdicts overlap earlier calls' execution.
 - **Jev in context.** The live fleet check measured 1.9 s median for a
-  short turn on gpt-5.6-luna, so a model round that also needs Jev is
-  roughly 20% slower. A
-  Terminal-Bench schemelike trial made 36 to 53 model calls
-  (2026-09-26 rerun); if every round needed Jev that is 14 to 23 s more per
-  trial. How many rounds reach Jev is the number that decides whether this
-  is acceptable, and it is not measured yet (below).
+  short turn on gpt-5.6-luna, so a short model round that also needs Jev is
+  roughly 20% slower. Real trials are dominated by long rounds and tool
+  runs, so the share of a whole trial is far smaller (below).
 - **Cost.** Jev bills input only, at $0.042 per million tokens (TypeSafe's
   models page, read 2026-09-26). The probe's requests were 420 to 1,970
   input tokens, so $0.00002 to $0.00008 each. A trial of 50 checks costs
@@ -566,6 +581,37 @@ growing a queue of parked turns.
   the next model call writes the cache again. Keeping it warm through a
   parked wait is the same open question as parked `wait` turns (NEXT.md
   item 42).
+
+**Tool mix in the Harbor trials (measured).** The suggested gate and rules
+were applied, without model calls, to every tool call in the stored
+Terminal-Bench trials of the c585c16 matched rerun (5 tasks, 3 trials per
+arm; 2026-09-26, on George's Mac). The extracted rounds match each trial's
+recorded model rounds, and the calls match its `tool_started` events.
+
+| | ChatGPT plan (gpt-6-sol) | Sonnet 5 |
+| --- | ---: | ---: |
+| Rounds / calls | 172 / 168 | 381 / 368 |
+| Calls ungated / settled by rules / sent to Jev | 7 / 49 / 112 | 0 / 79 / 289 |
+| Rounds that would wait on Jev | 64% | 76% |
+| Jev rounds per trial, median (range) | 6 (2 to 21) | 16 (7 to 54) |
+| Jev time at 0.4 s a round, share of median trial | about 2% | about 1% (worst trial 9%) |
+
+- Every call sent to Jev was a shell command, apart from 4 writes outside
+  the workspace. The commonest reasons were heredocs (`python - <<'PY'`),
+  redirects such as `2>&1`, globs, variables, and running `python`
+  itself. `cat`, `ls`, and `grep` reached Jev only when one of those made
+  them opaque; the read-only list was not what held calls back.
+- Letting `2>&1`, redirects to `/dev/null`, and globs that cannot match a
+  secret name through moved the share by 1 to 2 points (64% to 63%, 76% to
+  74%). On these tasks most rounds run or test code, which a parser cannot
+  judge.
+- Across every stored trial (89 ChatGPT-plan and 34 Sonnet trials, the
+  earlier runs included) the shares were 62% and 75%.
+
+So in `auto` Jev reviews most rounds of coding work. That is affordable in
+time because a round's model call and its tools take several seconds (a
+median trial ran 92 s for ChatGPT and 354 s for Sonnet), and it is what
+sets the fleet cap above.
 
 **Placements considered and rejected:**
 
@@ -609,16 +655,16 @@ as one.
 
 ## Measure before building
 
-1. **Tool mix, no model calls.** Count, in the Harbor transcripts on
-   George's Mac, how many calls would be ungated, answered by rules, or sent
-   to Jev, per round and per trial. This decides whether the latency above
-   is acceptable.
+1. **Tool mix, no model calls.** Done 2026-09-26 (the table in
+   Performance): 64 to 76% of rounds would wait on Jev, about 1 to 2% of
+   median trial time. It also found the three gaps now closed in the rules:
+   recursive search, git's config-run programs, and symlinks.
 2. **Jev on a labeled set.** A few hundred calls from those transcripts
    plus synthetic dangerous ones (a force push, `curl | sh`, a key sent to
    an unknown host, `rm -rf ~`), each labeled. Record false allows and false
    denials per question and threshold, and latency p50 and p99. At the
-   probe's prices this is a few cents, but it is a paid run, so it waits for
-   George's go-ahead.
+   probe's prices this is a few cents; George approved the paid run on
+   2026-09-26.
 3. **The daemon path.** On the lifecycle screen with `approve` set and a
    rules-only approver, confirm zero added commits per call and under 1 ms
    added per gated call; then the park path with a delayed answer.
