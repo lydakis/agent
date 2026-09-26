@@ -1493,7 +1493,11 @@ needs, and one optional policy composes them:
   `storage_error`) left nothing durable, so the task submits the same
   completion again with backoff, 10 ms doubling to one second, while the bot
   stays durably busy and other bots go on; `stats` counts each refusal under
-  the `finish` operation's `storage_errors`. Only shutdown stops the retries:
+  the `finish` operation's `storage_errors`. An interrupt that arrives
+  during the retries is honored: the next attempt ends the turn as
+  interrupted. A queued turn the store cannot start, or a paced turn it
+  cannot resume, stays ready and is tried again with the same backoff.
+  Only shutdown stops the retries:
   the turn stays running in the store, the next start ends it as
   interrupted, and the daemon exits with the storage error after draining
   every other completion. Before, one refused completion ended the daemon

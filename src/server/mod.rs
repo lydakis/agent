@@ -597,6 +597,11 @@ struct Service {
     /// Active slots promised to queued admissions told they may start a
     /// turn; each is released when its admission is answered.
     reserved: usize,
+    /// The wait before trying a refused turn start again, doubling from
+    /// 10 ms to a second; zero once the store takes one.
+    storage_backoff: Duration,
+    /// When the ready turn a refused store left waiting is tried again.
+    ready_retry_at: Option<tokio::time::Instant>,
     /// Events of answered admissions that the publisher has not delivered
     /// yet, oldest first. Each keeps its room in its session's queue.
     unpublished: std::collections::VecDeque<Unpublished>,
@@ -919,6 +924,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         draining: false,
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
+        storage_backoff: Duration::ZERO,
+        ready_retry_at: None,
         unpublished: std::collections::VecDeque::new(),
     };
     for (at, bot, turn) in paced_at_start {
@@ -945,6 +952,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             // Computed before the select so its arms borrow the service freely.
             let (paced_due, paced_delay) = (service.paced.peek().is_some(), service.paced_delay());
+            let ready_retry = service.ready_retry_at;
             tokio::select! {
                 _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
                 Some(error) = failures.recv() => return Err(error),
@@ -973,8 +981,11 @@ pub async fn run(config: Configuration) -> Result<()> {
                 // One queued turn per iteration, so requests interleave with a
                 // long backlog; resumes hold no slot and are not starved because
                 // the branch choice is fair.
-                _ = std::future::ready(()), if service.ready_hint && service.has_capacity() => {
+                _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
                     service.dispatch_ready().await?;
+                }
+                _ = tokio::time::sleep_until(ready_retry.unwrap_or_else(tokio::time::Instant::now)), if ready_retry.is_some() => {
+                    service.ready_retry_at = None;
                 }
                 // A paced turn comes due: resume it like any parked turn, capacity
                 // permitting; a stale entry (interrupted, deleted) is dropped.
@@ -1399,22 +1410,55 @@ impl Service {
     async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
         // A wake-up can outlive an interrupt, deletion, or reuse of the name.
         // Check only its identity and state, without loading the full bot.
-        let pending = self
+        let check = bot.clone();
+        let pending = match self
             .store
-            .op("can_resume", move |db| {
-                Ok(db.can_resume(&bot, turn)?.then_some(bot))
-            })
-            .await?;
-        if let Some(bot) = pending {
+            .op("can_resume", move |db| db.can_resume(&check, turn))
+            .await
+        {
+            // A lost group (a full disk, say) leaves the turn parked: the
+            // wake-up comes due again after a backoff, as a paced one does.
+            Err(error) if error.code == "storage_error" => {
+                let at = now_ms() + self.storage_retry().as_millis() as u64;
+                self.paced.push(std::cmp::Reverse((at, bot, turn)));
+                return Ok(());
+            }
+            pending => pending?,
+        };
+        self.storage_backoff = Duration::ZERO;
+        if pending {
             self.spawn(bot, turn, true, false);
         }
         Ok(())
     }
 
+    /// The wait after the store refused to start a turn: doubling from
+    /// 10 ms up to a second, until one starts.
+    fn storage_retry(&mut self) -> Duration {
+        let delay = self.storage_backoff.max(Duration::from_millis(10));
+        self.storage_backoff = (delay * 2).min(Duration::from_secs(1));
+        delay
+    }
+
     /// Start the oldest turn waiting for a slot, or learn there is none.
     /// A turn that cannot start (for example, its bot's budget is spent)
     /// ends with that error; the bot's next queued turn takes its place.
+    /// A store that refuses writes (a full disk, say) leaves the turn ready,
+    /// and the service tries again after a backoff while the rest goes on.
     async fn dispatch_ready(&mut self) -> Result<()> {
+        match self.start_ready().await {
+            Err(error) if error.code == "storage_error" => {
+                let delay = self.storage_retry();
+                self.ready_retry_at = Some(tokio::time::Instant::now() + delay);
+                Ok(())
+            }
+            started => {
+                self.storage_backoff = Duration::ZERO;
+                started
+            }
+        }
+    }
+    async fn start_ready(&mut self) -> Result<()> {
         let Some((bot, turn)) = self.store.op("next_ready", |db| db.next_ready()).await? else {
             self.ready_hint = false;
             return Ok(());
@@ -1429,6 +1473,8 @@ impl Service {
         {
             Ok((_, steers)) => self.spawn(bot, turn, false, steers),
             Err(error) if error.code == "bot_busy" => {}
+            // Nothing was written: the turn is still ready.
+            Err(error) if error.code == "storage_error" => return Err(error),
             // A strict steer whose turn is over ends as stale, like any
             // other queued turn that cannot start; an already-ended row is
             // simply gone from the line.
@@ -2115,10 +2161,12 @@ impl Service {
 }
 
 /// Commit a finished turn. A group that cannot commit (a full disk, say)
-/// leaves nothing durable, so the same completion is tried again, with
-/// backoff, while the bot stays busy and other bots go on. Only shutdown
-/// stops it (its cause, or the service dropping the turn's slot): the turn
-/// then stays running in the store, and the next start ends it as interrupted.
+/// leaves nothing durable, so the completion is tried again, with backoff,
+/// while the bot stays busy and other bots go on. An interrupt that arrives
+/// meanwhile is honored: the next attempt ends the turn as interrupted.
+/// Only shutdown stops it (its cause, or the service dropping the turn's
+/// slot): the turn then stays running in the store, and the next start ends
+/// it as interrupted.
 async fn commit_finish(
     store: &Store,
     bot: &str,
@@ -2127,21 +2175,31 @@ async fn commit_finish(
     keep: Option<usize>,
     cancelled: &mut watch::Receiver<Option<&'static str>>,
 ) -> Result<()> {
+    let mut error = error.cloned();
     let mut backoff = Duration::from_millis(10);
     loop {
-        let (name, error) = (bot.to_owned(), error.cloned());
+        let (name, attempt) = (bot.to_owned(), error.clone());
         let failure = match store
             .op_pruning("finish", bot.to_owned(), move |db| {
-                turn::Finished::record(db, &name, turn, error.as_ref(), keep)
+                turn::Finished::record(db, &name, turn, attempt.as_ref(), keep)
             })
             .await
         {
             Err(failure) if failure.code == "storage_error" => failure,
             done => return done,
         };
+        let interrupted = error.as_ref().is_some_and(|e| e.code == turn::INTERRUPTED);
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = cancelled.wait_for(|cause| *cause == Some(turn::SHUTDOWN)) => return Err(failure),
+            cause = cancelled.wait_for(|cause| {
+                *cause == Some(turn::SHUTDOWN) || (!interrupted && *cause == Some(turn::INTERRUPTED))
+            }) => match cause.map(|cause| *cause) {
+                Ok(Some(turn::INTERRUPTED)) => {
+                    error = Some(Error::new(turn::INTERRUPTED));
+                    continue;
+                }
+                _ => return Err(failure),
+            },
         }
         backoff = (backoff * 2).min(Duration::from_secs(1));
     }
@@ -2506,6 +2564,8 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -2708,6 +2768,8 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
         };
         let duplicate = request(&mut service, submit("Bob", "same"), &output)
             .await
@@ -2918,6 +2980,8 @@ mod tests {
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
         }
     }
     /// Refuse Bob's completion the way a full disk refuses a commit: the
@@ -3071,6 +3135,182 @@ mod tests {
             })
             .unwrap();
         assert_eq!(kept, 0, "retention ran with the completion");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_during_a_finish_retry_ends_the_turn_interrupted() {
+        let dir = scratch("finish-interrupt");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        refuse_bobs_finish(&path, true);
+        let mut service = bare_service(&store);
+        service.spawn("Bob".into(), bob, false, false);
+        finish_errors(&store, 2).await;
+        assert!(
+            service.active["Bob"].cancel(turn::INTERRUPTED),
+            "acknowledged"
+        );
+        // An attempt already under way may not see it; the one after does.
+        let errors = store.stats()["operations"]["finish"]["storage_errors"]
+            .as_u64()
+            .unwrap();
+        finish_errors(&store, errors + 2).await;
+        refuse_bobs_finish(&path, false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "interrupted", "not the failure it was retrying");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Lose every group that changes one of Bob's turns' status, the way a
+    /// full disk loses a commit: a dangling deferred reference fails COMMIT.
+    fn lose_bobs_status_changes(path: &Path, lose: bool) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(if lose {
+                "CREATE TABLE IF NOT EXISTS parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER lose_status AFTER UPDATE OF status ON turns WHEN NEW.bot='Bob'
+                 BEGIN INSERT INTO child VALUES (1); END;"
+            } else {
+                "DROP TRIGGER lose_status;"
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ready_turn_the_store_cannot_start_stays_ready() {
+        let dir = scratch("ready-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = store
+            .call(|db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                    },
+                )?;
+                // No slot was free when it was accepted, so it queued.
+                db.begin(
+                    "Bob",
+                    "first",
+                    "work",
+                    false,
+                    &TurnOptions {
+                        delivery: Delivery::Queue,
+                        ..TurnOptions::default()
+                    },
+                    |_, _| Ok(()),
+                )
+                .map(|started| started.turn)
+            })
+            .await
+            .unwrap();
+        let status = || {
+            let store = store.clone();
+            async move {
+                store
+                    .call(move |db| db.turn_status("Bob", bob))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status().await, "ready");
+        lose_bobs_status_changes(&path, true);
+        let mut service = admitting(&store, 1024);
+        service.ready_hint = true;
+        service.dispatch_ready().await.unwrap();
+        assert!(service.active.is_empty());
+        assert_eq!(status().await, "ready", "neither started nor ended");
+        assert!(service.ready_retry_at.is_some(), "tried again later");
+        // Once the store takes writes again, the retry starts it.
+        lose_bobs_status_changes(&path, false);
+        service.ready_retry_at = None;
+        service.dispatch_ready().await.unwrap();
+        assert!(service.active.contains_key("Bob"));
+        assert_eq!(service.storage_backoff, Duration::ZERO);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wake_up_the_store_loses_comes_due_again() {
+        let dir = scratch("resume-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        // A creation that loses its group shares it with the wake-up's check.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER lose_zed AFTER INSERT ON bots WHEN NEW.name='Zed'
+                 BEGIN INSERT INTO child VALUES (1); END;",
+            )
+            .unwrap();
+        let mut service = bare_service(&store);
+        let (held, gate) = hold(&store).await;
+        let workspace = dir.clone();
+        let lost = store
+            .queue("create", move |db| {
+                db.create(
+                    "Zed",
+                    Some(workspace.to_str().unwrap()),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                    },
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let (resumed, ()) = tokio::join!(service.resume("Bob".into(), bob), async {
+            gate.send(()).unwrap();
+        });
+        resumed.unwrap();
+        assert_eq!(held.await.unwrap_err().code, "storage_error");
+        assert_eq!(lost.await.unwrap_err().code, "storage_error");
+        assert!(service.active.is_empty());
+        let std::cmp::Reverse((at, bot, turn)) = service.paced.peek().unwrap();
+        assert_eq!((bot.as_str(), *turn), ("Bob", bob), "due again");
+        assert!(*at > now_ms() - 1000);
+        assert!(service.storage_backoff > Duration::ZERO);
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
