@@ -162,6 +162,11 @@ impl Output {
             .map_err(|_| Error::new("output_closed"))
     }
 
+    /// Bytes and packets `try_send` would accept right now.
+    pub fn room(&self) -> (usize, usize) {
+        (self.budget.available_permits(), self.sender.capacity())
+    }
+
     /// Never waits. `output_lagged` means the consumer has not kept up.
     pub fn try_send(&self, event: Value) -> Result<()> {
         let bytes = Self::encode(&event)?;
@@ -180,7 +185,7 @@ impl Output {
 }
 
 /// Count encoded bytes without allocating another copy of a replay event.
-pub fn encoded_len(value: &Value) -> Result<usize> {
+pub fn encoded_len<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize> {
     struct Counter(usize);
     impl Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

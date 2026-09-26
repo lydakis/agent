@@ -767,6 +767,26 @@ close, and answer bytes; `--fsync` adds one pass per arm counting fsyncs under
 strace, setup included. Arms rotate across `--rounds`. Results are in
 [APPROVALS.md](APPROVALS.md#measure-before-building), item 3.
 
+## Admission burst
+
+```sh
+.local/venv/bin/python -m bench.admission_burst --binary .local/before --out .local/bench/admit-before
+.local/venv/bin/python -m bench.admission_burst --binary .local/target/release/agent --out .local/bench/admit-after
+```
+
+Three timed phases per fresh store, on one stdio connection and the synthetic
+provider. First, 32 submissions sent one at a time to already created bots,
+each timed from its write to its reply: the cost of an admission that arrives
+alone. Then 32 creations written at once, and 32 submissions to those bots
+written at once, each reply timed from that single write. Every submitted
+turn holds at the provider, so no completion runs during the phases. Each
+phase records daemon CPU (per-thread scheduler time on Linux), the `create`,
+`begin` and `commit` operation deltas, and the number of write groups; the
+groups include the admitted turns' own start-up jobs. One warmup and three
+measured runs are the default. Alternate builds, and compare them under the
+same durability settings; a burst on one connection is not the same arrival
+pattern as many clients, and this is not a capacity measurement.
+
 ## Mixed-workload soak
 
 ```sh

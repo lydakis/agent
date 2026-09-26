@@ -174,11 +174,16 @@ impl Delivery {
     }
 }
 /// What the storage worker hands to the publisher after each job, in commit
-/// order: every durable event committed past its watermark, then the
-/// outcomes of turns that job ended, for their waiters.
+/// order: every durable event committed past its watermark, how far that
+/// covers when the newest were removed first, then the outcomes of turns
+/// that job ended, for their waiters.
 #[derive(Debug)]
 pub enum Publication {
     Event(Value),
+    /// Every event up to this cursor was published or removed before it
+    /// could be: a job that deletes events can share a group with the job
+    /// that wrote them.
+    Through(i64),
     Finished {
         bot: String,
         turn: i64,
@@ -370,8 +375,8 @@ pub enum Gated {
         expires_ms: Option<u64>,
     },
 }
-/// An `answer` from a client.
-pub struct Answer<'a> {
+/// A gate's decision on a call, from a client's `answer`.
+pub struct Decision<'a> {
     pub bot: &'a str,
     pub turn: i64,
     pub call_id: &'a str,
@@ -642,10 +647,17 @@ impl Database {
         // On macOS a plain fsync leaves writes in the drive's cache, so FULL
         // survives a power cut only with F_FULLFSYNC, which SQLite sends when
         // these are on. Elsewhere they change nothing.
+        //
+        // Each job runs in a savepoint inside its group's transaction, and
+        // SQLite journals the pages a savepoint changes so it can roll back
+        // alone. Past 64 KiB that journal spills to a temporary file: a file
+        // created, written and deleted for every admission, and a write that
+        // fails with SQLITE_FULL when the disk is. In memory it is freed
+        // when the job ends, bounded by the pages one job changes.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;
-            PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048;",
+            PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let has_tables: bool = conn.query_row(
@@ -852,6 +864,22 @@ impl Database {
         self.conn.prepare_cached("BEGIN")?.execute([])?;
         Ok(())
     }
+    /// Run several writes as one: if `work` fails, none of what it wrote
+    /// stays in the group, and the waiting-turn counts are recounted. The
+    /// methods it calls release their own savepoints into this one.
+    pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT atomic")?;
+        let done = work(self);
+        if done.is_ok() {
+            self.conn.execute_batch("RELEASE atomic")?;
+        } else if self.in_group() {
+            // Unless SQLite already rolled back the whole transaction.
+            self.conn
+                .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
+            self.recount_pending()?;
+        }
+        done
+    }
     /// Whether the group's transaction is still open. A full disk or an I/O
     /// error can make SQLite roll back the whole transaction mid-job.
     pub fn in_group(&self) -> bool {
@@ -928,6 +956,19 @@ impl Database {
             }
             if delivered < 256 {
                 break;
+            }
+        }
+        let assigned: i64 = self
+            .conn
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
+            .query_row([], |row| row.get(0))
+            .optional()?
+            .unwrap_or(0);
+        if assigned > *watermark {
+            *watermark = assigned;
+            if !sink(Publication::Through(assigned)) {
+                self.outcomes.clear();
+                return Ok(());
             }
         }
         for (bot, turn, outcome) in self.outcomes.drain(..) {
@@ -3095,7 +3136,7 @@ impl Database {
     /// A running turn's verdict is held by the worker and wakes its task;
     /// a parked turn's is committed now, and resumes the turn only if it is
     /// parked on this call and the call is now decided.
-    pub fn answer(&mut self, answer: Answer<'_>) -> Result<Answered> {
+    pub fn answer(&mut self, answer: Decision<'_>) -> Result<Answered> {
         let owner: Option<(String, String)> = self
             .conn
             .query_row(
@@ -4150,11 +4191,18 @@ impl Database {
     /// and the turn rows themselves stay: retention here bounds what replay
     /// and tool retrieval keep, never what the model said.
     pub fn prune(&mut self, name: &str, keep_turns: usize) -> Result<Value> {
-        self.prune_except(name, keep_turns, None)
+        if !self.exists(name)? {
+            return fail("bot_not_found");
+        }
+        self.prune_records(name, keep_turns, None, 0, None)
     }
     /// Retention as part of a completion: the turn ending in this job keeps
     /// its records, so its terminal event is published and replayable until
     /// the next pass. Live delivery is what the store holds, never more.
+    /// One piece of the oldest turns per completion, like explicit pruning:
+    /// the job's savepoint journal holds every page it rewrites in memory,
+    /// so a backlog (retention newly enabled, or fewer turns kept) drains
+    /// over later completions instead of in one unbounded job.
     pub fn prune_except(
         &mut self,
         name: &str,
@@ -4164,7 +4212,7 @@ impl Database {
         if !self.exists(name)? {
             return fail("bot_not_found");
         }
-        self.prune_records(name, keep_turns, protect, 0, None)
+        self.prune_records(name, keep_turns, protect, 0, Some(Self::RETENTION_PIECE))
     }
     /// One identity-bound piece: the records of up to `limit` prunable turns
     /// after `after`, oldest first. `next_after` names where the next piece
@@ -4222,9 +4270,14 @@ impl Database {
         let tx = self.conn.savepoint()?;
         // The candidate index contains only this bot's unpruned turns, not
         // its entire history or operational records owned by other bots.
+        // A turn already pruned but still running a background process has
+        // nothing left to drop until the process ends; passing over it lets
+        // a piece that restarts from the oldest turn reach the turns after.
         let turns: Vec<i64> = tx
             .prepare_cached(
-                "SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
+                "SELECT turn FROM retained_turns r WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
+                 AND (EXISTS(SELECT 1 FROM events WHERE turn=r.turn)
+                      OR NOT EXISTS(SELECT 1 FROM processes WHERE turn=r.turn AND status='running'))
                  ORDER BY turn LIMIT ?5",
             )?
             .query_map(

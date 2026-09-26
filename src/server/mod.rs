@@ -10,10 +10,11 @@ use agent_runtime::{
     Error, Result,
     codec::{Family, split_model},
     fail, fail_with,
-    output::Output,
+    output::{self, Output},
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Delivery, Fork, Gate, Publication, Store, TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, Publication, Started, Store,
+        TurnOptions, Waiting, Wake,
     },
     tools::Registry,
 };
@@ -34,6 +35,112 @@ use tokio::{
     task::JoinSet,
 };
 use turn::Turn;
+
+/// Most admissions (submissions and creations) whose commits may be pending
+/// at once. The service queues each with the storage worker and goes on to
+/// the next request, so admissions that arrive together share a commit; an
+/// idle one waits for no company. Anything else waits for those already
+/// queued, and they are answered in the order they arrived.
+const ADMISSION_WINDOW: usize = 32;
+/// A canonical workspace in JSON: the path limit, every byte escaped.
+const PATH_JSON: usize = 6 * 4096 + 2;
+/// A model reference in JSON, at the limits `split_model` enforces.
+const MODEL_JSON: usize = 64 + 1 + 6 * 256 + 2;
+/// The rest of a reply or an event: its envelope, keys, numbers, and short
+/// fixed strings.
+const FIELDS_JSON: usize = 1024;
+
+/// Bytes and packets sent to one session.
+#[derive(Clone, Copy, Default)]
+struct Sends {
+    bytes: usize,
+    packets: usize,
+}
+impl std::ops::Add for Sends {
+    type Output = Sends;
+    fn add(self, other: Sends) -> Sends {
+        Sends {
+            bytes: self.bytes + other.bytes,
+            packets: self.packets + other.packets,
+        }
+    }
+}
+/// What an admission sends its own session: its reply when it is answered,
+/// and its event copies when the publisher delivers them, which can be later.
+#[derive(Clone, Copy, Default)]
+struct Bound {
+    reply: Sends,
+    events: Sends,
+}
+impl Bound {
+    fn total(self) -> Sends {
+        self.reply + self.events
+    }
+}
+
+/// At least what an admission sends its own session once its commit lands:
+/// its reply, and its event once per `deliveries`, each way the session
+/// follows the bot. Queued admissions are answered back to back, faster than
+/// any client reads, so what they send one session must fit its output queue
+/// together. A creation answers with the bot's record, which repeats the
+/// request's strings (escaped no longer than the request wrote them) and the
+/// canonical workspace; a submission names its bot twice. A refusal says no
+/// more, and may name what it refused. The event names the bot, the request
+/// or creator, a workspace and a model.
+fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
+    let (reply, named, reply_workspace) = match command {
+        Command::Create {
+            bot,
+            workspace,
+            model,
+            instructions,
+            reasoning,
+            tools,
+            created_by,
+            compaction_instructions,
+            compaction_model,
+            ..
+        } => (
+            output::encoded_len(&(
+                id,
+                bot,
+                model,
+                instructions,
+                reasoning,
+                tools,
+                created_by,
+                compaction_instructions,
+                compaction_model,
+            )),
+            output::encoded_len(&(bot, created_by)),
+            if workspace.is_some() { PATH_JSON } else { 0 },
+        ),
+        Command::Submit {
+            bot,
+            request_id,
+            model,
+            delivery,
+            ..
+        } => (
+            output::encoded_len(&(id, bot, bot, request_id, model, delivery)),
+            output::encoded_len(&(bot, request_id)),
+            0,
+        ),
+        _ => return Bound::default(),
+    };
+    let reply = reply.unwrap_or(output::MAX_EVENT) + reply_workspace + FIELDS_JSON;
+    let event = named.unwrap_or(output::MAX_EVENT) + PATH_JSON + MODEL_JSON + FIELDS_JSON;
+    Bound {
+        reply: Sends {
+            bytes: reply,
+            packets: 1,
+        },
+        events: Sends {
+            bytes: deliveries * event,
+            packets: deliveries,
+        },
+    }
+}
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -552,14 +659,30 @@ struct Service {
     ready_hint: bool,
     /// Provider-reported tokens since this daemon started, for `stats`.
     tokens: Arc<turn::TokenTotals>,
-    /// Turns parked on a rate-limited pool, by resume time, and turns
-    /// parked on a verdict, by when a gate lapses. Each holds no task and no
-    /// slot; the run loop resumes them as they come due.
+    /// Turns parked on a rate-limited pool, by resume time, turns parked
+    /// on a verdict, by when a gate lapses, and wake-ups the store lost, by
+    /// when they are tried again. Each holds no task and no slot; the run
+    /// loop resumes them as they come due.
     wakes: Wakes,
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
     approval_hold: Duration,
+    /// Admissions queued with the storage worker and not yet answered,
+    /// oldest first: the worker answers in queue order.
+    admissions: std::collections::VecDeque<Admission>,
+    /// Active slots promised to queued admissions told they may start a
+    /// turn; each is released when its admission is answered.
+    reserved: usize,
+    /// The wait before trying a refused turn start again, doubling from
+    /// 10 ms to a second; zero once the store takes one.
+    storage_backoff: Duration,
+    /// When the ready turn a refused store left waiting is tried again.
+    ready_retry_at: Option<tokio::time::Instant>,
+    /// Events of answered admissions not yet in their session's queue: the
+    /// publisher has not passed them, or a follow is still replaying toward
+    /// them. Each keeps its room in its session's queue.
+    unpublished: std::collections::VecDeque<Unpublished>,
 }
 
 /// Parked turns' wake times, at most one per turn: a turn that parks again
@@ -568,19 +691,26 @@ struct Service {
 #[derive(Default)]
 struct Wakes {
     due: std::collections::BTreeSet<(u64, i64)>,
-    turns: HashMap<i64, (u64, String)>,
+    /// Per turn: its time, its bot, and whether the wake is the turn's own
+    /// time coming due rather than a retried answer or resolved handle.
+    turns: HashMap<i64, (u64, String, bool)>,
 }
 
 impl Wakes {
     fn set(&mut self, at: u64, bot: String, turn: i64) {
-        if let Some((old, _)) = self.turns.insert(turn, (at, bot)) {
+        self.retry(at, bot, turn, true);
+    }
+
+    /// A wake-up the store lost, tried again at `at` as it first came.
+    fn retry(&mut self, at: u64, bot: String, turn: i64, due: bool) {
+        if let Some((old, _, _)) = self.turns.insert(turn, (at, bot, due)) {
             self.due.remove(&(old, turn));
         }
         self.due.insert((at, turn));
     }
 
     fn cancel(&mut self, turn: i64) {
-        if let Some((at, _)) = self.turns.remove(&turn) {
+        if let Some((at, _, _)) = self.turns.remove(&turn) {
             self.due.remove(&(at, turn));
         }
     }
@@ -589,9 +719,68 @@ impl Wakes {
         self.due.first().map(|&(at, _)| at)
     }
 
-    fn pop(&mut self) -> Option<(String, i64)> {
+    fn pop(&mut self) -> Option<(String, i64, bool)> {
         let (_, turn) = self.due.pop_first()?;
-        self.turns.remove(&turn).map(|(_, bot)| (bot, turn))
+        self.turns
+            .remove(&turn)
+            .map(|(_, bot, due)| (bot, turn, due))
+    }
+}
+
+struct Unpublished {
+    session: u64,
+    /// The bot whose event it is: a follow of it still replaying history
+    /// has not received it yet.
+    bot: String,
+    cursor: i64,
+    events: Sends,
+}
+
+/// A queued admission and whom to answer.
+struct Admission {
+    session: u64,
+    output: Output,
+    id: Value,
+    /// `admission_bound` of its request: room it holds in its session's queue.
+    bound: Bound,
+    pending: Pending,
+}
+enum Pending {
+    Submit {
+        bot: String,
+        request_id: String,
+        delivery: Delivery,
+        /// Holds one of `reserved`.
+        reserved: bool,
+        draining: bool,
+        answer: Answer<(i64, Started)>,
+        answered: Option<Result<(i64, Started)>>,
+    },
+    /// The bot's record, and the cursor of its `created` event.
+    Create {
+        /// The bot's name, kept when the session follows it.
+        bot: Option<String>,
+        answer: Answer<(Value, Option<i64>)>,
+        answered: Option<Result<(Value, Option<i64>)>>,
+    },
+    /// Settled before queueing (a refused request), kept in line so replies
+    /// stay in request order.
+    Settled(Result<Value>),
+}
+
+/// Wait for the oldest admission's answer and keep it with the admission.
+/// Cancel-safe: the answer is stored in the same poll that receives it.
+/// Borrows only the queue, so the run loop can select on it.
+async fn arrived(admissions: &mut std::collections::VecDeque<Admission>) {
+    let front = admissions.front_mut().expect("an admission is queued");
+    match &mut front.pending {
+        Pending::Submit {
+            answer, answered, ..
+        } if answered.is_none() => *answered = Some(answer.await),
+        Pending::Create {
+            answer, answered, ..
+        } if answered.is_none() => *answered = Some(answer.await),
+        _ => {}
     }
 }
 
@@ -636,6 +825,7 @@ pub(crate) async fn publish(
                 // A closed stdio owner ends the daemon through its own signal.
                 let _ = hub.durable(&bot, entry).await;
             }
+            Publication::Through(cursor) => hub.published_to(cursor),
             Publication::Finished { bot, turn, outcome } => {
                 handles.turn_finished(&bot, turn, outcome);
             }
@@ -886,6 +1076,11 @@ pub async fn run(config: Configuration) -> Result<()> {
         wakes,
         draining: false,
         approval_hold,
+        admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
+        reserved: 0,
+        storage_backoff: Duration::ZERO,
+        ready_retry_at: None,
+        unpublished: std::collections::VecDeque::new(),
     };
     let idle_exit = config
         .idle_exit
@@ -898,121 +1093,178 @@ pub async fn run(config: Configuration) -> Result<()> {
     // placeholder only fills the disabled select arm, never polled.
     let mut drain_until: Option<tokio::time::Instant> = None;
     let undrained = tokio::time::Instant::now();
-    loop {
-        if service.draining && service.active.is_empty() {
-            break;
-        }
-        // Computed before the select so its arms borrow the service freely.
-        let (wake_due, wake_delay) = (service.wakes.next().is_some(), service.wake_delay());
-        tokio::select! {
-            _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
-            Some(error) = failures.recv() => return Err(error),
-            _ = service.replays.join_next(), if !service.replays.is_empty() => {}
-            _ = service.retention.join_next(), if !service.retention.is_empty() => {}
-            joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
-                let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
-                service.complete(bot, turn, task, exit).await?;
+    // A fatal error still ends through the cleanup below, so queued
+    // admissions are answered and their turns end like any other, unless
+    // the stdio owner's output is what failed.
+    let served: Result<()> = async {
+        loop {
+            if service.draining && service.active.is_empty() {
+                break;
             }
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
-            _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
-            _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
-                // Idle means no client, no live turn, and no running command.
-                // Parked turns are durable and resume on the next start.
-                let running = service.store.op("running_processes", |db| db.running_processes()).await?;
-                if sessions.is_empty() && service.active.is_empty() && running == 0 {
-                    if last_activity.elapsed() >= idle_exit.unwrap() { break; }
-                } else {
+            // Computed before the select so its arms borrow the service freely.
+            let (wake_due, wake_delay) = (service.wakes.next().is_some(), service.wake_delay());
+            let ready_retry = service.ready_retry_at;
+            tokio::select! {
+                _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
+                Some(error) = failures.recv() => return Err(error),
+                _ = service.replays.join_next(), if !service.replays.is_empty() => {}
+                _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
+                    let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                    service.complete(bot, turn, task, exit).await?;
+                }
+                _ = terminate.recv() => break,
+                _ = interrupt.recv() => break,
+                _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
+                _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
+                    // Idle means no client, no live turn, and no running command.
+                    // Parked turns are durable and resume on the next start.
+                    let running = service.store.op("running_processes", |db| db.running_processes()).await?;
+                    if sessions.is_empty() && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
+                        if last_activity.elapsed() >= idle_exit.unwrap() { break; }
+                    } else {
+                        last_activity = std::time::Instant::now();
+                    }
+                }
+                Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
+                    service.resume(bot, turn, false).await?;
+                }
+                // One queued turn per iteration, so requests interleave with a
+                // long backlog; resumes hold no slot and are not starved because
+                // the branch choice is fair.
+                _ = std::future::ready(()), if service.ready_hint && ready_retry.is_none() && service.has_capacity() => {
+                    service.dispatch_ready().await?;
+                }
+                _ = tokio::time::sleep_until(ready_retry.unwrap_or_else(tokio::time::Instant::now)), if ready_retry.is_some() => {
+                    service.ready_retry_at = None;
+                }
+                // A parked turn's time comes due (a pool reopens, a gate lapses,
+                // a lost wake-up is retried): resume it like any parked turn,
+                // capacity permitting; a stale entry (deleted, or its name
+                // reused) is dropped.
+                _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
+                    if let Some((bot, turn, due)) = service.wakes.pop() {
+                        service.resume(bot, turn, due).await?;
+                    }
+                }
+                // Queued admissions are answered as their commits land, in order.
+                _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
+                    let (session, output, id, result) = service.settled();
+                    reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                }
+                message = inbound.recv() => {
+                    let Some(message) = message else { break };
                     last_activity = std::time::Instant::now();
-                }
-            }
-            Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
-                service.resume(bot, turn, false).await?;
-            }
-            // One queued turn per iteration, so requests interleave with a
-            // long backlog; resumes hold no slot and are not starved because
-            // the branch choice is fair.
-            _ = std::future::ready(()), if service.ready_hint && service.has_capacity() => {
-                service.dispatch_ready().await?;
-            }
-            // A parked turn's time comes due (a pool reopens, a gate lapses):
-            // resume it like any parked turn, capacity permitting; a stale
-            // entry (deleted, or its name reused) is dropped.
-            _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
-                if let Some((bot, turn)) = service.wakes.pop() {
-                    service.resume(bot, turn, true).await?;
-                }
-            }
-            message = inbound.recv() => {
-                let Some(message) = message else { break };
-                last_activity = std::time::Instant::now();
-                match message {
-                    Inbound::Open(id, output) => {
-                        let _ = output.try_send(ready.clone());
-                        sessions.insert(id, output);
-                        service.sessions = sessions.len();
-                    }
-                    Inbound::Closed(id) => {
-                        sessions.remove(&id);
-                        service.sessions = sessions.len();
-                        service.hub.close_session(id);
-                        service.handles.close_session(id);
-                        if id == 0 && stdio_owner { break; }
-                    }
-                    Inbound::Request(id, request) => {
-                        let Some(output) = sessions.get(&id).cloned() else { continue };
-                        let (request_id, result, shutdown) = match request {
-                            Ok(request) if request.id.is_u64() || request.id.as_str().is_some_and(|id| id.len() <= 128) => {
-                                let shutdown = match request.command {
-                                    Command::Shutdown { grace_ms } => Some(grace_ms),
-                                    _ => None,
-                                };
-                                let result = service.dispatch(request.command, id, &output, request.id.clone()).await;
-                                if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
-                                (request.id, result, shutdown)
-                            }
-                            Ok(_) => (Value::Null, fail("invalid_request_id"), None),
-                            Err(error) => (Value::Null, Err(error), None),
-                        };
-                        let shutdown = shutdown.filter(|_| result.is_ok());
-                        if id == 0 && stdio_owner {
-                            if !matches!(tokio::time::timeout(Duration::from_secs(5), output.respond(request_id, result)).await, Ok(Ok(()))) {
-                                return fail("output_closed");
-                            }
-                        } else if output.try_respond(request_id, result).is_err() {
+                    match message {
+                        Inbound::Open(id, output) => {
+                            let _ = output.try_send(ready.clone());
+                            sessions.insert(id, output);
+                            service.sessions = sessions.len();
+                        }
+                        Inbound::Closed(id) => {
                             sessions.remove(&id);
                             service.sessions = sessions.len();
                             service.hub.close_session(id);
                             service.handles.close_session(id);
-                            output.close();
+                            if id == 0 && stdio_owner { break; }
                         }
-                        if let Some(grace_ms) = shutdown {
-                            // A later shutdown can only bring the deadline closer.
-                            let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
-                            drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
-                            service.draining = true;
-                            if grace_ms == 0 || service.active.is_empty() {
-                                // The socket writer is a task on this runtime. Give
-                                // it time to acknowledge shutdown before exiting.
-                                let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
-                                break;
+                        Inbound::Request(id, request) => {
+                            let Some(output) = sessions.get(&id).cloned() else { continue };
+                            // A bad id is refused like a malformed line, after the
+                            // admissions queued before it.
+                            let request = request.and_then(|request| match &request.id {
+                                Value::Number(number) if number.is_u64() => Ok(request),
+                                Value::String(text) if text.len() <= 128 => Ok(request),
+                                _ => fail("invalid_request_id"),
+                            });
+                            let bound = request.as_ref().map_or(Bound::default(), |r| service.admission_sends(&r.command, &r.id, id));
+                            // Everything but an admission with room waits for the
+                            // admissions already queued, keeping request order.
+                            while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
+                                let (session, output, id, result) = service.settle().await;
+                                reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                            }
+                            // Even with none queued, an admission waits for the events
+                            // of those answered before it when they and it would not
+                            // fit together: a socket whose queue overflows is closed,
+                            // and its admission must not commit first. The stdio
+                            // owner's output waits for room instead.
+                            if !(id == 0 && stdio_owner)
+                                && let Some(cursor) = service.awaits_publication(request.as_ref().ok().map(|r| &r.command), id, &output, bound)
+                            {
+                                service.hub.published_through(cursor).await;
+                                if *output.subscribe_closed().borrow() { continue; }
+                            }
+                            let (request_id, result, shutdown) = match request {
+                                Ok(request) => {
+                                    let shutdown = match request.command {
+                                        Command::Shutdown { grace_ms } => Some(grace_ms),
+                                        _ => None,
+                                    };
+                                    let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
+                                    let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
+                                    if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
+                                    // A refused admission still answers after those queued before it.
+                                    if admission && !service.admissions.is_empty() {
+                                        service.admissions.push_back(Admission { session: id, output, id: request.id, bound, pending: Pending::Settled(result) });
+                                        continue;
+                                    }
+                                    (request.id, result, shutdown)
+                                }
+                                Err(error) => (Value::Null, Err(error), None),
+                            };
+                            let shutdown = shutdown.filter(|_| result.is_ok());
+                            reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                            if let Some(grace_ms) = shutdown {
+                                // A later shutdown can only bring the deadline closer.
+                                let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+                                drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
+                                service.draining = true;
+                                if grace_ms == 0 || service.active.is_empty() {
+                                    // The socket writer is a task on this runtime. Give
+                                    // it time to acknowledge shutdown before exiting.
+                                    let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
+    }
+    .await;
+    // The stdio owner's output is gone: no one is left to answer, and a
+    // blocked stdout write cannot be cancelled. The next start ends the rest.
+    if stdio_owner
+        && served
+            .as_ref()
+            .is_err_and(|error| error.code == "output_closed")
+    {
+        return served;
     }
     // Committed pieces survive cancellation. Deletion resumes at next open;
     // explicit pruning can be reissued. Await drops before joining stdout.
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
-    for active in service.active.values() {
+    answer_queued(&mut service, &mut sessions, stdio_owner).await;
+    // Release every slot as it is cancelled: a turn interrupted earlier keeps
+    // its first cause, and its dropped sender still stops a finish retry.
+    for active in std::mem::take(&mut service.active).into_values() {
         active.cancel(turn::SHUTDOWN);
     }
+    // A completion that could not commit leaves its turn for the next start
+    // to end as interrupted; the rest still drain, and the exit reports it.
+    let mut failed = None;
     while let Some(result) = service.jobs.join_next().await {
-        let (bot, turn, task, exit) = result.map_err(|_| Error::new("turn_task_failed"))?;
-        service.complete(bot, turn, task, exit).await?;
+        let completed = match result.map_err(|_| Error::new("turn_task_failed")) {
+            Ok((bot, turn, task, exit)) => service.complete(bot, turn, task, exit).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = completed {
+            failed.get_or_insert(error);
+        }
     }
     service.replays.abort_all();
     while service.replays.join_next().await.is_some() {}
@@ -1045,11 +1297,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     drop(sessions);
     // The stdio firehose's senders went with the service and the publisher;
     // the output worker can now drain and exit, including shutdown without EOF.
-    stdout_writer
+    let written = stdout_writer
         .join()
-        .map_err(|_| Error::new("output_worker_failed"))??;
+        .map_err(|_| Error::new("output_worker_failed"))
+        .flatten();
     drop(socket_owner);
-    Ok(())
+    // The first failure is the cause: a closed stdout also fails its writer.
+    served.and(written).and(failed.map_or(Ok(()), Err))
 }
 
 // Runs on the storage worker using the bot already read for admission. No
@@ -1079,7 +1333,205 @@ fn validate_provider(
 
 impl Service {
     fn has_capacity(&self) -> bool {
-        !self.draining && (self.limit_active == 0 || self.active.len() < self.limit_active)
+        !self.draining
+            && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
+    }
+
+    /// What an admission will send `session`: its reply, and its event once
+    /// for each way the session follows the bot.
+    fn admission_sends(&self, command: &Command, id: &Value, session: u64) -> Bound {
+        let deliveries = match command {
+            Command::Create { bot, .. } | Command::Submit { bot, .. } => {
+                self.hub.deliveries(bot, session)
+            }
+            _ => 0,
+        };
+        admission_bound(command, id, deliveries)
+    }
+
+    /// Whether a request must wait for queued admissions to be answered
+    /// before it is handled. Only an admission may join them, and only while
+    /// the window has room, its session's output queue can take what it,
+    /// the admissions queued for that session, and the events of those
+    /// answered but not yet published will send, and its capacity answer is
+    /// the one the serial order would give: with no slot left unpromised,
+    /// whether one frees up depends on how the queued admissions end.
+    fn must_settle(
+        &self,
+        command: Option<&Command>,
+        session: u64,
+        output: &Output,
+        bound: Bound,
+    ) -> bool {
+        if self.admissions.is_empty() {
+            return false;
+        }
+        let full = || {
+            if self.admissions.len() >= ADMISSION_WINDOW {
+                return true;
+            }
+            let (bytes, packets) = output.room();
+            let queued = self
+                .admissions
+                .iter()
+                .filter(|admission| admission.session == session)
+                .map(|admission| admission.bound.total());
+            let answered = self.pending_events(session).map(|events| events.events);
+            let promised = queued
+                .chain(answered)
+                .fold(bound.total(), |sum, sends| sum + sends);
+            promised.bytes > bytes || promised.packets > packets
+        };
+        match command {
+            Some(Command::Create { .. }) => full(),
+            Some(Command::Submit { .. }) => {
+                full()
+                    || (!self.draining
+                        && self.limit_active != 0
+                        && self.reserved > 0
+                        && self.active.len() + self.reserved >= self.limit_active)
+            }
+            _ => true,
+        }
+    }
+
+    /// Events answered for `session` that the publisher has not delivered.
+    fn pending_events(&self, session: u64) -> impl Iterator<Item = &Unpublished> {
+        self.unpublished
+            .iter()
+            .filter(move |events| events.session == session && !delivered(&self.hub, events))
+    }
+    /// For an admission that finds the window empty: the newest of its
+    /// session's events answered but not yet delivered, when those events
+    /// and the admission would not fit the session's queue together.
+    fn awaits_publication(
+        &self,
+        command: Option<&Command>,
+        session: u64,
+        output: &Output,
+        bound: Bound,
+    ) -> Option<i64> {
+        if !self.admissions.is_empty()
+            || !matches!(
+                command,
+                Some(Command::Create { .. } | Command::Submit { .. })
+            )
+        {
+            return None;
+        }
+        let (promised, newest) = self
+            .pending_events(session)
+            .fold((bound.total(), None), |(sum, _), events| {
+                (sum + events.events, Some(events.cursor))
+            });
+        let newest = newest?;
+        let (bytes, packets) = output.room();
+        (promised.bytes > bytes || promised.packets > packets).then_some(newest)
+    }
+
+    /// Answer the oldest queued admission once its commit is known.
+    async fn settle(&mut self) -> (u64, Output, Value, Result<Value>) {
+        arrived(&mut self.admissions).await;
+        self.settled()
+    }
+    /// Answer the oldest admission, whose commit `arrived` has seen, applying
+    /// what the serial path did after its store call: start the turn, flag a
+    /// steer, release the reserved slot. Its events keep their room in the
+    /// session's queue until the publisher has delivered them.
+    fn settled(&mut self) -> (u64, Output, Value, Result<Value>) {
+        let Admission {
+            session,
+            output,
+            id,
+            bound,
+            pending,
+        } = self.admissions.pop_front().expect("an admission is queued");
+        let followed = bound.events.packets > 0;
+        let (result, cursor, bot) = match pending {
+            Pending::Submit {
+                bot,
+                request_id,
+                delivery,
+                reserved,
+                draining,
+                answered,
+                ..
+            } => {
+                self.reserved -= usize::from(reserved);
+                let answered = answered.expect("the submission was answered");
+                let name = followed.then(|| bot.clone());
+                let result = self.admitted(bot, request_id, delivery, draining, answered);
+                let cursor = result.as_ref().ok().and_then(|r| r["cursor"].as_i64());
+                (result, cursor, name)
+            }
+            Pending::Create { bot, answered, .. } => {
+                match answered.expect("the creation was answered") {
+                    Ok((created, cursor)) => (Ok(created), cursor, bot),
+                    Err(error) => (Err(error), None, None),
+                }
+            }
+            Pending::Settled(result) => (result, None, None),
+        };
+        let hub = &self.hub;
+        self.unpublished.retain(|events| !delivered(hub, events));
+        if let (Some(cursor), Some(bot)) = (cursor, bot) {
+            let events = Unpublished {
+                session,
+                bot,
+                cursor,
+                events: bound.events,
+            };
+            if !delivered(hub, &events) {
+                self.unpublished.push_back(events);
+            }
+        }
+        (session, output, id, result)
+    }
+
+    /// After a submission's commit: start its turn if it runs now, and
+    /// make its reply.
+    fn admitted(
+        &mut self,
+        bot: String,
+        request_id: String,
+        delivery: Delivery,
+        draining: bool,
+        result: Result<(i64, Started)>,
+    ) -> Result<Value> {
+        // While draining no turn starts: `reject` work is refused for the
+        // next daemon, and queued work waits durably for it.
+        let (identity, started) = result.map_err(|error| match error.code.as_str() {
+            "active_agent_limit" if draining => Error::new("daemon_draining"),
+            _ => error,
+        })?;
+        let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
+        if started.fresh && started.status == "running" {
+            // A steer queued behind it in the window is its steer once
+            // committed: arm the turn's first round boundary for it.
+            let steered = self.admissions.iter().any(|admission| {
+                matches!(&admission.pending, Pending::Submit { bot: queued, delivery: Delivery::Steer, .. } if *queued == bot)
+            });
+            self.spawn(bot.clone(), started.turn, None, steered);
+        }
+        // The running turn may have started after the steer was queued, from
+        // an admission answered in between.
+        if started.fresh
+            && started.status == "queued"
+            && delivery == Delivery::Steer
+            && let Some(active) = self.active.get(&bot)
+        {
+            active
+                .steers
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if started.status == "ready" {
+            self.ready_hint = true;
+        }
+        Ok(
+            json!({"bot":bot,"bot_id":identity,"turn":started.turn,"request_id":request_id,
+            "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
+            "handle":format!("turn:{bot}/{}", started.turn)}),
+        )
     }
 
     /// How long until the earliest parked turn is due.
@@ -1103,18 +1555,30 @@ impl Service {
             Later(String, Option<u64>),
             Stale,
         }
-        let claimed = self
+        let name = bot.clone();
+        let claimed = match self
             .store
-            .op("resume", move |db| match db.wake(&bot, turn, due)? {
+            .op("resume", move |db| match db.wake(&name, turn, due)? {
                 Wake::Resume => match db.resume(turn) {
-                    Ok((waiting, _, steers)) => Ok(Claim::Run(bot, waiting, steers)),
+                    Ok((waiting, _, steers)) => Ok(Claim::Run(name, waiting, steers)),
                     Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
                     Err(error) => Err(error),
                 },
-                Wake::Later(at) => Ok(Claim::Later(bot, at)),
+                Wake::Later(at) => Ok(Claim::Later(name, at)),
                 Wake::Stale => Ok(Claim::Stale),
             })
-            .await?;
+            .await
+        {
+            // A lost group (a full disk, say) leaves the turn parked: the
+            // same wake-up comes due again after a backoff.
+            Err(error) if error.code == "storage_error" => {
+                let at = now_ms() + self.storage_retry().as_millis() as u64;
+                self.wakes.retry(at, bot, turn, due);
+                return Ok(());
+            }
+            claimed => claimed?,
+        };
+        self.storage_backoff = Duration::ZERO;
         match claimed {
             Claim::Run(bot, waiting, steers) => {
                 self.wakes.cancel(turn);
@@ -1128,10 +1592,33 @@ impl Service {
         Ok(())
     }
 
+    /// The wait after the store refused to start a turn: doubling from
+    /// 10 ms up to a second, until one starts.
+    fn storage_retry(&mut self) -> Duration {
+        let delay = self.storage_backoff.max(Duration::from_millis(10));
+        self.storage_backoff = (delay * 2).min(Duration::from_secs(1));
+        delay
+    }
+
     /// Start the oldest turn waiting for a slot, or learn there is none.
     /// A turn that cannot start (for example, its bot's budget is spent)
     /// ends with that error; the bot's next queued turn takes its place.
+    /// A store that refuses writes (a full disk, say) leaves the turn ready,
+    /// and the service tries again after a backoff while the rest goes on.
     async fn dispatch_ready(&mut self) -> Result<()> {
+        match self.start_ready().await {
+            Err(error) if error.code == "storage_error" => {
+                let delay = self.storage_retry();
+                self.ready_retry_at = Some(tokio::time::Instant::now() + delay);
+                Ok(())
+            }
+            started => {
+                self.storage_backoff = Duration::ZERO;
+                started
+            }
+        }
+    }
+    async fn start_ready(&mut self) -> Result<()> {
         let Some((bot, turn)) = self.store.op("next_ready", |db| db.next_ready()).await? else {
             self.ready_hint = false;
             return Ok(());
@@ -1146,6 +1633,8 @@ impl Service {
         {
             Ok((_, steers)) => self.spawn(bot, turn, None, steers),
             Err(error) if error.code == "bot_busy" => {}
+            // Nothing was written: the turn is still ready.
+            Err(error) if error.code == "storage_error" => return Err(error),
             // A strict steer whose turn is over ends as stale, like any
             // other queued turn that cannot start; an already-ended row is
             // simply gone from the line.
@@ -1231,17 +1720,15 @@ impl Service {
             let (bot, id) = (task.bot.clone(), task.turn);
             // Keep the cancellation receiver alive through completion so an
             // interrupt cannot mistake this task for an unreaped parked turn.
+            let mut cancelled = cancelled;
             let exit = task.execute(cancelled.clone()).await;
-            let result = if let turn::Exit::Finished(error) = &exit {
-                let (bot, error) = (bot.clone(), error.clone());
-                task.store
-                    .op_pruning("finish", bot.clone(), move |db| {
-                        turn::Finished::record(db, &bot, id, error.as_ref(), keep)
-                    })
-                    .await
-                    .map(|_| exit)
-            } else {
-                Ok(exit)
+            let result = match &exit {
+                turn::Exit::Finished(error) => {
+                    commit_finish(&task.store, &bot, id, error.as_ref(), keep, &mut cancelled)
+                        .await
+                        .map(|()| exit)
+                }
+                _ => Ok(exit),
             };
             drop(cancelled);
             (bot, id, task_id, result)
@@ -1265,6 +1752,7 @@ impl Service {
             // A slot opened, and a finish may promote the bot's next turn.
             self.ready_hint = true;
         }
+        self.storage_backoff = Duration::ZERO;
         match exit {
             turn::Exit::Finished(_) => {
                 // Interrupt may already have released the task's active slot.
@@ -1286,7 +1774,8 @@ impl Service {
         command: Command,
         session: u64,
         output: &Output,
-        request_id: Value,
+        id: Value,
+        bound: Bound,
     ) -> Result<Value> {
         let store = &self.store;
         match command {
@@ -1360,9 +1849,10 @@ impl Service {
                     }
                 }
                 let (provider, model) = (provider.to_owned(), model.to_owned());
-                let (created, event) = store
-                    .op("create", move |db| {
-                        db.create(
+                let follower = (bound.events.packets > 0).then(|| bot.clone());
+                let answer = store
+                    .queue("create", move |db| {
+                        let (created, event) = db.create(
                             &bot,
                             path.as_deref(),
                             Binding {
@@ -1380,11 +1870,22 @@ impl Service {
                                 fallbacks,
                                 gate: gate.as_ref(),
                             },
-                        )
+                        )?;
+                        Ok((serde_json::to_value(created)?, event["cursor"].as_i64()))
                     })
                     .await?;
-                let _ = event;
-                Ok(serde_json::to_value(created)?)
+                self.admissions.push_back(Admission {
+                    session,
+                    output: output.clone(),
+                    id,
+                    bound,
+                    pending: Pending::Create {
+                        bot: follower,
+                        answer,
+                        answered: None,
+                    },
+                });
+                Err(Error::new("deferred"))
             }
             Command::Turns { bot, after, limit } => {
                 store
@@ -1444,7 +1945,7 @@ impl Service {
                         Ok(deleted)
                     }
                     .await;
-                    retention_reply(session, &output, request_id, result).await;
+                    retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
             }
@@ -1484,7 +1985,7 @@ impl Service {
                         }
                     }
                     .await;
-                    retention_reply(session, &output, request_id, result).await;
+                    retention_reply(session, &output, id, result).await;
                 });
                 Err(Error::new("deferred"))
             }
@@ -1584,7 +2085,7 @@ impl Service {
                 let name = bot.clone();
                 let answered = store
                     .op("answer", move |db| {
-                        db.answer(Answer {
+                        db.answer(Decision {
                             bot: &name,
                             turn,
                             call_id: &call_id,
@@ -1644,7 +2145,7 @@ impl Service {
                         Completion::Respond {
                             session,
                             output: output.clone(),
-                            request: request_id,
+                            request: id,
                         },
                     )
                     .await;
@@ -1805,47 +2306,61 @@ impl Service {
                     delivery,
                     expected_turn,
                 };
+                // A slot is promised before the commit that may take it, so
+                // admissions queued together cannot start more turns than
+                // the limit allows.
                 let capacity = self.has_capacity();
+                let reserved = capacity && self.limit_active != 0;
+                self.reserved += usize::from(reserved);
+                // A steer arms the running turn inside its committing job,
+                // as `end_queued` does, so no round boundary before the
+                // answer finds it waiting behind a cleared flag.
+                let steers = self
+                    .active
+                    .get(&bot)
+                    .filter(|_| delivery == Delivery::Steer)
+                    .map(|active| active.steers.clone());
                 let (b, r) = (bot.clone(), request_id.clone());
                 let providers = self.providers.clone();
-                let draining = self.draining;
-                let (identity, started) = store
-                    .op("begin", move |db| {
+                let queued = store
+                    .queue("begin", move |db| {
                         let identity = db.identity(&b, bot_id)?;
                         let started =
                             db.begin(&b, &r, &prompt, capacity, &options, |bot, model| {
                                 validate_provider(&providers, bot, model)
                             })?;
+                        if started.fresh
+                            && started.status == "queued"
+                            && let Some(steers) = &steers
+                        {
+                            steers.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         Ok((identity, started))
                     })
-                    .await
-                    // While draining no turn starts: `reject` work is refused
-                    // for the next daemon, and queued work waits durably for it.
-                    .map_err(|error| match error.code.as_str() {
-                        "active_agent_limit" if draining => Error::new("daemon_draining"),
-                        _ => error,
-                    })?;
-                let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
-                if started.fresh && started.status == "running" {
-                    self.spawn(bot.clone(), started.turn, None, false);
-                }
-                if started.fresh
-                    && started.status == "queued"
-                    && delivery == Delivery::Steer
-                    && let Some(active) = self.active.get(&bot)
-                {
-                    active
-                        .steers
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                if started.status == "ready" {
-                    self.ready_hint = true;
-                }
-                Ok(
-                    json!({"bot":bot,"bot_id":identity,"turn":started.turn,"request_id":request_id,
-                    "duplicate":!started.fresh,"status":started.status,"cursor":cursor,
-                    "handle":format!("turn:{bot}/{}", started.turn)}),
-                )
+                    .await;
+                let answer = match queued {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        self.reserved -= usize::from(reserved);
+                        return Err(error);
+                    }
+                };
+                self.admissions.push_back(Admission {
+                    session,
+                    output: output.clone(),
+                    id,
+                    bound,
+                    pending: Pending::Submit {
+                        bot,
+                        request_id,
+                        delivery,
+                        reserved,
+                        draining: self.draining,
+                        answer,
+                        answered: None,
+                    },
+                });
+                Err(Error::new("deferred"))
             }
             Command::Interrupt { bot, turn } => {
                 if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
@@ -1882,8 +2397,6 @@ impl Service {
                 {
                     return fail("stale_turn");
                 }
-                self.handles.forget(Waiter::Turn(turn));
-                self.wakes.cancel(turn);
                 let name = bot.clone();
                 let keep = self.retain_turns;
                 store
@@ -1897,6 +2410,10 @@ impl Service {
                         )
                     })
                     .await?;
+                // Only once the end commits: a refused one leaves the turn
+                // parked, and its wait or lapse must still wake it.
+                self.handles.forget(Waiter::Turn(turn));
+                self.wakes.cancel(turn);
                 self.ready_hint = true;
                 Ok(json!({"interrupt_requested":true,"turn":turn,"parked":true}))
             }
@@ -1908,6 +2425,109 @@ impl Service {
             }
         }
     }
+}
+
+/// Commit a finished turn. A group that cannot commit (a full disk, say)
+/// leaves nothing durable, so the completion is tried again, with backoff,
+/// while the bot stays busy and other bots go on. An interrupt that arrives
+/// meanwhile is honored: the next attempt ends the turn as interrupted.
+/// Only shutdown stops it (its cause, or the service dropping the turn's
+/// slot): the turn then stays running in the store, and the next start ends
+/// it as interrupted.
+async fn commit_finish(
+    store: &Store,
+    bot: &str,
+    turn: i64,
+    error: Option<&Error>,
+    keep: Option<usize>,
+    cancelled: &mut watch::Receiver<Option<&'static str>>,
+) -> Result<()> {
+    let mut error = error.cloned();
+    let mut backoff = Duration::from_millis(10);
+    loop {
+        let (name, attempt) = (bot.to_owned(), error.clone());
+        let failure = match store
+            .op_pruning("finish", bot.to_owned(), move |db| {
+                turn::Finished::record(db, &name, turn, attempt.as_ref(), keep)
+            })
+            .await
+        {
+            Err(failure) if failure.code == "storage_error" => failure,
+            done => return done,
+        };
+        let interrupted = error.as_ref().is_some_and(|e| e.code == turn::INTERRUPTED);
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            cause = cancelled.wait_for(|cause| {
+                *cause == Some(turn::SHUTDOWN) || (!interrupted && *cause == Some(turn::INTERRUPTED))
+            }) => match cause.map(|cause| *cause) {
+                Ok(Some(turn::INTERRUPTED)) => {
+                    error = Some(Error::new(turn::INTERRUPTED));
+                    continue;
+                }
+                _ => return Err(failure),
+            },
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(1));
+    }
+}
+
+/// Whether an answered admission's events are in its session's queue: the
+/// publisher has passed them, and no follow of the bot in that session is
+/// still replaying history, which delivers them only when it reaches them.
+fn delivered(hub: &Hub, events: &Unpublished) -> bool {
+    events.cursor <= hub.published() && !hub.replaying(&events.bot, events.session)
+}
+
+/// Answer the admissions still queued at shutdown and start their turns, so
+/// shutdown ends those turns like any other running turn. A stdio owner that
+/// cannot take a reply within its timeout gets no more: the rest settle
+/// without waiting on it again.
+async fn answer_queued(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+) {
+    let mut stdout_lost = false;
+    while !service.admissions.is_empty() {
+        let (session, output, id, result) = service.settle().await;
+        if stdout_lost && session == 0 && stdio_owner {
+            continue;
+        }
+        // Only the stdio owner's reply can fail.
+        stdout_lost |= reply(service, sessions, stdio_owner, session, &output, id, result)
+            .await
+            .is_err();
+    }
+}
+
+/// Answer a request: the stdio owner gets bounded backpressure, and losing
+/// it ends the daemon; a socket client that cannot take the reply is dropped.
+async fn reply(
+    service: &mut Service,
+    sessions: &mut HashMap<u64, Output>,
+    stdio_owner: bool,
+    session: u64,
+    output: &Output,
+    id: Value,
+    result: Result<Value>,
+) -> Result<()> {
+    if session == 0 && stdio_owner {
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(5), output.respond(id, result)).await,
+            Ok(Ok(()))
+        ) {
+            return fail("output_closed");
+        }
+    } else if output.try_respond(id, result).is_err() {
+        if sessions.remove(&session).is_some() {
+            service.sessions = sessions.len();
+            service.hub.close_session(session);
+            service.handles.close_session(session);
+        }
+        output.close();
+    }
+    Ok(())
 }
 
 /// Match ordinary replies: the stdio owner (session zero) gets bounded
@@ -2239,6 +2859,11 @@ mod tests {
             wakes: Wakes::default(),
             draining: false,
             approval_hold: Duration::from_secs(2),
+            admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
+            reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
         };
         service.jobs.spawn(async move {
             drop(cancelled);
@@ -2255,6 +2880,7 @@ mod tests {
                 0,
                 &output,
                 Value::Null,
+                Bound::default(),
             )
             .await
             .unwrap_err();
@@ -2268,6 +2894,7 @@ mod tests {
                 0,
                 &output,
                 Value::Null,
+                Bound::default(),
             )
             .await
             .unwrap();
@@ -2438,43 +3065,18 @@ mod tests {
             wakes: Wakes::default(),
             draining: false,
             approval_hold: Duration::from_secs(2),
+            admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
+            reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
         };
-        let duplicate = service
-            .dispatch(
-                Command::Submit {
-                    bot: "Bob".into(),
-                    bot_id: None,
-                    request_id: "same".into(),
-                    prompt: "work".into(),
-                    workspace: None,
-                    model: None,
-                    delivery: None,
-                    expected_turn: None,
-                },
-                0,
-                &output,
-                Value::Null,
-            )
+        let duplicate = request(&mut service, submit("Bob", "same"), &output)
             .await
             .unwrap();
         assert_eq!(duplicate["turn"], turn);
         assert_eq!(duplicate["duplicate"], true);
-        let error = service
-            .dispatch(
-                Command::Submit {
-                    bot: "Other".into(),
-                    bot_id: None,
-                    request_id: "new".into(),
-                    prompt: "work".into(),
-                    workspace: None,
-                    model: None,
-                    delivery: None,
-                    expected_turn: None,
-                },
-                0,
-                &output,
-                Value::Null,
-            )
+        let error = request(&mut service, submit("Other", "new"), &output)
             .await
             .unwrap_err();
         assert_eq!(error.code, "active_agent_limit");
@@ -2496,85 +3098,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("agent-concurrent-finish-{}", std::process::id()));
         let (store, mut publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
-        let turns = store
-            .call(|db| {
-                (0..8)
-                    .map(|n| {
-                        let bot = format!("bot{n}");
-                        db.create(
-                            &bot,
-                            Some("/synthetic"),
-                            Binding {
-                                provider: "openai",
-                                family: Family::Responses,
-                                model: "synthetic",
-                                instructions: "",
-                                reasoning: None,
-                                budget_tokens: None,
-                                tools: &[],
-                                created_by: None,
-                                created_by_id: None,
-                                compaction_instructions: None,
-                                compaction_model: None,
-                                fallbacks: false,
-                                gate: None,
-                            },
-                        )?;
-                        let turn = db
-                            .begin(
-                                &bot,
-                                "first",
-                                "work",
-                                true,
-                                &TurnOptions::default(),
-                                |_, _| Ok(()),
-                            )?
-                            .turn;
-                        Ok((bot, turn))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .await
-            .unwrap();
-        let registry = Registry::new("echo").unwrap();
-        let transport = Transport::new(64, 1).unwrap();
-        let mut service = Service {
-            identity: 0,
-            store: store.clone(),
-            transport,
-            providers: Arc::new(HashMap::new()),
-            registry,
-            hub: Hub::default(),
-            handles: Handles::new(mpsc::unbounded_channel().0),
-            limits: Limits {
-                pending: 0,
-                pending_bytes: 0,
-                processes: 16,
-                detached: 16,
-                active: 1024,
-                connecting: 64,
-                connections: 11,
-                context_bytes: 8 << 20,
-                context_items: 4096,
-                note_turns: 48,
-                compact_at: 75,
-                compact_keep: 25,
-            },
-            retain_turns: None,
-            sessions: 0,
-            background_failures: mpsc::unbounded_channel().0,
-            limit_active: 1024,
-            active: HashMap::new(),
-            next_task: 0,
-            jobs: JoinSet::new(),
-            replays: JoinSet::new(),
-            retention: JoinSet::new(),
-            ready_hint: false,
-            tokens: Arc::default(),
-            wakes: Wakes::default(),
-            draining: false,
-            approval_hold: Duration::from_secs(2),
-        };
+        let names: Vec<String> = (0..8).map(|n| format!("bot{n}")).collect();
+        let turns = running(&store, &names).await;
+        let mut service = bare_service(&store);
         // Missing providers make the real turn tasks finish without network I/O.
         // Their durable completion must not depend on the service reaping them.
         for (bot, turn) in &turns {
@@ -2611,70 +3137,118 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[tokio::test]
-    async fn a_parked_turn_woken_twice_resumes_once_and_drops_its_lapse() {
-        let dir = std::env::temp_dir().join(format!("agent-double-wake-{}", std::process::id()));
-        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
-        let turn = store
-            .op("park", |db| {
-                db.create(
-                    "Bob",
-                    Some("/synthetic"),
-                    Binding {
-                        provider: "openai",
-                        family: Family::Responses,
-                        model: "synthetic-model",
-                        instructions: "test",
-                        reasoning: None,
-                        budget_tokens: None,
-                        tools: &[],
-                        created_by: None,
-                        created_by_id: None,
-                        compaction_instructions: None,
-                        compaction_model: None,
-                        fallbacks: false,
-                        gate: None,
-                    },
-                )?;
-                let turn = db
-                    .begin(
-                        "Bob",
-                        "first",
-                        "work",
-                        true,
-                        &TurnOptions::default(),
-                        |_, _| Ok(()),
-                    )?
-                    .turn;
-                let call = agent_runtime::provider::ToolCall {
-                    name: "wait".into(),
-                    call_id: "wait-1".into(),
-                    arguments: r#"{"handles":["proc:1"]}"#.into(),
-                };
-                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
-                "call_id":call.call_id,"arguments":call.arguments}))?
-                .into();
-                db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
-                db.tool_start(turn, &call)?;
-                db.suspend(
-                    turn,
-                    &call.call_id,
-                    &["proc:1".into()],
-                    None,
-                    false,
-                    &[],
-                    None,
-                )?;
-                Ok(turn)
+    fn submit(bot: &str, request_id: &str) -> Command {
+        Command::Submit {
+            bot: bot.into(),
+            bot_id: None,
+            request_id: request_id.into(),
+            prompt: "work".into(),
+            workspace: None,
+            model: None,
+            delivery: None,
+            expected_turn: None,
+        }
+    }
+    /// Take requests the way the run loop does: an admission with room joins
+    /// the queue, anything else first waits for those queued. Returns every
+    /// answer, in the order the loop would send them, with each request's
+    /// index as its id.
+    async fn requests(
+        service: &mut Service,
+        commands: Vec<Command>,
+        output: &Output,
+    ) -> Vec<(Value, Result<Value>)> {
+        let mut answers = Vec::new();
+        for (index, command) in commands.into_iter().enumerate() {
+            let bound = service.admission_sends(&command, &json!(index), 0);
+            while service.must_settle(Some(&command), 0, output, bound) {
+                let (_, _, id, result) = service.settle().await;
+                answers.push((id, result));
+            }
+            let admission = matches!(command, Command::Create { .. } | Command::Submit { .. });
+            let result = service
+                .dispatch(command, 0, output, json!(index), bound)
+                .await;
+            if result.as_ref().is_err_and(|e| e.code == "deferred") {
+                continue;
+            }
+            if admission && !service.admissions.is_empty() {
+                service.admissions.push_back(Admission {
+                    session: 0,
+                    output: output.clone(),
+                    id: json!(index),
+                    bound,
+                    pending: Pending::Settled(result),
+                });
+                continue;
+            }
+            answers.push((json!(index), result));
+        }
+        while !service.admissions.is_empty() {
+            let (_, _, id, result) = service.settle().await;
+            answers.push((id, result));
+        }
+        answers
+    }
+    async fn request(service: &mut Service, command: Command, output: &Output) -> Result<Value> {
+        requests(service, vec![command], output)
+            .await
+            .pop()
+            .unwrap()
+            .1
+    }
+    /// Bots with one running turn each, bound to a provider the test service
+    /// does not have, so their tasks finish at once without network I/O.
+    async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
+        let names = names.to_vec();
+        store
+            .call(move |db| {
+                names
+                    .iter()
+                    .map(|bot| {
+                        db.create(
+                            bot,
+                            Some("/synthetic"),
+                            Binding {
+                                provider: "openai",
+                                family: Family::Responses,
+                                model: "synthetic",
+                                instructions: "",
+                                reasoning: None,
+                                budget_tokens: None,
+                                tools: &[],
+                                created_by: None,
+                                created_by_id: None,
+                                compaction_instructions: None,
+                                compaction_model: None,
+                                fallbacks: false,
+                                gate: None,
+                            },
+                        )?;
+                        let turn = db
+                            .begin(
+                                bot,
+                                "first",
+                                "work",
+                                true,
+                                &TurnOptions::default(),
+                                |_, _| Ok(()),
+                            )?
+                            .turn;
+                        Ok((bot.clone(), turn))
+                    })
+                    .collect::<Result<Vec<_>>>()
             })
             .await
-            .unwrap();
-        let mut service = Service {
+            .unwrap()
+    }
+    fn bare_service(store: &Store) -> Service {
+        Service {
             identity: 0,
             store: store.clone(),
             transport: Transport::new(64, 1).unwrap(),
             providers: Arc::new(HashMap::new()),
-            registry: Registry::new("wait").unwrap(),
+            registry: Registry::new("echo").unwrap(),
             hub: Hub::default(),
             handles: Handles::new(mpsc::unbounded_channel().0),
             limits: Limits {
@@ -2705,7 +3279,1290 @@ mod tests {
             wakes: Wakes::default(),
             draining: false,
             approval_hold: Duration::from_secs(2),
+            admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
+            reserved: 0,
+            storage_backoff: Duration::ZERO,
+            ready_retry_at: None,
+        }
+    }
+    /// Refuse Bob's completion the way a full disk refuses a commit: the
+    /// finish job fails and leaves nothing durable. Another connection
+    /// installs it, as an operator's disk would, between the worker's groups.
+    fn refuse_bobs_finish(path: &Path, refuse: bool) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(if refuse {
+                "CREATE TRIGGER refuse_finish BEFORE UPDATE OF status ON turns
+                 WHEN NEW.bot='Bob' AND NEW.status!='running'
+                 BEGIN SELECT RAISE(ABORT,'refused'); END;"
+            } else {
+                "DROP TRIGGER refuse_finish;"
+            })
+            .unwrap();
+    }
+    async fn finish_errors(store: &Store, at_least: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.stats()["operations"]["finish"]["storage_errors"]
+            .as_u64()
+            .unwrap_or(0)
+            < at_least
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "finish never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finish_that_cannot_commit_retries_while_other_bots_go_on() {
+        let dir = std::env::temp_dir().join(format!("agent-finish-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.sqlite");
+        let (store, mut publications) = Store::open(&path).await.unwrap();
+        let turns = running(&store, &["Bob".into(), "Alice".into()]).await;
+        refuse_bobs_finish(&path, true);
+        let mut service = bare_service(&store);
+        for (bot, turn) in &turns {
+            service.spawn(bot.clone(), *turn, None, false);
+        }
+        // Alice finishes while Bob's completion keeps failing; nothing ends
+        // the daemon, and Bob stays durably busy.
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        assert_eq!(bot, "Alice");
+        service.complete(bot, turn, task, exit).await.unwrap();
+        finish_errors(&store, 3).await;
+        assert!(
+            service.jobs.try_join_next().is_none(),
+            "Bob is still retrying"
+        );
+        let bob = turns[0].1;
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        // Once the store takes it, the same completion commits.
+        refuse_bobs_finish(&path, false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        assert_eq!((bot.as_str(), turn), ("Bob", bob));
+        service.complete(bot, turn, task, exit).await.unwrap();
+        assert!(service.active.is_empty());
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "the provider was missing, as recorded");
+        let mut terminal = Vec::new();
+        while let Ok(publication) = publications.try_recv() {
+            if let Publication::Event(entry) = publication
+                && entry["event"] == "turn_finished"
+            {
+                terminal.push(entry["bot"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(
+            terminal,
+            ["Alice", "Bob"],
+            "one terminal event each, in commit order"
+        );
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_completion_whose_retention_fails_leaves_nothing_and_retries() {
+        let dir = scratch("finish-prune");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let last = store
+            .call(move |db| {
+                db.finish(first, None)?;
+                let next = |db: &mut agent_runtime::store::Database, request: &str| {
+                    db.begin(
+                        "Bob",
+                        request,
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )
+                    .map(|started| started.turn)
+                };
+                let second = next(db, "second")?;
+                db.finish(second, None)?;
+                next(db, "third")
+            })
+            .await
+            .unwrap();
+        // The completion commits, then its retention is refused: Bob's
+        // older events cannot be deleted.
+        let refuse = |on: bool| {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(if on {
+                    "CREATE TRIGGER refuse_prune BEFORE DELETE ON events WHEN OLD.bot='Bob'
+                     BEGIN SELECT RAISE(ABORT,'refused'); END;"
+                } else {
+                    "DROP TRIGGER refuse_prune;"
+                })
+                .unwrap()
         };
+        refuse(true);
+        let mut service = bare_service(&store);
+        service.retain_turns = Some(1);
+        service.spawn("Bob".into(), last, None, false);
+        finish_errors(&store, 2).await;
+        let status = || {
+            let store = store.clone();
+            async move { store.call(move |db| db.turn_status("Bob", last)).await }
+        };
+        assert_eq!(
+            status().await.unwrap(),
+            "running",
+            "the refused retention took the finish back with it"
+        );
+        refuse(false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        assert_eq!(status().await.unwrap(), "failed");
+        let kept: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events WHERE turn=?", [first], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 0, "retention ran with the completion");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_during_a_finish_retry_ends_the_turn_interrupted() {
+        let dir = scratch("finish-interrupt");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        refuse_bobs_finish(&path, true);
+        let mut service = bare_service(&store);
+        service.spawn("Bob".into(), bob, None, false);
+        finish_errors(&store, 2).await;
+        assert!(
+            service.active["Bob"].cancel(turn::INTERRUPTED),
+            "acknowledged"
+        );
+        // An attempt already under way may not see it; the one after does.
+        let errors = store.stats()["operations"]["finish"]["storage_errors"]
+            .as_u64()
+            .unwrap();
+        finish_errors(&store, errors + 2).await;
+        refuse_bobs_finish(&path, false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "interrupted", "not the failure it was retrying");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Lose every group that changes one of Bob's turns' status, the way a
+    /// full disk loses a commit: a dangling deferred reference fails COMMIT.
+    fn lose_bobs_status_changes(path: &Path, lose: bool) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(if lose {
+                "CREATE TABLE IF NOT EXISTS parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER lose_status AFTER UPDATE OF status ON turns WHEN NEW.bot='Bob'
+                 BEGIN INSERT INTO child VALUES (1); END;"
+            } else {
+                "DROP TRIGGER lose_status;"
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ready_turn_the_store_cannot_start_stays_ready() {
+        let dir = scratch("ready-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = store
+            .call(|db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                        gate: None,
+                    },
+                )?;
+                // No slot was free when it was accepted, so it queued.
+                db.begin(
+                    "Bob",
+                    "first",
+                    "work",
+                    false,
+                    &TurnOptions {
+                        delivery: Delivery::Queue,
+                        ..TurnOptions::default()
+                    },
+                    |_, _| Ok(()),
+                )
+                .map(|started| started.turn)
+            })
+            .await
+            .unwrap();
+        let status = || {
+            let store = store.clone();
+            async move {
+                store
+                    .call(move |db| db.turn_status("Bob", bob))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status().await, "ready");
+        lose_bobs_status_changes(&path, true);
+        let mut service = admitting(&store, 1024);
+        service.ready_hint = true;
+        service.dispatch_ready().await.unwrap();
+        assert!(service.active.is_empty());
+        assert_eq!(status().await, "ready", "neither started nor ended");
+        assert!(service.ready_retry_at.is_some(), "tried again later");
+        // Once the store takes writes again, the retry starts it.
+        lose_bobs_status_changes(&path, false);
+        service.ready_retry_at = None;
+        service.dispatch_ready().await.unwrap();
+        assert!(service.active.contains_key("Bob"));
+        assert_eq!(service.storage_backoff, Duration::ZERO);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wake_up_the_store_loses_comes_due_again() {
+        let dir = scratch("resume-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        // A creation that loses its group shares it with the wake-up's check.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                 CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER lose_zed AFTER INSERT ON bots WHEN NEW.name='Zed'
+                 BEGIN INSERT INTO child VALUES (1); END;",
+            )
+            .unwrap();
+        let mut service = bare_service(&store);
+        let (held, gate) = hold(&store).await;
+        let workspace = dir.clone();
+        let lost = store
+            .queue("create", move |db| {
+                db.create(
+                    "Zed",
+                    Some(workspace.to_str().unwrap()),
+                    Binding {
+                        provider: "openai",
+                        family: Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                        gate: None,
+                    },
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let (resumed, ()) = tokio::join!(service.resume("Bob".into(), bob, false), async {
+            gate.send(()).unwrap();
+        });
+        resumed.unwrap();
+        assert_eq!(held.await.unwrap_err().code, "storage_error");
+        assert_eq!(lost.await.unwrap_err().code, "storage_error");
+        assert!(service.active.is_empty());
+        let (at, bot, due) = service.wakes.turns[&bob].clone();
+        assert_eq!((bot.as_str(), due), ("Bob", false), "due again, as it came");
+        assert!(at > now_ms() - 1000);
+        assert!(service.storage_backoff > Duration::ZERO);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_interrupt_leaves_the_parked_turn_waiting_on_its_handle() {
+        let dir = scratch("parked-interrupt-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turns = running(&store, &["Bob".into(), "Zed".into()]).await;
+        let (bob, zed) = (turns[0].1, turns[1].1);
+        let handle = handles::Handle::Turn {
+            bot: "Zed".into(),
+            turn: zed,
+        }
+        .to_string();
+        let parked = handle.clone();
+        store
+            .call(move |db| {
+                let call = agent_runtime::provider::ToolCall {
+                    name: "wait".into(),
+                    call_id: "wait-1".into(),
+                    arguments: json!({"handles":[parked]}).to_string(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(bob, vec![item], std::slice::from_ref(&call), None)?;
+                db.tool_start(bob, &call)?;
+                db.suspend(bob, &call.call_id, &[parked], None, false, &[], None)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let (resume, mut resumed) = mpsc::unbounded_channel();
+        let mut service = bare_service(&store);
+        service.handles = Handles::new(resume);
+        service
+            .handles
+            .attach(
+                &store,
+                Waiter::Turn(bob),
+                &[handle],
+                None,
+                false,
+                Completion::Resume {
+                    bot: "Bob".into(),
+                    turn: bob,
+                },
+            )
+            .await;
+        refuse_bobs_finish(&path, true);
+        let output = Output::writer(tokio::io::sink());
+        let refused = service
+            .dispatch(
+                Command::Interrupt {
+                    bot: "Bob".into(),
+                    turn: bob,
+                },
+                0,
+                &output,
+                Value::Null,
+                Bound::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "storage_error");
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "waiting");
+        // The awaited turn ends: its wait still wakes the parked turn.
+        service
+            .handles
+            .turn_finished("Zed", zed, json!({"status":"completed"}));
+        assert_eq!(resumed.try_recv().ok(), Some(("Bob".into(), bob)));
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_stdout_holds_up_shutdown_once_not_per_queued_reply() {
+        let dir = scratch("stalled-drain");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = bare_service(&store);
+        // A consumer that never reads: its queue fills and stays full.
+        let (stalled, _unread) = tokio::io::duplex(1);
+        let output = Output::writer(stalled);
+        for _ in 0..3 {
+            while output.try_send(json!({})).is_ok() {}
+            tokio::task::yield_now().await;
+        }
+        for id in 0..4 {
+            service.admissions.push_back(Admission {
+                session: 0,
+                output: output.clone(),
+                id: json!(id),
+                bound: Bound::default(),
+                pending: Pending::Settled(Ok(json!({}))),
+            });
+        }
+        let started = tokio::time::Instant::now();
+        answer_queued(&mut service, &mut HashMap::new(), true).await;
+        assert!(service.admissions.is_empty());
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(10),
+            "one reply's timeout, not one per admission: {waited:?}"
+        );
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_resume_the_store_refuses_leaves_the_turn_parked() {
+        let dir = scratch("resume-write-refused");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let bob = running(&store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None)
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        // The claim's own write is what the store refuses.
+        lose_bobs_status_changes(&path, true);
+        let mut service = admitting(&store, 1024);
+        service.resume("Bob".into(), bob, true).await.unwrap();
+        assert!(service.active.is_empty(), "nothing claimed");
+        let status = || {
+            let store = store.clone();
+            async move {
+                store
+                    .call(move |db| db.turn_status("Bob", bob))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status().await, "paced", "still parked, not ended");
+        assert!(service.storage_backoff > Duration::ZERO);
+        let (bot, turn, due) = service.wakes.pop().unwrap();
+        assert_eq!((bot.as_str(), turn, due), ("Bob", bob, true), "due again");
+        // Once the store takes writes again, the same wake-up resumes it.
+        lose_bobs_status_changes(&path, false);
+        service.resume(bot, turn, due).await.unwrap();
+        assert!(service.active.contains_key("Bob"));
+        assert_eq!(service.storage_backoff, Duration::ZERO);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        assert_eq!(status().await, "failed", "the provider was missing");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_a_finish_retry_and_leaves_the_turn_for_recovery() {
+        let dir = std::env::temp_dir().join(format!("agent-finish-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turns = running(&store, &["Bob".into()]).await;
+        refuse_bobs_finish(&path, true);
+        let mut service = bare_service(&store);
+        let bob = turns[0].1;
+        service.spawn("Bob".into(), bob, None, false);
+        // An interrupt that lands first keeps its cause; shutdown releasing
+        // the slot still stops the retries.
+        assert!(service.active["Bob"].cancel(turn::INTERRUPTED));
+        finish_errors(&store, 2).await;
+        for active in std::mem::take(&mut service.active).into_values() {
+            active.cancel(turn::SHUTDOWN);
+        }
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        let error = service.complete(bot, turn, task, exit).await.unwrap_err();
+        assert_eq!(error.code, "storage_error");
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "running", "the next start ends it as interrupted");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A service whose bots may start turns, bound to `openai`, whose
+    /// provider refuses connections: a started turn fails without traffic.
+    fn admitting(store: &Store, limit_active: usize) -> Service {
+        let mut service = bare_service(store);
+        let provider = Provider::new(
+            service.transport.clone(),
+            Family::Responses,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap();
+        service.providers = Arc::new(HashMap::from([("openai".to_owned(), provider)]));
+        service.limit_active = limit_active;
+        service
+    }
+    fn create(bot: &str, workspace: &Path) -> Command {
+        Command::Create {
+            bot: bot.into(),
+            workspace: Some(workspace.to_str().unwrap().into()),
+            model: Some("openai/synthetic".into()),
+            instructions: Some(String::new()),
+            reasoning: None,
+            budget_tokens: None,
+            tools: Some(Vec::new()),
+            created_by: None,
+            created_by_id: None,
+            compaction_instructions: None,
+            compaction_model: None,
+            fallbacks: false,
+            approve: None,
+            approver: None,
+            approve_expire_ms: None,
+        }
+    }
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("agent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    /// Hold the storage worker inside a job until the gate is fed, so the
+    /// jobs queued meanwhile join its group.
+    async fn hold(store: &Store) -> (Answer<()>, std::sync::mpsc::Sender<()>) {
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let held = store
+            .queue("hold", move |_| {
+                let _ = wait.recv();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        (held, gate)
+    }
+
+    #[tokio::test]
+    async fn admissions_queued_together_share_one_commit_and_answer_in_order() {
+        let dir = scratch("admit-group");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let groups = |store: &Store| store.stats()["groups"]["count"].as_u64().unwrap();
+        let (held, gate) = hold(&store).await;
+        let before = groups(&store);
+        let bots = ["A", "B", "C", "D"];
+        let mut commands: Vec<Command> = bots.iter().map(|bot| create(bot, &dir)).collect();
+        commands.extend(bots.iter().map(|bot| submit(bot, "r1")));
+        // A retry of an admission still queued, and new work for a bot whose
+        // turn is still queued, see the writes queued before them.
+        commands.push(submit("A", "r1"));
+        commands.push(submit("A", "r2"));
+        let count = commands.len();
+        for (index, command) in commands.into_iter().enumerate() {
+            let bytes = service.admission_sends(&command, &json!(index), 0);
+            assert!(
+                !service.must_settle(Some(&command), 0, &output, bytes),
+                "the window has room"
+            );
+            let deferred = service
+                .dispatch(command, 0, &output, json!(index), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!(service.admissions.len(), count);
+        assert_eq!(service.reserved, 6, "every submission holds a slot");
+        assert!(
+            service.must_settle(
+                Some(&Command::Interrupt {
+                    bot: "A".into(),
+                    turn: 1
+                }),
+                0,
+                &output,
+                Bound::default()
+            ),
+            "anything else waits for queued admissions"
+        );
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        let mut answers = Vec::new();
+        while !service.admissions.is_empty() {
+            let (_, _, id, result) = service.settle().await;
+            answers.push((id, result));
+        }
+        assert_eq!(groups(&store) - before, 1, "one commit for all of them");
+        assert_eq!(
+            answers.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            (0..count).map(|index| json!(index)).collect::<Vec<_>>(),
+            "answered in request order"
+        );
+        for (_, created) in &answers[..4] {
+            assert!(created.is_ok());
+        }
+        let turns: Vec<_> = answers[4..8]
+            .iter()
+            .map(|(_, started)| {
+                let started = started.as_ref().unwrap();
+                assert_eq!(started["status"], "running");
+                assert_eq!(started["duplicate"], false);
+                started["turn"].clone()
+            })
+            .collect();
+        let retry = answers[8].1.as_ref().unwrap();
+        assert_eq!(retry["duplicate"], true);
+        assert_eq!(retry["turn"], turns[0]);
+        assert_eq!(answers[9].1.as_ref().unwrap_err().code, "bot_busy");
+        assert_eq!(
+            service.active.len(),
+            4,
+            "one turn started per fresh submission"
+        );
+        assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_steer_queued_behind_its_turns_start_arms_the_first_round() {
+        let dir = scratch("admit-steer");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let (held, gate) = hold(&store).await;
+        let mut steer = submit("A", "r2");
+        if let Command::Submit { delivery, .. } = &mut steer {
+            *delivery = Some("steer".into());
+        }
+        for (index, command) in [create("A", &dir), submit("A", "r1"), steer]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = service.admission_sends(&command, &json!(index), 0);
+            let deferred = service
+                .dispatch(command, 0, &output, json!(index), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        assert!(service.settle().await.3.is_ok(), "created");
+        let started = service.settle().await.3.unwrap();
+        assert_eq!(started["status"], "running");
+        // Nothing has run since the spawn: the turn has not absorbed yet.
+        assert!(
+            service.active["A"]
+                .steers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the steer committed with it is waiting at the first boundary"
+        );
+        let steered = service.settle().await.3.unwrap();
+        assert_eq!(
+            (steered["status"].as_str(), steered["duplicate"].as_bool()),
+            (Some("queued"), Some(false))
+        );
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_queues_no_more_admissions_than_its_output_can_take() {
+        let dir = scratch("admit-room");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        // A client that has read nothing yet: its queue holds every reply.
+        let (near, _far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let large = |bot: String| {
+            let mut command = create(&bot, &dir);
+            if let Command::Create {
+                instructions,
+                compaction_instructions,
+                ..
+            } = &mut command
+            {
+                *instructions = Some("i".repeat(64 * 1024));
+                *compaction_instructions = Some("c".repeat(64 * 1024));
+            }
+            command
+        };
+        let mut queued = 0;
+        while queued < ADMISSION_WINDOW {
+            let command = large(format!("B{queued}"));
+            let bytes = service.admission_sends(&command, &json!(queued), 1);
+            if service.must_settle(Some(&command), 1, &output, bytes) {
+                break;
+            }
+            let deferred = service
+                .dispatch(command, 1, &output, json!(queued), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            queued += 1;
+        }
+        assert!(queued > 1, "replies that fit share the window");
+        assert!(queued < ADMISSION_WINDOW, "the session's queue fills first");
+        let elsewhere = Output::writer(tokio::io::sink());
+        let command = large("Elsewhere".into());
+        let bytes = service.admission_sends(&command, &json!(0), 2);
+        assert!(
+            !service.must_settle(Some(&command), 2, &elsewhere, bytes),
+            "another session's admission still joins"
+        );
+        // Sent back to back, as the run loop sends them, every reply fits.
+        while !service.admissions.is_empty() {
+            let (_, output, id, result) = service.settle().await;
+            output.try_respond(id, Ok(result.unwrap())).unwrap();
+        }
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_following_a_bot_two_ways_has_room_for_both_events() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("admit-follows");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        let sink = Output::writer(tokio::io::sink());
+        let names: Vec<String> = (0..ADMISSION_WINDOW).map(|n| format!("B{n}")).collect();
+        let creates = || names.iter().map(|name| create(name, &dir)).collect();
+        for (_, created) in requests(&mut service, creates(), &sink).await {
+            created.unwrap();
+        }
+        // The session follows every bot, and each of these by name. Its
+        // client reads until a marker, then stops, as a slow client would.
+        let (near, far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(far).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("marker") {
+                    break;
+                }
+            }
+            lines
+        });
+        for name in std::iter::once(hub::ALL).chain(names.iter().map(String::as_str)) {
+            let sub = service.hub.subscribe(name, 1, output.clone(), 0);
+            replay(store.clone(), service.hub.clone(), name.to_owned(), sub)
+                .await
+                .unwrap();
+        }
+        // Deleting a bot keeps its followers for a bot of the same name.
+        let deletes = names
+            .iter()
+            .map(|bot| Command::Delete { bot: bot.clone() })
+            .collect();
+        for (_, deleted) in requests(&mut service, deletes, &sink).await {
+            deleted.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        output.try_send(json!({"marker": true})).unwrap();
+        let _stalled = reader.await.unwrap();
+        let mut queued = 0;
+        while queued < names.len() {
+            let command = create(&names[queued], &dir);
+            let bound = service.admission_sends(&command, &json!(queued), 1);
+            if service.must_settle(Some(&command), 1, &output, bound) {
+                break;
+            }
+            let deferred = service
+                .dispatch(command, 1, &output, json!(queued), bound)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            queued += 1;
+        }
+        assert!(queued > 1 && queued < names.len(), "{queued} queued");
+        while !service.admissions.is_empty() {
+            let (_, output, id, result) = service.settle().await;
+            output.try_respond(id, Ok(result.unwrap())).unwrap();
+        }
+        // Both copies of each creation's event reach the queue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !*output.subscribe_closed().borrow(),
+            "{queued} replies and their events fit"
+        );
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn answered_admissions_keep_room_for_events_not_yet_published() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("admit-unpublished");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        // The session follows every bot. Its client reads until a marker,
+        // then stops, as a slow client would.
+        let (near, far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(far).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("marker") {
+                    break;
+                }
+            }
+            lines
+        });
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
+            .await
+            .unwrap();
+        output.try_send(json!({"marker": true})).unwrap();
+        let _stalled = reader.await.unwrap();
+        // Two windows are answered before the publisher runs: the second
+        // must leave room for the first one's events.
+        let names: Vec<String> = (0..2 * ADMISSION_WINDOW).map(|n| format!("B{n}")).collect();
+        let mut queued = 0;
+        let mut windows = Vec::new();
+        for most in [ADMISSION_WINDOW / 2, ADMISSION_WINDOW] {
+            let first = queued;
+            while queued < names.len() && queued - first < most {
+                let command = create(&names[queued], &dir);
+                let bound = service.admission_sends(&command, &json!(queued), 1);
+                if service.must_settle(Some(&command), 1, &output, bound) {
+                    break;
+                }
+                let deferred = service
+                    .dispatch(command, 1, &output, json!(queued), bound)
+                    .await;
+                assert_eq!(deferred.unwrap_err().code, "deferred");
+                queued += 1;
+            }
+            windows.push(queued - first);
+            while !service.admissions.is_empty() {
+                let (_, output, id, result) = service.settle().await;
+                output.try_respond(id, Ok(result.unwrap())).unwrap();
+            }
+        }
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !*output.subscribe_closed().borrow(),
+            "windows of {windows:?} fit with their events"
+        );
+        assert!(windows[1] > 1, "{windows:?}");
+        // Published events no longer hold room.
+        assert_eq!(service.hub.published(), queued as i64);
+        let (_, output, id, result) = {
+            let command = create("Late", &dir);
+            let bound = service.admission_sends(&command, &json!("late"), 1);
+            let deferred = service
+                .dispatch(command, 1, &output, json!("late"), bound)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            service.settle().await
+        };
+        output.try_respond(id, Ok(result.unwrap())).unwrap();
+        assert_eq!(service.unpublished.len(), 1, "only the late event waits");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_follow_still_replaying_keeps_room_for_published_events() {
+        let dir = scratch("admit-replaying");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        // The session follows every bot, but its replay has not caught up:
+        // the publisher passes it by.
+        let output = Output::writer(tokio::io::sink());
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        let command = create("Bob", &dir);
+        let bound = service.admission_sends(&command, &json!(0), 1);
+        assert_eq!(bound.events.packets, 1);
+        let deferred = service.dispatch(command, 1, &output, json!(0), bound).await;
+        assert_eq!(deferred.unwrap_err().code, "deferred");
+        let (_, _, _, result) = service.settle().await;
+        result.unwrap();
+        let cursor = service.unpublished.back().unwrap().cursor;
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        service.hub.published_through(cursor).await;
+        assert_eq!(
+            service.pending_events(1).count(),
+            1,
+            "published, but the replay has not delivered it"
+        );
+        // Once the replay reaches it, the event holds no room.
+        replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
+            .await
+            .unwrap();
+        assert_eq!(service.pending_events(1).count(), 0);
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_admission_after_a_window_waits_for_that_windows_events() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("admit-after-window");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (near, far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(far).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("marker") {
+                    break;
+                }
+            }
+            lines
+        });
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
+            .await
+            .unwrap();
+        output.try_send(json!({"marker": true})).unwrap();
+        let _stalled = reader.await.unwrap();
+        // A window is answered before the publisher runs.
+        let window = ADMISSION_WINDOW / 2;
+        for n in 0..window {
+            let command = create(&format!("B{n}"), &dir);
+            let bound = service.admission_sends(&command, &json!(n), 1);
+            assert!(!service.must_settle(Some(&command), 1, &output, bound));
+            let deferred = service.dispatch(command, 1, &output, json!(n), bound).await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        while !service.admissions.is_empty() {
+            let (_, output, id, result) = service.settle().await;
+            output.try_respond(id, Ok(result.unwrap())).unwrap();
+        }
+        // Other traffic leaves exactly the room those events need.
+        let next = create("Next", &dir);
+        let bound = service.admission_sends(&next, &json!("next"), 1);
+        assert_eq!(
+            service.awaits_publication(Some(&next), 1, &output, bound),
+            None,
+            "the window's events and the next admission fit"
+        );
+        while output.room().1 > window {
+            output.try_send(json!({"filler": true})).unwrap();
+        }
+        let newest = service.awaits_publication(Some(&next), 1, &output, bound);
+        assert_eq!(newest, Some(window as i64), "the next admission waits");
+        assert_eq!(
+            service.awaits_publication(Some(&Command::Stats), 1, &output, Bound::default()),
+            None,
+            "only admissions wait"
+        );
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.hub.published_through(newest.unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(!*output.subscribe_closed().borrow(), "the events fit");
+        assert_eq!(
+            service.awaits_publication(Some(&next), 1, &output, bound),
+            None
+        );
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_bounds_cover_a_reply_and_its_event() {
+        let dir = scratch("admission-bound");
+        let (store, mut publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let output = Output::writer(tokio::io::sink());
+        // Every character here is escaped in JSON, or longer than one byte.
+        let awkward = "\"\\\u{1}\n/é".repeat(1000);
+        let id = json!("\u{1}".repeat(128));
+        let mut create = create("Bot", &dir);
+        if let Command::Create {
+            model,
+            instructions,
+            reasoning,
+            compaction_instructions,
+            compaction_model,
+            ..
+        } = &mut create
+        {
+            *model = Some(format!("openai/{}", "\u{1}".repeat(256)));
+            *instructions = Some(awkward.clone());
+            *reasoning = Some("high".into());
+            *compaction_instructions = Some(awkward);
+            *compaction_model = Some("openai/synthetic".into());
+        }
+        for command in [create, submit("Bot", "r1")] {
+            let bound = admission_bound(&command, &id, 1);
+            assert!(!service.must_settle(Some(&command), 0, &output, bound));
+            let deferred = service
+                .dispatch(command, 0, &output, id.clone(), bound)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            let (_, _, _, result) = service.settle().await;
+            let reply = json!({"id": id, "result": result.unwrap()});
+            let event = loop {
+                if let Publication::Event(entry) = publications.recv().await.unwrap()
+                    && matches!(
+                        entry["event"].as_str(),
+                        Some("created" | "accepted" | "queued")
+                    )
+                {
+                    break entry;
+                }
+            };
+            // Each is a line: its JSON and a newline.
+            let replied = output::encoded_len(&reply).unwrap() + 1;
+            let published = output::encoded_len(&event).unwrap() + 1;
+            assert!(
+                replied <= bound.reply.bytes && published <= bound.events.bytes,
+                "{replied} and {published} bytes sent, {} and {} promised",
+                bound.reply.bytes,
+                bound.events.bytes
+            );
+            assert_eq!((bound.reply.packets, bound.events.packets), (1, 1));
+        }
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admissions_at_the_limit_answer_as_one_at_a_time_would() {
+        let dir = scratch("admit-limit");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 2);
+        let (output, _writer) = Output::stdout();
+        let created = requests(
+            &mut service,
+            ["A", "B", "C"]
+                .iter()
+                .map(|bot| create(bot, &dir))
+                .collect(),
+            &output,
+        )
+        .await;
+        assert!(created.iter().all(|(_, result)| result.is_ok()));
+        // Two slots: the retry promised one it does not take, so B still
+        // starts, and only C finds the daemon full.
+        let answers = requests(
+            &mut service,
+            vec![
+                submit("A", "r1"),
+                submit("A", "r1"),
+                submit("B", "r1"),
+                submit("C", "r1"),
+            ],
+            &output,
+        )
+        .await;
+        let results: Vec<_> = answers
+            .iter()
+            .map(|(_, result)| match result {
+                Ok(started) => format!("{} {}", started["status"], started["duplicate"]),
+                Err(error) => error.code.clone(),
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                "\"running\" false",
+                "\"running\" true",
+                "\"running\" false",
+                "active_agent_limit"
+            ]
+        );
+        let mut active: Vec<_> = service.active.keys().cloned().collect();
+        active.sort();
+        assert_eq!(active, ["A", "B"]);
+        assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_group_commit_fails_its_admissions_and_starts_nothing() {
+        let dir = scratch("admit-lost");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let created = requests(
+            &mut service,
+            vec![create("Alice", &dir), create("Bob", &dir)],
+            &output,
+        )
+        .await;
+        assert!(created.iter().all(|(_, result)| result.is_ok()));
+        // Bob's turn leaves a dangling deferred reference, so the group's
+        // COMMIT fails the way a full disk fails it: every job is lost.
+        let lose = |install: bool| {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(if install {
+                    "CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child(parent INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+                     CREATE TRIGGER lose_commit AFTER INSERT ON turns WHEN NEW.bot='Bob'
+                     BEGIN INSERT INTO child VALUES (1); END;"
+                } else {
+                    "DROP TRIGGER lose_commit;"
+                })
+                .unwrap()
+        };
+        lose(true);
+        let (held, gate) = hold(&store).await;
+        for (index, bot) in ["Alice", "Bob"].into_iter().enumerate() {
+            let deferred = service
+                .dispatch(
+                    submit(bot, "r1"),
+                    0,
+                    &output,
+                    json!(index),
+                    Bound::default(),
+                )
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        assert_eq!(service.reserved, 2);
+        gate.send(()).unwrap();
+        assert_eq!(held.await.unwrap_err().code, "storage_error");
+        for _ in 0..2 {
+            let (_, _, _, result) = service.settle().await;
+            assert_eq!(result.unwrap_err().code, "storage_error");
+        }
+        assert!(service.active.is_empty(), "no lost admission starts a turn");
+        assert_eq!(service.reserved, 0, "their slots are free again");
+        // Nothing of the lost group is durable: the retry is new work.
+        lose(false);
+        let retry = request(&mut service, submit("Alice", "r1"), &output)
+            .await
+            .unwrap();
+        assert_eq!(retry["duplicate"], false);
+        assert_eq!(retry["status"], "running");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_waits_for_the_admission_before_it() {
+        let dir = scratch("admit-interrupt");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        // The store is fresh, so the submission's turn is the first.
+        let answers = requests(
+            &mut service,
+            vec![
+                create("A", &dir),
+                submit("A", "r1"),
+                Command::Interrupt {
+                    bot: "A".into(),
+                    turn: 1,
+                },
+            ],
+            &output,
+        )
+        .await;
+        assert_eq!(answers[1].1.as_ref().unwrap()["turn"], 1);
+        let interrupted = answers[2].1.as_ref().unwrap();
+        assert_eq!(interrupted["interrupt_requested"], true);
+        assert!(
+            interrupted.get("queued").is_none(),
+            "it reached the started task, not a durable row behind its back"
+        );
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        let status = store.call(|db| db.turn_status("A", 1)).await.unwrap();
+        assert_eq!(status, "interrupted");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Bob with one turn parked on a `wait` for a process that never ends.
+    async fn parked_on_wait(store: &Store) -> i64 {
+        let turn = running(store, &["Bob".into()]).await[0].1;
+        store
+            .call(move |db| {
+                let call = agent_runtime::provider::ToolCall {
+                    name: "wait".into(),
+                    call_id: "wait-1".into(),
+                    arguments: r#"{"handles":["proc:1"]}"#.into(),
+                };
+                let item = serde_json::to_vec(&json!({"type":"function_call","name":call.name,
+                "call_id":call.call_id,"arguments":call.arguments}))?
+                .into();
+                db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
+                db.tool_start(turn, &call)?;
+                db.suspend(
+                    turn,
+                    &call.call_id,
+                    &["proc:1".into()],
+                    None,
+                    false,
+                    &[],
+                    None,
+                )
+                .map(|_| ())
+            })
+            .await
+            .unwrap();
+        turn
+    }
+
+    #[tokio::test]
+    async fn a_parked_turn_woken_twice_resumes_once_and_drops_its_lapse() {
+        let dir = scratch("double-wake");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turn = parked_on_wait(&store).await;
+        let mut service = bare_service(&store);
+        service.registry = Registry::new("wait").unwrap();
         // Parked with a day-long lapse, then woken twice (a restart's check
         // and an answer) before the first task runs at all.
         service
@@ -2742,6 +4599,32 @@ mod tests {
             })
             .await
             .unwrap();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lost_handle_wake_up_is_retried_as_a_handle_wake_up() {
+        let dir = scratch("lost-handle-wake");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turn = parked_on_wait(&store).await;
+        let mut service = bare_service(&store);
+        service.registry = Registry::new("wait").unwrap();
+        // The wait's handle resolved, but the claim's write is lost.
+        lose_bobs_status_changes(&path, true);
+        service.resume("Bob".into(), turn, false).await.unwrap();
+        assert!(service.active.is_empty());
+        lose_bobs_status_changes(&path, false);
+        // Its own time would find no lapse and leave it parked for good;
+        // the retry resumes it as the handle did.
+        let (bot, id, due) = service.wakes.pop().unwrap();
+        assert_eq!((bot.as_str(), id, due), ("Bob", turn, false));
+        service.resume(bot, id, due).await.unwrap();
+        assert!(service.active.contains_key("Bob"), "resumed");
+        let (bot, id, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, id, task, exit).await.unwrap();
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

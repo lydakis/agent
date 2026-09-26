@@ -666,6 +666,47 @@ against writes the group lost. The outcomes it announced are dropped and the
 waiting-turn counts are recounted from the rows; if that recount fails, no
 job runs until one succeeds.
 
+Admissions (`create` and `submit`) reach that queue without the service
+awaiting each commit: it queues one and reads the next request, up to 32
+outstanding, so admissions that arrive together share a group, and one that
+arrives alone is queued at once and waits for nothing. Each is answered after
+its commit, in request order, and what followed the commit before (starting
+the turn, flagging a steer) happens as it is answered. A turn started this way
+is flagged at once when a steer for its bot is queued behind it, so its first
+model call can already carry the steer. Every other request
+waits until the queued admissions are answered. A submission told it may
+start a turn holds one `--max-active` slot until it is answered, so queued
+submissions never start more turns than the limit; when only promised slots
+stand between a submission and the limit, it waits too, since whether one
+frees up depends on how the earlier ones end. A burst therefore gets the
+answers it would get one request at a time. Queued replies go out back to
+back once their commit lands, faster than any client reads them, so an
+admission also waits when its session's output queue could not take what it
+and the admissions already queued for that session will send: each reply,
+and its event once for each way the session follows the bot (by name,
+through `*`, or as the stdio firehose). Events reach followers from the
+publisher, which runs apart from replies, so an admission's event can arrive
+before or after its reply; an answered admission's events keep their room
+until the publisher has delivered them, and while the session has a follow
+of that bot still replaying history, until that replay catches up, since the
+publisher passes such a follow by and its replay delivers the event later.
+An admission that finds nothing queued still waits for the publisher to pass
+those events when they and it would not fit together, so it cannot commit
+ahead of an overflow they cause. It does not wait for a replay, which moves
+at its client's pace; past that it is handled as a lone request always was. The storage worker also tells the
+publisher how far each pass reached, so events a deletion removed before
+publication hold no room and no wait. Both are bounded from the
+request: a creation's record repeats the request's strings, and a reply or
+event adds at most a canonical workspace and a model reference. A lost group answers each of its
+admissions with `storage_error`, starts no turn, and frees their slots. A
+fatal error, such as the store refusing a background command's result, exits
+through shutdown: queued admissions are answered first, and the turns they
+start end like any other running turn. A stdio owner that cannot take one of
+those replies within its five-second timeout gets no more of them, so a
+stalled consumer delays shutdown once, not once per queued reply. A stdio
+owner whose output fails still exits at once, since no one is left to answer
+and a blocked write cannot be cancelled.
+
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
 references to these items with an explicit Content-Length. They do not rebuild
@@ -859,19 +900,31 @@ does not, and each is one op:
   job count and its time queued versus time running (whether the worker or
   the disk is the bottleneck; jobs on the storage reader are counted the
   same way under their operation), the same per operation under `operations`
-  (each store method's count, queued and ran totals, slowest run, and two
-  fourteen-bucket latency histograms, `ran` and `queued`, over the
-  log-spaced bounds in `buckets_us`, so a controller can see which jobs
-  make the tail and how often), and the handle registry's size. The
-  `commit` operation counts the worker's group commits, and its `ran` time
-  is the COMMIT with its sync, so jobs per commit and the time spent
-  syncing are both readable. Other operations' `ran` times exclude the
-  sync, which they included before group commit. `agent stats
-  [--pretty]`. Store sizes use the canonical database path established at
-  open, including when the caller used a symlink. The counters cost three
-  clock reads and one short lock per storage job, and allocate only the
-  first time an operation is seen. Stats copies the operation records under
-  that lock, then derives totals and builds JSON outside it. `draining` is
+  (each store method's count, queued, ran and answered totals, slowest run
+  and slowest answer, `storage_errors` for the jobs answered `storage_error`
+  by their own SQLite failure or their group's, with the total at the top,
+  and three fourteen-bucket latency histograms, `ran`,
+  `queued` and `answered`, over the log-spaced bounds in `buckets_us`, so a
+  controller can see which jobs make the tail and how often), and the
+  handle registry's size. `answered` runs from queueing to the caller's
+  answer: for a write it includes the wait for the rest of its group and
+  the group's commit, which a cheap job pays when it shares a group with
+  costly ones; for a read it is queued plus ran. The `commit` operation
+  counts the worker's group commits, and its `ran` time is the COMMIT with
+  its sync, so jobs per commit and the time spent syncing are both
+  readable. Other operations' `ran` times exclude the sync, which they
+  included before group commit. `groups` counts answered write groups,
+  including any that could not begin: their jobs, a histogram of sizes over
+  `size_bounds` (up to 1, 2, 4, 8, 16 and 32 jobs), and a latency histogram
+  of each group's oldest job from queueing to its answer, with the slowest.
+  A job whose group could not begin counts its whole wait as queued and
+  zero as ran. `agent stats [--pretty]`. Store sizes use the canonical
+  database path established at open, including when the caller used a
+  symlink. The counters cost three clock reads per job, three per group, and
+  one short lock per group (per job on the reader), taken just before the
+  group's callers are answered; they allocate only the first time an
+  operation is seen. Stats copies the records under that lock, then derives
+  totals and builds JSON outside it. `draining` is
   true while a shutdown's grace period runs. The totals and
   histograms describe the same snapshot; time totals are summed before
   rounding to milliseconds.
@@ -1064,7 +1117,14 @@ immutable history nodes, turns, completed checkpoints, tool intents/results,
 retained tool artifacts, and durable event cursors. On macOS a plain fsync
 leaves writes in the drive's cache, so both connections also set `fullfsync`
 and `checkpoint_fullfsync`: every commit and checkpoint is an F_FULLFSYNC and
-survives a power cut. Other platforms ignore both. The store allows one owning
+survives a power cut. Other platforms ignore both. The writer sets
+`temp_store=MEMORY`: a job's savepoint journal (the pages it changed, kept so
+it can roll back alone) stays in memory and is freed when the job ends,
+instead of spilling past 64 KiB to a temporary file. Without it every
+admission created, wrote and deleted such a file, and a full disk refused it
+mid-job. The journal holds rewritten table and index pages, not the large
+values a deletion frees, and completion retention works a piece at a time, so
+no job holds a long history's pages. The store allows one owning
 process. A second owner fails before it can mark the first owner's work
 interrupted. Ownership uses the canonical database path with an appended
 `.owner-lock` suffix; symlinks resolve to the same lock and hard-linked database
@@ -1408,8 +1468,10 @@ needs, and one optional policy composes them:
   turn's tool intents or move retention past work that has not finished.
   A completion's own retention pass never removes that turn's records:
   the storage worker publishes what the store holds after the job, so the
-  terminal event stays published and replayable until the next pass, at
-  most one turn beyond `keep_turns` per bot.
+  terminal event stays published and replayable until the next pass. That
+  turn is the one beyond `keep_turns` a pass leaves behind; older turns
+  remain past it only while a backlog drains, one piece per completion
+  (below), or until an explicit `prune` clears them.
   Running process rows survive so their results can commit; a later prune
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the
@@ -1428,13 +1490,34 @@ needs, and one optional policy composes them:
   its turns finishes, including cancelled or failed queued work and interruption
   while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention
-  left it. Each turn task submits its completion to the storage worker, allowing
+  left it. Each completion removes one piece, the four oldest turns past N at
+  most, like explicit pruning: every page a job rewrites is held in memory
+  until it ends, so a backlog (retention newly enabled, or N lowered) drains
+  over later turns, or at once with `agent prune`. A turn already pruned whose
+  background process still runs keeps only that row and is passed over until
+  the process ends, so it never holds a piece. Each turn task submits its
+  completion to the storage worker, allowing
   concurrent finishes to share a commit. The bot stays durably busy until that
   commit; the worker publishes its terminal event before a successor's accepted
   event. Completion, cancellation, explicit pruning, and deletion jobs for the
   same bot cross a commit-and-publication boundary so later retention cannot
   erase an unpublished terminal event. Different bots still share commits.
   The service then retires the task, without another storage round trip.
+  The completion, its outcome and its retention commit together or not at
+  all. A completion the store refuses (a full disk fails its group with
+  `storage_error`) left nothing durable, so the task submits the same
+  completion again with backoff, 10 ms doubling to one second, while the bot
+  stays durably busy and other bots go on; `stats` counts each refusal under
+  the `finish` operation's `storage_errors`. An interrupt that arrives
+  during the retries is honored: the next attempt ends the turn as
+  interrupted. A queued turn the store cannot start stays ready, and a
+  parked turn it cannot resume stays parked; each is tried again with the
+  same backoff.
+  Only shutdown stops the retries:
+  the turn stays running in the store, the next start ends it as
+  interrupted, and the daemon exits with the storage error after draining
+  every other completion. Before, one refused completion ended the daemon
+  and every running turn with it.
   Shutdown drains completions through the
   same path, including cancellation events and pending turn-wait results.
 
