@@ -4318,3 +4318,166 @@ longer include the sync; the new `commit` operation carries it.
 Validation: 182 Rust tests, including two for grouped commits that fail
 when grouping or the rollback answer is removed; 264
 Python tests with 22 opt-in skips; strict Clippy and formatting.
+
+## Completion scheduling and macOS flush attribution
+
+Observed 2026-09-26 on macOS arm64. Baseline: `15d629c`, binary
+`c34bb494…`. Candidate: task-owned durable completion, binary `3e4da31b…`.
+Both use `synchronous=FULL`, `fullfsync=ON`, and `checkpoint_fullfsync=ON`.
+The worker still answers and publishes only after commit. Each finished turn
+now submits its own completion job before its task is reaped, so independent
+finishes can share a group; previously the service loop awaited them one at a
+time. Admission and bot creation still await their commits serially.
+
+### Attribution
+
+A separate diagnostic build changed only the two full-flush pragmas to OFF.
+This is a weaker durability contract, not an optimization candidate or a runtime
+mode. In a 32-bot, three-turn text probe (64 KiB new input, 5 KiB output, 500 ms
+scripted streaming per turn), median commit-operation time was 1,702 ms in the
+baseline versus 194 ms in the control. `begin` took 107 versus 94 ms;
+context-window work took 6 versus 5 ms, with item reads 13 versus 12 ms. These
+are medians of three measured runs after one warmup, with turn-phase wall times of 2.568 versus
+1.811 seconds. This identifies disk flushing as the largest cost in this short
+workload; it does not isolate every CPU increase since the older README build
+or establish the cost of long-history compaction.
+
+The streaming driver's `ready_seconds` includes creation of all benchmark bots.
+It is not daemon startup alone. Direct protocol readiness in this probe was a
+median 24 ms with full flushing and 15 ms in the weaker control. The earlier
+26-to-189-ms historical comparison measured benchmark readiness, including 32
+bot creations, not just process startup.
+
+### Completion burst
+
+`bench.completion_burst` reuses the existing synthetic provider and psutil.
+It holds all 32 model replies, then releases them together. Timings start at
+release and end at terminal-event receipt; CPU is the daemon's user plus system
+time over that interval. Creation and admission are outside the interval;
+response processing, append, completion, and publication are inside it. It
+checks successful completion but does not validate conversation contents.
+
+Two sequential pairs, with reversed order on the second pair; each cell is the
+median of three measured fresh-store runs after one excluded warmup:
+
+| Pair | Baseline release-to-terminal p99 | Candidate p99 | Baseline CPU | Candidate CPU | Baseline / candidate commit-operation time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline then candidate | 216.2 ms | 15.0 ms | 25.1 ms | 6.5 ms | 180 / 10 ms |
+| candidate then baseline | 238.1 ms | 18.0 ms | 27.4 ms | 6.7 ms | 209 / 13 ms |
+
+Every run completed all 32 turns. Commit-operation counts fell from median
+45–50 to 15–16; these counts include read-only transactions, so they are not
+physical-flush counts. The result establishes a benefit when replies finish
+together, not a steady-state throughput multiplier.
+
+### Ordinary streaming
+
+The same two-order comparison with the text workload above was less decisive:
+
+| Pair | Baseline / candidate wall time | Baseline / candidate terminal tail | Baseline / candidate daemon CPU |
+| --- | ---: | ---: | ---: |
+| baseline then candidate | 2.899 / 2.611 s | 1,031 / 881 ms | 0.518 / 0.491 s |
+| candidate then baseline | 2.609 / 2.659 s | 889 / 917 ms | 0.515 / 0.496 s |
+
+Here the terminal tail is the maximum of 96 turns (the nearest-rank p99).
+CPU includes startup and creation; wall time includes only the turn phase.
+The provider validates exact conversation history and every run completed all
+96 turns. This supports the mechanism and a small observed CPU reduction, but
+not a blanket latency improvement. End-of-work RSS was 22.2 / 24.4 MiB in the
+first pair and 24.8 / 24.6 MiB in the reversed pair; these are not peak-memory
+measurements or proof of memory parity.
+
+Next isolate serialized admission and creation, preserving capacity, same-bot
+ordering, durable acknowledgements, and provider execution only after commit.
+Measure long-history context construction separately before introducing caches.
+
+### Mixed workload and verification
+
+A sequential baseline/candidate pair used the existing 192-bot mixed soak for
+two minutes each, seed 7, with the first cancellation deliberately targeting a
+slow turn. The original random first attempt could select a turn that had
+already finished and fail to exercise cancellation at all. Later attempts stay
+randomized. The streaming-budget test also now counts the actual UTF-8 JSON,
+not an ASCII-escaped re-encoding.
+
+| Measurement | Baseline | Candidate |
+| --- | ---: | ---: |
+| Turns drained | 5,504 | 4,939 |
+| Unexpected failures | 0 | 0 |
+| Deliberate interruptions | 4 | 4 |
+| Turn p50 / p95 | 289 / 3,069 ms | 274 / 1,827 ms |
+| Sampled peak daemon RSS | 25.42 MiB | 27.16 MiB |
+| Final database / WAL | 36.01 / 4.12 MiB | 33.40 / 4.12 MiB |
+| Historical forks run and deleted | 1 | 2 |
+| Replay mismatches / unfinished after drain | 0 / 0 | 0 / 0 |
+
+Both recovered all 16 turns interrupted by a daemon kill. Neither reached the
+compaction threshold. Work selection depends on completion timing and pacing,
+so the different turn and fork counts make this an operational check, not an
+equivalent-workload efficiency comparison. In particular, the candidate's lower
+turn count does not establish throughput parity, and its smaller store does
+not establish better storage efficiency. A longer compaction/storage soak is
+still needed.
+
+Verification: 186 Rust tests, strict Clippy, formatting, and diff checks passed.
+The full Python run passed 246 tests, skipped 22, and failed the first-cancellation
+race above; the corrected real-daemon soak test passed on a focused rerun.
+
+### Fixed-work shell lifecycle
+
+The mixed run was followed by two reversed-order pairs of the socket lifecycle
+screen: 32 bots, three turns each, shell tools, all five tool schemas registered,
+one warmup and three measured runs per build. Each run validates 96 shell-tool
+results and workspace artifacts, exact replay, restart, idempotent submission,
+and historical forks. No quality warnings occurred.
+
+The observer now allows the configured shell workload's 65 processes (one
+daemon, 32 shells, 32 sleep children). Its former 48-process guard stopped a
+valid candidate warmup; that incomplete run and the preceding comparison were
+excluded. Both measured builds used the same corrected observer and guard.
+
+| Pair | Baseline / candidate turn p99 | Baseline / candidate observed tree CPU | Baseline / candidate peak daemon RSS | Baseline / candidate peak tree RSS |
+| --- | ---: | ---: | ---: | ---: |
+| baseline then candidate | 936.2 / 940.9 ms | 1.207 / 1.216 s | 18.78 / 18.86 MiB | 101.19 / 99.95 MiB |
+| candidate then baseline | 1019.0 / 945.7 ms | 1.229 / 1.223 s | 18.75 / 18.83 MiB | 92.08 / 98.81 MiB |
+
+Medians above include shell descendants in tree CPU and RSS; daemon RSS is
+reported separately. These short results are approximately flat, not a general
+speedup or proof of sustained-load parity. They support retaining the focused
+completion improvement while admission and long-run costs remain open.
+
+### Retention publication boundary
+
+The review found a same-bot race in the completion candidate: with
+`--retain-turns 1`, finishing A and cancelling queued B could share a commit.
+B's retention then removed A's terminal event before publication read it. A
+32-bot gated-provider probe reproduced missing completion events in two of ten
+runs on `3e4da31b…`, and none in ten on the fix, `d196f434…`.
+
+Completion, queued cancellation, explicit pruning, and deletion now identify
+which bot's events they may remove. The worker closes and publishes a group
+before taking a second such job for the same bot, preserving FIFO order.
+Different bots still batch. The check scans at most the existing 32-job group;
+it adds no SQL reads or event-payload copies. It adds a bot-name allocation to
+these jobs and can require another commit when same-bot retention conflicts.
+Durability and the retention policy are unchanged.
+
+A deterministic storage-worker regression first failed with terminal events
+`[3, 2]` instead of `[1, 3, 2]`. It now verifies all three events in order,
+subsequent pruning of the first result, and a shared commit for independent
+bots. All 187 Rust tests and 84 Python delivery/runtime/wait tests passed,
+as did strict Clippy, formatting, and diff checks.
+
+Matched 32-bot completion bursts on the same macOS arm64 host, with full
+flushing in both builds, one warmup and three measured runs per cell:
+
+| Order | Before / fixed p99 | Before / fixed daemon CPU |
+| --- | ---: | ---: |
+| before then fixed | 19.14 / 18.32 ms | 7.18 / 6.77 ms |
+| fixed then before | 34.19 / 15.89 ms | 7.04 / 6.58 ms |
+
+All runs completed 32 turns. These short samples show the cross-bot batching
+benefit survives the fix, with no observed CPU or tail regression in this
+probe. The varying baseline tails preclude attributing a further speedup to
+the boundary check. This does not resolve the mixed-soak or long-history gaps
+above, or measure the added commit cost when retention conflicts for one bot.

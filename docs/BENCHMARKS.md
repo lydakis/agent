@@ -679,17 +679,18 @@ daemon RSS separately from its descendant tree, and tree thread counts.
   --mode echo --tools echo,shell,read,write,edit --out .local/bench/socket-32
 ```
 
-This is the per-slice regression screen, and it runs in echo mode: shell
-mode at 32 agents puts a shell and its child under the daemon for every
-turn, 65 processes at once, which exceeds the observer's 48-process limit
-and fails the run before the turns complete. Use `--agents 8` for shell
-mode, or `--mode echo` at 32.
+The per-slice regression screen above uses echo mode. Shell mode at 32 agents
+can put a shell and its child under the daemon for every turn, 65 processes at
+once. Its observer guard admits that configured workload; it previously used
+48 and could stop valid runs. Guard failures retain their original failure
+status even when stopping the daemon leaves provider work incomplete.
 
 The observer/controller and provider are separate from the charged native
 process plus its descendants. Sampling is every 200 ms, including recursive child
 discovery, with a wider group scan every 500 ms. Each idle observation lasts 450 ms. Short-lived processes can still
 be missed and observed CPU is a lower bound. Limits are 30 seconds, 512 MiB per
-target/provider tree, 48 target processes. Each case has one excluded warmup and
+target/provider tree, and 48 target processes (65 for the 32-agent shell case).
+Each case has one excluded warmup and
 three measured runs. A full service startup happens before its first sample;
 reported peak RSS cannot exclude earlier transient peaks. Idle phase samples
 show retained RSS, not live heap allocation.
@@ -733,6 +734,23 @@ not a matched regression comparison or a capacity claim. The temporary store
 is removed afterwards unless `--keep` is given. `--bots` must be at least 32.
 See [the results and limitations](DAEMON_MEASUREMENTS.md#store-scale).
 
+## Completion burst
+
+```sh
+.local/venv/bin/python -m bench.completion_burst --binary .local/before --out .local/bench/finish-before
+.local/venv/bin/python -m bench.completion_burst --binary .local/target/release/agent --out .local/bench/finish-after
+```
+
+The existing synthetic provider holds 32 replies until every request has arrived,
+then releases them together. Timings run from that release through each durable
+terminal event. Creation and admission are excluded; receiving the replies,
+appending their items, committing completion, and publishing are included.
+The probe records daemon CPU over that interval and storage operation deltas.
+It checks successful completion, but does not validate the conversation content.
+One warmup and three measured fresh stores are the default. Run builds sequentially
+in both orders with the same durability settings. This measures a completion
+burst, not steady-state capacity; pair it with the streaming and lifecycle screens.
+
 ## Mixed-workload soak
 
 ```sh
@@ -744,8 +762,8 @@ One daemon on the socket transport and the synthetic provider, no spend, with
 compacting on a small window, shell output overflowing into artifacts,
 background-command bursts, parents parked on children, one-time provider
 failures, historical forks run and deleted, slow socket followers, and a
-running turn interrupted every 30 seconds (a slow turn is submitted for it
-when nothing interruptible is running), with retention pruning every bot as
+running turn interrupted every 30 seconds (the first attempt uses a slow turn;
+later attempts select active work, or submit a slow turn if none is available), with retention pruning every bot as
 it goes. Every five seconds it samples daemon RSS, threads, file
 descriptors, descendant processes and their memory, store and WAL size, the
 store's queue and run time, active, waiting, paced, and queued turns,

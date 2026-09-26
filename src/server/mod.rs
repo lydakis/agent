@@ -463,7 +463,7 @@ struct Service {
     /// task may already own the slot.
     active: HashMap<String, Active>,
     next_task: u64,
-    jobs: JoinSet<(String, i64, u64, turn::Exit)>,
+    jobs: JoinSet<(String, i64, u64, Result<turn::Exit>)>,
     replays: JoinSet<()>,
     /// Retention tasks own outputs and must release them before stdout joins.
     retention: JoinSet<()>,
@@ -970,7 +970,7 @@ impl Service {
         let keep = self.retain_turns;
         let steers = self.active.get(&bot).map(|active| active.steers.clone());
         self.store
-            .op("end_queued", move |db| {
+            .op_pruning("end_queued", bot.clone(), move |db| {
                 db.end_queued(turn, &error)?;
                 // Removing an incompatible head can expose eligible steers.
                 // Re-arm this bot inside the committing job, before another
@@ -1024,36 +1024,47 @@ impl Service {
             steers,
             tokens: self.tokens.clone(),
         };
+        let keep = self.retain_turns;
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
-            let result = task.execute(cancelled).await;
+            // Keep the cancellation receiver alive through completion so an
+            // interrupt cannot mistake this task for an unreaped parked turn.
+            let exit = task.execute(cancelled.clone()).await;
+            let result = if let turn::Exit::Finished(error) = &exit {
+                let (bot, error) = (bot.clone(), error.clone());
+                task.store
+                    .op_pruning("finish", bot.clone(), move |db| {
+                        turn::Finished::record(db, &bot, id, error.as_ref(), keep)
+                    })
+                    .await
+                    .map(|_| exit)
+            } else {
+                Ok(exit)
+            };
+            drop(cancelled);
             (bot, id, task_id, result)
         });
     }
 
-    /// Commit and publish completion without dispatching another command in
-    /// between. The durable busy state prevents newer accepted events from
-    /// overtaking the terminal event while the task waits to be reaped.
+    /// Reap a task after its completion has committed. Independent turns send
+    /// their finishes concurrently, letting the worker group their syncs.
+    /// The durable busy state and worker publication order keep a successor's
+    /// accepted event behind its predecessor's terminal event.
     async fn complete(
         &mut self,
         bot: String,
         turn: i64,
         task: u64,
-        exit: turn::Exit,
+        exit: Result<turn::Exit>,
     ) -> Result<()> {
+        let exit = exit?;
         if self.active.get(&bot).is_some_and(|a| a.task == task) {
             self.active.remove(&bot);
             // A slot opened, and a finish may promote the bot's next turn.
             self.ready_hint = true;
         }
         match exit {
-            turn::Exit::Finished(error) => {
-                let keep = self.retain_turns;
-                self.store
-                    .op("finish", move |db| {
-                        turn::Finished::record(db, &bot, turn, error.as_ref(), keep)
-                    })
-                    .await?;
+            turn::Exit::Finished(_) => {
                 // Interrupt may already have released the task's active slot.
                 // Finishing still promotes queued work in that case.
                 self.ready_hint = true;
@@ -1188,7 +1199,7 @@ impl Service {
                         loop {
                             let name = bot.clone();
                             let piece = store
-                                .op("delete_bot", move |db| {
+                                .op_pruning("delete_bot", name.clone(), move |db| {
                                     db.delete_bot_piece(
                                         &name,
                                         bot_id,
@@ -1236,7 +1247,7 @@ impl Service {
                         loop {
                             let name = bot.clone();
                             let piece = store
-                                .op("prune", move |db| {
+                                .op_pruning("prune", name.clone(), move |db| {
                                     db.prune_piece(
                                         &name,
                                         bot_id,
@@ -1564,7 +1575,7 @@ impl Service {
                 let name = bot.clone();
                 let keep = self.retain_turns;
                 store
-                    .op("finish", move |db| {
+                    .op_pruning("finish", name.clone(), move |db| {
                         turn::Finished::record(
                             db,
                             &name,
@@ -1895,7 +1906,7 @@ mod tests {
         };
         service.jobs.spawn(async move {
             drop(cancelled);
-            ("Bob".into(), turn, 1, turn::Exit::Parked)
+            ("Bob".into(), turn, 1, Ok(turn::Exit::Parked))
         });
         service.active["Bob"].cancel.closed().await;
         let output = Output::writer(tokio::io::sink());
@@ -1974,8 +1985,14 @@ mod tests {
         // A finished task can likewise be reaped after interrupt released
         // its active slot. Its successor must still wake the dispatcher.
         service.ready_hint = false;
+        store
+            .op("finish", move |db| {
+                turn::Finished::record(db, "Bob", next, None, None)
+            })
+            .await
+            .unwrap();
         service
-            .complete("Bob".into(), next, 2, turn::Exit::Finished(None))
+            .complete("Bob".into(), next, 2, Ok(turn::Exit::Finished(None)))
             .await
             .unwrap();
         assert!(service.ready_hint);
@@ -2132,6 +2149,122 @@ mod tests {
         drop(output);
         drop(service);
         writer.join().unwrap().unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn finished_turns_commit_without_service_reaping() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-concurrent-finish-{}", std::process::id()));
+        let (store, mut publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let turns = store
+            .call(|db| {
+                (0..8)
+                    .map(|n| {
+                        let bot = format!("bot{n}");
+                        db.create(
+                            &bot,
+                            Some("/synthetic"),
+                            Binding {
+                                provider: "openai",
+                                family: Family::Responses,
+                                model: "synthetic",
+                                instructions: "",
+                                reasoning: None,
+                                budget_tokens: None,
+                                tools: &[],
+                                created_by: None,
+                                created_by_id: None,
+                                compaction_instructions: None,
+                                compaction_model: None,
+                                fallbacks: false,
+                            },
+                        )?;
+                        let turn = db
+                            .begin(
+                                &bot,
+                                "first",
+                                "work",
+                                true,
+                                &TurnOptions::default(),
+                                |_, _| Ok(()),
+                            )?
+                            .turn;
+                        Ok((bot, turn))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        let registry = Registry::new("echo").unwrap();
+        let transport = Transport::new(64, 1).unwrap();
+        let mut service = Service {
+            identity: 0,
+            store: store.clone(),
+            transport,
+            providers: Arc::new(HashMap::new()),
+            registry,
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
+                processes: 16,
+                detached: 16,
+                active: 1024,
+                connecting: 64,
+                connections: 11,
+                context_bytes: 8 << 20,
+                context_items: 4096,
+                note_turns: 48,
+                compact_at: 75,
+                compact_keep: 25,
+            },
+            retain_turns: None,
+            sessions: 0,
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1024,
+            active: HashMap::new(),
+            next_task: 0,
+            jobs: JoinSet::new(),
+            replays: JoinSet::new(),
+            retention: JoinSet::new(),
+            ready_hint: false,
+            tokens: Arc::default(),
+            paced: std::collections::BinaryHeap::new(),
+        };
+        // Missing providers make the real turn tasks finish without network I/O.
+        // Their durable completion must not depend on the service reaping them.
+        for (bot, turn) in &turns {
+            service.spawn(bot.clone(), *turn, false, false);
+        }
+        let mut results = Vec::new();
+        while let Some(result) = service.jobs.join_next().await {
+            results.push(result.unwrap());
+        }
+        let check = turns.clone();
+        store
+            .call(move |db| {
+                for (bot, turn) in check {
+                    assert_eq!(db.turn_status(&bot, turn)?, "failed");
+                    assert!(db.inspect(&bot)?.running_turn.is_none());
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for (bot, turn, task, exit) in results {
+            service.complete(bot, turn, task, exit).await.unwrap();
+        }
+        assert!(service.active.is_empty());
+        let mut terminal = 0;
+        while let Ok(publication) = publications.try_recv() {
+            if let Publication::Event(entry) = publication {
+                terminal += usize::from(entry["event"] == "turn_finished");
+            }
+        }
+        assert_eq!(terminal, turns.len(), "one terminal event per turn");
+        drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

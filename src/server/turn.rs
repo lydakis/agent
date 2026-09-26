@@ -374,8 +374,8 @@ impl Turn {
                 Some(error)
             }
         };
-        // Leave the bot durably busy until the service can commit completion
-        // and publish it before dispatching a subsequent submission.
+        // The task wrapper commits completion before releasing the active slot.
+        // Until then, the store keeps the bot durably busy.
         Exit::Finished(error)
     }
 

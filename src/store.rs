@@ -1,6 +1,7 @@
 //! One database worker for all agents, plus one reader for bulk context
 //! reads. Durable writes never block the I/O runtime, and jobs that queue
-//! together commit together: one sync per group, not per job.
+//! together commit together: one sync per group, not per job. Retention jobs
+//! for the same bot cross a publication boundary before they can prune each other.
 use crate::{Error, Result};
 use rusqlite::Connection;
 use std::{
@@ -30,10 +31,12 @@ const GROUP_JOBS: usize = 32;
 /// is durable.
 trait Job: Send {
     fn run(&mut self, db: &mut Database);
+    fn pruning_bot(&self) -> Option<&str>;
     fn answer(self: Box<Self>, committed: bool);
 }
 struct Queued<F, T> {
     operation: Option<F>,
+    pruning_bot: Option<String>,
     outcome: Option<Result<T>>,
     reply: oneshot::Sender<Result<T>>,
     label: &'static str,
@@ -55,6 +58,9 @@ where
             (started - self.queued).as_nanos() as u64,
             started.elapsed().as_nanos() as u64,
         );
+    }
+    fn pruning_bot(&self) -> Option<&str> {
+        self.pruning_bot.as_deref()
     }
     fn answer(self: Box<Self>, committed: bool) {
         // A job's own error was decided against writes that the failed
@@ -245,7 +251,8 @@ impl Store {
                         };
                         let _ = ready.send(Ok(path));
                         let mut group: Vec<Box<dyn Job>> = Vec::with_capacity(GROUP_JOBS);
-                        while let Some(job) = receiver.blocking_recv() {
+                        let mut deferred = None;
+                        while let Some(job) = deferred.take().or_else(|| receiver.blocking_recv()) {
                             group.push(job);
                             let begun = db.begin_group().is_ok();
                             if begun {
@@ -259,7 +266,21 @@ impl Store {
                                         break;
                                     }
                                     match receiver.try_recv() {
-                                        Ok(job) => group.push(job),
+                                        Ok(job) => {
+                                            // Retention must see prior same-bot completions
+                                            // only after their events have been published.
+                                            // The group is bounded; no map or SQL lookup is
+                                            // needed, and independent bots still batch.
+                                            if job.pruning_bot().is_some_and(|bot| {
+                                                group
+                                                    .iter()
+                                                    .any(|prior| prior.pruning_bot() == Some(bot))
+                                            }) {
+                                                deferred = Some(job);
+                                                break;
+                                            }
+                                            group.push(job);
+                                        }
                                         Err(_) => break,
                                     }
                                 }
@@ -357,10 +378,32 @@ impl Store {
         label: &'static str,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.enqueue(label, None, operation).await
+    }
+    /// Run a job that can prune a bot's events. Jobs for different bots may
+    /// share a commit; another pruning job for this bot must follow publication
+    /// of the first, so it cannot erase a terminal event before live delivery.
+    /// Completion jobs use this even without automatic retention: a later
+    /// explicit prune or deletion must preserve their publication too.
+    pub async fn op_pruning<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        bot: String,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.enqueue(label, Some(bot), operation).await
+    }
+    async fn enqueue<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        pruning_bot: Option<String>,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let (reply, receiver) = oneshot::channel();
         self.sender
             .send(Box::new(Queued {
                 operation: Some(operation),
+                pruning_bot,
                 outcome: None,
                 reply,
                 label,
@@ -457,10 +500,18 @@ mod tests {
         store: &Store,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> tokio::task::JoinHandle<Result<T>> {
+        queue_pruning(store, None, operation).await
+    }
+    async fn queue_pruning<T: Send + 'static>(
+        store: &Store,
+        bot: Option<&str>,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<T>> {
+        let bot = bot.map(str::to_owned);
         let queued = store.sender.max_capacity() - store.sender.capacity() + 1;
         let job = tokio::spawn({
             let store = store.clone();
-            async move { store.call(operation).await }
+            async move { store.enqueue("test", bot, operation).await }
         });
         while store.sender.max_capacity() - store.sender.capacity() < queued {
             tokio::task::yield_now().await;
@@ -510,6 +561,119 @@ mod tests {
         three.await.unwrap().unwrap();
         assert_eq!(commits(&store), before + 1, "four jobs, one commit");
         assert_eq!(rows(&store).await, [1, 3]);
+    }
+
+    #[tokio::test]
+    async fn same_bot_retention_publishes_before_pruning_without_serializing_other_bots() {
+        let path = scratch_path("retention-publication");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (store, mut publications) = Store::open(&path).await.unwrap();
+        let (first, queued, other) = store
+            .call(|db| {
+                for name in ["Bob", "Alice"] {
+                    db.create(
+                        name,
+                        Some("/synthetic"),
+                        Binding {
+                            provider: "openai",
+                            family: crate::codec::Family::Responses,
+                            model: "synthetic",
+                            instructions: "",
+                            reasoning: None,
+                            budget_tokens: None,
+                            tools: &[],
+                            created_by: None,
+                            created_by_id: None,
+                            compaction_instructions: None,
+                            compaction_model: None,
+                            fallbacks: false,
+                        },
+                    )?;
+                }
+                let first = db
+                    .begin("Bob", "a", "work", true, &TurnOptions::default(), |_, _| {
+                        Ok(())
+                    })?
+                    .turn;
+                let queued = db
+                    .begin(
+                        "Bob",
+                        "b",
+                        "next",
+                        true,
+                        &TurnOptions {
+                            delivery: Delivery::Queue,
+                            ..TurnOptions::default()
+                        },
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                let other = db
+                    .begin(
+                        "Alice",
+                        "c",
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )?
+                    .turn;
+                Ok((first, queued, other))
+            })
+            .await
+            .unwrap();
+        let before = commits(&store);
+        let (held, gate) = hold(&store).await;
+        let finish = queue_pruning(&store, Some("Bob"), move |db| {
+            db.finish(first, None)?;
+            db.announce("Bob", first, db.turn_outcome("Bob", first)?.unwrap());
+            db.prune_except("Bob", 1, Some(first))?;
+            Ok(())
+        })
+        .await;
+        let independent = queue_pruning(&store, Some("Alice"), move |db| {
+            db.finish(other, None)?;
+            db.prune_except("Alice", 1, Some(other))?;
+            Ok(())
+        })
+        .await;
+        let cancel = queue_pruning(&store, Some("Bob"), move |db| {
+            db.end_queued(queued, &Error::new("cancelled"))?;
+            db.prune_except("Bob", 1, Some(queued))?;
+            Ok(())
+        })
+        .await;
+        gate.send(()).unwrap();
+        for job in [held, finish, independent, cancel] {
+            job.await.unwrap().unwrap();
+        }
+        // This read also waits for the preceding group's publication to drain.
+        assert_eq!(
+            store
+                .call(move |db| db.turn_outcome("Bob", first))
+                .await
+                .unwrap_err()
+                .code,
+            "turn_result_pruned"
+        );
+        let mut terminal = Vec::new();
+        while let Ok(publication) = publications.try_recv() {
+            if let Publication::Event(event) = publication
+                && event["event"] == "turn_finished"
+            {
+                terminal.push(event["turn"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(
+            terminal,
+            [first, other, queued],
+            "pruning must not erase live completion"
+        );
+        assert_eq!(
+            commits(&store),
+            before + 3,
+            "two mutation groups plus the final read; independent finishes share a commit"
+        );
     }
 
     #[tokio::test]

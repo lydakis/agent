@@ -754,14 +754,17 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     one sync for the jobs that queued together, and callers are answered
     after it ([measured](DAEMON_MEASUREMENTS.md#group-commit): at a 10 ms
     sync, 64 sustained bots went from 26 to 37 turns per second; level at
-    the VM's native sync). Next, the service loop: it awaits `begin` for
-    each submission and `finish` for each completion before handling the
-    next request, so those commits cannot share a sync with each other,
-    and they are now the ceiling (about 3 jobs per commit in that run). The
-    loop needs a job's result to decide, not its sync; answering it when
-    the job has run and holding client replies and publication for the
-    commit would let them group, but the ordering guarantees of item 21
-    and completion's busy state need a design first. Also done: on macOS
+    the VM's native sync). Completions now commit from their turn tasks,
+    allowing independent finishes to group without blocking the service loop.
+    The bot remains durably busy until commit, and publication keeps commit
+    order. Same-bot retention jobs cross a publication boundary; independent
+    bots still group. The [completion burst](DAEMON_MEASUREMENTS.md#completion-scheduling-and-macos-flush-attribution)
+    improves substantially; ordinary streaming tails remain mixed. Next,
+    admission and creation: the service still awaits their commits before
+    handling another request. Letting those jobs group needs a design for
+    capacity reservation, same-bot ordering, and item 21's guarantees. Client
+    acknowledgements, publication, and provider execution must stay after
+    commit. Also done: on macOS
     the store sets `fullfsync` and `checkpoint_fullfsync`, because a plain
     fsync there leaves commits in the drive cache. A flush costs about
     5.4 ms on an M1 Max, paid once per group; the service loop above now

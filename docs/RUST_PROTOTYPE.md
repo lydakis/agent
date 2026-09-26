@@ -1400,9 +1400,14 @@ needs, and one optional policy composes them:
   its turns finishes, including cancelled or failed queued work and interruption
   while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention
-  left it. The service commits completion and publishes its terminal event
-  before accepting another turn for that bot; the task is retired before
-  notifying followers and waiters. Shutdown drains completions through the
+  left it. Each turn task submits its completion to the storage worker, allowing
+  concurrent finishes to share a commit. The bot stays durably busy until that
+  commit; the worker publishes its terminal event before a successor's accepted
+  event. Completion, cancellation, explicit pruning, and deletion jobs for the
+  same bot cross a commit-and-publication boundary so later retention cannot
+  erase an unpublished terminal event. Different bots still share commits.
+  The service then retires the task, without another storage round trip.
+  Shutdown drains completions through the
   same path, including cancellation events and pending turn-wait results.
 
 Turn IDs come from a durable high-water mark. Node/checkpoint IDs use the

@@ -20,6 +20,11 @@ from .targets import clean_env, file_hash
 from .responses import prompt
 
 
+def process_limit(config, mode):
+    # The shell fixture retains its shell while its sleep child runs.
+    return max(48, 1 + 2 * config['concurrency']) if mode == 'shell' else 48
+
+
 def run_once(binary, directory, config, mode, toolset, transport='stdio', memory_detail=False):
     workload = directory / 'workload.json'
     workload.write_text(json.dumps(config))
@@ -59,7 +64,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
                        'provider_rss_bytes':fixture['rss_bytes'],
                        'provider_cpu_seconds':fixture['observed_cpu_seconds']}
                 samples.append(row)
-                if max(row['rss_bytes'], row['provider_rss_bytes']) > 512 * 1024**2 or row['processes'] > 48:
+                if max(row['rss_bytes'], row['provider_rss_bytes']) > 512 * 1024**2 or row['processes'] > process_limit(config, mode):
                     raise RuntimeError('resource limit')
                 if row['elapsed'] > 30:
                     raise TimeoutError('run timeout')
@@ -157,7 +162,8 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
     expected = config['concurrency']*config['turns']
     if (stats['invalid_requests'] or stats['completed_requests'] != expected*(1 if mode == 'text' else 2)
             or stats['tool_results'] != (0 if mode == 'text' else expected)):
-        result['status'] = 'provider_workload_mismatch'
+        if result['status'] == 'ok':
+            result['status'] = 'provider_workload_mismatch'
     (directory/'samples.json').write_text(json.dumps(samples))
     result.update(provider=stats, target_peak_rss_bytes=max((s['rss_bytes'] for s in samples),default=0),
                   daemon_peak_rss_bytes=max((s['daemon_rss_bytes'] for s in samples),default=0),
@@ -205,7 +211,7 @@ def main():
                   contract='sqlite_full; exact resume/replay; historical completed fork; no repeated tools',
                   host=dict(system=platform.system(),architecture=platform.machine(),host_id=digest(platform.node()),
                             python=platform.python_version(),psutil=psutil.__version__,external_power=battery.power_plugged if battery else None),
-                  sampling=dict(idle_seconds=.45,interval_seconds=.2,group_discovery_seconds=.5,timeout_seconds=30,rss_limit_mib=512,process_limit=48),runs=[])
+                  sampling=dict(idle_seconds=.45,interval_seconds=.2,group_discovery_seconds=.5,timeout_seconds=30,rss_limit_mib=512,process_limit=process_limit(config, args.mode)),runs=[])
     for index in range(args.repeat+1):
         directory = out/f'run-{index}'
         directory.mkdir()

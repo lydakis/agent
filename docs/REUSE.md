@@ -39,6 +39,13 @@ bounded candidate review alone.
 
 ## Measurement tools
 
+2026-09-26 follow-up: the completion-burst probe reuses the existing synthetic
+provider, JSONL client, and psutil. It isolates release-to-terminal latency
+under the same full-flush durability contract. [The paired measurements](DAEMON_MEASUREMENTS.md#completion-scheduling-and-macos-flush-attribution)
+support task-owned completion batching; ordinary-stream latency and long-run
+capacity remain separate questions. No runtime dependency or custom profiler
+was added.
+
 The [storage experiments](STORAGE_GROWTH.md) reuse SQLite's `dbstat` for page
 attribution. miniz_oxide 0.8.9 stays in the isolated benchmark; its partial-read
 cost ruled out blanket compression. The runtime reuses lz4_flex 0.14.0 for

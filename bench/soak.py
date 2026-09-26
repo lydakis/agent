@@ -190,6 +190,11 @@ class Soak:
 
     def interrupt_one(self):
         running = [(t, r, b) for t, (r, b, _) in self.in_flight.items() if r in ('noisy', 'plain', 'long', 'background')]
+        # A follower can lag completion: an in-flight entry is not proof the
+        # daemon still has a running turn. Exercise cancellation deliberately
+        # on the first attempt; later attempts retain the randomized races.
+        if self.counts['interrupt_attempts'] == 0:
+            running = []
         if running:
             turn, _, bot = self.random.choice(running)
         else:

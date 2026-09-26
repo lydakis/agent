@@ -164,16 +164,18 @@ to build and run it.
 ## How fast is it?
 
 Performance is the point of the project, and every claim links to its
-measurement. So far, one daemon has run 1,024 concurrent bots on real
-providers, held 64 for five minutes without drift, and pushed 10,000 bots
-through one API key at the provider's own rate with no failures
-([live fleet check](docs/LIVE_FLEET.md)). Those were short-context turns: they
+measurement. In the September 15–16 fleet checks, one daemon ran 1,024
+overlapping bot turns on real providers, held 64 for five minutes without
+drift, and pushed 10,000 bots through one API key at the provider's own rate
+with no failures
+([live fleet check](docs/LIVE_FLEET.md)). Overlap includes queued work, not
+necessarily simultaneous provider streams. Those were short-context turns: they
 show a lightweight runtime, not coding-agent capacity at that scale.
 
 The same synthetic conversation work through five harnesses, 32 agents at once,
 each doing three turns that add 64 KiB of text and stream back 5 KiB
 ([full screen](docs/HARNESS_MEASUREMENTS.md), 2026-09-23, 4-vCPU Linux VM,
-medians of three runs):
+medians of three runs; Agent source `8ebbc44`):
 
 | Harness | Peak memory | CPU time | Turn p99 |
 | --- | ---: | ---: | ---: |
