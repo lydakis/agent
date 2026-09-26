@@ -1149,6 +1149,30 @@ fn held_verdicts_follow_the_group_that_holds_them() {
 }
 
 #[test]
+fn a_group_waits_for_a_write_lock_another_connection_holds() {
+    let path = std::env::temp_dir().join(format!("agent-group-lock-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // The daemon's reader takes the write lock for a moment when it catches
+    // the WAL header mid-update; any holder will do here.
+    let other = Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        other.execute_batch("COMMIT").unwrap();
+    });
+    // A job that reads before it writes: past its first read, SQLite would
+    // answer SQLITE_BUSY at once rather than wait.
+    db.begin_group().unwrap();
+    db.last_event_id().unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    db.commit_group().unwrap();
+    holder.join().unwrap();
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

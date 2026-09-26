@@ -869,7 +869,11 @@ impl Database {
             self.abandon_group()?;
         }
         self.live_before.clear();
-        self.conn.prepare_cached("BEGIN")?.execute([])?;
+        // IMMEDIATE takes the write lock here, where SQLite waits out the
+        // busy timeout for it. A group that read first and asked later would
+        // get SQLITE_BUSY at once if the reader held the lock at that moment,
+        // as it does briefly when it catches the WAL header mid-update.
+        self.conn.prepare_cached("BEGIN IMMEDIATE")?.execute([])?;
         Ok(())
     }
     /// Run several writes as one: if `work` fails, none of what it wrote
