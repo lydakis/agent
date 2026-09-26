@@ -236,6 +236,10 @@ Reconnects, retention, overload, compaction and recovery.
 - The five-harness screen at the current build.
 - Compaction quality and cost on real coding tasks, beyond one synthetic
   task with three bots per condition, and at a realistic budget.
+- Whether sending summary requests as copies of the bot's call saves
+  anything. At the 20 KiB test budget the copies read cache but sent more
+  uncached summary input than fresh requests (21,111 against 17,606 tokens,
+  over 8 summaries against 11).
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.

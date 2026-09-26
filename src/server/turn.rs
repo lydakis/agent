@@ -915,128 +915,145 @@ impl Turn {
                 .await?;
             return Ok(Compaction::Skipped);
         };
-        let mut instructions = record.compaction_instructions.clone().unwrap();
         // A turn may run on another model than the bot's, and then the
         // bot's summarizer can neither read that call's cache nor take its
-        // routing token or thinking.
-        accounting.copied = None;
-        let copy = match sent.filter(|sent| sent.model == reference && !plan.catch_up) {
-            Some(Sent { view, last, .. }) => {
-                let request = Bytes::from(agent_runtime::store::CompactionPlan::request(
-                    summarizer.family(),
-                    &instructions,
-                    plan.summary_bytes,
-                )?);
-                match self.copy_of(view, last, &plan, &request) {
-                    Some((prefix, items, window)) => {
-                        let thinking = self.bound(record, &prefix, window).await?;
-                        // A park keeps what is copied, and the prefix
-                        // itself only when the view no longer sends it.
-                        let prefix_text = if prefix == view.prefix.bytes {
-                            None
-                        } else {
-                            let text = std::str::from_utf8(&prefix)
-                                .map_err(|_| Error::new("storage_error"))?;
-                            Some((text.to_owned(), items))
-                        };
-                        accounting.copied = Some(agent_runtime::store::CopiedCall {
-                            floor: window.elided,
-                            first: window.ids[0],
-                            prefix: prefix_text,
-                        });
-                        Some((prefix, window, thinking, request))
+        // routing token or thinking. A copy whose reply is no summary, a
+        // tool call or no text, is asked again as a request of its own.
+        let mut sent = sent.filter(|sent| sent.model == reference && !plan.catch_up);
+        let (summary, usage) = loop {
+            let mut instructions = record.compaction_instructions.clone().unwrap();
+            accounting.copied = None;
+            let copy = match sent.take() {
+                Some(Sent { view, last, .. }) => {
+                    let request = Bytes::from(agent_runtime::store::CompactionPlan::request(
+                        summarizer.family(),
+                        &instructions,
+                        plan.summary_bytes,
+                    )?);
+                    match self.copy_of(view, last, &plan, &request) {
+                        Some((prefix, items, window)) => {
+                            let thinking = self.bound(record, &prefix, window).await?;
+                            // A park keeps what is copied, and the prefix
+                            // itself only when the view no longer sends it.
+                            let prefix_text = if prefix == view.prefix.bytes {
+                                None
+                            } else {
+                                let text = std::str::from_utf8(&prefix)
+                                    .map_err(|_| Error::new("storage_error"))?;
+                                Some((text.to_owned(), items))
+                            };
+                            accounting.copied = Some(agent_runtime::store::CopiedCall {
+                                floor: window.elided,
+                                first: window.ids[0],
+                                prefix: prefix_text,
+                            });
+                            Some((prefix, window, thinking, request))
+                        }
+                        None => None,
                     }
-                    None => None,
                 }
-            }
-            None => None,
-        };
-        // Messages requires definitions for historical tool blocks. Reuse the
-        // already encoded bot selection; tool_choice disables new calls.
-        // Responses accepts historical calls without definitions. A copy
-        // keeps the call's tools and tool choice, which the cache covers.
-        let empty;
-        let (body, summary_tools) = match &copy {
-            Some((prefix, window, thinking, request)) => {
-                instructions = record.instructions.clone();
-                let copied = Copied {
-                    prefix,
-                    window,
-                    thinking: *thinking,
-                    request,
-                };
-                (Body::Copied(copied), tools)
-            }
-            None => match summarizer.family() {
-                agent_runtime::codec::Family::Anthropic => (Body::Span(&plan), tools),
-                agent_runtime::codec::Family::Responses => {
-                    empty = self.registry.encoded(summarizer.family(), &[])?;
-                    (Body::Span(&plan), &*empty)
+                None => None,
+            };
+            let copied = copy.is_some();
+            // Messages requires definitions for historical tool blocks. Reuse the
+            // already encoded bot selection; tool_choice disables new calls.
+            // Responses accepts historical calls without definitions. A copy
+            // keeps the call's tools and tool choice, which the cache covers.
+            let empty;
+            let (body, summary_tools) = match &copy {
+                Some((prefix, window, thinking, request)) => {
+                    instructions = record.instructions.clone();
+                    let copied = Copied {
+                        prefix,
+                        window,
+                        thinking: *thinking,
+                        request,
+                    };
+                    (Body::Copied(copied), tools)
                 }
-            },
-        };
-        let completion = match self
-            .call_with(
-                summarizer,
-                model,
-                &instructions,
-                summary_tools,
-                body,
-                record,
-                model_rounds,
-                turn,
-                accounting,
-            )
-            .await
-        {
-            Ok(Some(completion)) => {
-                accounting.copied = None;
-                completion
+                None => match summarizer.family() {
+                    agent_runtime::codec::Family::Anthropic => (Body::Span(&plan), tools),
+                    agent_runtime::codec::Family::Responses => {
+                        empty = self.registry.encoded(summarizer.family(), &[])?;
+                        (Body::Span(&plan), &*empty)
+                    }
+                },
+            };
+            let completion = match self
+                .call_with(
+                    summarizer,
+                    model,
+                    &instructions,
+                    summary_tools,
+                    body,
+                    record,
+                    model_rounds,
+                    turn,
+                    accounting,
+                )
+                .await
+            {
+                Ok(Some(completion)) => {
+                    accounting.copied = None;
+                    completion
+                }
+                Ok(None) => return Ok(Compaction::Parked(accounting.parked_until)),
+                Err(error) => {
+                    accounting.copied = None;
+                    self.hub
+                        .live(
+                            &self.bot,
+                            json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
+                                "error":error.code,"detail":error.detail}),
+                        )
+                        .await?;
+                    return Ok(Compaction::Skipped);
+                }
+            };
+            // Success is billable even if its text is empty or too large to use.
+            *model_rounds += 1;
+            if let Some(usage) = &completion.usage {
+                record.tokens_used = record
+                    .tokens_used
+                    .saturating_add(usage.input_tokens)
+                    .saturating_add(usage.output_tokens);
             }
-            Ok(None) => return Ok(Compaction::Parked(accounting.parked_until)),
-            Err(error) => {
-                accounting.copied = None;
-                self.hub
-                    .live(
-                        &self.bot,
-                        json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                            "error":error.code,"detail":error.detail}),
-                    )
-                    .await?;
-                return Ok(Compaction::Skipped);
-            }
-        };
-        // Success is billable even if its text is empty or too large to use.
-        *model_rounds += 1;
-        if let Some(usage) = &completion.usage {
-            record.tokens_used = record
-                .tokens_used
-                .saturating_add(usage.input_tokens)
-                .saturating_add(usage.output_tokens);
-        }
-        let usage = completion
-            .usage
-            .map(|usage| summarizer_usage(usage, name, model));
-        let summary = completion_text(&completion.items);
-        // A copy offers the bot's tools; a call there is not a summary.
-        let invalid = if !completion.calls.is_empty() {
-            Some(Error::new("compaction_tool_call"))
-        } else if summary.len() > plan.summary_bytes {
-            Some(Error::new("compaction_summary_limit"))
-        } else if summary.trim().is_empty() {
-            Some(Error::new("empty_summary"))
-        } else {
-            None
-        };
-        if let Some(error) = invalid {
+            let usage = completion
+                .usage
+                .map(|usage| summarizer_usage(usage, name, model));
+            let summary = completion_text(&completion.items);
+            // A copy offers the bot's tools; a call there is not a summary.
+            let invalid = if !completion.calls.is_empty() {
+                Error::new("compaction_tool_call")
+            } else if summary.len() > plan.summary_bytes {
+                Error::new("compaction_summary_limit")
+            } else if summary.trim().is_empty() {
+                Error::new("empty_summary")
+            } else {
+                break (summary, usage);
+            };
             self.store
                 .op("compaction_usage", move |db| {
                     db.compaction_usage(turn, usage.as_ref())
                 })
                 .await?;
-            self.compaction_failed(turn, &error).await?;
-            return Ok(Compaction::Skipped);
-        }
+            // The request of its own is another call, checked as each is.
+            if !copied
+                || invalid.code == "compaction_summary_limit"
+                || budget_error(record.budget_tokens, record.tokens_used).is_some()
+                || *model_rounds >= MAX_ROUNDS
+            {
+                self.compaction_failed(turn, &invalid).await?;
+                return Ok(Compaction::Skipped);
+            }
+            self.hub
+                .live(
+                    &self.bot,
+                    json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
+                        "error":invalid.code,"detail":invalid.detail,"fallback":true}),
+                )
+                .await?;
+        };
         let bot = self.bot.clone();
         let billed = usage.clone();
         let note_turns = self.note_turns;

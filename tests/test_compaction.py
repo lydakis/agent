@@ -691,17 +691,23 @@ class SummaryCopyTests(ModelFixture):
         self.assertEqual(len(outputs), 3)
         self.assertFalse(any(o.startswith('[tool result elided') for o in outputs))
 
-    def test_a_summary_that_calls_a_tool_is_billed_and_not_installed(self):
+    def test_a_copy_that_calls_a_tool_is_billed_and_asked_again_on_its_own(self):
+        # As Claude Code does: the copy's reply is not installed, and the
+        # summary is asked for again at once, without tools.
         self.model.compaction_call = True
         client = self.start()
         for n in range(3):
             self.turn(client, str(n), str(n) * 500)
-        self.assertEqual(len(self.copies(self.requests())), 1)
+        requests = self.requests()
+        copy, own = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(own, copy + 1)
+        self.assertEqual(self.copies(requests[:own]), [copy])
+        self.assertEqual((requests[own]['tools'], requests[own]['instructions']), ([], 'Summarize.'))
         bot = client.request('resume', bot='Bob')['result']
-        self.assertIsNone(bot['compaction'])
-        self.assertEqual(bot['tokens_used'], 440)  # three answers plus the summary
-        self.assertTrue(any(m.get('event') == 'compaction_failed' and m.get('error') == 'compaction_tool_call'
-                            for m in client.saved))
+        self.assertIsNotNone(bot['compaction'])
+        self.assertEqual(bot['tokens_used'], 550)  # three answers and both summaries
+        failed = [m for m in client.saved if m.get('event') == 'compaction_failed']
+        self.assertEqual([(m['error'], m.get('fallback')) for m in failed], [('compaction_tool_call', True)])
         self.assertEqual(self.events(client, 'tool_started'), [])
 
     def test_a_turn_on_another_model_than_the_summarizer_gets_a_request_of_its_own(self):

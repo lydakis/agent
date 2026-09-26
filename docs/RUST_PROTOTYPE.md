@@ -1732,8 +1732,11 @@ keeps in its park record the floor that window was read under, where it
 starts, and that prefix when the view no longer sends it, so its retry,
 after a restart too, copies the same call. It does not set `tool_choice`, which on
 Anthropic would invalidate the message cache, so the request asks for text
-and a reply that calls a tool is billed and not installed
-(`compaction_tool_call`). The summary covers everything the copy shows,
+and a reply that calls a tool (`compaction_tool_call`) or has no text
+(`empty_summary`) is billed and not installed. As Claude Code does, the
+summary is then asked for at once in a request of its own, below, if the
+bot's budget and round limit allow another call; the `compaction_failed`
+event for the copy says `"fallback": true`. The summary covers everything the copy shows,
 the verbatim tail included. Otherwise (a step through a backlog larger than
 the budget, below; a copy that would exceed the input limit; or another
 summarizer, which cannot read that call's cache, as when a turn

@@ -288,7 +288,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = getattr(self.server, 'compaction_text', 'A short synthetic summary.')
                 output = [{'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
-                if getattr(self.server, 'compaction_call', False):
+                if getattr(self.server, 'compaction_call', False) and request.get('tools'):
                     # A copy offers the bot's tools, and a model may call one.
                     output.append({'type': 'function_call', 'name': 'echo', 'call_id': 'summary-call',
                                    'arguments': json.dumps({'text': 'instead'})})
