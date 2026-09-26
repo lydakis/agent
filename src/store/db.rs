@@ -406,7 +406,8 @@ pub enum Planning {
     CatchUp(CatchUp),
 }
 /// Oldest node, depth, own total, ordinal, child on the lineage and its
-/// ordinal, and the bounded prompt text inside the budget.
+/// ordinal, the bounded prompt text inside the budget, and thinking
+/// through the node.
 type CatchUpRow = (
     i64,
     i64,
@@ -415,6 +416,7 @@ type CatchUpRow = (
     Option<i64>,
     Option<i64>,
     Option<String>,
+    i64,
 );
 /// A catch-up walk from the head back to the previous cut. Only the rows
 /// that start inside the budget are kept, so its memory is bounded by the
@@ -424,8 +426,9 @@ pub struct CatchUp {
     head: i64,
     previous_cut: i64,
     /// The head's bytes, and the bytes and depth before the previous cut,
-    /// counted as sent.
-    totals: (i64, i64, i64),
+    /// counted as sent, then the thinking before the cut, which a summary
+    /// request does not send.
+    totals: (i64, i64, i64, i64),
     /// The bot's elision floor and what its stubs save through it.
     elision: (i64, i64),
     /// A previous cut inside a turn: that turn's prompt and ordinal.
@@ -497,7 +500,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 31;
+    pub const SCHEMA: i32 = 32;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -571,7 +574,8 @@ impl Database {
             CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
                 turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
-                elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0);
+                elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0,
+                total_thinking INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -1573,14 +1577,36 @@ impl Database {
         // previous cut, head's totals, and the totals before the cut.
         // Bytes count as the summarizer is sent them: stubs through the
         // bot's elision floor, as the model last saw the span.
-        // A previous cut inside a turn also names that turn's prompt.
-        type Span = (i64, i64, i64, i64, i64, i64, i64, Option<(i64, i64)>);
-        let (previous_cut, head_total, head_depth, before, depth_before, elided, saved, partial): Span =
-            self.conn
+        // A previous cut inside a turn also names that turn's prompt. The
+        // summarizer is sent no thinking, so its fit is sized without it.
+        type Span = (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<(i64, i64)>,
+            (i64, i64),
+        );
+        let (
+            previous_cut,
+            head_total,
+            head_depth,
+            before,
+            depth_before,
+            elided,
+            saved,
+            partial,
+            (head_thinking, thinking_before),
+        ): Span = self
+            .conn
                 .prepare_cached(
                     "SELECT COALESCE(c.cut,-1),h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),
                         h.depth,COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0),
-                        COALESCE(p.depth,0),COALESCE(e.through,0),COALESCE(e.saved,0),c.pinned,pn.turn_seq
+                        COALESCE(p.depth,0),COALESCE(e.through,0),COALESCE(e.saved,0),c.pinned,pn.turn_seq,
+                        h.total_thinking,COALESCE(p.total_thinking,0)
                  FROM nodes h LEFT JOIN compactions c ON c.node=?2
                  LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
                  LEFT JOIN nodes pn ON pn.id=c.pinned
@@ -1599,13 +1625,17 @@ impl Database {
                         r.get::<_, Option<i64>>(7)?
                             .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(8)?)) })
                             .transpose()?,
+                        (r.get(9)?, r.get(10)?),
                     ))
                 })?;
-        if head_total - before > max_bytes || head_depth - depth_before > max_items {
+        let totals = (head_total, before, depth_before, thinking_before);
+        if head_total - head_thinking - (before - thinking_before) > max_bytes
+            || head_depth - depth_before > max_items
+        {
             return Ok(Some(Planning::CatchUp(CatchUp {
                 head,
                 previous_cut,
-                totals: (head_total, before, depth_before),
+                totals,
                 elision: (elided, saved),
                 partial,
                 newest_prompt: self.running_prompt_depth(&bot)?,
@@ -1618,19 +1648,22 @@ impl Database {
         // in a fork. Decode only prompt nodes, outside the metadata-only walk,
         // and return bounded text rather than whole native items to Rust.
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq) AS (
-                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.total_bytes-MIN(n.total_elided,?4),n.turn_seq
+            "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq,total_thinking) AS (
+                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq,total_thinking
+                FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.total_bytes-MIN(n.total_elided,?4),n.turn_seq,
+                    n.total_thinking
                 FROM nodes n JOIN chain c ON n.id=c.parent
                 WHERE c.id IS NOT ?2)
              SELECT c.id,c.total_bytes,COALESCE(p.total_bytes-MIN(p.total_elided,?4),0),c.turn_seq,
                 CASE WHEN c.turn_seq IS NOT NULL THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?3)
-                     FROM nodes WHERE id=c.id) END
+                     FROM nodes WHERE id=c.id) END,c.total_thinking
              FROM chain c LEFT JOIN nodes p ON p.id=c.parent ORDER BY c.id DESC",
         )?;
-        // Newest first: id, own total, parent's total, ordinal, prompt.
-        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>);
+        // Newest first: id, own total, parent's total, ordinal, prompt, and
+        // thinking through it.
+        type SpanRow = (i64, i64, i64, Option<i64>, Option<String>, i64);
         let rows: Vec<SpanRow> = statement
             .query_map(
                 params![
@@ -1639,7 +1672,16 @@ impl Database {
                     Self::COMPACTION_PROMPT_BYTES as i64 + 1,
                     saved
                 ],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )?
             .collect::<rusqlite::Result<_>>()?;
         // The newest boundary whose tail reaches either retention target: a
@@ -1663,7 +1705,7 @@ impl Database {
             Ok(result)
         };
         let mut cut = None;
-        for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
+        for (index, (id, _, before, seq, ..)) in rows.iter().enumerate() {
             if head_total - before < keep_bytes && ((index + 1) as i64) < keep_items {
                 continue;
             }
@@ -1683,9 +1725,10 @@ impl Database {
         // Everything older than the cut, back to and including the previous
         // cut: whole turns, or the rest of a turn a previous cut split.
         let older = &rows[cut_index + 1..];
-        if older.is_empty() {
+        let Some(newest) = older.first() else {
             return Ok(None);
-        }
+        };
+        let thinking = newest.5 - thinking_before;
         // A cut inside the turn keeps its prompt in view: the newest prompt
         // walked, or, when the previous cut was inside this turn too, the
         // prompt that one kept.
@@ -1697,7 +1740,9 @@ impl Database {
         let span = older
             .iter()
             .rev()
-            .map(|(id, total, before, seq, prompt)| (*id, total - before, *seq, prompt.as_deref()));
+            .map(|(id, total, before, seq, prompt, _)| {
+                (*id, total - before, *seq, prompt.as_deref())
+            });
         let previous_summary = self.previous_summary(&bot)?;
         let mut plan = Self::span_plan(
             cut,
@@ -1724,14 +1769,14 @@ impl Database {
             + plan.ids.len().saturating_sub(1)
             + head_frame.len()
             + tail_frame.len()
-            > max_bytes as usize
+            > max_bytes.saturating_add(thinking) as usize
             || plan.ids.len() + 1 + usize::from(plan.previous_summary.is_some())
                 > max_items as usize
         {
             return Ok(Some(Planning::CatchUp(CatchUp {
                 head,
                 previous_cut,
-                totals: (head_total, before, depth_before),
+                totals,
                 elision: (elided, saved),
                 partial,
                 newest_prompt: self.running_prompt_depth(&bot)?,
@@ -1762,29 +1807,30 @@ impl Database {
         let Some((from, child, child_seq)) = walk.next else {
             return Ok(());
         };
-        let (_, before, depth_before) = walk.totals;
+        let (_, before, depth_before, thinking_before) = walk.totals;
         let (_, _, max_bytes, max_items) = walk.bounds;
         let (_, saved) = walk.elision;
         // Each row carries its child on the lineage, so cutting at a prompt
         // child needs no parent lookup: the span ends at this row. Only rows
         // inside the budget, the piece's oldest row, and, until the newest
-        // prompt is found, prompts leave SQLite.
+        // prompt is found, prompts leave SQLite. The budget holds bytes as
+        // the summarizer is sent them, without thinking.
         let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k) AS (
-                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1
+            "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k,total_thinking) AS (
+                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1,total_thinking
                 FROM nodes WHERE id=?1
                 UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?9),
-                    n.turn_seq,c.id,c.turn_seq,c.k+1
+                    n.turn_seq,c.id,c.turn_seq,c.k+1,n.total_thinking
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
              SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
-                CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes<=?7 AND c.depth<=?8 THEN
+                CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8 THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
-                     FROM nodes WHERE id=c.id) END
-             FROM chain c WHERE (c.total_bytes<=?7 AND c.depth<=?8)
+                     FROM nodes WHERE id=c.id) END,c.total_thinking
+             FROM chain c WHERE (c.total_bytes-c.total_thinking<=?7 AND c.depth<=?8)
                 OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
         let (max_total, max_depth) = (
-            before.saturating_add(max_bytes),
+            (before - thinking_before).saturating_add(max_bytes),
             depth_before.saturating_add(max_items),
         );
         let mut rows = statement.query(params![
@@ -1803,9 +1849,18 @@ impl Database {
         while let Some(r) = rows.next()? {
             let (id, parent, depth, total, seq): (i64, Option<i64>, i64, i64, Option<i64>) =
                 (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
-            if total <= max_total && depth <= max_depth {
-                walk.rows
-                    .push((id, depth, total, seq, r.get(5)?, r.get(6)?, r.get(7)?));
+            let thinking: i64 = r.get(8)?;
+            if total - thinking <= max_total && depth <= max_depth {
+                walk.rows.push((
+                    id,
+                    depth,
+                    total,
+                    seq,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    thinking,
+                ));
             }
             if seq.is_some() && walk.newest_prompt.is_none_or(|newest| depth > newest) {
                 walk.newest_prompt = Some(depth);
@@ -1833,7 +1888,7 @@ impl Database {
             return fail("compaction_walk_incomplete");
         }
         let CatchUp {
-            totals: (head_total, before, depth_before),
+            totals: (head_total, before, depth_before, thinking_before),
             elision: (elided, _),
             partial,
             newest_prompt,
@@ -1868,9 +1923,10 @@ impl Database {
         let newest_depth = newest_prompt.unwrap_or(depth_before);
         let fits = rows
             .iter()
-            .take_while(|(_, depth, total, ..)| {
+            .take_while(|(_, depth, total, .., thinking)| {
                 let items = depth - depth_before;
-                items <= span_items && total - before + items <= span_bytes
+                items <= span_items
+                    && total - thinking - (before - thinking_before) + items <= span_bytes
             })
             .count();
         let mut item = self
@@ -1888,7 +1944,7 @@ impl Database {
         let mut end = None;
         'search: for any_turn in [false, true] {
             for index in (0..fits).rev() {
-                let (id, depth, total, _, child, child_seq, _) = rows[index];
+                let (id, depth, total, _, child, child_seq, ..) = rows[index];
                 if !prompted(index)
                     || (head_total - total < keep_bytes && head_depth - depth < keep_items)
                 {
@@ -1919,7 +1975,7 @@ impl Database {
         let mut previous = before;
         let span = rows[..=end]
             .iter()
-            .map(|(id, _, total, seq, _, _, prompt)| {
+            .map(|(id, _, total, seq, _, _, prompt, _)| {
                 let size = total - previous;
                 previous = *total;
                 (*id, size, *seq, prompt.as_deref())
@@ -5210,6 +5266,19 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE bots ADD COLUMN thinking_elided INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('nodes') WHERE name='total_thinking')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 31 -> 32: thinking summed along the lineage, so a summary request,
+        // which sends none, is sized without it. Nodes stored before count
+        // none and are sized with theirs, as before: a backfill would change
+        // the cumulative total of every later node on its lineage.
+        conn.execute_batch(
+            "ALTER TABLE nodes ADD COLUMN total_thinking INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 /// Keep the oldest and newest excerpts within the text/metadata budget.
@@ -5446,15 +5515,18 @@ fn insert_node(
     turn: Option<i64>,
     elided: i64,
 ) -> Result<i64> {
-    let (bytes, depth, saved): (i64, i64, i64) = match parent {
+    let (bytes, depth, saved, thought): (i64, i64, i64, i64) = match parent {
         Some(id) => conn
-            .prepare_cached("SELECT total_bytes,depth,total_elided FROM nodes WHERE id=?")?
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?,
-        None => (0, 0, 0),
+            .prepare_cached(
+                "SELECT total_bytes,depth,total_elided,total_thinking FROM nodes WHERE id=?",
+            )?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?,
+        None => (0, 0, 0, 0),
     };
     if bytes < 0 || depth < 0 {
         return fail("storage_error");
     }
+    let thinking = super::thinking_bytes(item) as i64;
     let turn_seq = match (turn, parent) {
         (None, _) => None,
         (Some(_), None) => Some(1),
@@ -5464,8 +5536,9 @@ fn insert_node(
     // ever committed. Allocate atomically in the insert, avoiding a separate
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
-        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?
+        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided,
+            total_thinking)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -5475,9 +5548,10 @@ fn insert_node(
         depth + 1,
         turn,
         turn_seq,
-        super::thinking_bytes(item) as i64,
+        thinking,
         elided,
-        saved + elided
+        saved + elided,
+        thought + thinking
     ])?;
     Ok(conn.last_insert_rowid())
 }

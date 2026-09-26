@@ -1163,16 +1163,6 @@ impl Turn {
             plan.previous_summary.as_deref(),
             plan.summary_bytes,
         )?;
-        let total = head.len()
-            + plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
-            + plan.ids.len().saturating_sub(1)
-            + tail.len();
-        if total > self.input_limit().bytes
-            || plan.ids.len() + 1 + usize::from(plan.previous_summary.is_some())
-                > self.input_limit().items
-        {
-            return fail("compaction_input_limit");
-        }
         // The summarizer's instructions differ from the bot's, so no
         // thinking block in the span is bound to this request.
         let stripped: usize = if family == agent_runtime::codec::Family::Anthropic {
@@ -1186,7 +1176,17 @@ impl Turn {
         } else {
             0
         };
-        let total = total.saturating_sub(stripped);
+        let total = (head.len()
+            + plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
+            + plan.ids.len().saturating_sub(1)
+            + tail.len())
+        .saturating_sub(stripped);
+        if total > self.input_limit().bytes
+            || plan.ids.len() + 1 + usize::from(plan.previous_summary.is_some())
+                > self.input_limit().items
+        {
+            return fail("compaction_input_limit");
+        }
         let (head, tail) = (Bytes::from(head), Bytes::from(tail));
         let (store, chunks): (_, Arc<[_]>) =
             (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
@@ -2302,7 +2302,7 @@ impl Turn {
                 .await
             {
                 Ok(page) => page,
-                // A piece wider than the room left is not the text's fault.
+                // No part of a piece fits the room left: not the text's fault.
                 Err(error) if error.code == "read_line_too_long" => {
                     return fail("read_context_exhausted");
                 }

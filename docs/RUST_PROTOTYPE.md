@@ -1412,7 +1412,7 @@ the `context_window` capability. Version 20 repairs previously blocked
 `uncertain` bots once, appending missing tool results without rewriting original
 history. If operational tool records were pruned, repair reconstructs unanswered
 calls from the interrupted turn's durable transcript. Stores are schema version
-30; supported migrations run at open. Store initialization and migration run in one
+32; supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -1657,8 +1657,11 @@ shell result is one JSON line, often longer than a `read` page, so that
 read splits lines longer than 4 KiB into numbered pieces and pages them.
 A page stays beside its call until the model answers it, where neither
 elision nor a cut can take it, so it takes at most the room the running
-turn and what goes ahead of it leave; with no room for one piece, the read
-fails with `read_context_exhausted`.
+turn and what goes ahead of it leave. A piece wider than that room shows
+in part under its own number, with a notice to read that offset again when
+the turn has more room, which a cut inside the turn makes; numbering pieces to
+the room would make an offset name other text on a later read. With no
+room for any of it, the read fails with `read_context_exhausted`.
 The lineage check walks from the head counting steps down to the result's
 depth, reading only each node's parent, since `depth` follows the item in
 a row; a turn checks each result once, and its later pages skip the walk,
@@ -1797,7 +1800,9 @@ without walking the transcript. A span larger than the context budget, left
 by failed summaries or a round that outgrew the budget, is caught up oldest
 first. Each round boundary summarizes the longest run from the previous cut
 whose summarizer request fits the budget, including the previous summary
-and the request marker. The cut moves to the next prompt, or to a round
+and the request marker, and without the thinking blocks such a request
+leaves out: each node sums its lineage's thinking bytes, as it sums its
+bytes (schema 32; nodes stored before count none). The cut moves to the next prompt, or to a round
 inside a turn too large for one step (see [cuts inside a
 turn](#cuts-inside-a-turn)), and the window keeps omitting what is still
 behind it until the steps reach the tail. The `compacted` event says `catch_up`. Finding the oldest

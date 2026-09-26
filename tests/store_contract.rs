@@ -5608,6 +5608,48 @@ fn a_result_on_one_line_reads_back_whole_in_pieces() {
 }
 
 #[test]
+fn a_piece_wider_than_the_room_reads_in_part_under_its_own_number() {
+    // Numbers stay those of whole pieces, so an offset names the same text
+    // whatever room a later read has.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let wide = format!("{}{}", "é".repeat(3_000), "z".repeat(6_000));
+    let (_, node) = exchange(&mut db, turn, "wide", &wide);
+    let whole = db
+        .result_lines("Bob", node, 2, 1, false, usize::MAX)
+        .unwrap();
+    let piece = whole.lines().next().unwrap().split_once('\t').unwrap().1;
+    assert_eq!(piece.len(), agent_runtime::tools::PIECE_BYTES);
+    let page = db.result_lines("Bob", node, 2, 5000, true, 1024).unwrap();
+    assert!(page.len() <= 1024, "{page}");
+    let mut lines = page.lines();
+    let (number, part) = lines.next().unwrap().split_once('\t').unwrap();
+    assert_eq!(number.trim(), "2");
+    assert!(!part.is_empty() && part.len() < piece.len());
+    assert!(piece.starts_with(part));
+    assert!(lines.next().unwrap().contains("read offset=2 again"));
+    assert!(lines.next().is_none());
+    // Too little room for any of it is still an error.
+    assert_eq!(
+        db.result_lines("Bob", node, 2, 5000, true, 130)
+            .unwrap_err()
+            .code,
+        "read_line_too_long"
+    );
+}
+
+#[test]
 fn a_bot_without_read_stores_no_stubs() {
     // A stub names a read the model could not make, so its results carry
     // no stub and no saving, and nothing is ever planned for elision.
@@ -6120,6 +6162,64 @@ fn a_catch_up_step_may_end_before_a_steer_that_follows_a_result() {
     assert_eq!(plan.ids.last(), Some(&calls[3].1));
 }
 
+/// An Anthropic bot whose every reply thinks for 3,000 bytes and answers in
+/// a few.
+fn thinking_turns(db: &mut Database, turns: usize) {
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            family: Family::Anthropic,
+            ..binding()
+        },
+    )
+    .unwrap();
+    for n in 1..=turns {
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("r{n}"),
+                &format!("p{n}"),
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let reply = json!({"role":"assistant","content":[
+            {"type":"thinking","thinking":"t".repeat(3000),"signature":"s"},
+            {"type":"text","text":format!("r{n}")}]});
+        db.append(
+            turn,
+            vec![serde_json::to_vec(&reply).unwrap().into()],
+            &[],
+            None,
+        )
+        .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+}
+
+#[test]
+fn a_summary_span_is_sized_without_the_thinking_its_request_leaves_out() {
+    // No reply fits 2 KiB with its thinking, and every one fits without it,
+    // as the summarizer is sent them.
+    for (turns, catch_up) in [(4, false), (40, true)] {
+        let mut db = db();
+        thinking_turns(&mut db, turns);
+        let plan = compaction_plan(&db, "Bob", 1, 2048, 256)
+            .unwrap()
+            .expect("a span that fits once its thinking is left out");
+        assert_eq!(plan.catch_up, catch_up);
+        assert!(plan.ids.len() >= 4);
+        let (head, tail) =
+            CompactionPlan::frame(Family::Anthropic, None, plan.summary_bytes).unwrap();
+        let sent = db.items_by_ids(&plan.ids, i64::MAX, 0).unwrap();
+        assert!(!String::from_utf8_lossy(&sent).contains("\"thinking\""));
+        assert!(head.len() + sent.len() + tail.len() <= 2048);
+    }
+}
+
 /// Every step of a catch-up walk through a bot's backlog, recorded with
 /// numbered summaries, one step per round as the runtime takes them; each
 /// step must end at a completed exchange of the long turn and keep its
@@ -6502,6 +6602,48 @@ fn schema_31_keeps_each_bots_thinking_and_forks_carry_a_strip_from_before_them()
         );
     }
     drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_32_sums_thinking_from_the_nodes_stored_after_it() {
+    let path = std::env::temp_dir().join(format!("agent-thought-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        thinking_turns(&mut db, 1);
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE nodes DROP COLUMN total_thinking; PRAGMA user_version=31;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // Nodes stored before count none; each later node adds its own.
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "p2",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.append(turn, vec![Bytes::from_static(THINKING)], &[], None)
+        .unwrap();
+    db.finish(turn, None).unwrap();
+    drop(db);
+    let totals: Vec<i64> = Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT total_thinking FROM nodes ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let thought = agent_runtime::store::thinking_bytes(THINKING) as i64;
+    assert_eq!(totals, [0, 0, 0, thought]);
     std::fs::remove_file(path).unwrap();
 }
 
