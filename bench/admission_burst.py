@@ -53,20 +53,42 @@ def burst(client, requests):
     return replies
 
 
-def phase(client, process, send):
-    """Run one timed phase and report replies, daemon CPU, and store work."""
-    before = client.request('stats')['result']['store']
-    cpu = cpu_ms(process)
-    replies, elapsed = send()
-    spent = cpu_ms(process) - cpu
-    after = client.request('stats')['result']['store']
-    for reply, _ in replies:
-        assert 'result' in reply, reply
+def store_work(after, before):
+    """Store counters that moved between two `stats` snapshots."""
     operations = {label: {key: after['operations'].get(label, {}).get(key, 0)
                           - before['operations'].get(label, {}).get(key, 0)
                           for key in ('count', 'queued_ms', 'ran_ms', 'answered_ms')}
-                  for label in LABELS}
+                  for label in (*LABELS, 'counts')}
     groups = {key: after['groups'][key] - before['groups'][key] for key in ('count', 'jobs')}
+    return operations, groups
+
+
+def phase(client, process, model, send, turns=0):
+    """Run one timed phase and report replies, daemon CPU, and store work.
+
+    `stats` runs a job on the storage worker and counts it before answering,
+    so the snapshot that ends a phase includes its own job. Two snapshots
+    back to back first measure one idle request's share, which is subtracted.
+    The phase's turns reach the model before the ending snapshot, so their
+    start-up jobs are counted and cannot share its group."""
+    base = client.request('stats')['result']['store']
+    before = client.request('stats')['result']['store']
+    started = model.requests
+    cpu = cpu_ms(process)
+    replies, elapsed = send()
+    spent = cpu_ms(process) - cpu
+    deadline = time.monotonic() + 10
+    while model.requests - started < turns:
+        assert time.monotonic() < deadline, 'turns did not reach the model'
+        time.sleep(.001)
+    after = client.request('stats')['result']['store']
+    for reply, _ in replies:
+        assert 'result' in reply, reply
+    (own_operations, own_groups), (operations, groups) = store_work(before, base), store_work(after, before)
+    assert own_operations['counts']['count'] == 1 and own_groups == {'count': 1, 'jobs': 1}, own_groups
+    operations = {label: {key: value - own_operations[label][key] for key, value in keys.items()}
+                  for label, keys in operations.items() if label != 'counts'}
+    groups = {key: value - own_groups[key] for key, value in groups.items()}
     return dict(requests=len(replies), elapsed_ms=elapsed,
                 reply_ms=percentiles([latency for _, latency in replies]),
                 cpu_ms=spent,
@@ -97,12 +119,12 @@ def run(binary, out, bots):
                 return replies, max(latency for _, latency in replies)
             return send
 
-        row = dict(lone_submit=phase(client, process, lone))
-        row['burst_create'] = phase(client, process, together(
+        row = dict(lone_submit=phase(client, process, model, lone, turns=bots))
+        row['burst_create'] = phase(client, process, model, together(
             [('create', dict(bot=f'burst{n}', workspace=workspace)) for n in range(bots)]))
-        row['burst_submit'] = phase(client, process, together(
+        row['burst_submit'] = phase(client, process, model, together(
             [('submit', dict(bot=f'burst{n}', request_id='first', prompt='hold:admission'))
-             for n in range(bots)]))
+             for n in range(bots)]), turns=bots)
         started = client.request('stats')['result']['active_turns']
         assert started == 2 * bots, started
         row['rss_mib'] = process.memory_info().rss / 2**20

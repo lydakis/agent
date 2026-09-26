@@ -4818,7 +4818,7 @@ medians of ten measured runs at native sync and eight at 2 ms:
 | 32 submissions at once, last reply | 37.3 ms | 5.2 ms | 113.8 ms | 7.5 ms |
 | Median reply | 13.0 ms | 4.8 ms | 49.1 ms | 7.2 ms |
 | Daemon CPU | 27.6 ms | 5.2 ms | 32.3 ms | 6.0 ms |
-| Write groups | 38 | 4 | 34 | 4 |
+| Write groups | 37.5 | 4 | 35 | 4 |
 | 32 creations at once, last reply | 15.8 ms | 4.1 ms | 90.2 ms | 6.5 ms |
 | Daemon CPU | 10.4 ms | 3.7 ms | 15.2 ms | 4.0 ms |
 | One submission alone, median / p99 | 1.25 / 2.34 ms | 1.26 / 2.75 ms | 5.69 / 11.37 ms | 5.72 / 11.23 ms |
@@ -4826,16 +4826,21 @@ medians of ten measured runs at native sync and eight at 2 ms:
 The burst rows' ranges do not overlap between builds. A submission that
 arrives alone is not delayed: its median and daemon CPU match, and its p99,
 the slowest of 32 samples per run, varies within the same range in both.
-Groups include the admitted turns' own start-up jobs.
+Groups count every write job of the phase: 128 for 32 submissions, each
+admission and its turn's three start-up jobs. They were recounted, six runs
+per build at native sync and three at 2 ms, after the bench stopped counting
+its own closing `stats` request, which is a storage job too. That fix changes
+no other row.
 
-Window sizes, same bench, eight runs at native sync and six at 2 ms:
+Window sizes, same bench, eight runs at native sync and six at 2 ms, with
+groups recounted over three runs at native sync as above:
 
 | Window | Native: last reply / median | Groups | 2 ms: last reply / median | Daemon CPU at 2 ms |
 | --- | ---: | ---: | ---: | ---: |
-| Serial | 41.2 / 13.9 ms | 38 | 114.4 / 48.6 ms | 30.8 ms |
+| Serial | 41.2 / 13.9 ms | 37 | 114.4 / 48.6 ms | 30.8 ms |
 | 1 | 38.1 / 13.1 ms | 37 | 112.3 / 49.2 ms | 32.9 ms |
-| 4 | 12.3 / 5.2 ms | 11 | 30.7 / 15.0 ms | 16.4 ms |
-| 8 | 8.5 / 4.2 ms | 9.5 | 18.7 / 8.6 ms | 12.2 ms |
+| 4 | 12.3 / 5.2 ms | 12 | 30.7 / 15.0 ms | 16.4 ms |
+| 8 | 8.5 / 4.2 ms | 9 | 18.7 / 8.6 ms | 12.2 ms |
 | 16 | 5.9 / 3.1 ms | 5 | 12.2 / 5.3 ms | 7.1 ms |
 | 32 | 5.2 / 4.9 ms | 4 | 7.3 / 7.0 ms | 5.9 ms |
 

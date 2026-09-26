@@ -670,7 +670,9 @@ awaiting each commit: it queues one and reads the next request, up to 32
 outstanding, so admissions that arrive together share a group, and one that
 arrives alone is queued at once and waits for nothing. Each is answered after
 its commit, in request order, and what followed the commit before (starting
-the turn, flagging a steer) happens as it is answered. Every other request
+the turn, flagging a steer) happens as it is answered. A turn started this way
+is flagged at once when a steer for its bot is queued behind it, so its first
+model call can already carry the steer. Every other request
 waits until the queued admissions are answered. A submission told it may
 start a turn holds one `--max-active` slot until it is answered, so queued
 submissions never start more turns than the limit; when only promised slots
@@ -683,7 +685,12 @@ and the admissions already queued for that session will send: each reply,
 and each event should the session follow the bot. Both are bounded from the
 request: a creation's record repeats the request's strings, and a reply or
 event adds at most a canonical workspace and a model reference. A lost group answers each of its
-admissions with `storage_error`, starts no turn, and frees their slots.
+admissions with `storage_error`, starts no turn, and frees their slots. A
+fatal error, such as the store refusing a background command's result, exits
+through shutdown: queued admissions are answered first, and the turns they
+start end like any other running turn. A stdio owner whose output fails still
+exits at once, since no one is left to answer and a blocked write cannot be
+cancelled.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream

@@ -887,123 +887,139 @@ pub async fn run(config: Configuration) -> Result<()> {
     // placeholder only fills the disabled select arm, never polled.
     let mut drain_until: Option<tokio::time::Instant> = None;
     let undrained = tokio::time::Instant::now();
-    loop {
-        if service.draining && service.active.is_empty() {
-            break;
-        }
-        // Computed before the select so its arms borrow the service freely.
-        let (paced_due, paced_delay) = (service.paced.peek().is_some(), service.paced_delay());
-        tokio::select! {
-            _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
-            Some(error) = failures.recv() => return Err(error),
-            _ = service.replays.join_next(), if !service.replays.is_empty() => {}
-            _ = service.retention.join_next(), if !service.retention.is_empty() => {}
-            joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
-                let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
-                service.complete(bot, turn, task, exit).await?;
+    // A fatal error still ends through the cleanup below, so queued
+    // admissions are answered and their turns end like any other, unless
+    // the stdio owner's output is what failed.
+    let served: Result<()> = async {
+        loop {
+            if service.draining && service.active.is_empty() {
+                break;
             }
-            _ = terminate.recv() => break,
-            _ = interrupt.recv() => break,
-            _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
-            _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
-                // Idle means no client, no live turn, and no running command.
-                // Parked turns are durable and resume on the next start.
-                let running = service.store.op("running_processes", |db| db.running_processes()).await?;
-                if sessions.is_empty() && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
-                    if last_activity.elapsed() >= idle_exit.unwrap() { break; }
-                } else {
-                    last_activity = std::time::Instant::now();
+            // Computed before the select so its arms borrow the service freely.
+            let (paced_due, paced_delay) = (service.paced.peek().is_some(), service.paced_delay());
+            tokio::select! {
+                _ = stdout_closed.wait_for(|closed| *closed), if stdio_owner => return fail("output_closed"),
+                Some(error) = failures.recv() => return Err(error),
+                _ = service.replays.join_next(), if !service.replays.is_empty() => {}
+                _ = service.retention.join_next(), if !service.retention.is_empty() => {}
+                joined = service.jobs.join_next(), if !service.jobs.is_empty() => {
+                    let (bot, turn, task, exit) = joined.unwrap().map_err(|_| Error::new("turn_task_failed"))?;
+                    service.complete(bot, turn, task, exit).await?;
                 }
-            }
-            Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
-                service.resume(bot, turn).await?;
-            }
-            // One queued turn per iteration, so requests interleave with a
-            // long backlog; resumes hold no slot and are not starved because
-            // the branch choice is fair.
-            _ = std::future::ready(()), if service.ready_hint && service.has_capacity() => {
-                service.dispatch_ready().await?;
-            }
-            // A paced turn comes due: resume it like any parked turn, capacity
-            // permitting; a stale entry (interrupted, deleted) is dropped.
-            _ = tokio::time::sleep(paced_delay), if paced_due && service.has_capacity() => {
-                if let Some(std::cmp::Reverse((_, bot, turn))) = service.paced.pop() {
+                _ = terminate.recv() => break,
+                _ = interrupt.recv() => break,
+                _ = tokio::time::sleep_until(drain_until.unwrap_or(undrained)), if drain_until.is_some() => break,
+                _ = tokio::time::sleep(idle_exit.unwrap_or(Duration::MAX).min(Duration::from_secs(3600))), if idle_exit.is_some() => {
+                    // Idle means no client, no live turn, and no running command.
+                    // Parked turns are durable and resume on the next start.
+                    let running = service.store.op("running_processes", |db| db.running_processes()).await?;
+                    if sessions.is_empty() && service.active.is_empty() && service.admissions.is_empty() && running == 0 {
+                        if last_activity.elapsed() >= idle_exit.unwrap() { break; }
+                    } else {
+                        last_activity = std::time::Instant::now();
+                    }
+                }
+                Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
                     service.resume(bot, turn).await?;
                 }
-            }
-            // Queued admissions are answered as their commits land, in order.
-            _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
-                let (session, output, id, result) = service.settled();
-                reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
-            }
-            message = inbound.recv() => {
-                let Some(message) = message else { break };
-                last_activity = std::time::Instant::now();
-                match message {
-                    Inbound::Open(id, output) => {
-                        let _ = output.try_send(ready.clone());
-                        sessions.insert(id, output);
-                        service.sessions = sessions.len();
+                // One queued turn per iteration, so requests interleave with a
+                // long backlog; resumes hold no slot and are not starved because
+                // the branch choice is fair.
+                _ = std::future::ready(()), if service.ready_hint && service.has_capacity() => {
+                    service.dispatch_ready().await?;
+                }
+                // A paced turn comes due: resume it like any parked turn, capacity
+                // permitting; a stale entry (interrupted, deleted) is dropped.
+                _ = tokio::time::sleep(paced_delay), if paced_due && service.has_capacity() => {
+                    if let Some(std::cmp::Reverse((_, bot, turn))) = service.paced.pop() {
+                        service.resume(bot, turn).await?;
                     }
-                    Inbound::Closed(id) => {
-                        sessions.remove(&id);
-                        service.sessions = sessions.len();
-                        service.hub.close_session(id);
-                        service.handles.close_session(id);
-                        if id == 0 && stdio_owner { break; }
-                    }
-                    Inbound::Request(id, request) => {
-                        let Some(output) = sessions.get(&id).cloned() else { continue };
-                        // A bad id is refused like a malformed line, after the
-                        // admissions queued before it.
-                        let request = request.and_then(|request| match &request.id {
-                            Value::Number(number) if number.is_u64() => Ok(request),
-                            Value::String(text) if text.len() <= 128 => Ok(request),
-                            _ => fail("invalid_request_id"),
-                        });
-                        let bound = request.as_ref().map_or(0, |r| admission_bound(&r.command, &r.id));
-                        // Everything but an admission with room waits for the
-                        // admissions already queued, keeping request order.
-                        while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
-                            let (session, output, id, result) = service.settle().await;
-                            reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                }
+                // Queued admissions are answered as their commits land, in order.
+                _ = arrived(&mut service.admissions), if !service.admissions.is_empty() => {
+                    let (session, output, id, result) = service.settled();
+                    reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
+                }
+                message = inbound.recv() => {
+                    let Some(message) = message else { break };
+                    last_activity = std::time::Instant::now();
+                    match message {
+                        Inbound::Open(id, output) => {
+                            let _ = output.try_send(ready.clone());
+                            sessions.insert(id, output);
+                            service.sessions = sessions.len();
                         }
-                        let (request_id, result, shutdown) = match request {
-                            Ok(request) => {
-                                let shutdown = match request.command {
-                                    Command::Shutdown { grace_ms } => Some(grace_ms),
-                                    _ => None,
-                                };
-                                let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
-                                let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
-                                if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
-                                // A refused admission still answers after those queued before it.
-                                if admission && !service.admissions.is_empty() {
-                                    service.admissions.push_back(Admission { session: id, output, id: request.id, bound, pending: Pending::Settled(result) });
-                                    continue;
-                                }
-                                (request.id, result, shutdown)
+                        Inbound::Closed(id) => {
+                            sessions.remove(&id);
+                            service.sessions = sessions.len();
+                            service.hub.close_session(id);
+                            service.handles.close_session(id);
+                            if id == 0 && stdio_owner { break; }
+                        }
+                        Inbound::Request(id, request) => {
+                            let Some(output) = sessions.get(&id).cloned() else { continue };
+                            // A bad id is refused like a malformed line, after the
+                            // admissions queued before it.
+                            let request = request.and_then(|request| match &request.id {
+                                Value::Number(number) if number.is_u64() => Ok(request),
+                                Value::String(text) if text.len() <= 128 => Ok(request),
+                                _ => fail("invalid_request_id"),
+                            });
+                            let bound = request.as_ref().map_or(0, |r| admission_bound(&r.command, &r.id));
+                            // Everything but an admission with room waits for the
+                            // admissions already queued, keeping request order.
+                            while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
+                                let (session, output, id, result) = service.settle().await;
+                                reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                             }
-                            Err(error) => (Value::Null, Err(error), None),
-                        };
-                        let shutdown = shutdown.filter(|_| result.is_ok());
-                        reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
-                        if let Some(grace_ms) = shutdown {
-                            // A later shutdown can only bring the deadline closer.
-                            let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
-                            drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
-                            service.draining = true;
-                            if grace_ms == 0 || service.active.is_empty() {
-                                // The socket writer is a task on this runtime. Give
-                                // it time to acknowledge shutdown before exiting.
-                                let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
-                                break;
+                            let (request_id, result, shutdown) = match request {
+                                Ok(request) => {
+                                    let shutdown = match request.command {
+                                        Command::Shutdown { grace_ms } => Some(grace_ms),
+                                        _ => None,
+                                    };
+                                    let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
+                                    let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
+                                    if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
+                                    // A refused admission still answers after those queued before it.
+                                    if admission && !service.admissions.is_empty() {
+                                        service.admissions.push_back(Admission { session: id, output, id: request.id, bound, pending: Pending::Settled(result) });
+                                        continue;
+                                    }
+                                    (request.id, result, shutdown)
+                                }
+                                Err(error) => (Value::Null, Err(error), None),
+                            };
+                            let shutdown = shutdown.filter(|_| result.is_ok());
+                            reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                            if let Some(grace_ms) = shutdown {
+                                // A later shutdown can only bring the deadline closer.
+                                let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
+                                drain_until = Some(drain_until.map_or(until, |current| current.min(until)));
+                                service.draining = true;
+                                if grace_ms == 0 || service.active.is_empty() {
+                                    // The socket writer is a task on this runtime. Give
+                                    // it time to acknowledge shutdown before exiting.
+                                    let _ = tokio::time::timeout(Duration::from_secs(5), output.drain()).await;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        Ok(())
+    }
+    .await;
+    // The stdio owner's output is gone: no one is left to answer, and a
+    // blocked stdout write cannot be cancelled. The next start ends the rest.
+    if stdio_owner
+        && served
+            .as_ref()
+            .is_err_and(|error| error.code == "output_closed")
+    {
+        return served;
     }
     // Committed pieces survive cancellation. Deletion resumes at next open;
     // explicit pruning can be reissued. Await drops before joining stdout.
@@ -1072,11 +1088,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     drop(sessions);
     // The stdio firehose's senders went with the service and the publisher;
     // the output worker can now drain and exit, including shutdown without EOF.
-    stdout_writer
+    let written = stdout_writer
         .join()
-        .map_err(|_| Error::new("output_worker_failed"))??;
+        .map_err(|_| Error::new("output_worker_failed"))
+        .flatten();
     drop(socket_owner);
-    failed.map_or(Ok(()), Err)
+    // The first failure is the cause: a closed stdout also fails its writer.
+    served.and(written).and(failed.map_or(Ok(()), Err))
 }
 
 // Runs on the storage worker using the bot already read for admission. No
@@ -1209,7 +1227,12 @@ impl Service {
         })?;
         let cursor = started.entry.as_ref().and_then(|e| e["cursor"].as_i64());
         if started.fresh && started.status == "running" {
-            self.spawn(bot.clone(), started.turn, false, false);
+            // A steer queued behind it in the window is its steer once
+            // committed: arm the turn's first round boundary for it.
+            let steered = self.admissions.iter().any(|admission| {
+                matches!(&admission.pending, Pending::Submit { bot: queued, delivery: Delivery::Steer, .. } if *queued == bot)
+            });
+            self.spawn(bot.clone(), started.turn, false, steered);
         }
         // The running turn may have started after the steer was queued, from
         // an admission answered in between.
@@ -3076,6 +3099,49 @@ mod tests {
             "one turn started per fresh submission"
         );
         assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_steer_queued_behind_its_turns_start_arms_the_first_round() {
+        let dir = scratch("admit-steer");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (output, _writer) = Output::stdout();
+        let (held, gate) = hold(&store).await;
+        let mut steer = submit("A", "r2");
+        if let Command::Submit { delivery, .. } = &mut steer {
+            *delivery = Some("steer".into());
+        }
+        for (index, command) in [create("A", &dir), submit("A", "r1"), steer]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes = admission_bound(&command, &json!(index));
+            let deferred = service
+                .dispatch(command, 0, &output, json!(index), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        gate.send(()).unwrap();
+        held.await.unwrap();
+        assert!(service.settle().await.3.is_ok(), "created");
+        let started = service.settle().await.3.unwrap();
+        assert_eq!(started["status"], "running");
+        // Nothing has run since the spawn: the turn has not absorbed yet.
+        assert!(
+            service.active["A"]
+                .steers
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the steer committed with it is waiting at the first boundary"
+        );
+        let steered = service.settle().await.3.unwrap();
+        assert_eq!(
+            (steered["status"].as_str(), steered["duplicate"].as_bool()),
+            (Some("queued"), Some(false))
+        );
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
