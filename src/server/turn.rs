@@ -889,9 +889,11 @@ impl Turn {
         let (head, tail) = (Bytes::from(head), Bytes::from(tail));
         let (store, chunks): (_, Arc<[_]>) =
             (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
+        // Elided results go as the stubs the model last saw.
+        let elided = plan.elided;
         Ok(Items::new(total, move || {
             stream::iter([Ok(head.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX, 0))
+                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX, elided))
                 .chain(stream::iter([Ok(tail.clone())]))
                 .boxed()
         }))

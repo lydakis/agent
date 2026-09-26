@@ -1083,7 +1083,8 @@ exact indexed matches; older steers without that mapping keep their inline
 text. The prompt-node foreign key has a partial index for deletion checks.
 Schema 29 adds [tool-result elision](#tool-result-elision): it writes a stub
 for each stored tool result large enough to elide, in one pass over the rows
-of at least 1 KiB, and starts every bot with no elision floor.
+of at least 1 KiB, then the cumulative savings in one pass over node ids and
+parents, and starts every bot with no elision floor.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1537,11 +1538,17 @@ before if the view is still over its threshold.
 
 A result is elidable when its stub saves at least 1 KiB. The stub is made
 when the result is recorded, with the node id its insert takes, and stored
-beside it; the node records what the stub saves, so window accounting reads
-no item. A request reads the stub in place of the result's row. The stored
-transcript is never rewritten: `item`, `history`, forks, and the summarizer
-see every result whole, and `read` with `result/NODE` returns one on the
-bot's own lineage.
+beside it. Each node records what its stub saves and, like its byte total,
+the cumulative savings along its lineage; each floor version records the
+cumulative savings through its floor. A node's bytes as sent are then its
+byte total less the smaller of the two, so the window, turn admission, and
+compaction accounting stay constant-time lookups and read no item. A
+request reads the stub in place of the result's row. The stored transcript
+is never rewritten: `item`, `history`, and forks see every result whole,
+and `read` with `result/NODE` returns one on the bot's own lineage.
+Compaction sizes and plans its span as sent, and the summarizer reads it
+as the model last saw it, stubs included, so a long turn whose results
+are several budgets as stored can still be summarized in one request.
 
 The floor is versioned like notes and compactions: `elided` events record
 each move (version node, previous version, `through`, the number of newly

@@ -121,7 +121,8 @@ class Model(http.server.BaseHTTPRequestHandler):
             elif user.startswith('long:'):
                 # One long task: a shell call a round, each result about
                 # 11 KiB, then a read of the first elided result, then done.
-                calls = [i for i in request['input'] if i.get('type') == 'function_call']
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user')
+                calls = [i for i in request['input'][start:] if i.get('type') == 'function_call']
                 stubs = [i for i in request['input'] if i.get('type') == 'function_call_output'
                          and i['output'].startswith('[tool result elided')]
                 text = ''
@@ -397,7 +398,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                            for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
             if prompt:
                 # The Messages form of the long task: shell rounds, then done.
-                calls = sum(b['type'] == 'tool_use' for m in request['messages'] for b in m['content'])
+                start = max(n for n, m in enumerate(request['messages'])
+                            if any(b['type'] == 'text' and b['text'] == prompt for b in m['content']))
+                calls = sum(b['type'] == 'tool_use' for m in request['messages'][start:] for b in m['content'])
                 if calls < int(prompt[5:]):
                     blocks.append({'type': 'tool_use', 'id': f'toolu_long_{calls}', 'name': 'shell',
                                    'input': {'command': f"seq -f 'round {calls} line %g' 1 600"}})

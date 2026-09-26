@@ -4707,14 +4707,18 @@ file-backed store. Medians:
 | Window, results elided | n/a | 3.2 ms |
 | Read the window's items | 3.8 ms (7.5 MB) | 2.5 to 3.0 ms (2.46 MB) |
 | Plan the floor (reader) | n/a | 3 ms |
-| Move the floor (writer, with commit) | n/a | 1 ms |
+| Move the floor (writer, with commit) | n/a | 0.8 to 1.1 ms |
+| Current-turn bytes for admission (`turn_usage`), results elided | n/a | 3 µs |
 
 Run-to-run spread was about 15%, so the window difference is not resolved at
 this sample size. Recording a result now also builds and stores its stub,
 inside the same transaction. Two earlier layouts were measured and rejected:
 computing savings from stub lengths inside the window walk cost about 30%,
 and joining stubs into every item read about 15%; the node savings column
-and a stub probe only for ids at or below the floor replaced them.
+and a stub probe only for ids at or below the floor replaced them. A third
+summed savings with a walk wherever a span's bytes as sent were needed; the
+cumulative savings column made those one subtraction, and three reruns of
+the fixture with it matched the table above.
 
 Every window walk reads through the item overflow pages because the metadata
 columns follow the `item` BLOB. A covering index on the walk's columns, used
@@ -4725,6 +4729,9 @@ separate change, to be measured in the daemon first.
 Behavior is covered by `tests/test_elision.py` against scripted providers: a
 turn of 24 rounds of about 12 KiB each completes within a 64 KiB budget with
 every request under it, the newest result is never a stub, `read` returns an
-elided result, and a historical fork binds the floor at its checkpoint; on
-the Anthropic family, thinking stays bound under prefix enforcement across
-floor moves. No live provider run was made for this change.
+elided result, and a historical fork binds the floor at its checkpoint; two
+turns of ten such rounds in 32 KiB compact once, with the summarizer reading
+the first turn's stubs (without that, the stored span exceeded the budget
+and no summary was attempted); on the Anthropic family, thinking stays
+bound under prefix enforcement across floor moves. No live provider run was
+made for this change.

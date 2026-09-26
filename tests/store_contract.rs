@@ -5442,6 +5442,25 @@ fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
 fn schema_29_writes_stubs_for_stored_results() {
     let path = std::env::temp_dir().join(format!("agent-stubs-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
+    // Every node's own and cumulative savings, and every stub, as written.
+    let recorded = |path: &std::path::Path| {
+        let conn = Connection::open(path).unwrap();
+        let nodes: Vec<(i64, i64, i64)> = conn
+            .prepare("SELECT id,elided,total_elided FROM nodes ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let stubs: Vec<(i64, Vec<u8>)> = conn
+            .prepare("SELECT node,item FROM stubs ORDER BY node")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (nodes, stubs)
+    };
     let expected = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -5458,54 +5477,126 @@ fn schema_29_writes_stubs_for_stored_results() {
             .turn;
         exchange(&mut db, turn, "small", "short");
         exchange(&mut db, turn, "large", &lines(0, 400));
+        exchange(&mut db, turn, "larger", &lines(0, 800));
         db.append(turn, vec![assistant("done")], &[], None).unwrap();
         db.finish(turn, None).unwrap();
         drop(db);
-        let mut stubs: Vec<(i64, Vec<u8>)> = Connection::open(&path)
-            .unwrap()
-            .prepare("SELECT node,item FROM stubs ORDER BY node")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(stubs.len(), 1);
-        stubs.pop().unwrap()
+        recorded(&path)
     };
+    assert_eq!(expected.1.len(), 2);
+    // Savings accumulate along the lineage, as byte totals do.
+    let (nodes, _) = &expected;
+    assert!(nodes.windows(2).all(|w| w[1].2 == w[0].2 + w[1].1));
+    assert_eq!(
+        nodes.last().unwrap().2,
+        nodes.iter().map(|n| n.1).sum::<i64>()
+    );
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "DROP INDEX bots_elision; ALTER TABLE bots DROP COLUMN elision;
-             ALTER TABLE nodes DROP COLUMN elided;
+             ALTER TABLE nodes DROP COLUMN elided; ALTER TABLE nodes DROP COLUMN total_elided;
              DROP TABLE stubs; DROP TABLE elisions; PRAGMA user_version=28;",
         )
         .unwrap();
     }
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    let migrated: (i64, Vec<u8>) = Connection::open(&path)
-        .unwrap()
-        .query_row("SELECT node,item FROM stubs", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
-    assert_eq!(migrated, expected);
+    assert_eq!(recorded(&path), expected);
     assert_eq!(db.inspect("Bob").unwrap().elision, None);
-    // Its savings are recorded with the node, as a new result's are.
-    let saves: i64 = Connection::open(&path)
-        .unwrap()
-        .query_row(
-            "SELECT n.elided FROM nodes n JOIN stubs s ON s.node=n.id",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let item: Vec<u8> = Connection::open(&path)
-        .unwrap()
-        .query_row("SELECT item FROM nodes WHERE id=?", [migrated.0], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(saves as usize, item.len() - migrated.1.len());
+    // A stub's saving is what sending it instead of its result saves.
+    let conn = Connection::open(&path).unwrap();
+    for (node, stub) in &expected.1 {
+        let (item, saves): (Vec<u8>, i64) = conn
+            .query_row("SELECT item,elided FROM nodes WHERE id=?", [node], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(saves as usize, item.len() - stub.len());
+    }
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn compaction_counts_and_summarizes_stubs_under_the_elision_floor() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let older = db
+        .begin(
+            "Bob",
+            "r1",
+            "p1",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, older, "old", &lines(100, 800));
+    db.append(older, vec![assistant("r1")], &[], None).unwrap();
+    db.finish(older, None).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    for n in 0..8 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 800));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let raw = db.unsummarized_bytes("Bob").unwrap();
+    let plan = db.elision_plan("Bob", 16 << 10, 1).unwrap().unwrap();
+    db.elide("Bob", &plan).unwrap();
+    // Bytes not yet summarized count the stubs, one subtraction per node.
+    let unsummarized = db.unsummarized_bytes("Bob").unwrap();
+    assert_eq!(unsummarized, raw - plan.saved_bytes);
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!(
+        window.unsummarized.bytes as i64, window.item_bytes,
+        "the whole unsummarized span is in view"
+    );
+    // The raw span is over the summarizer's 64 KiB; as sent, it plans in
+    // one step, the older turn with its result as the stub the model saw.
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    assert!(raw > limit.bytes as i64 && unsummarized < limit.bytes as i64);
+    let summarized = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert!(!summarized.catch_up);
+    assert_eq!(summarized.covered, (1, 1));
+    assert_eq!(summarized.elided, window.elided);
+    let items = db
+        .items_by_ids(&summarized.ids, i64::MAX, summarized.elided)
+        .unwrap();
+    assert_eq!(
+        items.len() + 1,
+        summarized
+            .sizes
+            .iter()
+            .map(|&s| s as usize + 1)
+            .sum::<usize>()
+    );
+    let text = String::from_utf8(items).unwrap();
+    assert!(text.contains("[tool result elided from this request"));
+    assert!(!text.contains("result 100 line 400"));
+    // The current turn fits only as sent; the new view is checked the same
+    // way, so the summary installs.
+    db.compact("Bob", &summarized, "summary", None, 0, limit)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.omitted_turns, 1);
+    assert_eq!(window.unsummarized.bytes as i64, window.item_bytes);
+    let (_, bytes, _) = db.turn_usage("Bob", turn).unwrap();
+    assert_eq!(bytes as i64, window.item_bytes);
 }

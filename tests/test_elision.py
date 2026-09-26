@@ -75,6 +75,29 @@ class ElisionTests(ModelFixture):
         branch = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 65536 for r in branch))
 
+    def test_compaction_summarizes_elided_results_as_their_stubs(self):
+        # Two long turns in 32 KiB: the second compacts the first, whose
+        # results as stored are several budgets but as sent are stubs.
+        client = self.client(tools='shell,read', extra=('--context-bytes', '32768'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       compaction_instructions='Summarize.')
+        for n in range(2):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt='long:10')['result']['turn']
+            ended = client.finished(turn)
+            self.assertEqual(ended['data']['status'], 'completed', ended)
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 32768 for r in requests))
+        summaries = [r for r in requests if r.get('instructions') == 'Summarize.']
+        self.assertEqual(len(summaries), 1)
+        # The summarizer reads the span as the model last saw it.
+        span = [i for i in summaries[0]['input'] if i.get('type') == 'function_call_output']
+        self.assertEqual(len(span), 11)  # ten rounds and the read
+        self.assertTrue(any(i['output'].startswith(STUB) for i in span))
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertEqual([c['covered_turns'] for c in compacted], [[1, 1]])
+        self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
+
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicElisionTests(ModelFixture):
