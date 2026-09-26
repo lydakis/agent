@@ -323,12 +323,13 @@ impl Request {
             .map(|ms| (self.announced_ms.max(0) as u64).saturating_add(ms))
             .min()
     }
-    fn approvals(&self, verdicts: &[&Verdict]) -> Value {
+    /// Every verdict it got, for the call's replayed record.
+    fn approvals(&self) -> Value {
         Value::Array(
-            verdicts
+            self.verdicts
                 .iter()
                 .map(|v| {
-                    json!({"tag":v.tag,"by":v.by,
+                    json!({"tag":v.tag,"by":v.by,"allow":v.allow,
                         "waited_ms":(v.at_ms - self.announced_ms).max(0)})
                 })
                 .collect(),
@@ -342,6 +343,16 @@ impl Request {
 struct Live {
     notify: Arc<Notify>,
     verdicts: HashMap<String, Vec<Verdict>>,
+}
+/// What a wake-up for a parked turn finds.
+#[derive(Debug, PartialEq)]
+pub enum Wake {
+    /// Claim and resume it.
+    Resume,
+    /// Not yet: wake it again at this time, or only on an answer.
+    Later(Option<u64>),
+    /// Not the bot's parked turn any more.
+    Stale,
 }
 /// What a gated call does next, decided on the storage worker.
 pub enum Gated {
@@ -2733,21 +2744,23 @@ impl Database {
                 announced.push(json!({"call_id":call.call_id,"request":1,
                     "announced_ms":announced_ms,"gates":tags,"name":call.name,"node":node}));
             }
-            let data = json!({"calls":announced});
-            let cursor = event(
-                &tx,
-                &bot.name,
-                Some(turn),
-                "approval_requested",
-                data.clone(),
-            )?;
-            entries.push(entry(
-                cursor,
-                &bot.name,
-                Some(turn),
-                "approval_requested",
-                data,
-            ));
+            for calls in announcements(announced)? {
+                let data = json!({"calls":calls});
+                let cursor = event(
+                    &tx,
+                    &bot.name,
+                    Some(turn),
+                    "approval_requested",
+                    data.clone(),
+                )?;
+                entries.push(entry(
+                    cursor,
+                    &bot.name,
+                    Some(turn),
+                    "approval_requested",
+                    data,
+                ));
+            }
         }
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
@@ -2953,7 +2966,8 @@ impl Database {
                 turn,
                 &call.call_id,
                 denial.reason.as_deref(),
-                request.approvals(&[denial]),
+                // Every accepted verdict, so replay keeps each approver's.
+                request.approvals(),
                 false,
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
@@ -2976,20 +2990,21 @@ impl Database {
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
             let mut data = started(call);
-            data["approvals"] = request.approvals(&request.verdicts.iter().collect::<Vec<_>>());
+            data["approvals"] = request.approvals();
             event(&tx, &bot.name, Some(turn), "tool_started", data)?;
             tx.commit()?;
             Gated::Started
         } else if expired {
             // No approver answered in time: the daemon's fixed reason, and
             // the turn ends, since nothing further in it could run.
-            let lapsed: Vec<Value> = request
-                .unanswered()
-                .map(|g| {
-                    json!({"tag":g.tag,"by":null,
+            // The verdicts it got, then each gate that lapsed: a deny by no one.
+            let mut lapsed = request.approvals();
+            if let Value::Array(entries) = &mut lapsed {
+                entries.extend(request.unanswered().map(|g| {
+                    json!({"tag":g.tag,"by":null,"allow":false,
                         "waited_ms":(now_ms as i64 - request.announced_ms).max(0)})
-                })
-                .collect();
+                }));
+            }
             let tx = self.conn.savepoint()?;
             deny(
                 &tx,
@@ -2997,7 +3012,7 @@ impl Database {
                 turn,
                 &call.call_id,
                 Some("not reviewed: no verdict"),
-                Value::Array(lapsed),
+                lapsed,
                 true,
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
@@ -3180,11 +3195,20 @@ impl Database {
         if !(1..=256).contains(&limit) || after < 0 {
             return fail("invalid_approval_page");
         }
-        let mut statement = self.conn.prepare_cached(
-            "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
-             FROM approvals a JOIN turns t ON t.id=a.turn
-             WHERE a.id>?1 AND (?2 IS NULL OR t.bot=?2) ORDER BY a.id LIMIT ?3",
-        )?;
+        // Only a bot's running turn has calls waiting, so one bot's listing
+        // starts from that turn instead of scanning every bot's calls.
+        let mut statement = match bot {
+            Some(_) => self.conn.prepare_cached(
+                "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
+                 FROM bots b JOIN approvals a ON a.turn=b.running_turn
+                 WHERE a.id>?1 AND b.name=?2 ORDER BY a.id LIMIT ?3",
+            )?,
+            None => self.conn.prepare_cached(
+                "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
+                 FROM approvals a JOIN turns t ON t.id=a.turn
+                 WHERE a.id>?1 ORDER BY a.id LIMIT ?3",
+            )?,
+        };
         let mut rows = statement.query(params![after, bot, READ as i64])?;
         let (mut listed, mut bytes, mut read, mut last, mut more) =
             (Vec::new(), 0, 0, after, false);
@@ -3499,34 +3523,62 @@ impl Database {
     }
     /// A queued wake-up is valid only for the bot's current parked turn.
     /// Deleted bots and replaced turns are stale, not store failures.
-    /// A turn parked on a verdict wakes only once its call is decided or a
-    /// gate lapses, whichever of its wake-ups comes first.
-    pub fn can_resume(&self, name: &str, turn: i64) -> Result<bool> {
-        let parked: Option<Option<bool>> = self
+    /// A turn parked on a verdict wakes once its call is decided or a gate
+    /// lapses. A turn parked on a wait wakes early only when a gated call
+    /// later in its round has lapsed (`due`: the wake-up is that lapse's),
+    /// since the lapse ends the turn. Otherwise it answers when to look
+    /// again: a partial verdict can move a call's lapse later.
+    pub fn wake(&self, name: &str, turn: i64, due: bool) -> Result<Wake> {
+        let parked: Option<(Option<bool>, String)> = self
             .conn
             .prepare_cached(
-                "SELECT json_extract(t.waiting,'$.approval') FROM bots b JOIN turns t ON t.id=b.running_turn
+                "SELECT json_extract(t.waiting,'$.approval'),b.status FROM bots b JOIN turns t ON t.id=b.running_turn
                  WHERE b.name=? AND b.status IN ('waiting','paced') AND b.running_turn=?",
             )?
-            .query_row(params![name, turn], |r| r.get(0))
+            .query_row(params![name, turn], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
-        match parked {
-            None => Ok(false),
-            Some(Some(true)) => {
+        let now = epoch_ms().max(0) as u64;
+        Ok(match parked {
+            None => Wake::Stale,
+            Some((Some(true), _)) => {
                 let Some(waiting) = self.waiting(turn)? else {
-                    return Ok(true);
+                    return Ok(Wake::Resume);
                 };
-                Ok(self.request(turn, &waiting.call_id)?.is_none_or(|request| {
-                    request.decided()
-                        || request
-                            .expires_ms()
-                            .is_some_and(|at| epoch_ms().max(0) as u64 >= at)
-                }))
+                match self.request(turn, &waiting.call_id)? {
+                    Some(request)
+                        if !request.decided() && request.expires_ms().is_none_or(|at| now < at) =>
+                    {
+                        Wake::Later(request.expires_ms())
+                    }
+                    _ => Wake::Resume,
+                }
             }
-            Some(_) => Ok(true),
-        }
+            Some((_, status)) if due && status == "waiting" => match self.next_lapse(turn)? {
+                Some(at) if now >= at => Wake::Resume,
+                later => Wake::Later(later),
+            },
+            Some(_) => Wake::Resume,
+        })
     }
-
+    /// When the turn's earliest undecided gated call lapses, if any does.
+    pub fn next_lapse(&self, turn: i64) -> Result<Option<u64>> {
+        let calls = self
+            .conn
+            .prepare_cached("SELECT call_id FROM approvals WHERE turn=?")?
+            .query_map([turn], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut lapse: Option<u64> = None;
+        for call_id in calls {
+            if let Some(at) = self
+                .request(turn, &call_id)?
+                .filter(|request| !request.decided())
+                .and_then(|request| request.expires_ms())
+            {
+                lapse = Some(lapse.map_or(at, |earlier| earlier.min(at)));
+            }
+        }
+        Ok(lapse)
+    }
     /// Bring a parked turn back to running; the caller then records the wait
     /// result. Also answers whether a steer queued while it was parked.
     pub fn resume(&mut self, turn: i64) -> Result<(Waiting, Value, bool)> {
@@ -4735,14 +4787,33 @@ fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<boo
         calls.push(json!({"call_id":call_id,"request":request + 1,
             "announced_ms":announced_ms,"gates":tags,"name":name,"node":node}));
     }
-    event(
-        tx,
-        bot,
-        Some(turn),
-        "approval_requested",
-        json!({"calls":calls,"failed":failed}),
-    )?;
+    for calls in announcements(calls)? {
+        event(
+            tx,
+            bot,
+            Some(turn),
+            "approval_requested",
+            json!({"calls":calls,"failed":failed}),
+        )?;
+    }
     Ok(true)
+}
+/// A round's announced calls in events small enough to page: up to 256 KiB
+/// each, well under the half-event page bound, since one call is at most its
+/// 64 KiB id and a few short fields.
+fn announcements(calls: Vec<Value>) -> Result<Vec<Vec<Value>>> {
+    let mut events = vec![Vec::new()];
+    let mut bytes = 0;
+    for call in calls {
+        let size = crate::output::encoded_len(&call)? + 1;
+        if bytes + size > 256 * 1024 && events.last().is_some_and(|calls| !calls.is_empty()) {
+            events.push(Vec::new());
+            bytes = 0;
+        }
+        bytes += size;
+        events.last_mut().expect("one event").push(call);
+    }
+    Ok(events)
 }
 /// Write the verdicts the worker holds for a turn into their requests, in
 /// the commit that parks the turn.

@@ -1534,8 +1534,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
 `resume`, `bots`, `created`, and `forked` report `gates`. The design and its reasoning are in [APPROVALS.md](APPROVALS.md).
 
 - **Announcement.** The commit that records a model response with gated
-  calls also writes one `approval_requested` event for the round:
+  calls also writes an `approval_requested` event for the round:
   `{"calls":[{"call_id","request","announced_ms","gates","name","node"}]}`.
+  A round whose calls take more than 256 KiB is announced in several such
+  events, in order, so each one pages.
 - **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?}`
   records one gate's verdict on the call's current request; `tag` may be
   left out when the call has one gate, and `reason` goes only with a deny
@@ -1547,9 +1549,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `turn_not_found`.
 - **Verdicts.** A call needs an allow from every gate, and the first deny
   denies it. An allow rides the call's `tool_started` commit, which gains
-  `approvals: [{tag, by, waited_ms}]`. A deny is the call's result,
+  `approvals: [{tag, by, allow, waited_ms}]`. A deny is the call's result,
   `{"error":"approval_denied","detail":REASON}`, and its `tool_completed`
-  carries `denied: true`; the turn goes on.
+  carries `denied: true` and the same `approvals`, every verdict the call
+  got, so an allow before the deny is kept; the turn goes on.
 - **Hold, then park.** A verdict for a running turn is held by the storage
   worker, which wakes the turn's task, until the call's start, its denial,
   or a park writes it. A gated call waits live for `--approval-hold-ms`
@@ -1561,9 +1564,13 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
 - **Expiry.** With `approve_expire_ms`, a call still without that gate's
   verdict that long after it was announced, however long the calls before
   it ran, is denied with "not reviewed: no verdict" (`tool_completed`
-  carries `expired: true`), and the turn ends
+  carries `expired: true`, and its `approvals` add each lapsed gate with
+  `by: null` and `allow: false`), and the turn ends
   `interrupted` with `approval_expired`. When a call has several gates, a
-  deny decides it only if it came before an open gate lapsed.
+  deny decides it only if it came before an open gate lapsed, and an allow
+  on one moves the turn's wake-up to the next gate's lapse. A turn parked
+  on a `wait` ahead of a gated call is woken when that call lapses, and
+  the lapse ends it; the wait returns what it has.
 - **Rounds.** A verdict is for the round as planned. When a call fails (an
   error result, a denial, or a command that did not succeed, as the tool
   reports it rather than as its output reads), every gated
@@ -1598,8 +1605,8 @@ tools instead, and `fork` takes both. `full`, the default, gates nothing.
 approver exists. `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
 [--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
-tool shell, and `run --pretty` prints each pending call with the command
-that answers it.
+tool shell, and `run --pretty` prints each pending call with the commands
+that allow or deny it.
 
 ### Compaction
 

@@ -64,8 +64,10 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `note`, and `echo`. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)).
 - `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
-  With `--pretty`, each call shows what it would do and one command per
-  gate still open. `answer --bot NAME --turn TURN --call ID --request N
+  With `--pretty`, each call shows what it would do and, for each gate still
+  open, two whole commands, one that allows and one that denies, so a
+  pasted line never carries a verdict its reader did not pick. The call id
+  is written `--call=ID`, so an id that starts with `--` stays the value. `answer --bot NAME --turn TURN --call ID --request N
   [--tag TAG] [--reason TEXT] allow|deny` records one gate's verdict; `--tag`
   may be left out when the call has one gate, and a denial's `--reason` is
   what the model sees (an allow takes none). `answer` refuses to run inside a bot's own tool shell

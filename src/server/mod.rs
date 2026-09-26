@@ -12,7 +12,9 @@ use agent_runtime::{
     fail, fail_with,
     output::Output,
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
-    store::{Answer, Binding, Bot, Delivery, Fork, Gate, Publication, Store, TurnOptions, Waiting},
+    store::{
+        Answer, Binding, Bot, Delivery, Fork, Gate, Publication, Store, TurnOptions, Waiting, Wake,
+    },
     tools::Registry,
 };
 use handles::{Completion, Handles, Waiter, now_ms};
@@ -814,7 +816,20 @@ pub async fn run(config: Configuration) -> Result<()> {
     // Turns parked before a restart keep waiting; their processes are gone.
     // Those parked on a closed pool wait for their time, not for handles.
     let mut wakes = Wakes::default();
-    for waiting in store.op("waiting_turns", |db| db.waiting_turns()).await? {
+    let parked = store
+        .op("waiting_turns", |db| {
+            let parked = db.waiting_turns()?;
+            let lapses = parked
+                .iter()
+                .map(|w| match w.approval || w.paced_since_ms.is_some() {
+                    true => Ok(None),
+                    false => db.next_lapse(w.turn),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(parked.into_iter().zip(lapses).collect::<Vec<_>>())
+        })
+        .await?;
+    for (waiting, lapse) in parked {
         if waiting.paced_since_ms.is_some() {
             wakes.set(waiting.deadline_ms.unwrap_or(0), waiting.bot, waiting.turn);
             continue;
@@ -828,6 +843,10 @@ pub async fn run(config: Configuration) -> Result<()> {
             }
             handles.wake(waiting.bot, waiting.turn);
             continue;
+        }
+        // A gated call later in the round ends the turn when it lapses.
+        if let Some(at) = lapse {
+            wakes.set(at, waiting.bot.clone(), waiting.turn);
         }
         handles
             .attach(
@@ -908,7 +927,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                 }
             }
             Some((bot, turn)) = resumes.recv(), if service.has_capacity() => {
-                service.resume(bot, turn).await?;
+                service.resume(bot, turn, false).await?;
             }
             // One queued turn per iteration, so requests interleave with a
             // long backlog; resumes hold no slot and are not starved because
@@ -921,7 +940,7 @@ pub async fn run(config: Configuration) -> Result<()> {
             // entry (deleted, or its name reused) is dropped.
             _ = tokio::time::sleep(wake_delay), if wake_due && service.has_capacity() => {
                 if let Some((bot, turn)) = service.wakes.pop() {
-                    service.resume(bot, turn).await?;
+                    service.resume(bot, turn, true).await?;
                 }
             }
             message = inbound.recv() => {
@@ -1071,28 +1090,40 @@ impl Service {
             .unwrap_or(Duration::MAX)
     }
 
-    async fn resume(&mut self, bot: String, turn: i64) -> Result<()> {
+    /// `due` marks a wake-up from the turn's own time rather than an
+    /// answer or a resolved handle.
+    async fn resume(&mut self, bot: String, turn: i64, due: bool) -> Result<()> {
         // A wake-up can outlive an interrupt, deletion, or reuse of the name,
         // and one turn can get several (a restart's check and an answer). The
         // job that checks its identity and state also claims it, so a later
         // wake-up finds it running and is dropped; the claim also drops the
         // turn's lapse, which would otherwise wait out the gate's expiry.
+        enum Claim {
+            Run(String, Waiting, bool),
+            Later(String, Option<u64>),
+            Stale,
+        }
         let claimed = self
             .store
-            .op("resume", move |db| {
-                if !db.can_resume(&bot, turn)? {
-                    return Ok(None);
-                }
-                match db.resume(turn) {
-                    Ok((waiting, _, steers)) => Ok(Some((bot, waiting, steers))),
-                    Err(error) if error.code == "turn_not_waiting" => Ok(None),
+            .op("resume", move |db| match db.wake(&bot, turn, due)? {
+                Wake::Resume => match db.resume(turn) {
+                    Ok((waiting, _, steers)) => Ok(Claim::Run(bot, waiting, steers)),
+                    Err(error) if error.code == "turn_not_waiting" => Ok(Claim::Stale),
                     Err(error) => Err(error),
-                }
+                },
+                Wake::Later(at) => Ok(Claim::Later(bot, at)),
+                Wake::Stale => Ok(Claim::Stale),
             })
             .await?;
-        if let Some((bot, waiting, steers)) = claimed {
-            self.wakes.cancel(turn);
-            self.spawn(bot, turn, Some(waiting), steers);
+        match claimed {
+            Claim::Run(bot, waiting, steers) => {
+                self.wakes.cancel(turn);
+                self.spawn(bot, turn, Some(waiting), steers);
+            }
+            // Still parked: its next lapse may have moved, or gone.
+            Claim::Later(bot, Some(at)) => self.wakes.set(at, bot, turn),
+            Claim::Later(_, None) => self.wakes.cancel(turn),
+            Claim::Stale => {}
         }
         Ok(())
     }
@@ -1240,7 +1271,11 @@ impl Service {
                 // Finishing still promotes queued work in that case.
                 self.ready_hint = true;
             }
-            turn::Exit::Paced(at) => self.wakes.set(at, bot, turn),
+            // A wake-up may already have claimed the turn again.
+            turn::Exit::Paced(at) if !self.active.get(&bot).is_some_and(|a| a.turn == turn) => {
+                self.wakes.set(at, bot, turn)
+            }
+            turn::Exit::Paced(_) => {}
             turn::Exit::Parked => {}
         }
         Ok(())
@@ -2682,8 +2717,8 @@ mod tests {
             )
             .await
             .unwrap();
-        service.resume("Bob".into(), turn).await.unwrap();
-        service.resume("Bob".into(), turn).await.unwrap();
+        service.resume("Bob".into(), turn, false).await.unwrap();
+        service.resume("Bob".into(), turn, false).await.unwrap();
         assert_eq!(service.jobs.len(), 1, "one task for the turn");
         assert_eq!(service.wakes.next(), None, "the claim dropped the lapse");
         let task = service.active["Bob"].task;

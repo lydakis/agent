@@ -24,6 +24,7 @@ use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    ops::ControlFlow,
     path::PathBuf,
     sync::{
         Arc,
@@ -280,7 +281,7 @@ enum Round {
 /// on handles or a verdict, and is resumed by the service.
 enum Stop {
     Parked,
-    /// Parked on a verdict; the service wakes it when a gate lapses.
+    /// Parked on a verdict or a wait; the service wakes it when a gate lapses.
     Lapses(u64),
 }
 impl Stop {
@@ -1663,8 +1664,8 @@ impl Turn {
                         .park(&call.call_id, handles, timeout_ms, any, &mut calls, route)
                         .await?
                     {
-                        Some(outcome) => outcome,
-                        None => return Ok(Some(Stop::Parked)),
+                        ControlFlow::Continue(outcome) => outcome,
+                        ControlFlow::Break(stop) => return Ok(Some(stop)),
                     }
                 }
                 Ok(Prepared::Shell {
@@ -1911,12 +1912,12 @@ impl Turn {
         any: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
-    ) -> Result<Option<Outcome>> {
+    ) -> Result<ControlFlow<Stop, Outcome>> {
         for text in &handles {
             match Handle::parse(text) {
-                Err(error) => return Ok(Some(failure(error))),
+                Err(error) => return Ok(ControlFlow::Continue(failure(error))),
                 Ok(Handle::Turn { bot, turn }) if bot == self.bot && turn == self.turn => {
-                    return Ok(Some(failure(Error::with(
+                    return Ok(ControlFlow::Continue(failure(Error::with(
                         "invalid_handle",
                         "a turn cannot wait on itself",
                     ))));
@@ -1929,7 +1930,10 @@ impl Turn {
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
         let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
         let route = route.map(str::to_owned);
-        self.store
+        // A gated call after the wait still lapses on time: the service
+        // wakes the turn then, and the lapse ends it.
+        let lapse = self
+            .store
             .op("suspend", move |db| {
                 db.suspend(
                     turn,
@@ -1939,7 +1943,8 @@ impl Turn {
                     any,
                     &pending,
                     route.as_deref(),
-                )
+                )?;
+                db.next_lapse(turn)
             })
             .await?;
         self.handles
@@ -1955,7 +1960,7 @@ impl Turn {
                 },
             )
             .await;
-        Ok(None)
+        Ok(ControlFlow::Break(lapse.map_or(Stop::Parked, Stop::Lapses)))
     }
 
     /// Start a command now; its result is retrievable through a proc handle

@@ -1609,15 +1609,23 @@ fn answer_lines(call: &Value, target: &str) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(|tag| {
-            format!(
-                "  waits for {tag} · agent answer{target} --bot {} --turn {} --call {} --request {} --tag {} allow|deny",
+        .flat_map(|tag| {
+            // One whole command per verdict: a placeholder such as
+            // `allow|deny` would run as a pipeline that allows. The id goes
+            // after `=`, so one that starts with `--` is still its value.
+            let command = format!(
+                "agent answer{target} --bot {} --turn {} --call={} --request {} --tag {}",
                 shell_word(call["bot"].as_str().unwrap_or("")),
                 call["turn"],
                 shell_word(call["call_id"].as_str().unwrap_or("")),
                 call["request"],
                 shell_word(tag),
-            )
+            );
+            [
+                format!("  waits for {tag}"),
+                format!("    {command} allow"),
+                format!("    {command} deny"),
+            ]
         })
         .collect()
 }
@@ -1818,9 +1826,19 @@ mod tests {
         assert_eq!(
             answer_lines(&call, ""),
             [
-                "  waits for manual · agent answer --bot Bob --turn 7 --call 'c 1' --request 2 --tag manual allow|deny",
-                "  waits for second · agent answer --bot Bob --turn 7 --call 'c 1' --request 2 --tag second allow|deny",
+                "  waits for manual",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag manual allow",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag manual deny",
+                "  waits for second",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag second allow",
+                "    agent answer --bot Bob --turn 7 --call='c 1' --request 2 --tag second deny",
             ]
+        );
+        // An id that reads as a flag is still the value of `--call`.
+        let flag = json!({"bot":"Bob","turn":7,"call_id":"--help","request":1,"gates":["manual"]});
+        assert_eq!(
+            answer_lines(&flag, "")[1],
+            "    agent answer --bot Bob --turn 7 --call=--help --request 1 --tag manual allow"
         );
     }
 
@@ -1842,10 +1860,8 @@ mod tests {
         assert!(target(home, &socket(home), None).starts_with(" --store /home/a/"));
         let call = json!({"bot":"Bob","turn":7,"call_id":"c1","request":1,"gates":["manual"]});
         assert_eq!(
-            answer_lines(&call, " --store /s"),
-            [
-                "  waits for manual · agent answer --store /s --bot Bob --turn 7 --call c1 --request 1 --tag manual allow|deny"
-            ]
+            answer_lines(&call, " --store /s")[2],
+            "    agent answer --store /s --bot Bob --turn 7 --call=c1 --request 1 --tag manual deny"
         );
     }
 

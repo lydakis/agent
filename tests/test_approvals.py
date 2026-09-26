@@ -226,7 +226,43 @@ class ApprovalTests(ModelFixture):
         self.assertIsInstance(pending['expires_ms'], int)
         self.answer(client, turn, 'shell-1', bot='Carol', tag='second', decision='deny', reason='no')
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        self.assertEqual(self.tool_output(client, 'shell-1', bot='Carol')[1]['detail'], 'no')
+        completed, output = self.tool_output(client, 'shell-1', bot='Carol')
+        self.assertEqual(output['detail'], 'no')
+        # The denied call's record keeps the allow that came before the deny.
+        self.assertEqual([(a['tag'], a['by'], a['allow']) for a in completed['approvals']],
+                         [('manual', 'test', True), ('second', 'test', False)])
+
+    def test_a_partial_verdict_keeps_the_later_gates_lapse(self):
+        client = self.gated(extra=('--approval-hold-ms', '0'), approve_expire_ms=1000)
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['shell'],
+                       approver='second', approve_expire_ms=2500)
+        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        # The earlier gate is allowed while the turn is parked; the later one
+        # still lapses on time and ends the turn.
+        first = self.answer(client, turn, 'shell-1', bot='Carol', tag='manual')['result']
+        self.assertEqual(first['pending'], ['second'])
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('interrupted', 'approval_expired'))
+        completed, _ = self.tool_output(client, 'shell-1', bot='Carol')
+        self.assertEqual([(a['tag'], a['by'], a['allow']) for a in completed['approvals']],
+                         [('manual', 'test', True), ('second', None, False)])
+
+    def test_a_gate_lapses_on_time_while_its_turn_waits_on_a_handle(self):
+        client = self.gated(approve_expire_ms=300)
+        client.request('create', bot='Alice', workspace=str(self.path))
+        alice = client.request('submit', bot='Alice', request_id='a', prompt='wait')['result']
+        turn = client.request('submit', bot='Bob', request_id='t',
+                              prompt=f"waitshell:{alice['handle']}|printf after")['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        parked = time.monotonic()
+        finished = client.finished(turn)
+        self.assertEqual((finished['data']['status'], finished['data']['error']),
+                         ('interrupted', 'approval_expired'))
+        # Ended by the lapse, long before the turn it waited on.
+        self.assertLess(time.monotonic() - parked, 2)
+        self.assertEqual(client.request('resume', bot='Alice')['result']['status'], 'running')
+        self.assertTrue(self.tool_output(client, 'shell-1')[0]['expired'])
 
     def test_a_parked_verdict_survives_restart_and_interrupt_cancels_it(self):
         client = self.gated(extra=('--approval-hold-ms', '0'))
@@ -278,7 +314,7 @@ class ApprovalCliTests(ModelFixture):
         [call] = pending
         pretty = self.agent('approvals', '--store', str(self.store), '--pretty').stdout
         self.assertIn(f"agent answer --store {shlex.quote(str(self.store))} --bot Bob "
-                      f"--turn {submitted['turn']} --call shell-1 --request 1", pretty)
+                      f"--turn {submitted['turn']} --call=shell-1 --request 1", pretty)
         self.assertIn('printf ok', pretty)
         inside = self.agent('answer', '--store', str(self.store), '--bot', 'Bob', '--turn', str(call['turn']),
                             '--call', 'shell-1', '--request', '1', 'allow', check=False,
@@ -301,11 +337,13 @@ class ApprovalCliTests(ModelFixture):
             time.sleep(.05)
         self.assertEqual([c['call_id'] for c in pending], [ODD_CALL_ID])
         pretty = self.agent('approvals', '--store', str(self.store), '--pretty').stdout
-        [line] = [line for line in pretty.splitlines() if ' · agent answer ' in line]
+        # One whole command per verdict; the allow one runs as printed.
+        [line] = [line.strip() for line in pretty.splitlines()
+                  if line.strip().startswith('agent answer ') and line.endswith(' allow')]
         # The command names this store, so it reaches this daemon as printed.
         self.assertIn(f'agent answer --store {shlex.quote(str(self.store))} --bot', line)
-        command = line.split(' · ', 1)[1].replace('agent answer', f'{shlex.quote(str(self.binary))} answer', 1)
-        pasted = subprocess.run(['bash', '-c', command.replace('allow|deny', 'allow')], cwd=self.path,
+        command = line.replace('agent answer', f'{shlex.quote(str(self.binary))} answer', 1)
+        pasted = subprocess.run(['bash', '-c', command], cwd=self.path,
                                 env=clean_env(), capture_output=True, text=True, timeout=30)
         self.assertEqual(pasted.returncode, 0, pasted.stderr)
         self.assertEqual(json.loads(pasted.stdout)['pending'], [])
@@ -321,10 +359,11 @@ class ApprovalCliTests(ModelFixture):
         lines = queue.Queue()
         threading.Thread(target=lambda: [lines.put(line) for line in run.stdout], daemon=True).start()
         shown = ''
-        while 'agent answer' not in shown:
+        while 'manual deny' not in shown:
             shown += lines.get(timeout=10)
         self.assertIn('⏸ shell printf shown', shown)
-        self.assertIn('--call shell-1 --request 1 --tag manual allow|deny', shown)
+        self.assertIn('--call=shell-1 --request 1 --tag manual allow\n', shown)
+        self.assertIn('--call=shell-1 --request 1 --tag manual deny\n', shown)
         turn = re.search(r'--turn (\d+)', shown)[1]
         self.agent('answer', '--store', str(self.store), '--bot', 'Bob', '--turn', turn, '--call', 'shell-1',
                    '--request', '1', 'allow')

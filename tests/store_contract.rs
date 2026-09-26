@@ -805,6 +805,47 @@ fn a_long_field_hides_no_other_in_a_listing() {
 }
 
 #[test]
+fn a_round_of_long_call_ids_is_announced_in_events_that_page() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let planned: Vec<(Bytes, ToolCall)> = (1..=12)
+        .map(|n| {
+            shell_call(
+                &format!("fc_{n}"),
+                &format!("{n:02}{}", "c".repeat(60 << 10)),
+                "true",
+            )
+        })
+        .collect();
+    let (items, calls): (Vec<Bytes>, Vec<ToolCall>) = planned.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    // Every event pages, and together they announce each call once, in order.
+    let (mut announced, mut events, mut after) = (Vec::new(), 0, 0);
+    loop {
+        let page = db.events("Bob", after, 256).unwrap();
+        let page_events = page["events"].as_array().unwrap();
+        if page_events.is_empty() {
+            break;
+        }
+        for event in page_events
+            .iter()
+            .filter(|e| e["event"] == "approval_requested")
+        {
+            events += 1;
+            for call in event["data"]["calls"].as_array().unwrap() {
+                announced.push(call["call_id"].as_str().unwrap().to_owned());
+            }
+        }
+        after = page["next_cursor"].as_i64().unwrap();
+    }
+    assert!(events > 1, "one event would be over the page bound");
+    assert_eq!(
+        announced,
+        calls.iter().map(|c| c.call_id.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);

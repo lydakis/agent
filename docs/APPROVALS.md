@@ -1031,6 +1031,13 @@ Where it differs from the design above:
   `write` puts `content` before `path`, which a prefix would hide.
 - A `reason` goes only with a deny; an allow with one is refused with
   `invalid_reason`.
+- Each `approvals` entry carries `allow`, and a denied or expired call's
+  `tool_completed` lists every verdict it got, so replay keeps an allow that
+  came before the deciding deny.
+- A round's announcement is split into several `approval_requested`
+  events when its calls take more than 256 KiB, so every event pages.
+- A turn parked on a `wait` ahead of a gated call wakes and ends when that
+  call lapses, rather than when the wait returns.
 
 Not built yet: the automatic approver (rules and Jev), with
 `serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`

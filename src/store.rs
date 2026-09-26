@@ -17,7 +17,7 @@ pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, with
 pub use db::{
     Absorbed, Answer, Answered, Binding, Bot, CatchUp, CompactionPlan, CompactionView, Database,
     Delivery, Fork, Gate, Gated, Planning, Publication, Started, TurnContext, TurnOptions, Waiting,
-    Window, cache_hit, merge_gates,
+    Wake, Window, cache_hit, merge_gates,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
