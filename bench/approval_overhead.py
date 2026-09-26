@@ -127,6 +127,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
                 message = client.queue.get(timeout=30)
                 assert message is not None, 'daemon exited'
                 if message.get('id') in pending_submits:
+                    assert 'error' not in message, message
                     name, at = pending_submits.pop(message['id'])
                     started[message['result']['turn']] = (name, at)
                 elif message.get('id') is not None:
