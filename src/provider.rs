@@ -322,6 +322,10 @@ pub struct Request<'a> {
     /// token must not cross into another turn (openai/codex aa38089,
     /// core/src/client.rs). HTTP only.
     pub route: Option<&'a OnceLock<String>>,
+    /// Set when the request is first sent, where its prompt cache's lifetime
+    /// starts. Shared so a caller refreshing that cache while the reply
+    /// streams can read it before the call returns.
+    pub sent: Option<&'a OnceLock<tokio::time::Instant>>,
 }
 
 /// A request's place in its bot's history. `items` is the whole input; when
@@ -909,7 +913,7 @@ impl Provider {
                 )
                 .await;
         }
-        let (cache_key, route) = (request.cache_key, request.route);
+        let (cache_key, route, sent) = (request.cache_key, request.route, request.sent);
         let (body, len) = self.body(prefix, &request.items);
         // The lease lives until this function returns, stream included.
         let (client, _lease) = self.transport.lease();
@@ -964,7 +968,9 @@ impl Provider {
         }
         reservation.dispatch();
         report.dispatched = true;
-        report.sent_at = Some(tokio::time::Instant::now());
+        if let Some(sent) = sent {
+            let _ = sent.set(tokio::time::Instant::now());
+        }
         let response = match http.send().await {
             Ok(response) => response,
             Err(error) => {
@@ -1192,6 +1198,7 @@ impl Provider {
             items,
             chain,
             cache_key,
+            sent,
             ..
         } = request;
         let (bot, window, tail) = match chain {
@@ -1241,7 +1248,9 @@ impl Provider {
                         if failure.refused {
                             reservation.dispatch();
                             report.dispatched = true;
-                            report.sent_at = Some(tokio::time::Instant::now());
+                            if let Some(sent) = sent {
+                                let _ = sent.set(tokio::time::Instant::now());
+                            }
                             if let Some(headers) = &failure.headers {
                                 reservation.learn(headers, self.family);
                             }
@@ -1272,7 +1281,9 @@ impl Provider {
             let text = create(&prefix, plan.previous.as_deref(), input).await?;
             reservation.dispatch();
             report.dispatched = true;
-            report.sent_at = Some(tokio::time::Instant::now());
+            if let Some(sent) = sent {
+                let _ = sent.set(tokio::time::Instant::now());
+            }
             match session
                 .exchange(
                     text,
@@ -1690,6 +1701,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -1720,6 +1732,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             })
             .unwrap();
         let text = String::from_utf8(prefix).unwrap();
@@ -1742,6 +1755,7 @@ mod tests {
                     items: Items::empty(),
                     chain: None,
                     route: None,
+                    sent: None,
                 })
                 .unwrap(),
         )
@@ -1761,6 +1775,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             })
             .unwrap();
         let legacy = String::from_utf8(legacy).unwrap();
@@ -1783,6 +1798,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             })
             .unwrap();
         empty_prefix.extend_from_slice(b"]}");
@@ -1808,6 +1824,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             })
             .unwrap();
         prefix.extend_from_slice(b"]}");
@@ -1842,6 +1859,7 @@ mod tests {
                             items: Items::empty(),
                             chain: None,
                             route: None,
+                            sent: None,
                         })
                         .unwrap();
                     prefix.extend_from_slice(b"]}");
@@ -1923,6 +1941,7 @@ mod tests {
                     items: Items::empty(),
                     chain: None,
                     route: None,
+                    sent: None,
                 })
                 .unwrap();
             prefix.extend_from_slice(b"]}");
@@ -2021,6 +2040,7 @@ mod tests {
                     items: Items::empty(),
                     chain: None,
                     route: None,
+                    sent: None,
                 })
                 .unwrap();
             let text = String::from_utf8(prefix).unwrap();
@@ -2053,6 +2073,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let parse = |mut bytes: Vec<u8>| -> Value {
             bytes.extend_from_slice(b"]}");
@@ -2094,6 +2115,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let mut bytes = provider.prefix(&request).unwrap();
         bytes.extend_from_slice(b"]}");
@@ -2286,6 +2308,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             },
             |delta| {
                 if let Delta::Text(part) = delta {
@@ -2352,6 +2375,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
             };
             let error = provider
                 .complete(request, |_| async { Ok(()) })
@@ -2412,6 +2436,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let _ = provider
             .complete(
@@ -2466,6 +2491,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let error = provider
             .complete(request, |_| async { Ok(()) })
@@ -2575,6 +2601,7 @@ mod tests {
                 tail: Box::new(|_| Items::empty()),
             }),
             route: None,
+            sent: None,
         };
         let error = provider
             .complete(request(), |_| async { Ok(()) })
@@ -2670,6 +2697,7 @@ mod tests {
                 tail: Box::new(|_| Items::empty()),
             }),
             route: None,
+            sent: None,
         };
         for _ in 0..2 {
             provider
@@ -2717,6 +2745,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let started = tokio::time::Instant::now();
         let refresh = Refresh::default();
@@ -2766,6 +2795,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let started = tokio::time::Instant::now();
         let (usage, sent_at) = provider
@@ -2819,6 +2849,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route,
+            sent: None,
         };
         let mut sent = Vec::new();
         for slot in [Some(&route), Some(&route), Some(&route), None] {
@@ -2870,6 +2901,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
             cache_key: None,
         };
         // Refused, and the file still holds the refused token: final, and
@@ -2945,6 +2977,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
             cache_key: None,
         };
         let call = provider.complete(request, |_| async { Ok(()) });
@@ -2993,6 +3026,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
             cache_key: None,
         };
         let error = provider
@@ -3037,6 +3071,7 @@ mod tests {
                 items: Items::empty(),
                 chain: None,
                 route: None,
+                sent: None,
                 cache_key: None,
             };
             let error = provider
@@ -3072,6 +3107,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
             cache_key: None,
         };
         let error = provider
@@ -3120,6 +3156,7 @@ mod tests {
             items: Items::empty(),
             chain: None,
             route: None,
+            sent: None,
         };
         let completion = provider
             .complete(request, |_| async { Ok(()) })

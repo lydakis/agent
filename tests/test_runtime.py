@@ -292,6 +292,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             self.server.requests.put(request)
+            if hasattr(self.server, 'arrivals'):
+                self.server.arrivals.append((time.monotonic(), request))
             assert self.path == '/v1/messages'
             assert self.headers.get('x-api-key') == 'synthetic-anthropic-key'
             assert self.headers.get('anthropic-version') == '2023-06-01'
@@ -428,14 +430,19 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                      'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 1, 'output_tokens': 7}]
             events.append(('message_delta', {'delta': {'stop_reason': stop}, 'usage': usage}))
             events.append(('message_stop', {}))
+            # A slow start: the answer to 'hold' waits this long for its headers.
+            held = last['content'][0].get('text') == 'hold'
+            if held:
+                time.sleep(self.server.hold_delay)
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Transfer-Encoding', 'chunked')
             self.end_headers()
-            # A long reply: the first answer streams its start, then pauses
-            # this long before the rest, as a long generation does.
-            generating = getattr(self.server, 'generate_delay', 0)
-            self.server.generate_delay = 0
+            # A long reply: the first answer not held streams its start, then
+            # pauses this long before the rest, as a long generation does.
+            generating = 0 if held else getattr(self.server, 'generate_delay', 0)
+            if not held:
+                self.server.generate_delay = 0
             for index, (kind, body) in enumerate(events):
                 frame = f'event: {kind}\ndata: {json.dumps({"type": kind, **body})}\n\n'.encode()
                 self.wfile.write(f'{len(frame):x}\r\n'.encode() + frame + b'\r\n')
@@ -524,6 +531,43 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([r['max_tokens'] == 0 for r in requests], [False, True, False])
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
+
+    def test_a_steered_round_counts_the_last_replys_refresh_toward_the_budget(self):
+        client, model, path = self.start(extra=('--keep-warm', '1'))
+        model.generate_delay = 1.5
+        model.warm_delay = 1
+        # The call bills 14 tokens (5 + 2 cached in, 7 out) and its refresh 9.
+        client.request('create', bot='Bob', workspace=str(path), reasoning='low', budget_tokens=20)
+        turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
+        model.requests.get(timeout=5)
+        client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
+        # The refresh still in flight when the reply ends is answered and
+        # counted before the steer's round, which the budget then refuses.
+        self.assertEqual(client.finished(turn)['data']['error'], 'budget_exhausted')
+        self.assertEqual(model.requests.get(timeout=1)['max_tokens'], 0)
+        self.assertTrue(model.requests.empty())
+        self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 23)
+
+    def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
+        # One request may start at a time and Ann's waits for its headers,
+        # so Bob's call waits to be sent; its cache exists only from then.
+        client, model, path = self.start(extra=('--keep-warm', '1', '--max-connecting', '1'))
+        model.hold_delay = 2.5
+        model.generate_delay = 1.5
+        model.arrivals = []
+        for bot in ('Ann', 'Bob'):
+            client.request('create', bot=bot, workspace=str(path), reasoning='low')
+        held = client.request('submit', bot='Ann', request_id='h1', prompt='hold')['result']['turn']
+        model.requests.get(timeout=5)
+        turn = client.request('submit', bot='Bob', request_id='h2', prompt='long')['result']['turn']
+        for waited in (held, turn):
+            self.assertEqual(client.finished(waited)['data']['status'], 'completed')
+        bob = [(at, r) for at, r in model.arrivals if r['messages'][-1]['content'][0].get('text') == 'long']
+        (sent, call), warms = bob[0], bob[1:]
+        self.assertTrue(warms)
+        for _, warm in warms:
+            self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
+        self.assertGreaterEqual(warms[0][0] - sent, 0.9)
 
     def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
         client, model, path = self.start(extra=('--keep-warm', '1'))

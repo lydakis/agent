@@ -516,14 +516,16 @@ default), it sends that call's request again with `max_tokens: 0` and
 `stream: false`. That request generates nothing, bills a cache read, and
 restarts the cache's lifetime. It repeats until the reply and then the tool
 finish. The lifetime is counted from when the call, or the last refresh, was
-sent. Refreshing during the reply matters because a long one outlives the
+sent, so a call still waiting for its pool or startup admission is not
+refreshed. Refreshing during the reply matters because a long one outlives the
 cache on its own: in the 2026-09-25 Sonnet 5 rerun, six replies of 32k to
 86k output tokens each took longer than five minutes, and the refresh sent
 when the next tool started found the prefix gone and wrote it again. Each
 refresh runs as a task of its own: one still unanswered when the reply ends
-carries into the tool that follows, and when the tool or the turn ends, or
-the turn is interrupted, one not yet sent is dropped at no cost, and one
-already sent is answered, so its cost is recorded. A summary's call is not
+carries into the tool that follows. When the tool ends, the next model round
+starts, or the turn ends or is interrupted, one not yet sent is dropped at no
+cost, and one already sent is answered, so its cost is recorded and counts
+toward the bot's budget before another call. A summary's call is not
 refreshed.
 Nothing else in the request differs, since the cache is keyed on everything it
 renders. A refresh is paced and admitted like a call, but gives up waiting
