@@ -50,14 +50,16 @@ more turns is not here, because its work changes with its speed; it is under
   slower (median 1.61 against 1.67 ms). Under sustained load, 64 bots at
   10 ms a sync went from about 56 to 131 turns a second, with no change at
   native sync. RSS after the bursts was 0.3 MiB higher, cause not isolated.
-  Linux x86_64 container, `4260673` against the window build, 2026-09-26.
+  Linux x86_64 container, `4260673` against `3b6dd53`, 2026-09-26.
   macOS is not measured: the earlier macOS probe of 32 clients (median
   284.8 ms to all replies, `7120b48`) has not been rerun.
   [Record](DAEMON_MEASUREMENTS.md#admission-window).
 - **Savepoint journals in memory.** With the writer's journals in memory
   instead of temporary files, a submission's `begin` job ran in a median
-  164 µs instead of 451 µs and its round trip took 1.26 instead of 1.45 ms,
-  RSS unchanged. Linux x86_64 container, `8724f22` against the change,
+  184 µs instead of 416 µs, ranges not overlapping. Its round trip (1.28
+  against 1.43 ms) and daemon CPU moved within overlapping ranges, and RSS
+  did not change. Linux x86_64 container, `8724f22` against the same source
+  with only `temp_store=MEMORY` added (the line `4260673` landed),
   2026-09-26; macOS, where creating a file may cost more, is not measured.
   [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
@@ -184,8 +186,8 @@ Reconnects, retention, overload, compaction and recovery.
   turn or parked turn the store refuses is tried again with backoff. A turn
   whose reply cannot be stored still fails. With every write refused for
   0.5 s, all 32 turns ended `failed` and the daemon kept running, where
-  before it exited. Linux x86_64 container, `8724f22` against the change,
-  2026-09-26; no run on a nearly full macOS disk.
+  before it exited. Linux x86_64 container, `8724f22` against `4260673` and
+  `095ff68`, 2026-09-26; no run on a nearly full macOS disk.
   [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
 - **Retention.** A race that could lose a completion event under
   `--retain-turns 1` (2 of 10 runs) is fixed (0 of 10). Retention halves
