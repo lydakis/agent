@@ -4236,3 +4236,85 @@ bot's fallback choice exactly as its call did, so the cache it refreshes is
 the one the call wrote. Validation of the merged tree: 121 Rust tests, 264
 Python tests with 22 opt-in skips, strict Clippy and formatting.
 
+
+## Group commit
+
+Observed 2026-09-26 on a Linux x86_64 cloud VM (4 vCPUs, ext4 on a virtio
+disk), Rust 1.98.0, bundled SQLite. Baseline is main `2d03ac2` (binary
+`181c783b…`); the candidate commits the storage worker's queued jobs in
+groups (binary `2a88e7b3…`). Every store job used to be its own transaction
+and its own sync, so the one worker allowed at most one job per sync. This
+VM syncs in about 0.15 ms, so a delay was injected into every `fsync` and
+`fdatasync` with an `LD_PRELOAD` shim (sleep, then the real call) to stand
+in for slower storage. Treating 2 and 10 ms as the range of SD cards and
+network block devices is an assumption, not a measurement of either.
+
+The screen: 64 bots each resubmit the moment their turn finishes (open
+loop, requests pipelined on stdio), a synthetic model holding each reply
+200 ms, text turns, `--context-items 8`, 3 s warmup then 10 s measured.
+Alternating pairs, baseline first:
+
+| Injected sync | Baseline turns/s | Group turns/s | Baseline p50 / p95 ms | Group p50 / p95 ms | Jobs per commit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| none | 307.3, 307.6 | 304.3, 308.4 | 208 / 214, 207 / 213 | 209 / 221, 207 / 212 | 2.36, 2.25 |
+| 2 ms | 95.1, 94.1 | 128.3, 127.2 | 667 / 860, 683 / 803 | 490 / 603, 504 / 577 | 3.28, 3.29 |
+| 10 ms | 26.2, 25.9 | 37.8, 36.9 | 2,402 / 3,005, 2,432 / 2,808 | 1,663 / 1,884, 1,724 / 1,890 | 3.12, 3.09 |
+
+The model's own ceiling is 320 turns/s (64 bots, 200 ms per reply). With no
+injected delay neither binary is storage-bound. With a delay, the baseline
+runs about five syncs per turn back to back, and grouping lifts throughput
+by about 35 to 45 percent and cuts the median by about a third. It does not
+reach the model's ceiling: about three jobs share a commit, because the
+service loop awaits `begin` for each submission and `finish` for each
+completion before handling the next request, so those commits never share a
+sync with each other. That loop is now the limit on slow storage (NEXT item
+44).
+
+The 32-agent socket echo screen (`bench.lifecycle --agents 32 --mode echo
+--tools echo,shell,read,write,edit --transport socket --repeat 3`), three
+alternating pairs, medians of three measured runs each:
+
+| Pair | CPU s, baseline / group | Peak RSS MiB | Turn p95 ms |
+| --- | ---: | ---: | ---: |
+| 1 | 1.10 / 1.12 | 21.81 / 22.10 | 595.4 / 582.9 |
+| 2 | 1.10 / 1.12 | 21.95 / 22.25 | 587.7 / 581.1 |
+| 3 | 1.10 / 1.15 | 22.04 / 22.17 | 584.7 / 584.0 |
+
+p95 is level or slightly lower. RSS is up about 0.2 MiB in every pair. CPU
+medians are higher in every pair with overlapping ranges (baseline 1.08 to
+1.16, group 1.06 to 1.16), so the difference is unresolved, not shown to be
+noise. SQLite's share should fall rather than rise: a separate probe with
+sync off (Python's SQLite, three jobs of one insert and one update each) spent
+14 to 15 µs of CPU per job as separate transactions and 10 to 12.5 µs as
+savepoints in one group. The candidate's own additions per job are one
+`try_recv` and holding the answer until the commit; this screen does not
+attribute the difference.
+
+Not established: real slow hardware, the daemon on macOS, tool turns, or
+more than 64 bots.
+
+**macOS flush.** The same change turns on `PRAGMA fullfsync` and
+`checkpoint_fullfsync`. Without them the bundled SQLite syncs with a plain
+`fsync`, which on macOS does not flush the drive cache, so `synchronous=FULL`
+was not power-loss durable there. A microbenchmark on an M1 Max (internal
+APFS SSD, AC power, rusqlite 0.40.2 with bundled SQLite 3.53.2, WAL, one job
+= a 600-byte insert and a counter update, median of three rotated 3 s
+rounds; observed 2026-09-26, source and table in the project's shared
+files) gives the price:
+
+| Strategy | Jobs/s |
+| --- | ---: |
+| Plain fsync, one job per commit (before) | 11,600 |
+| F_FULLFSYNC, one job per commit | 184 |
+| F_FULLFSYNC, savepoint groups of 8 / 32 | 1,280 / 5,090 |
+
+A flush is about 5.4 ms, so an idle Mac pays that per commit: a shell turn of
+about six commits takes about 30 ms longer. Under load the flush is shared by
+the group. Linux ignores both pragmas; the Linux screens above are unchanged.
+A store test checks that the writer carries both pragmas and the reader,
+which can run the checkpoint when the last connection closes, carries
+`checkpoint_fullfsync`. The per-operation `ran` times in `stats` no
+longer include the sync; the new `commit` operation carries it.
+Validation: 182 Rust tests, including two for grouped commits that fail
+when grouping or the rollback answer is removed; 264
+Python tests with 22 opt-in skips; strict Clippy and formatting.

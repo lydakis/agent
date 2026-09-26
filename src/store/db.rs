@@ -345,6 +345,9 @@ pub struct Database {
     /// events. Captured inside the job, so retention in the same job
     /// cannot remove what a waiter is owed.
     outcomes: Vec<(String, i64, Value)>,
+    /// A group was abandoned and `pending` not yet recounted from the rows;
+    /// no job runs until a recount succeeds.
+    pending_stale: bool,
 }
 
 /// The share of input tokens the provider served from its prompt cache,
@@ -384,21 +387,30 @@ impl Database {
     pub const RETENTION_PIECE: usize = 4;
 
     /// A second connection that only reads. The writer owns the file, its
-    /// lock, migration, and recovery; this one sees each job's commit once
-    /// it is done and never takes the write lock.
+    /// lock, migration, and recovery; this one sees a job's writes once that
+    /// job is answered and never takes the write lock. It can still run the
+    /// checkpoint SQLite makes when the last connection closes, so it syncs
+    /// checkpoints the way the writer does.
     pub fn reader(conn: Connection) -> Result<Self> {
-        conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-2048;")?;
+        conn.execute_batch(
+            "PRAGMA query_only=ON; PRAGMA cache_size=-2048; PRAGMA checkpoint_fullfsync=ON;",
+        )?;
         Ok(Self {
             conn,
             pending_limits: (0, 0),
             pending: (0, 0),
             outcomes: Vec::new(),
+            pending_stale: false,
         })
     }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
+        // On macOS a plain fsync leaves writes in the drive's cache, so FULL
+        // survives a power cut only with F_FULLFSYNC, which SQLite sends when
+        // these are on. Elsewhere they change nothing.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -534,6 +546,7 @@ impl Database {
             pending_limits: (0, 0),
             pending: (0, 0),
             outcomes: Vec::new(),
+            pending_stale: false,
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -565,18 +578,62 @@ impl Database {
                 GROUP BY t.bot)",
             [],
         )?;
-        // One pass over the waiting rows, through their partial indexes.
+        db.recount_pending()?;
+        Ok(db)
+    }
+    /// Count the waiting turns from their rows: one pass over the queued
+    /// and ready rows, through their partial indexes.
+    fn recount_pending(&mut self) -> Result<()> {
+        self.pending_stale = true;
+        self.pending = (0, 0);
         for statement in [
             "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='queued'",
             "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='ready'",
         ] {
-            let (turns, bytes): (i64, i64) = db
+            let (turns, bytes): (i64, i64) = self
                 .conn
                 .query_row(statement, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            db.pending.0 += turns;
-            db.pending.1 += bytes;
+            self.pending.0 += turns;
+            self.pending.1 += bytes;
         }
-        Ok(db)
+        self.pending_stale = false;
+        Ok(())
+    }
+    /// Open the transaction a group of jobs shares. Each job's own
+    /// transaction is a savepoint inside it, so a failed job rolls back
+    /// alone and the group still commits once.
+    pub fn begin_group(&mut self) -> Result<()> {
+        // A group that could not be abandoned cleanly finishes that first:
+        // admission must not run on counts the rolled-back jobs changed.
+        if self.pending_stale {
+            self.abandon_group()?;
+        }
+        self.conn.prepare_cached("BEGIN")?.execute([])?;
+        Ok(())
+    }
+    /// Whether the group's transaction is still open. A full disk or an I/O
+    /// error can make SQLite roll back the whole transaction mid-job.
+    pub fn in_group(&self) -> bool {
+        !self.conn.is_autocommit()
+    }
+    /// Commit the group: one sync for every job in it.
+    pub fn commit_group(&mut self) -> Result<()> {
+        if !self.in_group() {
+            return fail("storage_group_rolled_back");
+        }
+        self.conn.prepare_cached("COMMIT")?.execute([])?;
+        Ok(())
+    }
+    /// Forget a group that did not commit: roll back whatever is still
+    /// open, drop the outcomes its jobs announced, and recount the waiting
+    /// turns they counted.
+    pub fn abandon_group(&mut self) -> Result<()> {
+        self.outcomes.clear();
+        self.pending_stale = true;
+        if self.in_group() {
+            self.conn.prepare_cached("ROLLBACK")?.execute([])?;
+        }
+        self.recount_pending()
     }
     /// The newest committed event id: the publication watermark at open.
     /// Older events belong to replay, never to live delivery.
@@ -765,7 +822,7 @@ impl Database {
         if self.exists(name)? {
             return fail("bot_exists");
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, binding.created_by, binding.created_by_id)?;
         tx.execute(
@@ -1423,7 +1480,7 @@ impl Database {
                 );
             }
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to) VALUES (?,?,?,?,?,?,?)",
             params![
@@ -2026,7 +2083,7 @@ impl Database {
                 }
             }
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         // A deleted bot must never make an old turn handle refer to new work.
         let turn: i64 = tx
             .prepare_cached(
@@ -2128,7 +2185,7 @@ impl Database {
             .or(bot.workspace.clone())
             .ok_or(Error::new("workspace_required"))?;
         let model = model.unwrap_or_else(|| format!("{}/{}", bot.provider, bot.model));
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let head = start_locked(&tx, &bot, turn, &prompt)?;
         let data = json!({"request_id":request_id,"node":head,"workspace":workspace,"model":model});
         let cursor = event(&tx, &name, Some(turn), "accepted", data.clone())?;
@@ -2181,7 +2238,7 @@ impl Database {
         } else {
             "failed"
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET status=?,finished_ms=? WHERE id=?",
             params![ended, epoch_ms(), turn],
@@ -2276,7 +2333,7 @@ impl Database {
         if !capped && (more || steers.len() == STEER_BATCH_ITEMS) {
             absorbed.next_through = Some(through);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut steered = Vec::with_capacity(steers.len());
         for (steer, item, size) in steers {
@@ -2327,7 +2384,7 @@ impl Database {
         usage: Option<&Usage>,
     ) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
         for item in items {
@@ -2362,7 +2419,7 @@ impl Database {
     /// Charge an unsuccessful provider call without accepting its output.
     pub fn failed_usage(&mut self, turn: i64, usage: &Usage) -> Result<Value> {
         let bot = self.active(turn)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let entry = record_usage(&tx, &bot.name, turn, usage)?;
         tx.execute(
             "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
@@ -2375,7 +2432,7 @@ impl Database {
     /// nothing, so it is not a model round.
     pub fn keep_warm_usage(&mut self, turn: i64, usage: &Usage) -> Result<()> {
         let bot = self.active(turn)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         record_usage_for(&tx, &bot.name, turn, usage, Some("keep_warm"))?;
         tx.commit()?;
         Ok(())
@@ -2383,7 +2440,7 @@ impl Database {
     /// Charge a summarizer response without adding it to the transcript.
     pub fn compaction_usage(&mut self, turn: i64, usage: Option<&Usage>) -> Result<()> {
         let bot = self.active(turn)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         if let Some(usage) = usage {
             record_usage_for(&tx, &bot.name, turn, usage, Some("compaction"))?;
         }
@@ -2396,7 +2453,7 @@ impl Database {
     }
     pub fn tool_start(&mut self, turn: i64, call: &ToolCall) -> Result<Value> {
         let bot = self.active(turn)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         if tx.execute(
             "UPDATE tools SET status='executing' WHERE turn=? AND call_id=? AND status='planned'",
             params![turn, call.call_id],
@@ -2419,7 +2476,7 @@ impl Database {
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
         let item = bot.family()?.tool_result_item(call_id, &outcome.output)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         if tx.execute(
             "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'",
             params![turn, call_id],
@@ -2492,7 +2549,7 @@ impl Database {
     pub fn finish(&mut self, turn: i64, error: Option<&Error>) -> Result<Vec<Value>> {
         let bot = self.active(turn)?;
         let waiting = self.waiting(turn)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
         // Complete the transcript, not the external operation. Dropped native
@@ -2617,7 +2674,7 @@ impl Database {
             call_spent_ms: 0,
             compaction: false,
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET status='waiting',waiting=? WHERE id=?",
             params![serde_json::to_string(&waiting)?, turn],
@@ -2659,7 +2716,7 @@ impl Database {
             call_spent_ms,
             compaction,
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET status='paced',waiting=?,retries=retries+?,paced_ms=paced_ms+? WHERE id=?",
             params![serde_json::to_string(&waiting)?, retries as i64, paced_ms as i64, turn],
@@ -2704,7 +2761,7 @@ impl Database {
         if bot.status != "waiting" && bot.status != "paced" {
             return fail("turn_not_waiting");
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "UPDATE turns SET status='running',waiting=NULL,paced_ms=paced_ms+? WHERE id=?",
             params![waiting.paced_elapsed_ms(), turn],
@@ -2795,7 +2852,7 @@ impl Database {
         result: &Value,
         artifacts: &[(&str, Vec<u8>)],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         if tx.execute(
             "UPDATE processes SET status='finished',result=? WHERE id=? AND status='running'",
             params![result.to_string(), id],
@@ -2934,7 +2991,7 @@ impl Database {
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
@@ -3120,7 +3177,7 @@ impl Database {
     }
     fn delete_bot_piece_for(&mut self, name: &str, bot: Bot, piece: usize) -> Result<Value> {
         let piece = piece.max(1) as i64;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut out = json!({"turns":0,"events":0,"nodes":0,"done":false});
         if bot.status != "deleting" {
             if bot.running_turn.is_some() {
@@ -3310,7 +3367,7 @@ impl Database {
         let Some(floor) = floor else {
             return Ok(json!({"events":0,"pruned_cursor":Value::Null,"next_after":Value::Null}));
         };
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         // The candidate index contains only this bot's unpruned turns, not
         // its entire history or operational records owned by other bots.
         let turns: Vec<i64> = tx
@@ -4449,4 +4506,20 @@ fn node_with_turn(
         super::thinking_bytes(item) as i64
     ])?;
     Ok(conn.last_insert_rowid())
+}
+
+// Last in the file: bench.query_plans audits the statements above the first
+// test marker.
+#[cfg(test)]
+impl Database {
+    /// The connection itself, for tests that stage what no store method does.
+    pub(crate) fn connection(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+    /// One integer pragma as this connection has it.
+    pub(crate) fn pragma(&self, name: &str) -> i64 {
+        self.conn
+            .pragma_query_value(None, name, |r| r.get(0))
+            .unwrap()
+    }
 }
