@@ -731,7 +731,7 @@ impl Database {
                 PRIMARY KEY(bot,head));
             CREATE TABLE IF NOT EXISTS tools(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(turn,call_id));
-            CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY, turn INTEGER NOT NULL REFERENCES turns(id),
+            CREATE TABLE IF NOT EXISTS approvals(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, name TEXT NOT NULL, node INTEGER NOT NULL, request INTEGER NOT NULL,
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS approvals_call ON approvals(turn,call_id);
@@ -4691,9 +4691,9 @@ fn deny(
 /// a new request number and no verdicts, naming the call that failed.
 /// Answers computed for the old request are refused as superseded.
 fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<bool> {
-    let rows: Vec<(i64, String, String, i64, i64, String)> = tx
+    let rows: Vec<(i64, String, String, i64, i64, String, String)> = tx
         .prepare_cached(
-            "SELECT id,call_id,name,node,request,gates FROM approvals WHERE turn=? ORDER BY id",
+            "SELECT id,call_id,name,node,request,gates,arguments FROM approvals WHERE turn=? ORDER BY id",
         )?
         .query_map([turn], |r| {
             Ok((
@@ -4703,6 +4703,7 @@ fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<boo
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -4711,11 +4712,24 @@ fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<boo
     }
     let announced_ms = epoch_ms();
     let mut calls = Vec::with_capacity(rows.len());
-    for (id, call_id, name, node, request, gates) in rows {
+    for (id, call_id, name, node, request, gates, arguments) in rows {
+        // A new request takes a new row, so a listing already paged past
+        // the old one still finds it.
+        tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
+            .execute([id])?;
         tx.prepare_cached(
-            "UPDATE approvals SET request=?,announced_ms=?,verdicts=NULL WHERE id=?",
+            "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates,arguments) VALUES (?,?,?,?,?,?,?,?)",
         )?
-        .execute(params![request + 1, announced_ms, id])?;
+        .execute(params![
+            turn,
+            call_id,
+            name,
+            node,
+            request + 1,
+            announced_ms,
+            gates,
+            arguments
+        ])?;
         let gates: Vec<CallGate> = serde_json::from_str(&gates)?;
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         calls.push(json!({"call_id":call_id,"request":request + 1,

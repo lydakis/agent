@@ -1430,21 +1430,41 @@ fn summary(name: &str, arguments: &str) -> String {
     one_line(&text, false)
 }
 
-/// The first line of `text`, marked when more lines follow or it was cut.
+/// The first line of `text`, marked when more lines follow or it was cut,
+/// with anything a terminal would act on shown escaped instead.
 fn one_line(text: &str, cut: bool) -> String {
     let mut lines = text.lines();
     let first: String = lines.next().unwrap_or("").chars().take(200).collect();
     let rest = lines.count();
+    let cut = cut || (rest == 0 && first.len() < text.trim_end().len());
+    let first = visible(&first);
     if rest > 0 {
         format!(
             "{first} … (+{rest} more lines{})",
             if cut { ", then cut" } else { "" }
         )
-    } else if cut || first.len() < text.trim_end().len() {
+    } else if cut {
         format!("{first} …")
     } else {
         first
     }
+}
+
+/// Model-written text as a terminal should show it: control characters
+/// and bidirectional overrides escaped, so a call cannot clear the screen
+/// or reorder what the person reads before they allow it.
+fn visible(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control()
+            || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
 }
 
 /// A top-level string field of JSON text that may be cut short, decoded as
@@ -1720,6 +1740,14 @@ mod tests {
         assert_eq!(
             line("shell", json!({"arguments":null})),
             "shell [arguments are not a JSON object]"
+        );
+        // What a terminal would act on is shown, not sent to it.
+        assert_eq!(
+            line(
+                "shell",
+                json!({"arguments":{"command":"\u{1b}[2Jrm x\r\u{202e}txt.exe"}})
+            ),
+            r"shell \u{1b}[2Jrm x\r\u{202e}txt.exe"
         );
         assert_eq!(
             line(

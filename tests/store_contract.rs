@@ -805,6 +805,50 @@ fn a_long_field_hides_no_other_in_a_listing() {
 }
 
 #[test]
+fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let planned: Vec<(Bytes, ToolCall)> = (1..=4)
+        .map(|n| shell_call(&format!("fc_{n}"), &format!("s{n}"), "true"))
+        .collect();
+    let (items, calls): (Vec<Bytes>, Vec<ToolCall>) = planned.into_iter().unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    allow(&mut db, turn, "s1").unwrap();
+    allow(&mut db, turn, "s2").unwrap();
+    // A caller pages past the answered calls to s3.
+    let page = db.approvals(Some("Bob"), None, 0, 1).unwrap();
+    assert_eq!(page["approvals"][0]["call_id"], "s3");
+    let after = page["next_after"].as_i64().unwrap();
+    // Then s1 fails, and s2 needs a verdict again.
+    assert!(matches!(
+        db.approval_start(turn, &calls[0], 0).unwrap(),
+        Gated::Started
+    ));
+    let failed = Outcome {
+        failed: true,
+        ..result("{}")
+    };
+    db.tool_finish(turn, "s1", &failed).unwrap();
+    let mut seen = Vec::new();
+    let mut after = json!(after);
+    while let Some(from) = after.as_i64() {
+        let page = db.approvals(Some("Bob"), None, from, 1).unwrap();
+        for call in page["approvals"].as_array().unwrap() {
+            seen.push((call["call_id"].clone(), call["request"].clone()));
+        }
+        after = page["next_after"].clone();
+    }
+    assert_eq!(
+        seen,
+        [
+            (json!("s2"), json!(2)),
+            (json!("s3"), json!(2)),
+            (json!("s4"), json!(2))
+        ]
+    );
+}
+
+#[test]
 fn a_call_larger_than_a_page_still_fills_one() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);

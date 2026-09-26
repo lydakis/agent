@@ -1578,7 +1578,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   object, which no tool accepts. The previews are taken once, when the
   call is planned, so a listing reads no item. A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger; `next_after` continues
-  it. `stats` reports `approval_requests`, the calls
+  it. Positions are never reused, and a call announced again takes a new
+  one at the end, so a listing that pages on finds it. `stats` reports `approval_requests`, the calls
   announced and not yet started or denied.
 - Interrupting a turn cancels its gated calls like any planned call.
   Anything that reaches the socket can answer, a bot's own shell included:
