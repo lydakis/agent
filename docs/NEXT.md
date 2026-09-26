@@ -520,8 +520,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       pay for it. Jev was not used: its probes showed it answers the
       judgments, but not that it beats the static rule of keeping user
       prompts verbatim, and the daemon knows structurally when a boundary
-      is stable. If Jev has a place it is in permission automation, which
-      is deferred. Still open: a real 8 MiB window over a long task, Sonnet,
+      is stable. If Jev has a place it is in permission automation, now
+      [item 45](APPROVALS.md). Still open: a real 8 MiB window over a long task, Sonnet,
       the summarizer's latency at size, and an evaluation that can see a
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
@@ -766,6 +766,19 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     fsync there leaves commits in the drive cache. A flush costs about
     5.4 ms on an M1 Max, paid once per group; the service loop above now
     matters on a Mac as much as on slow Linux storage.
+
+45. Approving tool calls. Every allowed call runs without a verdict today.
+    [The design](APPROVALS.md) gives a bot an `approve` list of tools whose
+    calls wait for an `answer` from any client: the request rides the plan
+    commit, the verdict rides the call's start or its denial, and a verdict
+    that has not arrived within a short hold parks the turn like `wait`.
+    The daemon has no rules, prompts, or model. Manual approval is the CLI
+    or the app answering; automatic approval is a client that answers from
+    deterministic rules first, then asks Jev a few narrow questions per
+    round, and escalates or denies what stays unclear. It is oversight, not
+    a sandbox. First, count the tool mix in the Harbor transcripts to see
+    how many rounds would reach Jev; then a labeled Jev run, which is paid
+    and waits for George.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

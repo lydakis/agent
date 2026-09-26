@@ -84,33 +84,81 @@ Code facts at b07080c:
 
 ## How peers do it
 
-PEERS_PLACEHOLDER
+Read on 2026-09-26. Claude Code from its docs (changelog at v2.1.283) and
+Anthropic's [auto mode post](https://www.anthropic.com/engineering/claude-code-auto-mode)
+(2026-03-25); Codex from source at `25270df` and its
+[auto-review docs](https://learn.chatgpt.com/docs/sandboxing/auto-review);
+Cursor from its [run modes](https://cursor.com/docs/agent/security/run-modes)
+and [hooks](https://cursor.com/docs/agent/hooks) docs; the others from source
+pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
+`a350dc7`, opencode `696f41b`, Pi `d6af72e`).
+
+| Harness | Modes | Automatic judge | What the judge sees | Judge fails | On denial |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | manual, acceptEdits, plan, auto (default since v2.1.283), dontAsk, bypass | Sonnet 5, two stages: a one-token filter, then reasoning only on flags | user messages, bare tool calls, CLAUDE.md; not tool results or the model's prose | closed: deny | reason to the model; after 3 in a row or 20 per session, asks the person |
+| Codex | `approval_policy` untrusted, on-request, never, granular; sandbox read-only, workspace-write, full | `codex-auto-review` (ChatGPT login) or gpt-5.6-luna, low effort, as a read-only turn that may run commands to inspect | transcript with tool outputs, marked untrusted; only requests that would escalate out of the sandbox | closed, labeled "a review failure"; timeout reported apart | reason plus "do not work around this"; interrupts after 3 in a row or 10 of the last 50 |
+| Cursor | auto-review (default), allowlist, run everything; sandbox | Haiku 4.5 or GPT-5.4 Mini | not documented | not documented | the agent may try another way, then the person is asked |
+| Gemini CLI | plan, default, autoEdit, yolo; TOML policy rules | Conseca (off by default): Gemini 3.5 Flash writes a policy per prompt, then checks each call | the prompt's policy and the call | Conseca allows on its own errors; the runner denies on timeout | "denied by policy" plus the rule's message |
+| goose | auto, approve, smart_approve, chat | the session's own model, one call per batch, asked only "which are read-only?" | tool name and arguments, marked untrusted, no transcript | asks the person | "DO NOT attempt to call this tool again" |
+| OpenHands | always confirm, never, confirm risky | the acting model's own risk label, or a separate guard model | recent actions (guard model) | unknown risk asks the person | "Action rejected: REASON" |
+| opencode | allow, ask, deny per tool and pattern | none | | | a reason continues the loop; a plain reject stops it |
+| Amp | none by default since 2026-05-06; legacy rules could `delegate` to a program | a program you name, by exit code | tool name and arguments on stdin | | the program's stderr goes to the model |
+| Pi | none; extensions can block a call | none | | an extension's failure blocks | |
+| Unreal Agent | none described in its README | none | | | |
 
 ## What to take from them
 
 - **Most calls should never reach a model.** Claude Code skips its
   classifier for read-only actions and edits inside the working directory,
-  and Anthropic reports that sandboxing cut prompts by 84% internally. The
-  cheapest verdict is the one never asked for.
-- **The approver must not read tool results.** Anthropic's classifier sees
-  the user's messages and the bare tool calls; the model's own prose and
-  every tool output are stripped, so text in a file or web page cannot
-  address the judge. Adding them made results worse on its test set.
-- **Static rules do most of the work.** CARE (2026) scored 85.0% F1 on
-  command safety with static rules alone at 0.34 ms a command, and 85.6%
-  with a model behind them. Anthropic's API traffic had 0.8% of actions
-  that looked irreversible. A model belongs on the few calls rules cannot
-  settle.
+  Codex's reviewer only sees what would leave its sandbox, and Anthropic
+  reports that sandboxing cut prompts by 84% internally. CARE (2026) scored
+  85.0% F1 on command safety with static rules alone at 0.34 ms a command,
+  and 85.6% with a model behind them. Anthropic found 0.8% of actions in its
+  API traffic looked irreversible. A model belongs on the few calls rules
+  cannot settle.
+- **The judge should not read tool results here.** Anthropic strips them,
+  and the model's own prose, so text in a file or web page cannot address
+  the judge; adding them made its results worse. OpenAI shows them, marked
+  untrusted, but behind a sandbox that still bounds a wrong allow. Agent
+  has no sandbox behind the approver, so it takes Anthropic's side.
 - **Ask narrow questions.** Anthropic's classifier answers against named
-  rules and denies with a rule tag. Our own Jev probes found the same: a
-  question that names the judgment ("does turn N state a rule that applies
-  later?") separated cleanly, and an abstract one ("will the agent need
-  turn N?") barely did.
-- **Deny and continue, then stop asking.** A denied call returns its reason
-  to the model, which tries another way. After 3 denials in a row or 20 in a
-  session, Claude Code stops auto-deciding and asks the person.
-- **Fail closed.** A classifier error, timeout, or unreadable answer denies
-  the call in Claude Code; it never allows it.
+  rules and denies with a rule tag; Codex's reviewer returns a risk level
+  and the user's authorization separately. Our own Jev probes found the
+  same: a question that names the judgment ("does turn N state a rule that
+  applies later?") separated cleanly, and an abstract one ("will the agent
+  need turn N?") barely did.
+- **Deny and continue, then stop.** Every peer returns the reason and lets
+  the model try another way, except opencode on a reject with no message.
+  Claude Code asks the person after 3 denials in a row or 20 per session;
+  Codex interrupts after 3 in a row or 10 of the last 50.
+- **Fail closed, and say so.** Claude Code denies on a classifier error or
+  timeout. Codex denies too, but tells the model it was "a review failure,
+  not a determination that the action is unsafe", and reports a timeout
+  separately. Gemini's Conseca and Cursor's hooks fail open by default,
+  which is the mistake to avoid.
+- **Nobody times out a person.** Codex, opencode, and OpenHands wait for a
+  human approval as long as it takes, and Claude Code's SDK callback may
+  stay pending indefinitely.
+- **Programs can drive a rich protocol.** Codex's app-server sends
+  `item/commandExecution/requestApproval` with the command, its directory,
+  and a proposed rule, and takes `accept`, `acceptForSession`,
+  `acceptWithExecpolicyAmendment`, `decline` (the turn continues), or
+  `cancel` (the turn ends).
+- **Pattern rules get bypassed.** Cursor's allowlist fell to backticks and
+  `$(...)` (CVE-2025-54131) and to environment variables poisoned through
+  shell built-ins (CVE-2026-22708). Claude Code's docs say its Bash rules do
+  not match `/bin/rm`, `sh -c '...'`, or `git -C . push`. Codex splits a
+  script into commands only when it is plain words joined by `&&`, `||`,
+  `;`, or `|`, and treats anything with a redirect, substitution, or
+  variable as one opaque command.
+- **A model grading its own call is not a judge.** OpenHands' default
+  analyzer and Cline's safe-command toggle trust the acting model's own
+  risk label.
+- **No one publishes latency.** Codex exposes a 90 s review deadline. A
+  user's measurement of Claude Code found 94% of first-stage checks under
+  2 s and 60% of second-stage checks at 10 s or more (claude-code issue
+  #82133, 2026-07). The only sub-second figure in this note is our own Jev
+  probe.
 - **People are poor approvers at volume.** In Anthropic's study of 1,053
   testers, people caught 13.6% of dangerous commands, falling to about 5%
   after 50 prompts, and approved 93 to 97% of all prompts (claims from
@@ -125,7 +173,10 @@ PEERS_PLACEHOLDER
 - **A classifier is not a boundary.** Rehberger's August 2026 chain got
   Claude Code's auto mode to run attacker code in 60 to 80% of tries: each
   step the classifier saw looked benign. Anthropic's answer was that auto
-  mode is "best-effort… not a security guarantee".
+  mode is "best-effort… not a security guarantee". An independent test
+  (Ji et al., 2026) found 36.8% of state-changing actions went around the
+  classifier as in-project file edits. Cursor's docs say the same of its
+  classifier: "not a security boundary".
 
 ## Design
 
@@ -149,8 +200,9 @@ PEERS_PLACEHOLDER
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
   `{"node":N,"calls":[{"call_id","name","arguments","arguments_truncated"}]}`.
-  Arguments are previewed to 2 KiB, as `tool_started` already does; an
-  approver reads a longer one (a large `write`) with `item` on the node.
+  Arguments are previewed to 2,048 characters, as `tool_started` already
+  does; an approver reads a longer one (a large `write`) with `item` on the
+  node.
   One event per round, not per call, and no extra commit.
 - **`answer` decides one call.**
   `{"op":"answer","bot","turn","call_id","decision":"allow"|"deny","reason"?,"by"?}`.
@@ -238,14 +290,20 @@ same module inside the app. It follows `approval_requested` on every bot
      edits (Ji et al., 2026). The approver also remembers what each bot
      wrote this turn, so a command that runs one of those files is judged
      with the file's content in view.
-   - A shell command that is one simple command from a read-only list (`ls`,
-     `cat`, `rg`, `git status`, `git diff`, `git log`, and so on) is allowed.
-     Anything with a pipe, `;`, `&&`, `$(`, a backtick, or a redirect goes
-     on to the model. Parsing shell well enough to allow compound commands
-     is where Cursor's and Claude Code's pattern rules were bypassed; the
-     approver does not try.
-   - Commands that talk to the approval channel itself (`agent answer`, the
-     daemon's socket, the store file) are denied outright.
+   - A shell command is split the way Codex splits it: only plain words
+     joined by `&&`, `||`, `;`, or `|`. If every part is on a read-only list
+     of commands and flag forms (`ls`, `cat`, `rg`, `git status`, `git diff`,
+     `git log`, `find` without `-exec` or `-delete`, and so on), it is
+     allowed. A redirect, `$(`, a backtick, or a variable makes the whole
+     command opaque, and it goes on to the model. This is where Cursor's
+     allowlist was bypassed; the approver does not try to parse more.
+   - Commands that reach the approval channel itself (`agent answer`, the
+     daemon's socket other than through `agent`, the store file) are denied
+     outright.
+   - Delegation goes to the model with the task as the action. `agent run
+     --bot NAME` hands work to an existing bot that may have no gate, so a
+     task that asks for something this bot could not do unreviewed is
+     judged as if this bot did it.
    - Rules the user adds ("allow `cargo test`", "deny `git push`") are
      checked here. "Always allow" from the manual UI adds a rule here.
 3. **Jev, about 0.4 s.** One request per round: the state is the context
@@ -272,13 +330,19 @@ same module inside the app. It follows `approval_requested` on every bot
 4. **Unclear.** With a person attached (the app is open, or `agent
    approver --escalate`), the approver answers nothing and marks the call
    for the person, who sees only these. Unattended, it asks a larger model
-   if one is configured, else denies with "needs review". It never allows
-   on an unclear, failed, or timed-out verdict.
+   if one is configured, else denies. That larger model can be a bot in the
+   same daemon with only `read`, working as Codex's reviewer does: a
+   separate turn that may look at files before it answers. It never allows
+   on an unclear, failed, or timed-out verdict. As in Codex, the reason
+   says which it was: "judged risky: REASON" or "not reviewed: the check
+   failed", so the model can tell a refusal from an outage. A Jev request
+   gets 10 s, the SDK's default, before it counts as failed.
 5. **Circuit breaker.** After 3 denials in a row for a bot, or 20 in one
    turn, the approver stops answering that bot automatically and escalates
-   everything, or interrupts the turn when no one is attached. A model
-   that keeps trying variations of a denied action is the pattern this
-   catches.
+   everything, or interrupts the turn when no one is attached. Claude Code
+   uses 3 and 20 per session and then asks; Codex uses 3 in a row or 10 of
+   the last 50 and interrupts. A model that keeps trying variations of a
+   denied action is the pattern this catches.
 
 **What Jev is shown.** The human prompts, the round's planned calls, the
 calls already allowed in this turn, the workspace path, and the user's
@@ -288,10 +352,10 @@ content written to steer it "can move the answer", and a planned call is
 model-written text too: a command can carry a comment claiming the user
 approved it. So the intent question is asked of the human prompts, and a
 high risk that the prompts do not name is denied whatever the command
-says about itself. For a bot created by another
-bot, the prompt was written by a model; the approver follows `created_by` to
-the first bot a person prompted and shows that prompt as the user's intent,
-the child's prompt as a model-written task. Anthropic reports that most of
+says about itself. For a bot created by another bot, the prompt was
+written by a model; the approver follows `created_by` to the first bot a
+person prompted and shows that prompt as the user's intent, the child's
+prompt as a model-written task. Anthropic reports that most of
 its classifier's misses come from misjudging consent, and a delegation
 chain is where consent is easiest to fake.
 
@@ -333,8 +397,9 @@ like any other.
   announced when the plan commits, their verdicts come back together. A
   round pays about one Jev latency however many calls it has, instead of one
   per call, and later calls' verdicts overlap earlier calls' execution.
-- **Jev in context.** The live fleet check measured 1.9 s median per turn on
-  gpt-5.6-luna, so a round that needs Jev is roughly 20% slower. A
+- **Jev in context.** The live fleet check measured 1.9 s median for a
+  short turn on gpt-5.6-luna, so a model round that also needs Jev is
+  roughly 20% slower. A
   Terminal-Bench schemelike trial made 36 to 53 model calls
   (2026-09-26 rerun); if every round needed Jev that is 14 to 23 s more per
   trial. How many rounds reach Jev is the number that decides whether this
@@ -347,10 +412,11 @@ like any other.
 - **A person's wait.** Parking and recording the verdict are two commits,
   about 11 ms on an idle Mac; the call's start after resuming is a commit it
   makes anyway. A parked turn then costs a store row and a registry entry
-  ([parked turns](DAEMON_MEASUREMENTS.md#parked-turns)). A wait longer than the prompt-cache TTL (5 minutes by
-  default, `--cache-ttl 1h`) means the next model call writes the cache
-  again. Keeping it warm through a parked wait is the same open question as
-  parked `wait` turns (NEXT.md item 42).
+  ([parked turns](DAEMON_MEASUREMENTS.md#parked-turns)). A wait longer
+  than the prompt-cache TTL (5 minutes by default, `--cache-ttl 1h`) means
+  the next model call writes the cache again. Keeping it warm through a
+  parked wait is the same open question as parked `wait` turns (NEXT.md
+  item 42).
 
 **Placements considered and rejected:**
 
@@ -378,7 +444,8 @@ as one.
   multi-step chain in which each step looks benign passes any per-call judge
   that cannot see results; that is Rehberger's attack on Claude Code.
 - **A bot can reach the approval channel.** Its shell can call `answer` on
-  its own pending calls, create a bot without the gate, or edit the store.
+  its own pending calls, create a bot without the gate, hand its task to
+  an existing bot that has none, or edit the store.
   The rules layer denies the obvious forms; a determined command can hide
   them from any text-based judge. Making this a boundary means running the
   tools where the socket and the store are out of reach, in a container or
