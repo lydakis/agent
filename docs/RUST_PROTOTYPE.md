@@ -686,10 +686,13 @@ and its event once for each way the session follows the bot (by name,
 through `*`, or as the stdio firehose). Events reach followers from the
 publisher, which runs apart from replies, so an admission's event can arrive
 before or after its reply; an answered admission's events keep their room
-until the publisher has delivered them. An admission that finds nothing
-queued still waits for those events when they and it would not fit
-together, so it cannot commit ahead of an overflow they cause; past that it
-is handled as a lone request always was. The storage worker also tells the
+until the publisher has delivered them, and while the session has a follow
+of that bot still replaying history, until that replay catches up, since the
+publisher passes such a follow by and its replay delivers the event later.
+An admission that finds nothing queued still waits for the publisher to pass
+those events when they and it would not fit together, so it cannot commit
+ahead of an overflow they cause. It does not wait for a replay, which moves
+at its client's pace; past that it is handled as a lone request always was. The storage worker also tells the
 publisher how far each pass reached, so events a deletion removed before
 publication hold no room and no wait. Both are bounded from the
 request: a creation's record repeats the request's strings, and a reply or

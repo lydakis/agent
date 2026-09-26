@@ -602,13 +602,17 @@ struct Service {
     storage_backoff: Duration,
     /// When the ready turn a refused store left waiting is tried again.
     ready_retry_at: Option<tokio::time::Instant>,
-    /// Events of answered admissions that the publisher has not delivered
-    /// yet, oldest first. Each keeps its room in its session's queue.
+    /// Events of answered admissions not yet in their session's queue: the
+    /// publisher has not passed them, or a follow is still replaying toward
+    /// them. Each keeps its room in its session's queue.
     unpublished: std::collections::VecDeque<Unpublished>,
 }
 
 struct Unpublished {
     session: u64,
+    /// The bot whose event it is: a follow of it still replaying history
+    /// has not received it yet.
+    bot: String,
     cursor: i64,
     events: Sends,
 }
@@ -635,6 +639,8 @@ enum Pending {
     },
     /// The bot's record, and the cursor of its `created` event.
     Create {
+        /// The bot's name, kept when the session follows it.
+        bot: Option<String>,
         answer: Answer<(Value, Option<i64>)>,
         answered: Option<Result<(Value, Option<i64>)>>,
     },
@@ -652,9 +658,9 @@ async fn arrived(admissions: &mut std::collections::VecDeque<Admission>) {
         Pending::Submit {
             answer, answered, ..
         } if answered.is_none() => *answered = Some(answer.await),
-        Pending::Create { answer, answered } if answered.is_none() => {
-            *answered = Some(answer.await)
-        }
+        Pending::Create {
+            answer, answered, ..
+        } if answered.is_none() => *answered = Some(answer.await),
         _ => {}
     }
 }
@@ -1244,10 +1250,9 @@ impl Service {
 
     /// Events answered for `session` that the publisher has not delivered.
     fn pending_events(&self, session: u64) -> impl Iterator<Item = &Unpublished> {
-        let published = self.hub.published();
         self.unpublished
             .iter()
-            .filter(move |events| events.session == session && events.cursor > published)
+            .filter(move |events| events.session == session && !delivered(&self.hub, events))
     }
     /// For an admission that finds the window empty: the newest of its
     /// session's events answered but not yet delivered, when those events
@@ -1294,7 +1299,8 @@ impl Service {
             bound,
             pending,
         } = self.admissions.pop_front().expect("an admission is queued");
-        let (result, cursor) = match pending {
+        let followed = bound.events.packets > 0;
+        let (result, cursor, bot) = match pending {
             Pending::Submit {
                 bot,
                 request_id,
@@ -1306,35 +1312,31 @@ impl Service {
             } => {
                 self.reserved -= usize::from(reserved);
                 let answered = answered.expect("the submission was answered");
+                let name = followed.then(|| bot.clone());
                 let result = self.admitted(bot, request_id, delivery, draining, answered);
                 let cursor = result.as_ref().ok().and_then(|r| r["cursor"].as_i64());
-                (result, cursor)
+                (result, cursor, name)
             }
-            Pending::Create { answered, .. } => {
+            Pending::Create { bot, answered, .. } => {
                 match answered.expect("the creation was answered") {
-                    Ok((created, cursor)) => (Ok(created), cursor),
-                    Err(error) => (Err(error), None),
+                    Ok((created, cursor)) => (Ok(created), cursor, bot),
+                    Err(error) => (Err(error), None, None),
                 }
             }
-            Pending::Settled(result) => (result, None),
+            Pending::Settled(result) => (result, None, None),
         };
-        // Commits are answered in order, so cursors only grow.
-        let published = self.hub.published();
-        while self
-            .unpublished
-            .front()
-            .is_some_and(|events| events.cursor <= published)
-        {
-            self.unpublished.pop_front();
-        }
-        if let Some(cursor) = cursor.filter(|cursor| *cursor > published)
-            && bound.events.packets > 0
-        {
-            self.unpublished.push_back(Unpublished {
+        let hub = &self.hub;
+        self.unpublished.retain(|events| !delivered(hub, events));
+        if let (Some(cursor), Some(bot)) = (cursor, bot) {
+            let events = Unpublished {
                 session,
+                bot,
                 cursor,
                 events: bound.events,
-            });
+            };
+            if !delivered(hub, &events) {
+                self.unpublished.push_back(events);
+            }
         }
         (session, output, id, result)
     }
@@ -1668,6 +1670,7 @@ impl Service {
                     }
                 }
                 let (provider, model) = (provider.to_owned(), model.to_owned());
+                let follower = (bound.events.packets > 0).then(|| bot.clone());
                 let answer = store
                     .queue("create", move |db| {
                         let (created, event) = db.create(
@@ -1697,6 +1700,7 @@ impl Service {
                     id,
                     bound,
                     pending: Pending::Create {
+                        bot: follower,
                         answer,
                         answered: None,
                     },
@@ -2199,6 +2203,13 @@ async fn commit_finish(
         }
         backoff = (backoff * 2).min(Duration::from_secs(1));
     }
+}
+
+/// Whether an answered admission's events are in its session's queue: the
+/// publisher has passed them, and no follow of the bot in that session is
+/// still replaying history, which delivers them only when it reaches them.
+fn delivered(hub: &Hub, events: &Unpublished) -> bool {
+    events.cursor <= hub.published() && !hub.replaying(&events.bot, events.session)
 }
 
 /// Answer the admissions still queued at shutdown and start their turns, so
@@ -3905,6 +3916,45 @@ mod tests {
         };
         output.try_respond(id, Ok(result.unwrap())).unwrap();
         assert_eq!(service.unpublished.len(), 1, "only the late event waits");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_follow_still_replaying_keeps_room_for_published_events() {
+        let dir = scratch("admit-replaying");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        // The session follows every bot, but its replay has not caught up:
+        // the publisher passes it by.
+        let output = Output::writer(tokio::io::sink());
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        let command = create("Bob", &dir);
+        let bound = service.admission_sends(&command, &json!(0), 1);
+        assert_eq!(bound.events.packets, 1);
+        let deferred = service.dispatch(command, 1, &output, json!(0), bound).await;
+        assert_eq!(deferred.unwrap_err().code, "deferred");
+        let (_, _, _, result) = service.settle().await;
+        result.unwrap();
+        let cursor = service.unpublished.back().unwrap().cursor;
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        service.hub.published_through(cursor).await;
+        assert_eq!(
+            service.pending_events(1).count(),
+            1,
+            "published, but the replay has not delivered it"
+        );
+        // Once the replay reaches it, the event holds no room.
+        replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
+            .await
+            .unwrap();
+        assert_eq!(service.pending_events(1).count(), 0);
         publisher.abort();
         drop(service);
         drop(store);

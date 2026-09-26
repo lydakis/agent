@@ -49,7 +49,7 @@ pub const ALL: &str = "*";
 #[derive(Clone, Default)]
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
-    /// The newest durable cursor delivered to every follower.
+    /// The newest durable cursor delivered to every live follower.
     published: Arc<watch::Sender<i64>>,
 }
 #[derive(Default)]
@@ -109,6 +109,21 @@ impl Hub {
             .count();
         firehose + follows(ALL) + if bot == ALL { 0 } else { follows(bot) }
     }
+    /// Whether one of `session`'s follows that receives `bot`'s events is
+    /// still paging history: the publisher passes those follows by, and
+    /// their replay delivers the events when it reaches them. A follow busy
+    /// with a page counts as replaying, so this never waits on a store job.
+    pub fn replaying(&self, bot: &str, session: u64) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let replaying = |name: &str| {
+            inner.subs.get(name).is_some_and(|subs| {
+                subs.iter().any(|(id, sub)| {
+                    *id == session && sub.try_lock().map_or(true, |s| !s.live && !s.cancelled)
+                })
+            })
+        };
+        replaying(ALL) || (bot != ALL && replaying(bot))
+    }
     fn firehose(&self) -> Vec<Output> {
         self.inner
             .lock()
@@ -164,9 +179,10 @@ impl Hub {
         }
         sent
     }
-    /// The newest durable cursor delivered: every event up to it is in its
-    /// followers' queues, refused and their sessions closed, or was removed
-    /// before publication.
+    /// The newest durable cursor published: every event up to it is in its
+    /// live followers' queues, refused and their sessions closed, or was
+    /// removed before publication. A follow still replaying gets it from
+    /// its replay (see `replaying`).
     pub fn published(&self) -> i64 {
         *self.published.borrow()
     }
@@ -179,7 +195,7 @@ impl Hub {
             moved
         });
     }
-    /// Wait until every event up to `cursor` is delivered.
+    /// Wait until every event up to `cursor` is published.
     pub async fn published_through(&self, cursor: i64) {
         let mut published = self.published.subscribe();
         let _ = published.wait_for(|published| *published >= cursor).await;
