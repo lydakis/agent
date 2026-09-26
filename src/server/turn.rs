@@ -241,7 +241,8 @@ struct Accounting {
     /// reply streamed, and whether one was refused.
     warm_read_at: Option<tokio::time::Instant>,
     warm_stopped: bool,
-    /// The provider's sticky-routing token for this turn's model calls.
+    /// The provider's sticky-routing token for this turn's model calls,
+    /// kept in the park record while the turn waits.
     route: std::sync::OnceLock<String>,
 }
 impl Accounting {
@@ -330,11 +331,21 @@ impl Turn {
         let flushed = if let Ok(Round::Paced(at)) = &result {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
             let compaction = accounting.compaction;
+            let route = accounting.route.get().cloned();
             // Commit the park and its accounting together, outside cancellation.
             self.store
                 .op("suspend_paced", move |db| {
-                    db.suspend_paced(turn, at, attempts, spent, retries, paced_ms, compaction)
-                        .map(|_| ())
+                    db.suspend_paced(
+                        turn,
+                        at,
+                        attempts,
+                        spent,
+                        retries,
+                        paced_ms,
+                        compaction,
+                        route.as_deref(),
+                    )
+                    .map(|_| ())
                 })
                 .await
         } else if retries > 0 || paced_ms > 0 {
@@ -857,6 +868,10 @@ impl Turn {
                 // Queued while parked: absorbed at the first boundary below.
                 self.steers.store(true, Relaxed);
             }
+            // The park did not end the turn, so neither does its route.
+            if let Some(route) = waiting.route {
+                let _ = accounting.route.set(route);
+            }
             // Only a pool park continues the same model call's retry budget.
             if waiting.paced_since_ms.is_some() {
                 accounting.call_attempts = waiting.call_attempts;
@@ -876,6 +891,7 @@ impl Turn {
                         &environment,
                         &record.tools,
                         None,
+                        accounting.route.get().map(String::as_str),
                     )
                     .await?
                 {
@@ -1018,6 +1034,7 @@ impl Turn {
                     &environment,
                     &record.tools,
                     warm.as_mut(),
+                    accounting.route.get().map(String::as_str),
                 )
                 .await?;
             let refreshed = warm.map_or(0, |warm| warm.tokens);
@@ -1557,6 +1574,7 @@ impl Turn {
         environment: &[(String, String)],
         allowed: &[String],
         mut warm: Option<&mut Warm<'_>>,
+        route: Option<&str>,
     ) -> Result<bool> {
         let turn = self.turn;
         let mut calls = calls.into_iter();
@@ -1580,7 +1598,7 @@ impl Turn {
                     any,
                 }) => {
                     match self
-                        .park(&call.call_id, handles, timeout_ms, any, &mut calls)
+                        .park(&call.call_id, handles, timeout_ms, any, &mut calls, route)
                         .await?
                     {
                         Some(outcome) => outcome,
@@ -1745,6 +1763,7 @@ impl Turn {
         timeout_ms: Option<u64>,
         any: bool,
         calls: &mut std::vec::IntoIter<ToolCall>,
+        route: Option<&str>,
     ) -> Result<Option<Outcome>> {
         for text in &handles {
             match Handle::parse(text) {
@@ -1762,9 +1781,18 @@ impl Turn {
         let pending: Vec<ToolCall> = calls.collect();
         let deadline_ms = timeout_ms.map(|t| now_ms() + t);
         let (turn, id, list) = (self.turn, call_id.to_owned(), handles.clone());
+        let route = route.map(str::to_owned);
         self.store
             .op("suspend", move |db| {
-                db.suspend(turn, &id, &list, deadline_ms, any, &pending)
+                db.suspend(
+                    turn,
+                    &id,
+                    &list,
+                    deadline_ms,
+                    any,
+                    &pending,
+                    route.as_deref(),
+                )
             })
             .await?;
         self.handles

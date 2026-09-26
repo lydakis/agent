@@ -1836,7 +1836,15 @@ mod tests {
                 .into();
                 db.append(turn, vec![item], std::slice::from_ref(&call), None)?;
                 db.tool_start(turn, &call)?;
-                db.suspend(turn, &call.call_id, &["proc:1".into()], None, false, &[])?;
+                db.suspend(
+                    turn,
+                    &call.call_id,
+                    &["proc:1".into()],
+                    None,
+                    false,
+                    &[],
+                    None,
+                )?;
                 Ok(turn)
             })
             .await

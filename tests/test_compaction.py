@@ -167,7 +167,8 @@ class CompactionTests(ModelFixture):
         self.assertEqual(self.run_turn(client, 'Bob', 'large', 'y' * 2000)['data']['status'], 'completed')
         requests = self.requests()
         self.assertTrue(requests)
-        self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':')).encode()) - 2 <= 4096
+        # The bound is on the bytes sent, so measure UTF-8, not \u escapes.
+        self.assertTrue(all(len(json.dumps(r['input'], separators=(',', ':'), ensure_ascii=False).encode()) - 2 <= 4096
                             for r in requests))
         self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
 
