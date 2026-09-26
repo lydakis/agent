@@ -1867,18 +1867,15 @@ fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {
 }
 
 /// Failures of the provider's pace, capacity, or transport, none of which say
-/// anything about the request. Model-level outcomes (`provider_incomplete`)
-/// and client errors are final.
+/// anything about the request. Every 5xx is one, as Anthropic's SDK treats it
+/// (anthropic-sdk-python 4421d56, `_should_retry`): a CDN's 520 says no more
+/// than a 502. Model-level outcomes (`provider_incomplete`) and client errors
+/// are final.
 fn retryable(code: &str) -> bool {
     matches!(
         code,
         "provider_rate_limited"
             | "provider_http_429"
-            | "provider_http_500"
-            | "provider_http_502"
-            | "provider_http_503"
-            | "provider_http_504"
-            | "provider_http_529"
             | "provider_stream_failed"
             | "provider_stream_stalled"
             | "provider_login_refreshed"
@@ -1886,6 +1883,7 @@ fn retryable(code: &str) -> bool {
             | "provider_admission_timeout"
             | "provider_socket_expired"
     ) || code.starts_with("provider_connection_")
+        || code.starts_with("provider_http_5")
 }
 
 /// 250 ms doubling to 30 s, spread by up to a fifth either way so several

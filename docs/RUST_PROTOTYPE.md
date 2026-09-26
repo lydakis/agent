@@ -1173,7 +1173,8 @@ still pause its pool.
 
 A model call has no side effects, so a failed one is retried by rebuilding
 the request from the store: within 5 minutes, up to 8 attempts for capacity
-(5xx), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
+(any 5xx, as `_should_retry` in anthropic-sdk-python 4421d56 treats it,
+observed 2026-09-26), transport failures, or a stalled stream and up to 64 for refusals for pace, which the pool
 spaces and which are not the request's fault; never for a response the model
 could not finish (`provider_incomplete`) or a client error. The providers'
 reset headers are only how long a full refill takes; the pool learns the level
