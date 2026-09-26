@@ -47,11 +47,32 @@ const MODEL_JSON: usize = 64 + 1 + 6 * 256 + 2;
 /// fixed strings.
 const FIELDS_JSON: usize = 1024;
 
-/// Bytes and packets an admission sends its own session once its commit lands.
+/// Bytes and packets sent to one session.
 #[derive(Clone, Copy, Default)]
 struct Sends {
     bytes: usize,
     packets: usize,
+}
+impl std::ops::Add for Sends {
+    type Output = Sends;
+    fn add(self, other: Sends) -> Sends {
+        Sends {
+            bytes: self.bytes + other.bytes,
+            packets: self.packets + other.packets,
+        }
+    }
+}
+/// What an admission sends its own session: its reply when it is answered,
+/// and its event copies when the publisher delivers them, which can be later.
+#[derive(Clone, Copy, Default)]
+struct Bound {
+    reply: Sends,
+    events: Sends,
+}
+impl Bound {
+    fn total(self) -> Sends {
+        self.reply + self.events
+    }
 }
 
 /// At least what an admission sends its own session once its commit lands:
@@ -63,7 +84,7 @@ struct Sends {
 /// canonical workspace; a submission names its bot twice. A refusal says no
 /// more, and may name what it refused. The event names the bot, the request
 /// or creator, a workspace and a model.
-fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Sends {
+fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
     let (reply, named, reply_workspace) = match command {
         Command::Create {
             bot,
@@ -102,13 +123,19 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Sends {
             output::encoded_len(&(bot, request_id)),
             0,
         ),
-        _ => return Sends::default(),
+        _ => return Bound::default(),
     };
     let reply = reply.unwrap_or(output::MAX_EVENT) + reply_workspace + FIELDS_JSON;
     let event = named.unwrap_or(output::MAX_EVENT) + PATH_JSON + MODEL_JSON + FIELDS_JSON;
-    Sends {
-        bytes: reply + deliveries * event,
-        packets: 1 + deliveries,
+    Bound {
+        reply: Sends {
+            bytes: reply,
+            packets: 1,
+        },
+        events: Sends {
+            bytes: deliveries * event,
+            packets: deliveries,
+        },
     }
 }
 
@@ -570,6 +597,15 @@ struct Service {
     /// Active slots promised to queued admissions told they may start a
     /// turn; each is released when its admission is answered.
     reserved: usize,
+    /// Events of answered admissions that the publisher has not delivered
+    /// yet, oldest first. Each keeps its room in its session's queue.
+    unpublished: std::collections::VecDeque<Unpublished>,
+}
+
+struct Unpublished {
+    session: u64,
+    cursor: i64,
+    events: Sends,
 }
 
 /// A queued admission and whom to answer.
@@ -578,7 +614,7 @@ struct Admission {
     output: Output,
     id: Value,
     /// `admission_bound` of its request: room it holds in its session's queue.
-    bound: Sends,
+    bound: Bound,
     pending: Pending,
 }
 enum Pending {
@@ -592,9 +628,10 @@ enum Pending {
         answer: Answer<(i64, Started)>,
         answered: Option<Result<(i64, Started)>>,
     },
+    /// The bot's record, and the cursor of its `created` event.
     Create {
-        answer: Answer<Value>,
-        answered: Option<Result<Value>>,
+        answer: Answer<(Value, Option<i64>)>,
+        answered: Option<Result<(Value, Option<i64>)>>,
     },
     /// Settled before queueing (a refused request), kept in line so replies
     /// stay in request order.
@@ -881,6 +918,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         draining: false,
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
+        unpublished: std::collections::VecDeque::new(),
     };
     for (at, bot, turn) in paced_at_start {
         service.paced.push(std::cmp::Reverse((at, bot, turn)));
@@ -974,7 +1012,7 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 Value::String(text) if text.len() <= 128 => Ok(request),
                                 _ => fail("invalid_request_id"),
                             });
-                            let bound = request.as_ref().map_or(Sends::default(), |r| service.admission_sends(&r.command, &r.id, id));
+                            let bound = request.as_ref().map_or(Bound::default(), |r| service.admission_sends(&r.command, &r.id, id));
                             // Everything but an admission with room waits for the
                             // admissions already queued, keeping request order.
                             while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, bound) {
@@ -1137,16 +1175,9 @@ impl Service {
             && (self.limit_active == 0 || self.active.len() + self.reserved < self.limit_active)
     }
 
-    /// Whether a request must wait for queued admissions to be answered
-    /// before it is handled. Only an admission may join them, and only while
-    /// the window has room, its session's output queue can take what it and
-    /// the admissions queued for that session will send, and its capacity
-    /// answer is the one the serial order would give: with no slot left
-    /// unpromised, whether one frees up depends on how the queued
-    /// admissions end.
     /// What an admission will send `session`: its reply, and its event once
     /// for each way the session follows the bot.
-    fn admission_sends(&self, command: &Command, id: &Value, session: u64) -> Sends {
+    fn admission_sends(&self, command: &Command, id: &Value, session: u64) -> Bound {
         let deliveries = match command {
             Command::Create { bot, .. } | Command::Submit { bot, .. } => {
                 self.hub.deliveries(bot, session)
@@ -1156,12 +1187,19 @@ impl Service {
         admission_bound(command, id, deliveries)
     }
 
+    /// Whether a request must wait for queued admissions to be answered
+    /// before it is handled. Only an admission may join them, and only while
+    /// the window has room, its session's output queue can take what it,
+    /// the admissions queued for that session, and the events of those
+    /// answered but not yet published will send, and its capacity answer is
+    /// the one the serial order would give: with no slot left unpromised,
+    /// whether one frees up depends on how the queued admissions end.
     fn must_settle(
         &self,
         command: Option<&Command>,
         session: u64,
         output: &Output,
-        bound: Sends,
+        bound: Bound,
     ) -> bool {
         if self.admissions.is_empty() {
             return false;
@@ -1171,14 +1209,20 @@ impl Service {
                 return true;
             }
             let (bytes, packets) = output.room();
-            let promised = self
+            let published = self.hub.published();
+            let queued = self
                 .admissions
                 .iter()
                 .filter(|admission| admission.session == session)
-                .fold(bound, |sum, admission| Sends {
-                    bytes: sum.bytes + admission.bound.bytes,
-                    packets: sum.packets + admission.bound.packets,
-                });
+                .map(|admission| admission.bound.total());
+            let answered = self
+                .unpublished
+                .iter()
+                .filter(|events| events.session == session && events.cursor > published)
+                .map(|events| events.events);
+            let promised = queued
+                .chain(answered)
+                .fold(bound.total(), |sum, sends| sum + sends);
             promised.bytes > bytes || promised.packets > packets
         };
         match command {
@@ -1201,16 +1245,17 @@ impl Service {
     }
     /// Answer the oldest admission, whose commit `arrived` has seen, applying
     /// what the serial path did after its store call: start the turn, flag a
-    /// steer, release the reserved slot.
+    /// steer, release the reserved slot. Its events keep their room in the
+    /// session's queue until the publisher has delivered them.
     fn settled(&mut self) -> (u64, Output, Value, Result<Value>) {
         let Admission {
             session,
             output,
             id,
+            bound,
             pending,
-            ..
         } = self.admissions.pop_front().expect("an admission is queued");
-        let result = match pending {
+        let (result, cursor) = match pending {
             Pending::Submit {
                 bot,
                 request_id,
@@ -1222,11 +1267,36 @@ impl Service {
             } => {
                 self.reserved -= usize::from(reserved);
                 let answered = answered.expect("the submission was answered");
-                self.admitted(bot, request_id, delivery, draining, answered)
+                let result = self.admitted(bot, request_id, delivery, draining, answered);
+                let cursor = result.as_ref().ok().and_then(|r| r["cursor"].as_i64());
+                (result, cursor)
             }
-            Pending::Create { answered, .. } => answered.expect("the creation was answered"),
-            Pending::Settled(result) => result,
+            Pending::Create { answered, .. } => {
+                match answered.expect("the creation was answered") {
+                    Ok((created, cursor)) => (Ok(created), cursor),
+                    Err(error) => (Err(error), None),
+                }
+            }
+            Pending::Settled(result) => (result, None),
         };
+        // Commits are answered in order, so cursors only grow.
+        let published = self.hub.published();
+        while self
+            .unpublished
+            .front()
+            .is_some_and(|events| events.cursor <= published)
+        {
+            self.unpublished.pop_front();
+        }
+        if let Some(cursor) = cursor.filter(|cursor| *cursor > published)
+            && bound.events.packets > 0
+        {
+            self.unpublished.push_back(Unpublished {
+                session,
+                cursor,
+                events: bound.events,
+            });
+        }
         (session, output, id, result)
     }
 
@@ -1451,7 +1521,7 @@ impl Service {
         session: u64,
         output: &Output,
         id: Value,
-        bound: Sends,
+        bound: Bound,
     ) -> Result<Value> {
         let store = &self.store;
         match command {
@@ -1518,7 +1588,7 @@ impl Service {
                 let (provider, model) = (provider.to_owned(), model.to_owned());
                 let answer = store
                     .queue("create", move |db| {
-                        let (created, _event) = db.create(
+                        let (created, event) = db.create(
                             &bot,
                             path.as_deref(),
                             Binding {
@@ -1536,7 +1606,7 @@ impl Service {
                                 fallbacks,
                             },
                         )?;
-                        Ok(serde_json::to_value(created)?)
+                        Ok((serde_json::to_value(created)?, event["cursor"].as_i64()))
                     })
                     .await?;
                 self.admissions.push_back(Admission {
@@ -2392,6 +2462,7 @@ mod tests {
             paced: std::collections::BinaryHeap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
             reserved: 0,
         };
         service.jobs.spawn(async move {
@@ -2409,7 +2480,7 @@ mod tests {
                 0,
                 &output,
                 Value::Null,
-                Sends::default(),
+                Bound::default(),
             )
             .await
             .unwrap_err();
@@ -2423,7 +2494,7 @@ mod tests {
                 0,
                 &output,
                 Value::Null,
-                Sends::default(),
+                Bound::default(),
             )
             .await
             .unwrap();
@@ -2593,6 +2664,7 @@ mod tests {
             paced: std::collections::BinaryHeap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
             reserved: 0,
         };
         let duplicate = request(&mut service, submit("Bob", "same"), &output)
@@ -2802,6 +2874,7 @@ mod tests {
             paced: std::collections::BinaryHeap::new(),
             draining: false,
             admissions: std::collections::VecDeque::new(),
+            unpublished: std::collections::VecDeque::new(),
             reserved: 0,
         }
     }
@@ -3081,7 +3154,7 @@ mod tests {
                 }),
                 0,
                 &output,
-                Sends::default()
+                Bound::default()
             ),
             "anything else waits for queued admissions"
         );
@@ -3299,6 +3372,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn answered_admissions_keep_room_for_events_not_yet_published() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("admit-unpublished");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        // The session follows every bot. Its client reads until a marker,
+        // then stops, as a slow client would.
+        let (near, far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(far).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("marker") {
+                    break;
+                }
+            }
+            lines
+        });
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
+            .await
+            .unwrap();
+        output.try_send(json!({"marker": true})).unwrap();
+        let _stalled = reader.await.unwrap();
+        // Two windows are answered before the publisher runs: the second
+        // must leave room for the first one's events.
+        let names: Vec<String> = (0..2 * ADMISSION_WINDOW).map(|n| format!("B{n}")).collect();
+        let mut queued = 0;
+        let mut windows = Vec::new();
+        for most in [ADMISSION_WINDOW / 2, ADMISSION_WINDOW] {
+            let first = queued;
+            while queued < names.len() && queued - first < most {
+                let command = create(&names[queued], &dir);
+                let bound = service.admission_sends(&command, &json!(queued), 1);
+                if service.must_settle(Some(&command), 1, &output, bound) {
+                    break;
+                }
+                let deferred = service
+                    .dispatch(command, 1, &output, json!(queued), bound)
+                    .await;
+                assert_eq!(deferred.unwrap_err().code, "deferred");
+                queued += 1;
+            }
+            windows.push(queued - first);
+            while !service.admissions.is_empty() {
+                let (_, output, id, result) = service.settle().await;
+                output.try_respond(id, Ok(result.unwrap())).unwrap();
+            }
+        }
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !*output.subscribe_closed().borrow(),
+            "windows of {windows:?} fit with their events"
+        );
+        assert!(windows[1] > 1, "{windows:?}");
+        // Published events no longer hold room.
+        assert_eq!(service.hub.published(), queued as i64);
+        let (_, output, id, result) = {
+            let command = create("Late", &dir);
+            let bound = service.admission_sends(&command, &json!("late"), 1);
+            let deferred = service
+                .dispatch(command, 1, &output, json!("late"), bound)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            service.settle().await
+        };
+        output.try_respond(id, Ok(result.unwrap())).unwrap();
+        assert_eq!(service.unpublished.len(), 1, "only the late event waits");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn admission_bounds_cover_a_reply_and_its_event() {
         let dir = scratch("admission-bound");
         let (store, mut publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
@@ -3342,14 +3495,16 @@ mod tests {
                     break entry;
                 }
             };
-            let sent =
-                output::encoded_len(&reply).unwrap() + output::encoded_len(&event).unwrap() + 2;
+            // Each is a line: its JSON and a newline.
+            let replied = output::encoded_len(&reply).unwrap() + 1;
+            let published = output::encoded_len(&event).unwrap() + 1;
             assert!(
-                sent <= bound.bytes,
-                "{sent} bytes sent, {} promised",
-                bound.bytes
+                replied <= bound.reply.bytes && published <= bound.events.bytes,
+                "{replied} and {published} bytes sent, {} and {} promised",
+                bound.reply.bytes,
+                bound.events.bytes
             );
-            assert_eq!(bound.packets, 2, "a reply and one event");
+            assert_eq!((bound.reply.packets, bound.events.packets), (1, 1));
         }
         drop(service);
         drop(store);
@@ -3448,7 +3603,7 @@ mod tests {
                     0,
                     &output,
                     json!(index),
-                    Sends::default(),
+                    Bound::default(),
                 )
                 .await;
             assert_eq!(deferred.unwrap_err().code, "deferred");

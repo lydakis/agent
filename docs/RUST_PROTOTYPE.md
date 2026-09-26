@@ -683,7 +683,9 @@ back once their commit lands, faster than any client reads them, so an
 admission also waits when its session's output queue could not take what it
 and the admissions already queued for that session will send: each reply,
 and its event once for each way the session follows the bot (by name,
-through `*`, or as the stdio firehose). Both are bounded from the
+through `*`, or as the stdio firehose). Events reach followers after the
+reply, from the publisher, so an answered admission's events keep their room
+until the publisher has delivered them. Both are bounded from the
 request: a creation's record repeats the request's strings, and a reply or
 event adds at most a canonical workspace and a model reference. A lost group answers each of its
 admissions with `storage_error`, starts no turn, and frees their slots. A
