@@ -1126,7 +1126,7 @@ impl Turn {
             };
             accounting.begin(attempt > 0);
             (accounting.warm_read_at, accounting.warm_stopped) = (None, false);
-            let sent = std::sync::OnceLock::new();
+            let sent = agent_runtime::provider::Sent::default();
             let call = provider.complete_accounted(
                     ModelRequest {
                         model,
@@ -1173,7 +1173,7 @@ impl Turn {
                     let result = self.stream_warm(call, &sent, &mut warm).await;
                     // The call's own read, unless a refresh read the cache since.
                     accounting.warm_read_at =
-                        Some(sent.get().map_or(warm.read_at, |&at| warm.read_at.max(at)));
+                        Some(sent.get().map_or(warm.read_at, |at| warm.read_at.max(at)));
                     accounting.warm_stopped = warm.stopped;
                     let refreshed = warm.tokens;
                     record.tokens_used = record.tokens_used.saturating_add(refreshed);
@@ -1181,7 +1181,7 @@ impl Turn {
                 }
                 _ => call.await,
             };
-            let sent_ms = sent.get().map_or(0, |&at| epoch_ms(at));
+            let sent_ms = sent.get().map_or(0, epoch_ms);
             let error = match result {
                 Ok(mut completion) => {
                     if let Some(usage) = &mut completion.usage {
@@ -1359,7 +1359,7 @@ impl Turn {
     async fn stream_warm<T>(
         &self,
         call: impl std::future::Future<Output = T>,
-        sent: &std::sync::OnceLock<tokio::time::Instant>,
+        sent: &agent_runtime::provider::Sent,
         warm: &mut Warm<'_>,
     ) -> Result<T> {
         tokio::pin!(call);
@@ -1371,7 +1371,7 @@ impl Turn {
                 // Nothing is cached before the send, and one still to come
                 // leaves the cache unread for `after` no sooner than from now.
                 let due = match sent.get() {
-                    Some(&at) => warm.read_at.max(at),
+                    Some(at) => warm.read_at.max(at),
                     None => tokio::time::Instant::now(),
                 } + warm.after;
                 tokio::select! {
@@ -1379,7 +1379,7 @@ impl Turn {
                     result = &mut call => return Ok(result),
                     () = tokio::time::sleep_until(due) => {}
                 }
-                let Some(&at) = sent.get() else { continue };
+                let Some(at) = sent.get() else { continue };
                 warm.read_at = warm.read_at.max(at);
                 if warm.read_at + warm.after > tokio::time::Instant::now() {
                     continue;

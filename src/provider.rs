@@ -327,10 +327,24 @@ pub struct Request<'a> {
     /// token must not cross into another turn (openai/codex aa38089,
     /// core/src/client.rs). HTTP only.
     pub route: Option<&'a OnceLock<String>>,
-    /// Set when the request is first sent, where its prompt cache's lifetime
+    /// When the request was last sent, where its prompt cache's lifetime
     /// starts. Shared so a caller refreshing that cache while the reply
     /// streams can read it before the call returns.
-    pub sent: Option<&'a OnceLock<tokio::time::Instant>>,
+    pub sent: Option<&'a Sent>,
+}
+
+/// When a request was last sent: a socket continuation the server forgot is
+/// sent again in full, and that send is the one that reads the cache and
+/// is billed.
+#[derive(Debug, Default)]
+pub struct Sent(std::sync::Mutex<Option<tokio::time::Instant>>);
+impl Sent {
+    fn mark(&self) {
+        *self.0.lock().unwrap() = Some(tokio::time::Instant::now());
+    }
+    pub fn get(&self) -> Option<tokio::time::Instant> {
+        *self.0.lock().unwrap()
+    }
 }
 
 /// A request's place in its bot's history. `items` is the whole input; when
@@ -974,7 +988,7 @@ impl Provider {
         reservation.dispatch();
         report.dispatched = true;
         if let Some(sent) = sent {
-            let _ = sent.set(tokio::time::Instant::now());
+            sent.mark();
         }
         let response = match http.send().await {
             Ok(response) => response,
@@ -1254,7 +1268,7 @@ impl Provider {
                             reservation.dispatch();
                             report.dispatched = true;
                             if let Some(sent) = sent {
-                                let _ = sent.set(tokio::time::Instant::now());
+                                sent.mark();
                             }
                             if let Some(headers) = &failure.headers {
                                 reservation.learn(headers, self.family);
@@ -1287,7 +1301,7 @@ impl Provider {
             reservation.dispatch();
             report.dispatched = true;
             if let Some(sent) = sent {
-                let _ = sent.set(tokio::time::Instant::now());
+                sent.mark();
             }
             match session
                 .exchange(
