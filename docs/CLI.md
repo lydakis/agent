@@ -60,8 +60,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   gate), `manual` waits for an answer from any client, and `auto` is refused
   with `approval_mode_unsupported` until an automatic approver exists.
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
-  picks the gated tools; the default is every tool but `history`, `wait`,
-  `note`, and `echo`. A fork keeps its source's gates and a created bot its
+  picks the gated tools and must name at least one; the default is every
+  tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)).
 - `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
   With `--pretty`, each call shows what it would do and, for each gate still

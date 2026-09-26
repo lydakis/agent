@@ -390,6 +390,12 @@ class ApprovalCliTests(ModelFixture):
         self.assertIn('--approval manual', full.stderr)
         unknown = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'some', 'hi', check=False)
         self.assertEqual(unknown.returncode, 2)
+        # Asked to gate nothing is refused, not run ungated.
+        for listed in ('', ',,'):
+            empty = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'manual',
+                               '--approve', listed, 'hi', check=False)
+            self.assertEqual(empty.returncode, 2)
+            self.assertIn('--approve names no tools', empty.stderr)
         existing = self.agent('run', *self.common, '--bot', 'Bob', '--approval', 'manual', 'hi', check=False)
         self.assertEqual(existing.returncode, 2)
         self.assertIn('creation options', existing.stderr)

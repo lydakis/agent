@@ -705,10 +705,13 @@ fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
                     .cloned()
                     .collect(),
             };
-            if approve.is_empty() {
-                return Ok(json!({}));
+            match approve.is_empty() {
+                // Asked to gate nothing: refused rather than run ungated.
+                true if options.approve.is_some() => fail_with("usage", "--approve names no tools"),
+                // A bot with only ungated tools has nothing to wait for.
+                true => Ok(json!({})),
+                false => Ok(json!({"approve":approve,"approver":"manual"})),
             }
-            Ok(json!({"approve":approve,"approver":"manual"}))
         }
         "auto" => fail_with(
             "approval_mode_unsupported",
@@ -1414,28 +1417,49 @@ fn exit_code(data: &Value) -> i32 {
     }
 }
 
-/// The argument that says what a call of this tool does, if it has one.
-fn summary_key(name: &str) -> &'static str {
+/// The arguments that say what a call of this tool does, if it has any:
+/// the first is shown bare, a later one after its name. A `read` names a
+/// file or another call's artifact.
+fn summary_keys(name: &str) -> &'static [&'static str] {
     match name {
-        "shell" => "command",
-        "read" | "write" | "edit" => "path",
-        _ => "",
+        "shell" => &["command"],
+        "read" => &["path", "artifact"],
+        "write" | "edit" => &["path"],
+        _ => &[],
     }
+}
+
+/// The first of `keys` that `field` finds, labeled when it is not the
+/// first, or what is missing.
+fn summary_field(
+    keys: &[&str],
+    mut field: impl FnMut(&str) -> Option<String>,
+) -> std::result::Result<String, String> {
+    keys.iter()
+        .enumerate()
+        .find_map(|(index, key)| {
+            field(key).map(|text| match index {
+                0 => text,
+                _ => format!("{key} {text}"),
+            })
+        })
+        .ok_or_else(|| keys.join(" or "))
 }
 
 /// A started call's arguments as one short line: the command or path when
 /// the tool has one. Arguments may be a preview cut short, so the field is
 /// read from as much of the text as there is.
 fn summary(name: &str, arguments: &str) -> String {
-    let key = summary_key(name);
-    let text = if key.is_empty() {
+    let keys = summary_keys(name);
+    let text = if keys.is_empty() {
         arguments.to_owned()
     } else {
-        match serde_json::from_str::<Value>(arguments) {
-            Ok(args) => args[key].as_str().map(str::to_owned),
-            Err(_) => preview_field(arguments, key),
-        }
-        .unwrap_or_else(|| format!("[no {key} in the arguments shown]"))
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        summary_field(keys, |key| match &parsed {
+            Some(args) => args[key].as_str().map(str::to_owned),
+            None => preview_field(arguments, key),
+        })
+        .unwrap_or_else(|missing| format!("[no {missing} in the arguments shown]"))
     };
     one_line(&text, false)
 }
@@ -1583,19 +1607,19 @@ fn call_line(call: &Value) -> String {
             .as_array()
             .is_some_and(|cut| cut.iter().any(|field| field == key))
     };
-    let shown = match summary_key(name) {
+    let shown = match summary_keys(name) {
         _ if !arguments.is_object() => "[arguments are not a JSON object]".to_owned(),
-        "" => one_line(
+        [] => one_line(
             &arguments.to_string(),
             call["arguments_cut"]
                 .as_array()
                 .is_some_and(|cut| !cut.is_empty())
                 || call["arguments_omitted"].as_u64().unwrap_or(0) > 0,
         ),
-        key => match arguments[key].as_str() {
-            Some(text) => one_line(text, cut(key)),
-            None => format!("[no {key} in the arguments]"),
-        },
+        keys => summary_field(keys, |key| {
+            arguments[key].as_str().map(|text| one_line(text, cut(key)))
+        })
+        .unwrap_or_else(|missing| format!("[no {missing} in the arguments]")),
     };
     format!("{name} {shown}")
 }
@@ -1759,6 +1783,16 @@ mod tests {
         );
         assert_eq!(summary("shell", r#"{"command":"ls"}"#), "ls");
         assert_eq!(summary("shell", r#"{"command":"ec"#), "ec");
+        // A read names a file or another call's artifact.
+        assert_eq!(
+            summary("read", r#"{"artifact":"3/call_1/stdout","offset":1}"#),
+            "artifact 3/call_1/stdout"
+        );
+        assert_eq!(summary("read", r#"{"path":"a.txt"}"#), "a.txt");
+        assert_eq!(
+            summary("read", r#"{"offset":1}"#),
+            "[no path or artifact in the arguments shown]"
+        );
     }
 
     #[test]
@@ -1795,6 +1829,17 @@ mod tests {
         assert_eq!(
             line("edit", json!({"arguments":{"old":"a"}})),
             "edit [no path in the arguments]"
+        );
+        assert_eq!(
+            line(
+                "read",
+                json!({"arguments":{"artifact":"3/call_1/stdout","offset":1}})
+            ),
+            "read artifact 3/call_1/stdout"
+        );
+        assert_eq!(
+            line("read", json!({"arguments":{"offset":1}})),
+            "read [no path or artifact in the arguments]"
         );
         assert_eq!(
             line("shell", json!({"arguments":null})),
