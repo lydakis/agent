@@ -63,7 +63,7 @@ fn stored(db: &mut Database, name: &str) -> Vec<Value> {
     let Some(window) = db.window(name, i64::MAX, i64::MAX).unwrap() else {
         return Vec::new();
     };
-    let joined = db.items_by_ids(&window.ids, 0).unwrap();
+    let joined = db.items_by_ids(&window.ids, 0, 0).unwrap();
     serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap()
 }
 fn result(output: &str) -> Outcome {
@@ -1717,7 +1717,7 @@ fn context_windows_start_at_turn_boundaries_and_move_with_hysteresis() {
     let all = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
     assert_eq!(all.ids.len(), 20);
     assert_eq!((all.omitted_items, all.omitted_turns), (0, 0));
-    let joined = db.items_by_ids(&all.ids, 0).unwrap();
+    let joined = db.items_by_ids(&all.ids, 0, 0).unwrap();
     assert_eq!(joined.len() as i64, all.item_bytes + 19);
     let parsed: Vec<Value> = serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap();
     assert_eq!(parsed[0]["content"][0]["text"], "p1");
@@ -1855,7 +1855,7 @@ fn history_preserves_content_beyond_the_preview() {
         .unwrap();
     db.finish(turn, None).unwrap();
     let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
-    let replay = db.items_by_ids(&window.ids, 0).unwrap();
+    let replay = db.items_by_ids(&window.ids, 0, 0).unwrap();
     let page = db.history_read("Bob", 1, 0, 65536).unwrap();
     assert!(page["text"].as_str().unwrap().contains("final fact"));
     // The reading view keeps reasoning summaries but excludes opaque state.
@@ -1887,7 +1887,7 @@ fn history_preserves_content_beyond_the_preview() {
     assert_eq!(records.len(), 3);
     assert_eq!(records[1]["summary"][0]["text"], "Résumé 🦀");
     assert_eq!(records[1]["type"], "reasoning");
-    assert_eq!(db.items_by_ids(&window.ids, 0).unwrap(), replay);
+    assert_eq!(db.items_by_ids(&window.ids, 0, 0).unwrap(), replay);
     assert!(
         String::from_utf8(replay)
             .unwrap()
@@ -1965,7 +1965,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             .unwrap();
         db.finish(turn, None).unwrap();
         let window = db.window(name, i64::MAX, i64::MAX).unwrap().unwrap();
-        let replay = db.items_by_ids(&window.ids, 0).unwrap();
+        let replay = db.items_by_ids(&window.ids, 0, 0).unwrap();
         assert!(replay.ends_with(item.as_bytes()));
         let mut joined = String::new();
         let mut offset = 0;
@@ -1991,7 +1991,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
         if !item.contains(['\r', '\n']) {
             assert_eq!(joined.lines().nth(1).unwrap(), item);
         }
-        assert_eq!(db.items_by_ids(&window.ids, 0).unwrap(), replay);
+        assert_eq!(db.items_by_ids(&window.ids, 0, 0).unwrap(), replay);
     }
 }
 
@@ -4363,7 +4363,7 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
             assert_eq!(view.covered, (1, 3));
             assert_eq!(view.prompts, expected);
             // Compaction leaves the original native items retrievable.
-            let raw = db.items_by_ids(&plan.ids, 0).unwrap();
+            let raw = db.items_by_ids(&plan.ids, 0, 0).unwrap();
             let items: Vec<Value> =
                 serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
             assert_eq!(items.len(), 6);
@@ -5126,8 +5126,8 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
         window.thinking.iter().map(|&t| t as usize).sum::<usize>(),
         stripped
     );
-    let full = db.items_by_ids(&window.ids, 0).unwrap();
-    let sent = db.items_by_ids(&window.ids, i64::MAX).unwrap();
+    let full = db.items_by_ids(&window.ids, 0, 0).unwrap();
+    let sent = db.items_by_ids(&window.ids, i64::MAX, 0).unwrap();
     assert_eq!(full.len() - sent.len(), stripped);
     assert!(!String::from_utf8(sent).unwrap().contains("\"thinking\""));
     let bob = db.inspect("Bob").unwrap();
@@ -5174,4 +5174,338 @@ fn a_store_keeps_its_identity_and_forks_inherit_fallbacks() {
     assert_ne!(other.store_identity().unwrap(), identity);
     drop((db, other));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// One answered model round in a running turn: the model's call, then its
+/// result. Returns the call's node and the result's.
+fn exchange(db: &mut Database, turn: i64, call_id: &str, output: &str) -> (i64, i64) {
+    let call = ToolCall {
+        name: "shell".into(),
+        call_id: call_id.into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":call_id,"name":"shell","arguments":"{}"});
+    let entries = db
+        .append(
+            turn,
+            vec![serde_json::to_vec(&item).unwrap().into()],
+            std::slice::from_ref(&call),
+            None,
+        )
+        .unwrap();
+    let asked = entries
+        .iter()
+        .find_map(|entry| entry["data"]["node"].as_i64())
+        .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let (_, entry) = db.tool_finish(turn, call_id, &result(output)).unwrap();
+    (asked, entry["data"]["node"].as_i64().unwrap())
+}
+fn lines(tag: usize, count: usize) -> String {
+    (0..count)
+        .map(|n| format!("result {tag} line {n}\n"))
+        .collect()
+}
+/// A window's items as the runtime sends them, checked against the sizes
+/// the window counted for them.
+fn sent(db: &Database, window: &agent_runtime::store::Window) -> Vec<Value> {
+    let mut items = Vec::new();
+    for (id, size) in window.ids.iter().zip(&window.sizes) {
+        let bytes = db.items_by_ids(&[*id], 0, window.elided).unwrap();
+        assert_eq!(bytes.len(), *size as usize, "node {id}");
+        items.push(serde_json::from_slice(&bytes).unwrap());
+    }
+    let joined = db.items_by_ids(&window.ids, 0, window.elided).unwrap();
+    assert_eq!(
+        joined.len() as i64 + 1,
+        window.item_bytes + window.ids.len() as i64
+    );
+    items
+}
+
+#[test]
+fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
+    let path = std::env::temp_dir().join(format!("agent-elision-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let mut rounds = Vec::new();
+    for n in 0..6 {
+        rounds.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 400)));
+    }
+    let before = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(before.elided, 0);
+    let full = sent(&db, &before);
+    // Keep about two results verbatim. The newest result is not answered
+    // yet, so however little is kept, the floor stays below its call.
+    let size = full[2].to_string().len() as i64;
+    let plan = db.elision_plan("Bob", 2 * size, 1).unwrap().unwrap();
+    assert!(plan.through < rounds[5].0);
+    let tight = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    assert_eq!(tight.through, rounds[5].0);
+    assert!(
+        db.elision_plan("Bob", 2 * size, plan.saved_bytes + 1)
+            .unwrap()
+            .is_none()
+    );
+    let entry = db.elide("Bob", &plan).unwrap();
+    assert_eq!(entry["event"], "elided");
+    assert_eq!(entry["turn"], turn);
+    assert_eq!(entry["data"]["through"], plan.through);
+    assert_eq!(entry["data"]["results"], plan.results);
+    // Moving the floor is forward only, once per head.
+    assert_eq!(
+        db.elide("Bob", &plan).unwrap_err().code,
+        "elision_not_forward"
+    );
+    let after = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(after.ids, before.ids);
+    assert_eq!(after.elided, plan.through);
+    assert_eq!(before.item_bytes - after.item_bytes, plan.saved_bytes);
+    assert_eq!(
+        before.unsummarized.bytes - after.unsummarized.bytes,
+        plan.saved_bytes as usize
+    );
+    let items = sent(&db, &after);
+    let mut stubs = 0;
+    for (item, id) in items.iter().zip(&after.ids) {
+        let output = item["output"].as_str().unwrap_or("");
+        if output.starts_with("[tool result elided") {
+            stubs += 1;
+            assert!(*id <= plan.through);
+            // The same call id, the size, the reference, both ends.
+            assert!(item["call_id"].as_str().unwrap().starts_with('c'));
+            assert!(output.contains(&format!("artifact \"result/{id}\"")));
+            let whole = db.result_lines("Bob", *id, 1, 5000).unwrap();
+            assert!(whole.contains("line 399"), "{whole}");
+            assert!(output.contains("line 0") && output.contains("line 399"));
+        } else if item["type"] == "function_call_output" {
+            assert!(*id > plan.through, "{id}");
+        }
+    }
+    assert_eq!(stubs, plan.results);
+    // The stored transcript itself is unchanged.
+    assert_eq!(stored(&mut db, "Bob"), full);
+    // A result that is not on the reader's lineage is not theirs to read.
+    db.create("Other", Some("/synthetic"), binding()).unwrap();
+    assert_eq!(
+        db.result_lines("Other", rounds[0].1, 1, 10)
+            .unwrap_err()
+            .code,
+        "result_not_found"
+    );
+    assert_eq!(
+        db.result_lines("Bob", rounds[0].0, 1, 10).unwrap_err().code,
+        "result_not_found"
+    );
+    // Forks see what the source saw at their checkpoint: before the move,
+    // every result whole; after it, the same stubs.
+    let early = rounds[4].1;
+    db.fork(
+        "Bob",
+        "Early",
+        Fork {
+            checkpoint: Some(early),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Early").unwrap().elision, None);
+    let window = db.window("Early", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(window.elided, 0);
+    assert_eq!(sent(&db, &window), full[..window.ids.len()]);
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    let checkpoint = db.finish(turn, None).unwrap().last().unwrap()["data"]["checkpoint"]
+        .as_i64()
+        .unwrap();
+    db.fork(
+        "Bob",
+        "Late",
+        Fork {
+            checkpoint: Some(checkpoint),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(db.inspect("Late").unwrap().elision, bob.elision);
+    let late = db.window("Late", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(late.elided, plan.through);
+    let source = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(sent(&db, &late), sent(&db, &source));
+    // The version outlives its bot while a fork holds it, then goes with the
+    // last holder; stubs go with their nodes.
+    db.delete_bot("Bob").unwrap();
+    assert_eq!(
+        db.window("Late", 1 << 20, 1024).unwrap().unwrap().elided,
+        plan.through
+    );
+    db.delete_bot("Late").unwrap();
+    let count = |table: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("elisions"), 0);
+    // Early keeps its own stubs, for results up to its checkpoint.
+    assert_eq!(count("stubs"), 5);
+    db.delete_bot("Early").unwrap();
+    assert_eq!(count("stubs"), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
+    for family in [Family::Responses, Family::Anthropic] {
+        let mut db = db();
+        let mut binding = binding();
+        binding.family = family;
+        db.create("Bob", Some("/synthetic"), binding).unwrap();
+        converse(&mut db, "Bob", 1);
+        let turn = db
+            .begin(
+                "Bob",
+                "r2",
+                "long task",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        for n in 0..8 {
+            let call = ToolCall {
+                name: "shell".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+            };
+            let item = match family {
+                Family::Responses => {
+                    json!({"type":"function_call","call_id":call.call_id,"name":"shell","arguments":"{}"})
+                }
+                Family::Anthropic => json!({"role":"assistant","content":[
+                    {"type":"tool_use","id":call.call_id,"name":"shell","input":{}}]}),
+            };
+            db.append(
+                turn,
+                vec![serde_json::to_vec(&item).unwrap().into()],
+                std::slice::from_ref(&call),
+                None,
+            )
+            .unwrap();
+            db.tool_start(turn, &call).unwrap();
+            db.tool_finish(turn, &call.call_id, &result(&lines(n, 800)))
+                .unwrap();
+            // The runtime reads the window each round, which saves its start.
+            if n == 0 {
+                db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+            }
+        }
+        // The turn alone exceeds 64 KiB.
+        assert_eq!(
+            db.window("Bob", 64 << 10, 1024).unwrap_err().code,
+            "context_limit"
+        );
+        let plan = db.elision_plan("Bob", 16 << 10, 1).unwrap().unwrap();
+        db.elide("Bob", &plan).unwrap();
+        let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+        assert!(window.item_bytes + window.ids.len() as i64 - 1 <= 64 << 10);
+        // With the stubs, the saved start fits again: the earlier turn stays.
+        assert_eq!(window.omitted_turns, 0);
+        let items = sent(&db, &window);
+        let stubbed = items
+            .iter()
+            .filter(|item| item.to_string().contains("[tool result elided"))
+            .count();
+        assert_eq!(stubbed as i64, plan.results);
+        // Admission for history reads and notes counts the stubs as well.
+        let (_, bytes, items) = db.turn_usage("Bob", turn).unwrap();
+        let current = &window.sizes[window.ids.len() - items..];
+        assert_eq!(bytes, current.iter().map(|&b| b as usize).sum::<usize>());
+    }
+}
+
+#[test]
+fn schema_29_writes_stubs_for_stored_results() {
+    let path = std::env::temp_dir().join(format!("agent-stubs-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let expected = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "r1",
+                "task",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        exchange(&mut db, turn, "small", "short");
+        exchange(&mut db, turn, "large", &lines(0, 400));
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        drop(db);
+        let mut stubs: Vec<(i64, Vec<u8>)> = Connection::open(&path)
+            .unwrap()
+            .prepare("SELECT node,item FROM stubs ORDER BY node")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(stubs.len(), 1);
+        stubs.pop().unwrap()
+    };
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX bots_elision; ALTER TABLE bots DROP COLUMN elision;
+             ALTER TABLE nodes DROP COLUMN elided;
+             DROP TABLE stubs; DROP TABLE elisions; PRAGMA user_version=28;",
+        )
+        .unwrap();
+    }
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let migrated: (i64, Vec<u8>) = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT node,item FROM stubs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(migrated, expected);
+    assert_eq!(db.inspect("Bob").unwrap().elision, None);
+    // Its savings are recorded with the node, as a new result's are.
+    let saves: i64 = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT n.elided FROM nodes n JOIN stubs s ON s.node=n.id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let item: Vec<u8> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT item FROM nodes WHERE id=?", [migrated.0], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(saves as usize, item.len() - migrated.1.len());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }

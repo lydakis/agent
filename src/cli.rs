@@ -198,11 +198,11 @@ fn print_flags(flags: &str) {
             "--note-turns" => ("N", "Omitted turns the context note lists; 0 lists none"),
             "--compact-at" => (
                 "PERCENT",
-                "Compact when the turns since the last summary hold this share of the context budget",
+                "Elide answered tool results, then compact, once the context holds this share of its budget",
             ),
             "--compact-keep" => (
                 "PERCENT",
-                "Share of the context budget kept verbatim at compaction",
+                "Share of the context budget kept verbatim by elision and compaction",
             ),
             "--compaction-instructions" => (
                 "TEXT",

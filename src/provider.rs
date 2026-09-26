@@ -346,10 +346,11 @@ impl Sent {
 /// items after the first `n` window ids, is sent instead.
 pub struct Chain<'a> {
     pub bot: &'a str,
-    /// Context bytes ahead of the window items (summary and notes), and the
-    /// window's node ids; `None` for a request that is not a window, such as
-    /// a summary over a span.
-    pub window: Option<(&'a [u8], &'a [i64])>,
+    /// Context bytes ahead of the window items (summary and notes), the
+    /// elision floor the items are read under, and the window's node ids;
+    /// `None` for a request that is not a window, such as a summary over a
+    /// span.
+    pub window: Option<(&'a [u8], i64, &'a [i64])>,
     pub tail: Box<dyn FnOnce(usize) -> Items + Send + 'a>,
 }
 
@@ -1205,8 +1206,10 @@ impl Provider {
             Some(Chain { bot, window, tail }) => (Some(bot), window, Some(tail)),
             None => (None, None, None),
         };
-        let key = socket::key(&prefix, window.map_or(&[][..], |(head, _)| head));
-        let ids = window.map(|(_, ids)| ids);
+        let key = window.map_or(socket::key(&prefix, &[], 0), |(head, elided, _)| {
+            socket::key(&prefix, head, elided)
+        });
+        let ids = window.map(|(_, _, ids)| ids);
         // A connection opened under an older login would present its token
         // until it closes; open a new one instead, as Codex does.
         let auth = login.map_or(0, |s| {

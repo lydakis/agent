@@ -4690,3 +4690,41 @@ the diagnostic binary is
 `05d13ff8b530e4325e2810dbed19f0bb7b642581f5a50342b67cf0dc2b74f8ad`.
 Ignored evidence under `.local/sqlite-diagnostics/` includes both binaries,
 test logs, the admission driver and captures, and all four `mixed-*` results.
+
+## Tool-result elision
+
+Store costs of [tool-result elision](RUST_PROTOTYPE.md#tool-result-elision),
+measured 2026-09-26 in a Linux cloud container with release builds of the
+branch and its base `afdd633`, run alternately, five runs each. The fixture is
+synthetic: one bot, one turn of 600 shell rounds, each result 600 short lines
+(about 12.5 KiB), so 1,201 transcript rows and 7.5 MB of items in a
+file-backed store. Medians:
+
+| Operation | Base | Branch |
+| --- | ---: | ---: |
+| Record a tool result (`tool_finish`, with commit) | 0.45 to 0.5 ms | 0.45 to 0.5 ms |
+| Window over the whole turn, nothing elided | 2.9 ms | 3.2 ms |
+| Window, results elided | n/a | 3.2 ms |
+| Read the window's items | 3.8 ms (7.5 MB) | 2.5 to 3.0 ms (2.46 MB) |
+| Plan the floor (reader) | n/a | 3 ms |
+| Move the floor (writer, with commit) | n/a | 1 ms |
+
+Run-to-run spread was about 15%, so the window difference is not resolved at
+this sample size. Recording a result now also builds and stores its stub,
+inside the same transaction. Two earlier layouts were measured and rejected:
+computing savings from stub lengths inside the window walk cost about 30%,
+and joining stubs into every item read about 15%; the node savings column
+and a stub probe only for ids at or below the floor replaced them.
+
+Every window walk reads through the item overflow pages because the metadata
+columns follow the `item` BLOB. A covering index on the walk's columns, used
+with `INDEXED BY` because the planner does not choose it, cut the same walk in
+a Python `sqlite3` probe of the fixture store from 4.0 to 1.45 ms. That is a
+separate change, to be measured in the daemon first.
+
+Behavior is covered by `tests/test_elision.py` against scripted providers: a
+turn of 24 rounds of about 12 KiB each completes within a 64 KiB budget with
+every request under it, the newest result is never a stub, `read` returns an
+elided result, and a historical fork binds the floor at its checkpoint; on
+the Anthropic family, thinking stays bound under prefix enforcement across
+floor moves. No live provider run was made for this change.

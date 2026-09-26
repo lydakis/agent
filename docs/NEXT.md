@@ -544,14 +544,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     Within-turn reclamation remains item 34.
 34. Compaction inside a running turn. Cuts land only at submitted-turn
     starts and the window must hold the whole current turn, so one long
-    autonomous task with many tool rounds in a single turn still reaches
-    `context_limit`. First, deterministic tool-result elision: in the
-    request view replace older bulk tool outputs with a short stub naming
-    the call, the size, and how to read it back, never touching the store
-    and never splitting a call from its result; the observation-masking
-    result in the survey makes this the baseline to beat. Then a cut at any
-    completed tool exchange within the turn, the turn's prompt kept
-    verbatim, the turn still running for everyone outside. (From Astra
+    autonomous task with many tool rounds in a single turn reached
+    `context_limit`. First slice done: [deterministic tool-result
+    elision](RUST_PROTOTYPE.md#tool-result-elision) (schema 29). Answered
+    results below a versioned floor go as stubs with their size, excerpts,
+    and a `result/NODE` read reference; the store keeps every result whole,
+    no call is split from its result, and forks bind the floor at their
+    checkpoint. It runs before compaction at the same thresholds, and when
+    the current turn alone overflows. Store costs are in [the
+    measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). Next, a cut
+    at any completed tool exchange within the turn, the turn's prompt kept
+    verbatim, the turn still running for everyone outside, for turns whose
+    own words and small results outgrow the window. Also open: every window
+    walk traverses the item overflow pages because the metadata columns sit
+    after `item`; a covering index cut a probe of the walk from 4.0 to
+    1.45 ms, to be measured in the daemon before adopting. (From Astra
     Pro's compaction review.)
 35. Thinking-prefix compatibility. Anthropic binds preserved thinking to
     the request prefix on newer accounts; a compaction rewrites that prefix

@@ -91,7 +91,7 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -280,10 +280,21 @@ pub enum ReadSource {
         call_id: String,
         stream: String,
     },
+    /// A recorded tool result, whole: what an elided result's stub names.
+    Result {
+        node: i64,
+    },
 }
 impl ReadSource {
-    /// `TURN/CALL_ID/STREAM`, the reference a truncated result lists.
+    /// `TURN/CALL_ID/STREAM`, the reference a truncated result lists, or
+    /// `result/NODE`, the one an elided result gives.
     pub fn parse_artifact(text: &str) -> Result<ReadSource> {
+        if let Some(node) = text.strip_prefix("result/")
+            && let Ok(node) = node.parse::<i64>()
+            && node > 0
+        {
+            return Ok(ReadSource::Result { node });
+        }
         let mut parts = text.splitn(3, '/');
         if let (Some(turn), Some(call_id), Some(stream)) =
             (parts.next(), parts.next(), parts.next())
@@ -687,7 +698,7 @@ impl Registry {
                 Ok(self.shell_outcome(stdout, stderr, exit))
             }
             Prepared::Read {
-                source: ReadSource::Artifact { .. },
+                source: ReadSource::Artifact { .. } | ReadSource::Result { .. },
                 ..
             } => fail("artifact_requires_runtime"),
             Prepared::Read {

@@ -55,27 +55,35 @@ const CATCH_UP_PIECE_NODES: i64 = 1024;
 const WINDOW_BATCH: usize = 64;
 const WINDOW_BATCH_BYTES: u64 = 256 * 1024;
 
-/// Stored items to stream: ids with their sizes, and the bytes each loses
-/// without thinking.
+/// Stored items to stream: ids with their sizes as sent, the bytes each
+/// loses without thinking, and the elision floor the sizes count stubs to.
 #[derive(Clone, Copy)]
 struct Span<'a> {
     ids: &'a [i64],
     sizes: &'a [u32],
     thinking: &'a [u32],
+    elided: i64,
 }
 impl Span<'_> {
     const EMPTY: Span<'static> = Span {
         ids: &[],
         sizes: &[],
         thinking: &[],
+        elided: 0,
     };
 }
 
-/// A stable fingerprint of the context in front of a window: its encoded
-/// prefix and first item. FNV-1a, so it survives restarts and upgrades.
-fn fingerprint(prefix: &[u8], first: i64) -> i64 {
+/// A stable fingerprint of the context in front of a window and of how its
+/// items read: the encoded prefix, the first item, and the elision floor,
+/// since a stub replacing a result changes what later items followed.
+/// FNV-1a, so it survives restarts and upgrades.
+fn fingerprint(prefix: &[u8], first: i64, elided: i64) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in prefix.iter().chain(&first.to_le_bytes()) {
+    for byte in prefix
+        .iter()
+        .chain(&first.to_le_bytes())
+        .chain(&elided.to_le_bytes())
+    {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -108,6 +116,7 @@ fn item_chunks(
     store: Store,
     chunks: Arc<[Vec<i64>]>,
     floor: i64,
+    elided: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     let mut started = false;
     stream::iter(0..chunks.len())
@@ -116,7 +125,7 @@ fn item_chunks(
             async move {
                 store
                     .read("items_by_ids", move |db| {
-                        db.items_by_ids(&chunks[index], floor)
+                        db.items_by_ids(&chunks[index], floor, elided)
                     })
                     .await
                     .map_err(|error| std::io::Error::other(error.code))
@@ -497,6 +506,7 @@ impl Turn {
                     ids: &w.ids,
                     sizes: &w.sizes,
                     thinking: &w.thinking,
+                    elided: w.elided,
                 },
                 context.thinking_floor,
             ),
@@ -522,7 +532,7 @@ impl Turn {
         else {
             return Ok(());
         };
-        let prefix = fingerprint(&context.prefix.bytes, window.ids[0]);
+        let prefix = fingerprint(&context.prefix.bytes, window.ids[0], window.elided);
         if record.thinking_prefix != Some(prefix) {
             let floor = window.ids[window.ids.len() - 1] + 1;
             let bot = self.bot.clone();
@@ -545,6 +555,7 @@ impl Turn {
             ids,
             sizes,
             thinking,
+            elided,
         } = span;
         let stripped: usize = ids
             .iter()
@@ -559,9 +570,57 @@ impl Turn {
         let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
         Items::new(total, move || {
             stream::iter([Ok(prefix.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), floor))
+                .chain(item_chunks(store.clone(), chunks.clone(), floor, elided))
                 .boxed()
         })
+    }
+
+    /// Whether the window has reached the compaction threshold, the point
+    /// where answered tool results start going as stubs.
+    fn elision_due(&self, context: &Context, output_bytes: Option<usize>) -> bool {
+        let limit = self.input_limit();
+        let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
+        context.usage().bytes
+            >= (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
+    }
+
+    /// Elision at a round boundary: tool results the model has answered,
+    /// older than the newest `compact_keep` percent of the budget, go to it
+    /// as stubs from this request on. No model call; each result stays whole
+    /// in the store and the read tool returns it. Unless the window cannot
+    /// fit without it (`forced`), a move must save a sixteenth of the budget,
+    /// so a context of mostly other text does not rewrite its cached prefix
+    /// each round for a little room. Returns whether the floor moved.
+    async fn elide(&self, prefix: usize, forced: bool) -> Result<bool> {
+        let limit = self.input_limit();
+        let keep = (self.context_bytes / 100 * self.compact_keep)
+            .min(limit.bytes.saturating_sub(prefix) * self.compact_keep / self.compact_at)
+            .max(1) as i64;
+        let min_saving = if forced {
+            1
+        } else {
+            (self.context_bytes / 16) as i64
+        };
+        let bot = self.bot.clone();
+        let Some(plan) = self
+            .store
+            .read("elision_plan", move |db| {
+                db.elision_plan(&bot, keep, min_saving)
+            })
+            .await?
+        else {
+            return Ok(false);
+        };
+        let bot = self.bot.clone();
+        match self
+            .store
+            .op("elide", move |db| db.elide(&bot, &plan))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if error.code == "elision_not_forward" => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Compaction at a round boundary: once the turns since the last summary
@@ -832,7 +891,7 @@ impl Turn {
             (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
         Ok(Items::new(total, move || {
             stream::iter([Ok(head.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX))
+                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX, 0))
                 .chain(stream::iter([Ok(tail.clone())]))
                 .boxed()
         }))
@@ -934,14 +993,45 @@ impl Turn {
             // Resume the parked call, not the whole boundary. In particular,
             // an exhausted summary must not start over when the ordinary call
             // parks on the same pool. A later model round may compact again.
-            let mut context = self
+            let resuming = std::mem::take(&mut resume_window);
+            let output_bytes = provider.output_byte_estimate(model);
+            let mut context = match self
                 .context(
                     self.context_bytes,
                     self.context_items,
                     self.context_bytes * 2 / 3,
                 )
-                .await?;
-            if !std::mem::take(&mut resume_window)
+                .await
+            {
+                Ok(context) => context,
+                // The current turn outgrew the budget: elide what the model
+                // has answered, then look again.
+                Err(error) if error.code == "context_limit" => {
+                    if !self.elide(0, true).await? {
+                        return Err(error);
+                    }
+                    self.context(
+                        self.context_bytes,
+                        self.context_items,
+                        self.context_bytes * 2 / 3,
+                    )
+                    .await?
+                }
+                Err(error) => return Err(error),
+            };
+            if !resuming
+                && self.elision_due(&context, output_bytes)
+                && self.elide(context.prefix.bytes.len(), false).await?
+            {
+                context = self
+                    .context(
+                        self.context_bytes,
+                        self.context_items,
+                        self.context_bytes * 2 / 3,
+                    )
+                    .await?;
+            }
+            if !resuming
                 && let Some(parked) = self
                     .compact_if_due(
                         &mut record,
@@ -950,7 +1040,7 @@ impl Turn {
                         accounting,
                         &tools,
                         &mut context,
-                        provider.output_byte_estimate(model),
+                        output_bytes,
                     )
                     .await?
             {
@@ -1351,12 +1441,13 @@ impl Turn {
                 thinking_floor,
             }) => Chain {
                 bot: &self.bot,
-                window: Some((&prefix.bytes[..], &window.ids[..])),
+                window: Some((&prefix.bytes[..], window.elided, &window.ids[..])),
                 tail: Box::new(move |skip| {
                     let span = Span {
                         ids: &window.ids[skip..],
                         sizes: &window.sizes[skip..],
                         thinking: &window.thinking[skip..],
+                        elided: window.elided,
                     };
                     self.window_items(Bytes::new(), span, *thinking_floor)
                 }),
@@ -1655,6 +1746,23 @@ impl Turn {
                         .store
                         .op("artifact_lines", move |db| {
                             db.artifact_lines(&bot, owner, &ref_call, &stream, offset, limit)
+                        })
+                        .await;
+                    match text {
+                        Ok(page) => Outcome::text(self.registry.redact_text(page)),
+                        Err(error) => failure(error),
+                    }
+                }
+                Ok(Prepared::Read {
+                    source: ReadSource::Result { node },
+                    offset,
+                    limit,
+                }) => {
+                    let bot = self.bot.clone();
+                    let text = self
+                        .store
+                        .read("result_lines", move |db| {
+                            db.result_lines(&bot, node, offset, limit)
                         })
                         .await;
                     match text {

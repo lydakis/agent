@@ -247,6 +247,97 @@ pub fn thinking_bytes(item: &[u8]) -> usize {
     }
 }
 
+/// Bytes of a tool result's output its stub keeps from each end.
+const STUB_EXCERPT: usize = 256;
+/// A tool result gets a stub only when sending the stub instead saves at
+/// least this much, so an elided request never trades a small result for
+/// a pointer to it.
+pub const ELISION_MIN_SAVING: usize = 1024;
+
+/// What a request sends in place of a tool result below the bot's elision
+/// floor: a result for the same call that gives the output's size, the
+/// reference the read tool takes to return it whole, and its first and last
+/// bytes. Deterministic in its inputs, so the store writes it once beside
+/// the result and a request knows its length before reading it. `None` when
+/// it would not save `ELISION_MIN_SAVING` bytes over `item`, the stored result.
+pub fn stub(
+    family: Family,
+    call_id: &str,
+    output: &str,
+    node: i64,
+    item: usize,
+) -> Result<Option<Vec<u8>>> {
+    if output.len() < ELISION_MIN_SAVING + 2 * STUB_EXCERPT {
+        return Ok(None);
+    }
+    let mut head = STUB_EXCERPT;
+    while !output.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = output.len() - STUB_EXCERPT;
+    while !output.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let text = format!(
+        "[tool result elided from this request: {} bytes, retained in full. The read tool returns it with artifact \"result/{node}\". Its first and last bytes:]\n{}\n[...]\n{}",
+        output.len(),
+        &output[..head],
+        &output[tail..]
+    );
+    let stub = family.tool_result_item(call_id, &text)?;
+    Ok((stub.len() + ELISION_MIN_SAVING <= item).then_some(stub))
+}
+
+/// The family, call id and output of a stored tool result; `None` for any
+/// other item.
+pub fn tool_result(item: &[u8]) -> Option<(Family, String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Output {
+        #[serde(rename = "type")]
+        kind: String,
+        call_id: String,
+        output: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Message {
+        role: String,
+        content: Vec<Block>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Block {
+        #[serde(rename = "type")]
+        kind: String,
+        tool_use_id: String,
+        content: String,
+    }
+    if let Ok(result) = serde_json::from_slice::<Output>(item) {
+        return (result.kind == "function_call_output").then_some((
+            Family::Responses,
+            result.call_id,
+            result.output,
+        ));
+    }
+    let mut message = serde_json::from_slice::<Message>(item).ok()?;
+    let block = message.content.pop()?;
+    (message.role == "user" && message.content.is_empty() && block.kind == "tool_result")
+        .then_some((Family::Anthropic, block.tool_use_id, block.content))
+}
+
+/// Whether a stored item is the model's own output, as opposed to a user
+/// message or a tool result.
+pub fn model_output(item: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Kind<'a> {
+        #[serde(borrow)]
+        role: Option<std::borrow::Cow<'a, str>>,
+        #[serde(borrow, rename = "type")]
+        kind: Option<std::borrow::Cow<'a, str>>,
+    }
+    serde_json::from_slice::<Kind<'_>>(item).is_ok_and(|item| {
+        item.role.as_deref() != Some("user") && item.kind.as_deref() != Some("function_call_output")
+    })
+}
+
 /// Stable pinned blocks retain their own Anthropic cache breakpoints.
 pub fn pinned_item(family: Family, text: &str) -> Result<Vec<u8>> {
     match family {

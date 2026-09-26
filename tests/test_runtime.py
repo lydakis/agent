@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -117,6 +118,25 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
                            'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
+            elif user.startswith('long:'):
+                # One long task: a shell call a round, each result about
+                # 11 KiB, then a read of the first elided result, then done.
+                calls = [i for i in request['input'] if i.get('type') == 'function_call']
+                stubs = [i for i in request['input'] if i.get('type') == 'function_call_output'
+                         and i['output'].startswith('[tool result elided')]
+                text = ''
+                if len(calls) < int(user[5:]):
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{len(calls)}',
+                               'arguments': json.dumps({'command': f"seq -f 'round {len(calls)} line %g' 1 600",
+                                                        'timeout_ms': 5000})}]
+                elif stubs and not any(c['name'] == 'read' for c in calls):
+                    reference = re.search(r'artifact "(result/[0-9]+)"', stubs[0]['output']).group(1)
+                    output = [{'type': 'function_call', 'name': 'read', 'call_id': 'long-read',
+                               'arguments': json.dumps({'artifact': reference})}]
+                else:
+                    text = f'done after {len(calls)} calls'
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
@@ -373,7 +393,19 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                             return
                 signature = thinking_binding(request, request['messages'])
             blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
-            if last['content'][0]['type'] == 'tool_result':
+            prompt = next((b['text'] for m in request['messages'] if m['role'] == 'user'
+                           for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
+            if prompt:
+                # The Messages form of the long task: shell rounds, then done.
+                calls = sum(b['type'] == 'tool_use' for m in request['messages'] for b in m['content'])
+                if calls < int(prompt[5:]):
+                    blocks.append({'type': 'tool_use', 'id': f'toolu_long_{calls}', 'name': 'shell',
+                                   'input': {'command': f"seq -f 'round {calls} line %g' 1 600"}})
+                    stop = 'tool_use'
+                else:
+                    blocks.append({'type': 'text', 'text': f'done after {calls} calls'})
+                    stop = 'end_turn'
+            elif last['content'][0]['type'] == 'tool_result':
                 blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'end_turn'
             else:

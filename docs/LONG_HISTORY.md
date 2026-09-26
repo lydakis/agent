@@ -85,7 +85,11 @@ task-quality evaluation decide how far down the list to go.
    deterministic, cache-friendly, and lossless because the original is one
    tool call away. This should let the window hold several times as many
    turns and composes with the window's hysteresis, artifacts, and the
-   history tool as they are.
+   history tool as they are. Built 2026-09-26 as [tool-result
+   elision](RUST_PROTOTYPE.md#tool-result-elision), triggered by size
+   rather than age, and within the running turn too: a versioned floor
+   below the model's newest output, a stub with the size, head and tail
+   excerpts, and a `result/NODE` read reference.
 2. **A pinned, agent-owned note.** One durable item per bot, always first in
    context, and a tool that rewrites it. The agent records what it knows it
    will need: constraints, decisions, paths, what is left. The harness

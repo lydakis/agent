@@ -320,8 +320,8 @@ bound; the operating system is then the only limit.
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
 | `--note-turns` | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
-| `--compact-at` | Percent of either context envelope that triggers compaction. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
-| `--compact-keep` | Target percent of either context envelope kept verbatim as newest whole turns, reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
+| `--compact-at` | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
+| `--compact-keep` | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
 | `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -1081,6 +1081,9 @@ to avoid reference/index overhead. Idempotency and turn listings resolve the
 same original text. Absorbed steers share their own user node. Migration shares
 exact indexed matches; older steers without that mapping keep their inline
 text. The prompt-node foreign key has a partial index for deletion checks.
+Schema 29 adds [tool-result elision](#tool-result-elision): it writes a stub
+for each stored tool result large enough to elide, in one pass over the rows
+of at least 1 KiB, and starts every bot with no elision floor.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1321,14 +1324,14 @@ character returns `invalid_history_page`. No summaries are made and nothing is
 deleted; compaction with summaries remains future work in [LONG_HISTORY.md](LONG_HISTORY.md).
 
 The window always contains the whole current turn. If that turn alone exceeds
-a budget, the turn fails with `context_limit` rather than sending a truncated
-request. Both limits are daemon flags forwarded by the client, reported in
+a budget even with its answered tool results [elided](#tool-result-elision),
+the turn fails with `context_limit` rather than sending a truncated request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
 the `context_window` capability. Version 20 repairs previously blocked
 `uncertain` bots once, appending missing tool results without rewriting original
 history. If operational tool records were pruned, repair reconstructs unanswered
 calls from the interrupted turn's durable transcript. Stores are schema version
-20; supported migrations run at open. Store initialization and migration run in one
+29; supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -1508,6 +1511,53 @@ foreground shell, but native file I/O or background commands can outlive the
 cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
+
+### Tool-result elision
+
+Most of a long tool-using turn is tool output the model has already read.
+At a round boundary, after steers are absorbed and before compaction, once
+the window and its pinned context hold `--compact-at` percent of the byte
+envelope, or the current turn cannot fit at all, the daemon moves the bot's
+elision floor. Every tool result at or below the floor goes to the model as
+a stub instead of its output: a result for the same call id that states the
+output's size, the `read` reference that returns it whole
+(`artifact: "result/NODE"`), and its first and last 256 bytes. Everything
+else, the model's own messages and calls, user prompts and steers, and
+small results, stays verbatim, and no call is ever separated from its
+result. There is no model call. The floor goes through the newest item the
+verbatim tail of `--compact-keep` percent cannot take, and never past the
+model's newest output, so the model reads every result whole in the request
+that answers it. A move must save a sixteenth of the byte envelope, so a
+context of mostly other text does not rewrite its cached prefix each round
+for a little room; when the current turn cannot fit otherwise, any saving
+counts. Elision works with or without compaction instructions: it is how a
+single long turn outgrows the window, and it comes first because it costs
+no call and keeps the model's own reasoning in view. Compaction then runs as
+before if the view is still over its threshold.
+
+A result is elidable when its stub saves at least 1 KiB. The stub is made
+when the result is recorded, with the node id its insert takes, and stored
+beside it; the node records what the stub saves, so window accounting reads
+no item. A request reads the stub in place of the result's row. The stored
+transcript is never rewritten: `item`, `history`, forks, and the summarizer
+see every result whole, and `read` with `result/NODE` returns one on the
+bot's own lineage.
+
+The floor is versioned like notes and compactions: `elided` events record
+each move (version node, previous version, `through`, the number of newly
+elided results, and the bytes saved), a bot's `elision` names its current
+version, and a historical fork binds to the newest version at or before its
+checkpoint, so it sees what its source saw there. Moving the floor rewrites
+items the provider has cached, so it is a prompt-cache break like a window
+move: the Responses WebSocket chain key includes the floor, and the Anthropic
+thinking fingerprint includes it too, so thinking written before the move
+is sent without it afterwards while later thinking keeps its own. Between
+moves the prefix is stable and the cache extends as usual. Anthropic documents
+server-side tool-result clearing (context editing) as not counting as an edit
+for its binding check, which would keep that thinking; it is family-specific
+and has not been compared with elision (item 35). Admission for
+`history` results and notes counts the current turn's stubs rather than
+its raw results.
 
 ### Compaction
 
