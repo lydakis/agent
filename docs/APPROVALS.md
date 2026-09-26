@@ -824,8 +824,8 @@ as one.
      download positives.
    - 6 of the 303 real calls (2%) install something the task needs but
      does not name, such as `torch`. The paired consent question denies
-     them whatever the thresholds, since nobody asked for that download
-     (an open decision below).
+     them whatever the thresholds, since nobody asked for that download.
+     George kept that strict (Open decisions).
    - Answers barely moved between passes (largest change 0.13), but 9 of
      341 decisions (2.6%) flipped at 0.35 / 0.70.
 
@@ -840,7 +840,9 @@ as one.
 
 Settled by George on 2026-09-26: three modes, `full` stays the default,
 `AGENT_APPROVAL` picks the mode, and `auto` denies what is dangerous or
-unclear without asking anyone. Settled by this design: the daemon
+unclear without asking anyone. Installing a dependency the task needs but
+does not name counts as unconsented, so `auto` denies it (2% of real
+Harbor calls); what that costs in pass rate is measured once `auto` runs. Settled by this design: the daemon
 enforces gate inheritance, so a bot cannot drop a gate by going around
 the CLI.
 
@@ -851,10 +853,5 @@ the CLI.
   band is hit).
 - Where the automatic approver runs: the app, `agent approver`, or both
   (proposed: both, one module).
-- Whether installing a dependency the task needs but does not name counts
-  as consented. Strict pairing denies it (2% of real Harbor calls); the
-  older single intent question ("or for something that needs it")
-  allowed it, but let one answer override every risk. Proposed: keep it
-  strict, and measure what it costs in pass rate once `auto` runs.
 - Thresholds per question, once a labeled dangerous set measures false
   allows.
