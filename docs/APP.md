@@ -72,7 +72,7 @@ client/          agent-client: the socket protocol and the client policy
 
 ```sh
 cargo build --release -p agent-app
-AGENT_MODEL=anthropic/claude-sonnet-4-5 .local/target/release/agent-app \
+AGENT_MODEL=anthropic/claude-sonnet-5 .local/target/release/agent-app \
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 

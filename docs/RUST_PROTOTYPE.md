@@ -48,9 +48,9 @@ socket protocol is the contract; the `agent` client is one consumer of it.
 
 ```sh
 export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY / OPENROUTER_API_KEY
-agent run --new --model anthropic/claude-sonnet-4-5 --bot Bob -- "Add a failing test for the parser bug, then fix it"
+agent run --new --model anthropic/claude-sonnet-5 --bot Bob -- "Add a failing test for the parser bug, then fix it"
 agent run --bot Bob -- "Now run the full suite"          # same bot, next turn, same conversation
-agent run --bot Bob --model anthropic/claude-opus-4-1 -- "Review the diff"   # this turn only
+agent run --bot Bob --model anthropic/claude-opus-5-5 -- "Review the diff"   # this turn only
 agent follow --bot Bob --after 0                         # replay, then live events
 agent fork --source Bob --checkpoint 12 --bot Bob-alt      # workspace comes with each later run
 agent interrupt --bot Bob
@@ -814,8 +814,8 @@ they report. Live `text_delta` and `thinking_delta` notifications keep their
 own path from the turn. Example requests:
 
 ```json
-{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-4-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
-{"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-4-1"}
+{"id":1,"op":"create","bot":"Bob","workspace":"/workspaces/project","model":"anthropic/claude-sonnet-5","reasoning":"low","instructions":"...","tools":["shell","read","write","edit","wait","history"],"compaction_instructions":"...","created_by":"Alice","created_by_id":42}
+{"id":2,"op":"submit","bot":"Bob","request_id":"work-1","prompt":"Hello","workspace":"/workspaces/project-copy","model":"anthropic/claude-opus-5-5"}
 {"id":19,"op":"submit","bot":"Bob","request_id":"work-2","prompt":"Also check the docs","delivery":"steer"}
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"resume","bot":"Bob"}
