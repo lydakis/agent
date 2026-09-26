@@ -40,7 +40,8 @@ has to be counted per call.
 4. **The fast path adds no storage commit.** Requests ride the commit that
    already records the model's plan, and verdicts ride the commit that
    already starts or finishes the call. A verdict answered by rules costs
-   one socket round trip, measured at 0.13 ms median. A person's slow answer
+   one socket round trip, measured at 0.13 ms median, and one job on the
+   storage worker that commits nothing. A person's slow answer
    parks the turn durably, like `wait`, so it holds no task and no slot and
    survives a restart.
 5. **It is oversight, not containment.** An allowed shell command runs with
@@ -192,17 +193,24 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   prompt cache is untouched.
 - **Bots created from inside a gated bot inherit its list.** When `create`
   names a creator that has an `approve` list, the new bot's list is the
-  union of both. This is a guard against accidents, not a boundary: the
+  union of both, intersected with the new bot's own tools, so it stays a
+  subset of them. A read-only child of a bot gated on `shell,write,edit`
+  gets nothing to approve, because it has none of those tools. A fork keeps
+  its source's tools, so its list stays a subset even when the fork's
+  allowed list is narrower; an entry for a tool the fork may not call never
+  comes up. This is a guard against accidents, not a boundary: the
   creator is declared by the shell's environment, and a command that clears
   it creates an ungated bot. The approver sees that command first.
 - **The request rides the plan commit.** When `append` records a model
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
-  `{"node":N,"calls":[{"call_id","name","arguments","arguments_truncated"}]}`.
-  Arguments are previewed to 2,048 characters, as `tool_started` already
-  does; an approver reads a longer one (a large `write`) with `item` on the
-  node.
+  `{"calls":[{"call_id","name","node","arguments","arguments_truncated"}]}`.
+  Each call names its own node: an Anthropic round keeps all its calls in
+  one assistant item, but a Responses round stores each `function_call` as
+  an item of its own. Arguments are previewed to 2,048 characters, as
+  `tool_started` already does; an approver reads a longer one (a large
+  `write`) with `item` on that call's node.
   One event per round, not per call, and no extra commit.
 - **`answer` decides one call.**
   `{"op":"answer","bot","turn","call_id","decision":"allow"|"deny","reason"?,"by"?}`.
@@ -218,6 +226,14 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `write` of `run.sh` followed by `sh run.sh`). Execution stays in order,
   one call at a time, as today. Each gated call waits only for its own
   verdict.
+- **A verdict is for the round as planned.** When a call ends denied, with
+  an error, or as a shell command that exits nonzero, every later gated
+  call in the round whose verdict arrived before that happened loses it and
+  is announced again with the failed call named. The approver judged
+  `sh run.sh` expecting the planned `write`; if the write was refused, the
+  file it would run is not the one it saw. The new request rides the failed
+  call's own finishing commit, and a rules-only approver answers it again
+  in microseconds. The success path pays nothing.
 - **Allow rides `tool_start`.** The call starts as today, and its
   `tool_started` event gains `"approval":{"by","waited_ms"}`. No extra
   commit.
@@ -232,14 +248,24 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   commit, no task, no active slot, restart-safe. A verdict for a parked turn
   is committed when it arrives and resumes the turn. The hold keeps model
   verdicts off the park path and keeps a person's wait off the task table.
-- **Verdicts are durable no later than the call starts.** While the turn has
-  a task, an early verdict (for call 3 while call 1 runs) waits in memory and
-  is written by the next commit the turn makes anyway: that call's start, its
-  denial, or a park. If the daemon dies first, recovery interrupts the turn
-  and cancels its planned calls, so the verdict no longer matters. When the
-  turn is parked, `answer` commits the verdict itself. Answers, parks, and
-  call starts go through the storage worker, which serializes them, so a
-  verdict landing while the turn parks is neither lost nor applied twice.
+- **Verdicts are durable no later than the call starts, and the storage
+  worker holds them until then.** `answer` is a job on the storage worker,
+  the thread that already runs every commit. The worker keeps unwritten
+  verdicts in a map of its own, not in the turn's task. For a live turn,
+  the job records the verdict there and wakes the task, with no commit. The
+  next commit the turn makes anyway takes it out and writes it: that
+  call's start, its denial, or a park. For a parked turn, the job commits
+  the verdict and resumes the turn. Because `answer`, `suspend`, and
+  `tool_start` all run on that one thread, a verdict that lands as the hold
+  expires is either in the map when `suspend` runs, and written with the
+  park, or it arrives after, finds the turn parked, and is committed. The
+  client is answered after the job runs, so an acknowledged verdict is
+  never lost. If the daemon dies before a live turn writes it, recovery
+  interrupts the turn and cancels its planned calls, so the verdict no
+  longer matters. The price is one trip through the worker's queue, a few
+  microseconds when idle and up to a few milliseconds under load (the
+  `append` queue p99 was under 2.5 ms in the [storage
+  counters](DAEMON_MEASUREMENTS.md#storage-counters-by-operation)).
 - **Interrupt and restart need nothing new.** Interrupting a turn with
   pending verdicts cancels those calls, as it cancels any planned call. A
   turn parked on a verdict survives restart like a parked `wait`, and its
@@ -276,9 +302,11 @@ same module inside the app. It follows `approval_requested` on every bot
 (`follow --all`) and answers in layers:
 
 1. **Daemon gate.** Only tools in a bot's `approve` list reach it. The
-   suggested list is `shell,write,edit`; `read`, `history`, `wait`, `note`,
-   and `echo` change nothing outside the store. (`read` can read a secret,
-   but sending it anywhere takes a gated call.)
+   suggested list is `shell,write,edit,read`. `read` is gated because a
+   result is sent to the model provider in the next request: reading
+   `~/.ssh/id_ed25519` sends the key off the machine with no further call.
+   `history`, `wait`, `note`, and `echo` touch only the bot's own store
+   records and stay ungated.
 2. **Deterministic rules, microseconds.**
    - `write` and `edit` inside the turn's workspace are allowed. The path is
      resolved before judging, and a symlink that leaves the workspace does
@@ -290,13 +318,22 @@ same module inside the app. It follows `approval_requested` on every bot
      edits (Ji et al., 2026). The approver also remembers what each bot
      wrote this turn, so a command that runs one of those files is judged
      with the file's content in view.
+   - `read` inside the workspace is allowed, except files that look like
+     secrets (`.env*`, `*.pem`, `*.key`, `id_*`, anything under `.ssh/`,
+     `.aws/`, `.gnupg/`, or named `credentials`). Those, and reads outside
+     the workspace, go to the model.
    - A shell command is split the way Codex splits it: only plain words
-     joined by `&&`, `||`, `;`, or `|`. If every part is on a read-only list
-     of commands and flag forms (`ls`, `cat`, `rg`, `git status`, `git diff`,
-     `git log`, `find` without `-exec` or `-delete`, and so on), it is
-     allowed. A redirect, `$(`, a backtick, or a variable makes the whole
-     command opaque, and it goes on to the model. This is where Cursor's
-     allowlist was bypassed; the approver does not try to parse more.
+     joined by `&&`, `||`, `;`, or `|`. It is allowed only if every part is
+     a command on the read-only list, every flag it uses is on that
+     command's own list of allowed flags, and every path it names is a
+     readable path by the rule above. The lists name what is allowed, not
+     what is not: `find` may take `-name` and `-type` but not `-exec`,
+     `-delete`, `-fprint`, `-fprintf`, or `-fls`, simply because they are
+     not listed; the same goes for `git diff --output`, `rg --pre`, and
+     `sort -o`. An unlisted flag, a redirect, `$(`, a backtick, or a
+     variable makes the command opaque, and it goes on to the model. This
+     is where Cursor's allowlist was bypassed; the approver does not try to
+     parse more.
    - Commands that reach the approval channel itself (`agent answer`, the
      daemon's socket other than through `agent`, the store file) are denied
      outright.
@@ -355,12 +392,29 @@ high risk that the prompts do not name is denied whatever the command
 says about itself. For a bot created by another bot, the prompt was
 written by a model; the approver follows `created_by` to the first bot a
 person prompted and shows that prompt as the user's intent, the child's
-prompt as a model-written task. Anthropic reports that most of
+prompt as a model-written task.
+
+**The intent view is bounded.** Jev takes at most 32k tokens of state, and
+a long-lived bot's prompts outgrow that. The approver sends, in this
+order: the environment note, the root person's prompt for this turn, the
+current turn's prompt and its steers, the planned and already allowed
+calls, and then earlier prompts newest first until a 16k-token budget is
+spent. If the first four alone do not fit, it does not call Jev; the call
+is unclear (step 4), with the reason "not reviewed: intent too long".
+Standing limits ("never push to main") belong in the environment note,
+which is always sent, not in an old prompt that may fall out of the view.
+Claude Code has the same gap: its docs say a boundary stated in the
+conversation can be lost to compaction. Anthropic reports that most of
 its classifier's misses come from misjudging consent, and a delegation
 chain is where consent is easiest to fake.
 
-**Where the key lives.** The approver process holds the Jev key. Bots never
-see it: their shells are children of the daemon, not of the approver.
+**Where the key lives.** The approver process holds the Jev key, so it is
+not in the environment the bots' shells inherit. That is all it gets. A
+tool running as the same OS user can still read it: on Linux through
+`/proc/PID/environ` of the approver, or from wherever the key is stored.
+The daemon's provider keys are exposed the same way today. Protecting
+either from tools needs a separate OS user or a credential broker, which
+this design does not provide.
 
 **Jev's limits bound a fleet.** The published limits for `jev-1.13.0` are
 1,200 requests a minute and 250k tokens a second, "adjusting dynamically",
@@ -377,7 +431,7 @@ like any other.
 | Path | Added per gated call | Extra commits | Holds a task |
 | --- | ---: | ---: | --- |
 | Tool not in `approve` | nothing measurable (one list lookup, as today) | 0 | as today |
-| Rules answer | one socket round trip, 0.13 ms median, 0.3 ms p99 (measured) | 0 | yes, briefly |
+| Rules answer | one socket round trip, 0.13 ms median, 0.3 ms p99 (measured), plus one storage-worker job with no commit | 0 | yes, briefly |
 | Jev answers | about 0.34 to 0.44 s median (2026-09-19 probe) | 0 | yes, up to the hold |
 | Person answers | the person's time | 2 (park, verdict) | no, after the hold |
 
