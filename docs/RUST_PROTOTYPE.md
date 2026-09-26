@@ -632,9 +632,21 @@ These are threads and tasks, not one process per bot. The storage reader is a
 second SQLite connection in query-only mode on its own thread; it serves
 reads whose result is bytes for a caller, today the batches of context items
 that stream into a model request, so a long history's 8 MiB window is not
-read on the thread every other bot's commit waits for. It sees each job's
-commit once that job is done; anything that decides against the store's
+read on the thread every other bot's commit waits for. It sees a job's
+writes once that job is answered; anything that decides against the store's
 current state stays on the worker.
+
+The worker commits in groups. It takes one job, then whatever else is already
+queued, up to one full queue of 32, and runs them in order inside one
+transaction; each job's own transaction is a savepoint in it, so a failed job
+rolls back alone. One COMMIT, one sync, then every job in the group is
+answered. No caller hears of
+a write before it is durable, an idle daemon's group is one job and waits for
+nothing, and under load the jobs that queued during one sync share the next.
+If SQLite rolls back the whole transaction under a job (a full disk, an I/O
+error), or the COMMIT fails, every job in the group is answered with
+`storage_error`, the outcomes it announced are dropped, and the waiting-turn
+counts are recounted from the rows.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
@@ -712,9 +724,9 @@ Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 `data`, in exactly the shape `events` replays them. Durable events reach
-followers in commit order: the storage worker itself hands each job's
-committed events, and the outcomes of turns the job ended, to one publisher
-before taking the next job. Tasks never publish durable events, so a
+followers in commit order: the storage worker itself hands each group's
+committed events, and the outcomes of turns its jobs ended, to one publisher
+before taking the next group. Tasks never publish durable events, so a
 follower's cursors only rise, its greatest cursor is a complete resume
 point, and a committed batch is delivered whether or not the task that
 asked for it was cancelled meanwhile. Wait answers follow the terminal event
@@ -814,7 +826,11 @@ does not, and each is one op:
   (each store method's count, queued and ran totals, slowest run, and two
   fourteen-bucket latency histograms, `ran` and `queued`, over the
   log-spaced bounds in `buckets_us`, so a controller can see which jobs
-  make the tail and how often), and the handle registry's size. `agent stats
+  make the tail and how often), and the handle registry's size. The
+  `commit` operation counts the worker's group commits, and its `ran` time
+  is the COMMIT with its sync, so jobs per commit and the time spent
+  syncing are both readable. Other operations' `ran` times exclude the
+  sync, which they included before group commit. `agent stats
   [--pretty]`. Store sizes use the canonical database path established at
   open, including when the caller used a symlink. The counters cost three
   clock reads and one short lock per storage job, and allocate only the
@@ -1003,7 +1019,8 @@ racing on `bot_busy`.
 
 ## Durable state and recovery
 
-SQLite WAL with `synchronous=FULL` stores bot metadata and provider binding,
+SQLite WAL with `synchronous=FULL`, committed in groups (see Core ownership),
+stores bot metadata and provider binding,
 immutable history nodes, turns, completed checkpoints, tool intents/results,
 retained tool artifacts, and durable event cursors. The store allows one owning
 process. A second owner fails before it can mark the first owner's work

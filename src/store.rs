@@ -1,5 +1,6 @@
 //! One database worker for all agents, plus one reader for bulk context
-//! reads. Durable writes never block the I/O runtime.
+//! reads. Durable writes never block the I/O runtime, and jobs that queue
+//! together commit together: one sync per group, not per job.
 use crate::{Error, Result};
 use rusqlite::Connection;
 use std::{
@@ -17,8 +18,53 @@ pub use db::{
     Planning, Publication, Started, TurnContext, TurnOptions, Waiting, Window, cache_hit,
 };
 
-type Job = Box<dyn FnOnce(&mut Database) + Send>;
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;
+/// Most jobs one commit carries: one full queue. Under load the worker runs
+/// everything already queued, up to this many, inside one transaction and
+/// syncs once for all of them; idle, a group is one job and nothing waits
+/// for company. The bound caps how long the group's first job waits on the
+/// ones behind it.
+const GROUP_JOBS: usize = 32;
+/// A storage job: run inside its group's transaction, then answered once
+/// that group's commit is known, so no caller hears of a write before it
+/// is durable.
+trait Job: Send {
+    fn run(&mut self, db: &mut Database);
+    fn answer(self: Box<Self>, committed: bool);
+}
+struct Queued<F, T> {
+    operation: Option<F>,
+    outcome: Option<Result<T>>,
+    reply: oneshot::Sender<Result<T>>,
+    label: &'static str,
+    queued: std::time::Instant,
+    counters: std::sync::Arc<Counters>,
+}
+impl<F, T> Job for Queued<F, T>
+where
+    F: FnOnce(&mut Database) -> Result<T> + Send,
+    T: Send,
+{
+    fn run(&mut self, db: &mut Database) {
+        let started = std::time::Instant::now();
+        if let Some(operation) = self.operation.take() {
+            self.outcome = Some(operation(db));
+        }
+        self.counters.record(
+            self.label,
+            (started - self.queued).as_nanos() as u64,
+            started.elapsed().as_nanos() as u64,
+        );
+    }
+    fn answer(self: Box<Self>, committed: bool) {
+        let outcome = match self.outcome {
+            Some(Ok(_)) if !committed => Err(Error::new("storage_error")),
+            Some(outcome) => outcome,
+            None => Err(Error::new("storage_error")),
+        };
+        let _ = self.reply.send(outcome);
+    }
+}
 /// Storage worker counters: how long jobs queued for the worker versus how
 /// long they ran on it, in total and per operation. The split says whether
 /// the worker or the disk is the bottleneck; the per-operation histograms
@@ -90,7 +136,7 @@ impl Counters {
 }
 #[derive(Clone)]
 pub struct Store {
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<Box<dyn Job>>,
     reader: mpsc::Sender<ReadJob>,
     path: std::sync::Arc<std::path::PathBuf>,
     counters: std::sync::Arc<Counters>,
@@ -126,12 +172,14 @@ impl Store {
     }
 
     /// Open the store and its publication stream. The worker publishes
-    /// what each job committed, in commit order, before taking the next
-    /// job; the stream is bounded, so a publisher that stops reading
-    /// eventually holds the worker, never memory.
+    /// what each group of jobs committed, in commit order, before taking
+    /// the next group; the stream is bounded, so a publisher that stops
+    /// reading eventually holds the worker, never memory.
     pub async fn open(path: &Path) -> Result<(Self, mpsc::Receiver<Publication>)> {
         let path = path.to_path_buf();
-        let (sender, mut receiver) = mpsc::channel::<Job>(32);
+        let (sender, mut receiver) = mpsc::channel::<Box<dyn Job>>(GROUP_JOBS);
+        let counters = std::sync::Arc::<Counters>::default();
+        let worker_counters = counters.clone();
         let (publisher, publications) = mpsc::channel::<Publication>(1024);
         let (ready, opened) = oneshot::channel();
         std::thread::Builder::new()
@@ -195,10 +243,46 @@ impl Store {
                             }
                         };
                         let _ = ready.send(Ok(path));
+                        let mut group: Vec<Box<dyn Job>> = Vec::with_capacity(GROUP_JOBS);
                         while let Some(job) = receiver.blocking_recv() {
-                            job(&mut db);
-                            // A storage error here has no caller to answer;
-                            // the next job's read reports it.
+                            group.push(job);
+                            let begun = db.begin_group().is_ok();
+                            if begun {
+                                let mut ran = 0;
+                                // Whatever queued while the last group
+                                // synced shares this one's sync.
+                                loop {
+                                    group[ran].run(&mut db);
+                                    ran += 1;
+                                    if !db.in_group() || group.len() == GROUP_JOBS {
+                                        break;
+                                    }
+                                    match receiver.try_recv() {
+                                        Ok(job) => group.push(job),
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            let committed = begun && {
+                                let started = std::time::Instant::now();
+                                let committed = db.commit_group().is_ok();
+                                worker_counters.record(
+                                    "commit",
+                                    0,
+                                    started.elapsed().as_nanos() as u64,
+                                );
+                                committed
+                            };
+                            // A group that did not commit leaves nothing
+                            // durable; its bookkeeping goes with it. A
+                            // storage error in the recount has no caller
+                            // to answer; the next job's read reports it.
+                            if !committed {
+                                let _ = db.abandon_group();
+                            }
+                            for job in group.drain(..) {
+                                job.answer(committed);
+                            }
                             let _ = db.publish_since(&mut watermark, |publication| {
                                 publisher.blocking_send(publication).is_ok()
                             });
@@ -216,7 +300,7 @@ impl Store {
         // rather than decide anything: streaming a context window out of
         // the store must not hold every other bot's commit behind it. It
         // opens after the worker, so the file, its WAL, and the current
-        // schema exist, and it sees each job's commit once that job is done.
+        // schema exist, and it sees a job's writes once that job is answered.
         let (reader, mut reads) = mpsc::channel::<ReadJob>(32);
         let (ready, opened) = oneshot::channel();
         let reader_path = store_path.clone();
@@ -246,7 +330,7 @@ impl Store {
                 sender,
                 reader,
                 path: std::sync::Arc::new(store_path),
-                counters: std::sync::Arc::default(),
+                counters,
             },
             publications,
         ))
@@ -272,18 +356,15 @@ impl Store {
         label: &'static str,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let (sender, receiver) = oneshot::channel();
-        let counters = self.counters.clone();
-        let queued = std::time::Instant::now();
+        let (reply, receiver) = oneshot::channel();
         self.sender
-            .send(Box::new(move |db| {
-                let started = std::time::Instant::now();
-                let _ = sender.send(operation(db));
-                counters.record(
-                    label,
-                    (started - queued).as_nanos() as u64,
-                    started.elapsed().as_nanos() as u64,
-                );
+            .send(Box::new(Queued {
+                operation: Some(operation),
+                outcome: None,
+                reply,
+                label,
+                queued: std::time::Instant::now(),
+                counters: self.counters.clone(),
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;
@@ -331,6 +412,121 @@ impl Store {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    async fn scratch_store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("agent-group-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        store
+            .call(|db| Ok(db.connection().execute_batch("CREATE TABLE t(x INTEGER)")?))
+            .await
+            .unwrap();
+        store
+    }
+    /// Hold the worker inside a job until the returned gate is dropped or
+    /// fed, so the jobs queued meanwhile run as one group behind it.
+    async fn hold(
+        store: &Store,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (gate, wait) = std::sync::mpsc::channel::<()>();
+        let (entered, inside) = oneshot::channel();
+        let store = store.clone();
+        let held = tokio::spawn(async move {
+            store
+                .call(move |_| {
+                    let _ = entered.send(());
+                    let _ = wait.recv();
+                    Ok(())
+                })
+                .await
+        });
+        inside.await.unwrap();
+        (held, gate)
+    }
+    /// Queue a job and return once it waits in the worker's channel.
+    async fn queue<T: Send + 'static>(
+        store: &Store,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<T>> {
+        let queued = store.sender.max_capacity() - store.sender.capacity() + 1;
+        let job = tokio::spawn({
+            let store = store.clone();
+            async move { store.call(operation).await }
+        });
+        while store.sender.max_capacity() - store.sender.capacity() < queued {
+            tokio::task::yield_now().await;
+        }
+        job
+    }
+    fn insert(x: i64) -> impl FnOnce(&mut Database) -> Result<()> + Send + 'static {
+        move |db| {
+            db.connection().execute("INSERT INTO t VALUES (?)", [x])?;
+            Ok(())
+        }
+    }
+    async fn rows(store: &Store) -> Vec<i64> {
+        store
+            .call(|db| {
+                let mut statement = db.connection().prepare("SELECT x FROM t ORDER BY x")?;
+                let rows = statement.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+            })
+            .await
+            .unwrap()
+    }
+    fn commits(store: &Store) -> u64 {
+        store.stats()["operations"]["commit"]["count"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn jobs_queued_together_share_one_commit_and_fail_alone() {
+        let store = scratch_store("share").await;
+        let before = commits(&store);
+        let (held, gate) = hold(&store).await;
+        let one = queue(&store, insert(1)).await;
+        // A job whose own transaction fails rolls back alone.
+        let failed = queue(&store, |db| {
+            let tx = db.connection().savepoint()?;
+            tx.execute("INSERT INTO t VALUES (2)", [])?;
+            crate::fail::<()>("job_failed")
+        })
+        .await;
+        let three = queue(&store, insert(3)).await;
+        gate.send(()).unwrap();
+        held.await.unwrap().unwrap();
+        one.await.unwrap().unwrap();
+        assert_eq!(failed.await.unwrap().unwrap_err().code, "job_failed");
+        three.await.unwrap().unwrap();
+        assert_eq!(commits(&store), before + 1, "four jobs, one commit");
+        assert_eq!(rows(&store).await, [1, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_group_rolled_back_under_its_jobs_answers_none_of_them_ok() {
+        let store = scratch_store("rollback").await;
+        let (held, gate) = hold(&store).await;
+        let one = queue(&store, insert(1)).await;
+        // What SQLite does to the whole transaction on a full disk or an
+        // I/O error: nothing the group ran may be reported as written.
+        let lost = queue(&store, |db| {
+            db.connection().execute_batch("ROLLBACK")?;
+            Ok(())
+        })
+        .await;
+        gate.send(()).unwrap();
+        for answer in [held.await.unwrap(), one.await.unwrap(), lost.await.unwrap()] {
+            assert_eq!(answer.unwrap_err().code, "storage_error");
+        }
+        assert!(rows(&store).await.is_empty());
+        // The worker recovers: the next group commits normally.
+        store.call(insert(4)).await.unwrap();
+        assert_eq!(rows(&store).await, [4]);
+    }
 
     #[test]
     fn live_counter_snapshots_reconcile_totals_and_histograms() {

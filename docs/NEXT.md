@@ -748,6 +748,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     then measurement of the cache and of the fork-or-fresh rule in the
     preamble.
 
+44. Storage commits on a slow disk. Done: the worker commits in groups,
+    one sync for the jobs that queued together, and callers are answered
+    after it ([measured](DAEMON_MEASUREMENTS.md#group-commit): at a 10 ms
+    sync, 64 sustained bots went from 26 to 37 turns per second; level at
+    the VM's native sync). Next, the service loop: it awaits `begin` for
+    each submission and `finish` for each completion before handling the
+    next request, so those commits cannot share a sync with each other,
+    and they are now the ceiling (about 3 jobs per commit in that run). The
+    loop needs a job's result to decide, not its sync; answering it when
+    the job has run and holding client replies and publication for the
+    commit would let them group, but the ordering guarantees of item 21
+    and completion's busy state need a design first. Open: `PRAGMA
+    fullfsync` on macOS, where `synchronous=FULL` is a plain fsync that
+    does not flush the drive cache; grouped, the flush is paid per group.
+
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
 
