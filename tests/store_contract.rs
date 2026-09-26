@@ -2999,6 +2999,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
         .iter()
         .map(|p| match p {
             Publication::Event(e) => e["event"].as_str().unwrap(),
+            Publication::Through(_) => "through",
             Publication::Finished { .. } => "finished",
         })
         .collect();
@@ -3058,6 +3059,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
     db.publish_since(&mut watermark, |p| {
         order.push(match p {
             Publication::Event(e) => e["event"].as_str().unwrap().to_owned(),
+            Publication::Through(through) => format!("through:{through}"),
             Publication::Finished { turn, .. } => format!("finished:{turn}"),
         });
         true

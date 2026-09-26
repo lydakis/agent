@@ -6,11 +6,9 @@ use agent_runtime::{Result, fail, output::Output, store::Store};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicI64, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
+use tokio::sync::watch;
 
 pub struct Subscription {
     session: u64,
@@ -52,7 +50,7 @@ pub const ALL: &str = "*";
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
     /// The newest durable cursor delivered to every follower.
-    published: Arc<AtomicI64>,
+    published: Arc<watch::Sender<i64>>,
 }
 #[derive(Default)]
 struct HubInner {
@@ -162,14 +160,29 @@ impl Hub {
             }
         }
         if let Some(cursor) = cursor {
-            self.published.fetch_max(cursor, Ordering::Release);
+            self.published_to(cursor);
         }
         sent
     }
-    /// The newest durable cursor `durable` has delivered: every event up to
-    /// it is in its followers' queues, or refused and their sessions closed.
+    /// The newest durable cursor delivered: every event up to it is in its
+    /// followers' queues, refused and their sessions closed, or was removed
+    /// before publication.
     pub fn published(&self) -> i64 {
-        self.published.load(Ordering::Acquire)
+        *self.published.borrow()
+    }
+    pub fn published_to(&self, cursor: i64) {
+        self.published.send_if_modified(|published| {
+            let moved = cursor > *published;
+            if moved {
+                *published = cursor;
+            }
+            moved
+        });
+    }
+    /// Wait until every event up to `cursor` is delivered.
+    pub async fn published_through(&self, cursor: i64) {
+        let mut published = self.published.subscribe();
+        let _ = published.wait_for(|published| *published >= cursor).await;
     }
     pub async fn live(&self, bot: &str, event: Value) -> Result<()> {
         self.fan_out(bot, &event, None);

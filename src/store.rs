@@ -882,6 +882,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_publication_pass_covers_events_removed_before_it() {
+        let path = scratch_path("publish-through");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (store, mut publications) = Store::open(&path).await.unwrap();
+        // A deletion can share a group with the job whose events it removes.
+        let cursor = store
+            .call(|db| {
+                let (_, event) = db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: crate::codec::Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                    },
+                )?;
+                db.connection().execute("DELETE FROM events", [])?;
+                Ok(event["cursor"].as_i64().unwrap())
+            })
+            .await
+            .unwrap();
+        let publication =
+            tokio::time::timeout(std::time::Duration::from_secs(1), publications.recv())
+                .await
+                .expect("the pass says how far it covered")
+                .unwrap();
+        assert!(
+            matches!(publication, Publication::Through(through) if through == cursor),
+            "{publication:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_diagnostics_survive_commit_and_transaction_rollback() {
         for (name, setup, write, extended) in [
             (

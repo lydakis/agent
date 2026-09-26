@@ -695,6 +695,7 @@ pub(crate) async fn publish(
                 // A closed stdio owner ends the daemon through its own signal.
                 let _ = hub.durable(&bot, entry).await;
             }
+            Publication::Through(cursor) => hub.published_to(cursor),
             Publication::Finished { bot, turn, outcome } => {
                 handles.turn_finished(&bot, turn, outcome);
             }
@@ -1019,6 +1020,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 let (session, output, id, result) = service.settle().await;
                                 reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                             }
+                            // Even with none queued, an admission waits for the events
+                            // of those answered before it when they and it would not
+                            // fit together: a socket whose queue overflows is closed,
+                            // and its admission must not commit first. The stdio
+                            // owner's output waits for room instead.
+                            if !(id == 0 && stdio_owner)
+                                && let Some(cursor) = service.awaits_publication(request.as_ref().ok().map(|r| &r.command), id, &output, bound)
+                            {
+                                service.hub.published_through(cursor).await;
+                                if *output.subscribe_closed().borrow() { continue; }
+                            }
                             let (request_id, result, shutdown) = match request {
                                 Ok(request) => {
                                     let shutdown = match request.command {
@@ -1209,17 +1221,12 @@ impl Service {
                 return true;
             }
             let (bytes, packets) = output.room();
-            let published = self.hub.published();
             let queued = self
                 .admissions
                 .iter()
                 .filter(|admission| admission.session == session)
                 .map(|admission| admission.bound.total());
-            let answered = self
-                .unpublished
-                .iter()
-                .filter(|events| events.session == session && events.cursor > published)
-                .map(|events| events.events);
+            let answered = self.pending_events(session).map(|events| events.events);
             let promised = queued
                 .chain(answered)
                 .fold(bound.total(), |sum, sends| sum + sends);
@@ -1236,6 +1243,41 @@ impl Service {
             }
             _ => true,
         }
+    }
+
+    /// Events answered for `session` that the publisher has not delivered.
+    fn pending_events(&self, session: u64) -> impl Iterator<Item = &Unpublished> {
+        let published = self.hub.published();
+        self.unpublished
+            .iter()
+            .filter(move |events| events.session == session && events.cursor > published)
+    }
+    /// For an admission that finds the window empty: the newest of its
+    /// session's events answered but not yet delivered, when those events
+    /// and the admission would not fit the session's queue together.
+    fn awaits_publication(
+        &self,
+        command: Option<&Command>,
+        session: u64,
+        output: &Output,
+        bound: Bound,
+    ) -> Option<i64> {
+        if !self.admissions.is_empty()
+            || !matches!(
+                command,
+                Some(Command::Create { .. } | Command::Submit { .. })
+            )
+        {
+            return None;
+        }
+        let (promised, newest) = self
+            .pending_events(session)
+            .fold((bound.total(), None), |(sum, _), events| {
+                (sum + events.events, Some(events.cursor))
+            });
+        let newest = newest?;
+        let (bytes, packets) = output.room();
+        (promised.bytes > bytes || promised.packets > packets).then_some(newest)
     }
 
     /// Answer the oldest queued admission once its commit is known.
@@ -3445,6 +3487,82 @@ mod tests {
         };
         output.try_respond(id, Ok(result.unwrap())).unwrap();
         assert_eq!(service.unpublished.len(), 1, "only the late event waits");
+        publisher.abort();
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_admission_after_a_window_waits_for_that_windows_events() {
+        use tokio::io::AsyncBufReadExt;
+        let dir = scratch("admit-after-window");
+        let (store, publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let (near, far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(far).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.contains("marker") {
+                    break;
+                }
+            }
+            lines
+        });
+        let sub = service.hub.subscribe(hub::ALL, 1, output.clone(), 0);
+        replay(store.clone(), service.hub.clone(), hub::ALL.to_owned(), sub)
+            .await
+            .unwrap();
+        output.try_send(json!({"marker": true})).unwrap();
+        let _stalled = reader.await.unwrap();
+        // A window is answered before the publisher runs.
+        let window = ADMISSION_WINDOW / 2;
+        for n in 0..window {
+            let command = create(&format!("B{n}"), &dir);
+            let bound = service.admission_sends(&command, &json!(n), 1);
+            assert!(!service.must_settle(Some(&command), 1, &output, bound));
+            let deferred = service.dispatch(command, 1, &output, json!(n), bound).await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+        }
+        while !service.admissions.is_empty() {
+            let (_, output, id, result) = service.settle().await;
+            output.try_respond(id, Ok(result.unwrap())).unwrap();
+        }
+        // Other traffic leaves exactly the room those events need.
+        let next = create("Next", &dir);
+        let bound = service.admission_sends(&next, &json!("next"), 1);
+        assert_eq!(
+            service.awaits_publication(Some(&next), 1, &output, bound),
+            None,
+            "the window's events and the next admission fit"
+        );
+        while output.room().1 > window {
+            output.try_send(json!({"filler": true})).unwrap();
+        }
+        let newest = service.awaits_publication(Some(&next), 1, &output, bound);
+        assert_eq!(newest, Some(window as i64), "the next admission waits");
+        assert_eq!(
+            service.awaits_publication(Some(&Command::Stats), 1, &output, Bound::default()),
+            None,
+            "only admissions wait"
+        );
+        let publisher = tokio::spawn(publish(
+            publications,
+            service.hub.clone(),
+            service.handles.clone(),
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.hub.published_through(newest.unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(!*output.subscribe_closed().borrow(), "the events fit");
+        assert_eq!(
+            service.awaits_publication(Some(&next), 1, &output, bound),
+            None
+        );
         publisher.abort();
         drop(service);
         drop(store);

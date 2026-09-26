@@ -161,11 +161,16 @@ impl Delivery {
     }
 }
 /// What the storage worker hands to the publisher after each job, in commit
-/// order: every durable event committed past its watermark, then the
-/// outcomes of turns that job ended, for their waiters.
+/// order: every durable event committed past its watermark, how far that
+/// covers when the newest were removed first, then the outcomes of turns
+/// that job ended, for their waiters.
 #[derive(Debug)]
 pub enum Publication {
     Event(Value),
+    /// Every event up to this cursor was published or removed before it
+    /// could be: a job that deletes events can share a group with the job
+    /// that wrote them.
+    Through(i64),
     Finished {
         bot: String,
         turn: i64,
@@ -710,6 +715,19 @@ impl Database {
             }
             if delivered < 256 {
                 break;
+            }
+        }
+        let assigned: i64 = self
+            .conn
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
+            .query_row([], |row| row.get(0))
+            .optional()?
+            .unwrap_or(0);
+        if assigned > *watermark {
+            *watermark = assigned;
+            if !sink(Publication::Through(assigned)) {
+                self.outcomes.clear();
+                return Ok(());
             }
         }
         for (bot, turn, outcome) in self.outcomes.drain(..) {

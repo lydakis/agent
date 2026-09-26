@@ -685,7 +685,12 @@ and the admissions already queued for that session will send: each reply,
 and its event once for each way the session follows the bot (by name,
 through `*`, or as the stdio firehose). Events reach followers after the
 reply, from the publisher, so an answered admission's events keep their room
-until the publisher has delivered them. Both are bounded from the
+until the publisher has delivered them. An admission that finds nothing
+queued still waits for those events when they and it would not fit
+together, so it cannot commit ahead of an overflow they cause; past that it
+is handled as a lone request always was. The storage worker also tells the
+publisher how far each pass reached, so events a deletion removed before
+publication hold no room and no wait. Both are bounded from the
 request: a creation's record repeats the request's strings, and a reply or
 event adds at most a canonical workspace and a model reference. A lost group answers each of its
 admissions with `storage_error`, starts no turn, and frees their slots. A
