@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{ContextPrefix, ContextUsage, Store, Window},
+    store::{ContextPrefix, ContextUsage, Store, Strip, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -73,17 +73,11 @@ impl Span<'_> {
     };
 }
 
-/// A stable fingerprint of the context in front of a window and of how its
-/// items read: the encoded prefix, the first item, and the elision floor,
-/// since a stub replacing a result changes what later items followed.
-/// FNV-1a, so it survives restarts and upgrades.
-fn fingerprint(prefix: &[u8], first: i64, elided: i64) -> i64 {
+/// A stable fingerprint of the context in front of a window: the encoded
+/// prefix and the first item. FNV-1a, so it survives restarts and upgrades.
+fn fingerprint(prefix: &[u8], first: i64) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in prefix
-        .iter()
-        .chain(&first.to_le_bytes())
-        .chain(&elided.to_le_bytes())
-    {
+    for byte in prefix.iter().chain(&first.to_le_bytes()) {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -115,7 +109,7 @@ fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
 fn item_chunks(
     store: Store,
     chunks: Arc<[Vec<i64>]>,
-    floor: i64,
+    strip: Strip,
     elided: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     let mut started = false;
@@ -125,7 +119,7 @@ fn item_chunks(
             async move {
                 store
                     .read("items_by_ids", move |db| {
-                        db.items_by_ids(&chunks[index], floor, elided)
+                        db.items_by_ids(&chunks[index], strip, elided)
                     })
                     .await
                     .map_err(|error| std::io::Error::other(error.code))
@@ -418,7 +412,7 @@ impl Turn {
         Ok(Context {
             window: Some(window),
             prefix,
-            thinking_floor: 0,
+            thinking: Strip::default(),
         })
     }
 
@@ -508,19 +502,22 @@ impl Turn {
                     thinking: &w.thinking,
                     elided: w.elided,
                 },
-                context.thinking_floor,
+                context.thinking,
             ),
-            None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, 0),
+            None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, Strip::default()),
         }
     }
 
     /// Anthropic thinking replay. Each thinking block is bound to the exact
-    /// context before it, so once the context in front of the window changes
+    /// context before it. Once the context in front of the window changes
     /// (the window slides, a compaction or note lands, or a fork starts from
-    /// other instructions) the blocks written under the old one are sent
-    /// without thinking; blocks written after the change keep theirs. Other
-    /// families send items unchanged.
-    async fn thinking_floor(
+    /// other instructions), every block written under the old one is sent
+    /// without thinking. When the elision floor moves, only the blocks after
+    /// the first newly stubbed result are: those before it still follow what
+    /// they were written after, and the provider's cache still holds them.
+    /// Blocks written after a change keep theirs. Other families send items
+    /// unchanged.
+    async fn bind_thinking(
         &self,
         record: &mut agent_runtime::store::Bot,
         context: &mut Context,
@@ -532,25 +529,49 @@ impl Turn {
         else {
             return Ok(());
         };
-        let prefix = fingerprint(&context.prefix.bytes, window.ids[0], window.elided);
-        if record.thinking_prefix != Some(prefix) {
-            let floor = window.ids[window.ids.len() - 1] + 1;
+        let prefix = fingerprint(&context.prefix.bytes, window.ids[0]);
+        let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
+        let mut strip = record.thinking;
+        if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
+            strip = Strip::from(next);
+        } else if elided > record.thinking_elided {
+            // Ids grow along a lineage, so the window's are ascending.
+            let start = window
+                .ids
+                .partition_point(|id| *id <= record.thinking_elided);
+            let end = window.ids.partition_point(|id| *id <= elided);
+            let moved = window.ids[start..end].to_vec();
+            let first = self
+                .store
+                .read("first_stub", move |db| db.first_stub(&moved))
+                .await?;
+            if let Some(first) = first {
+                strip = strip.and(first, next);
+            }
+        }
+        if (
+            record.thinking_prefix,
+            record.thinking,
+            record.thinking_elided,
+        ) != (Some(prefix), strip, elided)
+        {
             let bot = self.bot.clone();
             self.store
                 .op("set_thinking", move |db| {
-                    db.set_thinking(&bot, prefix, floor)
+                    db.set_thinking(&bot, prefix, strip, elided)
                 })
                 .await?;
             record.thinking_prefix = Some(prefix);
-            record.thinking_floor = floor;
+            record.thinking = strip;
+            record.thinking_elided = elided;
         }
-        context.thinking_floor = record.thinking_floor;
+        context.thinking = strip;
         Ok(())
     }
 
     /// The context prefix, then the items of `ids` read from the store in
-    /// batches as the request streams; items below `floor` without thinking.
-    fn window_items(&self, prefix: Bytes, span: Span<'_>, floor: i64) -> Items {
+    /// batches as the request streams; those `strip` names without thinking.
+    fn window_items(&self, prefix: Bytes, span: Span<'_>, strip: Strip) -> Items {
         let Span {
             ids,
             sizes,
@@ -560,7 +581,7 @@ impl Turn {
         let stripped: usize = ids
             .iter()
             .zip(thinking)
-            .filter(|(id, _)| **id < floor)
+            .filter(|(id, _)| strip.strips(**id))
             .map(|(_, &bytes)| bytes as usize)
             .sum();
         let total = (prefix.len()
@@ -570,7 +591,7 @@ impl Turn {
         let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
         Items::new(total, move || {
             stream::iter([Ok(prefix.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), floor, elided))
+                .chain(item_chunks(store.clone(), chunks.clone(), strip, elided))
                 .boxed()
         })
     }
@@ -644,9 +665,9 @@ impl Turn {
         tools: &serde_json::value::RawValue,
         context: &mut Context,
         output_bytes: Option<usize>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         }
         let pressure = context.pressure();
         let limit = self.input_limit();
@@ -654,7 +675,7 @@ impl Turn {
         if pressure.bytes < (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
             && pressure.items < (self.context_items * self.compact_at / 100).min(limit.items)
         {
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         }
         let keep = (self.context_bytes / 100 * self.compact_keep)
             .min(
@@ -668,7 +689,7 @@ impl Turn {
                     / self.compact_at,
             )
             .max(1) as i64;
-        match self
+        let compaction = self
             .compact(
                 record,
                 model_rounds,
@@ -678,21 +699,17 @@ impl Turn {
                 keep,
                 keep_items,
             )
-            .await?
-        {
-            Compaction::Parked(until) => return Ok(Some(until)),
-            Compaction::Done => {
-                *context = self
-                    .context(
-                        self.context_bytes,
-                        self.context_items,
-                        self.context_bytes * 2 / 3,
-                    )
-                    .await?;
-            }
-            Compaction::Skipped => {}
+            .await?;
+        if let Compaction::Done = compaction {
+            *context = self
+                .context(
+                    self.context_bytes,
+                    self.context_items,
+                    self.context_bytes * 2 / 3,
+                )
+                .await?;
         }
-        Ok(None)
+        Ok(compaction)
     }
 
     /// The current turn cannot fit the budget. Elide what the model has
@@ -983,7 +1000,12 @@ impl Turn {
         let elided = plan.elided;
         Ok(Items::new(total, move || {
             stream::iter([Ok(head.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX, elided))
+                .chain(item_chunks(
+                    store.clone(),
+                    chunks.clone(),
+                    Strip::from(i64::MAX),
+                    elided,
+                ))
                 .chain(stream::iter([Ok(tail.clone())]))
                 .boxed()
         }))
@@ -1070,7 +1092,9 @@ impl Turn {
         // bot that has the tool elides.
         let elides = record.tools.iter().any(|tool| tool == "read");
         // Steers submitted since the last boundary go in before this call.
-        self.absorb().await?;
+        // One the turn has no room for stays queued until elision or a
+        // summary makes some.
+        let mut capped = self.absorb().await?.capped;
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
@@ -1090,6 +1114,7 @@ impl Turn {
             // parks on the same pool. A later model round may compact again.
             let resuming = std::mem::take(&mut resume_window);
             let output_bytes = provider.output_byte_estimate(model);
+            let mut made_room = false;
             let mut context = match self
                 .context(
                     self.context_bytes,
@@ -1110,7 +1135,10 @@ impl Turn {
                     )
                     .await?
                 {
-                    Overflow::Fits(context) => *context,
+                    Overflow::Fits(context) => {
+                        made_room = true;
+                        *context
+                    }
                     Overflow::Parked(until) => return Ok(Round::Paced(until)),
                     Overflow::Stuck => return Err(error),
                 },
@@ -1121,6 +1149,7 @@ impl Turn {
                 && self.elision_due(&context, output_bytes)
                 && self.elide(context.prefix.bytes.len(), false).await?
             {
+                made_room = true;
                 context = self
                     .context(
                         self.context_bytes,
@@ -1129,8 +1158,8 @@ impl Turn {
                     )
                     .await?;
             }
-            if !resuming
-                && let Some(parked) = self
+            if !resuming {
+                match self
                     .compact_if_due(
                         &mut record,
                         &mut model_rounds,
@@ -1141,8 +1170,25 @@ impl Turn {
                         output_bytes,
                     )
                     .await?
-            {
-                return Ok(Round::Paced(parked));
+                {
+                    Compaction::Parked(parked) => return Ok(Round::Paced(parked)),
+                    Compaction::Done => made_room = true,
+                    Compaction::Skipped => {}
+                }
+            }
+            if capped && made_room {
+                self.steers.store(true, Relaxed);
+                let absorbed = self.absorb().await?;
+                capped = absorbed.capped;
+                if absorbed.steered {
+                    context = self
+                        .context(
+                            self.context_bytes,
+                            self.context_items,
+                            self.context_bytes * 2 / 3,
+                        )
+                        .await?;
+                }
             }
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
@@ -1151,7 +1197,7 @@ impl Turn {
                 return fail("tool_round_limit");
             }
             let mut context = self.fit_context(context, self.input_limit()).await?;
-            self.thinking_floor(&mut record, &mut context).await?;
+            self.bind_thinking(&mut record, &mut context).await?;
             let Some(response) = self
                 .call(
                     provider,
@@ -1200,7 +1246,7 @@ impl Turn {
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard.
-                if self.absorb().await? {
+                if self.absorb().await?.steered {
                     continue;
                 }
                 return Ok(Round::Finished);
@@ -1243,7 +1289,7 @@ impl Turn {
             if parked {
                 return Ok(Round::Parked);
             }
-            self.absorb().await?;
+            capped |= self.absorb().await?.capped;
         }
         fail("tool_round_limit")
     }
@@ -1252,27 +1298,28 @@ impl Turn {
     /// recorded so far. The worker publishes each batch and answers the
     /// steers' waiters. One atomic read when nothing is waiting; the flag
     /// clears before the read, so a steer landing during it is seen next.
-    async fn absorb(&self) -> Result<bool> {
+    async fn absorb(&self) -> Result<Steered> {
+        let mut out = Steered::default();
         if !self.steers.swap(false, Relaxed) {
-            return Ok(false);
+            return Ok(out);
         }
         let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
         let mut through = None;
-        let mut steered = false;
         loop {
             let absorbed = self
                 .store
                 .op("absorb", move |db| db.absorb(turn, through, bytes, items))
                 .await?;
             through = absorbed.next_through;
-            steered |= !absorbed.outcomes.is_empty();
+            out.steered |= !absorbed.outcomes.is_empty();
+            out.capped |= absorbed.capped;
             // Release the batch before loading another; new arrivals beyond
             // the initial snapshot wait for the next model-round boundary.
             if through.is_none() {
                 break;
             }
         }
-        Ok(steered)
+        Ok(out)
     }
 
     /// One model call with retries. Each attempt streams the same immutable
@@ -1536,7 +1583,7 @@ impl Turn {
             Body::Window(Context {
                 window: Some(window),
                 prefix,
-                thinking_floor,
+                thinking,
             }) => Chain {
                 bot: &self.bot,
                 window: Some((&prefix.bytes[..], window.elided, &window.ids[..])),
@@ -1547,7 +1594,7 @@ impl Turn {
                         thinking: &window.thinking[skip..],
                         elided: window.elided,
                     };
-                    self.window_items(Bytes::new(), span, *thinking_floor)
+                    self.window_items(Bytes::new(), span, *thinking)
                 }),
             },
             _ => Chain {
@@ -2186,8 +2233,8 @@ use agent_runtime::store::pinned_item;
 struct Context {
     window: Option<Window>,
     prefix: ContextPrefix,
-    /// Items with ids below this go without their thinking blocks.
-    thinking_floor: i64,
+    /// The items sent without their thinking blocks.
+    thinking: Strip,
 }
 impl Context {
     fn empty() -> Self {
@@ -2197,7 +2244,7 @@ impl Context {
                 bytes: Bytes::new(),
                 items: 0,
             },
-            thinking_floor: 0,
+            thinking: Strip::default(),
         }
     }
     fn usage(&self) -> ContextUsage {
@@ -2216,8 +2263,17 @@ impl Context {
     }
 }
 
+/// What a boundary's absorb did: whether steers went in, and whether one
+/// stayed queued because the turn had no room for it.
+#[derive(Default)]
+struct Steered {
+    steered: bool,
+    capped: bool,
+}
+
 /// How a summary attempt ended: recorded, parked on its pool until the
-/// time given, or not made (nothing to cut, or a failure reported live).
+/// time given, or not made (not due, nothing to cut, or a failure reported
+/// live).
 enum Compaction {
     Done,
     Parked(u64),

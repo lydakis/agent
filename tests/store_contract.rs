@@ -2,7 +2,7 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, TurnOptions},
+    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, Strip, TurnOptions},
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -6100,6 +6100,99 @@ fn schema_30_adds_the_prompt_a_cut_inside_a_turn_keeps() {
     assert_eq!(pinned, vec![None]);
     let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
     assert_eq!((window.omitted_turns, window.omitted_in_turn), (5, 0));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_stub_strips_thinking_from_itself_up_to_the_request_that_sent_it() {
+    // Nodes below 10 lost their context; the first stub is node 20 and the
+    // request that sent it ended at node 30.
+    let one = Strip::from(10).and(20, 31);
+    assert_eq!(
+        one,
+        Strip {
+            below: 10,
+            from: 20,
+            to: 31
+        }
+    );
+    assert_eq!(
+        (0..33).filter(|id| !one.strips(*id)).collect::<Vec<_>>(),
+        [(10..20).collect::<Vec<_>>(), vec![31, 32]].concat()
+    );
+    // A later stub inside the range, or past it, extends it to the new
+    // request; the nodes between two ranges go with them.
+    for first in [25, 35] {
+        assert_eq!(
+            one.and(first, 41),
+            Strip {
+                below: 10,
+                from: 20,
+                to: 41
+            }
+        );
+    }
+    // A stub at or below the floor strips everything up to the request.
+    assert_eq!(one.and(10, 41), Strip::from(41));
+    assert_eq!(Strip::default().and(1, 5).from, 1);
+}
+
+#[test]
+fn schema_31_keeps_each_bots_thinking_and_forks_carry_a_strip_from_before_them() {
+    let path = std::env::temp_dir().join(format!("agent-strip-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=3 {
+            converse(&mut db, "Bob", n);
+        }
+        db.set_thinking("Bob", 7, Strip::from(3), 0).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN thinking_from; ALTER TABLE bots DROP COLUMN thinking_to;
+             ALTER TABLE bots DROP COLUMN thinking_elided; PRAGMA user_version=30;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(
+        (bob.thinking_prefix, bob.thinking, bob.thinking_elided),
+        (Some(7), Strip::from(3), 0)
+    );
+    // A strip recorded by a request that sent the head carries to a fork
+    // there, and not to one from before it.
+    let head = bob.head.unwrap();
+    let strip = Strip {
+        below: 3,
+        from: head - 2,
+        to: head + 1,
+    };
+    db.set_thinking("Bob", 7, strip, head - 2).unwrap();
+    for (name, checkpoint, carried) in [("Now", None, true), ("Before", Some(head - 2), false)] {
+        db.fork(
+            "Bob",
+            name,
+            Fork {
+                checkpoint,
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+        let fork = db.inspect(name).unwrap();
+        let expected = if carried {
+            (Some(7), strip, head - 2)
+        } else {
+            (None, Strip::default(), 0)
+        };
+        assert_eq!(
+            (fork.thinking_prefix, fork.thinking, fork.thinking_elided),
+            expected
+        );
+    }
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

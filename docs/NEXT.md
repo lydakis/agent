@@ -559,7 +559,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     [the measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). A
     round that overflows before compaction is due forces a summary after
     the forced elision, and catch-up steps cut at rounds inside a turn too
-    large for one step. Still open: an overflowing round whose one catch-up
+    large for one step. A steer the turn had no room for is tried again at
+    the boundary where elision or a summary makes some, rather than only
+    after the turn ends. Still open: an overflowing round whose one catch-up
     step leaves the view over budget ends with `context_limit`, since one
     step is recorded per head; steers absorbed before an in-turn cut are
     summarized, not kept verbatim like the prompt; and every window and
@@ -577,7 +579,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     prefix enforcement, and either drop invalidated thinking with the loss
     reported or use the documented handling, before Fable is offered
     compaction. Benchmark a provider-native compactor behind the versioned
-    view while there. (From Astra Pro's compaction review.)
+    view while there. An elision move now drops only thinking written after
+    its first newly stubbed result, so the prefix before that result stays
+    cached. (From Astra Pro's compaction review.)
 36. The evaluation that challenges the summary, and the soak's second
     half in one: a single substantial repository task on luna that crosses
     several compactions, with facts that live only in tool results (a
@@ -591,14 +595,20 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     call; measure total input and output, cache reads and writes, and
     summarizer latency per correctly completed task. Compare a few
     threshold policies on it before changing the 75/25 defaults. First
-    slice built, not yet run live: [`bench/long_task_eval.py`](LONG_TASK_EVAL.md)
-    runs one synthetic repository task with those four facts and a
-    steered correction, in a small-budget and a full-context condition
-    from fresh starts, scored from the workspace and the events. Still
-    open: branching from identical checkpoints, the omission-listing,
-    elision-only, and prompt-excerpts conditions, threshold policies, and
-    the live runs on the ChatGPT plan. (From Astra Pro's compaction review,
-    and the remainder of item 16.)
+    slice built: [`bench/long_task_eval.py`](LONG_TASK_EVAL.md) runs one
+    synthetic repository task with those four facts and a steered
+    correction, in a small-budget and a full-context condition from fresh
+    starts, scored from the workspace and the events. [Run live
+    once](LONG_TASK_EVAL.md#live-run-1): every bot kept the four facts; the
+    one wrong answer came from a steer the runtime left queued, since
+    fixed; compacting served 28% of model input from cache against 75%,
+    and no summary request read any. Still open: summary requests that reuse the
+    bot's cache, as Claude Code and Codex send theirs; stub passes and cuts
+    that break the cache on separate rounds; branching from identical
+    checkpoints, the omission-listing, elision-only, and prompt-excerpts
+    conditions, a realistic budget and preamble, threshold policies, and a
+    rerun. (From Astra Pro's compaction review, and the remainder of item
+    16.)
 37. Context construction cost, measured before built. Item 33 shares an
     encoded prefix across retries, combines window metadata, removes the
     separate `unsummarized_bytes` lookup, and avoids full-window construction

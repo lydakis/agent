@@ -10,9 +10,10 @@ rounding rule of the prompt. The `compact` condition holds the context
 budget small, so the turn compacts several times; `full` gives the same task
 a large budget as the control. Scores come from the workspace and the event
 log, not from the model's account of itself: hidden tests, the vendor
-checksum, how often `make quick` and `tools/migrate` ran, whether the final
-answer carries the measured number, plus every model and summarizer token,
-compactions, and retrieval calls.
+checksum, how often `make quick` ran and the migration was applied, whether
+the correction reached the task, whether the final answer carries the
+measured number, plus every model and summarizer token, compactions, and
+retrieval calls.
 
 Real model, real spend. Run it on the ChatGPT plan with Codex's login,
 naming the model as Codex's /model picker shows it:
@@ -280,7 +281,6 @@ def score(root, facts, events, answer):
                     command = ''
                 commands.append((event['cursor'], command))
     quick = [c for c, command in commands if 'make quick' in command]
-    migrate = [c for c, command in commands if 'tools/migrate' in command and '--status' not in command]
     repeated = {}
     seen = set()
     for cursor, command in commands:
@@ -317,7 +317,6 @@ def score(root, facts, events, answer):
         'make_quick_runs': count_lines(root / '.quick-attempts'),
         'make_quick_calls_after_first_compaction': sum(first_cut is not None and c > first_cut for c in quick),
         'migrations_applied': count_lines(root / '.migrations.log'),
-        'migrate_calls': len(migrate),
         'reported_throughput': str(facts['throughput']) in (answer or '').replace(',', ''),
         'compactions': len(compactions),
         'elisions': sum(e['event'] == 'elided' for e in events),
@@ -357,23 +356,33 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         for name in names:
             turns[name] = client.request('submit', bot=name, request_id='task', prompt=TASK)['result']['turn']
         # Live events: count completed tools per bot, steer once each passes
-        # STEER_AFTER, and collect the terminal events.
-        done, steered, completed = {}, {}, {name: 0 for name in names}
+        # STEER_AFTER, and collect the terminal events of tasks and steers.
+        done, steers, ends, completed = {}, {}, {}, {name: 0 for name in names}
         while len(done) < len(names):
             message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
                                      timeout=timeout)
             name = message.get('bot')
-            if name not in turns or message.get('turn') != turns[name]:
+            if name not in turns:
+                continue
+            if message['event'] == 'turn_finished' and message.get('turn') == steers.get(name, {}).get('turn'):
+                ends[name] = message['data']
+                continue
+            if message.get('turn') != turns[name]:
                 continue
             if message['event'] == 'turn_finished':
                 done[name] = message
                 continue
             completed[name] += 1
-            if completed[name] == STEER_AFTER and name not in steered:
+            if completed[name] == STEER_AFTER and name not in steers:
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
                                        delivery='steer', expected_turn=turns[name])
-                steered[name] = reply.get('error') or 'steered'
+                steers[name] = reply.get('result') or {'error': reply.get('error')}
         wall = round(time.monotonic() - started, 1)
+        # A steer still queued when its task ends fails then, as it names
+        # that task's turn.
+        for name, steer in steers.items():
+            if 'turn' in steer and name not in ends:
+                ends[name] = client.finished(steer['turn'], timeout=60)['data']
         # Failed summaries are reported live only.
         failures = {name: [m.get('error') for m in client.saved
                            if m.get('event') == 'compaction_failed' and m.get('bot') == name] for name in names}
@@ -385,13 +394,22 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 item = client.request('item', bot=name, node=checkpoint)['result']
                 answer = ''.join(c.get('text', '') for c in item.get('content', []) if isinstance(c, dict))
             results[name] = {'status': done[name]['data']['status'], 'error': done[name]['data'].get('error'),
-                             'steer': steered.get(name, 'not sent: fewer tool calls'),
+                             'steer': steer_outcome(steers.get(name), ends.get(name)),
                              'answer': answer[:2000], 'compaction_failures': failures[name],
                              **score(root / name, facts[name], events, answer)}
         client.request('shutdown')
     finally:
         client.close(kill=True)
     return {'condition': condition, 'context_bytes': CONDITIONS[condition], 'wall_s': wall, 'bots': results}
+
+
+def steer_outcome(steer, end):
+    """Whether the correction reached the task: its turn's final status."""
+    if steer is None:
+        return 'not sent: fewer tool calls'
+    if 'turn' not in steer:
+        return f"refused: {steer['error']}"
+    return end['status'] if end['status'] == 'steered' else f"{end['status']}: {end.get('error')}"
 
 
 def summarize(block):
@@ -402,6 +420,7 @@ def summarize(block):
 
     return {'condition': block['condition'], 'context_bytes': block['context_bytes'],
             'completed': f"{sum(b['status'] == 'completed' for b in bots)}/{len(bots)}",
+            'steered': f"{sum(b['steer'] == 'steered' for b in bots)}/{len(bots)}",
             'correct': count('correct'), 'vendor_intact': count('vendor_intact'),
             'reported_throughput': count('reported_throughput'),
             'migrated_once': f"{sum(b['migrations_applied'] == 1 for b in bots)}/{len(bots)}",

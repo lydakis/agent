@@ -1012,8 +1012,12 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   steer stay within three quarters of `--context-bytes` and
   `--context-items`, the target the window itself keeps, so a burst of
   large steers cannot make the running turn exceed its context and fail
-  with `context_limit`. Steers that do not fit stay queued and start as
-  their own turns when the line moves; later steers do not overtake them.
+  with `context_limit`. A steer that does not fit stays queued, and later
+  steers do not overtake it. Once elision or a summary makes room in the
+  running turn, the same boundary tries it again before the model call, so
+  a correction reaches a long task that compacts; one still queued when the
+  turn ends starts as its own turn when the line moves (a strict steer, which
+  names that turn, fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
   of the turn's first node, found through a partial `nodes(turn)` index. This
   takes a fixed number of indexed lookups regardless of current-turn length;
@@ -1563,10 +1567,16 @@ each move (version node, previous version, `through`, the number of newly
 elided results, and the bytes saved), a bot's `elision` names its current
 version, and a historical fork binds to the newest version at or before its
 checkpoint, so it sees what its source saw there. Moving the floor rewrites
-items the provider has cached, so it is a prompt-cache break like a window
-move: the Responses WebSocket chain key includes the floor, and the Anthropic
-thinking fingerprint includes it too, so thinking written before the move
-is sent without it afterwards while later thinking keeps its own. Between
+items the provider has cached from the first newly stubbed result on, so it
+is a prompt-cache break there: the Responses WebSocket chain key includes the
+floor. On Anthropic, only thinking written after that result and before the
+move is sent without it afterwards. The bot records the floor its last
+request was read under and, beside the floor below which the context
+changed, one range of nodes whose thinking goes: from the first newly
+stubbed node to the move's request. A later move extends the range; one
+apart from it takes in the nodes between, which costs only some valid
+thinking. Thinking before the first new stub, and after the move, keeps its
+own, so the cached prefix up to that stub stays as it was sent. Between
 moves the prefix is stable and the cache extends as usual. Anthropic documents
 server-side tool-result clearing (context editing) as not counting as an edit
 for its binding check, which would keep that thinking; it is family-specific

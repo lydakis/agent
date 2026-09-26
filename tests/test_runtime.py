@@ -61,7 +61,9 @@ class Model(http.server.BaseHTTPRequestHandler):
                 return
             assert self.path == '/v1/responses'
             assert request['model'] == 'synthetic-model'
-            user = [i for i in request['input'] if i.get('role') == 'user'][-1]['content'][0]['text']
+            texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
+            # A `steer:` message joins the running task, which its prompt drives.
+            user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
@@ -140,7 +142,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # `long:COUNTxLINES,...` sets each round's lines instead.
                 # Progress is the newest call since the prompt: a cut inside
                 # the turn summarizes older rounds but keeps the prompt.
-                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user')
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                            and not i['content'][0]['text'].startswith('steer:'))
                 calls = [i for i in request['input'][start:] if i.get('type') == 'function_call']
                 done = max((int(c['call_id'][5:]) + 1 for c in calls if c['call_id'][5:].isdigit()), default=0)
                 stubs = [i for i in request['input'] if i.get('type') == 'function_call_output'

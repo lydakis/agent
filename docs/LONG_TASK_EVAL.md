@@ -5,8 +5,8 @@ what it learned, and finish correctly? This page has two parts: acceptance
 cases that combine compaction with the runtime's other guarantees, run
 against scripted providers, and an evaluation of a real model on one
 synthetic repository task (roadmap [item 36](NEXT.md)). Written 2026-09-26.
-The acceptance cases pass; the evaluation has only run against a scripted
-agent so far, and no live results are recorded here yet.
+The acceptance cases pass. The evaluation has run once live, recorded
+[below](#live-run-1).
 
 ## Acceptance cases
 
@@ -74,7 +74,16 @@ workspace, so a replayed side effect shows as an extra line.
    kept bound across cuts on the Anthropic family with prefix enforcement
    (`test_thinking_stays_bound_across_cuts_inside_the_turn`), and the
    elision cases in `tests/test_elision.py`.
-6. **The evaluation runner itself.** `tests/test_long_task_eval.py`: the
+6. **A steer the turn has no room for.** `tests/test_elision.py`,
+   `test_a_steer_the_turn_had_no_room_for_goes_in_once_elision_makes_some`.
+   A strict steer arrives while the turn holds two whole results of about
+   11 KiB in a 24 KiB budget, more than the three quarters a steer may join.
+   Expected: it goes in at the next boundary, after elision stubs the older
+   result and before that boundary's model call, following a result the
+   model has not answered yet; its turn ends `steered` into the task. Before
+   the fix it stayed queued and failed with `stale_turn` when the task
+   ended, which is what the live run hit.
+7. **The evaluation runner itself.** `tests/test_long_task_eval.py`: the
    scorer reads each fact from a workspace where it was kept and where it
    was lost, and the runner drives a scripted agent through the task below
    to a correct finish, sending the correction as a steer, crossing a
@@ -114,8 +123,9 @@ history`.
 
 Scores come from the workspace and the event log, not the model's account
 of itself: hidden tests passed, vendor checksum intact, `make quick` runs
-in total and after the first compaction, migrations applied and migrate
-calls, whether the answer carries the measured number, commands repeated
+in total and after the first compaction, migrations applied, whether the
+correction reached the task (its steer turn's final status, not the submit
+reply), whether the answer carries the measured number, commands repeated
 after the first compaction, retrieval calls (`history`, or `read` of a
 `result/` reference), compactions, elisions, the context-view version each
 model call was made under, input, cached input, and output tokens for the
@@ -138,9 +148,67 @@ under `.local/long-task-eval/run/`, which git ignores. Each condition
 prints a one-line summary; the JSON file keeps every bot's scores and
 answer.
 
+## Live run 1
+
+2026-09-26, commit `b9541c7`, `chatgpt/gpt-6-sol` on the ChatGPT plan with
+Codex's login, seed 7, three bots per condition. No API key was used. The
+numbers below are from the run's JSON, kept in the ignored `.local/`
+directory of the machine that ran it.
+
+| | compact (20 KiB) | full (4 MiB) |
+| --- | --- | --- |
+| Completed / correct | 3/3 / 2/3 | 3/3 / 3/3 |
+| Vendor intact, migrated once, number reported | 3/3 each | 3/3 each |
+| `make quick` runs | 0, 0, 0 | 0, 0, 0 |
+| Compactions / elisions per bot | 4/3, 4/3, 3/3 | none |
+| Retrieval calls per bot | 0, 1, 1 | 0, 0, 0 |
+| Model input / cached / output tokens | 103,365 / 28,928 / 3,444 | 156,819 / 117,120 / 3,443 |
+| Summarizer input / cached / output tokens | 17,606 / 0 / 7,185 | none |
+| Model input served from cache | 28% (12 of 38 calls read any) | 75% |
+| Summary time holding the model back | 147.8 s over 11 summaries | none |
+| Condition wall time | 121.6 s | 48.1 s |
+
+Every bot kept all four facts from tool results, and compact-0 and
+compact-1 kept the steered correction across two or three later cuts. The
+one wrong answer, compact-2, never received the correction. It was queued
+after the sixth tool call, one compaction into the turn. At that boundary
+the turn held 15,833 bytes against the 15,360 a steer may join, measured
+before that round's elision, so the steer stayed queued. Nothing retried
+it once elision and two cuts made room. At the turn's end the strict steer
+failed with `stale_turn`, and the bot truncated as the prompt said
+(hidden tests 5/9). That is fixed: acceptance case 6.
+
+Two scorer faults were found and fixed. `steer` recorded the submit reply,
+so compact-2 read "steered". A `migrate_calls` count matched command text,
+counting reads of the script and missing runs chained with `--status`.
+`migrations_applied`, from the workspace, was right: no bot applied the
+migration twice.
+
+Compaction's cost in this run:
+- Uncached model input was 74,437 tokens against 39,699, plus 17,606
+  summarizer input tokens, none cached.
+- Summary requests are built fresh, with the compaction instructions, no
+  tools, and their own cache key, so nothing they send starts with a prefix
+  the provider holds.
+- Each cut and each stub pass rewrites the view near its front. Stub passes
+  fell on other rounds than cuts, so their misses stacked; one bot made
+  three uncached calls in a row.
+- After a cut only the instructions and tools stay ahead of the summary,
+  which here is under OpenAI's 1,024-token minimum cacheable prefix.
+- The 20 KiB budget forces a cut about every three calls, far more often
+  than a real budget would, so this overstates the cost per task.
+
+Claude Code and Codex send the summary request as a copy of the call just
+made, with the compaction instruction appended, so most of it reads from
+cache. Sources: Anthropic's "Lessons from building Claude Code: Prompt
+caching is everything" and Codex's `compact_remote_v2_attempt.rs` on
+`openai/codex` main, both checked 2026-09-26. Pi builds a fresh summary
+prompt, as this runtime does.
+
 ## Not covered yet
 
 The rest of item 36: branching every condition from identical
 checkpoints rather than fresh starts, the omission-listing, elision-only,
-and prompt-excerpts conditions, comparing threshold policies before
-changing the 75/25 defaults, and the live runs themselves.
+and prompt-excerpts conditions, a condition with a realistic budget and
+preamble, comparing threshold policies before changing the 75/25 defaults,
+and a rerun after the steer fix.

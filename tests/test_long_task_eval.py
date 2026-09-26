@@ -9,7 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bench import long_task_eval
-from bench.long_task_eval import CORRECTION, STEER_AFTER, TASK, run_condition, score, workspace
+from bench.long_task_eval import (CORRECTION, STEER_AFTER, TASK, run_condition, score, steer_outcome,
+                                  workspace)
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
 
@@ -82,7 +83,7 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(result['hidden_tests'], f'{len(long_task_eval.HIDDEN)}/{len(long_task_eval.HIDDEN)}')
         self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'])
         self.assertEqual((result['make_quick_runs'], result['make_quick_calls_after_first_compaction']), (1, 0))
-        self.assertEqual((result['migrations_applied'], result['migrate_calls']), (1, 1))
+        self.assertEqual(result['migrations_applied'], 1)
         self.assertEqual(result['repeated_commands_after_first_compaction'], {})
         self.assertEqual(result['compactions'], 1)
 
@@ -100,10 +101,18 @@ class LongTaskScoreTests(unittest.TestCase):
         result = score(self.root, self.facts, events, 'Tests pass.')
         self.assertFalse(result['correct'] or result['vendor_intact'] or result['reported_throughput'])
         self.assertEqual((result['make_quick_runs'], result['make_quick_calls_after_first_compaction']), (2, 1))
-        self.assertEqual((result['migrations_applied'], result['migrate_calls']), (2, 2))
+        self.assertEqual(result['migrations_applied'], 2)
         self.assertEqual(result['repeated_commands_after_first_compaction'],
                          {'make quick': 1, 'tools/migrate': 1})
         self.assertIsNotNone(result['hidden_failure'])
+
+    def test_a_steer_counts_only_once_it_reached_the_task(self):
+        self.assertEqual(steer_outcome({'turn': 9}, {'status': 'steered', 'into': 1}), 'steered')
+        # Queued behind a full turn until the task ended, then refused.
+        self.assertEqual(steer_outcome({'turn': 9}, {'status': 'failed', 'error': 'stale_turn'}),
+                         'failed: stale_turn')
+        self.assertEqual(steer_outcome({'error': 'stale_turn'}, None), 'refused: stale_turn')
+        self.assertEqual(steer_outcome(None, None), 'not sent: fewer tool calls')
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')

@@ -67,13 +67,15 @@ pub struct Bot {
     /// is the bot's own.
     pub cache_bot: Option<i64>,
     /// Anthropic thinking replay: a fingerprint of the context in front of
-    /// the window at the last request, and the first node whose thinking
-    /// was written under it. Blocks on older nodes were bound to a context
-    /// the provider no longer sees, so requests send them without thinking.
+    /// the window at the last request, the nodes whose thinking was bound
+    /// to a context the provider no longer sees, so requests send them
+    /// without it, and the elision floor that request was read under.
     #[serde(skip)]
     pub thinking_prefix: Option<i64>,
     #[serde(skip)]
-    pub thinking_floor: i64,
+    pub thinking: Strip,
+    #[serde(skip)]
+    pub thinking_elided: i64,
     /// Anthropic server-side fallbacks: a declined request is rerun on the
     /// model Anthropic recommends instead of failing the turn. The client's
     /// choice at creation; forks inherit it.
@@ -184,6 +186,8 @@ pub struct Absorbed {
     pub outcomes: Vec<(i64, Value)>,
     /// Continue this boundary's finite snapshot in another bounded call.
     pub next_through: Option<i64>,
+    /// A steer stayed queued because the window had no room for it.
+    pub capped: bool,
 }
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -250,6 +254,51 @@ pub struct Window {
     /// Tool results with ids up to this one that have stubs go as their
     /// stubs, which `sizes` counts; zero when nothing is elided.
     pub elided: i64,
+}
+/// The nodes an Anthropic request sends without their thinking blocks:
+/// those below `below`, written before the context in front of the window
+/// changed, and those in `from..to`, written after a tool result that now
+/// goes as its stub. Each block is bound to what preceded it, so a change
+/// strips every node after it up to the request that first sent it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Strip {
+    pub below: i64,
+    pub from: i64,
+    pub to: i64,
+}
+impl Strip {
+    pub fn strips(self, id: i64) -> bool {
+        id < self.below || (self.from <= id && id < self.to)
+    }
+    /// Also strip `first` up to `to`. One range is kept: a new range apart
+    /// from the current one takes in the nodes between them, which only
+    /// sends some valid thinking without it.
+    pub fn and(self, first: i64, to: i64) -> Self {
+        let from = if self.from < self.to {
+            self.from.min(first)
+        } else {
+            first
+        };
+        if from <= self.below {
+            Self::from(to)
+        } else {
+            Self {
+                below: self.below,
+                from,
+                to,
+            }
+        }
+    }
+}
+impl From<i64> for Strip {
+    /// Every node below `below`.
+    fn from(below: i64) -> Self {
+        Self {
+            below,
+            from: 0,
+            to: 0,
+        }
+    }
 }
 /// What a compaction left in place of the turns it covered.
 #[derive(Debug, Clone)]
@@ -416,7 +465,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 30;
+    pub const SCHEMA: i32 = 31;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -525,7 +574,10 @@ impl Database {
                 cache_bot INTEGER, thinking_prefix INTEGER,
                 thinking_floor INTEGER NOT NULL DEFAULT 0,
                 fallbacks INTEGER NOT NULL DEFAULT 0,
-                elision INTEGER REFERENCES elisions(node));
+                elision INTEGER REFERENCES elisions(node),
+                thinking_from INTEGER NOT NULL DEFAULT 0,
+                thinking_to INTEGER NOT NULL DEFAULT 0,
+                thinking_elided INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -781,12 +833,17 @@ impl Database {
             compaction_model: r.get(21)?,
             cache_bot: r.get(22)?,
             thinking_prefix: r.get(23)?,
-            thinking_floor: r.get(24)?,
+            thinking: Strip {
+                below: r.get(24)?,
+                from: r.get(27)?,
+                to: r.get(28)?,
+            },
+            thinking_elided: r.get(29)?,
             fallbacks: r.get::<_, i64>(25)? != 0,
             elision: r.get(26)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -2111,9 +2168,15 @@ impl Database {
         Ok(out)
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
-    /// Items joined by commas; those with ids below `floor` go without
-    /// their thinking blocks, and one that held only thinking is left out.
-    pub fn items_by_ids(&self, ids: &[i64], floor: i64, elided: i64) -> Result<Vec<u8>> {
+    /// Items joined by commas; those `strip` names go without their
+    /// thinking blocks, and one that held only thinking is left out.
+    pub fn items_by_ids(
+        &self,
+        ids: &[i64],
+        strip: impl Into<Strip>,
+        elided: i64,
+    ) -> Result<Vec<u8>> {
+        let strip = strip.into();
         let mut statement = self
             .conn
             .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
@@ -2136,7 +2199,7 @@ impl Database {
             }
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
-                let item = match (*id < floor && r.get::<_, i64>(1)? > 0)
+                let item = match (strip.strips(*id) && r.get::<_, i64>(1)? > 0)
                     .then(|| super::without_thinking(item))
                     .flatten()
                 {
@@ -2177,13 +2240,41 @@ impl Database {
             })
             .collect()
     }
-    /// Record the context fingerprint a bot's requests now start with and
-    /// the first node whose thinking is bound to it.
-    pub fn set_thinking(&mut self, name: &str, prefix: i64, floor: i64) -> Result<()> {
+    /// Record the context fingerprint a bot's requests now start with, the
+    /// nodes they send without thinking, and the elision floor.
+    pub fn set_thinking(
+        &mut self,
+        name: &str,
+        prefix: i64,
+        strip: Strip,
+        elided: i64,
+    ) -> Result<()> {
         self.conn
-            .prepare_cached("UPDATE bots SET thinking_prefix=?,thinking_floor=? WHERE name=?")?
-            .execute(params![prefix, floor, name])?;
+            .prepare_cached(
+                "UPDATE bots SET thinking_prefix=?,thinking_floor=?,thinking_from=?,thinking_to=?,
+                    thinking_elided=? WHERE name=?",
+            )?
+            .execute(params![
+                prefix,
+                strip.below,
+                strip.from,
+                strip.to,
+                elided,
+                name
+            ])?;
         Ok(())
+    }
+    /// The first of `ids` that has a stub.
+    pub fn first_stub(&self, ids: &[i64]) -> Result<Option<i64>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM stubs WHERE node=?)")?;
+        for id in ids {
+            if statement.query_row([id], |r| r.get::<_, bool>(0))? {
+                return Ok(Some(*id));
+            }
+        }
+        Ok(None)
     }
     /// Bytes and items in the active turn alone. Older turns can be removed
     /// from the context window; the current turn cannot, though a compaction
@@ -2872,7 +2963,10 @@ impl Database {
                 steers.push((row.get(0)?, item, size));
             }
         }
-        let mut absorbed = Absorbed::default();
+        let mut absorbed = Absorbed {
+            capped,
+            ..Absorbed::default()
+        };
         if steers.is_empty() {
             return Ok(absorbed);
         }
@@ -3562,11 +3656,22 @@ impl Database {
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
+        // Every strip was recorded by a request that sent nodes up to it.
+        let before = checkpoint.map_or(0, |c| c + 1);
+        let thinking = if parent.thinking.below <= before && parent.thinking.to <= before {
+            (
+                parent.thinking_prefix,
+                parent.thinking,
+                parent.thinking_elided,
+            )
+        } else {
+            (None, Strip::default(), 0)
+        };
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -3589,11 +3694,12 @@ impl Database {
                 // its window. Carry that over only if it was already in
                 // place at the checkpoint; the fork's first request compares
                 // its own context against it.
-                (parent.thinking_floor <= checkpoint.map_or(0, |c| c + 1))
-                    .then_some(parent.thinking_prefix)
-                    .flatten(),
-                parent.thinking_floor,
-                parent.fallbacks
+                thinking.0,
+                thinking.1.below,
+                parent.fallbacks,
+                thinking.1.from,
+                thinking.1.to,
+                thinking.2
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -4922,6 +5028,21 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE compactions ADD COLUMN pinned INTEGER REFERENCES nodes(id);
              CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;",
+        )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='thinking_elided')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 30 -> 31: a stub strips thinking only from the nodes after it.
+        // The fingerprint no longer covers the elision floor, so each bot's
+        // first request strips its window's thinking once, as a change of
+        // context does.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN thinking_from INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE bots ADD COLUMN thinking_to INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE bots ADD COLUMN thinking_elided INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     Ok(())

@@ -13,6 +13,15 @@ def encoded(items):
     return len(json.dumps(items, separators=(',', ':'), ensure_ascii=False).encode()) - 2
 
 
+def plain(value):
+    """A request without its cache markers, which may move freely."""
+    if isinstance(value, dict):
+        return {k: plain(v) for k, v in value.items() if k != 'cache_control'}
+    if isinstance(value, list):
+        return [plain(v) for v in value]
+    return value
+
+
 def drain(model):
     out = []
     while not model.requests.empty():
@@ -129,6 +138,37 @@ class ElisionTests(ModelFixture):
         self.assertEqual([c['covered_turns'] for c in compacted], [[1, 1]])
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
 
+    def test_a_steer_the_turn_had_no_room_for_goes_in_once_elision_makes_some(self):
+        # At a round's end the turn holds two whole results of about 11 KiB,
+        # more than the three quarters of 24 KiB a steer may join. The next
+        # boundary stubs the older one, and the steer goes in there, before
+        # the model's next call, rather than failing when the turn ends.
+        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               tools=['shell', 'read'], compaction_instructions='Summarize.'))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
+                       and m.get('data', {}).get('call_id') == 'long-1')
+        correction = 'steer:' + 'x' * 1000
+        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        outcome = client.finished(steer)['data']
+        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        work = [r for r in drain(self.model) if r.get('instructions') != 'Summarize.']
+        steered = [n for n, r in enumerate(work)
+                   if any(i.get('role') == 'user' and i['content'][0]['text'] == correction for i in r['input'])]
+        first = work[steered[0]]['input']
+        at = next(n for n, i in enumerate(first) if i.get('role') == 'user' and i['content'][0]['text'] == correction)
+        # It follows a result the model has not answered yet, and the
+        # request that first carries it stubs more than the one before.
+        self.assertEqual((first[at - 1]['type'], first[at - 1]['output'].startswith(STUB)),
+                         ('function_call_output', False))
+        stubs = lambda r: sum(i.get('type') == 'function_call_output' and i['output'].startswith(STUB)
+                              for i in r['input'])
+        self.assertGreater(stubs(work[steered[0]]), stubs(work[steered[0] - 1]))
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
+
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicElisionTests(ModelFixture):
@@ -165,3 +205,14 @@ class AnthropicElisionTests(ModelFixture):
         self.assertGreater(counts[-1], 0)
         # Thinking written after a move is replayed until the next one.
         self.assertTrue(any(stubbed(r) and thinking(r) for r in requests))
+        # A move changes the request from its first new stub on. Everything
+        # before it, thinking included, is sent as the previous request sent
+        # it, so the provider's cache and the model's reasoning both hold.
+        moves = [n for n in range(1, len(requests)) if counts[n] > counts[n - 1]]
+        self.assertGreaterEqual(len(moves), 2)
+        for n in moves:
+            before, after = (plain(requests[n - 1]['messages']), plain(requests[n]['messages']))
+            first = next(i for i, (a, b) in enumerate(zip(before, after)) if a != b)
+            self.assertGreater(stubbed({'messages': [after[first]]}),
+                               stubbed({'messages': [before[first]]}))
+            self.assertGreater(thinking({'messages': after[:first]}), 0)
