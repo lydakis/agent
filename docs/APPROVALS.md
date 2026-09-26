@@ -42,7 +42,8 @@ has to be counted per call.
    obvious cases in microseconds, and Jev answers ten narrow questions
    about the rest in about 0.3 s. In the stored Harbor trials
    the rules settled only 21 to 29% of calls, so Jev is the common path,
-   not the exception: 64 to 76% of model rounds would wait on it, about 1
+   not the exception: at least 64 to 76% of model rounds would wait on
+   it (the count treated four git commands as read-only), about 1
    to 2% of median trial time. What is dangerous or unclear is
    denied, never silently allowed and never sent to a person. On a
    labeled set of 341 calls from those trials, Jev's answers with the
@@ -210,8 +211,10 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   A list and its tag together make a **gate**. A gate may also carry an
   `expire_ms` its creator chooses: a call whose verdict for that gate has
   not arrived that long after it was announced is denied by the daemon
-  with the reason "not reviewed: no verdict", so a crashed approver stops
-  its bots instead of stalling them. The CLI sets 15 s on `auto` gates
+  with the reason "not reviewed: no verdict", and the turn ends as
+  interrupted, since with no approver answering nothing further in it
+  could run. So a crashed approver stops its bots, and their model
+  calls, instead of stalling them. The CLI sets 15 s on `auto` gates
   (the approver's own 10 s Jev deadline plus margin) and none on
   `manual` ones, since a person may take hours.
 - **Gates only accumulate.** A new bot keeps every gate it descends from
@@ -222,25 +225,24 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
     gated fork, and a fork never drops its source's gate.
 
   Each gate's list is intersected with the new bot's tools, and gates with
-  the same tag merge, keeping the shorter expiry. A call needs an allow from every gate whose list
-  names its tool, and the first deny from any of them denies it. So a bot
-  under `manual` that forks an `auto` bot gets a fork whose calls need
-  both, and nothing a bot asks for can replace a gate it inherited. Mixed
-  gates are rare; the common bot has one. A read-only child of a bot gated
-  on `shell,write,edit` gets nothing to approve, because it has none of
-  those tools. A fork keeps its source's tools, so its lists stay subsets
-  even when its allowed list is narrower. Tool definitions never change,
-  so the prompt cache is untouched. This is a guard against accidents, not
-  a boundary: the creator is declared by the shell's environment, and a
-  command that clears it creates an ungated bot. The approver sees that
-  command first.
+  the same tag merge, keeping the shorter expiry. A call needs an allow
+  from every gate whose list names its tool, and the first deny from any
+  of them denies it. So a bot under `manual` that forks an `auto` bot gets
+  a fork whose calls need both, and nothing a bot asks for can replace a
+  gate it inherited. Mixed gates are rare; the common bot has one. A
+  read-only child of a bot gated on `shell,write,edit` gets nothing to
+  approve, because it has none of those tools. A fork keeps its source's
+  tools, so its lists stay subsets even when its allowed list is narrower.
+  Tool definitions never change, so the prompt cache is untouched. This is
+  a guard against accidents, not a boundary: the creator is declared by
+  the shell's environment, and a command that clears it creates an ungated
+  bot. The approver sees that command first.
 - **The request rides the plan commit.** When `append` records a model
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
-  `{"calls":[{"call_id","request","announced_ms","gates","name","node","path"?}]}`,
-  where `gates` lists the tags whose answer the call needs, `path` is the
-  resolved file for `read`, `write`, and `edit` (see the rules), and
+  `{"calls":[{"call_id","request","announced_ms","gates","name","node"}]}`,
+  where `gates` lists the tags whose answer the call needs and
   `announced_ms` is when this request was written. The stored event holds
   no arguments, since the node already does; a few dozen bytes per call.
   What is sent to approvers also carries, per gate, the bot's
@@ -260,7 +262,10 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   large `write`) with `item` on that call's node. Bot followers get the
   compact event. One event per round, not per call, and no extra commit.
 - **`answer` decides one request.**
-  `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"until_prior"?,"lease"?}`.
+  `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"until_prior"?,"lease"?,"path"?}`.
+  An allow of `read`, `write`, or `edit` carries `path`, the file the
+  approver resolved and judged (see the rules); for a person, the CLI or
+  app resolves it and shows it before the person allows.
   `request` is the number the call was announced with, and it changes each
   time the call is announced again. `tag` names the gate answered and may
   be left out when the call has one. The first answer to the current
@@ -409,9 +414,10 @@ own clock.
   when it is not running; with `auto` it starts `agent approver` the same
   way. A gated call with no approver waits, parked and visible in
   `approvals`, rather than running or failing silently, until its gate's
-  15 s expiry denies it. So if the approver dies and nothing restarts it,
-  each auto bot gets denials with that reason, trips the circuit
-  breaker's count, and stops, instead of hanging.
+  15 s expiry denies it and ends the turn. So if the approver dies and
+  nothing restarts it, each auto bot stops at its next gated call with
+  that reason, instead of hanging or looping; the next `auto` command
+  starts a new approver.
 - **Software callers keep `full`.** A program that drives bots gains nothing
   from a gate it has to answer itself, and `full` pays nothing.
 
@@ -475,11 +481,14 @@ so only one instance runs at a time, and answers in layers:
      after that call runs. Other processes can change it too: a
      background command from an earlier round, a watcher, or anything
      else the user runs. For `read`, `write`, and `edit` the daemon closes
-     that gap. It reports each call's resolved path in the announcement,
-     and at execution it opens the file, asks the OS which file it opened
+     that gap. The allow carries the path the approver resolved, and at
+     execution the daemon opens the file, asks the OS which file it opened
      (`F_GETPATH` on macOS, `/proc/self/fd` on Linux), and fails the call
-     as `path_changed` if that is not the path announced, which
-     re-announces the rest of the round like any failure. A shell
+     as `path_changed` if that is not the path allowed, which
+     re-announces the rest of the round like any failure. The approver
+     resolves each path once, which it must do anyway; the daemon adds
+     one system call after an open it makes anyway, and no lookup before
+     the plan commit. A shell
      command resolves its own paths when it runs, so there the gap stays:
      oversight, not containment.
    - `read` inside the workspace is allowed, except files that look like
@@ -491,12 +500,23 @@ so only one instance runs at a time, and answers in layers:
      `secrets.*`. Those, and reads outside the workspace, go to the model.
      This is a list, and a secret in a file it does not name reaches the
      provider. The daemon's redaction only catches its own provider keys.
+   - `read` with an `artifact` instead of a path pages through the
+     retained output of a shell call this bot's lineage already ran,
+     and the daemon refuses any other. That output's head and tail
+     already went to the model as the call's result, unscreened, so
+     the rules allow the page. Approval judges actions, not results: a
+     secret a command prints unexpectedly reaches the provider in its
+     result whether or not anyone pages the middle. Screening results
+     would be a filter on the daemon's output path, beside its
+     provider-key redaction, and is not part of this design.
    - A shell command is split the way Codex splits it: only plain words
      joined by `&&`, `||`, `;`, or `|`. It is allowed only if every part is
      a command on the read-only list, every flag it uses is on that
      command's own list of allowed flags, and every path it names is a
      readable path by the rule above. The name must also resolve, through
-     the tool shell's `PATH`, to an executable outside the workspace that
+     the tool shell's `PATH`, which the daemon reports in the
+     `serve_approvals` reply for that reason, to an executable outside the
+     workspace that
      the user cannot write, in a directory the user cannot write, or to
      one the environment note trusts (a Homebrew prefix is owned by the
      user). An `rg` or `find` found anywhere else, such as one an earlier
@@ -515,9 +535,9 @@ so only one instance runs at a time, and answers in layers:
        a secret-looking name (`rg -g '*.rs'`); otherwise it goes to the
        model. `rg` also reads a config file named by `RIPGREP_CONFIG_PATH`,
        which can add `--pre` and run a program, so it counts only with
-       `--no-config` or when that variable is unset in the tool shell's
-       environment. The approver is started with the same environment as
-       the daemon (the CLI starts both), so it checks its own.
+       `--no-config`. The approver cannot see the tool shell's variables:
+       a daemon started earlier keeps the environment it was started
+       with, which may not be the approver's.
      - Git is not on the read-only list at all. Even `git status` and
        `git diff` can run programs: `core.fsmonitor`, external diff
        drivers and `GIT_EXTERNAL_DIFF`, textconv and clean filters chosen
@@ -547,7 +567,10 @@ so only one instance runs at a time, and answers in layers:
      history someone else has (a force push)?
    - Does it send files, secrets, or code to a destination the user did
      not name?
-   - Does it read, print, or change credentials or access permissions?
+   - Does it read, print, use, or change credentials or access
+     permissions, such as signing in to a remote host (`ssh prod
+     uptime`) with a saved key or login? (The labeled run asked this
+     without "use"; the broader question is untested.)
    - Does it change a shared or production system (deploy, migrate,
      publish, send a message)?
    - Does it download and run code from the network?
@@ -673,24 +696,32 @@ or `password`. Each match is replaced with a typed placeholder such as
 where, and judges the destination. A secret the detector does not
 recognize is sent as is; like the `read` list, this is a list.
 
-**The intent view is bounded.** Jev takes at most 32k tokens of state, and
-a long-lived bot's prompts outgrow that. The approver sends, in this
+**The intent view is bounded.** Jev takes at most 32k tokens of state,
+and a long-lived bot's prompts outgrow that. The approver sends, in this
 order: the environment note, the root person's prompt for this turn, the
 current turn's prompt and its steers, each marked as a person's or a
-model's words, the calls being judged, the calls already allowed, and then
-earlier prompts newest first until a 16k-token budget is spent. The calls
-being judged are sent whole, read with `item` when their preview was cut,
-and so is any file written this turn that one of them runs; only the
-already allowed calls are previewed, to 2,048 characters. If everything
-before the earlier prompts does not fit, it does not call Jev; the call is
-unclear (step 4), with the reason "not reviewed: intent too long". A
-command that runs a file too large to show is refused rather than judged
-on its first part.
-In the stored Harbor trials this never fires: across the 1,398 rounds that
-would reach Jev, the prompt plus every planned and already allowed call
-(each previewed to 2,048 characters) came to a median of about 4k
-characters for ChatGPT-plan runs and 7k for Sonnet, and 25k at most,
-roughly 1k to 8k tokens (measured 2026-09-26, no model calls).
+model's words, the calls being judged, the calls already allowed, and
+then earlier prompts newest first until a 16k-token budget is spent. The
+calls being judged are sent whole, read with `item` when their preview
+was cut, and so is any file written this turn that one of them runs. So
+are the already allowed shell and caller-registered calls, since a
+one-time request is used up by a call that did it and a deploy past a
+preview's 2,048 characters would hide that; an allowed `write` or `edit`
+is shown as its path and size, since a file's content is not what
+consent is about. If the calls being judged do not fit, it does not call
+Jev; the call is unclear (step 4), with the reason "not reviewed: intent
+too long". If the already allowed calls do not fit, consent is not
+counted: Jev still judges the risks, a call whose risks are all low can
+be allowed, and a risky one is unclear. A command that runs a file too
+large to show is refused rather than judged on its first part.
+
+In the stored Harbor trials the first limit never fires: across the
+1,398 rounds that would reach Jev, the prompt plus every planned and
+already allowed call (each previewed to 2,048 characters) came to a
+median of about 4k characters for ChatGPT-plan runs and 7k for Sonnet,
+and 25k at most, roughly 1k to 8k tokens (measured 2026-09-26, no model
+calls). Sending allowed shell calls whole makes this larger; that has
+not been measured.
 Standing limits ("never push to main") belong in the environment note,
 which is always sent, not in an old prompt that may fall out of the view.
 Claude Code has the same gap: its docs say a boundary stated in the
@@ -717,7 +748,10 @@ with 64k tokens per request of which 32k can be state. The sustained live
 fleet ran 60 model calls a second through one daemon. At the 64 to 76% of
 rounds that reached Jev in the Harbor trials, that is about twice the
 request limit: one key caps an `auto` fleet at roughly 26 to 31 model
-rounds a second. Hence one request per round rather than per call, the
+rounds a second, at most. Both figures are bounds: the count treated
+`git status`, `diff`, `log`, and `show` as read-only, and git now goes
+to the model, so the share is higher and the cap lower. Hence one
+request per round rather than per call, the
 rules layer in front, and a pace in the approver that backs off on 429
 and 529 as TypeSafe's docs ask. The pace has a bound: each round gets 10 s
 from announcement to verdict, queue time included, measured from the
@@ -733,8 +767,9 @@ closed and visibly, instead of growing a queue of parked turns.
 | Path | Added per gated call | Extra commits | Holds a task |
 | --- | ---: | ---: | --- |
 | Tool not in `approve` | nothing measurable (one list lookup, as today) | 0 | as today |
-| Rules answer | one socket round trip, 0.13 ms median, 0.3 ms p99 (measured), plus one storage-worker job with no commit | 0 | yes, briefly |
-| Jev answers (64 to 76% of rounds, measured below) | 0.26 s median, 0.52 to 0.57 s p99 (labeled run, ten questions) | 0 | yes, up to the hold |
+| Rules answer | one socket round trip, 0.13 ms median, 0.3 ms p99 (measured), plus one storage-worker job with no commit, plus the approver's path resolution (a few `stat` calls; not measured, and slower on a network mount) | 0 | yes, briefly |
+| Jev answers within the hold (at least 64 to 76% of rounds, measured below) | 0.26 s median, 0.52 to 0.57 s p99 (labeled run, ten questions) | 0 | yes, up to the hold |
+| A verdict after the hold, or while the turn is parked on an earlier `wait` | the answer's time | 1 or 2 (the park if this call caused it, and the verdict) | no, after the hold |
 | Person answers | the person's time | 2 (park, verdict) | no, after the hold |
 
 - **The socket hop.** A Python client sent 5,000 sequential JSONL requests
@@ -900,9 +935,11 @@ as one.
    until then.
 3. **The daemon path.** On the lifecycle screen with `approve` set and a
    rules-only approver, confirm zero added commits per call and under 1 ms
-   added per gated call, and record the bytes each gated call adds to the
-   store and WAL and to the approver's socket, against the same screen
-   without `approve`; then the park path with a delayed answer.
+   added per gated call, path resolution included, and record the bytes
+   each gated call adds to the store and WAL and to the approver's
+   socket, against the same screen without `approve`; then the park path
+   with a delayed answer, counting its commits, and a verdict that
+   arrives while the turn is parked on an earlier `wait`.
 
 ## Open decisions
 
