@@ -714,6 +714,11 @@ pub struct Database {
     /// at open and kept by the one writer at each transition, so admission
     /// and `stats` cost nothing on the store.
     pending: (i64, i64),
+    /// Announced calls not yet started or denied, for `stats`: counted from
+    /// the rows at open and after a failed job or group, as `pending` is,
+    /// and kept by the one writer at each announcement, start, denial, and
+    /// turn end.
+    approvals: i64,
     /// Outcomes of turns ended by the current job, published after its
     /// events. Captured inside the job, so retention in the same job
     /// cannot remove what a waiter is owed.
@@ -790,6 +795,7 @@ impl Database {
             conn,
             pending_limits: (0, 0),
             pending: (0, 0),
+            approvals: 0,
             outcomes: Vec::new(),
             pending_stale: false,
             live: HashMap::new(),
@@ -967,6 +973,7 @@ impl Database {
             conn,
             pending_limits: (0, 0),
             pending: (0, 0),
+            approvals: 0,
             outcomes: Vec::new(),
             pending_stale: false,
             live: HashMap::new(),
@@ -1006,10 +1013,15 @@ impl Database {
         Ok(db)
     }
     /// Count the waiting turns from their rows: one pass over the queued
-    /// and ready rows, through their partial indexes.
+    /// and ready rows, through their partial indexes. The announced calls
+    /// are counted with them.
     fn recount_pending(&mut self) -> Result<()> {
         self.pending_stale = true;
         self.pending = (0, 0);
+        self.approvals = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM approvals")?
+            .query_row([], |r| r.get(0))?;
         for statement in [
             "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='queued'",
             "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='ready'",
@@ -3575,6 +3587,7 @@ impl Database {
         }
         // Every gated call of the round is announced in the commit that
         // plans it, one event for the round.
+        let mut announced_calls = 0;
         if gated {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
@@ -3612,6 +3625,7 @@ impl Database {
                 announced.push(json!({"call_id":call.call_id,"request":1,
                     "announced_ms":announced_ms,"gates":tags,"name":call.name,"node":node}));
             }
+            announced_calls = announced.len() as i64;
             for calls in announcements(announced)? {
                 let data = json!({"calls":calls});
                 let cursor = event(
@@ -3641,6 +3655,7 @@ impl Database {
             [turn],
         )?;
         tx.commit()?;
+        self.approvals += announced_calls;
         Ok(entries)
     }
     /// Charge an unsuccessful provider call without accepting its output.
@@ -3948,6 +3963,8 @@ impl Database {
                 expires_ms: lapse,
             });
         };
+        // Started, denied, or expired: its request is gone either way.
+        self.approvals -= 1;
         if let Some(live) = self.live_changed(turn) {
             live.verdicts.remove(&call.call_id);
             live.answered.remove(&request.id);
@@ -4251,11 +4268,8 @@ impl Database {
         Ok(Some(entry))
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
-    pub fn approval_requests(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .prepare_cached("SELECT COUNT(*) FROM approvals")?
-            .query_row([], |r| r.get(0))?)
+    pub fn approval_requests(&self) -> i64 {
+        self.approvals
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
@@ -4338,9 +4352,10 @@ impl Database {
                 params![waiting.paced_elapsed_ms(), turn],
             )?;
         }
-        if !bot.gates.is_empty() {
-            tx.execute("DELETE FROM approvals WHERE turn=?", [turn])?;
-        }
+        let unstarted = match bot.gates.is_empty() {
+            true => 0,
+            false => tx.execute("DELETE FROM approvals WHERE turn=?", [turn])? as i64,
+        };
         let code = error.map(|e| e.code.as_str());
         // Interrupted, by cause: a client's interrupt, the daemon shutting
         // down around the turn, a daemon that died with it running, or a
@@ -4375,6 +4390,7 @@ impl Database {
             "error":code,"detail":error.and_then(|e| e.detail.clone())});
         let cursor = event(&tx, &bot.name, Some(turn), "turn_finished", data.clone())?;
         tx.commit()?;
+        self.approvals -= unstarted;
         self.forget_live(turn);
         entries.push(entry(cursor, &bot.name, Some(turn), "turn_finished", data));
         Ok(entries)

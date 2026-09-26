@@ -1288,6 +1288,76 @@ fn held_verdicts_follow_the_group_that_holds_them() {
 }
 
 #[test]
+fn the_announced_call_count_follows_the_rows() {
+    let path = std::env::temp_dir().join(format!(
+        "agent-approval-count-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let reader = Connection::open(&path).unwrap();
+    let rows = || -> i64 {
+        reader
+            .query_row("SELECT count(*) FROM approvals", [], |r| r.get(0))
+            .unwrap()
+    };
+    let turn = gated_turn(&mut db, None);
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = ["s1", "s2", "s3"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| shell_call(&format!("fc_{i}"), id, "true"))
+        .unzip();
+    db.append(turn, items, &round, None).unwrap();
+    assert_eq!((db.approval_requests(), rows()), (3, 3));
+    allow(&mut db, turn, "s1").unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &round[0], 0).unwrap(),
+        Gated::Started
+    ));
+    assert_eq!((db.approval_requests(), rows()), (2, 2));
+    // A group that fails to commit takes its start back, and the count.
+    db.begin_group().unwrap();
+    allow(&mut db, turn, "s2").unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &round[1], 0).unwrap(),
+        Gated::Started
+    ));
+    assert_eq!(db.approval_requests(), 1);
+    db.abandon_group().unwrap();
+    assert_eq!((db.approval_requests(), rows()), (2, 2));
+    // A denial removes its call; the rest of the round, announced again,
+    // keeps its count.
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s2",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason: Some("no"),
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &round[1], 0).unwrap(),
+        Gated::Denied
+    ));
+    assert_eq!((db.approval_requests(), rows()), (1, 1));
+    // A parked turn's call is counted again when the store opens.
+    db.suspend_approval(turn, &round[2..], epoch_now(), None)
+        .unwrap();
+    drop(db);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!((db.approval_requests(), rows()), (1, 1));
+    // The turn's end takes the rest.
+    db.resume(turn).unwrap();
+    db.finish(turn, Some(&Error::new("cancelled"))).unwrap();
+    assert_eq!((db.approval_requests(), rows()), (0, 0));
+    drop((db, reader));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn a_group_waits_for_a_write_lock_another_connection_holds() {
     let path = std::env::temp_dir().join(format!("agent-group-lock-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
