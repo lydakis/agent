@@ -2,7 +2,6 @@
 import fcntl
 import json
 import re
-import http.server
 import concurrent.futures
 import threading
 import os
@@ -14,7 +13,7 @@ import tempfile
 import time
 import unittest
 
-from bench.runtime_client import Client, serve_args
+from bench.runtime_client import Client
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture

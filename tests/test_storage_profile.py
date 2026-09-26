@@ -50,12 +50,12 @@ class StorageProfileTests(unittest.TestCase):
                 db.executescript('''CREATE TABLE nodes(id INTEGER,turn INTEGER,item BLOB);
                     CREATE TABLE turns(id INTEGER,prompt TEXT);
                     CREATE TABLE retained_turns(turn INTEGER);
-                    CREATE TABLE artifacts(turn INTEGER,call_id TEXT,stream TEXT,data BLOB);
+                    CREATE TABLE artifacts(turn INTEGER,call_id TEXT,stream TEXT,data BLOB,raw_bytes INTEGER);
                     CREATE TABLE events(id INTEGER);
                     CREATE TABLE compactions(node INTEGER);''')
                 db.execute('INSERT INTO nodes VALUES (1,1,?)', (item,))
                 db.execute('INSERT INTO turns VALUES (1,?)', ('é\0hello',))
-                db.execute('INSERT INTO artifacts VALUES (1,\'x\',\'stdout\',?)', (b'\xff\0output',))
+                db.execute('INSERT INTO artifacts VALUES (1,\'x\',\'stdout\',?,0)', (b'\xff\0output',))
             before = hashlib.sha256(path.read_bytes()).hexdigest()
             result = profile(path)
             self.assertEqual(result['duplicate_prompt_bytes'], len('é\0hello'.encode()))

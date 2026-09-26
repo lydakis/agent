@@ -81,7 +81,7 @@ class SocketClient:
         self.followers, self.turns = {}, {}
         self.control = None
         self.process = subprocess.Popen(
-            [str(binary), *serve_args(path, url, tools), '--socket', str(self.socket_path)],
+            [str(binary), *serve_args(path, url), '--socket', str(self.socket_path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, env=clean_env())
         try:

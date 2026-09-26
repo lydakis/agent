@@ -30,13 +30,11 @@ def profile(path):
             "SELECT coalesce(json_extract(CAST(item AS TEXT),'$.type'),"
             "json_extract(CAST(item AS TEXT),'$.role'),'other'),count(*),sum(length(item)) "
             'FROM nodes GROUP BY 1')]
-        artifact_columns = {row[1] for row in db.execute('PRAGMA table_info(artifacts)')}
-        artifact_size = 'CASE WHEN raw_bytes>0 THEN raw_bytes ELSE length(data) END' if 'raw_bytes' in artifact_columns else 'length(data)'
         result['stored_artifact_bytes'] = db.execute('SELECT coalesce(sum(length(data)),0) FROM artifacts').fetchone()[0]
         result['payload_bytes'] = dict(zip(('nodes', 'turn_prompts', 'artifacts'), db.execute(
             'SELECT (SELECT coalesce(sum(length(item)),0) FROM nodes),'
             '(SELECT coalesce(sum(length(CAST(prompt AS BLOB))),0) FROM turns),'
-            f'(SELECT coalesce(sum({artifact_size}),0) FROM artifacts)').fetchone()))
+            '(SELECT coalesce(sum(CASE WHEN raw_bytes>0 THEN raw_bytes ELSE length(data) END),0) FROM artifacts)').fetchone()))
         # Count only exact duplicate text, not all turns or guessed JSON overhead.
         result['duplicate_prompt_bytes'] = db.execute(
             "SELECT coalesce(sum(length(CAST(t.prompt AS BLOB))),0) FROM turns t "
