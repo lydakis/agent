@@ -228,8 +228,11 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
-  `{"calls":[{"call_id","request","gates","name","node","arguments","arguments_truncated"}]}`,
-  where `gates` lists the tags whose answer the call needs.
+  `{"calls":[{"call_id","request","announced_ms","gates","name","node","arguments","arguments_truncated"}]}`,
+  where `gates` lists the tags whose answer the call needs and
+  `announced_ms` is when this request was written. `approvals` and
+  `serve_approvals` return it too, so an approver that takes over a
+  pending request knows how much of the client's deadline is left.
   Each call names its own node: an Anthropic round keeps all its calls in
   one assistant item, but a Responses round stores each `function_call` as
   an item of its own. Arguments are previewed to 2,048 characters, as
@@ -250,10 +253,13 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   client can answer, including a bot's shell; see the security section.
 - **`approvals` lists what is pending,** optionally for one bot or one tag,
   so an approver that connects late or restarts can catch up. It runs on
-  the storage worker, like `answer`, and leaves out calls whose verdict is
-  in the worker's map but not yet written, so it never offers a call that
-  would only fail with `approval_already_answered`. `stats` counts pending
-  verdicts the same way.
+  the storage worker, like `answer`. A call is pending while any of its
+  gates lacks a verdict, and each listed call names only the gates still
+  unanswered, counting verdicts that are in the worker's map but not yet
+  written. So it never offers a gate that would only fail with
+  `approval_already_answered`, and a call answered by `auto` stays
+  visible to `manual` until a person answers too. `stats` counts pending
+  gates the same way.
 - **One session serves a tag's approvals.** `serve_approvals
   {"tag","lease_ms"}` hands a session the pending requests whose gates
   include that tag and then streams only new `approval_requested` events
@@ -265,11 +271,14 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   while connected, like a suspended app or a wedged loop, loses the tag:
   the daemon sends it `approvals_lost`, and the next `serve_approvals`
   takes over. Until one does, its calls wait. The approver never reads the
-  fleet's other
-  events, so its cost grows with gated calls, not with everything the
-  bots stream, and two automatic approvers (the app and `agent approver`)
-  never both pay Jev for the same call. Any session can still `answer`,
-  which is how a person overrides.
+  fleet's other events, so its cost grows with gated calls, not with
+  everything the bots stream, and two automatic approvers (the app and
+  `agent approver`) do not both pay Jev for the same call in normal
+  running. A takeover can bill a round twice: a holder suspended with a
+  Jev request in flight loses the tag, the new holder sends the same
+  round, and the old answer is refused when the old holder wakes. That is
+  bounded by the rounds in flight at the takeover. Any session can still
+  `answer`, which is how a person overrides.
 - **Every planned call of a round is announced at once,** so an approver
   judges them in parallel and can judge each in light of the others (a
   `write` of `run.sh` followed by `sh run.sh`). Execution stays in order,
@@ -277,18 +286,23 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   verdict.
 - **A verdict is for the round as planned.** When a call ends denied, with
   an error, or as a shell command that exits nonzero, every later gated
-  call in the round whose verdict arrived before that happened loses it and
-  is announced again, with a new `request` number and the failed call
-  named. The approver judged
+  call in the round is announced again, with a new `request` number and
+  the failed call named, whether its verdict had arrived or not. A verdict
+  it already had is dropped, and one still being computed is refused on
+  arrival as `approval_superseded`. The approver judged
   `sh run.sh` expecting the planned `write`; if the write was refused, the
   file it would run is not the one it saw. The new request rides the failed
   call's own finishing commit, and a rules-only approver answers it again
   in microseconds. The success path pays nothing, with one exception the
   approver asks for: an allow sent with `"until_prior":true` holds only
-  for the filesystem the approver looked at, so if any earlier call of the
-  round finishes after it arrived, successfully or not, the call is
-  announced again the same way. The rules set it when an allow depended on
-  resolving a path and an earlier call of the round could change files.
+  for the filesystem the approver could have looked at, so if any earlier
+  call of the round finished after that request was announced,
+  successfully or not, the call is announced again the same way. The
+  comparison is with the announcement, not with the verdict's arrival,
+  because the approver may have resolved the path before a call that
+  finished while its answer was on the way. The rules set it when an
+  allow depended on resolving a path and an earlier call of the round
+  could change files.
 - **Allow rides `tool_start`.** The call starts as today, and its
   `tool_started` event gains `"approval":{"by","waited_ms"}`. No extra
   commit.
@@ -395,15 +409,19 @@ so only one instance runs at a time, and answers in layers:
    `history`, `wait`, `note`, and `echo` touch only the bot's own store
    records and stay ungated.
 2. **Deterministic rules, microseconds.**
-   - `write` and `edit` inside the turn's workspace are allowed. Files a
-     later command will execute are the exception and go to the model:
-     `.git/`, `.agent/`, `AGENTS.md`, build and hook files (`Makefile`,
-     `package.json`, `.envrc`, CI workflows). An independent test of Claude
-     Code's auto mode found 36.8% of state-changing actions went around its
-     classifier as in-project file edits (Ji et al., 2026). The approver
-     also remembers what each bot
-     wrote this turn, so a command that runs one of those files is judged
-     with the file's content in view.
+   - `write` and `edit` inside the turn's workspace are allowed, with two
+     exceptions that go to the model. The first is files a later command
+     will execute: `.git/`, `.agent/`, `AGENTS.md`, build and hook files
+     (`Makefile`, `package.json`, `.envrc`, CI workflows), and shell
+     startup files (`.bashrc`, `.zshrc`, `.profile`). An independent test
+     of Claude Code's auto mode found 36.8% of state-changing actions went
+     around its classifier as in-project file edits (Ji et al., 2026). The
+     second is files that hold secrets or grant access: every path on the
+     `read` list below, and `authorized_keys`. A workspace that is a home
+     directory would otherwise let a bot change its own keys unreviewed.
+     The approver also remembers what each bot wrote this turn, so a
+     command that runs one of those files is judged with the file's
+     content in view.
    - Every path is resolved on disk when the approver judges it, not read
      as text, so a symlink inside the workspace that points out of it
      counts as outside. An earlier call in the same round can change what
@@ -424,14 +442,13 @@ so only one instance runs at a time, and answers in layers:
      a command on the read-only list, every flag it uses is on that
      command's own list of allowed flags, and every path it names is a
      readable path by the rule above. The name must also resolve, through
-     the tool shell's `PATH`, to an executable outside the workspace in a
-     directory the user cannot write, or in one the environment note
-     trusts (a Homebrew prefix is owned by the user). A `git` or `rg` found
-     anywhere else, such as one an earlier command put in a writable
-     directory on `PATH`, makes the command opaque. The lists name what is
-     allowed, not
-     what is not: `find` may take `-name` and `-type` but not `-exec`,
-     `-delete`, `-fprint`, `-fprintf`, or `-fls`, simply because they are
+     the tool shell's `PATH`, to an executable outside the workspace that
+     the user cannot write, in a directory the user cannot write, or to
+     one the environment note trusts (a Homebrew prefix is owned by the
+     user). A `git` or `rg` found anywhere else, such as one an earlier
+     command put in a writable directory on `PATH`, makes the command
+     opaque. The lists name what is allowed, not what is not: `find` may
+     take `-name` and `-type` but not `-exec`, `-delete`, `-fprint`, `-fprintf`, or `-fls`, simply because they are
      not listed; the same goes for `git diff --output`, `rg --pre`, and
      `sort -o`. An unlisted flag, a redirect, `$(`, a backtick, or a
      variable makes the command opaque, and it goes on to the model. This
@@ -442,7 +459,11 @@ so only one instance runs at a time, and answers in layers:
        so a `.env` or key file inside the workspace goes out with the
        results. It is allowed only with an include glob that cannot match
        a secret-looking name (`rg -g '*.rs'`); otherwise it goes to the
-       model.
+       model. `rg` also reads a config file named by `RIPGREP_CONFIG_PATH`,
+       which can add `--pre` and run a program, so it counts only with
+       `--no-config` or when that variable is unset in the tool shell's
+       environment. The approver is started with the same environment as
+       the daemon (the CLI starts both), so it checks its own.
      - `git status`, `diff`, `log`, and `show` run programs named in git
        config: `core.fsmonitor`, external diff drivers, and textconv
        filters. Git counts as read-only only while its effective config
@@ -463,9 +484,9 @@ so only one instance runs at a time, and answers in layers:
    - Rules the user adds ("allow `cargo test`", "deny `git push`") are
      checked here. "Always allow" from the manual UI adds a rule here.
 3. **Jev, about 0.4 s.** One request per round: the state is the context
-   below plus the round's calls, and each call gets a few `noul` (true or
-   false) questions, each naming one judgment and returning a probability:
-   - Did the user ask for this action, or for something that needs it?
+   below plus the round's calls, and each call gets `noul` (true or false)
+   questions, each naming one judgment and returning a probability. Five
+   name a risk:
    - Does it delete or overwrite data outside the workspace, or rewrite
      history someone else has (a force push)?
    - Does it send files, secrets, or code to a destination the user did
@@ -475,12 +496,20 @@ so only one instance runs at a time, and answers in layers:
      publish, send a message)?
    - Does it download and run code from the network?
 
-   Allow when every risk is low. Allow a risky call too when the intent
-   answer is high, meaning the caller asked for this action, and no hard
-   deny (step 4) matches: a task that says to install a package, publish,
-   or deploy has consented to that. Deny, with the question as the reason
-   (like Claude Code's rule tags), when a risk is high and the user did not
-   ask for it. Everything else goes to step 4. The starting thresholds are
+   Each risk has a consent question asked beside it that names the same
+   effect: did the caller ask for this deletion, this destination, this
+   credential change, this system change, this download? Asking all ten
+   in one request keeps it to one round trip; they share the state, and
+   Jev bills input only.
+
+   Allow when every risk is low. Allow a risky call too when every high
+   risk has a high consent answer and no hard deny (step 4) matches. A
+   task that says to install a package, publish, or deploy has consented
+   to that effect and no other: a requested deploy that also sends a
+   credential to a host nobody named has a high risk with no consent, and
+   is denied. Deny, with the question as the reason (like Claude Code's
+   rule tags), when any risk is high and its consent is low. Everything
+   else goes to step 4. The starting thresholds are
    TypeSafe's guardrail cookbook's: below 0.35 is low, 0.70 or more is
    high. TypeSafe publishes no calibration figures; a third-party benchmark
    (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
@@ -490,7 +519,7 @@ so only one instance runs at a time, and answers in layers:
    The approver denies with a reason and moves on; it never pages a
    person. The reason tells the model what was refused and that it can ask
    its caller for an explicit go-ahead. If the caller's next message (a new
-   turn or a steer) names the action, the intent question now finds it in
+   turn or a steer) names the action, the consent question now finds it in
    a prompt the caller wrote, and the retry is allowed. This is how Claude
    Code's auto mode already weighs explicit user intent, and it needs no
    approval screen: consent is part of the conversation. Only prompts from
@@ -523,7 +552,7 @@ environment note (trusted remotes and hosts). Not tool results, not the
 model's prose, and not the model's reasoning. Jev's own limits page says
 content written to steer it "can move the answer", and a planned call is
 model-written text too: a command can carry a comment claiming the user
-approved it. So the intent question is asked of the human prompts, and a
+approved it. So the consent questions are asked of the human prompts, and a
 high risk that the prompts do not name is denied whatever the command
 says about itself.
 
@@ -538,7 +567,11 @@ opens a turn or is absorbed as a steer, and reports it in
 with `from` was written by the model of the turn it names, and the
 approver follows it back to that turn's own person-written items. So a
 bot that steers a person's turn does not speak for the person, and a
-person who steers a delegated turn does.
+person who steers a delegated turn does. If the chain cannot be followed
+because a bot it names was deleted, the approver treats the prompt as
+model-written with no person above it: nothing in it counts as consent,
+so a risky call from that bot is denied rather than allowed on a model's
+words.
 Like the creator, `from` is declared, not verified: a command that clears
 the environment submits a turn that looks like the caller's. The rules
 deny `agent` commands that clear or override these variables (`env -i`,
@@ -585,12 +618,13 @@ request limit: one key caps an `auto` fleet at roughly 26 to 31 model
 rounds a second. Hence one request per round rather than per call, the
 rules layer in front, and a pace in the approver that backs off on 429
 and 529 as TypeSafe's docs ask. The pace has a bound: each round gets 10 s
-from announcement to verdict, queue time
-included, and the queue holds at most as many rounds as Jev's current
-limit admits in that time. A round that would wait longer, or runs out of
-time, is denied at once with "not reviewed: the approver is overloaded".
-Under sustained overload `auto` then fails closed and visibly, instead of
-growing a queue of parked turns.
+from announcement to verdict, queue time included, measured from the
+request's `announced_ms` so a new holder after a takeover inherits the
+clock instead of starting a fresh one. The queue holds at most as many
+rounds as Jev's current limit admits in that time. A round that would
+wait longer, or runs out of time, is denied at once with "not reviewed:
+the approver is overloaded". Under sustained overload `auto` then fails
+closed and visibly, instead of growing a queue of parked turns.
 
 ## Performance
 
@@ -731,12 +765,12 @@ as one.
 
 Settled by George on 2026-09-26: three modes, `full` stays the default,
 `AGENT_APPROVAL` picks the mode, and `auto` denies what is dangerous or
-unclear without asking anyone.
+unclear without asking anyone. Settled by this design: the daemon
+enforces gate inheritance, so a bot cannot drop a gate by going around
+the CLI.
 
 - The hold before parking: 2 s covers a Jev verdict with margin; shorter
   frees slots sooner for people.
-- Whether bots created from a gated bot inherit its list in the daemon, or
-  only by the CLI passing it on.
 - Whether auto sends the unclear band to a larger model before denying, or
   denies straight away (proposed: straight away, and measure how often the
   band is hit).
