@@ -1646,16 +1646,18 @@ running turn moves its bot's head, so the reader's snapshot plans what the
 worker would. Indexed byte/item accounting sizes the unsummarized span first,
 without walking the transcript. A span larger than the context budget, left
 by failed summaries or a round that outgrew the budget, is caught up oldest
-first. Each round boundary summarizes the longest run of whole turns from
-the previous cut whose summarizer request fits the budget, including the
-previous summary and the request marker. The cut moves to the next prompt,
-and the window keeps omitting what is still behind it until the steps
-reach the tail. The `compacted` event says `catch_up`. Finding the oldest
+first. Each round boundary summarizes the longest run from the previous cut
+whose summarizer request fits the budget, including the previous summary
+and the request marker. The cut moves to the next prompt, or to a round
+inside a turn too large for one step (see [cuts inside a
+turn](#cuts-inside-a-turn)), and the window keeps omitting what is still
+behind it until the steps reach the tail. The `compacted` event says `catch_up`. Finding the oldest
 turns means walking the lineage back from the head, since nodes only point
 to their parents and forks give a node several children. That walk reads
 metadata in pieces of 1,024 nodes, so other bots' reads interleave with it,
-and only rows inside the budget leave SQLite. A turn larger than the whole
-budget cannot be summarized and answers `compaction_span_limit`. Catch-up
+and only rows inside the budget leave SQLite; the newest turn's prompt is
+the running turn's, or, with none running, the first the walk passes. A
+round larger than the whole budget cannot be summarized and answers `compaction_span_limit`. Catch-up
 converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
 marker and the item count, and the final marker gives the summarizer its
@@ -1776,6 +1778,24 @@ fork from inside a split turn sees that prompt and the tail from the cut.
 Steers absorbed before the cut are summarized with the rounds around them,
 as a covered turn's steers are. Schema 30 adds the `pinned` column; every
 earlier cut is a turn's prompt, so none has one.
+
+A round can take the turn past its budget before compaction is due, for
+example one large result after several small ones. The runtime then elides
+what the model has answered, as above, and if the view still cannot fit, it
+summarizes at once with a keep target of one byte, so the cut lands at the
+newest round that follows a result, and the round goes on. When elision
+cannot make room and the bot has no summarizer instructions, or when even
+the newest round cannot fit, the turn ends with `context_limit`. A span that big usually outgrows
+the summarizer's own budget, so the summary is a [catch-up](#compaction)
+step. Catch-up steps end at a prompt, or at a round start inside the newest
+turn, whichever leaves the longer step; a turn older than the newest that
+alone exceeds the budget, for example after the budget was lowered, is cut
+at its rounds too, keeping its prompt, rather than failing with
+`compaction_span_limit`. One step is recorded per head, as before. A step
+may leave the view over budget as long as the running turn's prompt and
+newest round still fit beside the new summary; an overflowing round whose
+one step leaves it over budget still ends with `context_limit`, since the
+next step needs a new head.
 
 ### Compaction and prompt-cache reuse
 

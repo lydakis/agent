@@ -4770,3 +4770,26 @@ Store contract tests cover the cut, the pinned prompt, the context note and
 summary header, a second cut in the same turn, a later cut that covers the
 turn whole, a historical fork from inside the split turn, and the schema 30
 migration. No live provider run was made for this change.
+
+Catch-up through an oversized turn, measured 2026-09-26 the same way
+against base `0280bca`, three alternating runs of 50 walks each. The
+fixture is the same 600 rounds without elision (7.5 MB), with a running
+turn, walked in pieces of 1,024 nodes toward a 1 MiB step:
+
+| Operation | Base | Branch |
+| --- | ---: | ---: |
+| Walk, one turn | 2.8 to 3.0 ms, then `compaction_span_limit` | 2.9 to 3.2 ms, then a step of 175 items ending at a round |
+| Walk, 600 turns | 3.9 to 4.7 ms | 3.7 to 4.1 ms |
+| Choose the step | 66 to 76 µs, one turn; 95 to 120 µs, 600 turns | 102 to 113 µs, one turn; 87 to 105 µs, 600 turns |
+
+The walk needs the depth of the newest prompt to tell the newest turn's
+rounds apart. Taking it from the running turn's prompt keeps the walk's
+output to the rows inside the budget; a first version that let every
+prompt leave SQLite made the 600-turn walk about 8% slower. Without a
+running turn, prompts leave SQLite only until the newest is found.
+Choosing a step reads two items at each candidate end, newest first, and
+stops at the first round start. Behavior is covered by the store contract
+tests `catch_up_through_a_turn_larger_than_the_budget_cuts_at_its_rounds`
+and `catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds`
+and by `test_a_round_that_overflows_before_compaction_is_due_forces_a_summary`,
+which fails on the base with `context_limit`.

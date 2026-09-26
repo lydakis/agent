@@ -668,6 +668,101 @@ impl Turn {
                     / self.compact_at,
             )
             .max(1) as i64;
+        match self
+            .compact(
+                record,
+                model_rounds,
+                turn,
+                accounting,
+                tools,
+                keep,
+                keep_items,
+            )
+            .await?
+        {
+            Compaction::Parked(until) => return Ok(Some(until)),
+            Compaction::Done => {
+                *context = self
+                    .context(
+                        self.context_bytes,
+                        self.context_items,
+                        self.context_bytes * 2 / 3,
+                    )
+                    .await?;
+            }
+            Compaction::Skipped => {}
+        }
+        Ok(None)
+    }
+
+    /// The current turn cannot fit the budget. Elide what the model has
+    /// answered and look again; if it still cannot fit, summarize all but
+    /// the newest boundary, a round inside the turn or its prompt, and look
+    /// again. Stuck when neither applies or the view still cannot fit.
+    async fn overflow(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+        elides: bool,
+    ) -> Result<Overflow> {
+        let fits = |context: Result<Context>| match context {
+            Ok(context) => Ok(Some(context)),
+            Err(error) if error.code == "context_limit" => Ok(None),
+            Err(error) => Err(error),
+        };
+        if elides
+            && self.elide(0, true).await?
+            && let Some(context) = fits(
+                self.context(
+                    self.context_bytes,
+                    self.context_items,
+                    self.context_bytes * 2 / 3,
+                )
+                .await,
+            )?
+        {
+            return Ok(Overflow::Fits(Box::new(context)));
+        }
+        if record.compaction_instructions.is_none() {
+            return Ok(Overflow::Stuck);
+        }
+        match self
+            .compact(record, model_rounds, turn, accounting, tools, 1, 1)
+            .await?
+        {
+            Compaction::Parked(until) => Ok(Overflow::Parked(until)),
+            Compaction::Skipped => Ok(Overflow::Stuck),
+            Compaction::Done => Ok(fits(
+                self.context(
+                    self.context_bytes,
+                    self.context_items,
+                    self.context_bytes * 2 / 3,
+                )
+                .await,
+            )?
+            .map_or(Overflow::Stuck, |context| Overflow::Fits(Box::new(context)))),
+        }
+    }
+
+    /// One summary: plan the span older than the newest boundary whose tail
+    /// reaches the keep targets, summarize it with the client's
+    /// instructions and summarizer, and record it as the new context start.
+    /// A failed summary leaves the view unchanged and is reported live.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+        keep: i64,
+        keep_items: i64,
+    ) -> Result<Compaction> {
+        let limit = self.input_limit();
         let (max_bytes, max_items) = (limit.bytes as i64, limit.items as i64);
         // Nodes are immutable and only this turn moves the bot's head, so
         // the reader's snapshot plans what the worker would. A catch-up walk
@@ -678,10 +773,10 @@ impl Turn {
             .await
         {
             Ok(Some(plan)) => plan,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok(Compaction::Skipped),
             Err(error) if error.code == "compaction_span_limit" => {
                 self.compaction_failed(turn, &error).await?;
-                return Ok(None);
+                return Ok(Compaction::Skipped);
             }
             Err(error) => return Err(error),
         };
@@ -695,7 +790,7 @@ impl Turn {
                         "error":"provider_unavailable","detail":name}),
                 )
                 .await?;
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         };
         let instructions = record.compaction_instructions.clone().unwrap();
         // Messages requires definitions for historical tool blocks. Reuse the
@@ -724,7 +819,7 @@ impl Turn {
             .await
         {
             Ok(Some(completion)) => completion,
-            Ok(None) => return Ok(Some(accounting.parked_until)),
+            Ok(None) => return Ok(Compaction::Parked(accounting.parked_until)),
             Err(error) => {
                 self.hub
                     .live(
@@ -733,7 +828,7 @@ impl Turn {
                             "error":error.code,"detail":error.detail}),
                     )
                     .await?;
-                return Ok(None);
+                return Ok(Compaction::Skipped);
             }
         };
         // Success is billable even if its text is empty or too large to use.
@@ -762,7 +857,7 @@ impl Turn {
                 })
                 .await?;
             self.compaction_failed(turn, &error).await?;
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         }
         let bot = self.bot.clone();
         let billed = usage.clone();
@@ -792,18 +887,11 @@ impl Turn {
                 "compaction_not_smaller" | "compaction_context_limit"
             ) {
                 self.compaction_failed(turn, &error).await?;
-                return Ok(None);
+                return Ok(Compaction::Skipped);
             }
             return Err(error);
         }
-        *context = self
-            .context(
-                self.context_bytes,
-                self.context_items,
-                self.context_bytes * 2 / 3,
-            )
-            .await?;
-        Ok(None)
+        Ok(Compaction::Done)
     }
 
     async fn plan_compaction(
@@ -1011,19 +1099,21 @@ impl Turn {
                 .await
             {
                 Ok(context) => context,
-                // The current turn outgrew the budget: elide what the model
-                // has answered, then look again.
-                Err(error) if error.code == "context_limit" => {
-                    if !elides || !self.elide(0, true).await? {
-                        return Err(error);
-                    }
-                    self.context(
-                        self.context_bytes,
-                        self.context_items,
-                        self.context_bytes * 2 / 3,
+                Err(error) if error.code == "context_limit" => match self
+                    .overflow(
+                        &mut record,
+                        &mut model_rounds,
+                        turn,
+                        accounting,
+                        &tools,
+                        elides,
                     )
                     .await?
-                }
+                {
+                    Overflow::Fits(context) => *context,
+                    Overflow::Parked(until) => return Ok(Round::Paced(until)),
+                    Overflow::Stuck => return Err(error),
+                },
                 Err(error) => return Err(error),
             };
             if elides
@@ -2124,6 +2214,22 @@ impl Context {
             w.unsummarized.with_prefix(&self.prefix)
         })
     }
+}
+
+/// How a summary attempt ended: recorded, parked on its pool until the
+/// time given, or not made (nothing to cut, or a failure reported live).
+enum Compaction {
+    Done,
+    Parked(u64),
+    Skipped,
+}
+
+/// A turn over its budget after `overflow`: its view now fits, its summary
+/// parked, or nothing more can be reclaimed.
+enum Overflow {
+    Fits(Box<Context>),
+    Parked(u64),
+    Stuck,
 }
 
 /// What a model call sends: the bot's window, or a compaction's span.

@@ -5814,6 +5814,253 @@ fn a_cut_inside_the_running_turn_keeps_its_prompt_ahead_of_the_tail() {
     assert_eq!(*window.ids.last().unwrap(), calls[7].1);
 }
 
+/// Every step of a catch-up walk through a bot's backlog, recorded with
+/// numbered summaries, one step per round as the runtime takes them; each
+/// step must end at a completed exchange of the long turn and keep its
+/// prompt.
+fn catch_up_steps(
+    db: &mut Database,
+    turn: i64,
+    turn_prompt: i64,
+    calls: &mut Vec<(i64, i64)>,
+    max_bytes: i64,
+) -> Vec<CompactionPlan> {
+    let mut steps: Vec<CompactionPlan> = Vec::new();
+    while let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256)
+        .unwrap()
+    {
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, 16).unwrap();
+        }
+        let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        assert!(plan.catch_up);
+        assert_eq!(plan.pinned, Some(turn_prompt));
+        let round = calls
+            .iter()
+            .position(|(asked, _)| *asked == plan.cut)
+            .expect("each step cuts at a round");
+        // The span ends with the previous round's result, and every call
+        // in it has its result.
+        assert_eq!(plan.ids.last(), Some(&calls[round - 1].1));
+        let span: Vec<Value> = {
+            let items = db.items_by_ids(&plan.ids, i64::MAX, 0).unwrap();
+            serde_json::from_slice(&[b"[", &items[..], b"]"].concat()).unwrap()
+        };
+        let ids = |kind: &str| -> Vec<String> {
+            span.iter()
+                .filter(|i| i["type"] == kind)
+                .map(|i| i["call_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(ids("function_call"), ids("function_call_output"));
+        assert!(plan.sizes.iter().map(|&s| s as i64).sum::<i64>() <= max_bytes);
+        if let Some(previous) = steps.last() {
+            assert_eq!(plan.ids.first(), Some(&previous.cut));
+            assert_eq!(
+                plan.previous_summary,
+                Some(format!("summary {}", steps.len() - 1))
+            );
+        }
+        let event = db
+            .compact(
+                "Bob",
+                &plan,
+                &format!("summary {}", steps.len()),
+                None,
+                0,
+                agent_runtime::store::ContextUsage {
+                    bytes: max_bytes as usize,
+                    items: 256,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (&event["data"]["catch_up"], &event["data"]["pinned"]),
+            (&json!(true), &json!(turn_prompt))
+        );
+        steps.push(plan);
+        assert!(steps.len() < 64, "catch-up does not converge");
+        let n = calls.len();
+        calls.push(exchange(db, turn, &format!("c{n}"), &lines(n, 50)));
+    }
+    steps
+}
+
+#[test]
+fn catch_up_through_a_turn_larger_than_the_budget_cuts_at_its_rounds() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls: Vec<(i64, i64)> = (0..40)
+        .map(|n| exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    let max_bytes = 8192;
+    // The walk's pieces do not change the first step, whatever their size.
+    let mut first = Vec::new();
+    for piece in [1, 7, 4096] {
+        let Some(Planning::CatchUp(mut walk)) = db
+            .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256)
+            .unwrap()
+        else {
+            panic!("expected a catch-up walk");
+        };
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, piece).unwrap();
+        }
+        let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        first.push((plan.cut, plan.pinned, plan.ids, plan.covered, plan.prompts));
+    }
+    assert!(first.windows(2).all(|pair| pair[0] == pair[1]));
+    // The first step takes turn one whole and the long turn's start.
+    let (_, _, ids, covered, prompts) = &first[0];
+    assert_eq!(*covered, (1, 2));
+    assert_eq!(
+        prompts
+            .iter()
+            .map(|(o, p)| (*o, p.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "p1"), (2, "long task")]
+    );
+    assert!(ids.contains(&prompt));
+
+    // Steps walk through the turn a round boundary at a time, then the
+    // rest fits one ordinary summary that cuts at the newest round.
+    let steps = catch_up_steps(&mut db, turn, prompt, &mut calls, max_bytes);
+    assert!(steps.len() > 1);
+    assert!(steps[1..].iter().all(|step| step.covered == (2, 2)));
+    let last = compaction_plan(&db, "Bob", 1, max_bytes, 256)
+        .unwrap()
+        .unwrap();
+    assert!(!last.catch_up);
+    assert_eq!(
+        (last.cut, last.pinned),
+        (calls.last().unwrap().0, Some(prompt))
+    );
+    assert_eq!(last.ids.first(), Some(&steps.last().unwrap().cut));
+    // The view sends the prompt whole, then the tail from the last cut.
+    let window = db.window("Bob", max_bytes, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, steps.last().unwrap().cut]);
+    // The transcript is intact.
+    assert_eq!(
+        db.history_read("Bob", 2, 0, 65536).unwrap()["items"],
+        1 + 2 * calls.len()
+    );
+}
+
+#[test]
+fn catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds() {
+    // A finished turn outgrew a budget set after it ran: the walk cuts it
+    // at its rounds, keeping its prompt, then goes on at turn boundaries.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let calls: Vec<(i64, i64)> = (0..40)
+        .map(|n| exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    for n in 2..=4 {
+        converse(&mut db, "Bob", n);
+    }
+    let Some(Planning::CatchUp(mut walk)) =
+        db.compaction_plan("Bob", 1, i64::MAX, 8192, 256).unwrap()
+    else {
+        panic!("expected a catch-up walk");
+    };
+    while !walk.done() {
+        db.catch_up_piece(&mut walk, 16).unwrap();
+    }
+    let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+    assert_eq!(plan.pinned, Some(prompt));
+    assert_eq!(plan.covered, (1, 1));
+    assert!(calls[1..].iter().any(|(asked, _)| *asked == plan.cut));
+    db.compact(
+        "Bob",
+        &plan,
+        "summary 0",
+        None,
+        0,
+        agent_runtime::store::ContextUsage {
+            bytes: 8192,
+            items: 256,
+        },
+    )
+    .unwrap();
+    // The view keeps the old turn's prompt ahead of the rest of that turn
+    // and the turns after it.
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, plan.cut]);
+    // Later steps, one a turn, carry on through the old turn and then at
+    // turn boundaries until the rest fits.
+    let mut cuts = vec![plan.cut];
+    let mut n = 5;
+    converse(&mut db, "Bob", n);
+    while let Some(Planning::CatchUp(mut walk)) =
+        db.compaction_plan("Bob", 1, i64::MAX, 8192, 256).unwrap()
+    {
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, 16).unwrap();
+        }
+        let next = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        assert_eq!(next.ids.first(), cuts.last());
+        assert_eq!(next.covered.0, 1);
+        cuts.push(next.cut);
+        db.compact(
+            "Bob",
+            &next,
+            "summary",
+            None,
+            0,
+            agent_runtime::store::ContextUsage {
+                bytes: 8192,
+                items: 256,
+            },
+        )
+        .unwrap();
+        n += 1;
+        converse(&mut db, "Bob", n);
+        assert!(n < 64, "catch-up does not converge");
+    }
+    // The steps cut inside the old turn; the rest then fits one ordinary
+    // summary, cut at the newest turn's prompt.
+    assert!(cuts.len() > 1);
+    assert!(
+        cuts.iter()
+            .all(|cut| calls.iter().any(|(asked, _)| asked == cut))
+    );
+    let last = compaction_plan(&db, "Bob", 1, 8192, 256).unwrap().unwrap();
+    assert_eq!((last.pinned, last.covered), (None, (1, n as i64 - 1)));
+    assert_eq!(last.ids.first(), cuts.last());
+    assert_eq!(
+        db.history_read("Bob", 1, 0, 65536).unwrap()["items"],
+        1 + 2 * calls.len() + 1
+    );
+}
+
 #[test]
 fn schema_30_adds_the_prompt_a_cut_inside_a_turn_keeps() {
     let path = std::env::temp_dir().join(format!("agent-pinned-{}.sqlite", std::process::id()));

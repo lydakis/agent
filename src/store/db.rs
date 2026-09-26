@@ -275,7 +275,7 @@ pub struct ElisionPlan {
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
     /// Where the verbatim tail starts, the new context start: a turn's
-    /// prompt, or the first output of a model round inside the newest turn.
+    /// prompt, or the first output of a model round inside a turn.
     pub cut: i64,
     /// For a cut inside a turn, that turn's prompt, sent whole ahead of it.
     pub pinned: Option<i64>,
@@ -349,6 +349,9 @@ pub struct CatchUp {
     elision: (i64, i64),
     /// A previous cut inside a turn: that turn's prompt and ordinal.
     partial: Option<(i64, i64)>,
+    /// The depth of the newest prompt on the lineage: the running turn's,
+    /// or the first the walk passes.
+    newest_prompt: Option<i64>,
     /// Verbatim tail byte/item targets, then input byte/item limits.
     bounds: (i64, i64, i64, i64),
     /// Where the next piece starts, and the child it continues from.
@@ -1439,6 +1442,7 @@ impl Database {
                 totals: (head_total, before, depth_before),
                 elision: (elided, saved),
                 partial,
+                newest_prompt: self.running_prompt_depth(&bot)?,
                 bounds: (keep_bytes, keep_items, max_bytes, max_items),
                 next: Some((head, None, None)),
                 rows: Vec::new(),
@@ -1567,12 +1571,25 @@ impl Database {
                 totals: (head_total, before, depth_before),
                 elision: (elided, saved),
                 partial,
+                newest_prompt: self.running_prompt_depth(&bot)?,
                 bounds: (keep_bytes, keep_items, max_bytes, max_items),
                 next: Some((head, None, None)),
                 rows: Vec::new(),
             })));
         }
         Ok(Some(Planning::Plan(plan)))
+    }
+    /// The depth of the running turn's prompt, which a catch-up walk would
+    /// otherwise find by passing every prompt back to it.
+    fn running_prompt_depth(&self, bot: &Bot) -> Result<Option<i64>> {
+        let Some(turn) = bot.running_turn else {
+            return Ok(None);
+        };
+        Ok(self
+            .conn
+            .prepare_cached("SELECT depth FROM nodes WHERE turn=?")?
+            .query_row([turn], |r| r.get(0))
+            .optional()?)
     }
     /// One piece of a catch-up walk: at most `limit` nodes further back
     /// along the head's lineage toward the previous cut, reading node
@@ -1587,7 +1604,8 @@ impl Database {
         let (_, saved) = walk.elision;
         // Each row carries its child on the lineage, so cutting at a prompt
         // child needs no parent lookup: the span ends at this row. Only rows
-        // inside the budget and the piece's oldest row leave SQLite.
+        // inside the budget, the piece's oldest row, and, until the newest
+        // prompt is found, prompts leave SQLite.
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k) AS (
                 SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1
@@ -1600,7 +1618,7 @@ impl Database {
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
                      FROM nodes WHERE id=c.id) END
              FROM chain c WHERE (c.total_bytes<=?7 AND c.depth<=?8)
-                OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL",
+                OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
         let (max_total, max_depth) = (
             before.saturating_add(max_bytes),
@@ -1615,7 +1633,8 @@ impl Database {
             Self::COMPACTION_PROMPT_BYTES as i64 + 1,
             max_total,
             max_depth,
-            saved
+            saved,
+            walk.newest_prompt.is_none()
         ])?;
         let mut last: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
         while let Some(r) = rows.next()? {
@@ -1624,6 +1643,9 @@ impl Database {
             if total <= max_total && depth <= max_depth {
                 walk.rows
                     .push((id, depth, total, seq, r.get(5)?, r.get(6)?, r.get(7)?));
+            }
+            if seq.is_some() && walk.newest_prompt.is_none_or(|newest| depth > newest) {
+                walk.newest_prompt = Some(depth);
             }
             if last.is_none_or(|(_, oldest, _, _)| depth < oldest) {
                 last = Some((id, depth, parent, seq));
@@ -1637,9 +1659,11 @@ impl Database {
         };
         Ok(())
     }
-    /// Choose a finished catch-up walk's step: the longest run of whole
-    /// turns from the previous cut whose summarizer request, previous
-    /// summary included, fits the budget, cut at the next prompt.
+    /// Choose a finished catch-up walk's step: the longest run from the
+    /// previous cut whose summarizer request, previous summary included,
+    /// fits the budget, cut at the next prompt or, inside the newest turn,
+    /// at the next round that follows a tool result. A turn older than the
+    /// newest that alone exceeds the budget is cut at a round too.
     pub fn catch_up_plan(&self, name: &str, walk: CatchUp) -> Result<Option<CompactionPlan>> {
         let bot = self.inspect(name)?;
         if walk.next.is_some() || bot.head != Some(walk.head) {
@@ -1649,6 +1673,7 @@ impl Database {
             totals: (head_total, before, depth_before),
             elision: (elided, _),
             partial,
+            newest_prompt,
             bounds: (keep_bytes, keep_items, max_bytes, max_items),
             mut rows,
             ..
@@ -1673,28 +1698,64 @@ impl Database {
                     r.get(0)
                 })?;
         // The rest of a turn a previous cut split may end a step alone.
-        let mut prompted = partial.is_some();
+        let first_prompt = rows.iter().position(|row| row.3.is_some());
+        let prompted = |index: usize| partial.is_some() || first_prompt.is_some_and(|p| p <= index);
+        // The newest turn: after the newest prompt, or all of it when the
+        // previous cut split that turn and no later prompt followed.
+        let newest_depth = newest_prompt.unwrap_or(depth_before);
+        let fits = rows
+            .iter()
+            .take_while(|(_, depth, total, ..)| {
+                let items = depth - depth_before;
+                items <= span_items && total - before + items <= span_bytes
+            })
+            .count();
+        let mut item = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut kind = |id: i64| -> Result<(bool, bool)> {
+            Ok(item.query_row([id], |r| {
+                let item = r.get_ref(0)?.as_blob()?;
+                Ok((
+                    super::context::model_output(item),
+                    super::context::is_tool_result(item),
+                ))
+            })?)
+        };
+        // The longest step, newest end first: a prompt child, or a round
+        // start inside the newest turn; failing both, a round start inside
+        // the oldest turn, which alone exceeds the budget. Only items at
+        // candidate ends are read.
         let mut end = None;
-        for (index, (_, depth, total, seq, _, child_seq, _)) in rows.iter().enumerate() {
-            prompted |= seq.is_some();
-            let items = depth - depth_before;
-            if items > span_items || total - before + items > span_bytes {
-                break;
-            }
-            if prompted
-                && child_seq.is_some()
-                && (head_total - total >= keep_bytes || head_depth - depth >= keep_items)
-            {
-                end = Some(index);
+        'search: for any_turn in [false, true] {
+            for index in (0..fits).rev() {
+                let (id, depth, total, _, child, child_seq, _) = rows[index];
+                if !prompted(index)
+                    || (head_total - total < keep_bytes && head_depth - depth < keep_items)
+                {
+                    continue;
+                }
+                if child_seq.is_some() {
+                    end = Some((index, false));
+                    break 'search;
+                }
+                if let Some(child) = child
+                    && (any_turn || depth > newest_depth)
+                    && kind(id)?.1
+                    && kind(child)?.0
+                {
+                    end = Some((index, true));
+                    break 'search;
+                }
             }
         }
-        let Some(end) = end else {
+        let Some((end, within)) = end else {
             return fail_with(
                 "compaction_span_limit",
                 "the oldest unsummarized turn exceeds the context budget; original history remains available",
             );
         };
-        // The cut is the prompt that follows the span on the head's lineage.
+        // The cut is the node that follows the span on the head's lineage.
         let cut = rows[end].4.ok_or(Error::new("storage_error"))?;
         let mut previous = before;
         let span = rows[..=end]
@@ -1715,7 +1776,44 @@ impl Database {
         if let Some((_, turn)) = partial {
             plan.covered = (plan.covered.0.min(turn), plan.covered.1.max(turn));
         }
+        // A step ending inside a turn keeps that turn's prompt.
+        if within {
+            let (prompt, turn) = rows[..=end]
+                .iter()
+                .rev()
+                .find_map(|row| row.3.map(|seq| (row.0, seq)))
+                .or(partial)
+                .ok_or(Error::new("storage_error"))?;
+            plan.pinned = Some(prompt);
+            plan.covered = (plan.covered.0.min(turn), turn);
+        }
         Ok(Some(plan))
+    }
+    /// The start of the newest model round that follows a tool result,
+    /// walking back from `head` no further than `stop`. Rounds are short,
+    /// so the walk reads a few items.
+    fn newest_round(&self, head: i64, stop: i64) -> Result<Option<i64>> {
+        let mut node = self
+            .conn
+            .prepare_cached("SELECT parent,item FROM nodes WHERE id=?")?;
+        let (mut id, mut output) = (head, None);
+        while id != stop {
+            let (parent, is_output, is_result) = node.query_row([id], |r| {
+                let item = r.get_ref(1)?.as_blob()?;
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    super::context::model_output(item),
+                    super::context::is_tool_result(item),
+                ))
+            })?;
+            if is_result && output.is_some() {
+                return Ok(output);
+            }
+            output = is_output.then_some(id);
+            let Some(parent) = parent else { break };
+            id = parent;
+        }
+        Ok(None)
     }
     fn previous_summary(&self, bot: &Bot) -> Result<Option<String>> {
         Ok(match bot.compaction {
@@ -1838,14 +1936,18 @@ impl Database {
         if !after.fits(input_limit)
             && let Some(turn) = bot.running_turn
         {
-            // The active turn from its prompt, or from a cut inside it.
-            let (start, pinned) = match plan.pinned {
-                Some(prompt) => (plan.cut, Some(prompt)),
-                None => (
-                    self.conn
-                        .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?,
-                    None,
-                ),
+            // The least the active turn can be cut to: its prompt ahead of
+            // its newest round, or, before its first result, all of it.
+            let prompt: i64 =
+                self.conn
+                    .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
+            let head = bot.head.ok_or(Error::new("storage_error"))?;
+            let (start, pinned) = match self.newest_round(head, prompt)? {
+                Some(round) => (round, Some(prompt)),
+                None => match plan.pinned {
+                    Some(pinned) => (plan.cut, Some(pinned)),
+                    None => (prompt, None),
+                },
             };
             let minimum = self.compaction_context_usage(
                 &bot,

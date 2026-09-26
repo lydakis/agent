@@ -58,6 +58,41 @@ class TurnCompactionTests(ModelFixture):
             self.assertEqual(asked[:len(answered)], answered)
             self.assertLessEqual(len(asked) - len(answered), 1)
 
+    def test_a_round_that_overflows_before_compaction_is_due_forces_a_summary(self):
+        # Four small rounds, then one that takes the turn past its budget
+        # before compaction is due. Without read nothing is elided, so the
+        # runtime summarizes the earlier rounds, keeping the prompt, and the
+        # turn goes on; with no summarizer instructions it fails.
+        client = self.client(tools='shell', extra=('--context-bytes', '24576', '--compact-at', '99'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        self.assertIn('done after 5 rounds', json.dumps(answer))
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
+        # One summary, made after the round that overflowed.
+        kinds = ['summary' if r.get('instructions') == 'Summarize.' else 'work' for r in requests]
+        self.assertEqual(kinds, ['work'] * 5 + ['summary', 'work'])
+        events = all_events(client, 'Bob')
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertEqual(len(compacted), 1)
+        self.assertTrue(compacted[0]['pinned'])
+        self.assertEqual(compacted[0]['covered_turns'], [1, 1])
+        users = [i['content'][0]['text'] for i in requests[-1]['input'] if i.get('role') == 'user']
+        self.assertIn('covering the start of turn 1]', users[0])
+        self.assertEqual(users[-1], 'long:4x250,1x600')
+        calls = [i['call_id'] for i in requests[-1]['input'] if i.get('type') == 'function_call']
+        self.assertEqual(calls, ['long-4'])
+
+        client.request('create', bot='Ann', workspace=str(self.path), tools=['shell'])
+        turn = client.request('submit', bot='Ann', request_id='1', prompt='long:4x250,1x600')['result']['turn']
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'failed', ended)
+        self.assertEqual(ended['data']['error'], 'context_limit', ended)
+
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicTurnCompactionTests(ModelFixture):
