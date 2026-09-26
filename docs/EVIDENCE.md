@@ -4,7 +4,8 @@ Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
 updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, and at
 `973be14`, the change that built tool approval, for its cost and a store
-lock fix. This is the one place that says what is currently known. The documents it links to
+lock fix, and at `dd95047` for the per-summary choice between a copy and a
+request of its own. This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
