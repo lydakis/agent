@@ -4868,8 +4868,8 @@ A creation's reply repeats its instructions and compaction instructions,
 replies sent back to back overflowed a session's 2 MiB output queue
 (`output_lagged`), which closes a socket session after its bots were
 created. An admission now waits when its session's queue could not take
-its reply with the ones already promised to that session. With both at
-64 KiB, 13 share a window. On the burst above, where replies are small, the check changed
+its reply and event with those already promised to that session. With both
+texts at 64 KiB, 11 share a window. On the burst above, where replies are small, the check changed
 nothing measurable: five runs each, last reply 5.11 ms before and 5.14 ms
 after for submissions, 4.41 and 4.29 ms for creations.
 

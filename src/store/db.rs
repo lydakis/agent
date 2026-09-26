@@ -3423,9 +3423,14 @@ impl Database {
         let tx = self.conn.savepoint()?;
         // The candidate index contains only this bot's unpruned turns, not
         // its entire history or operational records owned by other bots.
+        // A turn already pruned but still running a background process has
+        // nothing left to drop until the process ends; passing over it lets
+        // a piece that restarts from the oldest turn reach the turns after.
         let turns: Vec<i64> = tx
             .prepare_cached(
-                "SELECT turn FROM retained_turns WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
+                "SELECT turn FROM retained_turns r WHERE bot=?1 AND turn<?2 AND turn IS NOT ?3 AND turn>?4
+                 AND (EXISTS(SELECT 1 FROM events WHERE turn=r.turn)
+                      OR NOT EXISTS(SELECT 1 FROM processes WHERE turn=r.turn AND status='running'))
                  ORDER BY turn LIMIT ?5",
             )?
             .query_map(

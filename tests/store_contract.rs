@@ -2080,6 +2080,50 @@ fn completion_retention_prunes_one_piece_of_the_oldest_turns() {
 }
 
 #[test]
+fn completion_retention_passes_turns_whose_processes_still_run() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let piece = Database::RETENTION_PIECE;
+    let mut processes = Vec::new();
+    for n in 0..piece {
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("bg{n}"),
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        processes.push(db.process_start(turn, "bg").unwrap());
+        db.append(turn, vec![assistant("launched")], &[], None)
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    // The oldest piece launched processes that still run: pruning keeps
+    // their rows, and the next pass must reach the two turns after them.
+    assert!(
+        db.prune_except("Bob", 1, None).unwrap()["events"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 3 * 2);
+    assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
+    assert_eq!(db.running_processes().unwrap(), piece as i64);
+    // A process that ends makes its turn prunable again.
+    db.process_finish(processes[0], &json!({"stdout":"done"}), &[])
+        .unwrap();
+    db.prune_except("Bob", 1, None).unwrap();
+    assert!(db.process_result(processes[0]).unwrap().is_none());
+}
+
+#[test]
 fn pruning_keeps_the_transcript_and_marks_the_replay_gap() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

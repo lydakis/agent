@@ -678,10 +678,11 @@ stand between a submission and the limit, it waits too, since whether one
 frees up depends on how the earlier ones end. A burst therefore gets the
 answers it would get one request at a time. Queued replies go out back to
 back once their commit lands, faster than any client reads them, so an
-admission also waits when its session's output queue could not take its
-reply together with those already promised to that session. Each reply is
-bounded from its request: a creation's record repeats the request's strings
-and adds the canonical workspace. A lost group answers each of its
+admission also waits when its session's output queue could not take what it
+and the admissions already queued for that session will send: each reply,
+and each event should the session follow the bot. Both are bounded from the
+request: a creation's record repeats the request's strings, and a reply or
+event adds at most a canonical workspace and a model reference. A lost group answers each of its
 admissions with `storage_error`, starts no turn, and frees their slots.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
@@ -1460,7 +1461,10 @@ needs, and one optional policy composes them:
   left it. Each completion removes one piece, the four oldest turns past N at
   most, like explicit pruning: every page a job rewrites is held in memory
   until it ends, so a backlog (retention newly enabled, or N lowered) drains
-  over later turns, or at once with `agent prune`. Each turn task submits its completion to the storage worker, allowing
+  over later turns, or at once with `agent prune`. A turn already pruned whose
+  background process still runs keeps only that row and is passed over until
+  the process ends, so it never holds a piece. Each turn task submits its
+  completion to the storage worker, allowing
   concurrent finishes to share a commit. The bot stays durably busy until that
   commit; the worker publishes its terminal event before a successor's accepted
   event. Completion, cancellation, explicit pruning, and deletion jobs for the
