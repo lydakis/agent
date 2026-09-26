@@ -1716,7 +1716,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   call id and the previews, well inside a 1 MiB line); `next_after` continues
   it. Positions are never reused, and a call announced again takes a new
   one at the end, so a listing that pages on finds it. `stats` reports `approval_requests`, the calls
-  announced and not yet started or denied.
+  announced and not yet started or denied: a count the storage worker
+  keeps at each announcement, start, denial, and turn end, as it does
+  `queued_turns`, so `stats` reads no approval row.
 - Interrupting a turn cancels its gated calls like any planned call.
   Anything that reaches the socket can answer, a bot's own shell included:
   this is oversight, not containment.

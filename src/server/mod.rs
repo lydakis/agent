@@ -2033,7 +2033,7 @@ impl Service {
                             queued,
                             paced,
                             db.pending()?.1,
-                            db.approval_requests()?,
+                            db.approval_requests(),
                         ))
                     })
                     .await?;
