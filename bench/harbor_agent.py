@@ -282,17 +282,27 @@ class Agent(BaseInstalledAgent):
                     usage.n_output_tokens += sign * attempt['output_tokens']
         # Cache writes are inside input tokens; they are priced above input,
         # hour-long ones higher still. Each billed attempt also counts as a
-        # call on the model that ran it.
+        # call on the model the provider says answered it.
         writes: dict[str, tuple[int, int]] = {}
         served: dict[str, int] = {}
+        unnamed = 0
         for model, data in events:
             provider = model.split('/', 1)[0] + '/' if '/' in model else ''
-            for attempt in data.get('models') or [data]:
+            attempts = data.get('models') or [data]
+            for attempt in attempts:
                 key = ran_on(provider, attempt) if 'model' in attempt else model
                 total, hourly = writes.get(key, (0, 0))
                 writes[key] = (total + attempt.get('cache_write_tokens', 0),
                                hourly + attempt.get('cache_write_1h_tokens', 0))
-                served[key] = served.get(key, 0) + 1
+                # Each attempt of a fallback names its model, and otherwise
+                # the response does. Prices stay on the requested names,
+                # which the price table knows and a dated snapshot may not.
+                named = attempt['model'] if len(attempts) > 1 else data.get('served_model')
+                if named:
+                    answered = ran_on(provider, {**attempt, 'model': named})
+                    served[answered] = served.get(answered, 0) + 1
+                else:
+                    unnamed += 1
         # A turn sticky routing served entirely elsewhere leaves nothing to price.
         for model in moved:
             usage = models[model]
@@ -327,6 +337,8 @@ class Agent(BaseInstalledAgent):
                             'served_calls': served if unrecorded == 0 else None}
         if unrecorded:
             context.metadata['unrecorded_input_tokens'] = unrecorded
+        if unnamed and unrecorded == 0:
+            context.metadata['unnamed_calls'] = unnamed
 
     def _store_turns(self) -> list[dict[str, Any]] | None:
         """Every turn in the store copied after the daemon exited, or None when

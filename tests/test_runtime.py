@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -248,7 +249,9 @@ class Model(http.server.BaseHTTPRequestHandler):
             if text:
                 events.append({'type': 'response.output_text.delta', 'delta': text})
             if user != 'truncate':
-                events.append({'type': 'response.completed', 'response': {'status': 'completed', 'output': output,
+                # A dated snapshot answers, as providers name it.
+                events.append({'type': 'response.completed', 'response': {
+                    'model': request['model'] + '-2026-09-26', 'status': 'completed', 'output': output,
                     'usage': {'input_tokens': 100, 'output_tokens': 10,
                               'input_tokens_details': {'cached_tokens': 40 if user.startswith('cached:') else 0}}}})
             if user == 'incomplete':
@@ -384,6 +387,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             if warm:
                 time.sleep(getattr(self.server, 'warm_delay', 0))
                 body = json.dumps({'type': 'message', 'role': 'assistant', 'content': [],
+                                   'model': request['model'] + '-20260926',
                                    'stop_reason': 'max_tokens', 'usage': {
                                        'input_tokens': 0, 'cache_read_input_tokens': 9,
                                        'cache_creation_input_tokens': 0, 'output_tokens': 0}}).encode()
@@ -438,7 +442,8 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 else:
                     blocks.append({'type': 'text', 'text': 'reply:' + user})
                     stop = 'max_tokens' if user == 'incomplete' else 'end_turn'
-            start = {'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2,
+            start = {'model': request['model'] + '-20260926',
+                     'usage': {'input_tokens': 5, 'cache_read_input_tokens': 2,
                                **getattr(self.server, 'start_usage', {})}}
             if getattr(self.server, 'report_drops', 0):
                 start['input_transformations'] = [{'type': 'thinking_dropped', 'message_index': 1, 'block_index': 0}
@@ -537,7 +542,8 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         sent = [u.pop('sent_ms') for u in usage]
         self.assertEqual([u for u in usage if u.get('purpose') == 'keep_warm'], [
-            {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm'}] * 2)
+            {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm',
+             'served_model': 'synthetic-claude-20260926'}] * 2)
         self.assertEqual(len(usage), 4)
         self.assertEqual(sent, sorted(sent))
         self.assertGreaterEqual(sent[2] - sent[1], 900)
@@ -679,12 +685,13 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         fallback = [m for m in client.saved if m.get('event') == 'model_fallback']
         self.assertEqual([(m['from'], m['to']) for m in fallback], [('synthetic-claude', 'synthetic-fallback')])
-        # Both attempts produced output, so both are billed, each at its model.
+        # Both attempts produced output, so both are billed, each at its model,
+        # and the answer the turn keeps came from the model fallen back to.
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         # Cache writes are recorded with the attempt that made them.
         usage[0].pop('sent_ms')
         self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2,
-                                    'cache_write_tokens': 1, 'models': [
+                                    'cache_write_tokens': 1, 'served_model': 'synthetic-fallback', 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
             {'model': 'synthetic-fallback', 'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 0,
              'cache_write_tokens': 1}]})
@@ -717,7 +724,9 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # Each call records when it was sent, in epoch milliseconds.
         sent = [u['data'].pop('sent_ms') for u in usage]
         self.assertTrue(before - 1 <= sent[0] <= sent[1] <= after + 1, (before, sent, after))
-        self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2})
+        # The call names the dated model that answered, not only the one asked.
+        self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2,
+                                            'served_model': 'synthetic-claude-20260926'})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
         self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
                                              'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})
@@ -942,6 +951,66 @@ class RuntimeTests(ModelFixture):
         restarted = self.client()
         result = restarted.request('result', bot='Bob', turn=turn)['result']
         self.assertEqual((result['status'], result['error']), ('interrupted', 'daemon_shutdown'))
+
+    def held_admissions(self, client, count):
+        """Submissions to `count` bots, each of which would start a turn that
+        stays on the model until shutdown ends it. The first one's store job
+        takes over a second, so the rest queue behind it uncommitted."""
+        bots = ['Slow'] + [f'B{index}' for index in range(count)]
+        for bot in bots:
+            client.request('create', bot=bot, workspace=str(self.path))
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            db.execute('CREATE TABLE burn(x)')
+            db.executemany('INSERT INTO burn VALUES (?)', [(n,) for n in range(6000)])
+            db.execute("CREATE TRIGGER slow_admission AFTER INSERT ON turns WHEN NEW.bot='Slow' "
+                       "BEGIN SELECT count(*) FROM burn a, burn b WHERE a.x+b.x>=0; END")
+        return [{'id': f'submit-{bot}', 'op': 'submit', 'bot': bot, 'request_id': 'held', 'prompt': 'wait'}
+                for bot in bots]
+
+    def answered(self, client):
+        return any('id' in message for message in [*client.saved, *list(client.queue.queue)] if message)
+
+    def assert_shutdown_ended(self, client, turns):
+        """Shutdown ended every started turn with its own cause, rather than
+        leaving it running for the next start to find."""
+        for turn in turns:
+            data = client.finished(turn)['data']
+            self.assertEqual((data['status'], data['error']), ('interrupted', 'daemon_shutdown'))
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM turns WHERE status!='interrupted'").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE running_turn IS NOT NULL").fetchone()[0], 0)
+
+    def test_a_shutdown_request_behind_queued_admissions_waits_for_their_answers(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        lines = self.held_admissions(client, 8) + [{'id': 'stop', 'op': 'shutdown'}]
+        client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
+        client.process.stdin.flush()
+        # The shutdown is answered after every admission queued ahead of it,
+        # and each admission's turn started before shutdown ended it.
+        replies = [client.receive(lambda m: 'id' in m) for _ in lines]
+        self.assertEqual([r['id'] for r in replies], [line['id'] for line in lines])
+        self.assertTrue(replies[-1]['result']['shutting_down'])
+        self.assertEqual({r['result']['status'] for r in replies[:-1]}, {'running'})
+        self.assert_shutdown_ended(client, [r['result']['turn'] for r in replies[:-1]])
+
+    def test_a_termination_signal_still_answers_the_admissions_it_finds_queued(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        lines = self.held_admissions(client, 8)
+        client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
+        client.process.stdin.flush()
+        time.sleep(.2)
+        # The signal lands while every admission still waits on its commit.
+        self.assertFalse(self.answered(client))
+        client.process.send_signal(signal.SIGTERM)
+        turns = []
+        for line in lines:
+            reply = client.receive(lambda m, id=line['id']: m.get('id') == id)
+            self.assertEqual(reply['result']['status'], 'running')
+            turns.append(reply['result']['turn'])
+        self.assert_shutdown_ended(client, turns)
 
     def test_request_startup_is_bounded_but_established_streams_are_not(self):
         self.model.release_headers = threading.Event()

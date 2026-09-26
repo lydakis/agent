@@ -122,9 +122,11 @@ it asked for and what actually answered, each from that harness's own records:
 
 - **Requested model**, as passed to the harness.
 - **Served models**, with the calls each answered. Ours come from the trial
-  metadata's `served_calls`, which counts every billed attempt, including
-  provider-side fallbacks, delegated bots and summarizers, and is null when
-  some of the trial's records are missing ([HARBOR.md](HARBOR.md#the-adapter)). Codex's come from
+  metadata's `served_calls`, which counts every billed attempt under the
+  model the provider named for it, including provider-side fallbacks,
+  delegated bots and summarizers, and is null when some of the trial's
+  records are missing; a call whose provider named no model counts in
+  `unnamed_calls` instead ([HARBOR.md](HARBOR.md#the-adapter)). Codex's come from
   its session rollout, which names the model once per turn. Claude Code's come
   from its per-message usage, which names the model the API reported for each
   response, and its per-model totals, which include any auxiliary model it
@@ -147,9 +149,13 @@ it asked for and what actually answered, each from that harness's own records:
 A pass rate or cost is compared only when both arms served the requested model
 for the task work, or the difference is stated beside the numbers.
 
-Gap: the daemon knows a call's served model only when a provider-side fallback
-splits it (Anthropic's `iterations`) or a summarizer ran on another model. It
-does not read the model a provider names in its response, so a reroute or a
-change of snapshot behind the same model name would not show. Codex's
-per-turn record has the same limit within a turn. Of the three, only Claude
-Code's record says which model answered each response.
+Gap: Agent builds through `095ff68`, which include every matched run so far,
+knew a call's served model only when a provider-side fallback split it
+(Anthropic's `iterations`) or a summarizer ran on another model, so a reroute
+or a change of snapshot behind the same model name would not show in them.
+Later builds keep the model the provider names in each response
+(`served_model` on every `usage` event), as Claude Code's record does. Both
+are the provider's own report of what answered, and a call cut off before it
+reported, as at a timeout, leaves no record at all. Codex's per-turn record
+still names the model once per turn, so a reroute within a turn would not
+show.

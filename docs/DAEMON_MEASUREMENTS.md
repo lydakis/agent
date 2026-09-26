@@ -4763,17 +4763,27 @@ as terminal events. Each completion was refused six times in that half
 second, counted as 192 `finish` storage errors in `stats`, and committed on
 the first retry after writes were accepted; three runs gave the same counts. Their replies were still lost: the jobs that append a reply are
 not retried, so a turn whose reply cannot be stored fails. Integrity checks
-passed.
+passed. A rerun later on 2026-09-26 on builds of clean checkouts, three runs
+each, gave the same results: `8724f22` exited with status 1 and left all 32
+turns `running`, while `4260673` and `095ff68`, where these changes merged,
+kept running and ended all 32 `failed`, with 192 `finish` storage errors.
 
 Sequential admission cost, 256 bots each receiving one held turn, eight
-alternating runs per build, native container sync:
+alternating runs per build, native container sync. The baseline is
+`8724f22` (binary `562e12ca…`); the candidate is the same checkout with only
+`PRAGMA temp_store=MEMORY` added (binary `e970f6ad…`), the line `4260673`
+landed. Both were built from clean checkouts:
 
-| Median per admission | `8724f22` | `temp_store=MEMORY` |
+| Median per admission (range) | `8724f22` | `temp_store=MEMORY` |
 | --- | ---: | ---: |
-| `begin` job execution | 451 µs | 164 µs |
-| Submit round trip | 1.45 ms | 1.26 ms |
-| Daemon CPU | 1.09 ms | 0.98 ms |
+| `begin` job execution | 416 µs (328–492) | 184 µs (160–227) |
+| Submit round trip | 1.43 ms (1.31–1.58) | 1.28 ms (1.21–1.45) |
+| Daemon CPU | 1.07 ms (0.98–1.17) | 0.98 ms (0.86–1.17) |
 | Daemon RSS after admission | 27.2 MiB | 27.2 MiB |
+
+Only the `begin` ranges do not overlap. An earlier run the same morning gave
+451 against 164 µs and 1.45 against 1.26 ms, but its baseline binary does
+not match a rebuild of `8724f22`, so it is superseded.
 
 These come from one Linux container. Creating a temporary file costs more on
 some filesystems, so macOS needs its own measurement. The per-group counter
@@ -4805,9 +4815,10 @@ would settle the platform question.
 
 Observed 2026-09-26 on a Linux x86_64 container (4 vCPUs), Rust 1.98.0,
 bundled SQLite. Baseline is `4260673`, this branch before the window (binary
-`a7e5561e…`); the candidate queues up to 32 admissions at once (binary
-`738cba82…`). The window-size builds are the candidate with only the
-constant changed. Slow storage uses the same `fsync` delay shim as
+`a7e5561e…`); the candidate, `3b6dd53`, queues up to 32 admissions at once
+(binary `738cba82…`). Rebuilding both commits from clean checkouts later the
+same day reproduced both binaries byte for byte. The window-size builds are
+the candidate with only the constant changed. Slow storage uses the same `fsync` delay shim as
 [group commit](#group-commit).
 
 Before, the service awaited each `create` and `submit` commit before it read
@@ -4898,8 +4909,11 @@ busy work queued behind the admission they depend on, the active limit with
 a promised slot that goes unused, a lost group commit that starts nothing
 and frees its slots, an interrupt behind the admission it names, large
 creations that must fit their session's output queue, and four clients
-sending the same submission at once. Shutdown with queued
-admissions is covered by reading the code, not by a test. All of this is one
+sending the same submission at once. Two Python tests hold nine admissions
+uncommitted behind one slow store job: a `shutdown` request queued behind
+them is answered after all nine, and a SIGTERM that finds them queued still
+answers each; in both, every started turn ends `interrupted` with
+`daemon_shutdown` and the daemon exits cleanly. All of this is one
 Linux container with an injected sync delay; macOS, where a flush costs
 about 5.4 ms, is not measured. The burst uses one connection; many clients
 arrive interleaved, which the Python test exercises but no timing does.

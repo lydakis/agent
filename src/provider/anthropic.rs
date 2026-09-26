@@ -43,15 +43,22 @@ pub(crate) fn usage(usage: &Value, hour: bool) -> Usage {
     }
 }
 
-/// A whole message's usage: per attempt when a server-side fallback ran,
-/// as the stream's final usage is read.
-pub(crate) fn message_usage(report: &Value, hour: bool) -> Usage {
+/// A whole message's usage and the model that answered it: per attempt
+/// when a server-side fallback ran, as the stream's final usage is read.
+pub(crate) fn message_usage(message: &Value, hour: bool) -> Usage {
+    let report = &message["usage"];
     let mut state = State::new(hour);
     state.usage = usage(report, hour);
+    state.usage.served_model = served(message);
     if let Some(iterations) = report["iterations"].as_array() {
         state.iterations(iterations);
     }
     state.usage
+}
+
+/// The model a message or an attempt names.
+fn served(value: &Value) -> String {
+    value["model"].as_str().unwrap_or_default().to_owned()
 }
 
 /// All input, cache reads, and cache writes with the hour-long part of them.
@@ -116,6 +123,7 @@ impl State {
         match event["type"].as_str() {
             Some("message_start") => {
                 self.usage = usage(&event["message"]["usage"], self.hour);
+                self.usage.served_model = served(&event["message"]);
                 self.saw_usage = true;
                 self.dropped(&event["message"]["input_transformations"]);
                 Ok(Frame::Quiet)
@@ -270,6 +278,12 @@ impl State {
         }
         let count = |entry: &Value, key: &str| entry[key].as_u64().unwrap_or(0);
         let last = iterations.len() - 1;
+        // The last attempt wrote the answer the turn keeps.
+        let answered = served(&iterations[last]);
+        let served_model = match answered.is_empty() {
+            true => std::mem::take(&mut self.usage.served_model),
+            false => answered,
+        };
         let models: Vec<ModelTokens> = iterations
             .iter()
             .enumerate()
@@ -277,7 +291,7 @@ impl State {
             .map(|(_, entry)| {
                 let (input, read, (written, hourly)) = tokens(entry, self.hour);
                 ModelTokens {
-                    model: entry["model"].as_str().unwrap_or_default().to_owned(),
+                    model: served(entry),
                     provider: None,
                     input_tokens: input,
                     output_tokens: count(entry, "output_tokens"),
@@ -294,6 +308,7 @@ impl State {
             cache_write_tokens: models.iter().map(|m| m.cache_write_tokens).sum(),
             cache_write_1h_tokens: models.iter().map(|m| m.cache_write_1h_tokens).sum(),
             models,
+            served_model,
             ..Usage::default()
         };
         self.saw_usage = true;
@@ -466,7 +481,7 @@ mod tests {
         let deltas = feed(
             &mut state,
             &[
-                r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3,"cache_creation_input_tokens":5}}}"#,
+                r#"{"type":"message_start","message":{"model":"claude-test-20260926","usage":{"input_tokens":12,"cache_read_input_tokens":3,"cache_creation_input_tokens":5}}}"#,
                 r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}"#,
                 r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
@@ -497,6 +512,7 @@ mod tests {
                 cache_write_1h_tokens: 0,
                 sent_ms: 0,
                 models: Vec::new(),
+                served_model: "claude-test-20260926".to_owned(),
             })
         );
     }
@@ -510,12 +526,18 @@ mod tests {
                  "cache_read_input_tokens":9,"cache_creation_input_tokens":0,"output_tokens":0},
                 {"type":"fallback_message","model":"claude-opus-4-8","input_tokens":2,
                  "cache_read_input_tokens":0,"cache_creation_input_tokens":7,"output_tokens":0}]});
-        let usage = super::message_usage(&report, false);
+        let usage = super::message_usage(&json!({"model":"claude-opus-5-5","usage":report}), false);
         assert_eq!(usage.models.len(), 1);
         assert_eq!(usage.models[0].model, "claude-opus-4-8");
         assert_eq!((usage.input_tokens, usage.cache_write_tokens), (9, 7));
-        let plain = super::message_usage(&json!({"cache_read_input_tokens":9}), false);
+        // The attempt that answered names the model, not the one asked.
+        assert_eq!(usage.served_model, "claude-opus-4-8");
+        let plain = super::message_usage(
+            &json!({"model":"claude-opus-5-5","usage":{"cache_read_input_tokens":9}}),
+            false,
+        );
         assert_eq!((plain.input_tokens, plain.cached_input_tokens), (9, 9));
+        assert_eq!(plain.served_model, "claude-opus-5-5");
     }
     /// Hour-long writes are read from the split when Anthropic reports one,
     /// and otherwise follow what the request asked for.
@@ -602,6 +624,8 @@ mod tests {
         assert_eq!(usage.models.len(), 2);
         assert_eq!(usage.models[1].model, "claude-opus-4-8");
         assert_eq!(usage.models[1].input_tokens, 13);
+        // The answer the turn keeps came from the model fallen back to.
+        assert_eq!(usage.served_model, "claude-opus-4-8");
         // Cache writes stay with the attempt that made them.
         assert_eq!(usage.cache_write_tokens, 4);
         assert_eq!(usage.models[1].cache_write_tokens, 4);
