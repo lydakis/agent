@@ -831,6 +831,23 @@ class SummaryCopyTests(ModelFixture):
                          ('synthetic-model', 'Summarize.', []))
         self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
 
+    def test_a_turn_after_one_that_failed_before_a_call_does_not_copy_it(self):
+        self.model.bodies = []
+        # The previous turn's prompt is stored, but its only request was
+        # refused with no usage, so no call sent the history it ends.
+        self.model.refused_prompts = {'1' * 600}
+        client = self.start()
+        for n in range(3):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 600)['result']['turn']
+            ended = client.finished(turn)['data']
+            self.assertEqual(ended['status'], 'failed' if n == 1 else 'completed', ended)
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(requests[index - 1]['input'][-1]['content'][0]['text'], '1' * 600)
+        summary = requests[index]
+        self.assertEqual((summary['instructions'], summary['tools']), ('Summarize.', []))
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+
     def request_of_its_own(self, client):
         """The one summary's `request`: a request of its own, priced."""
         compacted, = self.events(client, 'compacted')

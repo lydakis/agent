@@ -704,9 +704,10 @@ pub struct TurnContext {
     pub created_by_id: Option<i64>,
     pub workspace: String,
     pub model: String,
-    /// The model of the bot's latest earlier turn that started: the one
-    /// whose calls sent the history this turn starts from. `None` without
-    /// one, as on a fork's first turn.
+    /// The model of the bot's latest earlier turn that started, when its
+    /// calls sent the history this turn starts from: it made a model round
+    /// and something follows its prompt. `None` otherwise, as when it
+    /// failed before a call, or on a fork's first turn.
     pub previous_model: Option<String>,
 }
 pub struct Database {
@@ -4299,15 +4300,23 @@ impl Database {
         let bot = self.active(turn)?;
         let default = format!("{}/{}", bot.provider, bot.model);
         // Turns that never started (steers absorbed elsewhere, refusals)
-        // have no prompt node.
+        // have no prompt node. One that stored its prompt and failed before
+        // a call made no model round, or left its prompt, a prompt node,
+        // right before this one.
         let previous_model = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(t.model,?3) FROM turns t WHERE t.bot=?1 AND t.id<?2
-                   AND EXISTS(SELECT 1 FROM nodes WHERE turn=t.id) ORDER BY t.id DESC LIMIT 1",
+                "SELECT COALESCE(t.model,?3),t.model_rounds>0 AND p.turn IS NULL
+                   FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
+                  WHERE t.bot=?1 AND t.id<?2 AND s.turn=?2
+                    AND EXISTS(SELECT 1 FROM nodes WHERE turn=t.id)
+                  ORDER BY t.id DESC LIMIT 1",
             )?
-            .query_row(params![bot.name, turn, default], |r| r.get(0))
-            .optional()?;
+            .query_row(params![bot.name, turn, default], |r| {
+                r.get::<_, bool>(1)?.then(|| r.get(0)).transpose()
+            })
+            .optional()?
+            .flatten();
         Ok(TurnContext {
             model_rounds,
             workspace: workspace

@@ -1844,7 +1844,9 @@ floor and thinking strip, then one user item, the compaction request,
 carrying the client's compaction instructions and the maximum summary size.
 The view is the last call's in this task, or, before the task's first call,
 the view as the bot's call before the new prompt or wait sent it through its
-newest boundary. The copy takes what the call sent ahead of its window, so a
+newest boundary. That holds only when the bot's previous turn called the
+same model, made a model round, and left more than its prompt; after a turn
+that failed before a call, no call sent that history. The copy takes what the call sent ahead of its window, so a
 note written since does not show, and the window from before any stubs this
 boundary made.
 

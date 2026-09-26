@@ -80,6 +80,15 @@ class Model(http.server.BaseHTTPRequestHandler):
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
             # A `steer:` message joins the running task, which its prompt drives.
             user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
+            if user in getattr(self.server, 'refused_prompts', ()):
+                # A refusal with no usage: the turn fails without a model round.
+                body = b'{"error":{"message":"synthetic refusal"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
