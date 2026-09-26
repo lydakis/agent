@@ -34,10 +34,10 @@ has to be counted per call.
    whose calls wait for a verdict. The daemon announces those calls when the
    model plans them, waits for an `answer` from any client, runs or refuses
    the call, and records who decided. It has no rules, no prompts, no model,
-   and no timeout of its own.
+   and no verdict timeout of its own.
 3. **Manual and automatic are clients.** The mode names live in the CLI and
-   the app; the daemon sees a list of gated tools and an opaque tag naming
-   which approver answers.
+   the app; the daemon sees gates, each a list of tools and an opaque tag
+   naming which approver answers.
 4. **Auto is hands-off.** Deterministic rules in the client answer the
    obvious cases in microseconds, and Jev answers a handful of narrow
    questions about the rest in about 0.4 s. In the stored Harbor trials
@@ -201,31 +201,35 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   that removes a tool from it, because the bot's own shell could call that
   operation. The CLI flag is `run --approve shell,write,edit`.
 - **`create` also takes an `approver` tag,** an opaque string the daemon
-  stores, reports in `resume`, `bots`, and `approval_requested`, and copies
-  with the list, but never interprets. Clients use it to decide who answers
-  (see the modes above).
-- **Gates only accumulate.** A new bot's list is the union of every list
-  it descends from, intersected with its own tools so it stays a subset of
-  them:
-  - `create`: the list it asks for, plus its creator's when it names one.
-  - `fork`: the source's list, plus the list it asks for, plus its
-    creator's when a bot forks from its shell. A gated bot that forks an
-    ungated one gets a gated fork, and a fork never drops its source's gate.
+  stores, reports in `resume`, `bots`, and `approval_requested`, but never
+  interprets. Clients use it to decide who answers (see the modes above).
+  A list and its tag together make a **gate**.
+- **Gates only accumulate.** A new bot keeps every gate it descends from
+  and adds the one it asks for:
+  - `create`: its own gate, plus its creator's when it names one.
+  - `fork`: the source's gates, plus its own, plus its creator's when a bot
+    forks from its shell. A gated bot that forks an ungated one gets a
+    gated fork, and a fork never drops its source's gate.
 
-  A read-only child of a bot gated on `shell,write,edit` gets nothing to
-  approve, because it has none of those tools. A fork keeps its source's
-  tools, so its list stays a subset even when its allowed list is
-  narrower; an entry for a tool the fork may not call never comes up. The
-  tag goes with the list: the bot's own requested tag if it asked for a
-  list, else the source's if the source had one, else the creator's. Tool
-  definitions never change, so the prompt cache is untouched. This is a guard against accidents, not a boundary: the
-  creator is declared by the shell's environment, and a command that clears
-  it creates an ungated bot. The approver sees that command first.
+  Each gate's list is intersected with the new bot's tools, and gates with
+  the same tag merge. A call needs an allow from every gate whose list
+  names its tool, and the first deny from any of them denies it. So a bot
+  under `manual` that forks an `auto` bot gets a fork whose calls need
+  both, and nothing a bot asks for can replace a gate it inherited. Mixed
+  gates are rare; the common bot has one. A read-only child of a bot gated
+  on `shell,write,edit` gets nothing to approve, because it has none of
+  those tools. A fork keeps its source's tools, so its lists stay subsets
+  even when its allowed list is narrower. Tool definitions never change,
+  so the prompt cache is untouched. This is a guard against accidents, not
+  a boundary: the creator is declared by the shell's environment, and a
+  command that clears it creates an ungated bot. The approver sees that
+  command first.
 - **The request rides the plan commit.** When `append` records a model
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
-  `{"calls":[{"call_id","request","name","node","arguments","arguments_truncated"}]}`.
+  `{"calls":[{"call_id","request","gates","name","node","arguments","arguments_truncated"}]}`,
+  where `gates` lists the tags whose answer the call needs.
   Each call names its own node: an Anthropic round keeps all its calls in
   one assistant item, but a Responses round stores each `function_call` as
   an item of its own. Arguments are previewed to 2,048 characters, as
@@ -233,10 +237,12 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `write`) with `item` on that call's node.
   One event per round, not per call, and no extra commit.
 - **`answer` decides one request.**
-  `{"op":"answer","bot","turn","call_id","request","decision":"allow"|"deny","reason"?,"by"?}`.
+  `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"until_prior"?}`.
   `request` is the number the call was announced with, and it changes each
-  time the call is announced again. The first answer to the current request
-  wins. A second gets `approval_already_answered`; an answer to an earlier
+  time the call is announced again. `tag` names the gate answered and may
+  be left out when the call has one. The first answer to the current
+  request wins, per gate. A second gets `approval_already_answered`; an
+  answer to an earlier
   request of the same call, computed before an earlier call failed, gets
   `approval_superseded` and changes nothing; an unknown call gets
   `no_pending_approval`, a finished turn `stale_turn`. `by` is
@@ -248,12 +254,18 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   in the worker's map but not yet written, so it never offers a call that
   would only fail with `approval_already_answered`. `stats` counts pending
   verdicts the same way.
-- **One session serves a tag's approvals.** `serve_approvals {"tag"}` hands
-  a session the pending requests for bots with that tag and then streams
-  only new `approval_requested` events for them, from the same worker job,
-  so nothing falls between the list and the stream. At most one session
-  holds a tag; a second is refused with `approvals_served` and may retry
-  when the holder disconnects. The approver never reads the fleet's other
+- **One session serves a tag's approvals.** `serve_approvals
+  {"tag","lease_ms"}` hands a session the pending requests whose gates
+  include that tag and then streams only new `approval_requested` events
+  for them, from the same worker job, so nothing falls between the list
+  and the stream. At most one session holds a tag; a second is refused
+  with `approvals_served`. The holder keeps the tag by sending an answer or
+  a `renew` at least every `lease_ms`, a period it chooses (`agent
+  approver` renews every second on a 5 s lease). A holder that goes quiet
+  while connected, like a suspended app or a wedged loop, loses the tag:
+  the daemon sends it `approvals_lost`, and the next `serve_approvals`
+  takes over. Until one does, its calls wait. The approver never reads the
+  fleet's other
   events, so its cost grows with gated calls, not with everything the
   bots stream, and two automatic approvers (the app and `agent approver`)
   never both pay Jev for the same call. Any session can still `answer`,
@@ -271,7 +283,12 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `sh run.sh` expecting the planned `write`; if the write was refused, the
   file it would run is not the one it saw. The new request rides the failed
   call's own finishing commit, and a rules-only approver answers it again
-  in microseconds. The success path pays nothing.
+  in microseconds. The success path pays nothing, with one exception the
+  approver asks for: an allow sent with `"until_prior":true` holds only
+  for the filesystem the approver looked at, so if any earlier call of the
+  round finishes after it arrived, successfully or not, the call is
+  announced again the same way. The rules set it when an allow depended on
+  resolving a path and an earlier call of the round could change files.
 - **Allow rides `tool_start`.** The call starts as today, and its
   `tool_started` event gains `"approval":{"by","waited_ms"}`. No extra
   commit.
@@ -316,7 +333,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
 
 The daemon never judges a call, never writes text for the model beyond the
 error code, and never times out a verdict. A client that wants a deadline
-denies on its own clock.
+denies on its own clock. The one clock the daemon keeps is the serving
+lease, on the period its holder chose.
 
 ### The three modes
 
@@ -333,8 +351,8 @@ denies on its own clock.
 - **The daemon sees no modes.** The CLI turns a mode into two `create`
   fields: the `approve` list, and an `approver` tag the daemon stores and
   reports but never reads (`auto` or `manual`). The automatic approver
-  answers only bots tagged `auto`; the app offers Allow and Deny only on
-  bots tagged `manual`. So one daemon can run bots in all three modes at
+  answers only `auto` gates; the app offers Allow and Deny only for
+  `manual` gates. So one daemon can run bots in all three modes at
   once, and a program can invent its own tag and serve those bots itself.
 - **`auto` needs its approver running.** The CLI already starts the daemon
   when it is not running; with `auto` it starts `agent approver` the same
@@ -345,14 +363,20 @@ denies on its own clock.
 
 ### Manual mode
 
-- **CLI:** `agent approvals [--bot NAME]` lists pending calls;
-  `agent answer --bot NAME --turn N --call ID allow|deny [--reason TEXT]`
-  decides one. `follow --pretty` shows a pending call and who later decided
+- **CLI:** `agent approvals [--bot NAME]` lists pending calls, each with
+  its request number and gates; `agent answer --bot NAME --turn N --call ID
+  --request R allow|deny [--tag T] [--reason TEXT]` decides one. The
+  request number is required, so a decision made on what a person saw
+  cannot land on a call announced again since; it gets
+  `approval_superseded` and the person looks again. `follow --pretty` shows
+  a pending call and who later decided
   it. `agent answer` refuses to run inside a tool shell (it sees
   `AGENT_BOT`), the same kind of guard as the creator identity: it stops
   accidents, not a determined command.
-- **App:** on a bot tagged `manual`, a pending call renders as a card on
-  the bot's timeline with Allow and Deny (with an optional note). The app already follows every bot, so it
+- **App:** a call pending on a `manual` gate renders as a card on the
+  bot's timeline with Allow and Deny (with an optional note). The card
+  answers the request it shows; a call announced again replaces it. The app
+  already follows every bot, so it
   gets `approval_requested` with no new subscription.
 - **Program:** any process that follows events can answer. A CI job can
   allow a fixed set of commands and deny the rest with no model at all.
@@ -374,14 +398,18 @@ so only one instance runs at a time, and answers in layers:
    - `write` and `edit` inside the turn's workspace are allowed. Files a
      later command will execute are the exception and go to the model:
      `.git/`, `.agent/`, `AGENTS.md`, build and hook files (`Makefile`,
-     `package.json`, `.envrc`, CI workflows). An independent test of Claude Code's auto mode found 36.8% of
-     state-changing actions went around its classifier as in-project file
-     edits (Ji et al., 2026). The approver also remembers what each bot
+     `package.json`, `.envrc`, CI workflows). An independent test of Claude
+     Code's auto mode found 36.8% of state-changing actions went around its
+     classifier as in-project file edits (Ji et al., 2026). The approver
+     also remembers what each bot
      wrote this turn, so a command that runs one of those files is judged
      with the file's content in view.
    - Every path is resolved on disk when the approver judges it, not read
      as text, so a symlink inside the workspace that points out of it
-     counts as outside.
+     counts as outside. An earlier call in the same round can change what
+     a path resolves to, so when one could change files, an allow that
+     rests on a resolved path is sent with `until_prior` and judged again
+     after that call runs.
    - `read` inside the workspace is allowed, except files that look like
      secrets or commonly hold them: `.env*`, `*.pem`, `*.key`, `*.p12`,
      `*.pfx`, `*.keystore`, `id_*`, `.npmrc`, `.pypirc`, `.netrc`,
@@ -395,7 +423,13 @@ so only one instance runs at a time, and answers in layers:
      joined by `&&`, `||`, `;`, or `|`. It is allowed only if every part is
      a command on the read-only list, every flag it uses is on that
      command's own list of allowed flags, and every path it names is a
-     readable path by the rule above. The lists name what is allowed, not
+     readable path by the rule above. The name must also resolve, through
+     the tool shell's `PATH`, to an executable outside the workspace in a
+     directory the user cannot write, or in one the environment note
+     trusts (a Homebrew prefix is owned by the user). A `git` or `rg` found
+     anywhere else, such as one an earlier command put in a writable
+     directory on `PATH`, makes the command opaque. The lists name what is
+     allowed, not
      what is not: `find` may take `-name` and `-type` but not `-exec`,
      `-delete`, `-fprint`, `-fprintf`, or `-fls`, simply because they are
      not listed; the same goes for `git diff --output`, `rg --pre`, and
@@ -411,11 +445,14 @@ so only one instance runs at a time, and answers in layers:
        model.
      - `git status`, `diff`, `log`, and `show` run programs named in git
        config: `core.fsmonitor`, external diff drivers, and textconv
-       filters. Git counts as read-only only while the repository's and
-       the user's git config set none of `core.fsmonitor`, `diff.external`,
-       `diff.*.command`, `diff.*.textconv`, `include.path`, or
-       `includeIf.*`. The approver reads those files, cached by
-       modification time; if any is set, git goes to the model.
+       filters. Git counts as read-only only while its effective config
+       sets none of `core.fsmonitor`, `diff.external`, `diff.*.command`,
+       `diff.*.textconv`, `include.path`, or `includeIf.*`. The approver
+       asks git itself (`git config --get-regexp` in that directory, with
+       the tool shell's environment), which covers every scope: system,
+       global, repository, worktree, and `GIT_CONFIG_*` variables. It
+       caches the answer by those files' modification times; if any key is
+       set, git goes to the model.
    - Commands that reach the approval channel itself (`agent answer`, the
      daemon's socket other than through `agent`, the store file) are denied
      outright.
@@ -438,9 +475,12 @@ so only one instance runs at a time, and answers in layers:
      publish, send a message)?
    - Does it download and run code from the network?
 
-   Allow when every risk is low. Deny, with the question as the reason (like
-   Claude Code's rule tags), when a risk is high and the user did not ask
-   for it. Everything else goes to step 4. The starting thresholds are
+   Allow when every risk is low. Allow a risky call too when the intent
+   answer is high, meaning the caller asked for this action, and no hard
+   deny (step 4) matches: a task that says to install a package, publish,
+   or deploy has consented to that. Deny, with the question as the reason
+   (like Claude Code's rule tags), when a risk is high and the user did not
+   ask for it. Everything else goes to step 4. The starting thresholds are
    TypeSafe's guardrail cookbook's: below 0.35 is low, 0.70 or more is
    high. TypeSafe publishes no calibration figures; a third-party benchmark
    (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
@@ -467,9 +507,12 @@ so only one instance runs at a time, and answers in layers:
    the check failed", so the model can tell a refusal from an outage. A Jev
    request gets 10 s, the SDK's default, before it counts as failed.
 5. **Circuit breaker.** After 3 denials in a row for a bot, or 20 in one
-   turn, the approver denies every call of that turn that the rules do not
-   allow outright, with a reason asking the model to stop and report what it
-   needs. The turn ends with that report instead of more attempts. Claude
+   turn, the approver denies the call with a reason asking the model to
+   stop and report what it needs, then ends the turn with `interrupt` at
+   its next gated round or 30 s later, whichever comes first. A model that
+   reports ends the turn itself first; one that keeps going is stopped
+   without its cooperation. Interrupting a turn that already ended gets
+   `stale_turn` and does nothing. Claude
    Code uses 3 and 20 per session and then asks the person; Codex uses 3 in
    a row or 10 of the last 50 and interrupts. A model that keeps trying
    variations of a denied action is the pattern this catches.
@@ -486,13 +529,16 @@ says about itself.
 
 **Whose words a prompt is.** A turn a bot submits to another bot carries a
 prompt a model wrote. `created_by` names only a bot, not which of its turns
-did the delegating, so the daemon records it per turn: a tool shell's
+did the delegating, so the daemon records it per prompt: a tool shell's
 environment gains `AGENT_TURN` next to `AGENT_BOT`, the CLI run from that
 shell sends `from: {bot, turn}` with `submit`, `create`, and `fork`, and
-the daemon stores it on the new turn and reports it in
-`approval_requested`. The approver follows `from` turn by turn until it
-reaches a turn submitted without one, and only that turn's prompt counts
-as the caller's words; every prompt below it is a model-written task.
+the daemon stores it on the prompt item that `submit` writes, whether it
+opens a turn or is absorbed as a steer, and reports it in
+`approval_requested`. A prompt item without `from` is a person's words; one
+with `from` was written by the model of the turn it names, and the
+approver follows it back to that turn's own person-written items. So a
+bot that steers a person's turn does not speak for the person, and a
+person who steers a delegated turn does.
 Like the creator, `from` is declared, not verified: a command that clears
 the environment submits a turn that looks like the caller's. The rules
 deny `agent` commands that clear or override these variables (`env -i`,
@@ -505,7 +551,8 @@ isolation.
 **The intent view is bounded.** Jev takes at most 32k tokens of state, and
 a long-lived bot's prompts outgrow that. The approver sends, in this
 order: the environment note, the root person's prompt for this turn, the
-current turn's prompt and its steers, the planned and already allowed
+current turn's prompt and its steers, each marked as a person's or a
+model's words, the planned and already allowed
 calls, and then earlier prompts newest first until a 16k-token budget is
 spent. If the first four alone do not fit, it does not call Jev; the call
 is unclear (step 4), with the reason "not reviewed: intent too long".
@@ -532,7 +579,8 @@ rounds that reached Jev in the Harbor trials, that is about twice the
 request limit: one key caps an `auto` fleet at roughly 26 to 31 model
 rounds a second. Hence one request per round rather than per call, the
 rules layer in front, and a pace in the approver that backs off on 429
-and 529 as TypeSafe's docs ask. The pace has a bound: each round gets 10 s from announcement to verdict, queue time
+and 529 as TypeSafe's docs ask. The pace has a bound: each round gets 10 s
+from announcement to verdict, queue time
 included, and the queue holds at most as many rounds as Jev's current
 limit admits in that time. A round that would wait longer, or runs out of
 time, is denied at once with "not reviewed: the approver is overloaded".
