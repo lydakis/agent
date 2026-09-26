@@ -123,7 +123,8 @@ it asked for and what actually answered, each from that harness's own records:
 - **Requested model**, as passed to the harness.
 - **Served models**, with the calls each answered. Ours come from the trial
   metadata's `served_calls`, which counts every billed attempt, including
-  provider-side fallbacks, delegated bots and summarizers. Codex's come from
+  provider-side fallbacks, delegated bots and summarizers, and is null when
+  some of the trial's records are missing ([HARBOR.md](HARBOR.md#the-adapter)). Codex's come from
   its session rollout, which names the model once per turn. Claude Code's come
   from its per-message usage, which names the model the API reported for each
   response, and its per-model totals, which include any auxiliary model it

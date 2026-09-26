@@ -51,6 +51,11 @@ def store(path, turns):
                        [(bot, model, status, n, n // 2, n // 10) for bot, model, status, n in turns])
 
 
+def counted(logs, input_tokens):
+    """The daemon's own input count, as `agent stats` saves it before shutdown."""
+    Path(logs, 'stats.json').write_text(json.dumps({'tokens': {'input_tokens': input_tokens}}))
+
+
 @unittest.skipIf(Agent is None, 'harbor is not installed')
 class HarborAgentTest(unittest.TestCase):
     def agent(self, logs, **kwargs):
@@ -111,6 +116,7 @@ class HarborAgentTest(unittest.TestCase):
             store(Path(logs, 'state.sqlite'), [('task', 'gw/m', 'completed', 900),
                                                ('helper', 'gw/small', 'cancelled', 2000),
                                                ('task', None, 'interrupted', 100)])
+            counted(logs, 0)
             context = AgentContext()
             self.agent(logs).populate_context_post_run(context)
             unpriced = AgentContext()
@@ -150,8 +156,13 @@ class HarborAgentTest(unittest.TestCase):
                                         'models': attempts}),))
                 db.execute("INSERT INTO events(bot,turn,kind,data) VALUES ('task',1,'usage',?)",
                            (json.dumps({'input_tokens': 300, 'output_tokens': 50, 'cached_input_tokens': 400}),))
+            counted(logs, 1000)
             context = AgentContext()
             self.agent(logs).populate_context_post_run(context)
+            # The daemon counted more than the store holds: a bot was deleted.
+            counted(logs, 1500)
+            short = AgentContext()
+            self.agent(logs).populate_context_post_run(short)
         usage = context.model_usage
         self.assertEqual((usage['gw/m'].n_input_tokens, usage['gw/m'].n_cache_tokens, usage['gw/m'].n_output_tokens),
                          (600, 400, 70))
@@ -163,6 +174,9 @@ class HarborAgentTest(unittest.TestCase):
         self.assertEqual((context.metadata['requested_model'], context.metadata['served_calls'],
                           context.metadata['bot_settings']['task']['fallbacks']),
                          ('gw/m', {'gw/m': 2, 'gw/backup': 1}, True))
+        self.assertNotIn('unrecorded_input_tokens', context.metadata)
+        self.assertEqual((short.metadata['served_calls'], short.metadata['unrecorded_input_tokens']),
+                         (None, 500))
 
     def test_cache_writes_are_priced_at_the_write_rate(self):
         rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5,
@@ -340,6 +354,7 @@ class HarborStoreTest(ModelFixture):
         turn = client.request('submit', bot='task', request_id='r', prompt='hello')['result']['turn']
         client.finished(turn)
         listed = client.request('turns', bot='task', after=0, limit=8)['result']['turns']
+        Path(self.path, 'stats.json').write_text(json.dumps(client.request('stats')['result']))
         client.request('shutdown')
         client.close()
         context = AgentContext()
@@ -350,6 +365,26 @@ class HarborStoreTest(ModelFixture):
         self.assertEqual(list(context.model_usage), ['openai/synthetic-model'])
         self.assertEqual(context.metadata['bot_settings'],
                          {'task': {'reasoning': None, 'fallbacks': False}})
+        # The daemon's count and the stored usage events agree.
+        self.assertEqual(context.metadata['served_calls'],
+                         {'openai/synthetic-model': listed[0]['model_rounds']})
+        self.assertNotIn('unrecorded_input_tokens', context.metadata)
+
+    def test_a_deleted_helper_leaves_what_served_unknown(self):
+        client = self.client()
+        for bot in ('task', 'helper'):
+            client.request('create', bot=bot, workspace=str(self.path))
+            turn = client.request('submit', bot=bot, request_id=bot, prompt='hello')['result']['turn']
+            client.finished(turn)
+        helper = client.request('turns', bot='helper', after=0, limit=8)['result']['turns'][0]
+        client.request('delete', bot='helper')
+        Path(self.path, 'stats.json').write_text(json.dumps(client.request('stats')['result']))
+        client.request('shutdown')
+        client.close()
+        context = AgentContext()
+        Agent(logs_dir=self.path, model_name='openai/synthetic-model').populate_context_post_run(context)
+        self.assertIsNone(context.metadata['served_calls'])
+        self.assertEqual(context.metadata['unrecorded_input_tokens'], helper['input_tokens'])
 
 
 if __name__ == '__main__':

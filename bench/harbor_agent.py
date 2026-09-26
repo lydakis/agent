@@ -320,9 +320,13 @@ class Agent(BaseInstalledAgent):
                 for t in turns}
         # Two arms asking for one model are matched only if both ran it, so
         # say what was asked and what answered. Without the store only the
-        # task bot's stream is left, so what answered is unknown.
+        # task bot's stream is left, and a deleted bot takes its records with
+        # it, so then what answered is unknown.
+        unrecorded = self._unrecorded_input(events) if turns else None
         context.metadata = {**(context.metadata or {}), 'requested_model': self.model_name,
-                            'served_calls': served if turns else None}
+                            'served_calls': served if unrecorded == 0 else None}
+        if unrecorded:
+            context.metadata['unrecorded_input_tokens'] = unrecorded
 
     def _store_turns(self) -> list[dict[str, Any]] | None:
         """Every turn in the store copied after the daemon exited, or None when
@@ -360,6 +364,22 @@ class Agent(BaseInstalledAgent):
                     "WHERE e.kind='usage'")]
         except sqlite3.Error:
             return []
+
+    def _unrecorded_input(self, events: list[tuple[str, dict[str, Any]]]) -> int | None:
+        """Input tokens the daemon counted that no stored usage event holds,
+        or None when its count was not saved.
+
+        `agent stats` runs just before shutdown and its totals only grow, so
+        a shortfall means records left the store: `agent rm` deletes a
+        finished helper's turns and events, and a call cut off by shutdown
+        may be counted but never committed.
+        """
+        try:
+            stats = json.loads((self.logs_dir / 'stats.json').read_text())
+            counted = int(stats['tokens']['input_tokens'])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        return max(0, counted - sum(data.get('input_tokens', 0) for _, data in events))
 
     def _streamed_usage(self) -> list[dict[str, Any]] | None:
         """The task bot's per-call usage events, streamed as they happened.

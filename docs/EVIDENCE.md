@@ -16,8 +16,9 @@ more turns is not here, because its work changes with its speed; it is under
 [operational behavior](#operational-behavior).
 
 - **Group commit, fixed work.** 192 bots, 4,608 primary turns, the same
-  requests and retries in both builds, full flushing in both. Batching turn
-  completions took 17–20% less wall time and about 9% less daemon CPU
+  requests and retries in both builds, full flushing in both. The build that
+  batches turn completions, which also carried the retention-publication
+  fix, took 17–20% less wall time and about 9% less daemon CPU
   (94.62→78.57 s and 104.96→83.88 s; 21.50→19.52 s and 20.56→18.69 s CPU), in
   two runs per build in reversed order. Commits are still about 82% of store
   execution. macOS arm64, `15d629c` against `a7746cd`, 2026-09-26.
@@ -86,7 +87,9 @@ the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
 | | Codex 0.156.1 | 5/10 | $0.198 | 95.4% | 3, 2, 0 |
 
 - **Served models.** Each arm's records show only the model it requested,
-  and no fallback call. What that shows differs by record: Claude Code's
+  and no fallback call, but only for calls that finished: the three Sonnet
+  timeouts each cut off a call that left no record. What that shows differs
+  by record: Claude Code's
   name the model the API reported for each response, so its arm ran that
   model; Codex's name the model once per turn, and ours name the requested
   model unless a fallback or summarizer answered, so a provider-side reroute

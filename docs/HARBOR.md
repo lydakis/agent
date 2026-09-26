@@ -50,8 +50,8 @@ read, so the pair was run again as C. It is kept for Codex's failure causes.
 | --- | --- | ---: | --- | --- | ---: |
 | A | Agent | 172 | gpt-6-sol | `--fallbacks` on the task bot, inert on ChatGPT | 0 |
 | A | Codex | 227 | gpt-6-sol, per turn | none | not recorded |
-| B | Agent | 390 | claude-sonnet-5 | `--fallbacks` on the task bot | 0 |
-| B | Claude Code | 266 | claude-sonnet-5, per response | `--fallback-model` not set | 0 |
+| B | Agent | 390 | claude-sonnet-5 | `--fallbacks` on the task bot | 0 recorded, 2 cut off |
+| B | Claude Code | 266 | claude-sonnet-5, per response | `--fallback-model` not set | 0 recorded, 1 cut off |
 | C | Agent | 161 | gpt-6-sol | `--fallbacks` on the task bot, inert on ChatGPT | 0 |
 | C | Codex | 163 | gpt-6-sol, per turn | none | not recorded |
 | – | Codex | 128 | gpt-6-sol, per turn | none | not recorded |
@@ -63,6 +63,10 @@ read, so the pair was run again as C. It is kept for Codex's failure causes.
   fallback splits a call or a summarizer answers on another model; neither
   happened. See the gap in
   [COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons).
+- Each timed-out trial in B ended with a model call cut off before it
+  reported anything, so which model served those three calls, and whether
+  they fell back, is unknown. B's served-model record is complete only for
+  the calls that finished.
 - The adapter's `--fallbacks` asks Anthropic for its server-side fallback and
   does nothing on the ChatGPT provider, so it was live only in B. Harbor's
   Codex adapter has no fallback option and passed no `config.toml`. Harbor's
@@ -222,6 +226,11 @@ the same model can drive each harness on the same tasks.
    A call counts under the model it requested unless a fallback or summarizer
    answered on another. Without a store copy only the task bot's streamed
    calls are left, so `served_calls` is null and `bot_settings` absent.
+   `served_calls` is also null when the daemon's own input count, saved by
+   `agent stats` just before shutdown, exceeds the stored usage events, as
+   when the task deleted a finished helper with `agent rm`; the shortfall is
+   recorded as `unrecorded_input_tokens`, and the trial's cost is then a
+   lower bound.
    Provider failures map to Harbor's retryable error types, for example
    `provider_http_429` to `ApiRateLimitError`, `provider_stream_failed` to
    `NetworkConnectionError` and `provider_http_401` to `AgentAuthenticationError`.
