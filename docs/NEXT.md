@@ -865,8 +865,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Built (2026-09-26): the daemon
     mechanism and `manual` mode with `agent approvals` and `agent answer`.
-    Next, parked on 2026-09-26 behind within-turn compaction, the storage
-    failure, and admission batching (the last two landed in #32): the
+    Next, parked on 2026-09-26 behind core work: within-turn compaction,
+    the storage failure, and admission batching have landed (#32, #33),
+    and the realistic-budget compaction eval comes first. Then the
     rules-only `auto` approver with `serve_approvals`, then Jev, and a
     labeled dangerous set to measure false allows before thresholds are
     fixed.
