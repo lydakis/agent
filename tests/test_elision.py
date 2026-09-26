@@ -2,7 +2,7 @@
 import json
 import os
 from unittest import skipUnless
-from tests.test_runtime import AnthropicModel, ModelFixture
+from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from bench.runtime_client import Client
 from bench.targets import clean_env
 
@@ -155,7 +155,7 @@ class ElisionTests(ModelFixture):
             self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 32768 for r in requests))
-        summaries = [r for r in requests if r.get('instructions') == 'Summarize.']
+        summaries = [r for r in requests if is_summary(r)]
         self.assertEqual(len(summaries), 1)
         # The summarizer reads the span as the model last saw it.
         span = [i for i in summaries[0]['input'] if i.get('type') == 'function_call_output']
@@ -183,7 +183,7 @@ class ElisionTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         outcome = client.finished(steer)['data']
         self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
-        work = [r for r in drain(self.model) if r.get('instructions') != 'Summarize.']
+        work = [r for r in drain(self.model) if not is_summary(r)]
         steered = [n for n, r in enumerate(work)
                    if any(i.get('role') == 'user' and i['content'][0]['text'] == correction for i in r['input'])]
         first = work[steered[0]]['input']
@@ -214,7 +214,7 @@ class ElisionTests(ModelFixture):
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
-        work = [r for r in drain(self.model) if r.get('instructions') != 'Summarize.']
+        work = [r for r in drain(self.model) if not is_summary(r)]
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
         # Each cut left the turn room for the steer on its own.
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']

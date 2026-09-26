@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import ModelFixture, is_summary
 from bench.runtime_client import Client
 
 
@@ -332,20 +332,23 @@ class DeliveryTests(ModelFixture):
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
-        # The summarizer's own call: the client's instructions, no tools, the
-        # span's items, and the request to write, whose echo became the summary.
-        summarizer = [r for r in requests if r.get('instructions') == 'Summarize the conversation.']
+        # A copy of Bob's call, his instructions, tools, and window, with the
+        # request to write after it carrying the client's instructions.
+        summarizer = [r for r in requests if is_summary(r)]
         self.assertGreaterEqual(len(summarizer), 1)
-        self.assertEqual(summarizer[0]['tools'], [])
-        self.assertTrue(summarizer[0]['input'][-1]['content'][0]['text'].startswith('[compaction request]'))
+        work = [r for r in requests if not is_summary(r)
+                and r['prompt_cache_key'] == summarizer[0]['prompt_cache_key']]
+        self.assertEqual(summarizer[0]['tools'], work[0]['tools'])
+        self.assertEqual(summarizer[0]['instructions'], work[0]['instructions'])
+        self.assertTrue(summarizer[0]['input'][-1]['content'][0]['text'].endswith('Summarize the conversation.'))
         # Bob's later requests carry the summary and the covered prompts verbatim, ahead of the window.
-        later = [r for r in requests if r.get('instructions') != 'Summarize the conversation.'
+        later = [r for r in requests if not is_summary(r)
                  and any(i.get('role') == 'user' and i['content'][0]['text'].startswith('[compaction summary')
                          for i in r['input'])]
         self.assertGreaterEqual(len(later), 1)
         text = [i for i in later[-1]['input'] if i.get('role') == 'user'
                 and i['content'][0]['text'].startswith('[compaction summary')][0]['content'][0]['text']
-        self.assertIn('reply:[compaction request]', text)
+        self.assertIn('A short synthetic summary.', text)
         self.assertIn('User messages from those turns, verbatim:', text)
         self.assertIn('\n1: Task 1: 111', text)
         bob = client.request('resume', bot='Bob')['result']

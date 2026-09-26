@@ -17,6 +17,15 @@ from bench.targets import clean_env
 from bench.runtime_client import Client, serve_args
 
 
+
+def is_summary(request):
+    """A summary request in either form: a copy of the bot's call, or a
+    request of its own over a span. Both end in the compaction request."""
+    items = request.get('input') or request.get('messages') or []
+    content = items[-1].get('content') if items else None
+    return (isinstance(content, list) and bool(content) and items[-1].get('role') == 'user'
+            and content[-1].get('text', '').startswith('[compaction request]'))
+
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -40,7 +49,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.server.routes.append(self.headers.get('x-codex-turn-state'))
             if hasattr(self.server, 'expected_authorization'):
                 self.server.auth_checks.append(self.headers.get('Authorization') == self.server.expected_authorization)
-            if getattr(self.server, 'reject_compaction', False) and request.get('instructions') == 'Summarize.':
+            if getattr(self.server, 'reject_compaction', False) and is_summary(request):
                 body = b'{"error":{"message":"synthetic compaction refusal"}}'
                 self.send_response(400)
                 self.send_header('Content-Length', str(len(body)))
@@ -48,7 +57,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 self.wfile.flush()
                 return
-            if request.get('instructions') == 'Summarize.' and getattr(self.server, 'compaction_refusals', 0):
+            if is_summary(request) and getattr(self.server, 'compaction_refusals', 0):
                 self.server.compaction_refusals -= 1
                 body = b'{"error":{"message":"synthetic compaction rate limit"}}'
                 self.send_response(429)
@@ -60,7 +69,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             assert self.path == '/v1/responses'
-            assert request['model'] == 'synthetic-model'
+            assert request['model'] in getattr(self.server, 'models', ('synthetic-model',))
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
             # A `steer:` message joins the running task, which its prompt drives.
             user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
@@ -119,7 +128,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 # A scripted agent: one shell command a model call, then an
                 # answer quoting the throughput the last result reported.
                 step = self.server.task_step
-                if request.get('instructions') != 'Summarize.':
+                if not is_summary(request):
                     self.server.task_step += 1
                 text = ''
                 if step < len(self.server.task_script):
@@ -166,10 +175,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'script' and getattr(self.server, 'call_script', None):
-                # One call a round from `call_script`, then an answer.
-                start = max(n for n, i in enumerate(request['input'])
-                            if i.get('role') == 'user' and i['content'][0]['text'] == 'script')
-                done = sum(i.get('type') == 'function_call' for i in request['input'][start:])
+                # One call a round from `call_script`, then an answer; a cut
+                # inside the turn keeps at least its newest call in view.
+                done = max((int(i['call_id'][7:]) + 1 for i in request['input']
+                            if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
+                           default=0)
                 text = ''
                 if done < len(self.server.call_script):
                     name, arguments = self.server.call_script[done]
@@ -260,13 +270,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = getattr(self.server, 'reply_text', 'reply:' + user)
                 output = [{'id': 'msg_text', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
-            if request.get('instructions') == 'Summarize.':
+            if is_summary(request):
                 text = getattr(self.server, 'compaction_text', 'A short synthetic summary.')
                 output = [{'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
+                if getattr(self.server, 'compaction_call', False):
+                    # A copy offers the bot's tools, and a model may call one.
+                    output.append({'type': 'function_call', 'name': 'echo', 'call_id': 'summary-call',
+                                   'arguments': json.dumps({'text': 'instead'})})
             if getattr(self.server, 'history_reasoning', None):
                 output.insert(0, self.server.history_reasoning)
-            if getattr(self.server, 'empty_compaction', False) and request.get('instructions') == 'Summarize.':
+            if getattr(self.server, 'empty_compaction', False) and is_summary(request):
                 text, output = '', []
             events = [{'type': 'response.created', 'response': {'id': 'response_test'}}]
             if text:
@@ -379,11 +393,14 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
             assert request['cache_control'] == cache
-            summary = request.get('system', [{}])[0].get('text') == 'Summarize.'
+            summary = is_summary(request)
+            # A summary of its own disables tool calls; a copy of the bot's
+            # call keeps its tool choice, which the message cache covers.
+            own = request.get('system', [{}])[0].get('text') == 'Summarize.'
             history_uses_tools = any(b['type'] in ('tool_use', 'tool_result')
                                      for m in request['messages'] for b in m['content'])
             if (history_uses_tools and not request.get('tools')) or (
-                    summary and request.get('tools') and request.get('tool_choice') != {'type': 'none'}):
+                    own and request.get('tools') and request.get('tool_choice') != {'type': 'none'}):
                 body = b'{"error":{"message":"tool history needs definitions; summarization must disable tool calls"}}'
                 self.send_response(400)
                 self.send_header('Content-Length', str(len(body)))
@@ -391,7 +408,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 self.wfile.flush()
                 return
-            if not summary:
+            if not own:
                 assert 'tool_choice' not in request
             assert [t['name'] for t in request['tools']][:2] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]

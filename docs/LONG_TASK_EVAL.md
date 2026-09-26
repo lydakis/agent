@@ -231,10 +231,18 @@ read 2026-09-26:
   `dist/core/compaction/compaction.js` sends its own system prompt and one
   user message holding the conversation serialized as text, with no tools.
 
+George chose the copy on 2026-09-26, and summary requests on the bot's own
+model are now built that way: the bot's last call as it was sent, the
+items since, then the compaction request carrying the client's
+instructions ([details](RUST_PROTOTYPE.md#compaction)). A separate
+summarizer model, and a catch-up step over history larger than the budget,
+keep the request of their own. This run predates it; the rerun measures
+it.
+
 ## Not covered yet
 
 The rest of item 36: branching every condition from identical
 checkpoints rather than fresh starts, the omission-listing, elision-only,
 and prompt-excerpts conditions, a condition with a realistic budget and
 preamble, comparing threshold policies before changing the 75/25 defaults,
-and a rerun after the steer fix.
+and a rerun after the steer fix with summary requests sent as copies.

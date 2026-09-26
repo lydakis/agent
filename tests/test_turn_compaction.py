@@ -3,7 +3,7 @@ earlier rounds and finishes, its prompt kept whole."""
 import json
 import os
 from unittest import skipUnless
-from tests.test_runtime import AnthropicModel, ModelFixture
+from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from tests.test_elision import drain, encoded
 from bench.runtime_client import Client
 from bench.targets import clean_env
@@ -34,7 +34,7 @@ class TurnCompactionTests(ModelFixture):
         self.assertIn('done after 40 rounds', json.dumps(answer))
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
-        work = [r for r in requests if r.get('instructions') != 'Summarize.']
+        work = [r for r in requests if not is_summary(r)]
         self.assertGreaterEqual(len(requests) - len(work), 3)
         # Each round ran once: no work was repeated after a cut.
         events = all_events(client, 'Bob')
@@ -74,7 +74,7 @@ class TurnCompactionTests(ModelFixture):
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
         # One summary, made after the round that overflowed.
-        kinds = ['summary' if r.get('instructions') == 'Summarize.' else 'work' for r in requests]
+        kinds = ['summary' if is_summary(r) else 'work' for r in requests]
         self.assertEqual(kinds, ['work'] * 5 + ['summary', 'work'])
         events = all_events(client, 'Bob')
         compacted = [e['data'] for e in events if e['event'] == 'compacted']
@@ -117,7 +117,7 @@ class AnthropicTurnCompactionTests(ModelFixture):
         self.assertEqual(self.model.binding_errors, [])
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['messages']) <= 24576 for r in requests))
-        summaries = [r for r in requests if r.get('system', [{}])[0].get('text') == 'Summarize.']
+        summaries = [r for r in requests if is_summary(r)]
         self.assertGreaterEqual(len(summaries), 2)
         compacted = [e['data'] for e in all_events(client, 'Bob') if e['event'] == 'compacted']
         self.assertTrue(compacted and all(c['pinned'] for c in compacted))

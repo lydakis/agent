@@ -10,7 +10,7 @@ from unittest import skipUnless
 from bench.runtime_client import Client
 from bench.socket_client import Connection, SocketClient
 from tests.test_elision import drain, encoded
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import ModelFixture, is_summary
 from tests.test_turn_compaction import all_events
 
 BUDGET = 24576
@@ -22,7 +22,7 @@ def rounds(workspace):
 
 
 def work(requests):
-    return [r for r in requests if r.get('instructions') != 'Summarize.']
+    return [r for r in requests if not is_summary(r)]
 
 
 def paired(test, request):

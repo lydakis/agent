@@ -139,7 +139,9 @@ fn item_chunks(
 /// whose cache it shares (its own, or a fork's source) under the store's
 /// identity, so bots of different stores (every Harbor container's first
 /// bot is id 1) never share a key, and a daemon restart keeps every bot's
-/// cache affinity. Summaries have their own prefix, so their own key.
+/// cache affinity. A summary sent as a request of its own has its own
+/// prefix, so its own key; one sent as a copy of the bot's call shares the
+/// bot's.
 fn cache_key(identity: u128, bot: i64, summary: bool) -> String {
     let suffix = if summary { "-summary" } else { "" };
     format!("{identity:032x}-{bot}{suffix}")
@@ -534,14 +536,24 @@ impl Turn {
         record: &mut agent_runtime::store::Bot,
         context: &mut Context,
     ) -> Result<()> {
-        let Some(window) = context
-            .window
-            .as_ref()
-            .filter(|w| w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty())
-        else {
-            return Ok(());
-        };
-        let prefix = fingerprint(&context.prefix.bytes, window.ids[0]);
+        if let Some(window) = &context.window {
+            context.thinking = self.bound(record, &context.prefix.bytes, window).await?;
+        }
+        Ok(())
+    }
+
+    /// The strip for `window` sent behind `prefix`, recorded on the bot as
+    /// what its next request sends.
+    async fn bound(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        prefix: &[u8],
+        window: &Window,
+    ) -> Result<Strip> {
+        if window.family != agent_runtime::codec::Family::Anthropic || window.ids.is_empty() {
+            return Ok(Strip::default());
+        }
+        let prefix = fingerprint(prefix, window.ids[0]);
         let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
         let mut strip = record.thinking;
         if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
@@ -577,13 +589,35 @@ impl Turn {
             record.thinking = strip;
             record.thinking_elided = elided;
         }
-        context.thinking = strip;
-        Ok(())
+        Ok(strip)
     }
 
     /// The context prefix, then the items of `ids` read from the store in
     /// batches as the request streams; those `strip` names without thinking.
     fn window_items(&self, prefix: Bytes, span: Span<'_>, strip: Strip) -> Items {
+        self.framed_items(prefix, span, strip, Bytes::new())
+    }
+
+    /// A copy of the bot's call with the compaction request after it.
+    fn copied_items(&self, copy: Copied<'_>) -> Items {
+        let window = copy.window;
+        let span = Span {
+            ids: &window.ids,
+            sizes: &window.sizes,
+            thinking: &window.thinking,
+            elided: window.elided,
+        };
+        self.framed_items(
+            copy.prefix.clone(),
+            span,
+            copy.thinking,
+            copy.request.clone(),
+        )
+    }
+
+    /// Window items between `prefix` and `tail`, a trailing item with its
+    /// leading comma, or nothing.
+    fn framed_items(&self, prefix: Bytes, span: Span<'_>, strip: Strip, tail: Bytes) -> Items {
         let Span {
             ids,
             sizes,
@@ -598,13 +632,22 @@ impl Turn {
             .sum();
         let total = (prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
-            + ids.len().saturating_sub(1))
+            + ids.len().saturating_sub(1)
+            + tail.len())
         .saturating_sub(stripped);
         let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
         Items::new(total, move || {
-            stream::iter([Ok(prefix.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), strip, elided))
-                .boxed()
+            let items = stream::iter([Ok(prefix.clone())]).chain(item_chunks(
+                store.clone(),
+                chunks.clone(),
+                strip,
+                elided,
+            ));
+            if tail.is_empty() {
+                items.boxed()
+            } else {
+                items.chain(stream::iter([Ok(tail.clone())])).boxed()
+            }
         })
     }
 
@@ -661,7 +704,10 @@ impl Turn {
     /// Compaction at a round boundary: once the turns since the last summary
     /// hold `compact_at` percent of the budget, summarize everything older
     /// than the newest `compact_keep` percent with the client's instructions
-    /// and summarizer, and record the result as the new context start. A
+    /// and summarizer, and record the result as the new context start. The
+    /// summary request copies the view as the bot's last call sent it
+    /// (`sent`: the view before this boundary's stubs, if any, and what
+    /// that call sent ahead of its window) when it can. A
     /// backlog larger than the budget is summarized oldest first, one bounded
     /// span per round boundary, until it fits. A failed summary
     /// leaves the context view unchanged and is reported live; the turn goes on
@@ -676,6 +722,7 @@ impl Turn {
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
         context: &mut Context,
+        sent: (Option<&Context>, Option<&LastCall>),
         output_bytes: Option<usize>,
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
@@ -701,6 +748,7 @@ impl Turn {
                     / self.compact_at,
             )
             .max(1) as i64;
+        let (before, last) = sent;
         let compaction = self
             .compact(
                 record,
@@ -708,8 +756,8 @@ impl Turn {
                 turn,
                 accounting,
                 tools,
-                keep,
-                keep_items,
+                (keep, keep_items),
+                Some((before.unwrap_or(context), last)),
             )
             .await?;
         if let Compaction::Done = compaction {
@@ -754,7 +802,7 @@ impl Turn {
             return Ok(Overflow::Stuck);
         }
         match self
-            .compact(record, model_rounds, turn, accounting, tools, 1, 1)
+            .compact(record, model_rounds, turn, accounting, tools, (1, 1), None)
             .await?
         {
             Compaction::Parked(until) => Ok(Overflow::Parked(until)),
@@ -767,7 +815,13 @@ impl Turn {
     /// One summary: plan the span older than the newest boundary whose tail
     /// reaches the keep targets, summarize it with the client's
     /// instructions and summarizer, and record it as the new context start.
-    /// A failed summary leaves the view unchanged and is reported live.
+    /// When the summarizer is the bot's own model and `sent`, the view as
+    /// the bot's last call sent it, holds the whole span, the request is a
+    /// copy of that call with the instructions in a request after it, so
+    /// the provider reads it from cache. Otherwise, as for a step through a
+    /// backlog larger than the budget, it is a request of its own: the
+    /// instructions, then the span. A failed summary leaves the view
+    /// unchanged and is reported live.
     #[allow(clippy::too_many_arguments)]
     async fn compact(
         &self,
@@ -776,8 +830,8 @@ impl Turn {
         turn: i64,
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
-        keep: i64,
-        keep_items: i64,
+        (keep, keep_items): (i64, i64),
+        sent: Option<(&Context, Option<&LastCall>)>,
     ) -> Result<Compaction> {
         let limit = self.input_limit();
         let (max_bytes, max_items) = (limit.bytes as i64, limit.items as i64);
@@ -809,17 +863,48 @@ impl Turn {
                 .await?;
             return Ok(Compaction::Skipped);
         };
-        let instructions = record.compaction_instructions.clone().unwrap();
+        let mut instructions = record.compaction_instructions.clone().unwrap();
+        let own = reference == format!("{}/{}", record.provider, record.model);
+        let copy = match sent.filter(|_| own && !plan.catch_up) {
+            Some((view, last)) => {
+                let request = Bytes::from(agent_runtime::store::CompactionPlan::request(
+                    summarizer.family(),
+                    &instructions,
+                    plan.summary_bytes,
+                )?);
+                match self.copy_of(view, last, &plan, &request) {
+                    Some((prefix, window)) => {
+                        let thinking = self.bound(record, &prefix, window).await?;
+                        Some((prefix, window, thinking, request))
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         // Messages requires definitions for historical tool blocks. Reuse the
         // already encoded bot selection; tool_choice disables new calls.
-        // Responses accepts historical calls without definitions.
+        // Responses accepts historical calls without definitions. A copy
+        // keeps the call's tools and tool choice, which the cache covers.
         let empty;
-        let summary_tools = match summarizer.family() {
-            agent_runtime::codec::Family::Anthropic => tools,
-            agent_runtime::codec::Family::Responses => {
-                empty = self.registry.encoded(summarizer.family(), &[])?;
-                &empty
+        let (body, summary_tools) = match &copy {
+            Some((prefix, window, thinking, request)) => {
+                instructions = record.instructions.clone();
+                let copied = Copied {
+                    prefix,
+                    window,
+                    thinking: *thinking,
+                    request,
+                };
+                (Body::Copied(copied), tools)
             }
+            None => match summarizer.family() {
+                agent_runtime::codec::Family::Anthropic => (Body::Span(&plan), tools),
+                agent_runtime::codec::Family::Responses => {
+                    empty = self.registry.encoded(summarizer.family(), &[])?;
+                    (Body::Span(&plan), &*empty)
+                }
+            },
         };
         let completion = match self
             .call_with(
@@ -827,7 +912,7 @@ impl Turn {
                 model,
                 &instructions,
                 summary_tools,
-                Body::Span(&plan),
+                body,
                 record,
                 model_rounds,
                 turn,
@@ -860,7 +945,10 @@ impl Turn {
             .usage
             .map(|usage| summarizer_usage(usage, name, model));
         let summary = completion_text(&completion.items);
-        let invalid = if summary.len() > plan.summary_bytes {
+        // A copy offers the bot's tools; a call there is not a summary.
+        let invalid = if !completion.calls.is_empty() {
+            Some(Error::new("compaction_tool_call"))
+        } else if summary.len() > plan.summary_bytes {
             Some(Error::new("compaction_summary_limit"))
         } else if summary.trim().is_empty() {
             Some(Error::new("empty_summary"))
@@ -909,6 +997,36 @@ impl Turn {
             return Err(error);
         }
         Ok(Compaction::Done)
+    }
+
+    /// What a summary copies of the bot's call: the view's window, behind
+    /// what the last call sent ahead of it when that call's window started
+    /// at the same node under the same floor (a note written since does
+    /// not show), else behind the view's own. None when the window does not
+    /// hold the whole span, or the copy and `request` exceed the input limit.
+    fn copy_of<'a>(
+        &self,
+        view: &'a Context,
+        last: Option<&LastCall>,
+        plan: &agent_runtime::store::CompactionPlan,
+        request: &[u8],
+    ) -> Option<(Bytes, &'a Window)> {
+        let window = view.window.as_ref()?;
+        let at = window.ids.binary_search(plan.ids.first()?).ok()?;
+        if window.ids.get(at + plan.ids.len() - 1) != plan.ids.last() {
+            return None;
+        }
+        let (prefix, items) = match last {
+            Some(last) if last.first == window.ids[0] && last.elided == window.elided => {
+                (last.prefix.clone(), last.items)
+            }
+            _ => (view.prefix.bytes.clone(), view.prefix.items),
+        };
+        let usage = ContextUsage {
+            bytes: prefix.len() + window.item_bytes as usize + window.ids.len() - 1 + request.len(),
+            items: items + window.ids.len() + 1,
+        };
+        usage.fits(self.input_limit()).then_some((prefix, window))
     }
 
     async fn plan_compaction(
@@ -1094,6 +1212,8 @@ impl Turn {
         // What went ahead of the turn when a steer stayed queued for lack
         // of room, while one is still queued.
         let mut capped = None;
+        // What this task's last call sent ahead of its window.
+        let mut last = None;
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
@@ -1143,6 +1263,14 @@ impl Turn {
                 },
                 Err(error) => return Err(error),
             };
+            // While the view sends what the last call sent ahead of its
+            // window, a summary copies the view's own; the older bytes go.
+            if last
+                .as_ref()
+                .is_some_and(|last: &LastCall| last.prefix == context.prefix.bytes)
+            {
+                last = None;
+            }
             // Steers go in before this call, measured against what this
             // view must send ahead of the turn: its summary, pinned context,
             // and notes, a note a tool wrote this round included, but not
@@ -1153,19 +1281,23 @@ impl Turn {
                 resume_window = resuming;
                 continue;
             }
+            // A summary copies the view as the last call sent it, before
+            // this boundary's stubs.
+            let mut before = None;
             if elides
                 && !resuming
                 && self.elision_due(&context, output_bytes)
                 && self.elide(context.prefix.bytes.len(), false).await?
             {
                 made_room = true;
-                context = self
+                let elided = self
                     .context(
                         self.context_bytes,
                         self.context_items,
                         self.context_bytes * 2 / 3,
                     )
                     .await?;
+                before = Some(std::mem::replace(&mut context, elided));
             }
             if !resuming {
                 match self
@@ -1176,6 +1308,7 @@ impl Turn {
                         accounting,
                         &tools,
                         &mut context,
+                        (before.as_ref(), last.as_ref()),
                         output_bytes,
                     )
                     .await?
@@ -1185,6 +1318,7 @@ impl Turn {
                     Compaction::Skipped => {}
                 }
             }
+            drop(before);
             // A steer the turn had no room for is tried again once elision
             // or a summary makes some, and so is one that arrived while this
             // boundary summarized.
@@ -1244,6 +1378,12 @@ impl Turn {
             else {
                 return Ok(Round::Paced(accounting.parked_until));
             };
+            last = context.window.as_ref().map(|window| LastCall {
+                prefix: context.prefix.bytes.clone(),
+                items: context.prefix.items,
+                first: window.ids.first().copied().unwrap_or_default(),
+                elided: window.elided,
+            });
             model_rounds += 1;
             if let Some(usage) = &response.usage {
                 record.tokens_used = record
@@ -1412,7 +1552,8 @@ impl Turn {
         turn: i64,
         accounting: &mut Accounting,
     ) -> Result<Option<agent_runtime::provider::Completion>> {
-        accounting.compaction = matches!(body, Body::Span(_));
+        let summary = !matches!(body, Body::Window(_));
+        accounting.compaction = summary;
         let started = std::time::Instant::now();
         let mut attempt = std::mem::take(&mut accounting.call_attempts);
         let prior_spent =
@@ -1423,15 +1564,16 @@ impl Turn {
             record.cache_bot(),
             matches!(body, Body::Span(_)),
         );
-        // A summary's cache is its own and read once; only the turn's call
+        // A summary's view is replaced once it lands; only the turn's call
         // is refreshed while it streams.
         let warm_after = match body {
             Body::Window(_) => provider.keep_warm_after(model, record.reasoning.as_deref()),
-            Body::Span(_) => None,
+            Body::Copied(_) | Body::Span(_) => None,
         };
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context),
+                Body::Copied(copy) => self.copied_items(copy),
                 Body::Span(plan) => self.span_items(plan).await?,
             };
             accounting.begin(attempt > 0);
@@ -1443,19 +1585,20 @@ impl Turn {
                         instructions,
                         reasoning: record.reasoning.as_deref(),
                         tools,
-                        allow_tool_calls: matches!(body, Body::Window(_)),
+                        allow_tool_calls: !matches!(body, Body::Span(_)),
                         fallbacks: record.fallbacks,
                         cache_key: Some(&cache_key),
                         items,
                         chain: Some(self.chain(body)),
-                        // A summary is a request of its own, off the turn's route.
-                        route: matches!(body, Body::Window(_)).then_some(&accounting.route),
+                        // A summary of its own goes off the turn's route; a
+                        // copy follows it to the server that holds its cache.
+                        route: (!matches!(body, Body::Span(_))).then_some(&accounting.route),
                         sent: Some(&sent),
                     },
                     |delta| {
                         let (kind, text) = match delta {
-                            Delta::Text(text) => (if matches!(body, Body::Span(_)) { "compaction_text_delta" } else { "text_delta" }, text),
-                            Delta::Thinking(text) => (if matches!(body, Body::Span(_)) { "compaction_thinking_delta" } else { "thinking_delta" }, text),
+                            Delta::Text(text) => (if summary { "compaction_text_delta" } else { "text_delta" }, text),
+                            Delta::Thinking(text) => (if summary { "compaction_thinking_delta" } else { "thinking_delta" }, text),
                         };
                         self.hub.live(
                             &self.bot,
@@ -1548,7 +1691,7 @@ impl Turn {
                     .saturating_add(usage.output_tokens);
             }
             let usage = accounting.report.usage.take();
-            if matches!(body, Body::Span(_)) {
+            if summary {
                 if let Some(usage) = usage {
                     let reference = summarizer(record);
                     let usage = summarizer_usage(usage, split_model(&reference)?.0, model);
@@ -2326,11 +2469,35 @@ enum Overflow {
     Stuck,
 }
 
-/// What a model call sends: the bot's window, or a compaction's span.
+/// What a model call sends: the bot's window, a copy of the bot's call
+/// asking for a summary, or a summary request of its own over a span.
 #[derive(Clone, Copy)]
 enum Body<'a> {
     Window(&'a Context),
+    Copied(Copied<'a>),
     Span(&'a agent_runtime::store::CompactionPlan),
+}
+
+/// A summary request sent as a copy of the bot's call: what went ahead of
+/// the window when it was last sent, the window read under the same
+/// elision floor and thinking strip, and the compaction request after it.
+/// It shares the call's instructions, tools, model, and cache key, so the
+/// provider reads all but the newest items from cache.
+#[derive(Clone, Copy)]
+struct Copied<'a> {
+    prefix: &'a Bytes,
+    window: &'a Window,
+    thinking: Strip,
+    request: &'a Bytes,
+}
+
+/// What the bot's last call in this task sent ahead of its window, and
+/// where that window started, for a summary to copy.
+struct LastCall {
+    prefix: Bytes,
+    items: usize,
+    first: i64,
+    elided: i64,
 }
 
 /// The assistant text of a completion's items, in either family encoding.

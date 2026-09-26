@@ -368,6 +368,16 @@ impl CompactionPlan {
         tail.insert(0, b',');
         Ok((head, tail))
     }
+    /// The request that turns a copy of the bot's call into a summary
+    /// request, with its leading comma: the client's instructions travel
+    /// in it, since the copy keeps the bot's own.
+    pub fn request(family: Family, instructions: &str, summary_bytes: usize) -> Result<Vec<u8>> {
+        let mut request = family.user_item(&format!(
+            "[compaction request] Write the summary of the conversation above now, following these instructions, without calling tools. Keep the summary within {summary_bytes} UTF-8 bytes; be shorter when possible.\n\n{instructions}"
+        ))?;
+        request.insert(0, b',');
+        Ok(request)
+    }
 }
 /// Where compaction planning stands: a plan, or a backlog larger than the
 /// budget to walk first.

@@ -602,12 +602,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     once](LONG_TASK_EVAL.md#live-run-1): every bot kept the four facts; the
     one wrong answer came from a steer the runtime left queued, since
     fixed; compacting served 28% of model input from cache against 75%,
-    and no summary request read any. Still open: summary requests that reuse the
-    bot's cache, as Claude Code and Codex send theirs; stub passes and cuts
+    and no summary request read any. Summary requests on the bot's own
+    model now copy its last call, as Claude Code and Codex send theirs, so
+    they read the bot's cache. Still open: stub passes and cuts
     that break the cache on separate rounds; branching from identical
     checkpoints, the omission-listing, elision-only, and prompt-excerpts
     conditions, a realistic budget and preamble, threshold policies, and a
-    rerun. (From Astra Pro's compaction review, and the remainder of item
+    rerun that measures the copies. (From Astra Pro's compaction review, and the remainder of item
     16.)
 37. Context construction cost, measured before built. Item 33 shares an
     encoded prefix across retries, combines window metadata, removes the

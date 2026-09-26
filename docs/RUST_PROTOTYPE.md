@@ -466,7 +466,8 @@ header that the ChatGPT backend routes on: the store's identity plus the id
 of the bot whose cache the call shares. That is the bot's own id, except that
 a fork shares its source's key, because a fork copies its source's
 instructions and tools and so its first call repeats the source's prefix.
-Summaries add `-summary`, since their prefix differs.
+A summary sent as a copy of the bot's call uses the bot's key; one sent as a
+request of its own adds `-summary`, since its prefix differs.
 
 Within a turn, Responses calls over HTTP also return the ChatGPT backend's
 sticky-routing token. The backend sends `x-codex-turn-state` on a turn's
@@ -474,7 +475,9 @@ first response, and each later call of that turn sends the first token back,
 so the backend can route it to the server holding the turn's cache. Codex
 does the same and never carries a token into another turn (openai/codex
 aa38089, `core/src/client.rs`, read 2026-09-25). A new turn and a summary
-start without one. A turn that parks on a wait or a rate limit keeps its token
+request of its own start without one; a summary sent as a copy of the call
+sends the turn's token, so it reaches the server that holds the call's
+cache. A turn that parks on a wait or a rate limit keeps its token
 in the park record, so its calls after resuming send it too. The socket path
 does not carry the token. On short Terminal-Bench tasks over HTTP on
 2026-09-25, 1 to 4 calls per task read nothing from the cache, while the calls
@@ -492,8 +495,9 @@ item); when the fingerprint differs from the bot's last, the window slid or a
 compaction or note landed, and
 every node written before that request is sent without its thinking from
 then on. Removing a leading run of blocks is allowed; later blocks keep
-theirs. Summarizer requests carry no thinking, since their instructions
-differ. Each node records at write time how many bytes its thinking takes,
+theirs. A summary sent as a copy of the bot's call replays what that call
+would, bound the same way; a summary request of its own carries no
+thinking, since its instructions differ. Each node records at write time how many bytes its thinking takes,
 so a request still knows its length before it reads the items it streams;
 the bot records the fingerprint and the first node still bound to it. This
 costs the reasoning in the stripped blocks once per change, which already
@@ -1607,19 +1611,37 @@ verbatim, limited by the room left after pinned context. A boundary is a
 turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), a round
 start: the first item after a tool result that is not one, a model output or
 an absorbed steer. The item dimension can choose the cut even when small messages
-have barely consumed the byte budget. The summary is one model call
-under the bot's compaction instructions, with tool calls disabled, to the bot's own
-model or the `compaction_model` the client named at creation (same family;
-another family's items cannot be replayed to it). Its request carries the
-previous summary first, if any, so the summarizer merges rather than
-restarts, then the span's items as stored, then a request to write. The
-call is paced, retried, billed against the bot's budget, and counted as a
-model round like any other; if it parks on a closed pool, the turn parks.
-Anthropic summaries retain the bot's tool definitions because the span may
-contain native tool-use/result blocks, and set `tool_choice: {"type":"none"}`.
-The runtime borrows the already encoded tool selection. Responses summaries
-continue to send an empty tool list, which that family permits with historical
-calls. Stored history is not rewritten for summarization.
+have barely consumed the byte budget. The summary is one model call, to the
+bot's own model or the `compaction_model` the client named at creation (same
+family; another family's items cannot be replayed to it).
+
+On the bot's own model, when the view as the bot's last call sent it holds
+the whole span, the request is a copy of that call, as Claude Code and Codex
+send theirs: the bot's instructions, tools, tool choice, reasoning, cache
+key, and routing token, the prefix and window that call sent, read under
+its elision floor and thinking strip, and the items since, then one user
+item, the compaction request, carrying the client's compaction
+instructions and the maximum summary size. All but the newest items read
+from the provider cache. The copy takes what the last call sent ahead of
+its window, so a note written since does not show, and the window from
+before any stubs this boundary made. It does not set `tool_choice`, which on
+Anthropic would invalidate the message cache, so the request asks for text
+and a reply that calls a tool is billed and not installed
+(`compaction_tool_call`). The summary covers everything the copy shows,
+the verbatim tail included. Otherwise (a step through a backlog larger than
+the budget, below; a copy that would exceed the input limit; or another
+summarizer, which cannot read the bot's cache) the request is one of its
+own: the compaction instructions as its instructions, the previous summary
+first, if any, so the summarizer merges rather than restarts, then the
+span's items as stored, then a request to write. Anthropic requests of this
+form retain the bot's tool definitions because the span may contain native
+tool-use/result blocks, and set `tool_choice: {"type":"none"}`; the runtime
+borrows the already encoded tool selection. Responses requests of this form
+send an empty tool list, which that family permits with historical calls.
+
+Either way the call is paced, retried, billed against the bot's budget, and
+counted as a model round like any other; if it parks on a closed pool, the
+turn parks. Stored history is not rewritten for summarization.
 The park record identifies the unfinished call as summary or ordinary model
 work. Resumption, including after restart, continues that call. Once a summary
 exhausts its retries, parking the following ordinary call does not restart the
@@ -1850,12 +1872,14 @@ and [Anthropic caching guide](https://platform.claude.com/docs/en/build-with-cla
 provider hits: minimum sizes, expiration, routing, and model capabilities still
 matter.
 
-The summarizer currently has different instructions and disables tool calls,
-so its request must not be assumed to reuse the agent's cache. Anthropic retains
-tool definitions but changes tool choice; Responses omits tool definitions.
-A future comparison could keep
-that prefix identical and append the summarization instruction, but must prevent
-tool execution and verify model compliance and provider cache invalidation rules.
+A summary on the bot's own model keeps that prefix identical and appends
+the compaction request (see [compaction](#compaction)). It keeps the tool
+choice, since changing it invalidates Anthropic's message cache, so a reply
+that calls a tool is rejected and billed rather than prevented; how often
+models comply, and the hit rates providers give it, are for the
+[evaluation](LONG_TASK_EVAL.md) to measure. A summary request of its own,
+on another model or for a catch-up step, has different instructions and
+must not be assumed to reuse the agent's cache.
 Measure agent calls and summarizer calls separately, then total input/output,
 cache reads/writes, latency, and objective task quality. The old evaluation lacks
 successful summarizer usage and cannot establish total compaction cost.

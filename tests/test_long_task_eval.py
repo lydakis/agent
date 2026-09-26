@@ -12,7 +12,7 @@ from bench import long_task_eval
 from bench.long_task_eval import (CORRECTION, STEER_AFTER, TASK, run_condition, score, steer_outcome,
                                   workspace)
 from bench.targets import clean_env
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import ModelFixture, is_summary
 
 SOLUTION = '''import json
 from decimal import Decimal, {rounding}
@@ -208,7 +208,7 @@ class LongTaskRunnerTests(ModelFixture):
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
-        work = [r for r in requests if r.get('instructions') != 'Summarize.']
+        work = [r for r in requests if not is_summary(r)]
         # The task's prompt stays whole in every request, across the cuts.
         self.assertTrue(all(any(i.get('role') == 'user' and i['content'][0]['text'] == TASK for i in r['input'])
                             for r in work))
