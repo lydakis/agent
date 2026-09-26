@@ -1509,8 +1509,7 @@ impl Turn {
         // A stub names the `read` call that returns its result, so only a
         // bot that has the tool elides.
         let elides = record.tools.iter().any(|tool| tool == "read");
-        // What went ahead of the turn when a steer stayed queued for lack
-        // of room, while one is still queued.
+        // How a steer stayed queued for lack of room, while one still is.
         let mut capped = None;
         // The view this task's last call sent, for a summary to copy.
         let mut last: Option<LastCall> = None;
@@ -1589,8 +1588,9 @@ impl Turn {
             // and notes, a note a tool wrote this round included, but not
             // the previews of omitted turns, which yield. One that goes in
             // sends the view back through the overflow, elision, and
-            // compaction steps.
-            if self.absorb(&context.prefix, &mut capped).await? {
+            // compaction steps. It is measured against three quarters of
+            // the budget, so those steps can make it room first.
+            if self.absorb(&context.prefix, &mut capped, false).await? {
                 resume_window = resuming;
                 continue;
             }
@@ -1638,11 +1638,16 @@ impl Turn {
             }
             // A steer the turn had no room for is tried again once elision
             // or a summary makes some, and so is one that arrived while this
-            // boundary summarized.
+            // boundary summarized. Past those steps a bot with a summarizer
+            // measures it against the whole budget: when the turn's newest
+            // round fills it, as one large result can, no summary makes
+            // room, and the next round's summary can then take that round
+            // behind the steer.
             if capped.is_some() && made_room {
                 self.steers.store(true, Relaxed);
             }
-            if self.absorb(&context.prefix, &mut capped).await? {
+            let whole = record.compaction_instructions.is_some();
+            if self.absorb(&context.prefix, &mut capped, whole).await? {
                 resume_window = resuming;
                 continue;
             }
@@ -1740,7 +1745,8 @@ impl Turn {
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard.
-                if self.absorb(&context.prefix, &mut capped).await? {
+                let whole = record.compaction_instructions.is_some();
+                if self.absorb(&context.prefix, &mut capped, whole).await? {
                     last = LastCall::of(&context, true);
                     continue;
                 }
@@ -1796,18 +1802,21 @@ impl Turn {
     /// waiters. One atomic read when nothing is waiting; the flag clears
     /// before the read, so a steer landing during it is seen next. A steer
     /// that stayed queued for lack of room is tried again once less goes
-    /// ahead, a note cleared or shrunk. Returns whether any went in;
-    /// `capped` holds what went ahead when one stayed queued, and is left
-    /// alone when nothing was tried.
+    /// ahead, a note cleared or shrunk, and once more against the `whole`
+    /// budget when it stayed against three quarters. Returns whether any
+    /// went in; `capped` holds how one stayed queued, and is left alone
+    /// when nothing was tried.
     async fn absorb(
         &self,
         ahead: &ContextPrefix,
-        capped: &mut Option<ContextUsage>,
+        capped: &mut Option<Capped>,
+        whole: bool,
     ) -> Result<bool> {
         let reserved = ahead.required;
-        let shrunk =
-            capped.is_some_and(|at| reserved.bytes < at.bytes || reserved.items < at.items);
-        if !self.steers.swap(false, Relaxed) && !shrunk {
+        let retry = capped.is_some_and(|at| {
+            reserved.bytes < at.ahead.bytes || reserved.items < at.ahead.items || whole && !at.whole
+        });
+        if !self.steers.swap(false, Relaxed) && !retry {
             return Ok(false);
         }
         let (mut steered, mut stayed) = (false, false);
@@ -1817,7 +1826,7 @@ impl Turn {
             let absorbed = self
                 .store
                 .op("absorb", move |db| {
-                    db.absorb(turn, through, bytes, items, reserved)
+                    db.absorb(turn, through, bytes, items, reserved, whole)
                 })
                 .await?;
             through = absorbed.next_through;
@@ -1829,7 +1838,10 @@ impl Turn {
                 break;
             }
         }
-        *capped = stayed.then_some(reserved);
+        *capped = stayed.then_some(Capped {
+            ahead: reserved,
+            whole,
+        });
         Ok(steered)
     }
 
@@ -3042,6 +3054,14 @@ impl From<agent_runtime::store::CopiedCall> for LastCall {
                 .map(|(prefix, items)| (Bytes::from(prefix), items)),
         }
     }
+}
+
+/// A steer that stayed queued for lack of room: what went ahead of the
+/// turn then, and whether it was measured against the whole budget.
+#[derive(Clone, Copy)]
+struct Capped {
+    ahead: ContextUsage,
+    whole: bool,
 }
 
 /// A cached input byte counts as a tenth of one sent uncached, what

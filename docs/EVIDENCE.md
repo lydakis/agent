@@ -2,10 +2,11 @@
 
 Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
 updated at `095ff68` for admission batching and disk-full containment, at
-`e707632` and `6a81bd6` for the realistic-budget long-task runs, and at
+`e707632` and `6a81bd6` for the realistic-budget long-task runs, at
 `973be14`, the change that built tool approval, for its cost and a store
-lock fix, and at `dd95047` for the per-summary choice between a copy and a
-request of its own. This is the one place that says what is currently known. The documents it links to
+lock fix, at `dd95047` for the per-summary choice between a copy and a
+request of its own, and on 2026-09-27 for the fix to run 5's lost steers.
+This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -266,7 +267,8 @@ Reconnects, retention, overload, compaction and recovery.
   whole call and 0.337 never copying, and 9 of 10 bots finished correctly
   in both the choice arm and the arm with no copy. The two misses were
   a steer left waiting for room, which a scripted task reproduces on the
-  build before the choice. `dd95047` against `d9ecbcf`, 2026-09-26.
+  build before the choice; since fixed, with no live rerun. `dd95047`
+  against `d9ecbcf`, 2026-09-26.
   [Record](LONG_TASK_EVAL.md#live-run-5).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
@@ -289,6 +291,9 @@ Reconnects, retention, overload, compaction and recovery.
 - Whether compacting pays on any task at a realistic budget: on this one,
   full context cost less than every compacting arm at 128 KiB (runs 4
   and 5).
+- Whether a steer admitted against the whole budget, when one result
+  fills the turn, lets a live task follow it: a scripted test covers the
+  fix, and no live run has.
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.

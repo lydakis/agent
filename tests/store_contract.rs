@@ -3348,7 +3348,14 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
 
     // The boundary takes the steer, not the queued turn, and answers its waiters.
     let absorbed = db
-        .absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
+        .absorb(
+            first.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+        )
         .unwrap();
     assert_eq!(absorbed.outcomes.len(), 1);
     let (steered, outcome) = &absorbed.outcomes[0];
@@ -3367,10 +3374,17 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(items[1]["content"][0]["text"], "third");
     assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "queued");
     assert!(
-        db.absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
-            .unwrap()
-            .outcomes
-            .is_empty()
+        db.absorb(
+            first.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false
+        )
+        .unwrap()
+        .outcomes
+        .is_empty()
     );
 
     // Finishing promotes the bot's oldest queued turn to ready; starting it
@@ -3679,7 +3693,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         .unwrap()
         .turn;
     let result = db
-        .absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+        .absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
     assert_eq!(
         result
@@ -3690,7 +3704,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         [matched]
     );
     assert!(
-        db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+        db.absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
             .unwrap()
             .outcomes
             .is_empty()
@@ -3700,7 +3714,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(moved, allow_provider).unwrap();
     assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
     assert!(
-        db.absorb(moved, None, 8 << 20, 4096, ContextUsage::default())
+        db.absorb(moved, None, 8 << 20, 4096, ContextUsage::default(), false)
             .unwrap()
             .outcomes
             .is_empty()
@@ -3709,7 +3723,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(changed, allow_provider).unwrap();
     assert_eq!(db.context(changed).unwrap().model, "openai/other");
     assert_eq!(
-        db.absorb(changed, None, 8 << 20, 4096, ContextUsage::default())
+        db.absorb(changed, None, 8 << 20, 4096, ContextUsage::default(), false)
             .unwrap()
             .outcomes[0]
             .0,
@@ -3758,7 +3772,14 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         let mut late = None;
         while seen.len() < count {
             let absorbed = db
-                .absorb(first, through, 8 << 20, 4096, ContextUsage::default())
+                .absorb(
+                    first,
+                    through,
+                    8 << 20,
+                    4096,
+                    ContextUsage::default(),
+                    false,
+                )
                 .unwrap();
             through = absorbed.next_through;
             assert_eq!(absorbed.outcomes.len(), batch.min(count - seen.len()));
@@ -3776,14 +3797,14 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         assert_eq!(seen, submitted);
         assert_eq!(db.turn_status("Bob", late.unwrap()).unwrap(), "queued");
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
                 .unwrap()
                 .outcomes[0]
                 .0,
             late.unwrap()
         );
         assert!(
-            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
                 .unwrap()
                 .outcomes
                 .is_empty()
@@ -3945,7 +3966,14 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         .unwrap();
     assert_eq!(hit.status, "queued");
     let absorbed = db
-        .absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
+        .absorb(
+            first.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false,
+        )
         .unwrap();
     assert_eq!(absorbed.outcomes[0].0, hit.turn);
     // One that misses its boundary is never absorbed by the next turn and
@@ -3998,10 +4026,17 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         "stale_turn"
     );
     assert!(
-        db.absorb(plain.turn, None, 8 << 20, 4096, ContextUsage::default())
-            .unwrap()
-            .outcomes
-            .is_empty()
+        db.absorb(
+            plain.turn,
+            None,
+            8 << 20,
+            4096,
+            ContextUsage::default(),
+            false
+        )
+        .unwrap()
+        .outcomes
+        .is_empty()
     );
 }
 
@@ -4657,7 +4692,7 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
     // running turn; its prompt item takes some, and two of three 1,000-byte
     // steers fit. Items: with room for two more items, two fit as well.
     // What the view sends ahead of the turn, a summary or notes, leaves
-    // room for one.
+    // room for one. The whole budget takes one more.
     let reserved = |bytes, items| ContextUsage { bytes, items };
     for (context_bytes, context_items, ahead, fit) in [
         (4096usize, 4096usize, reserved(0, 0), 2),
@@ -4697,25 +4732,25 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
             })
             .collect();
         let absorbed = db
-            .absorb(first, None, context_bytes, context_items, ahead)
+            .absorb(first, None, context_bytes, context_items, ahead, false)
             .unwrap();
         let taken: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
         assert_eq!(taken, steers[..fit]);
         assert!(absorbed.capped && absorbed.next_through.is_none());
         // The next does not fit now and is not retried into a full turn.
         let again = db
-            .absorb(first, None, context_bytes, context_items, ahead)
+            .absorb(first, None, context_bytes, context_items, ahead, false)
             .unwrap();
         assert!(again.outcomes.is_empty() && again.capped);
         assert_eq!(db.turn_status("Bob", steers[fit]).unwrap(), "queued");
-        // With room it would have been taken: the budget is the only reason.
-        assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096, ahead)
-                .unwrap()
-                .outcomes[0]
-                .0,
-            steers[fit]
-        );
+        // Against the whole budget, as when no summary made room, the
+        // next one fits: the budget is the only reason.
+        let whole = db
+            .absorb(first, None, context_bytes, context_items, ahead, true)
+            .unwrap();
+        let taken: Vec<i64> = whole.outcomes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(taken, steers[fit..fit + 1]);
+        assert_eq!(whole.capped, fit + 1 < steers.len());
     }
 }
 
@@ -4770,7 +4805,7 @@ fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
         allow_provider,
     )
     .unwrap();
-    db.absorb(bob, None, 8 << 20, 4096, ContextUsage::default())
+    db.absorb(bob, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
     let (_, bytes, count) = db.turn_usage("Bob", bob).unwrap();
     assert_eq!(count, 66);
@@ -4872,7 +4907,7 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
         db.set_pending_limits(0, 0);
         // Leaving: absorbed into the running turn, cancelled, started.
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
                 .unwrap()
                 .outcomes[0]
                 .0,
@@ -6908,7 +6943,7 @@ fn steered_turn(db: &mut Database) -> (i64, i64, Vec<(i64, i64)>) {
     )
     .unwrap();
     let absorbed = db
-        .absorb(turn, None, 8 << 20, 4096, ContextUsage::default())
+        .absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
     let steered = absorbed.outcomes[0].1["node"].as_i64().unwrap();
     calls.push(exchange(db, turn, "c4", &lines(4, 400)));

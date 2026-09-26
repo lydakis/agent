@@ -1091,9 +1091,19 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   not overtake it. Once elision or a summary makes room in the running
   turn, the same boundary tries it again, and so does a later boundary
   whose view sends less ahead of the turn, a note cleared or shrunk, so a
-  correction reaches a long task that compacts; one still queued when the turn ends starts as its
-  own turn when the line moves (a strict steer, which names that turn,
-  fails with `stale_turn`).
+  correction reaches a long task that compacts. For a bot with
+  compaction instructions, a steer still queued after a boundary's
+  elision and compaction steps, or after a final reply, is measured
+  against the whole `--context-bytes` and `--context-items` instead: when
+  one large result in the newest round fills the turn, no stub or summary
+  can take it, and the steer would otherwise wait out the task. What it
+  adds may put the view past the compaction threshold, and the next
+  boundary's summary can then take the rounds behind it, as it does for
+  any view that size. A bot without a summarizer keeps three quarters,
+  since nothing could take those rounds and its next round would fail
+  with `context_limit`. One still queued when the turn ends starts as
+  its own turn when the line moves (a strict steer, which names that
+  turn, fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
   of the turn's first node, found through a partial `nodes(turn)` index. This
   takes a fixed number of indexed lookups regardless of current-turn length;

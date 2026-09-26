@@ -3467,6 +3467,7 @@ impl Database {
         context_bytes: usize,
         context_items: usize,
         reserved: super::ContextUsage,
+        whole: bool,
     ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
@@ -3483,10 +3484,16 @@ impl Database {
         // the window keeps, less what the turn already holds and what the
         // view sends ahead of it (`reserved`: its summary, pinned context,
         // and notes); what does not fit stays queued and starts as its own
-        // turn when the line moves.
+        // turn when the line moves. `whole` measures against the whole
+        // budget instead, for a steer no elision or summary made room for.
         let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
-        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes + reserved.bytes);
-        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items + reserved.items);
+        let (share_bytes, share_items) = if whole {
+            (context_bytes, context_items)
+        } else {
+            (context_bytes / 4 * 3, context_items / 4 * 3)
+        };
+        let mut room_bytes = share_bytes.saturating_sub(used_bytes + reserved.bytes);
+        let mut room_items = share_items.saturating_sub(used_items + reserved.items);
         let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
         let mut more = false;
         let mut capped = false;

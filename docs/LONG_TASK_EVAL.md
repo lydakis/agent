@@ -83,7 +83,13 @@ workspace, so a replayed side effect shows as an extra line.
    result and before that boundary's model call, following a result the
    model has not answered yet; its turn ends `steered` into the task. Before
    the fix it stayed queued and failed with `stale_turn` when the task
-   ended, which is what the live run hit.
+   ended, which is what the live run hit. In
+   `test_a_steer_goes_in_at_the_whole_budget_when_the_newest_result_fills_the_turn`
+   one result of about 15 KiB, the newest round, leaves no room within
+   three quarters and nothing a stub or summary can take. Expected: the
+   steer goes in against the whole budget, since the bot has a
+   summarizer, and the task finishes with it; before that fix it failed
+   with `stale_turn`, which is what run 5 hit.
 7. **The evaluation runner itself.** `tests/test_long_task_eval.py`: the
    scorer reads each fact from a workspace where it was kept and where it
    was lost, and the runner drives a scripted agent through the task below
@@ -559,7 +565,9 @@ per arm, all five arms at once, at 128 KiB except `large-full`.
   could make, since the result was part of the newest boundary, and failed
   with `stale_turn` when the task ended (hidden tests 5/9; the cause is
   inferred from their views). A scripted task reproduces it on `d9ecbcf`
-  as well, so the choice did not cause it.
+  as well, so the choice did not cause it. Since fixed: such a steer goes
+  in against the whole budget (acceptance case 6); no live run has
+  measured it yet.
 - Summaries held the model back about 41 s each in the choice arm, against
   35 s for requests of their own; fifty bots ran at once, and a summary of
   908 uncached tokens took 51.6 s, so the time here is the backend's
@@ -577,5 +585,6 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
 compactions and retrievals. From runs 3 to 5: a task whose context grows
-well past the budget, where compacting could pay, and a steer that waits
-while one result fills the room it needs.
+well past the budget, where compacting could pay, and a live run with a
+steer arriving while one result fills the room, since fixed and covered
+only by a scripted test.
