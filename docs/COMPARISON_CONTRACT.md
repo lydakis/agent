@@ -112,3 +112,44 @@ identical protocol and guards. See [the adapter notes](BENCHMARKS.md#claude-code
 4. Re-run a matched earlier profile after adding a feature to catch regressions.
    Maintain cross-engine observations as exploratory until the same contracts
    and measurement boundary have been independently verified.
+
+## Task comparisons
+
+Added 2026-09-26. A task benchmark ([HARBOR.md](HARBOR.md)) runs several
+harnesses on the same tasks with a real model. Two arms that request the same
+model do not necessarily run the same model policy, so each arm records what
+it asked for and what actually answered, each from that harness's own records:
+
+- **Requested model**, as passed to the harness.
+- **Served models**, with the calls each answered. Ours come from the trial
+  metadata's `served_calls`, which counts every billed attempt, including
+  provider-side fallbacks, delegated bots and summarizers, and is null when
+  some of the trial's records are missing ([HARBOR.md](HARBOR.md#the-adapter)). Codex's come from
+  its session rollout, which names the model once per turn. Claude Code's come
+  from its per-message usage, which names the model the API reported for each
+  response, and its per-model totals, which include any auxiliary model it
+  calls.
+- **Fallback policy as configured.** Our adapter creates task bots with
+  `--fallbacks`, so a declined Anthropic request finishes on the model
+  Anthropic recommends; the flag does nothing on the OpenAI or ChatGPT
+  providers. A bot the task delegates to sets its own, and the trial
+  metadata's `bot_settings` records each counted bot's choice. Each
+  baseline's flags or settings come from its adapter's source at the pinned
+  Harbor version. The record also says whether any fallback call happened.
+- **Reasoning effort for every agent that makes calls,** delegated bots and
+  subagents included, not only the one the benchmark starts. Ours is in
+  `bot_settings`.
+- **Everything else that shapes the work:** concurrency,
+  timeouts, harness and Harbor versions, dataset and task names, the Agent
+  commit, and the run window. Both arms run together, and a baseline is
+  always rerun, never reused.
+
+A pass rate or cost is compared only when both arms served the requested model
+for the task work, or the difference is stated beside the numbers.
+
+Gap: the daemon knows a call's served model only when a provider-side fallback
+splits it (Anthropic's `iterations`) or a summarizer ran on another model. It
+does not read the model a provider names in its response, so a reroute or a
+change of snapshot behind the same model name would not show. Codex's
+per-turn record has the same limit within a turn. Of the three, only Claude
+Code's record says which model answered each response.

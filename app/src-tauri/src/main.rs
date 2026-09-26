@@ -146,26 +146,53 @@ fn setup(state: State<'_, Shared>) -> Value {
 }
 
 /// The shared client policy for this workspace, composed now so an edited
-/// AGENTS.md reaches the next bot: preamble, AGENTS.md files, skills. Too
-/// much or unreadable text falls back to the preamble and says so.
+/// AGENTS.md reaches the next bot: preamble, AGENTS.md files, skills.
 #[tauri::command]
-fn policy(state: State<'_, Shared>) -> Value {
-    let workspace = std::path::Path::new(&state.config.workspace);
-    match agent_client::policy::instructions(workspace) {
-        Ok(composed) => json!({
-            "instructions": composed.text,
-            "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-            "note": format!(
-                "preamble + {} AGENTS.md + {} skills",
-                composed.sources.len(),
-                composed.skills.len()
-            ),
-        }),
-        Err(error) => json!({
-            "instructions": agent_client::policy::PREAMBLE,
-            "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-            "note": format!("preamble only: {error}"),
-        }),
+fn policy(state: State<'_, Shared>) -> Result<Value, String> {
+    compose(std::path::Path::new(&state.config.workspace))
+}
+
+/// Too much or unreadable text fails with the CLI's `--agents` code, and
+/// `/new` creates nothing: a bot without its workspace's rules is worse
+/// than no bot.
+fn compose(workspace: &std::path::Path) -> Result<Value, String> {
+    let composed = agent_client::policy::instructions(workspace)
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    Ok(json!({
+        "instructions": composed.text,
+        "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
+        "note": format!(
+            "preamble + {} AGENTS.md + {} skills",
+            composed.sources.len(),
+            composed.skills.len()
+        ),
+    }))
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::compose;
+
+    #[test]
+    fn a_workspace_policy_that_cannot_compose_is_an_error_not_the_preamble() {
+        let root = std::env::temp_dir().join(format!("agent-app-policy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let file = root.join("AGENTS.md");
+        std::fs::write(&file, "rule").unwrap();
+        let composed = compose(&root).unwrap();
+        let rule = format!("{}\n\nrule", file.display());
+        assert!(composed["instructions"].as_str().unwrap().contains(&rule));
+        std::fs::write(&file, "x".repeat(agent_client::policy::MAX_INSTRUCTIONS)).unwrap();
+        let error = compose(&root).unwrap_err();
+        assert!(error.starts_with("instructions_limit: "), "{error}");
+        assert!(error.contains(file.to_str().unwrap()), "{error}");
+        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+        let error = compose(&root).unwrap_err();
+        assert!(error.starts_with("instructions_unreadable: "), "{error}");
+        assert!(error.contains(file.to_str().unwrap()), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

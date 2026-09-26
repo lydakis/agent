@@ -124,7 +124,11 @@ class AccountingTests(ModelFixture):
         client = self.client()
         client.request('create', bot='Bob', workspace=str(self.path))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='cached:reused-call')['result']['turn']
-        self.assertEqual(client.finished(turn)['data']['error'], 'storage_error')
+        end = client.finished(turn)['data']
+        self.assertEqual(end['error'], 'storage_error')
+        self.assertRegex(end['detail'], r'^sqlite_primary=19 sqlite_extended=\d+$')
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual(next(e['data'] for e in events if e['event'] == 'turn_finished'), end)
         row = client.request('turns', bot='Bob')['result']['turns'][0]
         totals = client.request('stats')['result']['tokens']
         self.assertEqual(totals, {'input_tokens': 200, 'cached_input_tokens': 80,

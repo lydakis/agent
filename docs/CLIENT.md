@@ -30,9 +30,10 @@ Implemented 2026-09-19.
 The text is a stable prefix on purpose: after the first turn it rides the
 provider's prompt cache, and it changes only when a file changes. The whole
 composition is bounded at 60 KiB, under the daemon's 64 KiB limit. A workspace
-whose files exceed it fails to compose rather than being silently cut; the
-app then falls back to the preamble and says so in the create
-notice, the CLI reports `instructions_limit` with the file that tipped it.
+whose files exceed it fails to compose rather than being silently cut. The CLI
+and the app both report `instructions_limit` with the file that tipped it, or
+`instructions_unreadable` with the file that could not be read, and create
+nothing: a bot without its workspace's rules is worse than no bot.
 Skill discovery visits workspace overrides first and accounts each index row
 against the remaining byte budget before reading more paths or file heads.
 It fails as soon as the index cannot fit, then sorts only the bounded result.
@@ -41,7 +42,7 @@ It fails as soon as the index cannot fit, then sorts only the bounded result.
 
 - **CLI**: plumbing by default, the preamble alone. `--agents` on `run`
   composes the policy for the workspace; exclusive with `--instructions`.
-- **app**: the policy is the default for `/new`. The create notice says what went in, for example `preamble + 2 AGENTS.md + 1 skills`.
+- **app**: the policy is the default for `/new`. The create notice says what went in, for example `preamble + 2 AGENTS.md + 1 skills`; a policy that cannot compose refuses `/new` and keeps the command in the composer.
 - A **fork** takes no instructions: it copies its source's, so its first call
   can read the source's prompt cache. An edited AGENTS.md reaches a new bot;
   a caller that wants an existing conversation to follow it says so in a
