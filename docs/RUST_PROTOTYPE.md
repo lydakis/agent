@@ -251,7 +251,9 @@ summarizer call, naming the summarizer's provider and model, and
 `cache_write_tokens` when Anthropic wrote input to its prompt cache: part of
 `input_tokens`, billed above the base rate, and kept only in the event since
 no budget or cache ratio needs it, with `cache_write_1h_tokens` for the part
-cached for an hour; a prompt-cache refresh's event carries
+cached for an hour; `sent_ms`, when the request was sent in Unix-epoch
+milliseconds, so a cache miss can be set against the gap since the call before
+it; a prompt-cache refresh's event carries
 `purpose: "keep_warm"` and is not a model round), and the store keeps running
 totals: per turn (`input_tokens`, `output_tokens`, `cached_input_tokens`,
 `model_rounds`, `started_ms`, `finished_ms`) and per bot (`tokens_used`,

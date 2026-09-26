@@ -225,6 +225,11 @@ pub struct Usage {
     /// minutes, which Anthropic bills at twice the input rate.
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_1h_tokens: u64,
+    /// When the request was sent, in milliseconds since the Unix epoch, so
+    /// a cache miss can be set against the time since the call before it.
+    /// Set by the caller that knows it; zero when unknown.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub sent_ms: u64,
     /// The billed attempts, when a provider-side fallback ran more than one
     /// model for the call, or the summarizer's model on a compaction call,
     /// so each can be priced at its model's rates. The totals above are
@@ -316,10 +321,24 @@ pub struct Request<'a> {
     /// token must not cross into another turn (openai/codex aa38089,
     /// core/src/client.rs). HTTP only.
     pub route: Option<&'a OnceLock<String>>,
-    /// Set when the request is first sent, where its prompt cache's lifetime
+    /// When the request was last sent, where its prompt cache's lifetime
     /// starts. Shared so a caller refreshing that cache while the reply
     /// streams can read it before the call returns.
-    pub sent: Option<&'a OnceLock<tokio::time::Instant>>,
+    pub sent: Option<&'a Sent>,
+}
+
+/// When a request was last sent: a socket continuation the server forgot is
+/// sent again in full, and that send is the one that reads the cache and
+/// is billed.
+#[derive(Debug, Default)]
+pub struct Sent(std::sync::Mutex<Option<tokio::time::Instant>>);
+impl Sent {
+    fn mark(&self) {
+        *self.0.lock().unwrap() = Some(tokio::time::Instant::now());
+    }
+    pub fn get(&self) -> Option<tokio::time::Instant> {
+        *self.0.lock().unwrap()
+    }
 }
 
 /// A request's place in its bot's history. `items` is the whole input; when
@@ -950,7 +969,7 @@ impl Provider {
         reservation.dispatch();
         report.dispatched = true;
         if let Some(sent) = sent {
-            let _ = sent.set(tokio::time::Instant::now());
+            sent.mark();
         }
         let response = match http.send().await {
             Ok(response) => response,
@@ -1230,7 +1249,7 @@ impl Provider {
                             reservation.dispatch();
                             report.dispatched = true;
                             if let Some(sent) = sent {
-                                let _ = sent.set(tokio::time::Instant::now());
+                                sent.mark();
                             }
                             if let Some(headers) = &failure.headers {
                                 reservation.learn(headers, self.family);
@@ -1263,7 +1282,7 @@ impl Provider {
             reservation.dispatch();
             report.dispatched = true;
             if let Some(sent) = sent {
-                let _ = sent.set(tokio::time::Instant::now());
+                sent.mark();
             }
             match session
                 .exchange(

@@ -80,6 +80,7 @@ class Socket(socketserver.BaseRequestHandler):
                 body = json.loads(data)
                 with self.server.lock:
                     self.server.requests.append((connection, body))
+                    self.server.arrived.append(time.time() * 1000)
                     number = len(self.server.requests)
                     forget = number in self.server.forget
                 if number in self.server.limited:
@@ -87,6 +88,7 @@ class Socket(socketserver.BaseRequestHandler):
                         'type': 'requests', 'code': 'rate_limit_exceeded', 'message': 'Slow down.'}})
                     continue
                 if forget and body.get('previous_response_id'):
+                    time.sleep(self.server.forget_delay)
                     self.send({'type': 'error', 'status': 400, 'error': {
                         'type': 'invalid_request_error', 'code': 'previous_response_not_found',
                         'message': f"Previous response with id '{body['previous_response_id']}' not found."}})
@@ -106,10 +108,11 @@ class Socket(socketserver.BaseRequestHandler):
             pass
 
 
-def serve(test, forget=(), refuse=0, limited=()):
+def serve(test, forget=(), refuse=0, limited=(), forget_delay=0):
     server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Socket)
     server.daemon_threads = True
     server.lock, server.connections, server.requests = threading.Lock(), [], []
+    server.arrived, server.forget_delay = [], forget_delay
     server.forget, server.refuse, server.limited = set(forget), refuse, set(limited)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     test.addCleanup(server.server_close)
@@ -158,8 +161,9 @@ class ResponsesSocketTests(unittest.TestCase):
 
     def test_a_bot_continues_on_its_connection_and_resends_in_full_when_the_server_forgot(self):
         root = Path(__file__).resolve().parent.parent
-        # The fourth request is turn two's tool result; the server has lost it.
-        server = serve(self, forget={4})
+        # The fourth request is turn two's tool result; the server has lost it,
+        # and says so after a pause.
+        server = serve(self, forget={4}, forget_delay=0.3)
         with tempfile.TemporaryDirectory(dir=root/'.local') as directory:
             # One startup permit: the full resend must take it again, not hold it.
             client = Client(root/'.local/target/release/agent', Path(directory)/'agent.db',
@@ -193,6 +197,10 @@ class ResponsesSocketTests(unittest.TestCase):
                              ['user', 'function_call', 'function_call_output', 'message',
                               'user', 'function_call', 'function_call_output'])
             self.assertEqual(full[-1], bodies[3]['input'][0])
+            # The call's usage is the resend's, and so is the time it records.
+            sent = [m['data']['sent_ms'] for m in client.saved if m.get('event') == 'usage']
+            self.assertEqual(len(sent), 4)
+            self.assertGreaterEqual(sent[-1], server.arrived[3] + 250)
             # The idle connection is kept for Bob's next call and counted.
             stats = client.request('stats')['result']
             self.assertEqual(stats['providers']['openai']['sockets'], 1)

@@ -492,11 +492,15 @@ class AnthropicRuntimeTests(unittest.TestCase):
         for warm in warms:
             self.assertEqual(warm, {**call, 'max_tokens': 0, 'stream': False})
         self.assertEqual(answer['messages'][2]['content'][0]['type'], 'tool_result')
-        # Each refresh is billed as the cache read it was, not as a model round.
+        # Each refresh is billed as the cache read it was, not as a model round,
+        # and records when it was sent: a second apart, after the call.
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
+        sent = [u.pop('sent_ms') for u in usage]
         self.assertEqual([u for u in usage if u.get('purpose') == 'keep_warm'], [
             {'input_tokens': 9, 'output_tokens': 0, 'cached_input_tokens': 9, 'purpose': 'keep_warm'}] * 2)
         self.assertEqual(len(usage), 4)
+        self.assertEqual(sent, sorted(sent))
+        self.assertGreaterEqual(sent[2] - sent[1], 900)
 
     def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
         client, model, path = self.start(extra=('--keep-warm', '1'))
@@ -638,6 +642,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         # Both attempts produced output, so both are billed, each at its model.
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         # Cache writes are recorded with the attempt that made them.
+        usage[0].pop('sent_ms')
         self.assertEqual(usage[0], {'input_tokens': 14, 'output_tokens': 11, 'cached_input_tokens': 2,
                                     'cache_write_tokens': 1, 'models': [
             {'model': 'synthetic-claude', 'input_tokens': 7, 'output_tokens': 4, 'cached_input_tokens': 2},
@@ -659,14 +664,19 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_messages_family_round_trips_thinking_tools_and_usage(self):
         client, model, path = self.start()
         client.request('create', bot='Bob', workspace=str(path), reasoning='low', fallbacks=True)
+        before = time.time() * 1000
         turn = client.request('submit', bot='Bob', request_id='r1', prompt='tool:shared')['result']['turn']
         finished = client.finished(turn)
+        after = time.time() * 1000
         self.assertEqual(finished['data']['status'], 'completed')
         deltas = [m for m in client.saved if m.get('event') in ('text_delta', 'thinking_delta')]
         self.assertEqual([d['event'] for d in deltas][:2], ['thinking_delta', 'thinking_delta'])
         self.assertEqual(''.join(d['text'] for d in deltas if d['event'] == 'text_delta'), 'echo:shared')
         usage = [m for m in client.saved if m.get('event') == 'usage']
         self.assertEqual(len(usage), 2)
+        # Each call records when it was sent, in epoch milliseconds.
+        sent = [u['data'].pop('sent_ms') for u in usage]
+        self.assertTrue(before - 1 <= sent[0] <= sent[1] <= after + 1, (before, sent, after))
         self.assertEqual(usage[0]['data'], {'input_tokens': 7, 'output_tokens': 7, 'cached_input_tokens': 2})
         first, second = model.requests.get(timeout=1), model.requests.get(timeout=1)
         self.assertEqual(first['thinking'], {'type': 'adaptive', 'display': 'summarized',
@@ -904,6 +914,21 @@ class RuntimeTests(ModelFixture):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # Each turn is two calls; the second carries the token the first got back.
         self.assertEqual(self.model.routes, [None, 'route-1', None, 'route-3'])
+
+    def test_each_calls_usage_records_when_it_was_sent(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        before = time.time() * 1000
+        turn = client.request('submit', bot='Bob', request_id='s', prompt='tool:one')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        after = time.time() * 1000
+        # Two calls, each placed in time, so a cache miss can be set against
+        # the gap since the call before it.
+        sent = [m['data']['sent_ms'] for m in client.saved if m.get('event') == 'usage']
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(before - 1 <= sent[0] <= sent[1] <= after + 1, (before, sent, after))
+        stored = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual([e['data']['sent_ms'] for e in stored if e['event'] == 'usage'], sent)
 
     def test_tools_are_per_bot_shown_to_the_model_and_enforced_at_dispatch(self):
         client = self.client('echo,shell')
