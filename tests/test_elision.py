@@ -101,6 +101,34 @@ class ElisionTests(ModelFixture):
         self.assertTrue(last['long-36'].startswith(STUB) and last['long-37'].startswith(STUB))
         self.assertFalse(last['long-47'].startswith(STUB))
 
+    def test_a_turn_that_fits_only_without_its_note_elides_answered_results(self):
+        # An 8000-byte carry-forward note goes ahead of the turn. Small
+        # rounds, too small to elide, then two results of about 4.5 KiB
+        # inside the kept half: the turn alone fits the budget, but not
+        # beside the note, and ordinary elision finds nothing to move.
+        client = self.client(tools='shell,read,note',
+                             extra=('--context-bytes', '24576', '--compact-keep', '50'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'note'])
+        self.model.note_text = 'N' * 8000
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        self.assertEqual(client.finished(noted)['data']['status'], 'completed')
+        del self.model.note_text
+        drain(self.model)
+        turn = client.request('submit', bot='Bob', request_id='2',
+                              prompt='long:21x1,2x220,4x1')['result']['turn']
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
+        self.assertTrue(all(any(i.get('role') == 'user' and i['content'][0]['text'].startswith(
+            '[carry-forward note') for i in r['input']) for r in requests))
+        last = {i['call_id']: i['output'] for i in requests[-1]['input']
+                if i.get('type') == 'function_call_output'}
+        self.assertTrue(last['long-21'].startswith(STUB) and last['long-22'].startswith(STUB))
+        self.assertIn('round 21 line 150', last['long-read'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        self.assertEqual([e['data']['results'] for e in events if e['event'] == 'elided'], [2])
+
     def test_a_bot_without_read_never_elides(self):
         # A stub names a read the model could not make.
         client = self.client(tools='shell,read', extra=('--context-bytes', '65536'))

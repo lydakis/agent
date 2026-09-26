@@ -26,6 +26,8 @@ fn assistant(text: &str) -> Bytes {
 fn db() -> Database {
     Database::initialize(Connection::open_in_memory().unwrap()).unwrap()
 }
+/// The read tool, which a bot needs for its results to get stubs.
+static READ: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| vec!["read".into()]);
 fn binding() -> Binding<'static> {
     Binding {
         provider: "openai",
@@ -34,7 +36,7 @@ fn binding() -> Binding<'static> {
         instructions: "test",
         reasoning: None,
         budget_tokens: None,
-        tools: &[],
+        tools: &READ,
         created_by: None,
         created_by_id: None,
         compaction_instructions: None,
@@ -5518,6 +5520,50 @@ fn a_result_on_one_line_reads_back_whole_in_pieces() {
             .all(|p| p.len() <= agent_runtime::tools::PIECE_BYTES)
     );
     assert_eq!(pieces.concat(), wide);
+}
+
+#[test]
+fn a_bot_without_read_stores_no_stubs() {
+    // A stub names a read the model could not make, so its results carry
+    // no stub and no saving, and nothing is ever planned for elision.
+    let path = std::env::temp_dir().join(format!("agent-no-read-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let shell = vec!["shell".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &shell,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "c0", &lines(0, 400));
+    exchange(&mut db, turn, "c1", &lines(1, 400));
+    let stored = |sql: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(stored("SELECT count(*) FROM stubs"), 0);
+    assert_eq!(stored("SELECT count(*) FROM nodes WHERE elided>0"), 0);
+    db.window("Bob", 1 << 20, 1 << 20).unwrap();
+    assert!(db.elision_plan("Bob", 1, 1).unwrap().is_none());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

@@ -100,6 +100,16 @@ class LongTaskScoreTests(unittest.TestCase):
                 shell(self.root, change)
                 self.assertFalse(score(self.root, self.facts, [], answer)['vendor_intact'])
 
+    def test_the_hidden_tests_import_the_code_without_credentials(self):
+        # The model wrote convert.py, so importing it must not see the
+        # runner's API key.
+        shell(self.root, 'tools/migrate')
+        (self.root / 'ledger/convert.py').write_text(
+            "import os\nassert 'OPENAI_API_KEY' not in os.environ\n" + HALF_EVEN)
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'synthetic'}):
+            passed, total, failure = long_task_eval.hidden_tests(self.root)
+        self.assertEqual((passed, failure), (total, None))
+
     def test_each_lost_fact_is_scored_as_lost(self):
         # The correction ignored, the restriction broken, the failed
         # approach and the unknown-outcome operation both repeated after a

@@ -1529,8 +1529,9 @@ usable; history tells the model to inspect current state before retrying.
 Most of a long tool-using turn is tool output the model has already read.
 At a round boundary, after steers are absorbed and before compaction, once
 the window and its pinned context hold `--compact-at` percent of the byte
-envelope, or the current turn cannot fit at all, the daemon moves the bot's
-elision floor. Every tool result at or below the floor goes to the model as
+envelope, or the current turn cannot fit at all, alone or beside the
+summary, pinned context, and notes sent ahead of it, the daemon moves the
+bot's elision floor. Every tool result at or below the floor goes to the model as
 a stub instead of its output: a result for the same call id that states the
 output's size, the `read` reference that returns it whole
 (`artifact: "result/NODE"`), and its first and last 256 bytes. Everything
@@ -1544,14 +1545,14 @@ context of mostly other text does not rewrite its cached prefix each round
 for a little room. When the current turn cannot fit otherwise, the floor
 goes to the model's newest output, whatever the keep target, and any saving
 counts. Only a bot that has the `read` tool elides, since a stub names a
-`read` call; for any other bot results stay whole and a turn that outgrows
-the window ends with `context_limit`, as before. Elision works with or without compaction instructions: it is how a
+`read` call; any other bot's results get no stub and stay whole, and a
+turn that outgrows the window ends with `context_limit`, as before. Elision works with or without compaction instructions: it is how a
 single long turn outgrows the window, and it comes first because it costs
 no call and keeps the model's own reasoning in view. Compaction then runs as
 before if the view is still over its threshold.
 
-A result is elidable when its stub saves at least 1 KiB. The stub is made
-when the result is recorded, with the node id its insert takes, and stored
+A result is elidable when its stub saves at least 1 KiB. For a bot with
+`read`, the stub is made when the result is recorded, with the node id its insert takes, and stored
 beside it. Each node records what its stub saves and, like its byte total,
 the cumulative savings along its lineage; each floor version records the
 cumulative savings through its floor. A node's bytes as sent are then its
@@ -1801,8 +1802,10 @@ as a covered turn's steers are. Schema 30 adds the `pinned` column; every
 earlier cut is a turn's prompt, so none has one.
 
 A round can take the turn past its budget before compaction is due, for
-example one large result after several small ones. The runtime then elides
-what the model has answered, as above, and if the view still cannot fit, it
+example one large result after several small ones, or a turn that fits
+alone but not beside its summary, pinned context, and notes. The runtime
+then elides what the model has answered, as above, and if the view still
+cannot fit, it
 summarizes at once with a keep target of one byte, so the cut lands at the
 newest round that follows a result, and the round goes on. When elision
 cannot make room and the bot has no summarizer instructions, or when even

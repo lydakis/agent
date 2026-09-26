@@ -3127,9 +3127,15 @@ impl Database {
         }
         // The stub names the result's node, so it is made for the id the
         // insert takes, and its savings go in with the node. Written with
-        // the result, eliding it later reads no output.
+        // the result, eliding it later reads no output. A bot without the
+        // read tool never elides, since the model could not follow a stub,
+        // so it gets none.
         let next = next_node(&tx)?;
-        let stub = super::context::stub(family, call_id, &outcome.output, next, item.len())?;
+        let stub = if bot.tools.iter().any(|tool| tool == "read") {
+            super::context::stub(family, call_id, &outcome.output, next, item.len())?
+        } else {
+            None
+        };
         let elided = stub
             .as_ref()
             .map_or(0, |stub| (item.len() - stub.len()) as i64);

@@ -245,13 +245,14 @@ HIDDEN = [
 
 def hidden_tests(root):
     """Run the hidden cases against the workspace's `convert` in a child
-    process; returns (passed, total, first failure)."""
+    process without the runner's credentials, since the model wrote that
+    code; returns (passed, total, first failure)."""
     script = ('import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom ledger.convert import convert\n'
               'cases = json.loads(sys.stdin.read())\n'
               'print(json.dumps([convert([dict(r) for r in rows]) for rows in cases]))\n')
     try:
         done = subprocess.run([sys.executable, '-c', script, str(root)], input=json.dumps(HIDDEN),
-                              capture_output=True, text=True, timeout=30, cwd=root)
+                              capture_output=True, text=True, timeout=30, cwd=root, env=clean_env())
         got = json.loads(done.stdout) if done.returncode == 0 else None
     except (subprocess.TimeoutExpired, ValueError):
         got = None

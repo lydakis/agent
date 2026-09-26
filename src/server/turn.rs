@@ -441,6 +441,18 @@ impl Turn {
         }
     }
 
+    /// The view at the configured budget, fitted to the input limit.
+    async fn fitted_context(&self) -> Result<Context> {
+        let context = self
+            .context(
+                self.context_bytes,
+                self.context_items,
+                self.context_bytes * 2 / 3,
+            )
+            .await?;
+        self.fit_context(context, self.input_limit()).await
+    }
+
     async fn fit_context(&self, mut context: Context, limit: ContextUsage) -> Result<Context> {
         let mut raw = ContextUsage {
             bytes: self.context_bytes,
@@ -712,10 +724,12 @@ impl Turn {
         Ok(compaction)
     }
 
-    /// The current turn cannot fit the budget. Elide what the model has
-    /// answered and look again; if it still cannot fit, summarize all but
-    /// the newest boundary, a round inside the turn or its prompt, and look
-    /// again. Stuck when neither applies or the view still cannot fit.
+    /// The current turn cannot fit the budget, alone or beside what goes
+    /// ahead of it. Elide what the model has answered and look again; if it
+    /// still cannot fit, summarize all but the newest boundary, a round
+    /// inside the turn or its prompt, and look again. Each look fits the
+    /// view to the input limit, prefix included, so `Fits` is a view that
+    /// can be sent. Stuck when neither applies or the view still cannot fit.
     async fn overflow(
         &self,
         record: &mut agent_runtime::store::Bot,
@@ -732,14 +746,7 @@ impl Turn {
         };
         if elides
             && self.elide(0, true).await?
-            && let Some(context) = fits(
-                self.context(
-                    self.context_bytes,
-                    self.context_items,
-                    self.context_bytes * 2 / 3,
-                )
-                .await,
-            )?
+            && let Some(context) = fits(self.fitted_context().await)?
         {
             return Ok(Overflow::Fits(Box::new(context)));
         }
@@ -752,15 +759,8 @@ impl Turn {
         {
             Compaction::Parked(until) => Ok(Overflow::Parked(until)),
             Compaction::Skipped => Ok(Overflow::Stuck),
-            Compaction::Done => Ok(fits(
-                self.context(
-                    self.context_bytes,
-                    self.context_items,
-                    self.context_bytes * 2 / 3,
-                )
-                .await,
-            )?
-            .map_or(Overflow::Stuck, |context| Overflow::Fits(Box::new(context)))),
+            Compaction::Done => Ok(fits(self.fitted_context().await)?
+                .map_or(Overflow::Stuck, |context| Overflow::Fits(Box::new(context)))),
         }
     }
 
@@ -1199,7 +1199,33 @@ impl Turn {
             if model_rounds >= MAX_ROUNDS {
                 return fail("tool_round_limit");
             }
-            let mut context = self.fit_context(context, self.input_limit()).await?;
+            // The view fits the budget alone but not beside what goes ahead
+            // of it: the same forced recovery, then the steps again.
+            let mut context = match self.fit_context(context, self.input_limit()).await {
+                Ok(context) => context,
+                Err(error) if error.code == "context_limit" => match self
+                    .overflow(
+                        &mut record,
+                        &mut model_rounds,
+                        turn,
+                        accounting,
+                        &tools,
+                        elides,
+                    )
+                    .await?
+                {
+                    Overflow::Fits(_) => {
+                        if capped {
+                            self.steers.store(true, Relaxed);
+                        }
+                        resume_window = resuming;
+                        continue;
+                    }
+                    Overflow::Parked(until) => return Ok(Round::Paced(until)),
+                    Overflow::Stuck => return Err(error),
+                },
+                Err(error) => return Err(error),
+            };
             self.bind_thinking(&mut record, &mut context).await?;
             let Some(response) = self
                 .call(

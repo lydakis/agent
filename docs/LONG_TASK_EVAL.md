@@ -132,7 +132,9 @@ compactions, elisions, the context-view version each model call was made
 under, input, cached input, and output tokens for the model and the
 summarizer separately, and summarizer latency from its send to the send of
 the model call it held back. Failed summaries are live-only events, so the
-runner collects them as they arrive.
+runner collects them as they arrive. The hidden tests import the code the
+model wrote, so they run in a child process that keeps only `PATH`,
+`TMPDIR`, and the locale from the runner's environment, and no credentials.
 
 ## Running it
 
