@@ -369,10 +369,11 @@ impl Request {
 struct Live {
     notify: Arc<Notify>,
     verdicts: HashMap<String, Vec<Verdict>>,
-    /// The `(approval, tag)` index entries these verdicts answer, which a
-    /// tag's listing skips unread. Only the park that writes the verdicts
-    /// deletes the entries, so a crash loses neither.
-    answered: std::collections::HashSet<(i64, String)>,
+    /// The tags these verdicts answer, by approval: a tag's listing steps
+    /// past those index entries without reading the call. Only the park
+    /// that writes the verdicts deletes the entries, so a crash loses
+    /// neither.
+    answered: HashMap<i64, Vec<String>>,
 }
 /// One page of `approvals` as it fills.
 struct ApprovalPage {
@@ -927,8 +928,8 @@ impl Database {
                 announced_ms INTEGER NOT NULL, gates TEXT NOT NULL, verdicts TEXT, arguments TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS approvals_call ON approvals(turn,call_id);
             CREATE TABLE IF NOT EXISTS approval_tags(approval INTEGER NOT NULL REFERENCES approvals(id) ON DELETE CASCADE,
-                tag TEXT NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
-            CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval);
+                tag TEXT NOT NULL, turn INTEGER NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval,turn);
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
                 call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
@@ -3607,7 +3608,7 @@ impl Database {
                     serde_json::to_string(&gates)?,
                     arguments.to_string()
                 ])?;
-                tag_approval(&tx, tx.last_insert_rowid(), &gates)?;
+                tag_approval(&tx, tx.last_insert_rowid(), turn, &gates)?;
                 announced.push(json!({"call_id":call.call_id,"request":1,
                     "announced_ms":announced_ms,"gates":tags,"name":call.name,"node":node}));
             }
@@ -3949,7 +3950,7 @@ impl Database {
         };
         if let Some(live) = self.live_changed(turn) {
             live.verdicts.remove(&call.call_id);
-            live.answered.retain(|(id, _)| *id != request.id);
+            live.answered.remove(&request.id);
         }
         Ok(gated)
     }
@@ -4082,12 +4083,12 @@ impl Database {
         if status == "running" {
             self.keep_live(answer.turn);
             let live = self.live.entry(answer.turn).or_default();
+            let tags = live.answered.entry(request.id).or_default();
             if answer.allow {
-                live.answered.insert((request.id, tag));
+                tags.push(tag);
             } else {
                 // A deny decides the call: no gate waits on it any more.
-                live.answered
-                    .extend(request.gates.iter().map(|g| (request.id, g.tag.clone())));
+                *tags = request.gates.iter().map(|g| g.tag.clone()).collect();
             }
             live.verdicts
                 .entry(answer.call_id.to_owned())
@@ -4144,17 +4145,11 @@ impl Database {
         match (bot, tag) {
             // One tag's listing reads only the index entries for calls still
             // waiting on that tag, and a call's row only when no verdict the
-            // worker holds has answered that tag already.
+            // worker holds has answered that tag already. Every entry counts
+            // toward the page's reads, so paging advances past held answers.
             (None, Some(tag)) => {
-                let answered: std::collections::HashSet<i64> = self
-                    .live
-                    .values()
-                    .flat_map(|live| &live.answered)
-                    .filter(|(_, answered)| answered == tag)
-                    .map(|(id, _)| *id)
-                    .collect();
                 let mut ids = self.conn.prepare_cached(
-                    "SELECT approval FROM approval_tags WHERE tag=?1 AND approval>?2 ORDER BY approval",
+                    "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 ORDER BY approval",
                 )?;
                 let mut call = self.conn.prepare_cached(
                     "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
@@ -4164,17 +4159,19 @@ impl Database {
                 while read < READ
                     && let Some(r) = rows.next()?
                 {
-                    let id: i64 = r.get(0)?;
-                    // An entry skipped here costs an index read, not a row.
-                    let entry = match answered.contains(&id) {
+                    read += 1;
+                    let (id, turn): (i64, i64) = (r.get(0)?, r.get(1)?);
+                    let held = self
+                        .live
+                        .get(&turn)
+                        .and_then(|live| live.answered.get(&id))
+                        .is_some_and(|tags| tags.iter().any(|t| t == tag));
+                    let entry = match held {
                         true => None,
-                        false => {
-                            read += 1;
-                            match call.query([id])?.next()? {
-                                Some(row) => self.waiting_call(row, Some(tag))?,
-                                None => None,
-                            }
-                        }
+                        false => match call.query([id])?.next()? {
+                            Some(row) => self.waiting_call(row, Some(tag))?,
+                            None => None,
+                        },
                     };
                     if !page.add(id, entry)? {
                         break;
@@ -5855,13 +5852,14 @@ fn expiring(bot: &Bot) -> bool {
     bot.gates.iter().any(|gate| gate.expire_ms.is_some())
 }
 /// Index an announced call under each of its gates' tags, so a listing for
-/// one tag reads only the calls waiting on it. Deleting the call drops its
-/// tags.
-fn tag_approval(tx: &Connection, approval: i64, gates: &[CallGate]) -> Result<()> {
+/// one tag reads only the calls waiting on it, and with its turn, so the
+/// listing finds held answers without reading the call. Deleting the call
+/// drops its tags.
+fn tag_approval(tx: &Connection, approval: i64, turn: i64, gates: &[CallGate]) -> Result<()> {
     let mut insert =
-        tx.prepare_cached("INSERT OR IGNORE INTO approval_tags(approval,tag) VALUES (?,?)")?;
+        tx.prepare_cached("INSERT OR IGNORE INTO approval_tags(approval,tag,turn) VALUES (?,?,?)")?;
     for gate in gates {
-        insert.execute(params![approval, gate.tag])?;
+        insert.execute(params![approval, gate.tag, turn])?;
     }
     Ok(())
 }
@@ -5923,7 +5921,7 @@ fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<boo
             arguments
         ])?;
         let gates: Vec<CallGate> = serde_json::from_str(&gates)?;
-        tag_approval(tx, tx.last_insert_rowid(), &gates)?;
+        tag_approval(tx, tx.last_insert_rowid(), turn, &gates)?;
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         calls.push(json!({"call_id":call_id,"request":request + 1,
             "announced_ms":announced_ms,"gates":tags,"name":name,"node":node}));

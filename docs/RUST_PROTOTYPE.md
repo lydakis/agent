@@ -1709,7 +1709,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   waiting on that tag, through an index of each call's tags: written with
   its announcement, and a tag taken out when its answer is stored (every
   tag, for a deny). An answer the storage worker still holds skips the
-  call's entry without reading its row. A page holds at most `limit` (1 to 256, default 64) calls and
+  call's entry without reading its row. A page reads at most 1,024 calls
+  or index entries, skipped ones included, so a page can come back short
+  or empty with `next_after` set. A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger (bounded by the 64 KiB
   call id and the previews, well inside a 1 MiB line); `next_after` continues
   it. Positions are never reused, and a call announced again takes a new

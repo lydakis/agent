@@ -1081,14 +1081,13 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
         )
         .unwrap()
         .turn;
-    // As many calls as one listing page reads: each of them left in the
-    // index would fill the page with calls it then skips.
-    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = (0..1024)
+    // One more call than a listing page reads.
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = (0..1025)
         .map(|i| shell_call(&format!("fc_{i}"), &format!("s{i}"), "true"))
         .unzip();
     db.append(turn, items, &round, None).unwrap();
-    let answer_all = |db: &mut Database, tag| {
-        for call in &round {
+    let answer_all = |db: &mut Database, tag, calls: &[ToolCall]| {
+        for call in calls {
             db.answer(Decision {
                 bot: "Bob",
                 turn,
@@ -1103,25 +1102,27 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
         }
     };
     let empty = json!({"approvals":[],"next_after":null});
-    // Answers held for a running turn are skipped unread, and leave the
-    // index when it parks.
-    answer_all(&mut db, "a");
-    assert_eq!(db.approvals(None, Some("a"), 0, 64).unwrap(), empty);
+    let count = |page: &Value| page["approvals"].as_array().unwrap().len();
+    // Answers held for a running turn are stepped past unread, each counted
+    // toward the page's reads: the page ends there, and the next one goes on.
+    answer_all(&mut db, "a", &round[..1024]);
+    let first = db.approvals(None, Some("a"), 0, 64).unwrap();
+    assert_eq!(first["approvals"], json!([]));
+    let after = first["next_after"].as_i64().unwrap();
+    let rest = db.approvals(None, Some("a"), after, 64).unwrap();
+    assert_eq!(rest["approvals"][0]["call_id"], "s1024");
+    assert_eq!(rest["next_after"], Value::Null);
+    // They leave the index when the turn parks.
     assert_eq!(
         db.suspend_approval(turn, &round, epoch_now(), None)
             .unwrap(),
         Some(None)
     );
-    assert_eq!(db.approvals(None, Some("a"), 0, 64).unwrap(), empty);
-    assert_eq!(
-        db.approvals(None, Some("b"), 0, 64).unwrap()["approvals"]
-            .as_array()
-            .unwrap()
-            .len(),
-        64
-    );
+    let listed = db.approvals(None, Some("a"), 0, 64).unwrap();
+    assert_eq!((count(&listed), &listed["next_after"]), (1, &Value::Null));
+    assert_eq!(count(&db.approvals(None, Some("b"), 0, 64).unwrap()), 64);
     // Answers stored for a parked turn leave it at once.
-    answer_all(&mut db, "b");
+    answer_all(&mut db, "b", &round);
     assert_eq!(db.approvals(None, Some("b"), 0, 64).unwrap(), empty);
 }
 
