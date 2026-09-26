@@ -5393,7 +5393,9 @@ fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
             // The same call id, the size, the reference, both ends.
             assert!(item["call_id"].as_str().unwrap().starts_with('c'));
             assert!(output.contains(&format!("artifact \"result/{id}\"")));
-            let whole = db.result_lines("Bob", *id, 1, 5000, false).unwrap();
+            let whole = db
+                .result_lines("Bob", *id, 1, 5000, false, usize::MAX)
+                .unwrap();
             assert!(whole.contains("line 399"), "{whole}");
             assert!(output.contains("line 0") && output.contains("line 399"));
         } else if item["type"] == "function_call_output" {
@@ -5406,13 +5408,13 @@ fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
     // A result that is not on the reader's lineage is not theirs to read.
     db.create("Other", Some("/synthetic"), binding()).unwrap();
     assert_eq!(
-        db.result_lines("Other", rounds[0].1, 1, 10, false)
+        db.result_lines("Other", rounds[0].1, 1, 10, false, usize::MAX)
             .unwrap_err()
             .code,
         "result_not_found"
     );
     assert_eq!(
-        db.result_lines("Bob", rounds[0].0, 1, 10, false)
+        db.result_lines("Bob", rounds[0].0, 1, 10, false, usize::MAX)
             .unwrap_err()
             .code,
         "result_not_found"
@@ -5567,7 +5569,9 @@ fn a_result_on_one_line_reads_back_whole_in_pieces() {
     let mut read = Vec::new();
     let mut offset = 1;
     loop {
-        let page = db.result_lines("Bob", node, offset, 5000, false).unwrap();
+        let page = db
+            .result_lines("Bob", node, offset, 5000, false, usize::MAX)
+            .unwrap();
         assert!(page.len() < agent_runtime::tools::PREVIEW_BYTES);
         let mut next = None;
         for line in page.lines() {

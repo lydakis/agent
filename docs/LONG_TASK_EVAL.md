@@ -130,8 +130,8 @@ carries the measured number and the benchmark ran, whether the bot ran
 `tools/env-check` before changing anything, a passing `make check` on its
 final files, and the benchmark after that check, commands repeated after
 the first compaction, retrieval calls (`history`, or `read` of a `result/` reference),
-compactions, elisions, the context-view version each model call was made
-under, input, cached input, and output tokens for the model and the
+compactions, elisions, the view each model call was made under (its
+summary version and cut, and its elision floor), input, cached input, and output tokens for the model and the
 summarizer separately, and summarizer latency from its send to the send of
 the model call it held back. Failed summaries are live-only events, so the
 runner collects them as they arrive. The workspace's own tools record

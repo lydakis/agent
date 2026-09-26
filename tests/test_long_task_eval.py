@@ -123,6 +123,18 @@ class LongTaskScoreTests(unittest.TestCase):
         result = score(self.root, self.facts, events, '')
         self.assertEqual(result['summarizer_ms'], 7000 + 2000)
 
+    def test_each_call_is_scored_under_the_view_it_was_made_under(self):
+        usage = lambda cursor: {'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': cursor}}
+        # A call, a stub pass, a call, a summary and a second step at the
+        # same head, a call.
+        events = [usage(1), {'cursor': 2, 'event': 'elided', 'data': {'version': 9, 'through': 7}},
+                  usage(3), {'cursor': 4, 'event': 'compacted', 'data': {'version': 12, 'cut': 5}},
+                  {'cursor': 5, 'event': 'compacted', 'data': {'version': 12, 'cut': 8}}, usage(6)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['views'], [{'compaction': None, 'cut': None, 'floor': 0},
+                                           {'compaction': None, 'cut': None, 'floor': 7},
+                                           {'compaction': 12, 'cut': 8, 'floor': 7}])
+
     def test_each_lost_fact_is_scored_as_lost(self):
         # The correction ignored, the restriction broken, the failed
         # approach and the unknown-outcome operation both repeated after a
@@ -214,7 +226,7 @@ class LongTaskRunnerTests(ModelFixture):
         self.assertEqual(result['compaction_failures'], [])
         self.assertEqual(result['summarizer_calls'], result['compactions'])
         self.assertEqual(result['model_calls'], len(self.model.task_script) + 1)
-        self.assertEqual(len(result['view_versions']), result['model_calls'])
+        self.assertEqual(len(result['views']), result['model_calls'])
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())

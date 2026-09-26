@@ -15,9 +15,9 @@ mod context;
 mod db;
 pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, without_thinking};
 pub use db::{
-    Absorbed, Binding, Bot, CatchUp, CompactionPlan, CompactionView, Database, Delivery,
-    ElisionPlan, Fork, Planning, Publication, Started, Strip, TurnContext, TurnOptions, Waiting,
-    Window, cache_hit,
+    Absorbed, Binding, Bot, CatchUp, CompactionPlan, CompactionView, CopiedCall, Database,
+    Delivery, ElisionPlan, Fork, Planning, Publication, Started, Strip, TurnContext, TurnOptions,
+    Waiting, Window, cache_hit,
 };
 
 type ReadJob = Box<dyn FnOnce(&Database) + Send>;

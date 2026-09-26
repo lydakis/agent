@@ -193,6 +193,53 @@ class ElisionTests(ModelFixture):
         self.assertEqual([c['covered_turns'] for c in compacted], [[1, 1]])
         self.assertFalse([e for e in events if e['event'] == 'compaction_failed'])
 
+    def test_a_stub_read_back_pages_within_the_room_beside_the_turn(self):
+        # One result of about 23 KiB in 24 KiB goes as its stub, and the
+        # model reads it back with the default line limit. Whole, with its
+        # escaping as a result, the page would not fit beside its call; it
+        # stops where it fits.
+        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'])
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1x1200,2x1')['result']['turn']
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
+        read = next(i['output'] for i in requests[-1]['input']
+                    if i.get('type') == 'function_call_output' and i['call_id'] == 'long-read')
+        self.assertTrue(read.startswith('     1\t{"exit_code":0'), read[:40])
+        self.assertIn('; continue with offset=', read)
+        self.assertNotIn('round 0 line 1200', read)
+
+    def test_a_paced_summary_copies_the_same_call_when_it_resumes(self):
+        # One boundary stubs the first result, then summarizes a copy of the
+        # call made before the stub, and that summary is paced once; the
+        # daemon restarts while it waits. The retry copies the same call,
+        # not the view after the stub.
+        client = self.client(tools='shell,read', extra=('--context-bytes', '65536'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                       compaction_instructions='Summarize.')
+        self.model.compaction_refusals = 1
+        turn = client.request('submit', bot='Bob', request_id='1',
+                              prompt='long:1x600,35x40,1x700,2x1')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        client.close(kill=True)
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        extra=('--context-bytes', '65536'), tools='shell,read')
+        self.addCleanup(client.close)
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        moves = [e['data'] for e in events if e['event'] in ('elided', 'compacted')]
+        self.assertEqual([m['version'] for m in moves[:2]], [moves[0]['version']] * 2)
+        summaries = [r for r in drain(self.model) if is_summary(r)]
+        self.assertEqual(len(summaries), 2)
+        first, retry = summaries
+        self.assertTrue(first.get('tools'))
+        self.assertFalse(any(i.get('type') == 'function_call_output' and i['output'].startswith(STUB)
+                             for i in first['input']))
+        self.assertEqual((retry['input'], retry.get('tools')), (first['input'], first.get('tools')))
+
     def test_a_steer_the_turn_had_no_room_for_goes_in_once_elision_makes_some(self):
         # At a round's end the turn holds two whole results of about 11 KiB,
         # more than the three quarters of 24 KiB a steer may join. The next

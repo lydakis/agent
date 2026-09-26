@@ -246,6 +246,9 @@ struct Accounting {
     parked_until: u64,
     /// Persist the call's phase with its existing park transaction.
     compaction: bool,
+    /// What the summary call copies, kept in the park record so its retry
+    /// sends the same request.
+    copied: Option<agent_runtime::store::CopiedCall>,
     /// A prompt-cache refresh in flight while a reply streams or a tool runs.
     refresh: Option<Pending>,
     /// When the last call's cache was last read by a refresh sent while the
@@ -357,6 +360,7 @@ impl Turn {
         let flushed = if let Ok(Round::Paced(at)) = &result {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
             let compaction = accounting.compaction;
+            let copied = accounting.copied.take().filter(|_| compaction);
             let route = accounting.route.get().cloned();
             // Commit the park and its accounting together, outside cancellation.
             self.store
@@ -369,6 +373,7 @@ impl Turn {
                         retries,
                         paced_ms,
                         compaction,
+                        copied,
                         route.as_deref(),
                     )
                     .map(|_| ())
@@ -411,11 +416,22 @@ impl Turn {
     /// Prepare metadata and the encoded prefix once per model round. Retries
     /// stream the same immutable nodes without rebuilding the context view.
     async fn context(&self, bytes: usize, count: usize, prefix_budget: usize) -> Result<Context> {
+        self.context_under(bytes, count, prefix_budget, None).await
+    }
+
+    /// `context`, under an earlier elision floor when one is given.
+    async fn context_under(
+        &self,
+        bytes: usize,
+        count: usize,
+        prefix_budget: usize,
+        floor: Option<i64>,
+    ) -> Result<Context> {
         let bot = self.bot.clone();
         let window = self
             .store
             .op("window", move |db| {
-                db.window(&bot, bytes as i64, count as i64)
+                db.window_under(&bot, bytes as i64, count as i64, floor)
             })
             .await?;
         let Some(window) = window else {
@@ -903,6 +919,7 @@ impl Turn {
         // A turn may run on another model than the bot's, and then the
         // bot's summarizer can neither read that call's cache nor take its
         // routing token or thinking.
+        accounting.copied = None;
         let copy = match sent.filter(|sent| sent.model == reference && !plan.catch_up) {
             Some(Sent { view, last, .. }) => {
                 let request = Bytes::from(agent_runtime::store::CompactionPlan::request(
@@ -911,8 +928,22 @@ impl Turn {
                     plan.summary_bytes,
                 )?);
                 match self.copy_of(view, last, &plan, &request) {
-                    Some((prefix, window)) => {
+                    Some((prefix, items, window)) => {
                         let thinking = self.bound(record, &prefix, window).await?;
+                        // A park keeps what is copied, and the prefix
+                        // itself only when the view no longer sends it.
+                        let prefix_text = if prefix == view.prefix.bytes {
+                            None
+                        } else {
+                            let text = std::str::from_utf8(&prefix)
+                                .map_err(|_| Error::new("storage_error"))?;
+                            Some((text.to_owned(), items))
+                        };
+                        accounting.copied = Some(agent_runtime::store::CopiedCall {
+                            floor: window.elided,
+                            first: window.ids[0],
+                            prefix: prefix_text,
+                        });
                         Some((prefix, window, thinking, request))
                     }
                     None => None,
@@ -958,9 +989,13 @@ impl Turn {
             )
             .await
         {
-            Ok(Some(completion)) => completion,
+            Ok(Some(completion)) => {
+                accounting.copied = None;
+                completion
+            }
             Ok(None) => return Ok(Compaction::Parked(accounting.parked_until)),
             Err(error) => {
+                accounting.copied = None;
                 self.hub
                     .live(
                         &self.bot,
@@ -1048,7 +1083,7 @@ impl Turn {
         last: Option<&LastCall>,
         plan: &agent_runtime::store::CompactionPlan,
         request: &[u8],
-    ) -> Option<(Bytes, &'a Window)> {
+    ) -> Option<(Bytes, usize, &'a Window)> {
         let window = view.window.as_ref()?;
         let at = window.ids.binary_search(plan.ids.first()?).ok()?;
         if window.ids.get(at + plan.ids.len() - 1) != plan.ids.last() {
@@ -1064,7 +1099,9 @@ impl Turn {
             bytes: prefix.len() + window.item_bytes as usize + window.ids.len() - 1 + request.len(),
             items: items + window.ids.len() + 1,
         };
-        usage.fits(self.input_limit()).then_some((prefix, window))
+        usage
+            .fits(self.input_limit())
+            .then_some((prefix, items, window))
     }
 
     async fn plan_compaction(
@@ -1200,6 +1237,8 @@ impl Turn {
             environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
         }
         let mut resume_window = false;
+        // What a summary that parked had copied, for its retry to copy.
+        let mut copied = None;
         if self.resume {
             let (waiting, _, steers) =
                 match self.store.op("resume", move |db| db.resume(turn)).await {
@@ -1223,6 +1262,7 @@ impl Turn {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 resume_window = !waiting.compaction;
+                copied = waiting.copied.filter(|_| waiting.compaction);
             } else {
                 let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
                 let id = waiting.call_id;
@@ -1275,6 +1315,7 @@ impl Turn {
             // an exhausted summary must not start over when the ordinary call
             // parks on the same pool. A later model round may compact again.
             let resuming = std::mem::take(&mut resume_window);
+            let restore = copied.take();
             let output_bytes = provider.output_byte_estimate(model);
             let mut made_room = false;
             let mut context = match self
@@ -1322,11 +1363,36 @@ impl Turn {
             // compaction steps.
             if self.absorb(&context.prefix, &mut capped).await? {
                 resume_window = resuming;
+                copied = restore;
                 continue;
             }
             // A summary copies the view as the last call sent it, before
-            // this boundary's stubs.
+            // this boundary's stubs. A summary that parked copies again what
+            // it copied: the view under the floor that call was read under,
+            // behind what it sent ahead of that view, unless a forced
+            // summary has replaced that view since.
             let mut before = None;
+            if let Some(call) = restore.filter(|_| !made_room) {
+                if context.window.as_ref().map(|window| window.elided) != Some(call.floor) {
+                    before = Some(
+                        self.context_under(
+                            self.context_bytes,
+                            self.context_items,
+                            self.context_bytes * 2 / 3,
+                            Some(call.floor),
+                        )
+                        .await?,
+                    );
+                }
+                if let Some((prefix, items)) = call.prefix {
+                    last = Some(LastCall {
+                        prefix: Bytes::from(prefix),
+                        items,
+                        first: call.first,
+                        elided: call.floor,
+                    });
+                }
+            }
             if elides
                 && !resuming
                 && self.elision_due(&context, output_bytes)
@@ -2133,25 +2199,10 @@ impl Turn {
                     source: ReadSource::Result { node },
                     offset,
                     limit,
-                }) => {
-                    let bot = self.bot.clone();
-                    let checked = self.read_results.lock().unwrap().contains(&node);
-                    let text = self
-                        .store
-                        .read("result_lines", move |db| {
-                            db.result_lines(&bot, node, offset, limit, checked)
-                        })
-                        .await;
-                    match text {
-                        Ok(page) => {
-                            if !checked {
-                                self.read_results.lock().unwrap().push(node);
-                            }
-                            Outcome::text(self.registry.redact_text(page))
-                        }
-                        Err(error) => failure(error),
-                    }
-                }
+                }) => match self.result_page(&call.call_id, node, offset, limit).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure(error),
+                },
                 Ok(Prepared::History {
                     turn: wanted,
                     offset,
@@ -2206,6 +2257,76 @@ impl Turn {
         Ok(false)
     }
 
+    /// Room for a page the model asked for: a share of what the input
+    /// limit leaves beside the running turn and what goes ahead of it. Old
+    /// turns can leave the window; the current turn and pinned items
+    /// cannot. Indexed accounting avoids rebuilding a full window per read.
+    async fn page_budget(
+        &self,
+        share: usize,
+        exhausted: &str,
+    ) -> Result<(agent_runtime::codec::Family, usize)> {
+        let allowance = self.input_limit();
+        let (bot, turn) = (self.bot.clone(), self.turn);
+        let (family, used) = self
+            .store
+            .read("history_usage", move |db| db.history_usage(&bot, turn))
+            .await?;
+        let budget = allowance.bytes.saturating_sub(used.bytes + 1) / share;
+        if used.items >= allowance.items || budget < 256 {
+            return fail(exhausted);
+        }
+        Ok((family, budget))
+    }
+
+    /// A page of a result that went as its stub. It stays beside its call
+    /// until the model answers it, so neither elision nor a cut can make
+    /// room for it later: it takes at most the room the turn leaves.
+    async fn result_page(
+        &self,
+        call_id: &str,
+        node: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Outcome> {
+        let (family, budget) = self.page_budget(1, "read_context_exhausted").await?;
+        let mut checked = self.read_results.lock().unwrap().contains(&node);
+        let mut bytes = budget;
+        loop {
+            let bot = self.bot.clone();
+            let page = match self
+                .store
+                .read("result_lines", move |db| {
+                    db.result_lines(&bot, node, offset, limit, checked, bytes)
+                })
+                .await
+            {
+                Ok(page) => page,
+                // A piece wider than the room left is not the text's fault.
+                Err(error) if error.code == "read_line_too_long" => {
+                    return fail("read_context_exhausted");
+                }
+                Err(error) => return Err(error),
+            };
+            if !checked {
+                self.read_results.lock().unwrap().push(node);
+                checked = true;
+            }
+            // Numbering, JSON escaping, redaction, and the result envelope
+            // all count: shrink the page by what the item overshoots until
+            // the item itself fits.
+            let output = self.registry.redact_text(page);
+            let item = family.tool_result_item(call_id, &output)?.len();
+            if item <= budget {
+                return Ok(Outcome::text(output));
+            }
+            bytes = (bytes * budget / item).min(bytes.saturating_sub(1));
+            if bytes == 0 {
+                return fail("read_context_exhausted");
+            }
+        }
+    }
+
     async fn history(
         &self,
         call_id: &str,
@@ -2213,18 +2334,7 @@ impl Turn {
         offset: u64,
         limit: usize,
     ) -> Result<Outcome> {
-        // Old turns can leave the window; the current turn and pinned items
-        // cannot. Indexed accounting avoids rebuilding a full window per read.
-        let allowance = self.input_limit();
-        let (bot, turn) = (self.bot.clone(), self.turn);
-        let (family, used) = self
-            .store
-            .read("history_usage", move |db| db.history_usage(&bot, turn))
-            .await?;
-        let budget = allowance.bytes.saturating_sub(used.bytes + 1) / 2;
-        if used.items >= allowance.items || budget < 256 {
-            return fail("history_context_exhausted");
-        }
+        let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
         let bot = self.bot.clone();
         let mut page = self
             .store

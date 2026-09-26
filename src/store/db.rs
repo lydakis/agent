@@ -17,6 +17,33 @@ const PROMPT_SHARE_BYTES: usize = 4096;
 const STEER_BATCH_ITEMS: usize = 32;
 const STEER_BATCH_BYTES: usize = 256 * 1024;
 
+/// The one-row state `window_under` reads, with the elision floor it is
+/// read under joined as `e` (`through`, `saved`).
+macro_rules! window_state {
+    ($elision:literal) => {
+        concat!(
+            "SELECT b.head,b.family,COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),0),
+                    COALESCE(h.depth,0),s.id,COALESCE(s.depth,0),
+                    COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0),
+                    COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),0)
+                        -COALESCE(cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,0)),0),
+                    COALESCE(h.depth,0)-COALESCE(cp.depth,0),
+                    note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
+                    instr(','||b.tools||',',',history,')>0,COALESCE(e.through,0),COALESCE(e.saved,0),
+                    c.pinned,pn.total_bytes-COALESCE(pp.total_bytes,0),pn.turn_seq,pn.depth,
+                    c.cut IS b.context_start
+             FROM bots b LEFT JOIN nodes h ON h.id=b.head
+             LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+             LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
+             LEFT JOIN nodes cp ON cp.id=cut.parent
+             LEFT JOIN nodes pn ON pn.id=c.pinned LEFT JOIN nodes pp ON pp.id=pn.parent
+             LEFT JOIN notes note ON note.node=b.note
+             ",
+            $elision,
+            " WHERE b.name=?1"
+        )
+    };
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
     pub name: String,
@@ -223,6 +250,20 @@ pub struct Waiting {
     /// the park keep going to the server that holds its cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// What a paced summary copied of the bot's last call, so its retry
+    /// sends the same request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied: Option<CopiedCall>,
+}
+/// The call a summary copies: the elision floor its window was read under
+/// and the node that window starts at, and what went ahead of it when that
+/// was not what the view sends there now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CopiedCall {
+    pub floor: i64,
+    pub first: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<(String, usize)>,
 }
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
@@ -1066,6 +1107,18 @@ impl Database {
         context_bytes: i64,
         context_items: i64,
     ) -> Result<Option<Window>> {
+        self.window_under(name, context_bytes, context_items, None)
+    }
+    /// `window`, read under an earlier elision floor of the bot's (its
+    /// `through`, zero for none) rather than its current one: the view a
+    /// call made before the floor moved sent.
+    pub fn window_under(
+        &mut self,
+        name: &str,
+        context_bytes: i64,
+        context_items: i64,
+        floor: Option<i64>,
+    ) -> Result<Option<Window>> {
         // Heads only append and forks clear context_start, so the saved start
         // remains in this bot's ancestry. Read its accounting without walking
         // that ancestry or copying unrelated bot metadata such as instructions.
@@ -1089,29 +1142,24 @@ impl Database {
             /// depth, and whether the window still starts at the cut.
             pinned: Option<(i64, i64, i64, i64, bool)>,
         }
-        let state = self
-            .conn
-            .prepare_cached(
-                "SELECT b.head,b.family,COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),0),
-                    COALESCE(h.depth,0),s.id,COALESCE(s.depth,0),
-                    COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0),
-                    COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),0)
-                        -COALESCE(cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,0)),0),
-                    COALESCE(h.depth,0)-COALESCE(cp.depth,0),
-                    note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
-                    instr(','||b.tools||',',',history,')>0,COALESCE(e.through,0),COALESCE(e.saved,0),
-                    c.pinned,pn.total_bytes-COALESCE(pp.total_bytes,0),pn.turn_seq,pn.depth,
-                    c.cut IS b.context_start
-             FROM bots b LEFT JOIN nodes h ON h.id=b.head
-             LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
-             LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
-             LEFT JOIN nodes cp ON cp.id=cut.parent
-             LEFT JOIN nodes pn ON pn.id=c.pinned LEFT JOIN nodes pp ON pp.id=pn.parent
-             LEFT JOIN notes note ON note.node=b.note
-             LEFT JOIN elisions e ON e.node=b.elision
-             WHERE b.name=?",
-            )?
-            .query_row([name], |r| {
+        let mut statement = match floor {
+            None => self.conn.prepare_cached(window_state!(
+                "LEFT JOIN elisions e ON e.node=b.elision"
+            ))?,
+            Some(_) => self.conn.prepare_cached(window_state!(
+                "LEFT JOIN (SELECT id AS through,total_elided AS saved FROM nodes WHERE id=?2) e ON 1"
+            ))?,
+        };
+        let floor_id;
+        let args: &[&dyn rusqlite::ToSql] = match floor {
+            None => &[&name],
+            Some(floor) => {
+                floor_id = floor;
+                &[&name, &floor_id]
+            }
+        };
+        let state = statement
+            .query_row(args, |r| {
                 Ok(State {
                     head: r.get(0)?,
                     family: r.get(1)?,
@@ -3452,6 +3500,7 @@ impl Database {
             call_spent_ms: 0,
             compaction: false,
             route: route.map(str::to_owned),
+            copied: None,
         };
         let tx = self.conn.savepoint()?;
         tx.execute(
@@ -3477,6 +3526,7 @@ impl Database {
         retries: u64,
         paced_ms: u64,
         compaction: bool,
+        copied: Option<CopiedCall>,
         route: Option<&str>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
@@ -3496,6 +3546,7 @@ impl Database {
             call_spent_ms,
             compaction,
             route: route.map(str::to_owned),
+            copied,
         };
         let tx = self.conn.savepoint()?;
         tx.execute(
@@ -4574,6 +4625,7 @@ impl Database {
         offset: usize,
         limit: usize,
         checked: bool,
+        max_bytes: usize,
     ) -> Result<String> {
         if offset == 0 || !(1..=5000).contains(&limit) {
             return fail("invalid_tool_arguments");
@@ -4593,7 +4645,7 @@ impl Database {
         let Some((_, _, output)) = super::context::tool_result(&item) else {
             return fail("result_not_found");
         };
-        crate::tools::page_pieces(&output, offset, limit)
+        crate::tools::page_pieces(&output, offset, limit, max_bytes)
     }
     pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
         self.authorize_artifact(name, turn, call_id)?;

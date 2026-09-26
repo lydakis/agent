@@ -1653,6 +1653,10 @@ is never rewritten: `item`, `history`, and forks see every result whole,
 and `read` with `result/NODE` returns one on the bot's own lineage. A
 shell result is one JSON line, often longer than a `read` page, so that
 read splits lines longer than 4 KiB into numbered pieces and pages them.
+A page stays beside its call until the model answers it, where neither
+elision nor a cut can take it, so it takes at most the room the running
+turn and what goes ahead of it leave; with no room for one piece, the read
+fails with `read_context_exhausted`.
 The lineage check walks from the head counting steps down to the result's
 depth, reading only each node's parent, since `depth` follows the item in
 a row; a turn checks each result once, and its later pages skip the walk,
@@ -1718,7 +1722,10 @@ item, the compaction request, carrying the client's compaction
 instructions and the maximum summary size. All but the newest items read
 from the provider cache. The copy takes what the last call sent ahead of
 its window, so a note written since does not show, and the window from
-before any stubs this boundary made. It does not set `tool_choice`, which on
+before any stubs this boundary made. A summary that parks on a rate limit
+keeps in its park record the floor that window was read under, where it
+starts, and that prefix when the view no longer sends it, so its retry,
+after a restart too, copies the same call. It does not set `tool_choice`, which on
 Anthropic would invalidate the message cache, so the request asks for text
 and a reply that calls a tool is billed and not installed
 (`compaction_tool_call`). The summary covers everything the copy shows,

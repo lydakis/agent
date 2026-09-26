@@ -845,7 +845,7 @@ impl Registry {
 /// Number lines from a 1-based offset within the page budget. A single line
 /// beyond the budget is an explicit error rather than a silent cut.
 pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
-    page(text.lines(), offset, limit)
+    page(text.lines(), offset, limit, PREVIEW_BYTES)
 }
 
 /// The widest piece `page_pieces` numbers as a line.
@@ -854,8 +854,9 @@ pub const PIECE_BYTES: usize = 4096;
 /// `page_lines` with every line longer than `PIECE_BYTES` split at
 /// character boundaries into numbered pieces, so a text with no byte-level
 /// reader, such as one stored tool result on a single line, pages whole.
-pub fn page_pieces(text: &str, offset: usize, limit: usize) -> Result<String> {
-    page(text.lines().flat_map(pieces), offset, limit)
+/// A page stays within `max_bytes` as well as the preview bound.
+pub fn page_pieces(text: &str, offset: usize, limit: usize, max_bytes: usize) -> Result<String> {
+    page(text.lines().flat_map(pieces), offset, limit, max_bytes)
 }
 
 fn pieces(line: &str) -> impl Iterator<Item = &str> + Clone {
@@ -876,8 +877,10 @@ fn page<'a>(
     lines: impl Iterator<Item = &'a str> + Clone,
     offset: usize,
     limit: usize,
+    max_bytes: usize,
 ) -> Result<String> {
     let total = lines.clone().count();
+    let budget = max_bytes.min(PREVIEW_BYTES).saturating_sub(128);
     let mut output = String::new();
     let mut shown = 0;
     for (index, line) in lines.enumerate().skip(offset - 1).take(limit) {
@@ -885,7 +888,7 @@ fn page<'a>(
         // lengths before copying a potentially multi-megabyte line.
         let prefix = format!("{:>6}\t", index + 1);
         let entry_bytes = prefix.len() + line.len() + 1;
-        if output.len() + entry_bytes > PREVIEW_BYTES - 128 {
+        if output.len() + entry_bytes > budget {
             if shown == 0 {
                 return crate::fail_with(
                     "read_line_too_long",

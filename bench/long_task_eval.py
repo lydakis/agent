@@ -354,13 +354,17 @@ def score(root, facts, events, answer):
     usage = [e['data'] for e in events if e['event'] == 'usage']
     summarizer = [u for u in usage if u.get('purpose') == 'compaction']
     work = [u for u in usage if u.get('purpose') != 'compaction']
-    # The context-view version each model call was made under.
-    version, versions = None, []
+    # The view each model call was made under: the summary version and its
+    # cut, and the elision floor. A step or a move at the same head repeats
+    # its version, so the cut and the floor tell those apart.
+    view, views = {'compaction': None, 'cut': None, 'floor': 0}, []
     for event in events:
         if event['event'] == 'compacted':
-            version = event['data']['version']
+            view = {**view, 'compaction': event['data']['version'], 'cut': event['data'].get('cut')}
+        elif event['event'] == 'elided':
+            view = {**view, 'floor': event['data']['through']}
         elif event['event'] == 'usage' and event['data'].get('purpose') != 'compaction':
-            versions.append(version)
+            views.append(view)
 
     def total(rows, field):
         return sum(row.get(field) or 0 for row in rows)
@@ -397,7 +401,7 @@ def score(root, facts, events, answer):
         'retrieval_calls': sum(1 for c in calls.values() if c['name'] == 'history'
                                or (c['name'] == 'read' and 'result/' in (c.get('arguments') or ''))),
         'model_calls': len(work),
-        'view_versions': versions,
+        'views': views,
         'input_tokens': total(work, 'input_tokens'),
         'cached_input_tokens': total(work, 'cached_input_tokens'),
         'output_tokens': total(work, 'output_tokens'),
