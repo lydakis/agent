@@ -105,12 +105,26 @@ the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
   those records: ours on Sonnet, which Harbor never graded or priced, and
   Claude Code's, which Harbor rebuilt from a partial trajectory. ChatGPT-plan
   costs are what the same tokens cost on the API.
-- **Cache on the ChatGPT plan.** Our calls missed the prompt cache at the same
-  rate as Codex's from the third call on (9.0% against 10.5%), and no miss
-  lined up with anything the runtime does. Misses follow short gaps, which
-  points at OpenAI's routing. The one consistent gap is the second call of a
-  conversation, worth about 4% of our uncached input. `15d629c`, 5 tasks by 2
-  trials a side, 2026-09-26.
+- **Cache on the ChatGPT plan.** Misses cost us 4.8k tokens a trial and
+  Codex 5.0k, about $0.009 a trial at API rates. Our calls missed at the same
+  rate as Codex's from the third call on (9.0% against 10.5%). Every partial
+  miss on either side read exactly an earlier call's prompt, and misses
+  cluster early in a conversation and after gaps under 10 seconds, not after
+  idle time: an older cache copy served by OpenAI's routing, not expiry and
+  not a change in our requests. The one pattern that is ours alone is the
+  second call of a conversation (8 misses in 14 against 2 in 10), about 0.9k
+  tokens a trial. `15d629c`, 5 tasks by 2 trials a side, 2026-09-26.
+- **Cache on Sonnet 5.** Ordinary calls lost nothing: no misses, and each
+  call's cache writes equal its new tokens. Of nine refreshes during long
+  tool calls, six came after a reply that streamed for longer than the
+  cache's five minutes, found it expired, and rewrote 400k tokens, about
+  $0.92 or 6% of the arm. Claude Code, which does not refresh, lost 80k tokens to
+  the same expiry. `c585c16`, 2026-09-25. `e6a2ac8` (#20) now also refreshes
+  while a long reply streams; it has not been rerun on these tasks.
+- **Cached share is the wrong measure across harnesses.** We send 3.4 to 4.2
+  times less input a trial than Codex, so our cached share is lower (82 to
+  84% against 94 to 95%) while our uncached input is at parity or lower.
+  Tokens lost to misses a trial is the comparable number.
 - **Cost structure.** Our fixed prefix is about 1.2k tokens on ChatGPT and
   2.2k on Anthropic, against 11.8k for Codex and 23.7k for Claude Code, which
   is most of our cost edge on short tasks. On Sonnet, output (mostly thinking)
