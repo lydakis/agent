@@ -1535,10 +1535,11 @@ fn streamed(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// A character a terminal acts on rather than shows as it stands: a
-/// control character, or a bidirectional mark or override.
+/// control character, or one of Unicode's bidirectional controls (marks,
+/// embeddings, overrides, and isolates).
 fn acted_on(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// A top-level string field of JSON text that may be cut short, decoded as
@@ -1841,8 +1842,8 @@ mod tests {
         // Concealing what follows, rewriting the line, and reordering it
         // are all shown instead of done.
         assert_eq!(
-            streamed("fake\u{1b}[8m\rreal\u{202e}\u{9b}\n"),
-            r"fake\u{1b}[8m\rreal\u{202e}\u{9b}".to_owned() + "\n"
+            streamed("fake\u{1b}[8m\rreal\u{202e}\u{9b}\u{61c}1\n"),
+            r"fake\u{1b}[8m\rreal\u{202e}\u{9b}\u{61c}1".to_owned() + "\n"
         );
         let renderer = Renderer {
             color: true,
@@ -1982,6 +1983,8 @@ mod tests {
         assert_eq!(shell_word("a\nb'\x1b"), r"$'a\x0ab\'\x1b'");
         // A bidi override would reorder the flags printed after it.
         assert_eq!(shell_word("a\u{202e}b"), r"$'a\xe2\x80\xaeb'");
+        // So would the Arabic letter mark, which is no control character.
+        assert_eq!(shell_word("a\u{61c}1"), r"$'a\xd8\x9c1'");
     }
 
     #[test]

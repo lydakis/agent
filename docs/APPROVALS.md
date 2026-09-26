@@ -1040,7 +1040,7 @@ Where it differs from the design above:
   events when its calls take more than 256 KiB, so every event pages.
 - A turn parked on a `wait` or on a verdict ahead of another gated call
   wakes and ends when that call lapses, rather than when the wait returns
-  or the verdict comes.
+  or the verdict comes, and no call starts once a later one lapsed.
 
 Not built yet: the automatic approver (rules and Jev), with
 `serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`

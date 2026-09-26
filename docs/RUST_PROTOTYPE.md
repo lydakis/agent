@@ -1660,6 +1660,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   on a `wait` or on a verdict ahead of another gated call is woken when
   that call lapses, and the lapse ends it: the wait returns what it has,
   and a call still waiting ends with the rest of the round, as not run.
+  No call starts, gated or not, once a later call of its round lapsed.
 - **Rounds.** A verdict is for the round as planned. When a call fails (an
   error result, a denial, or a command that did not succeed, as the tool
   reports it rather than as its output reads), every gated
@@ -1676,7 +1677,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `arguments_omitted` counts those left out (past 8, repeated, or with a
   name over 128 bytes); `arguments` is null when they are not a JSON
   object, which no tool accepts. The previews are taken once, when the
-  call is planned, so a listing reads no item. A page holds at most `limit` (1 to 256, default 64) calls and
+  call is planned, so a listing reads no item. One bot's listing reads
+  only its running turn's calls, and one tag's only the calls that tag
+  gates, through an index of each call's tags written with its
+  announcement. A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger (bounded by the 64 KiB
   call id and the previews, well inside a 1 MiB line); `next_after` continues
   it. Positions are never reused, and a call announced again takes a new

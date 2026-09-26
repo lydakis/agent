@@ -819,10 +819,11 @@ fn a_deny_decides_the_call_and_later_answers_are_refused() {
     ));
 }
 
-#[test]
-fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
-    let mut db = db();
-    let tools = ["shell".to_owned(), "write".to_owned()];
+/// A running turn of Bob, whose `shell` calls wait on a gate that never
+/// lapses and whose `write` calls on one that lapses 50 ms after the round
+/// is announced, planning `calls` (tool, call id) in one round.
+fn lapsing_round(db: &mut Database, calls: &[(&str, &str)]) -> (i64, Vec<ToolCall>) {
+    let tools = ["shell".to_owned(), "write".to_owned(), "read".to_owned()];
     let gate = |tag: &str, tool: &str, expire_ms| Gate {
         tag: tag.into(),
         tools: vec![tool.into()],
@@ -832,7 +833,7 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
         gate("slow", "shell", None),
         gate("quick", "write", Some(50)),
     );
-    let create = |db: &mut Database, name, gate, creator: Option<&Bot>| {
+    let mut create = |name, gate, creator: Option<&Bot>| {
         let binding = Binding {
             tools: &tools,
             gate: Some(gate),
@@ -842,8 +843,8 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
         };
         db.create(name, Some("/synthetic"), binding).unwrap().0
     };
-    let ann = create(&mut db, "Ann", &slow, None);
-    create(&mut db, "Bob", &quick, Some(&ann));
+    let ann = create("Ann", &slow, None);
+    create("Bob", &quick, Some(&ann));
     let turn = db
         .begin(
             "Bob",
@@ -855,55 +856,135 @@ fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
         )
         .unwrap()
         .turn;
+    let (items, calls): (Vec<Bytes>, Vec<ToolCall>) = calls
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, call_id))| {
+            let arguments = match name {
+                "shell" => json!({"command":"true"}),
+                "write" => json!({"path":"note.txt","content":"x"}),
+                _ => json!({"path":"note.txt"}),
+            }
+            .to_string();
+            let item = json!({"type":"function_call","id":format!("fc_{i}"),
+                "call_id":call_id,"name":name,"arguments":arguments});
+            let call = ToolCall {
+                name: name.into(),
+                call_id: call_id.into(),
+                arguments,
+            };
+            (serde_json::to_vec(&item).unwrap().into(), call)
+        })
+        .unzip();
+    db.append(turn, items, &calls, None).unwrap();
+    (turn, calls)
+}
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
+    let mut db = db();
     // The first call waits on a gate with no expiry; the second one's lapses.
-    let (first, s1) = shell_call("fc_1", "s1", "true");
-    let arguments = json!({"path":"note.txt","content":"x"}).to_string();
-    let second = json!({"type":"function_call","id":"fc_2","call_id":"w1",
-        "name":"write","arguments":arguments});
-    let w1 = ToolCall {
-        name: "write".into(),
-        call_id: "w1".into(),
-        arguments,
-    };
-    let round = [s1.clone(), w1];
-    db.append(
-        turn,
-        vec![first, serde_json::to_vec(&second).unwrap().into()],
-        &round,
-        None,
-    )
-    .unwrap();
-    let now_ms = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-    };
+    let (turn, round) = lapsing_round(&mut db, &[("shell", "s1"), ("write", "w1")]);
+    let s1 = &round[0];
     let Gated::Pending {
         expires_ms: Some(lapse),
         ..
-    } = db.approval_start(turn, &s1, now_ms()).unwrap()
+    } = db.approval_start(turn, s1, epoch_now()).unwrap()
     else {
         panic!("the first call waits until the second call's gate lapses")
     };
     // Parked on the first call, the turn wakes when the second one lapses.
     assert_eq!(
-        db.suspend_approval(turn, &round, now_ms(), None).unwrap(),
+        db.suspend_approval(turn, &round, epoch_now(), None)
+            .unwrap(),
         Some(Some(lapse))
     );
     assert!(matches!(
         db.wake("Bob", turn, true).unwrap(),
         Wake::Later(Some(at)) if at == lapse
     ));
-    while now_ms() < lapse {
+    while epoch_now() < lapse {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(matches!(db.wake("Bob", turn, true).unwrap(), Wake::Resume));
     db.resume(turn).unwrap();
     assert!(matches!(
-        db.approval_start(turn, &s1, now_ms()).unwrap(),
+        db.approval_start(turn, s1, epoch_now()).unwrap(),
         Gated::Lapsed
     ));
+}
+
+#[test]
+fn no_call_starts_once_a_later_call_lapsed() {
+    let mut db = db();
+    let (turn, round) = lapsing_round(&mut db, &[("read", "r1"), ("shell", "s1"), ("write", "w1")]);
+    let (r1, s1) = (&round[0], &round[1]);
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: Some("slow"),
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    })
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    // Neither an ungated call nor an allowed one starts after the lapse.
+    let started = db.tool_start(turn, r1);
+    assert_eq!(
+        started.err().map(|e| e.to_string()).as_deref(),
+        Some("approval_expired: a later call's gate lapsed first")
+    );
+    assert!(matches!(
+        db.approval_start(turn, s1, epoch_now()).unwrap(),
+        Gated::Lapsed
+    ));
+}
+
+#[test]
+fn a_tag_listing_reads_only_that_tags_calls() {
+    let mut db = db();
+    let (turn, round) = lapsing_round(
+        &mut db,
+        &[("shell", "s1"), ("write", "w1"), ("shell", "s2")],
+    );
+    let listed = |db: &Database, tag| {
+        let page = db.approvals(None, Some(tag), 0, 64).unwrap();
+        page["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["call_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(listed(&db, "slow"), ["s1", "s2"]);
+    assert_eq!(listed(&db, "quick"), ["w1"]);
+    assert_eq!(listed(&db, "none"), Vec::<String>::new());
+    // A started call leaves the index with its row.
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: Some("slow"),
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &round[0], epoch_now()).unwrap(),
+        Gated::Started
+    ));
+    assert_eq!(listed(&db, "slow"), ["s2"]);
 }
 
 #[test]
