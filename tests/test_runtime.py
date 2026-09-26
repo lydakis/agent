@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -904,6 +905,66 @@ class RuntimeTests(ModelFixture):
         restarted = self.client()
         result = restarted.request('result', bot='Bob', turn=turn)['result']
         self.assertEqual((result['status'], result['error']), ('interrupted', 'daemon_shutdown'))
+
+    def held_admissions(self, client, count):
+        """Submissions to `count` bots, each of which would start a turn that
+        stays on the model until shutdown ends it. The first one's store job
+        takes over a second, so the rest queue behind it uncommitted."""
+        bots = ['Slow'] + [f'B{index}' for index in range(count)]
+        for bot in bots:
+            client.request('create', bot=bot, workspace=str(self.path))
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            db.execute('CREATE TABLE burn(x)')
+            db.executemany('INSERT INTO burn VALUES (?)', [(n,) for n in range(6000)])
+            db.execute("CREATE TRIGGER slow_admission AFTER INSERT ON turns WHEN NEW.bot='Slow' "
+                       "BEGIN SELECT count(*) FROM burn a, burn b WHERE a.x+b.x>=0; END")
+        return [{'id': f'submit-{bot}', 'op': 'submit', 'bot': bot, 'request_id': 'held', 'prompt': 'wait'}
+                for bot in bots]
+
+    def answered(self, client):
+        return any('id' in message for message in [*client.saved, *list(client.queue.queue)] if message)
+
+    def assert_shutdown_ended(self, client, turns):
+        """Shutdown ended every started turn with its own cause, rather than
+        leaving it running for the next start to find."""
+        for turn in turns:
+            data = client.finished(turn)['data']
+            self.assertEqual((data['status'], data['error']), ('interrupted', 'daemon_shutdown'))
+        self.assertEqual(client.process.wait(timeout=10), 0)
+        with sqlite3.connect(self.path / 'state.sqlite') as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM turns WHERE status!='interrupted'").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM bots WHERE running_turn IS NOT NULL").fetchone()[0], 0)
+
+    def test_a_shutdown_request_behind_queued_admissions_waits_for_their_answers(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        lines = self.held_admissions(client, 8) + [{'id': 'stop', 'op': 'shutdown'}]
+        client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
+        client.process.stdin.flush()
+        # The shutdown is answered after every admission queued ahead of it,
+        # and each admission's turn started before shutdown ended it.
+        replies = [client.receive(lambda m: 'id' in m) for _ in lines]
+        self.assertEqual([r['id'] for r in replies], [line['id'] for line in lines])
+        self.assertTrue(replies[-1]['result']['shutting_down'])
+        self.assertEqual({r['result']['status'] for r in replies[:-1]}, {'running'})
+        self.assert_shutdown_ended(client, [r['result']['turn'] for r in replies[:-1]])
+
+    def test_a_termination_signal_still_answers_the_admissions_it_finds_queued(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        lines = self.held_admissions(client, 8)
+        client.process.stdin.write(''.join(json.dumps(line) + '\n' for line in lines))
+        client.process.stdin.flush()
+        time.sleep(.2)
+        # The signal lands while every admission still waits on its commit.
+        self.assertFalse(self.answered(client))
+        client.process.send_signal(signal.SIGTERM)
+        turns = []
+        for line in lines:
+            reply = client.receive(lambda m, id=line['id']: m.get('id') == id)
+            self.assertEqual(reply['result']['status'], 'running')
+            turns.append(reply['result']['turn'])
+        self.assert_shutdown_ended(client, turns)
 
     def test_request_startup_is_bounded_but_established_streams_are_not(self):
         self.model.release_headers = threading.Event()

@@ -4898,8 +4898,11 @@ busy work queued behind the admission they depend on, the active limit with
 a promised slot that goes unused, a lost group commit that starts nothing
 and frees its slots, an interrupt behind the admission it names, large
 creations that must fit their session's output queue, and four clients
-sending the same submission at once. Shutdown with queued
-admissions is covered by reading the code, not by a test. All of this is one
+sending the same submission at once. Two Python tests hold nine admissions
+uncommitted behind one slow store job: a `shutdown` request queued behind
+them is answered after all nine, and a SIGTERM that finds them queued still
+answers each; in both, every started turn ends `interrupted` with
+`daemon_shutdown` and the daemon exits cleanly. All of this is one
 Linux container with an injected sync delay; macOS, where a flush costs
 about 5.4 ms, is not measured. The burst uses one connection; many clients
 arrive interleaved, which the Python test exercises but no timing does.
