@@ -188,7 +188,9 @@ schema 22, with the creator's identity since 23) or the `created` event; a bot
 without a creator, or whose creator's name has since changed hands, is a root.
 
 `/new` gives a bot the shared client policy ([CLIENT.md](CLIENT.md)); the
-create notice says what went in. It also supplies the same default compaction
+create notice says what went in. An oversized or unreadable AGENTS.md or skill
+refuses the creation with the CLI's `--agents` error rather than creating the
+bot without it. It also supplies the same default compaction
 instructions as the CLI, so app-created bots can summarize older context.
 Completed thoughts retain locally observed thinking time; historical thoughts
 without a recorded duration show no invented time.
@@ -207,9 +209,11 @@ eviction, a 10,000-peer fan-out, incremental text/thinking rendering, tool-row
 windowing, CSS control-character escaping, creation-event validation, concurrent
 submission IDs, fork-history paging, snapshot/history ordering, history paging
 past activity summaries, pinned submission identities, oversized-item isolation,
-compaction policy propagation, and completed thought timing.
-`cargo test --workspace` includes the silent-listener readiness deadline and
-fork workspace parity between durable records, live events, and replay.
+compaction policy propagation, creation refusal when the workspace policy
+cannot compose, and completed thought timing.
+`cargo test --workspace` includes the silent-listener readiness deadline,
+fork workspace parity between durable records, live events, and replay, and
+the app's policy errors for oversized and unreadable AGENTS.md files.
 
 A synthetic local debug-build probe with a 100,000-node in-memory history read
 the same 400 older items in three matched runs: individual ancestry checks took
