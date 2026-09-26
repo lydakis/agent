@@ -1668,7 +1668,14 @@ the view left behind before the floor reached them, summarized or outside
 the budget; the view's start only moves forward, so the bot sends none of
 them again, and the event does not count them. A bot's `elision`
 names its current version, and a historical fork binds to the newest version at or before its
-checkpoint, so it sees what its source saw there. Moving the floor rewrites
+checkpoint, so it sees what its source saw there. When the boundary's move
+leaves the view unable to fit and the forced move goes further before the
+model answers, that move extends the version made at the same head in
+place, and its event repeats the version and its previous. A version
+another bot sees, bound by a fork taken between the moves or through a
+version made on it, is never changed under it: that move fails with
+`elision_version_shared`, and a further summary step at such a head with
+`compaction_version_shared`, so the round ends with `context_limit`. Moving the floor rewrites
 items the provider has cached from the first newly stubbed result on, so it
 is a prompt-cache break there: the Responses WebSocket chain key includes the
 floor. On Anthropic, only thinking written after that result and before the
@@ -1928,11 +1935,15 @@ step. Catch-up steps end at a prompt, or at a round start inside the newest
 turn, whichever leaves the longer step; a turn older than the newest that
 alone exceeds the budget, for example after the budget was lowered, is cut
 at its rounds too, keeping its prompt, rather than failing with
-`compaction_span_limit`. One step is recorded per head, as before. A step
+`compaction_span_limit`. A step
 may leave the view over budget as long as the running turn's prompt and
-newest round still fit beside the new summary; an overflowing round whose
-one step leaves it over budget still ends with `context_limit`, since the
-next step needs a new head.
+newest round still fit beside the new summary; the round then takes
+further steps at the same head until the view fits, a step is skipped, or
+the turn reaches its round limit. Each extends the version made at that
+head in place, and its `compacted` event repeats the version and its
+previous. A resumed call that fits does not summarize again at a head that
+has a version, and a version another bot sees is not extended, as with
+the [elision floor](#tool-result-elision).
 
 ### Compaction and prompt-cache reuse
 

@@ -1423,29 +1423,46 @@ impl Database {
     pub fn elide(&mut self, name: &str, plan: &ElisionPlan) -> Result<Value> {
         let bot = self.inspect(name)?;
         let head = bot.head.ok_or(Error::new("storage_error"))?;
-        let elided: i64 = match bot.elision {
+        let (elided, previous): (i64, Option<i64>) = match bot.elision {
             Some(version) => self
                 .conn
-                .prepare_cached("SELECT through FROM elisions WHERE node=?")?
-                .query_row([version], |r| r.get(0))?,
-            None => 0,
+                .prepare_cached("SELECT through,previous FROM elisions WHERE node=?")?
+                .query_row([version], |r| Ok((r.get(0)?, r.get(1)?)))?,
+            None => (0, None),
         };
-        if plan.through <= elided || plan.through > head || bot.elision == Some(head) {
+        if plan.through <= elided || plan.through > head {
             return fail("elision_not_forward");
+        }
+        if bot.elision == Some(head) && elision_shared(&self.conn, head, name)? {
+            return fail("elision_version_shared");
         }
         let tx = self.conn.savepoint()?;
         // The version records what every stub through its floor saves, so
         // any node's bytes as sent are one subtraction (`sent_total`).
-        tx.execute(
-            "INSERT INTO elisions(node,previous,through,saved)
-             SELECT ?,?,id,total_elided FROM nodes WHERE id=?",
-            params![head, bot.elision, plan.through],
-        )?;
-        tx.execute(
-            "UPDATE bots SET elision=? WHERE name=?",
-            params![head, name],
-        )?;
-        let data = json!({"version":head,"previous":bot.elision,"through":plan.through,
+        let previous = if bot.elision == Some(head) {
+            // A second move before the model answers at this head: the
+            // view still could not fit beside what goes ahead of it, so the
+            // forced move goes further. No other bot sees the version, so
+            // only this bot's requests at this head send it as it ends.
+            tx.execute(
+                "UPDATE elisions SET through=id,saved=total_elided FROM nodes
+                 WHERE elisions.node=? AND nodes.id=?",
+                params![head, plan.through],
+            )?;
+            previous
+        } else {
+            tx.execute(
+                "INSERT INTO elisions(node,previous,through,saved)
+                 SELECT ?,?,id,total_elided FROM nodes WHERE id=?",
+                params![head, bot.elision, plan.through],
+            )?;
+            tx.execute(
+                "UPDATE bots SET elision=? WHERE name=?",
+                params![head, name],
+            )?;
+            bot.elision
+        };
+        let data = json!({"version":head,"previous":previous,"through":plan.through,
             "results":plan.results,"saved_bytes":plan.saved_bytes});
         let cursor = event(&tx, name, bot.running_turn, "elided", data.clone())?;
         tx.commit()?;
@@ -1512,13 +1529,16 @@ impl Database {
         keep_items: i64,
         max_bytes: i64,
         max_items: i64,
+        again: bool,
     ) -> Result<Option<Planning>> {
         let bot = self.inspect(name)?;
         let Some(head) = bot.head else {
             return Ok(None);
         };
-        // A resumed model call must not summarize again at the same head.
-        if bot.compaction == Some(head) {
+        // A resumed model call must not summarize again at the same head,
+        // unless the view still cannot fit (`again`): then another step
+        // extends the summary made here, while no other bot sees it.
+        if bot.compaction == Some(head) && (!again || compaction_shared(&self.conn, head, name)?) {
             return Ok(None);
         }
         // Constant-count indexed reads size the span before any walk:
@@ -1982,6 +2002,15 @@ impl Database {
         input_limit: super::ContextUsage,
     ) -> Result<Value> {
         let bot = self.inspect(name)?;
+        if let Some(head) = bot.head
+            && bot.compaction == Some(head)
+            && compaction_shared(&self.conn, head, name)?
+        {
+            return fail_with(
+                "compaction_version_shared",
+                "another bot sees the summary made at this head, so it cannot be extended",
+            );
+        }
         // A compaction stands for everything since the first: the summary
         // merged the previous one, and the kept prompts carry over, bounded.
         let (mut prompts, mut covered_from) = (Vec::new(), plan.covered.0);
@@ -2074,24 +2103,50 @@ impl Database {
             }
         }
         let tx = self.conn.savepoint()?;
-        tx.execute(
-            "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to,pinned) VALUES (?,?,?,?,?,?,?,?)",
-            params![
-                bot.head,
-                bot.compaction,
-                plan.cut,
-                summary,
-                serde_json::to_string(&candidate.prompts)?,
-                covered_from,
-                plan.covered.1,
-                plan.pinned
-            ],
-        )?;
+        let previous = if bot.compaction == bot.head {
+            // Another step before the model answers at this head, since the
+            // view still could not fit: it merged the summary made here and
+            // takes its place. No other bot sees the version, so only this
+            // bot's requests at this head send it as it ends.
+            tx.execute(
+                "UPDATE compactions SET cut=?,summary=?,prompts=?,covered_from=?,covered_to=?,pinned=?
+                 WHERE node=?",
+                params![
+                    plan.cut,
+                    summary,
+                    serde_json::to_string(&candidate.prompts)?,
+                    covered_from,
+                    plan.covered.1,
+                    plan.pinned,
+                    bot.head
+                ],
+            )?;
+            tx.query_row(
+                "SELECT previous FROM compactions WHERE node=?",
+                [bot.head],
+                |r| r.get(0),
+            )?
+        } else {
+            tx.execute(
+                "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to,pinned) VALUES (?,?,?,?,?,?,?,?)",
+                params![
+                    bot.head,
+                    bot.compaction,
+                    plan.cut,
+                    summary,
+                    serde_json::to_string(&candidate.prompts)?,
+                    covered_from,
+                    plan.covered.1,
+                    plan.pinned
+                ],
+            )?;
+            bot.compaction
+        };
         tx.execute(
             "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
             params![bot.head, plan.cut, name],
         )?;
-        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"previous":bot.compaction,"covered_turns":[covered_from, plan.covered.1],
+        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
             "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
@@ -5320,6 +5375,27 @@ fn node_with_turn(
     turn: Option<i64>,
 ) -> Result<i64> {
     insert_node(conn, parent, item, turn, 0)
+}
+/// Whether a bot other than `name` sees the compaction version at `node`:
+/// bound to it, or through a later version made on it. A version made at
+/// a bot's head is extended in place only while it is the bot's alone, so
+/// what a fork taken between the steps sees does not change under it.
+fn compaction_shared(conn: &Connection, node: i64, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE compaction=?1 AND name!=?2)
+             OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)",
+        )?
+        .query_row(params![node, name], |r| r.get(0))?)
+}
+/// `compaction_shared` for the elision floor's versions.
+fn elision_shared(conn: &Connection, node: i64, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE elision=?1 AND name!=?2)
+             OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)",
+        )?
+        .query_row(params![node, name], |r| r.get(0))?)
 }
 /// The id the next node insert takes, inside the caller's transaction.
 fn next_node(conn: &Connection) -> Result<i64> {

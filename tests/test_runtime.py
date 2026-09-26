@@ -76,6 +76,19 @@ class Model(http.server.BaseHTTPRequestHandler):
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
+            pace_at = getattr(self.server, 'pace_at', None)
+            if (pace_at is not None and not is_summary(request)
+                    and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at):
+                # Once, after that many results: a 429 that parks the turn.
+                self.server.pace_at = None
+                body = b'{"error":{"message":"try later"}}'
+                self.send_response(429)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Retry-After', '0.3')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if user == 'tool:park-rounds' and (attempt <= 8 or attempt == 10):
                 body = b'{"error":{"message":"try later"}}'
                 self.send_response(429 if attempt <= 8 else 503)

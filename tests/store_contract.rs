@@ -52,7 +52,7 @@ fn compaction_plan(
     max_bytes: i64,
     max_items: i64,
 ) -> Result<Option<CompactionPlan>> {
-    match db.compaction_plan(name, keep, i64::MAX, max_bytes, max_items)? {
+    match db.compaction_plan(name, keep, i64::MAX, max_bytes, max_items, false)? {
         None => Ok(None),
         Some(Planning::Plan(plan)) => Ok(Some(plan)),
         Some(Planning::CatchUp(mut walk)) => {
@@ -4944,7 +4944,7 @@ fn catch_up_is_bounded_by_items_and_rejects_a_turn_larger_than_the_budget() {
     // The walk's pieces do not change the plan, whatever their size.
     for piece in [1, 7, 4096] {
         let Some(Planning::CatchUp(mut walk)) = db
-            .compaction_plan("Bob", 1, i64::MAX, i64::MAX, 16)
+            .compaction_plan("Bob", 1, i64::MAX, i64::MAX, 16, false)
             .unwrap()
         else {
             panic!("expected a catch-up walk");
@@ -5370,7 +5370,7 @@ fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
     assert_eq!(entry["turn"], turn);
     assert_eq!(entry["data"]["through"], plan.through);
     assert_eq!(entry["data"]["results"], plan.results);
-    // Moving the floor is forward only, once per head.
+    // Moving the floor is forward only.
     assert_eq!(
         db.elide("Bob", &plan).unwrap_err().code,
         "elision_not_forward"
@@ -6097,8 +6097,9 @@ fn a_catch_up_step_may_end_before_a_steer_that_follows_a_result() {
     // round, so the step ends at the steer, keeping the prompt.
     let mut db = db();
     let (prompt, steered, calls) = steered_turn(&mut db);
-    let Some(Planning::CatchUp(mut walk)) =
-        db.compaction_plan("Bob", 1, i64::MAX, 8192, 256).unwrap()
+    let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, false)
+        .unwrap()
     else {
         panic!("expected a catch-up walk");
     };
@@ -6123,7 +6124,7 @@ fn catch_up_steps(
 ) -> Vec<CompactionPlan> {
     let mut steps: Vec<CompactionPlan> = Vec::new();
     while let Some(Planning::CatchUp(mut walk)) = db
-        .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256)
+        .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256, false)
         .unwrap()
     {
         while !walk.done() {
@@ -6208,7 +6209,7 @@ fn catch_up_through_a_turn_larger_than_the_budget_cuts_at_its_rounds() {
     let mut first = Vec::new();
     for piece in [1, 7, 4096] {
         let Some(Planning::CatchUp(mut walk)) = db
-            .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256)
+            .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256, false)
             .unwrap()
         else {
             panic!("expected a catch-up walk");
@@ -6282,8 +6283,9 @@ fn catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds() {
     for n in 2..=4 {
         converse(&mut db, "Bob", n);
     }
-    let Some(Planning::CatchUp(mut walk)) =
-        db.compaction_plan("Bob", 1, i64::MAX, 8192, 256).unwrap()
+    let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, false)
+        .unwrap()
     else {
         panic!("expected a catch-up walk");
     };
@@ -6315,8 +6317,9 @@ fn catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds() {
     let mut cuts = vec![plan.cut];
     let mut n = 5;
     converse(&mut db, "Bob", n);
-    while let Some(Planning::CatchUp(mut walk)) =
-        db.compaction_plan("Bob", 1, i64::MAX, 8192, 256).unwrap()
+    while let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, false)
+        .unwrap()
     {
         while !walk.done() {
             db.catch_up_piece(&mut walk, 16).unwrap();
@@ -6531,4 +6534,165 @@ fn lineage_checks_reject_a_node_on_another_branch_at_any_depth() {
         db.item("Branch", branch).unwrap()["content"][0]["text"],
         "r5"
     );
+}
+
+#[test]
+fn catch_up_steps_at_one_head_extend_the_summary_made_there() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let calls: Vec<(i64, i64)> = (0..40)
+        .map(|n| exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    let head = db.inspect("Bob").unwrap().head;
+    let max_bytes = 8192;
+    let plan = |db: &Database, again: bool| match db
+        .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256, again)
+        .unwrap()
+    {
+        None => None,
+        Some(Planning::Plan(plan)) => Some(plan),
+        Some(Planning::CatchUp(mut walk)) => {
+            while !walk.done() {
+                db.catch_up_piece(&mut walk, 16).unwrap();
+            }
+            db.catch_up_plan("Bob", walk).unwrap()
+        }
+    };
+    // No model call answers between the steps, as when a round overflows
+    // with a backlog several summarizer budgets long.
+    let mut steps: Vec<(CompactionPlan, Value)> = Vec::new();
+    while let Some(step) = plan(&db, !steps.is_empty()) {
+        let event = db
+            .compact(
+                "Bob",
+                &step,
+                &format!("summary {}", steps.len()),
+                None,
+                0,
+                agent_runtime::store::ContextUsage {
+                    bytes: max_bytes as usize,
+                    items: 256,
+                },
+            )
+            .unwrap();
+        if steps.is_empty() {
+            // A resumed call at this head does not summarize again.
+            assert!(plan(&db, false).is_none());
+        } else {
+            assert_eq!(
+                step.previous_summary,
+                Some(format!("summary {}", steps.len() - 1))
+            );
+            assert_eq!(step.ids.first(), Some(&steps.last().unwrap().0.cut));
+        }
+        let done = !step.catch_up;
+        steps.push((step, event));
+        assert!(steps.len() < 64, "catch-up does not converge");
+        if done {
+            break;
+        }
+    }
+    assert!(steps.len() > 2);
+    for (_, event) in &steps {
+        assert_eq!(event["data"]["version"], json!(head));
+        assert_eq!(event["data"]["previous"], Value::Null);
+    }
+    // The version at the head is the last step, cut at the newest round.
+    let (last, _) = steps.last().unwrap();
+    assert_eq!(
+        (last.cut, last.pinned),
+        (calls.last().unwrap().0, Some(prompt))
+    );
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(bot.compaction, head);
+    let window = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(window.ids[..2], [prompt, last.cut]);
+}
+
+#[test]
+fn a_version_a_fork_sees_is_not_extended_under_it() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    for n in 0..40 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 100));
+    }
+    let head = db.inspect("Bob").unwrap().head;
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 8192,
+        items: 256,
+    };
+    let plan = |db: &Database, again: bool| match db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, again)
+        .unwrap()
+    {
+        None => None,
+        Some(Planning::Plan(plan)) => Some(plan),
+        Some(Planning::CatchUp(mut walk)) => {
+            while !walk.done() {
+                db.catch_up_piece(&mut walk, 16).unwrap();
+            }
+            db.catch_up_plan("Bob", walk).unwrap()
+        }
+    };
+    let first = plan(&db, false).unwrap();
+    assert!(first.catch_up);
+    db.compact("Bob", &first, "summary 0", None, 0, limit)
+        .unwrap();
+    let floor = db.elision_plan("Bob", 4096, 1).unwrap().unwrap();
+    db.elide("Bob", &floor).unwrap();
+    // The next step is planned; a fork at the head binds both versions
+    // while its summary is being written.
+    let second = plan(&db, true).unwrap();
+    db.fork(
+        "Bob",
+        "Side",
+        Fork {
+            checkpoint: head,
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    let seen = db.window("Side", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(
+        db.compact("Bob", &second, "summary 1", None, 0, limit)
+            .unwrap_err()
+            .code,
+        "compaction_version_shared"
+    );
+    assert!(plan(&db, true).is_none());
+    let further = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    assert!(further.through > floor.through);
+    assert_eq!(
+        db.elide("Bob", &further).unwrap_err().code,
+        "elision_version_shared"
+    );
+    let after = db.window("Side", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(after.ids, seen.ids);
+    assert_eq!(after.elided, floor.through);
+    assert_eq!(after.compaction.unwrap().summary, "summary 0");
 }

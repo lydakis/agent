@@ -707,7 +707,14 @@ impl Turn {
             .await
         {
             Ok(_) => Ok(true),
-            Err(error) if error.code == "elision_not_forward" => Ok(false),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "elision_not_forward" | "elision_version_shared"
+                ) =>
+            {
+                Ok(false)
+            }
             Err(error) => Err(error),
         }
     }
@@ -816,14 +823,25 @@ impl Turn {
         if record.compaction_instructions.is_none() {
             return Ok(Overflow::Stuck);
         }
-        match self
-            .compact(record, model_rounds, turn, accounting, tools, (1, 1), None)
-            .await?
-        {
-            Compaction::Parked(until) => Ok(Overflow::Parked(until)),
-            Compaction::Skipped => Ok(Overflow::Stuck),
-            Compaction::Done => Ok(fits(self.fitted_context().await)?
-                .map_or(Overflow::Stuck, |context| Overflow::Fits(Box::new(context)))),
+        // A backlog larger than the summarizer's budget takes several
+        // catch-up steps at this head; each must shrink the view, and each
+        // counts as a model round, so the steps end.
+        loop {
+            match self
+                .compact(record, model_rounds, turn, accounting, tools, (1, 1), None)
+                .await?
+            {
+                Compaction::Parked(until) => return Ok(Overflow::Parked(until)),
+                Compaction::Skipped => return Ok(Overflow::Stuck),
+                Compaction::Done => {
+                    if let Some(context) = fits(self.fitted_context().await)? {
+                        return Ok(Overflow::Fits(Box::new(context)));
+                    }
+                    if *model_rounds >= MAX_ROUNDS {
+                        return Ok(Overflow::Stuck);
+                    }
+                }
+            }
         }
     }
 
@@ -854,8 +872,11 @@ impl Turn {
         // the reader's snapshot plans what the worker would. A catch-up walk
         // over a long backlog goes in pieces, so neither other bots' commits
         // nor their context reads wait behind all of it.
+        // Without `sent` the view cannot fit (overflow), and a summary
+        // already made at this head may take another step.
+        let again = sent.is_none();
         let plan = match self
-            .plan_compaction(keep, keep_items, max_bytes, max_items)
+            .plan_compaction(keep, keep_items, max_bytes, max_items, again)
             .await
         {
             Ok(Some(plan)) => plan,
@@ -1006,7 +1027,7 @@ impl Turn {
                 .await?;
             if matches!(
                 error.code.as_str(),
-                "compaction_not_smaller" | "compaction_context_limit"
+                "compaction_not_smaller" | "compaction_context_limit" | "compaction_version_shared"
             ) {
                 self.compaction_failed(turn, &error).await?;
                 return Ok(Compaction::Skipped);
@@ -1052,13 +1073,14 @@ impl Turn {
         keep_items: i64,
         max_bytes: i64,
         max_items: i64,
+        again: bool,
     ) -> Result<Option<agent_runtime::store::CompactionPlan>> {
         use agent_runtime::store::Planning;
         let bot = self.bot.clone();
         let planning = self
             .store
             .read("compaction_plan", move |db| {
-                db.compaction_plan(&bot, keep, keep_items, max_bytes, max_items)
+                db.compaction_plan(&bot, keep, keep_items, max_bytes, max_items, again)
             })
             .await?;
         let mut walk = match planning {

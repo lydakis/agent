@@ -93,6 +93,34 @@ class TurnCompactionTests(ModelFixture):
         self.assertEqual(ended['data']['status'], 'failed', ended)
         self.assertEqual(ended['data']['error'], 'context_limit', ended)
 
+    def test_a_turn_resumed_under_a_smaller_budget_takes_several_summary_steps(self):
+        # Twelve rounds of about 3 KiB fit 64 KiB; the call after them is
+        # paced, and the daemon restarts at 12 KiB. The resumed turn cannot
+        # fit, and one summarizer budget covers only a few of its rounds:
+        # the steps go on at that head, extending one version, until the
+        # view fits.
+        client = self.client(tools='shell', extra=('--context-bytes', '65536'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
+                       compaction_instructions='Summarize.')
+        self.model.pace_at = 12
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x150,2x1')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn, timeout=30)
+        client.close(kill=True)
+        drain(self.model)
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        extra=('--context-bytes', '12288'), tools='shell')
+        self.addCleanup(client.close)
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        requests = drain(self.model)
+        self.assertTrue(all(encoded(r['input']) <= 12288 for r in requests))
+        compacted = [e['data'] for e in all_events(client, 'Bob') if e['event'] == 'compacted']
+        steps = [c for c in compacted if c['catch_up']]
+        self.assertGreater(len(steps), 1)
+        self.assertEqual(len({c['version'] for c in steps}), 1)
+        self.assertEqual([c['cut'] for c in steps], sorted({c['cut'] for c in steps}))
+        self.assertEqual(sum(is_summary(r) for r in requests), len(compacted))
+
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicTurnCompactionTests(ModelFixture):

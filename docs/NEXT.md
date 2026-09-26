@@ -561,9 +561,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     the forced elision, and catch-up steps cut at rounds inside a turn too
     large for one step. A steer the turn had no room for is tried again at
     the boundary where elision or a summary makes some, rather than only
-    after the turn ends. Still open: an overflowing round whose one catch-up
-    step leaves the view over budget ends with `context_limit`, since one
-    step is recorded per head; steers absorbed before an in-turn cut are
+    after the turn ends. Catch-up steps and forced moves at one head extend
+    the version made there until the view fits, unless a fork taken
+    between them already sees it. Still open: steers absorbed before an in-turn cut are
     summarized, not kept verbatim like the prompt; and every window and
     planning walk traverses the item
     overflow pages because the metadata columns sit after `item`, where a

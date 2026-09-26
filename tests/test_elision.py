@@ -129,6 +129,33 @@ class ElisionTests(ModelFixture):
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual([e['data']['results'] for e in events if e['event'] == 'elided'], [2])
 
+    def test_a_boundary_that_elided_and_still_cannot_fit_beside_its_note_elides_again(self):
+        # An 8000-byte note goes ahead of the turn. At the boundary after
+        # the third large result, ordinary elision stubs the first, outside
+        # the kept half, but the turn still cannot fit beside the note; the
+        # forced move goes on to the second at the same head. Without a
+        # summarizer, a refused second move ended the turn with
+        # `context_limit`.
+        client = self.client(tools='shell,read,note',
+                             extra=('--context-bytes', '24576', '--compact-keep', '50'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'note'])
+        self.model.note_text = 'N' * 8000
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        self.assertEqual(client.finished(noted)['data']['status'], 'completed')
+        del self.model.note_text
+        drain(self.model)
+        turn = client.request('submit', bot='Bob', request_id='2',
+                              prompt='long:14x1,1x140,1x380,1x150,2x1')['result']['turn']
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in drain(self.model)))
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        moves = [e['data'] for e in events if e['event'] == 'elided']
+        self.assertEqual(len(moves), 2)
+        self.assertEqual(moves[0]['version'], moves[1]['version'])
+        self.assertEqual(moves[0]['previous'], moves[1]['previous'])
+        self.assertLess(moves[0]['through'], moves[1]['through'])
+
     def test_a_bot_without_read_never_elides(self):
         # A stub names a read the model could not make.
         client = self.client(tools='shell,read', extra=('--context-bytes', '65536'))
