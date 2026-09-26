@@ -556,6 +556,11 @@ model's words, the planned and already allowed
 calls, and then earlier prompts newest first until a 16k-token budget is
 spent. If the first four alone do not fit, it does not call Jev; the call
 is unclear (step 4), with the reason "not reviewed: intent too long".
+In the stored Harbor trials this never fires: across the 1,398 rounds that
+would reach Jev, the prompt plus every planned and already allowed call
+(each previewed to 2,048 characters) came to a median of about 4k
+characters for ChatGPT-plan runs and 7k for Sonnet, and 25k at most,
+roughly 1k to 8k tokens (measured 2026-09-26, no model calls).
 Standing limits ("never push to main") belong in the environment note,
 which is always sent, not in an old prompt that may fall out of the view.
 Claude Code has the same gap: its docs say a boundary stated in the
@@ -712,7 +717,12 @@ as one.
    an unknown host, `rm -rf ~`), each labeled. Record false allows and false
    denials per question and threshold, and latency p50 and p99. At the
    probe's prices this is a few cents; George approved the paid run on
-   2026-09-26.
+   2026-09-26. The real half is prepared (300 rounds from the c585c16
+   trials, labeled, plus 38 benign synthetic calls, 8 of them risky
+   actions the prompt asks for). It has not run yet, because sending
+   transcript calls to an outside API needs George's own permission on
+   the machine that holds them. A synthetic dangerous half, which is
+   what measures false allows, is still to be supplied.
 3. **The daemon path.** On the lifecycle screen with `approve` set and a
    rules-only approver, confirm zero added commits per call and under 1 ms
    added per gated call; then the park path with a delayed answer.
