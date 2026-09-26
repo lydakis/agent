@@ -6,8 +6,8 @@ cases that combine compaction with the runtime's other guarantees, run
 against scripted providers, and an evaluation of a real model on one
 synthetic repository task (roadmap [item 36](NEXT.md)). Written 2026-09-26.
 The acceptance cases pass. The evaluation has run twice live on the small
-task, recorded [below](#live-run-1); the large task at a realistic budget
-has not run live yet.
+task, recorded [below](#live-run-1), and once on the large task at a
+realistic budget ([live run 3](#live-run-3)).
 
 ## Acceptance cases
 
@@ -173,8 +173,11 @@ final files, and the benchmark after that check, commands repeated after
 the first compaction, retrieval calls (`history`, or `read` of a `result/` reference),
 compactions, elisions, the view each model call was made under (its
 summary version and cut, and its elision floor), input, cached input, and output tokens for the model and the
-summarizer separately, and summarizer latency from its send to the send of
-the model call it held back. Failed summaries are live-only events, so the
+summarizer separately, summarizer latency from its send to the send of
+the model call it held back, and for each installed summary whether it was
+a catch-up step (always a request of its own, never a copy), the bytes it
+summarized and the view they came from, and its summarizer calls and
+tokens. Failed summaries are live-only events, so the
 runner collects them as they arrive. The workspace's own tools record
 each run of `tools/env-check`, `make check`, and the benchmark with its
 exit status and a digest of the workspace's files, dotfiles and bytecode
@@ -224,7 +227,9 @@ wait
 ```
 
 Each JSON file records its binary's digest, which tells the two
-`large-summary` arms apart.
+`large-summary` arms apart. `--context-bytes N` gives every condition the
+run names the budget N instead of its own, for example to run the
+`large-` arms at 128 KiB beside a `large-full` run without it.
 
 ## Live run 1
 
@@ -362,6 +367,57 @@ Per correct task, compact sent 25,637 uncached input tokens (model and
 summarizer) against full's 12,669. The task is short enough that full
 context never grows large, so here compacting costs more than it saves;
 the 20 KiB budget exists to force boundaries, not to save tokens.
+
+## Live run 3
+
+2026-09-26, 19:35 to 19:39 UTC, commit `e707632`, `chatgpt/gpt-6-sol` on
+the ChatGPT plan with Codex's login, seed 7, the large task, five bots per
+arm, all four arms at once, each in its own daemon on macOS arm64. The fresh
+arm ran the copy-off build (binary digest `de6b3569…`), the other three the
+commit's own (`ed2e4ece…`). No API key was used. The JSON files are kept in
+the ignored `.local/` directory of the machine that ran them.
+
+| | large-compact | large-summary, copy | large-summary, fresh | large-full |
+| --- | --- | --- | --- | --- |
+| Budget | 256 KiB | 256 KiB | 256 KiB | 4 MiB |
+| Completed, correct, steered, vendor intact, migrated once | 5/5 each | 5/5 each | 5/5 each | 5/5 each |
+| Number reported | 4/5 | 5/5 | 5/5 | 5/5 |
+| `make quick` runs | 0, 0, 1, 0, 0 | none | 0, 0, 1, 1, 0 | 0, 0, 0, 1, 0 |
+| Bots that compacted / stub passes | 0 / 0 | 1 / 0 | 1 / 0 | 0 / 0 |
+| Peak input tokens per bot | 25,394 to 37,289 | 25,127 to 55,574 | 37,026 to 63,207 | 25,271 to 82,585 |
+| Model calls | 69 | 69 | 68 | 71 |
+| Model input / cached / output tokens | 1,800,945 / 1,610,624 / 8,090 | 2,063,297 / 1,799,808 / 7,041 | 2,485,180 / 2,189,824 / 7,006 | 2,478,429 / 2,220,544 / 14,574 |
+| Summarizer input / cached / output tokens | none | 73,668 / 54,400 / 729 | 54,079 / 0 / 571 | none |
+| Summary time holding the model back | none | 16.5 s | 12.4 s | none |
+| Condition wall time | 90.2 s | 93.9 s | 106.5 s | 218.6 s |
+
+- The task rarely reached the budget. Its required steps print about
+  357 KB, but no bot's context passed 82,585 tokens, and 13 of the 15 bots
+  at 256 KiB never reached the 75% trigger, so neither stubs nor summaries
+  ran. The peaks imply that the model read the long outputs filtered or in
+  part rather than whole; the runner does not collect commands, so that is
+  inferred.
+- Without a compaction, `large-compact` and `large-full` ran the same
+  path, and their totals still differ: full context sent 38% more input,
+  mostly from one bot that peaked at 82,585 tokens. Five bots per arm do
+  not separate differences smaller than that.
+- One summary per summary arm. The copy sent 73,668 input tokens and read
+  54,400 (74%) from cache; the fresh request sent 54,079 and read none. The
+  copy is the larger request because it carries the bot's instructions,
+  tools, and whole view, including the result that crossed the trigger.
+  Counting cached input at a tenth of the price, the copy cost 24,708
+  token-equivalents against 54,079, 54% less. It took 16.5 s against
+  12.4 s and wrote 729 output tokens against 571. With one summary each,
+  this is a direction, not a result.
+- The one answer without the benchmark's number came from a bot that ran
+  the benchmark after its passing check and never compacted, so no
+  compaction lost it.
+
+The copy needs more summaries than this task makes at 256 KiB. The next
+run repeats the three 256 KiB arms at 128 KiB (`--context-bytes 131072`),
+beside `large-full` at 4 MiB, with ten bots each. By this run's peaks,
+most bots would pass a 128 KiB trigger, and each summary would still be
+about ten times the size of the 20 KiB test's.
 
 ## Not covered yet
 

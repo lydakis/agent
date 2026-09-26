@@ -476,6 +476,23 @@ def score(root, facts, events, answer):
     def total(rows, field):
         return sum(row.get(field) or 0 for row in rows)
 
+    # Each summary installed, with the summarizer calls it took and what
+    # it summarized: a catch-up step always sends a request of its own; any
+    # other on the turn's model is a copy unless the copy would not fit.
+    summaries, spent = [], []
+    for event in events:
+        data = event['data']
+        if event['event'] == 'usage' and data.get('purpose') == 'compaction':
+            spent.append(data)
+        elif event['event'] == 'compacted':
+            summaries.append({'catch_up': data.get('catch_up'), 'span_bytes': data.get('bytes'),
+                              'view_bytes': (data.get('context_before') or {}).get('bytes'),
+                              'limit_bytes': (data.get('input_limit') or {}).get('bytes'),
+                              'calls': len(spent), 'input_tokens': total(spent, 'input_tokens'),
+                              'cached_input_tokens': total(spent, 'cached_input_tokens'),
+                              'output_tokens': total(spent, 'output_tokens')})
+            spent = []
+
     # A summary's latency: from its send to the send of the model call it
     # held back, which also counts recording the compaction. Attempts in a
     # row, such as a retry after one that failed, are one interval.
@@ -519,12 +536,14 @@ def score(root, facts, events, answer):
         'summarizer_cached_input_tokens': total(summarizer, 'cached_input_tokens'),
         'summarizer_output_tokens': total(summarizer, 'output_tokens'),
         'summarizer_ms': held,
+        'summaries': summaries,
     }
 
 
-def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, timeout):
+def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, timeout, context_bytes=None):
     provider, family, url, key_env = spec
     size, budget, tools = CONDITIONS[condition]
+    budget = context_bytes or budget
     root = Path(tempfile.mkdtemp(prefix=f'long-task-{condition}-', dir=out_dir))
     client = Client(binary, root / 'state.sqlite', url, tools=tools, model=model, key_env=key_env, env=env,
                     provider=provider, family=family, extra=('--context-bytes', str(budget)))
@@ -635,6 +654,7 @@ def main():
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--timeout', type=float, default=1800, help='seconds to wait for any event')
     parser.add_argument('--binary', type=Path, default=Path('.local/target/release/agent'))
+    parser.add_argument('--context-bytes', type=int, help="every condition's budget instead of its own")
     args = parser.parse_args()
     provider, model = args.model.split('/', 1)
     family, url, key_env = ENDPOINTS[provider]
@@ -649,7 +669,7 @@ def main():
     blocks = []
     for condition in args.conditions:
         block = run_condition(args.binary.resolve(), (provider, family, url, key_env), model, condition,
-                              args.trials, out_dir, env, args.seed, args.timeout)
+                              args.trials, out_dir, env, args.seed, args.timeout, args.context_bytes)
         blocks.append(block)
         print(json.dumps(summarize(block)), flush=True)
         args.out.write_text(json.dumps({'binary_sha256': file_hash(args.binary), 'model': args.model,

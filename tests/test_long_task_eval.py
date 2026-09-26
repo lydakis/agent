@@ -279,16 +279,17 @@ class LongTaskRunnerTests(ModelFixture):
     def test_at_the_realistic_budget_stubs_make_room_unless_the_bot_lacks_read(self):
         # The large task outgrows 256 KiB. With `read`, stubbing answered
         # results alone makes room, so no summary runs; without it,
-        # summaries must, which is what the copy is measured on.
+        # summaries must, which is what the copy is measured on. A budget
+        # given for the run replaces the condition's own.
         spec = ('openai', 'responses', self.url, None)
-        for condition in ('large-compact', 'large-summary'):
-            with self.subTest(condition=condition):
+        for condition, budget in (('large-compact', None), ('large-summary', None), ('large-summary', 128 << 10)):
+            with self.subTest(condition=condition, budget=budget):
                 self.model.task_step = 0
                 self.model.task_script = list(SCRIPT)
                 with patch.object(long_task_eval, 'COMPACTION', 'Summarize.'):
                     block = run_condition(self.binary, spec, 'synthetic-model', condition, 1, self.path,
-                                          clean_env(), 7, timeout=60)
-                self.assertEqual(block['context_bytes'], 256 << 10)
+                                          clean_env(), 7, timeout=60, context_bytes=budget)
+                self.assertEqual(block['context_bytes'], budget or 256 << 10)
                 result = block['bots'][f'{condition}-0']
                 self.assertEqual(result['status'], 'completed', result)
                 self.assertEqual(result['steer'], 'steered')
@@ -303,4 +304,12 @@ class LongTaskRunnerTests(ModelFixture):
                     self.assertEqual(result['elisions'], 0)
                     self.assertGreaterEqual(result['compactions'], 1)
                     self.assertEqual(result['summarizer_calls'], result['compactions'])
+                # Each installed summary names its span and what it cost.
+                self.assertEqual(len(result['summaries']), result['compactions'])
+                for summary in result['summaries']:
+                    self.assertEqual(summary['calls'], 1)
+                    self.assertGreater(summary['span_bytes'], 0)
+                    self.assertLessEqual(summary['view_bytes'], summary['limit_bytes'])
+                self.assertEqual(sum(s['input_tokens'] for s in result['summaries']),
+                                 result['summarizer_input_tokens'])
                 self.assertGreater(result['peak_input_tokens'], 0)
