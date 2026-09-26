@@ -130,9 +130,79 @@ class DaemonTests(ModelFixture):
             self.assertIn(label, operations, sorted(operations))
             self.assertEqual(sum(operations[label]['ran']), operations[label]['count'])
             self.assertEqual(sum(operations[label]['queued']), operations[label]['count'])
-            self.assertGreaterEqual(operations[label]['slowest_ms'], 0)
+            self.assertEqual(sum(operations[label]['answered']), operations[label]['count'])
+            self.assertGreaterEqual(operations[label]['slowest_answered_ms'], operations[label]['slowest_ms'])
         self.assertEqual(sum(o['count'] for o in operations.values()), stats['store']['jobs'])
+        self.assertEqual(stats['store']['storage_errors'], 0)
+        # Every write group is counted once, by size and by its oldest job's
+        # wait from queueing to its answer.
+        groups = stats['store']['groups']
+        self.assertEqual(groups['size_bounds'], [1, 2, 4, 8, 16, 32])
+        self.assertEqual(sum(groups['sizes']), groups['count'])
+        self.assertEqual(sum(groups['oldest']), groups['count'])
+        self.assertGreaterEqual(groups['count'], operations['commit']['count'])
+        self.assertGreaterEqual(groups['jobs'], groups['count'])
         self.assertEqual(stats['handles'], {'waiters': 0, 'retained': 0})
+
+    def test_admissions_sent_together_answer_in_order_and_start_once(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        bots = [f'b{n}' for n in range(8)]
+        requests = [dict(op='create', bot=bot, workspace=str(self.path), model='openai/synthetic-model',
+                         instructions='Test agent.', tools=['echo']) for bot in bots]
+        requests += [dict(op='submit', bot=bot, request_id='r1', prompt='hi') for bot in bots]
+        requests += [dict(op='submit', bot='b0', request_id='r1', prompt='hi'), dict(op='stats')]
+        # One write carries every request: each submission sees the creation
+        # queued before it, and the replies keep request order.
+        together = Connection(client.socket_path)
+        self.addCleanup(together.close)
+        together.socket.sendall(''.join(json.dumps(dict(id=n, **r)) + '\n' for n, r in enumerate(requests)).encode())
+        replies = [together.receive(lambda e: 'id' in e and 'event' not in e) for _ in requests]
+        self.assertEqual([r['id'] for r in replies], list(range(len(requests))))
+        for reply in replies[:8]:
+            self.assertIn('result', reply, reply)
+        started = [r['result'] for r in replies[8:16]]
+        self.assertEqual([s['duplicate'] for s in started], [False] * 8)
+        self.assertEqual(replies[16]['result']['duplicate'], True)
+        self.assertEqual(replies[16]['result']['turn'], started[0]['turn'])
+        self.assertEqual(replies[17]['result']['store']['operations']['begin']['count'], 9)
+        # The same submission from several clients at once runs once.
+        clients = [Connection(client.socket_path) for _ in range(4)]
+        for connection in clients:
+            self.addCleanup(connection.close)
+        line = json.dumps(dict(id=1, op='submit', bot='b7', request_id='r2', prompt='hi', delivery='queue')) + '\n'
+        for connection in clients:
+            connection.socket.sendall(line.encode())
+        answers = [c.receive(lambda e: e.get('id') == 1)['result'] for c in clients]
+        self.assertEqual(sorted(a['duplicate'] for a in answers), [False, True, True, True])
+        self.assertEqual({a['turn'] for a in answers}, {answers[0]['turn']})
+        everyone = Connection(client.socket_path)
+        self.addCleanup(everyone.close)
+        everyone.request('follow', bot='*', after=0)
+        for turn in {s['turn'] for s in started} | {answers[0]['turn']}:
+            self.assertEqual(everyone.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(len([e for e in everyone.durable if e['event'] == 'turn_finished']), 9)
+
+    def test_large_creations_sent_together_all_answer(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        # Each reply repeats both texts, so 32 replies are twice what one
+        # session's output queue holds at once.
+        text = 'x' * (64 * 1024)
+        creates = [dict(op='create', bot=f'big{n}', workspace=str(self.path), model='openai/synthetic-model',
+                        instructions=text, compaction_instructions=text, tools=['echo']) for n in range(32)]
+        lines = [dict(id=n, **r) for n, r in enumerate(creates)] + [dict(id=len(creates), op='stats')]
+        # A bad id is refused after the admission queued before it.
+        lines.insert(1, dict(id=dict(bad=True), op='submit', bot='big0', request_id='r1', prompt='hi'))
+        together = Connection(client.socket_path)
+        self.addCleanup(together.close)
+        together.socket.sendall(''.join(json.dumps(line) + '\n' for line in lines).encode())
+        replies = [together.receive(lambda e: 'id' in e and 'event' not in e) for _ in lines]
+        self.assertEqual([r['id'] for r in replies], [0, None, *range(1, len(creates) + 1)])
+        self.assertEqual(replies[1]['error'], 'invalid_request_id')
+        for reply in replies[:1] + replies[2:-1]:
+            self.assertEqual(reply['result']['instructions'], text)
+        self.assertIn('result', replies[-1])
 
     def test_stats_count_shared_transport_once_across_providers(self):
         self.model.release_headers = threading.Event()

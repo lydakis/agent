@@ -5,9 +5,14 @@ first-class design target. Since 2026-09-15 stored history is unbounded and each
 request carries a bounded context window of whole turns with an explicit
 omission note and a `history` tool for retrieval; see
 [RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#long-history-and-context-windows) and the
-[measurements](DAEMON_MEASUREMENTS.md#long-history). Compaction with summaries,
-versioned context views, and checkpoint indexes for old-node lookups remain
-future work described below.
+[measurements](DAEMON_MEASUREMENTS.md#long-history). Since 2026-09-19 the
+daemon also compacts a conversation of many turns into a versioned summary
+while keeping the original history and fork semantics
+([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md#compaction),
+[measurements](DAEMON_MEASUREMENTS.md#compaction)). Still future work, as
+described below: compaction inside one long turn, and checkpoint indexes for
+old-node lookups. [EVIDENCE.md](EVIDENCE.md#operational-behavior) has the
+current state.
 
 ## Separate the lifetimes
 

@@ -2057,6 +2057,78 @@ fn deleting_a_bot_frees_only_its_exclusive_history() {
 }
 
 #[test]
+fn completion_retention_prunes_one_piece_of_the_oldest_turns() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=7 {
+        converse(&mut db, "Bob", n);
+    }
+    // A backlog drains a piece per completion, so no one job rewrites a
+    // long history: six turns past the one kept, three events each.
+    let piece = Database::RETENTION_PIECE;
+    assert_eq!(
+        db.prune_except("Bob", 1, None).unwrap()["events"],
+        3 * piece
+    );
+    assert_eq!(
+        db.prune_except("Bob", 1, None).unwrap()["events"],
+        3 * (6 - piece)
+    );
+    assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
+    let left = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "turn_finished")
+        .count();
+    assert_eq!(left, 1);
+}
+
+#[test]
+fn completion_retention_passes_turns_whose_processes_still_run() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let piece = Database::RETENTION_PIECE;
+    let mut processes = Vec::new();
+    for n in 0..piece {
+        let turn = db
+            .begin(
+                "Bob",
+                &format!("bg{n}"),
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        processes.push(db.process_start(turn, "bg").unwrap());
+        db.append(turn, vec![assistant("launched")], &[], None)
+            .unwrap();
+        db.finish(turn, None).unwrap();
+    }
+    for n in 1..=3 {
+        converse(&mut db, "Bob", n);
+    }
+    // The oldest piece launched processes that still run: pruning keeps
+    // their rows, and the next pass must reach the two turns after them.
+    assert!(
+        db.prune_except("Bob", 1, None).unwrap()["events"]
+            .as_i64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 3 * 2);
+    assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
+    assert_eq!(db.running_processes().unwrap(), piece as i64);
+    // A process that ends makes its turn prunable again.
+    db.process_finish(processes[0], &json!({"stdout":"done"}), &[])
+        .unwrap();
+    db.prune_except("Bob", 1, None).unwrap();
+    assert!(db.process_result(processes[0]).unwrap().is_none());
+}
+
+#[test]
 fn pruning_keeps_the_transcript_and_marks_the_replay_gap() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();
@@ -2944,6 +3016,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
         .iter()
         .map(|p| match p {
             Publication::Event(e) => e["event"].as_str().unwrap(),
+            Publication::Through(_) => "through",
             Publication::Finished { .. } => "finished",
         })
         .collect();
@@ -3003,6 +3076,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
     db.publish_since(&mut watermark, |p| {
         order.push(match p {
             Publication::Event(e) => e["event"].as_str().unwrap().to_owned(),
+            Publication::Through(through) => format!("through:{through}"),
             Publication::Finished { turn, .. } => format!("finished:{turn}"),
         });
         true

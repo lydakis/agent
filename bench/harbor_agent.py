@@ -281,8 +281,10 @@ class Agent(BaseInstalledAgent):
                     usage.n_cache_tokens += sign * attempt['cached_input_tokens']
                     usage.n_output_tokens += sign * attempt['output_tokens']
         # Cache writes are inside input tokens; they are priced above input,
-        # hour-long ones higher still.
+        # hour-long ones higher still. Each billed attempt also counts as a
+        # call on the model that ran it.
         writes: dict[str, tuple[int, int]] = {}
+        served: dict[str, int] = {}
         for model, data in events:
             provider = model.split('/', 1)[0] + '/' if '/' in model else ''
             for attempt in data.get('models') or [data]:
@@ -290,6 +292,7 @@ class Agent(BaseInstalledAgent):
                 total, hourly = writes.get(key, (0, 0))
                 writes[key] = (total + attempt.get('cache_write_tokens', 0),
                                hourly + attempt.get('cache_write_1h_tokens', 0))
+                served[key] = served.get(key, 0) + 1
         # A turn sticky routing served entirely elsewhere leaves nothing to price.
         for model in moved:
             usage = models[model]
@@ -311,6 +314,19 @@ class Agent(BaseInstalledAgent):
                                 for key in ('model_rounds', 'retries', 'paced_ms')}
             context.metadata['status'] = [t['status'] for t in turns if t['bot'] == BOT]
             context.metadata['bots'] = len({t['bot'] for t in turns})
+            # A bot the task delegated to chose its own settings.
+            context.metadata['bot_settings'] = {
+                t['bot']: {'reasoning': t['reasoning'], 'fallbacks': bool(t['fallbacks'])}
+                for t in turns}
+        # Two arms asking for one model are matched only if both ran it, so
+        # say what was asked and what answered. Without the store only the
+        # task bot's stream is left, and a deleted bot takes its records with
+        # it, so then what answered is unknown.
+        unrecorded = self._unrecorded_input(events) if turns else None
+        context.metadata = {**(context.metadata or {}), 'requested_model': self.model_name,
+                            'served_calls': served if unrecorded == 0 else None}
+        if unrecorded:
+            context.metadata['unrecorded_input_tokens'] = unrecorded
 
     def _store_turns(self) -> list[dict[str, Any]] | None:
         """Every turn in the store copied after the daemon exited, or None when
@@ -329,7 +345,7 @@ class Agent(BaseInstalledAgent):
                 return [dict(row) for row in db.execute(
                     "SELECT t.bot,COALESCE(t.model,b.provider||'/'||b.model) AS model,t.status,"
                     't.input_tokens,t.cached_input_tokens,t.output_tokens,'
-                    't.model_rounds,t.retries,t.paced_ms '
+                    't.model_rounds,t.retries,t.paced_ms,b.reasoning,b.fallbacks '
                     'FROM turns t JOIN bots b ON b.name=t.bot ORDER BY t.id')]
         except sqlite3.Error:
             return None
@@ -348,6 +364,22 @@ class Agent(BaseInstalledAgent):
                     "WHERE e.kind='usage'")]
         except sqlite3.Error:
             return []
+
+    def _unrecorded_input(self, events: list[tuple[str, dict[str, Any]]]) -> int | None:
+        """Input tokens the daemon counted that no stored usage event holds,
+        or None when its count was not saved.
+
+        `agent stats` runs just before shutdown and its totals only grow, so
+        a shortfall means records left the store: `agent rm` deletes a
+        finished helper's turns and events, and a call cut off by shutdown
+        may be counted but never committed.
+        """
+        try:
+            stats = json.loads((self.logs_dir / 'stats.json').read_text())
+            counted = int(stats['tokens']['input_tokens'])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        return max(0, counted - sum(data.get('input_tokens', 0) for _, data in events))
 
     def _streamed_usage(self) -> list[dict[str, Any]] | None:
         """The task bot's per-call usage events, streamed as they happened.

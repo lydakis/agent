@@ -721,11 +721,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     their claim, not ours. The prototype is built: family `responses-ws`,
     one connection per bot, delta input only when the request extends the
     previous one exactly, the full input on every other case including
-    `previous_response_not_found`; the store stays the only history. Next,
-    the matched HTTP versus WebSocket screen in
-    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap, with a
-    prompt cache key in both arms. Open: lanes to share a connection among
-    bots, pacing without per-call headers, and HTTP after a failed upgrade.
+    `previous_response_not_found`; the store stays the only history. HTTP
+    stays the default. Next, the matched experiment in
+    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan): per-call bytes and time to
+    first token, the turn-state token on the socket, then a synthetic
+    resource screen with a synchronized loss of continuation state and a live
+    screen on the ChatGPT plan. Before any default change, an
+    [aggregate bound on full-send bytes](WEBSOCKET.md#a-bound-on-concurrent-full-send-bytes).
+    Open: lanes to share a connection among bots, pacing without per-call
+    headers, and HTTP after a failed upgrade.
 41. Several daemons, moving bots, and watching them: the
     [provisional roadmap](MULTI_DAEMON.md) separates shared durability,
     identity, admission, and execution-ownership contracts from later
@@ -802,22 +806,39 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     [instrumented operational follow-up](DAEMON_MEASUREMENTS.md#instrumented-operational-follow-up)
     passed replay, compaction and restart checks without reproducing that
     slowdown. A concurrent admission probe confirms serial acknowledgements,
-    but also exposed one unreproduced storage failure. Safe SQLite codes now
-    survive statement and group-commit failures; 81 diagnostic-build admission
-    retries passed with disk-space capture. A matched mixed-load screen found
-    no material regression, but the original failure remains unresolved
-    ([diagnostics](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics)). Resolve
-    that concern before changing concurrency. Next, admission
-    and creation: commits still account for about 82% of measured store
-    execution, and the service awaits admission commits before
-    handling another request. Letting those jobs group needs a design for
-    capacity reservation, same-bot ordering, and item 21's guarantees. Client
-    acknowledgements, publication, and provider execution must stay after
-    commit. Also done: on macOS
-    the store sets `fullfsync` and `checkpoint_fullfsync`, because a plain
-    fsync there leaves commits in the drive cache. A flush costs about
-    5.4 ms on an M1 Max, paid once per group; the service loop above now
-    matters on a Mac as much as on slow Linux storage.
+    but also exposed one storage failure. Safe SQLite codes now survive
+    statement and group-commit failures; 81 diagnostic-build admission
+    retries passed with disk-space capture, and a matched mixed-load screen
+    found no material regression ([diagnostics](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics)).
+    The failure's likely cause is a full disk
+    ([cause and containment](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment)):
+    the host had about 150–250 MB free, the system log shows `ENOSPC` 22 ms
+    after the failed commit, and one refused completion made the daemon exit.
+    An injected full disk reproduces both paths on the current build. Each
+    job's savepoint journal no longer spills to a temporary file (each
+    admission wrote one), and a completion the store refuses is retried
+    rather than ending the daemon. The original SQLite codes were never
+    captured, so the cause stays an inference. Appends that store a reply
+    are not retried; a turn whose reply cannot be stored still fails. Then
+    admission and creation, where commits were about 82% of measured storage
+    execution (job and commit time on the storage worker, not task time or
+    daemon CPU) and the service awaited each commit before reading the next
+    request. Now up to 32 admissions queue at once and share commits; each
+    is answered after its commit, in request order, and any other request
+    waits for them. A submission that may start a turn holds an active slot
+    until answered, so a burst gets the answers it would one at a time.
+    Acknowledgements, publication and provider execution stay after commit
+    ([measured](DAEMON_MEASUREMENTS.md#admission-window): 32 simultaneous
+    submissions answered in 5.3 ms instead of 47 ms, and 7.9 ms instead of
+    131 ms at a 2 ms sync, with about a third of the daemon CPU; 64 sustained bots
+    at a 10 ms sync went from 56 to 131 turns per second; a lone admission
+    is unchanged). `stats` reports group sizes and each group's oldest wait,
+    the evidence a group work or byte budget would need; none is added.
+    Also done: on macOS the store sets `fullfsync` and
+    `checkpoint_fullfsync`, because a plain fsync there leaves commits in
+    the drive cache. A flush costs about 5.4 ms on an M1 Max, paid once per
+    group, so a Mac should resemble the injected-delay rows above; the
+    window has not been measured there.
 
 45. Approving tool calls. Every allowed call runs without a verdict today,
     and that stays the default. [The design](APPROVALS.md) adds two more
@@ -839,6 +860,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Next: a labeled dangerous set to
     measure false allows before thresholds are fixed.
+46. The model that answered. A usage event names a model other than the
+    requested one only when Anthropic's fallback splits a call or a
+    summarizer runs elsewhere. Keep the model each provider names in its
+    response, stored only when it differs from the requested name, so a task
+    comparison can show what served every call, as Claude Code's records
+    already do ([the gap](COMPARISON_CONTRACT.md#task-comparisons)).
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

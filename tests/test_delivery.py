@@ -47,11 +47,12 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(waited['result']['results'][handle]['status'], 'interrupted')
         # A completion never prunes its own records: the last cancellation's
         # terminal event is published and replayable until the next pass,
-        # alongside the one retention keeps.
+        # alongside the one retention keeps. Its pass could prune the six
+        # turns between them and removes one piece, the oldest four.
         self.assertEqual(client.request('result', bot='Bob', turn=queued[0])['result']['status'], 'interrupted')
         self.assertEqual(client.request('result', bot='Bob', turn=queued[1])['error'], 'turn_result_pruned')
         terminal = [e for e in self.events(client, 'Bob') if e['event'] == 'turn_finished']
-        self.assertEqual([e['turn'] for e in terminal], [queued[-1], queued[0]])
+        self.assertEqual([e['turn'] for e in terminal], [queued[-1], queued[-2], queued[-3], queued[0]])
         self.assertEqual(client.request('stats')['result']['queued_turns'], 0)
         self.model.release_headers.set()
         client.finished(first)

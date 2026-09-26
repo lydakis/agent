@@ -34,16 +34,27 @@ trait Job: Send {
     fn run(&mut self, db: &mut Database);
     fn pruning_bot(&self) -> Option<&str>;
     fn error(&self) -> Option<&Error>;
+    fn timing(&self) -> Timing;
     fn answer(self: Box<Self>, failure: Option<&Error>);
+}
+/// A job's clock readings, counted once its group is answered: when it was
+/// queued, how long it waited for the worker, and how long it ran. A job
+/// that never ran (its group could not begin) waited until its answer.
+#[derive(Clone, Copy)]
+struct Timing {
+    label: &'static str,
+    queued: std::time::Instant,
+    waited_ns: u64,
+    ran_ns: Option<u64>,
+    /// Answered `storage_error`: its own SQLite failure, or its group's.
+    storage_error: bool,
 }
 struct Queued<F, T> {
     operation: Option<F>,
     pruning_bot: Option<String>,
     outcome: Option<Result<T>>,
     reply: oneshot::Sender<Result<T>>,
-    label: &'static str,
-    queued: std::time::Instant,
-    counters: std::sync::Arc<Counters>,
+    timing: Timing,
 }
 impl<F, T> Job for Queued<F, T>
 where
@@ -55,11 +66,8 @@ where
         if let Some(operation) = self.operation.take() {
             self.outcome = Some(operation(db));
         }
-        self.counters.record(
-            self.label,
-            (started - self.queued).as_nanos() as u64,
-            started.elapsed().as_nanos() as u64,
-        );
+        self.timing.waited_ns = (started - self.timing.queued).as_nanos() as u64;
+        self.timing.ran_ns = Some(started.elapsed().as_nanos() as u64);
     }
     fn pruning_bot(&self) -> Option<&str> {
         self.pruning_bot.as_deref()
@@ -68,6 +76,9 @@ where
         self.outcome
             .as_ref()
             .and_then(|outcome| outcome.as_ref().err())
+    }
+    fn timing(&self) -> Timing {
+        self.timing
     }
     fn answer(self: Box<Self>, failure: Option<&Error>) {
         // A job's own error was decided against writes that the failed
@@ -80,14 +91,23 @@ where
         let _ = self.reply.send(outcome);
     }
 }
-/// Storage worker counters: how long jobs queued for the worker versus how
-/// long they ran on it, in total and per operation. The split says whether
-/// the worker or the disk is the bottleneck; the per-operation histograms
-/// say which jobs make the tail. Three clock reads and one short lock per
-/// job; no allocation once an operation has been seen.
+/// Storage worker counters: how long jobs queued for the worker, how long
+/// they ran on it, and how long until their callers were answered, in total
+/// and per operation. Queued versus ran says whether the worker or the disk
+/// is the bottleneck; answered adds the wait for the rest of the group and
+/// its commit, which a cheap job pays when it shares a group with costly
+/// ones. The per-operation histograms say which jobs make the tail, and the
+/// group record says how large groups get and how long each one's oldest job
+/// waited for its answer. One short lock per group, and per read; no
+/// allocation once an operation has been seen.
 #[derive(Default)]
 pub struct Counters {
-    operations: std::sync::Mutex<std::collections::HashMap<&'static str, Operation>>,
+    inner: std::sync::Mutex<Inner>,
+}
+#[derive(Default, Clone)]
+struct Inner {
+    operations: std::collections::HashMap<&'static str, Operation>,
+    groups: Groups,
 }
 /// Upper bounds of the latency buckets, in microseconds; the last bucket is
 /// everything above the last bound. Log-spaced, so a histogram of fourteen
@@ -96,14 +116,44 @@ pub const BUCKETS_US: [u64; 13] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
     1_000_000,
 ];
+/// Upper bounds of the group-size buckets, in jobs; the last is the cap.
+const GROUP_SIZES: [usize; 6] = [1, 2, 4, 8, 16, GROUP_JOBS];
 #[derive(Default, Clone)]
 struct Operation {
     count: u64,
     queued_ns: u64,
     ran_ns: u64,
+    answered_ns: u64,
     slowest_ns: u64,
+    slowest_answered_ns: u64,
+    storage_errors: u64,
     ran: [u64; BUCKETS_US.len() + 1],
     queued: [u64; BUCKETS_US.len() + 1],
+    answered: [u64; BUCKETS_US.len() + 1],
+}
+impl Operation {
+    fn add(&mut self, queued_ns: u64, ran_ns: u64, answered_ns: u64, storage_error: bool) {
+        self.count += 1;
+        self.storage_errors += u64::from(storage_error);
+        self.queued_ns += queued_ns;
+        self.ran_ns += ran_ns;
+        self.answered_ns += answered_ns;
+        self.slowest_ns = self.slowest_ns.max(ran_ns);
+        self.slowest_answered_ns = self.slowest_answered_ns.max(answered_ns);
+        self.ran[bucket(ran_ns)] += 1;
+        self.queued[bucket(queued_ns)] += 1;
+        self.answered[bucket(answered_ns)] += 1;
+    }
+}
+/// Answered groups: how many jobs each carried, and how long each group's
+/// oldest job waited from queueing to its answer.
+#[derive(Default, Clone)]
+struct Groups {
+    count: u64,
+    jobs: u64,
+    sizes: [u64; GROUP_SIZES.len()],
+    oldest: [u64; BUCKETS_US.len() + 1],
+    slowest_oldest_ns: u64,
 }
 fn bucket(ns: u64) -> usize {
     let us = ns / 1_000;
@@ -113,40 +163,112 @@ fn bucket(ns: u64) -> usize {
         .unwrap_or(BUCKETS_US.len())
 }
 impl Counters {
-    fn record(&self, label: &'static str, queued_ns: u64, ran_ns: u64) {
-        let mut operations = self.operations.lock().unwrap();
-        let operation = operations.entry(label).or_default();
-        operation.count += 1;
-        operation.queued_ns += queued_ns;
-        operation.ran_ns += ran_ns;
-        operation.slowest_ns = operation.slowest_ns.max(ran_ns);
-        operation.ran[bucket(ran_ns)] += 1;
-        operation.queued[bucket(queued_ns)] += 1;
+    /// A job answered as soon as it ran: reads, which join no group. The
+    /// answer leaves once this lock is released, so waiting for it counts.
+    fn record(
+        &self,
+        label: &'static str,
+        queued: std::time::Instant,
+        started: std::time::Instant,
+        storage_error: bool,
+    ) {
+        let ran_ns = started.elapsed().as_nanos() as u64;
+        let mut inner = self.inner.lock().unwrap();
+        inner.operations.entry(label).or_default().add(
+            started.saturating_duration_since(queued).as_nanos() as u64,
+            ran_ns,
+            queued.elapsed().as_nanos() as u64,
+            storage_error,
+        );
+    }
+    /// A group whose callers are answered once this lock is released, with
+    /// its COMMIT time when it began.
+    fn group(&self, jobs: impl Iterator<Item = Timing>, commit_ns: Option<u64>) {
+        let mut inner = self.inner.lock().unwrap();
+        // A `stats` snapshot holding the lock delays every answer.
+        let answered = std::time::Instant::now();
+        let (mut oldest, mut size) = (0, 0);
+        for job in jobs {
+            size += 1;
+            let residence = answered.saturating_duration_since(job.queued).as_nanos() as u64;
+            oldest = oldest.max(residence);
+            let (queued_ns, ran_ns) = match job.ran_ns {
+                Some(ran_ns) => (job.waited_ns, ran_ns),
+                None => (residence, 0),
+            };
+            inner.operations.entry(job.label).or_default().add(
+                queued_ns,
+                ran_ns,
+                residence,
+                job.storage_error,
+            );
+        }
+        if let Some(commit_ns) = commit_ns {
+            inner
+                .operations
+                .entry("commit")
+                .or_default()
+                .add(0, commit_ns, commit_ns, false);
+        }
+        let groups = &mut inner.groups;
+        groups.count += 1;
+        groups.jobs += size as u64;
+        groups.sizes[GROUP_SIZES
+            .iter()
+            .position(|bound| size <= *bound)
+            .unwrap_or(GROUP_SIZES.len() - 1)] += 1;
+        groups.oldest[bucket(oldest)] += 1;
+        groups.slowest_oldest_ns = groups.slowest_oldest_ns.max(oldest);
     }
     fn snapshot(&self) -> serde_json::Value {
         // Copy the small fixed-size records while locked; JSON construction
         // and aggregate sums cannot stall the worker or observe later writes.
-        let operations = self.operations.lock().unwrap().clone();
-        let (mut jobs, mut queued_ns, mut ran_ns) = (0u64, 0u64, 0u64);
+        let inner = self.inner.lock().unwrap().clone();
+        let (mut jobs, mut queued_ns, mut ran_ns, mut answered_ns) = (0u64, 0u64, 0u64, 0u64);
+        let mut storage_errors = 0u64;
         let mut out = serde_json::Map::new();
-        for (label, o) in operations.iter() {
+        for (label, o) in inner.operations.iter() {
             jobs += o.count;
             queued_ns += o.queued_ns;
             ran_ns += o.ran_ns;
+            answered_ns += o.answered_ns;
+            storage_errors += o.storage_errors;
             out.insert(
                 (*label).to_owned(),
                 serde_json::json!({"count": o.count, "queued_ms": o.queued_ns / 1_000_000,
-                    "ran_ms": o.ran_ns / 1_000_000, "slowest_ms": o.slowest_ns / 1_000_000,
-                    "ran": o.ran, "queued": o.queued}),
+                    "ran_ms": o.ran_ns / 1_000_000, "answered_ms": o.answered_ns / 1_000_000,
+                    "slowest_ms": o.slowest_ns / 1_000_000,
+                    "slowest_answered_ms": o.slowest_answered_ns / 1_000_000,
+                    "storage_errors": o.storage_errors,
+                    "ran": o.ran, "queued": o.queued, "answered": o.answered}),
             );
         }
+        let g = &inner.groups;
         serde_json::json!({
             "jobs": jobs,
             "queued_ms": queued_ns / 1_000_000,
             "ran_ms": ran_ns / 1_000_000,
+            "answered_ms": answered_ns / 1_000_000,
+            "storage_errors": storage_errors,
             "buckets_us": BUCKETS_US,
             "operations": out,
+            "groups": {"count": g.count, "jobs": g.jobs, "size_bounds": GROUP_SIZES,
+                "sizes": g.sizes, "oldest": g.oldest,
+                "slowest_oldest_ms": g.slowest_oldest_ns / 1_000_000},
         })
+    }
+}
+/// A queued job's answer, ready once its group's commit is known.
+pub struct Answer<T>(oneshot::Receiver<Result<T>>);
+impl<T> std::future::Future for Answer<T> {
+    type Output = Result<T>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<T>> {
+        std::pin::Pin::new(&mut self.0)
+            .poll(context)
+            .map(|answer| answer.unwrap_or_else(|_| Err(Error::new("storage_worker_failed"))))
     }
 }
 #[derive(Clone)]
@@ -306,14 +428,11 @@ impl Store {
                                     }
                                 }
                             }
+                            let mut commit_ns = None;
                             let committed = begun.and_then(|()| {
                                 let started = std::time::Instant::now();
                                 let committed = db.commit_group();
-                                worker_counters.record(
-                                    "commit",
-                                    0,
-                                    started.elapsed().as_nanos() as u64,
-                                );
+                                commit_ns = Some(started.elapsed().as_nanos() as u64);
                                 committed
                             });
                             let failure = committed.err().map(|error| {
@@ -342,6 +461,16 @@ impl Store {
                             if failure.is_some() {
                                 let _ = db.abandon_group();
                             }
+                            // Counted before answering, so a caller's own job is
+                            // in any stats it reads next; about a microsecond.
+                            worker_counters.group(
+                                group.iter().map(|job| Timing {
+                                    storage_error: failure.is_some()
+                                        || job.error().is_some_and(|e| e.code == "storage_error"),
+                                    ..job.timing()
+                                }),
+                                commit_ns,
+                            );
                             for job in group.drain(..) {
                                 job.answer(failure.as_ref());
                             }
@@ -433,12 +562,30 @@ impl Store {
     ) -> Result<T> {
         self.enqueue(label, Some(bot), operation).await
     }
+    /// Queue a job without waiting for its answer: returns once the worker's
+    /// queue holds it, so a caller can queue more before any of them commits.
+    /// Jobs run in the order they are queued.
+    pub async fn queue<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<Answer<T>> {
+        self.send(label, None, operation).await
+    }
     async fn enqueue<T: Send + 'static>(
         &self,
         label: &'static str,
         pruning_bot: Option<String>,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.send(label, pruning_bot, operation).await?.await
+    }
+    async fn send<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        pruning_bot: Option<String>,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> Result<Answer<T>> {
         let (reply, receiver) = oneshot::channel();
         self.sender
             .send(Box::new(Queued {
@@ -446,15 +593,17 @@ impl Store {
                 pruning_bot,
                 outcome: None,
                 reply,
-                label,
-                queued: std::time::Instant::now(),
-                counters: self.counters.clone(),
+                timing: Timing {
+                    label,
+                    queued: std::time::Instant::now(),
+                    waited_ns: 0,
+                    ran_ns: None,
+                    storage_error: false,
+                },
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;
-        receiver
-            .await
-            .map_err(|_| Error::new("storage_worker_failed"))?
+        Ok(Answer(receiver))
     }
     /// Run a read on the reader connection, counted like any job. Only for
     /// reads whose result is bytes for a caller, never for decisions that
@@ -470,12 +619,14 @@ impl Store {
         self.reader
             .send(Box::new(move |db| {
                 let started = std::time::Instant::now();
-                let _ = sender.send(operation(db));
+                let outcome = operation(db);
                 counters.record(
                     label,
-                    (started - queued).as_nanos() as u64,
-                    started.elapsed().as_nanos() as u64,
+                    queued,
+                    started,
+                    outcome.as_ref().is_err_and(|e| e.code == "storage_error"),
                 );
+                let _ = sender.send(outcome);
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;
@@ -547,11 +698,26 @@ mod tests {
         bot: Option<&str>,
         operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
     ) -> tokio::task::JoinHandle<Result<T>> {
+        queue_as(store, "test", bot, operation).await
+    }
+    async fn queue_labelled<T: Send + 'static>(
+        store: &Store,
+        label: &'static str,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<T>> {
+        queue_as(store, label, None, operation).await
+    }
+    async fn queue_as<T: Send + 'static>(
+        store: &Store,
+        label: &'static str,
+        bot: Option<&str>,
+        operation: impl FnOnce(&mut Database) -> Result<T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<Result<T>> {
         let bot = bot.map(str::to_owned);
         let queued = store.sender.max_capacity() - store.sender.capacity() + 1;
         let job = tokio::spawn({
             let store = store.clone();
-            async move { store.enqueue("test", bot, operation).await }
+            async move { store.enqueue(label, bot, operation).await }
         });
         while store.sender.max_capacity() - store.sender.capacity() < queued {
             tokio::task::yield_now().await;
@@ -717,6 +883,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_publication_pass_covers_events_removed_before_it() {
+        let path = scratch_path("publish-through");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (store, mut publications) = Store::open(&path).await.unwrap();
+        // A deletion can share a group with the job whose events it removes.
+        let cursor = store
+            .call(|db| {
+                let (_, event) = db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: crate::codec::Family::Responses,
+                        model: "synthetic",
+                        instructions: "",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                    },
+                )?;
+                db.connection().execute("DELETE FROM events", [])?;
+                Ok(event["cursor"].as_i64().unwrap())
+            })
+            .await
+            .unwrap();
+        let publication =
+            tokio::time::timeout(std::time::Duration::from_secs(1), publications.recv())
+                .await
+                .expect("the pass says how far it covered")
+                .unwrap();
+        assert!(
+            matches!(publication, Publication::Through(through) if through == cursor),
+            "{publication:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_diagnostics_survive_commit_and_transaction_rollback() {
         for (name, setup, write, extended) in [
             (
@@ -798,6 +1006,8 @@ mod tests {
     #[tokio::test]
     async fn a_group_rolled_back_under_its_jobs_answers_none_of_them_ok() {
         let store = scratch_store("rollback").await;
+        let errors = |store: &Store| store.stats()["storage_errors"].as_u64().unwrap();
+        let before = errors(&store);
         let (held, gate) = hold(&store).await;
         let one = queue(&store, insert(1)).await;
         // A refusal decided against writes the group then loses no longer
@@ -819,6 +1029,9 @@ mod tests {
         ] {
             assert_eq!(answer.unwrap_err().code, "storage_error");
         }
+        // Every job the lost group answered is counted as a storage error,
+        // so a failure is visible without the daemon's stderr.
+        assert_eq!(errors(&store) - before, 4);
         assert!(rows(&store).await.is_empty());
         // The worker recovers: the next group commits normally.
         store.call(insert(4)).await.unwrap();
@@ -898,6 +1111,102 @@ mod tests {
         assert_eq!(reader, 1);
     }
 
+    #[tokio::test]
+    async fn the_writer_keeps_savepoint_journals_in_memory() {
+        // A job's savepoint journal past 64 KiB would otherwise go to a
+        // temporary file, created for every admission and refused on a full disk.
+        let store = scratch_store("temp-store").await;
+        let mode = store.call(|db| Ok(db.pragma("temp_store"))).await.unwrap();
+        assert_eq!(mode, 2, "MEMORY");
+    }
+
+    #[tokio::test]
+    async fn an_answer_held_up_by_a_stats_snapshot_counts_the_wait() {
+        let store = scratch_store("counter-lock").await;
+        // A snapshot holds the counters while the job commits; the worker
+        // cannot answer until it lets go.
+        let (locked, inside) = std::sync::mpsc::channel();
+        let counters = store.counters.clone();
+        let snapshot = std::thread::spawn(move || {
+            let _held = counters.inner.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        });
+        inside.recv().unwrap();
+        // Nothing holds the worker, so the job may leave its channel before
+        // `queue_labelled` sees it there; wait for the answer alone.
+        store.enqueue("held", None, insert(1)).await.unwrap();
+        snapshot.join().unwrap();
+        let held = &store.stats()["operations"]["held"];
+        assert!(held["ran_ms"].as_u64().unwrap() < 30);
+        assert!(held["answered_ms"].as_u64().unwrap() >= 25);
+    }
+
+    #[tokio::test]
+    async fn a_cheap_job_answered_with_a_costly_group_reports_the_wait() {
+        let store = scratch_store("answered").await;
+        let before = store.stats();
+        let (held, gate) = hold(&store).await;
+        let costly = queue_labelled(&store, "costly", |_| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Ok(())
+        })
+        .await;
+        let cheap = queue_labelled(&store, "cheap", insert(1)).await;
+        gate.send(()).unwrap();
+        for job in [held, costly, cheap] {
+            job.await.unwrap().unwrap();
+        }
+        let stats = store.stats();
+        let cheap = &stats["operations"]["cheap"];
+        let at_least = |histogram: &serde_json::Value, ms: u64| -> u64 {
+            BUCKETS_US
+                .iter()
+                .zip(histogram.as_array().unwrap().iter().skip(1))
+                .filter(|(lower, _)| **lower >= ms * 1_000)
+                .map(|(_, n)| n.as_u64().unwrap())
+                .sum()
+        };
+        // It ran in well under the costly job's sleep, but was answered
+        // only after that job and the shared commit.
+        assert_eq!(at_least(&cheap["ran"], 25), 0);
+        assert_eq!(at_least(&cheap["answered"], 25), 1);
+        assert!(cheap["answered_ms"].as_u64().unwrap() >= 30);
+        let (groups, earlier) = (&stats["groups"], &before["groups"]);
+        let delta =
+            |field: &str| groups[field].as_u64().unwrap() - earlier[field].as_u64().unwrap();
+        assert_eq!(delta("count"), 1, "held, costly and cheap share one group");
+        assert_eq!(delta("jobs"), 3);
+        let sizes = |g: &serde_json::Value| -> Vec<u64> {
+            g["sizes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_u64().unwrap())
+                .collect()
+        };
+        let grew: Vec<u64> = sizes(groups)
+            .iter()
+            .zip(sizes(earlier))
+            .map(|(a, b)| a - b)
+            .collect();
+        assert_eq!(
+            grew,
+            [0, 0, 1, 0, 0, 0],
+            "a group of three is in the up-to-four bucket"
+        );
+        assert!(groups["slowest_oldest_ms"].as_u64().unwrap() >= 30);
+        assert_eq!(
+            groups["oldest"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_u64().unwrap())
+                .sum::<u64>(),
+            groups["count"].as_u64().unwrap()
+        );
+    }
+
     #[test]
     fn live_counter_snapshots_reconcile_totals_and_histograms() {
         let (sender, _receiver) = mpsc::channel(1);
@@ -915,10 +1224,12 @@ mod tests {
             scope.spawn(move || {
                 ready.wait();
                 for index in 0..100_000 {
+                    let now = std::time::Instant::now();
                     counters.record(
                         if index % 2 == 0 { "read" } else { "write" },
-                        1_000_000,
-                        2_000_000,
+                        now,
+                        now,
+                        index % 3 == 0,
                     );
                 }
             });
@@ -930,15 +1241,23 @@ mod tests {
                     ("jobs", "count"),
                     ("queued_ms", "queued_ms"),
                     ("ran_ms", "ran_ms"),
+                    ("answered_ms", "answered_ms"),
+                    ("storage_errors", "storage_errors"),
                 ] {
                     let sum: u64 = operations
                         .values()
                         .map(|o| o[field].as_u64().unwrap())
                         .sum();
-                    assert_eq!(stats[total].as_u64().unwrap(), sum, "{total}");
+                    // Each part is rounded down to whole milliseconds on its
+                    // own, the total once.
+                    let total = stats[total].as_u64().unwrap();
+                    assert!(
+                        (sum..=sum + operations.len() as u64).contains(&total),
+                        "{field}: {total} against parts summing to {sum}"
+                    );
                 }
                 for operation in operations.values() {
-                    for histogram in ["ran", "queued"] {
+                    for histogram in ["ran", "queued", "answered"] {
                         let sum: u64 = operation[histogram]
                             .as_array()
                             .unwrap()

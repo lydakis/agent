@@ -5,7 +5,8 @@ once with the current binary to migrate a copy). Flags full scans on growing
 tables and temporary B-trees. Structural cases are listed, not counted:
 `SCAN CONSTANT ROW` from EXISTS subqueries, the recursive-CTE step scans that
 are bounded by a window or one turn, and per-turn sorts over a turn's tool
-rows, plus schema metadata. Statements inside
+rows, plus schema metadata (`sqlite_sequence` holds one row per
+autoincrement table). Statements inside
 the one-time migration function are skipped. Exit
 status 1 when any runtime statement scans a table by an unindexed column.
 
@@ -16,7 +17,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
-STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_master'}
+STRUCTURAL_SCANS = {'SCAN CONSTANT ROW', 'SCAN c', 'SCAN chain', 'SCAN sqlite_master',
+                    'SCAN sqlite_sequence'}
 
 
 def statements(source):
