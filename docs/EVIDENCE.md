@@ -1,9 +1,11 @@
 # Current evidence
 
-Snapshot, 2026-09-26, at `afdd633` plus the change that added this page. This
+Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
+updated at `095ff68` for admission batching and disk-full containment. This
 is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
-opening disagrees with this page, this page is current.
+opening disagrees with this page, this page is current. A change that lands a
+measurement updates this page with it.
 
 Each line says what was measured, on which build and host, and when. Unless a
 line says otherwise it is a measurement, and it holds only for that workload.
@@ -41,11 +43,25 @@ more turns is not here, because its work changes with its speed; it is under
   order: 19.85 and 19.93 s against 19.27 and 19.16 s, CPU and RSS within run
   noise. `7120b48` against the diagnostic build, 2026-09-26.
   [Record](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics).
-- **Admission is the next serial cost.** 32 clients submitting at once waited
-  a median 284.8 ms for all replies, 239 ms of it in commits, because the
-  service admits one submission at a time. This is a batching opportunity,
-  not a measured improvement. `7120b48`, 2026-09-26.
-  [Record](DAEMON_MEASUREMENTS.md#instrumented-operational-follow-up).
+- **Admission batching.** 32 submissions sent at once got their last reply
+  in 5.3 ms instead of 47.1 ms at native sync, and in 7.9 ms instead of
+  131.1 ms with 2 ms added to each sync, with daemon CPU 2.7 and 3.2 times
+  lower (36.6→13.4 and 43.6→13.8 ms). A submission arriving alone is no
+  slower (median 1.61 against 1.67 ms). Under sustained load, 64 bots at
+  10 ms a sync went from about 56 to 131 turns a second, with no change at
+  native sync. RSS after the bursts was 0.3 MiB higher, cause not isolated.
+  Linux x86_64 container, `4260673` against `3b6dd53`, 2026-09-26.
+  macOS is not measured: the earlier macOS probe of 32 clients (median
+  284.8 ms to all replies, `7120b48`) has not been rerun.
+  [Record](DAEMON_MEASUREMENTS.md#admission-window).
+- **Savepoint journals in memory.** With the writer's journals in memory
+  instead of temporary files, a submission's `begin` job ran in a median
+  184 µs instead of 416 µs, ranges not overlapping. Its round trip (1.28
+  against 1.43 ms) and daemon CPU moved within overlapping ranges, and RSS
+  did not change. Linux x86_64 container, `8724f22` against the same source
+  with only `temp_store=MEMORY` added (the line `4260673` landed),
+  2026-09-26; macOS, where creating a file may cost more, is not measured.
+  [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB
   and 24.9 s, opencode 927 MiB and 14.4 s, Claude Code 6,494 MiB and 23.8 s.
@@ -160,11 +176,19 @@ Reconnects, retention, overload, compaction and recovery.
   The store grew 21.7 MiB a minute. `bb6bc51`, 2026-09-20; it predates the
   corrected observer and has not been rerun.
   [Record](DAEMON_MEASUREMENTS.md#mixed-workload-soak).
-- **Unresolved storage failure.** One admission probe ended three turns with
-  `storage_error` and left two running, with no SQLite code kept. The build
-  now keeps codes, and 97 later runs (3,104 turns) were clean, but that does
-  not show the failure is fixed. Admission batching waits on it.
-  [Record](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics).
+- **Storage failure: most likely a full disk.** The admission probe that
+  ended three turns with `storage_error` ran while the Mac's volume had about
+  140–250 MB free, and the system log shows another process's SQLite write
+  failing with `ENOSPC` 22 ms after the commit that recorded those failures.
+  That cause is an inference: the build kept no SQLite codes. Injected
+  `ENOSPC` on Linux reproduced both ways the failure could arise. The daemon
+  now survives a full disk: journals stay in memory, and a completion, queued
+  turn or parked turn the store refuses is tried again with backoff. A turn
+  whose reply cannot be stored still fails. With every write refused for
+  0.5 s, all 32 turns ended `failed` and the daemon kept running, where
+  before it exited. Linux x86_64 container, `8724f22` against `4260673` and
+  `095ff68`, 2026-09-26; no run on a nearly full macOS disk.
+  [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
 - **Retention.** A race that could lose a completion event under
   `--retain-turns 1` (2 of 10 runs) is fixed (0 of 10). Retention halves
   per-turn store growth (1.4 against 2.8 KB).
@@ -178,9 +202,11 @@ Reconnects, retention, overload, compaction and recovery.
   and shell turns in 712 ms with their processes gone. Restart is ready in
   25.6 and 29.0 ms on stores of 1 and 9.6 GB, and in 154 ms with 10,000 bots.
   [Record](DAEMON_MEASUREMENTS.md#mass-interrupt).
-- **Shutdown.** A graceful drain lets running turns finish for a set time;
-  behavior only, not measured. Harbor trials end at their timeout within
-  about half a second.
+- **Shutdown.** A graceful drain lets running turns finish for a set time.
+  Admissions still waiting on their commit when a `shutdown` request or
+  SIGTERM arrives are answered, and their turns end `interrupted` with
+  `daemon_shutdown`. Behavior and tests only, not measured. Harbor trials end
+  at their timeout within about half a second.
 - **Compaction.** Long conversations of many turns are compacted with the
   original history kept. On luna, the evaluation's final file and every
   filler survived, and summaries restated the rule, with summarizer cost
@@ -201,8 +227,9 @@ Reconnects, retention, overload, compaction and recovery.
 - The five-harness screen at the current build.
 - Within-turn compaction, and compaction quality on real coding tasks with
   summarizer and retrieval costs included.
-- Admission batching and whole group-commit latency (enqueue to
-  acknowledgement) for small control operations.
+- Admission batching on macOS.
+- Enqueue-to-answer latency for small control operations: `stats` reports
+  it per operation, but no run has recorded it.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
 - Multi-daemon operation, approvals, and concurrent tool calls: designs only.
