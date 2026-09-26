@@ -1144,9 +1144,10 @@ impl Turn {
                 Err(error) => return Err(error),
             };
             // Steers go in before this call, measured against what this
-            // view sends ahead of the turn: its summary, pinned context, and
-            // notes, a note a tool wrote this round included. One that goes
-            // in sends the view back through the overflow, elision, and
+            // view must send ahead of the turn: its summary, pinned context,
+            // and notes, a note a tool wrote this round included, but not
+            // the previews of omitted turns, which yield. One that goes in
+            // sends the view back through the overflow, elision, and
             // compaction steps.
             if self.absorb(&context.prefix, &mut capped).await? {
                 resume_window = resuming;
@@ -1324,8 +1325,8 @@ impl Turn {
     }
 
     /// The round boundary: queued steers become user items after everything
-    /// recorded so far, while they fit beside what the view sends `ahead` of
-    /// the turn. The worker publishes each batch and answers the steers'
+    /// recorded so far, while they fit beside what the view must send
+    /// `ahead` of the turn; optional previews of omitted turns yield. The worker publishes each batch and answers the steers'
     /// waiters. One atomic read when nothing is waiting; the flag clears
     /// before the read, so a steer landing during it is seen next. A steer
     /// that stayed queued for lack of room is tried again once less goes
@@ -1337,10 +1338,7 @@ impl Turn {
         ahead: &ContextPrefix,
         capped: &mut Option<ContextUsage>,
     ) -> Result<bool> {
-        let reserved = ContextUsage {
-            bytes: ahead.bytes.len(),
-            items: ahead.items,
-        };
+        let reserved = ahead.required;
         let shrunk =
             capped.is_some_and(|at| reserved.bytes < at.bytes || reserved.items < at.items);
         if !self.steers.swap(false, Relaxed) && !shrunk {
@@ -2290,6 +2288,7 @@ impl Context {
             prefix: ContextPrefix {
                 bytes: Bytes::new(),
                 items: 0,
+                required: ContextUsage::default(),
             },
             thinking: Strip::default(),
         }

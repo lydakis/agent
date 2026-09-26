@@ -25,6 +25,9 @@ pub struct ContextPrefix {
     /// Every prefix item includes its separating comma before the tail.
     pub bytes: bytes::Bytes,
     pub items: usize,
+    /// What cannot yield to the current turn: the summary, the note, and
+    /// the context note without its optional previews.
+    pub required: ContextUsage,
 }
 
 impl Window {
@@ -149,6 +152,10 @@ pub(crate) fn context_prefix(
         )?);
     }
     let pinned_bytes = encoded.len();
+    let mut required = ContextUsage {
+        bytes: pinned_bytes,
+        items: count,
+    };
     let mut push = |mut item: Vec<u8>| {
         item.push(b',');
         encoded.extend_from_slice(&item);
@@ -192,29 +199,43 @@ pub(crate) fn context_prefix(
             }
             family.user_item(&text)
         };
-        let mut item = encode(listed)?;
-        if pinned_bytes + item.len() >= prefix_budget && !listed.is_empty() {
-            // Probe the full listing first (its last entry can remove the
-            // older-turns footer). Proper nonempty prefixes grow monotonically.
-            // Binary search avoids quadratic re-encoding for large listings.
-            let (mut low, mut high) = (0, listed.len());
-            item = encode(&[])?;
-            while low + 1 < high {
-                let mid = low + (high - low) / 2;
-                let candidate = encode(&listed[..mid])?;
-                if pinned_bytes + candidate.len() < prefix_budget {
-                    low = mid;
-                    item = candidate;
-                } else {
-                    high = mid;
+        let bare = encode(&[])?;
+        required.bytes += bare.len() + 1;
+        required.items += 1;
+        let full = if listed.is_empty() {
+            None
+        } else {
+            Some(encode(listed)?)
+        };
+        let item = match full {
+            None => bare,
+            Some(full) if pinned_bytes + full.len() < prefix_budget => full,
+            Some(_) => {
+                // Probe the full listing first (its last entry can remove
+                // the older-turns footer). Proper nonempty prefixes grow
+                // monotonically. Binary search avoids quadratic re-encoding
+                // for large listings.
+                let (mut low, mut high) = (0, listed.len());
+                let mut item = bare;
+                while low + 1 < high {
+                    let mid = low + (high - low) / 2;
+                    let candidate = encode(&listed[..mid])?;
+                    if pinned_bytes + candidate.len() < prefix_budget {
+                        low = mid;
+                        item = candidate;
+                    } else {
+                        high = mid;
+                    }
                 }
+                item
             }
-        }
+        };
         push(item);
     }
     Ok(ContextPrefix {
         bytes: encoded.into(),
         items: count,
+        required,
     })
 }
 

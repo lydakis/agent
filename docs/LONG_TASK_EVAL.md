@@ -126,13 +126,19 @@ of itself: hidden tests passed, every file under `vendor/` unchanged with
 none added or removed, `make quick` runs in total and after the first
 compaction, migrations applied, whether the correction reached the task
 (its steer turn's final status, not the submit reply), whether the answer
-carries the measured number, commands repeated after the first compaction,
-retrieval calls (`history`, or `read` of a `result/` reference),
+carries the measured number and `make bench` ran, whether the bot ran
+`tools/env-check` before its first edit, `make check` after its last, and
+`make bench` after that check, commands repeated after the first
+compaction, retrieval calls (`history`, or `read` of a `result/` reference),
 compactions, elisions, the context-view version each model call was made
 under, input, cached input, and output tokens for the model and the
 summarizer separately, and summarizer latency from its send to the send of
 the model call it held back. Failed summaries are live-only events, so the
-runner collects them as they arrive. The hidden tests import the code the
+runner collects them as they arrive. An edit is a `write` or `edit` call,
+`tools/migrate`, or a shell command that writes a file by redirect, `tee`,
+in-place `sed` or `perl`, a patch, or `cp`, `mv`, `rm`, `touch`, or
+`mkdir`, matched by pattern; a change made another way, such as a Python
+one-liner, is not seen. The hidden tests import the code the
 model wrote, so they run in a child process that keeps only `PATH`,
 `TMPDIR`, and the locale from the runner's environment, and no credentials.
 

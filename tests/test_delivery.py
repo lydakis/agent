@@ -469,6 +469,38 @@ class DeliveryTests(ModelFixture):
         # Asked after the echo without it, after the note is cleared with it.
         self.assertEqual(carries, [False, True])
 
+    def test_a_steer_is_admitted_beside_the_context_note_without_its_previews(self):
+        # A long history leaves most turns out of view, and the context note
+        # lists how each began. Those previews yield to the running turn, so
+        # a strict steer that fits beside the note without them goes in.
+        client = self.client('echo', extra=('--context-bytes', '16384'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'])
+        for n in range(50):
+            turn = client.request('submit', bot='Bob', request_id=str(n),
+                                  prompt=f'Task {n}: ' + 'p' * 300)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            self.model.requests.get()
+        self.model.call_script = [('echo', {'text': 'a'})]
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='run', prompt='script')['result']['turn']
+        first = self.model.requests.get(timeout=5)
+        note = first['input'][0]['content'][0]['text']
+        self.assertIn('How they began', note)
+        self.assertGreater(len(note), 4000)
+        correction = 'steer:' + 'x' * 9000
+        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        outcome = client.finished(steer)['data']
+        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+            self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 16384)
+
     def test_context_note_lists_how_omitted_turns_began(self):
         prompts = [f'Task {n}: ' + f'{n}' * 700 for n in range(1, 8)]
         # The note names the history tool only to a bot that has it.

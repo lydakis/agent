@@ -1008,8 +1008,10 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   batch's commit, event publication, and waiter notifications before stopping;
   it does not drain further batches. Unabsorbed work stays durable.
   Absorption is budgeted against the context: a boundary takes steers,
-  oldest first, only while what the view sends ahead of the running turn
-  (its summary, pinned context, and notes), the turn's own items, and each
+  oldest first, only while what the view must send ahead of the running
+  turn (its summary, pinned context, notes, and the context note without
+  the previews of omitted turns, which yield to the turn), the turn's own
+  items, and each
   encoded steer stay within three quarters of `--context-bytes` and
   `--context-items`, the target the window itself keeps, so a burst of
   large steers cannot make the running turn exceed its context and fail

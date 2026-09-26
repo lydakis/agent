@@ -82,6 +82,7 @@ class LongTaskScoreTests(unittest.TestCase):
                        f"Tests pass; throughput: {self.facts['throughput']:,} rows/s.")
         self.assertEqual(result['hidden_tests'], f'{len(long_task_eval.HIDDEN)}/{len(long_task_eval.HIDDEN)}')
         self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'])
+        self.assertTrue(result['followed_workflow'])
         self.assertEqual((result['make_quick_runs'], result['make_quick_calls_after_first_compaction']), (1, 0))
         self.assertEqual(result['migrations_applied'], 1)
         self.assertEqual(result['repeated_commands_after_first_compaction'], {})
@@ -123,11 +124,40 @@ class LongTaskScoreTests(unittest.TestCase):
                   started(4, 'make quick'), started(5, 'tools/migrate')]
         result = score(self.root, self.facts, events, 'Tests pass.')
         self.assertFalse(result['correct'] or result['vendor_intact'] or result['reported_throughput'])
+        self.assertFalse(result['env_check_before_edits'] or result['make_check_after_last_edit']
+                         or result['followed_workflow'])
         self.assertEqual((result['make_quick_runs'], result['make_quick_calls_after_first_compaction']), (2, 1))
         self.assertEqual(result['migrations_applied'], 2)
         self.assertEqual(result['repeated_commands_after_first_compaction'],
                          {'make quick': 1, 'tools/migrate': 1})
         self.assertIsNotNone(result['hidden_failure'])
+
+    def test_the_required_commands_count_only_in_the_order_the_task_gives(self):
+        shell(self.root, 'tools/migrate')
+        (self.root / 'ledger/convert.py').write_text(HALF_EVEN)
+        number = f"throughput: {self.facts['throughput']} rows/s."
+        edit = lambda cursor: {'cursor': cursor, 'event': 'tool_started',
+                               'data': {'call_id': f'w{cursor}', 'name': 'write', 'arguments': '{}'}}
+        # The number read from where the benchmark keeps it, not printed by
+        # `make bench`, is not reported.
+        read_seed = score(self.root, self.facts, [started(1, 'tools/env-check'), edit(2),
+                                                  started(3, 'make check'), started(4, 'cat tools/.seed')], number)
+        self.assertFalse(read_seed['reported_throughput'] or read_seed['make_bench_after_check'])
+        # The restriction checked only after an edit, and the checks run
+        # before the last one, do not follow the task.
+        late = score(self.root, self.facts, [started(1, "cat > notes.txt <<'EOF'\nx\nEOF"),
+                                             started(2, 'tools/env-check'), started(3, 'make check'),
+                                             started(4, 'make bench'), started(5, 'sed -i s/x/y/ notes.txt')],
+                     number)
+        self.assertTrue(late['reported_throughput'])
+        self.assertFalse(late['env_check_before_edits'] or late['make_check_after_last_edit']
+                         or late['followed_workflow'])
+        # Read-only looks and discarded output are not edits.
+        kept = score(self.root, self.facts, [started(1, 'cat ledger/convert.py'), started(2, 'tools/env-check'),
+                                             edit(3), started(4, 'tools/migrate --status'),
+                                             started(5, 'make check 2>&1 >/dev/null'), started(6, 'make bench')],
+                     number)
+        self.assertTrue(kept['followed_workflow'], kept)
 
     def test_a_steer_counts_only_once_it_reached_the_task(self):
         self.assertEqual(steer_outcome({'turn': 9}, {'status': 'steered', 'into': 1}), 'steered')
@@ -158,6 +188,7 @@ class LongTaskRunnerTests(ModelFixture):
         self.assertEqual(result['status'], 'completed', result)
         self.assertEqual(result['steer'], 'steered')
         self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'], result)
+        self.assertTrue(result['followed_workflow'], result)
         self.assertEqual((result['make_quick_runs'], result['migrations_applied']), (1, 1))
         self.assertGreaterEqual(result['compactions'], 1)
         self.assertEqual(result['compaction_failures'], [])
