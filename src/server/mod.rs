@@ -13,8 +13,8 @@ use agent_runtime::{
     output::{self, Output},
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, Publication, Started, Store,
-        TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Started,
+        Store, TurnOptions, Waiting, Wake,
     },
     tools::Registry,
 };
@@ -49,6 +49,9 @@ const MODEL_JSON: usize = 64 + 1 + 6 * 256 + 2;
 /// The rest of a reply or an event: its envelope, keys, numbers, and short
 /// fixed strings.
 const FIELDS_JSON: usize = 1024;
+/// One gate in JSON without its tools: a tag at the name limit (plain
+/// ASCII, never escaped), the keys, the longest expiry, and a separator.
+const GATE_JSON: usize = 192;
 
 /// Bytes and packets sent to one session.
 #[derive(Clone, Copy, Default)]
@@ -88,7 +91,7 @@ impl Bound {
 /// more, and may name what it refused. The event names the bot, the request
 /// or creator, a workspace and a model.
 fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
-    let (reply, named, reply_workspace) = match command {
+    let (reply, named, reply_workspace, gates) = match command {
         Command::Create {
             bot,
             workspace,
@@ -114,6 +117,10 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             )),
             output::encoded_len(&(bot, created_by)),
             if workspace.is_some() { PATH_JSON } else { 0 },
+            // Both the bot and its event carry its gates, most of them
+            // inherited from its creator, so the command does not show
+            // them. Each gate keeps only the bot's tools, which it lists.
+            output::encoded_len(tools).map(|tools| MAX_GATES * (GATE_JSON + tools)),
         ),
         Command::Submit {
             bot,
@@ -125,11 +132,13 @@ fn admission_bound(command: &Command, id: &Value, deliveries: usize) -> Bound {
             output::encoded_len(&(id, bot, bot, request_id, model, delivery)),
             output::encoded_len(&(bot, request_id)),
             0,
+            Ok(0),
         ),
         _ => return Bound::default(),
     };
-    let reply = reply.unwrap_or(output::MAX_EVENT) + reply_workspace + FIELDS_JSON;
-    let event = named.unwrap_or(output::MAX_EVENT) + PATH_JSON + MODEL_JSON + FIELDS_JSON;
+    let gates = gates.unwrap_or(output::MAX_EVENT);
+    let reply = reply.unwrap_or(output::MAX_EVENT) + reply_workspace + gates + FIELDS_JSON;
+    let event = named.unwrap_or(output::MAX_EVENT) + PATH_JSON + MODEL_JSON + gates + FIELDS_JSON;
     Bound {
         reply: Sends {
             bytes: reply,
@@ -4325,6 +4334,7 @@ mod tests {
         // Every character here is escaped in JSON, or longer than one byte.
         let awkward = "\"\\\u{1}\n/é".repeat(1000);
         let id = json!("\u{1}".repeat(128));
+        let mut child = create("Child", &dir);
         let mut create = create("Bot", &dir);
         if let Command::Create {
             model,
@@ -4341,8 +4351,63 @@ mod tests {
             *compaction_instructions = Some(awkward);
             *compaction_model = Some("openai/synthetic".into());
         }
-        for command in [create, submit("Bot", "r1")] {
+        // A creator carrying every gate a bot may, each at its limits, which
+        // the command creating its child does not show.
+        let tools = ["echo".to_owned()];
+        let parent = store
+            .call(move |db| {
+                let mut creator: Option<Bot> = None;
+                for i in 0..MAX_GATES {
+                    let gate = Gate {
+                        tag: format!("{i}{}", "t".repeat(127)),
+                        tools: tools.to_vec(),
+                        expire_ms: Some(86_400_000),
+                    };
+                    let (bot, _) = db.create(
+                        &format!("G{i}"),
+                        None,
+                        Binding {
+                            provider: "openai",
+                            family: Family::Responses,
+                            model: "synthetic",
+                            instructions: "",
+                            reasoning: None,
+                            budget_tokens: None,
+                            tools: &tools,
+                            created_by: creator.as_ref().map(|c| c.name.as_str()),
+                            created_by_id: creator.as_ref().map(|c| c.id),
+                            compaction_instructions: None,
+                            compaction_model: None,
+                            fallbacks: false,
+                            gate: Some(&gate),
+                        },
+                    )?;
+                    creator = Some(bot);
+                }
+                Ok(creator.unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(parent.gates.len(), MAX_GATES);
+        if let Command::Create {
+            workspace,
+            tools,
+            created_by,
+            created_by_id,
+            ..
+        } = &mut child
+        {
+            *workspace = None;
+            *tools = Some(vec!["echo".into()]);
+            *created_by = Some(parent.name);
+            *created_by_id = Some(parent.id);
+        }
+        for command in [create, submit("Bot", "r1"), child] {
             let bound = admission_bound(&command, &id, 1);
+            let (Command::Create { bot, .. } | Command::Submit { bot, .. }) = &command else {
+                unreachable!()
+            };
+            let bot = bot.clone();
             assert!(!service.must_settle(Some(&command), 0, &output, bound));
             let deferred = service
                 .dispatch(command, 0, &output, id.clone(), bound)
@@ -4351,7 +4416,9 @@ mod tests {
             let (_, _, _, result) = service.settle().await;
             let reply = json!({"id": id, "result": result.unwrap()});
             let event = loop {
+                // The gated creators' own events come first.
                 if let Publication::Event(entry) = publications.recv().await.unwrap()
+                    && entry["bot"] == bot.as_str()
                     && matches!(
                         entry["event"].as_str(),
                         Some("created" | "accepted" | "queued")

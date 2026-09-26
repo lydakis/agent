@@ -738,7 +738,7 @@ pub fn cache_hit(cached: i64, input: i64) -> f64 {
 }
 /// Most gates one bot carries. Gates accumulate down a chain of forks and
 /// delegations, so the bound keeps every bot row, event, and request small.
-const MAX_GATES: usize = 8;
+pub const MAX_GATES: usize = 8;
 /// A bot's gates as stored: none is NULL, so an ungated bot reads nothing.
 /// More than `MAX_GATES` is refused before anything is written.
 fn stored_gates(gates: &[Gate]) -> Result<Option<String>> {
