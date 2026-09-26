@@ -59,18 +59,23 @@ pub struct Bot {
     pub compaction: Option<i64>,
     pub compaction_instructions: Option<String>,
     pub compaction_model: Option<String>,
+    /// The node of the bot's current elision version, if any: tool results
+    /// through its floor go to the model as stubs.
+    pub elision: Option<i64>,
     /// The bot whose provider prompt cache this one shares: a fork with its
     /// source's instructions starts from the source's cached prefix. `None`
     /// is the bot's own.
     pub cache_bot: Option<i64>,
     /// Anthropic thinking replay: a fingerprint of the context in front of
-    /// the window at the last request, and the first node whose thinking
-    /// was written under it. Blocks on older nodes were bound to a context
-    /// the provider no longer sees, so requests send them without thinking.
+    /// the window at the last request, the nodes whose thinking was bound
+    /// to a context the provider no longer sees, so requests send them
+    /// without it, and the elision floor that request was read under.
     #[serde(skip)]
     pub thinking_prefix: Option<i64>,
     #[serde(skip)]
-    pub thinking_floor: i64,
+    pub thinking: Strip,
+    #[serde(skip)]
+    pub thinking_elided: i64,
     /// Anthropic server-side fallbacks: a declined request is rerun on the
     /// model Anthropic recommends instead of failing the turn. The client's
     /// choice at creation; forks inherit it.
@@ -186,6 +191,8 @@ pub struct Absorbed {
     pub outcomes: Vec<(i64, Value)>,
     /// Continue this boundary's finite snapshot in another bounded call.
     pub next_through: Option<i64>,
+    /// A steer stayed queued because the window had no room for it.
+    pub capped: bool,
 }
 /// A turn parked on handles; it holds no task or memory until they resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -216,6 +223,20 @@ pub struct Waiting {
     /// the park keep going to the server that holds its cache.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
+    /// What a paced summary copied of the bot's last call, so its retry
+    /// sends the same request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied: Option<CopiedCall>,
+}
+/// The call a summary copies: the elision floor its window was read under
+/// and the node that window starts at, and what went ahead of it when that
+/// was not what the view sends there now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct CopiedCall {
+    pub floor: i64,
+    pub first: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<(String, usize)>,
 }
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
@@ -236,8 +257,12 @@ pub struct Window {
     pub item_bytes: i64,
     /// Full unsummarized span, even when the bounded window omits a backlog.
     pub unsummarized: super::ContextUsage,
+    /// Messages of the earlier turns the window leaves out.
     pub omitted_items: i64,
     pub omitted_turns: i64,
+    /// Messages the window leaves out of the turn it starts inside: those
+    /// between that turn's prompt, sent ahead, and a compaction's cut.
+    pub omitted_in_turn: i64,
     /// Whether the bot may call the history tool, so the context note names
     /// it only when it can.
     pub history: bool,
@@ -245,6 +270,54 @@ pub struct Window {
     pub note: Option<(i64, String)>,
     /// The bot's current compaction, if any.
     pub compaction: Option<CompactionView>,
+    /// Tool results with ids up to this one that have stubs go as their
+    /// stubs, which `sizes` counts; zero when nothing is elided.
+    pub elided: i64,
+}
+/// The nodes an Anthropic request sends without their thinking blocks:
+/// those below `below`, written before the context in front of the window
+/// changed, and those in `from..to`, written after a tool result that now
+/// goes as its stub. Each block is bound to what preceded it, so a change
+/// strips every node after it up to the request that first sent it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Strip {
+    pub below: i64,
+    pub from: i64,
+    pub to: i64,
+}
+impl Strip {
+    pub fn strips(self, id: i64) -> bool {
+        id < self.below || (self.from <= id && id < self.to)
+    }
+    /// Also strip `first` up to `to`. One range is kept: a new range apart
+    /// from the current one takes in the nodes between them, which only
+    /// sends some valid thinking without it.
+    pub fn and(self, first: i64, to: i64) -> Self {
+        let from = if self.from < self.to {
+            self.from.min(first)
+        } else {
+            first
+        };
+        if from <= self.below {
+            Self::from(to)
+        } else {
+            Self {
+                below: self.below,
+                from,
+                to,
+            }
+        }
+    }
+}
+impl From<i64> for Strip {
+    /// Every node below `below`.
+    fn from(below: i64) -> Self {
+        Self {
+            below,
+            from: 0,
+            to: 0,
+        }
+    }
 }
 /// What a compaction left in place of the turns it covered.
 #[derive(Debug, Clone)]
@@ -254,12 +327,29 @@ pub struct CompactionView {
     /// The covered turns' user prompts, verbatim within bounds: ordinal and text.
     pub prompts: Vec<(i64, String)>,
     pub covered: (i64, i64),
+    /// The last covered turn is covered only up to a cut inside it. Its
+    /// prompt goes whole ahead of the window, so the view does not repeat it.
+    pub partial: bool,
+}
+/// Where an elision moves a bot's floor: tool results with stubs through
+/// this node go as their stubs. In the view, `results` of them are new,
+/// saving `saved_bytes`. Results the view left behind take the floor too
+/// but are not counted: its start only moves forward, so none is sent.
+#[derive(Debug, Clone, Copy)]
+pub struct ElisionPlan {
+    pub through: i64,
+    pub results: i64,
+    pub saved_bytes: i64,
 }
 /// What a compaction has to summarize, chosen at a turn boundary.
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
-    /// The prompt node the verbatim tail starts at: the new context start.
+    /// Where the verbatim tail starts, the new context start: a turn's
+    /// prompt, or a round start inside a turn: the first item after a tool
+    /// result that is not one, a model output or an absorbed steer.
     pub cut: i64,
+    /// For a cut inside a turn, that turn's prompt, sent whole ahead of it.
+    pub pinned: Option<i64>,
     /// The nodes to summarize, oldest first.
     pub ids: Vec<i64>,
     pub sizes: Vec<u32>,
@@ -271,6 +361,9 @@ pub struct CompactionPlan {
     /// ends where the next step starts, not at the verbatim tail.
     pub catch_up: bool,
     pub summary_bytes: usize,
+    /// The elision floor the span is read under: results through it go to
+    /// the summarizer as their stubs, which `sizes` counts.
+    pub elided: i64,
 }
 impl CompactionPlan {
     /// The summarizer request around the span's items: the previous summary
@@ -293,6 +386,16 @@ impl CompactionPlan {
         ))?;
         tail.insert(0, b',');
         Ok((head, tail))
+    }
+    /// The request that turns a copy of the bot's call into a summary
+    /// request, with its leading comma: the client's instructions travel
+    /// in it, since the copy keeps the bot's own.
+    pub fn request(family: Family, instructions: &str, summary_bytes: usize) -> Result<Vec<u8>> {
+        let mut request = family.user_item(&format!(
+            "[compaction request] Write the summary of the conversation above now, following these instructions, without calling tools. Keep the summary within {summary_bytes} UTF-8 bytes; be shorter when possible.\n\n{instructions}"
+        ))?;
+        request.insert(0, b',');
+        Ok(request)
     }
 }
 /// Where compaction planning stands: a plan, or a backlog larger than the
@@ -320,8 +423,16 @@ type CatchUpRow = (
 pub struct CatchUp {
     head: i64,
     previous_cut: i64,
-    /// The head's bytes, and the bytes and depth before the previous cut.
+    /// The head's bytes, and the bytes and depth before the previous cut,
+    /// counted as sent.
     totals: (i64, i64, i64),
+    /// The bot's elision floor and what its stubs save through it.
+    elision: (i64, i64),
+    /// A previous cut inside a turn: that turn's prompt and ordinal.
+    partial: Option<(i64, i64)>,
+    /// The depth of the newest prompt on the lineage: the running turn's,
+    /// or the first the walk passes.
+    newest_prompt: Option<i64>,
     /// Verbatim tail byte/item targets, then input byte/item limits.
     bounds: (i64, i64, i64, i64),
     /// Where the next piece starts, and the child it continues from.
@@ -386,7 +497,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 28;
+    pub const SCHEMA: i32 = 31;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -459,7 +570,8 @@ impl Database {
         tx.execute_batch("
             CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES nodes(id),
                 item BLOB NOT NULL, total_bytes INTEGER NOT NULL, depth INTEGER NOT NULL,
-                turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0);
+                turn INTEGER, turn_seq INTEGER, thinking INTEGER NOT NULL DEFAULT 0,
+                elided INTEGER NOT NULL DEFAULT 0, total_elided INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS nodes_turn_seq ON nodes(turn_seq) WHERE turn_seq IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS nodes_turn ON nodes(turn) WHERE turn IS NOT NULL;
             CREATE TABLE IF NOT EXISTS notes(node INTEGER PRIMARY KEY REFERENCES nodes(id),
@@ -468,9 +580,17 @@ impl Database {
             CREATE TABLE IF NOT EXISTS compactions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
                 previous INTEGER REFERENCES compactions(node), cut INTEGER NOT NULL REFERENCES nodes(id),
                 summary TEXT NOT NULL, prompts TEXT NOT NULL,
-                covered_from INTEGER NOT NULL, covered_to INTEGER NOT NULL);
+                covered_from INTEGER NOT NULL, covered_to INTEGER NOT NULL,
+                pinned INTEGER REFERENCES nodes(id));
             CREATE INDEX IF NOT EXISTS compactions_previous ON compactions(previous);
             CREATE INDEX IF NOT EXISTS compactions_cut ON compactions(cut);
+            CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                item BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
+                saved INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS elisions_previous ON elisions(previous);
             CREATE TABLE IF NOT EXISTS node_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO node_sequence VALUES (1,0);
@@ -492,10 +612,15 @@ impl Database {
                 compaction_instructions TEXT, compaction_model TEXT,
                 cache_bot INTEGER, thinking_prefix INTEGER,
                 thinking_floor INTEGER NOT NULL DEFAULT 0,
-                fallbacks INTEGER NOT NULL DEFAULT 0);
+                fallbacks INTEGER NOT NULL DEFAULT 0,
+                elision INTEGER REFERENCES elisions(node),
+                thinking_from INTEGER NOT NULL DEFAULT 0,
+                thinking_to INTEGER NOT NULL DEFAULT 0,
+                thinking_elided INTEGER NOT NULL DEFAULT 0);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
+            CREATE INDEX IF NOT EXISTS bots_elision ON bots(elision);
             CREATE TABLE IF NOT EXISTS bot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 last_id INTEGER NOT NULL CHECK(last_id>=0));
             INSERT OR IGNORE INTO bot_sequence VALUES (1,0);
@@ -776,11 +901,17 @@ impl Database {
             compaction_model: r.get(21)?,
             cache_bot: r.get(22)?,
             thinking_prefix: r.get(23)?,
-            thinking_floor: r.get(24)?,
+            thinking: Strip {
+                below: r.get(24)?,
+                from: r.get(27)?,
+                to: r.get(28)?,
+            },
+            thinking_elided: r.get(29)?,
             fallbacks: r.get::<_, i64>(25)? != 0,
+            elision: r.get(26)?,
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -910,21 +1041,28 @@ impl Database {
         let Some(head) = head else {
             return Ok(false);
         };
-        let depth: Option<i64> = self
+        let depths: Option<(i64, i64)> = self
             .conn
-            .query_row("SELECT depth FROM nodes WHERE id=?", [node], |r| r.get(0))
+            .query_row(
+                "SELECT h.depth,n.depth FROM nodes h, nodes n WHERE h.id=?1 AND n.id=?2",
+                params![head, node],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?;
-        let Some(depth) = depth else {
+        let Some((from, to)) = depths.filter(|(from, to)| to <= from) else {
             return Ok(false);
         };
+        // A node's depth is its parent's plus one, so the walk counts its
+        // steps: `depth` follows the item in a row, and reading it would
+        // page through every large result on the way.
         Ok(self
             .conn
             .query_row(
-                "WITH RECURSIVE chain(id,parent,depth) AS (
-                    SELECT id,parent,depth FROM nodes WHERE id=?1
-                    UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?3)
-                 SELECT 1 FROM chain WHERE id=?2 LIMIT 1",
-                params![head, node, depth],
+                "WITH RECURSIVE chain(id,parent,steps) AS (
+                    SELECT id,parent,?3 FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,c.steps-1 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.steps>0)
+                 SELECT 1 FROM chain WHERE steps=0 AND id=?2",
+                params![head, node, from - to],
                 |_| Ok(()),
             )
             .optional()?
@@ -932,18 +1070,33 @@ impl Database {
     }
     /// The bounded model context for the bot's next request: the newest
     /// turns that fit `context_bytes` and `context_items`, starting at a turn
-    /// boundary. The start is persisted and only moves when the budget is
-    /// exceeded, then jumps back to about three quarters of the budget so the
-    /// cached prefix stays stable across many turns.
+    /// boundary, with every tool result through the bot's elision floor
+    /// counted, and sent, as its stub. The start is persisted and only moves
+    /// when the budget is exceeded, then jumps back to about three quarters
+    /// of the budget so the cached prefix stays stable across many turns.
     pub fn window(
         &mut self,
         name: &str,
         context_bytes: i64,
         context_items: i64,
     ) -> Result<Option<Window>> {
+        self.window_under(name, context_bytes, context_items, None)
+    }
+    /// `window`, read under an earlier elision floor of the bot's (its
+    /// `through`, zero for none) rather than its current one: the view a
+    /// call made before the floor moved sent.
+    pub fn window_under(
+        &mut self,
+        name: &str,
+        context_bytes: i64,
+        context_items: i64,
+        floor: Option<i64>,
+    ) -> Result<Option<Window>> {
         // Heads only append and forks clear context_start, so the saved start
         // remains in this bot's ancestry. Read its accounting without walking
         // that ancestry or copying unrelated bot metadata such as instructions.
+        // Byte totals are as sent: less what the stubs through the bot's
+        // elision floor save (see `sent_total`).
         struct State {
             head: Option<i64>,
             family: String,
@@ -952,29 +1105,41 @@ impl Database {
             start: Option<i64>,
             start_depth: i64,
             before: i64,
-            turn_seq: i64,
             unsummarized: super::ContextUsage,
             history: bool,
             note: Option<(i64, String)>,
             compaction: Option<(i64, String, String, i64, i64)>,
+            elided: i64,
+            saved: i64,
+            /// A cut inside a turn: that turn's prompt, its size, ordinal and
+            /// depth, and whether the window still starts at the cut.
+            pinned: Option<(i64, i64, i64, i64, bool)>,
         }
+        // Under the bot's own floor (`e`), or an earlier one given by its
+        // `through` node (`f`), whose cumulative savings are its own.
         let state = self
             .conn
             .prepare_cached(
-                "SELECT b.head,b.family,COALESCE(h.total_bytes,0),COALESCE(h.depth,0),
-                    s.id,COALESCE(s.depth,0),COALESCE(p.total_bytes,0),COALESCE(s.turn_seq,1),
-                    COALESCE(h.total_bytes,0)-COALESCE(cp.total_bytes,0),
+                "SELECT b.head,b.family,COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,f.total_elided,0)),0),
+                    COALESCE(h.depth,0),s.id,COALESCE(s.depth,0),
+                    COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,f.total_elided,0)),0),
+                    COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,f.total_elided,0)),0)
+                        -COALESCE(cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,f.total_elided,0)),0),
                     COALESCE(h.depth,0)-COALESCE(cp.depth,0),
                     note.node,note.text,c.node,c.summary,c.prompts,c.covered_from,c.covered_to,
-                    instr(','||b.tools||',',',history,')>0
+                    instr(','||b.tools||',',',history,')>0,COALESCE(e.through,f.id,0),COALESCE(e.saved,f.total_elided,0),
+                    c.pinned,pn.total_bytes-COALESCE(pp.total_bytes,0),pn.turn_seq,pn.depth,
+                    c.cut IS b.context_start
              FROM bots b LEFT JOIN nodes h ON h.id=b.head
              LEFT JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
              LEFT JOIN compactions c ON c.node=b.compaction LEFT JOIN nodes cut ON cut.id=c.cut
              LEFT JOIN nodes cp ON cp.id=cut.parent
+             LEFT JOIN nodes pn ON pn.id=c.pinned LEFT JOIN nodes pp ON pp.id=pn.parent
              LEFT JOIN notes note ON note.node=b.note
-             WHERE b.name=?",
+             LEFT JOIN elisions e ON e.node=b.elision AND ?2 IS NULL LEFT JOIN nodes f ON f.id=?2
+             WHERE b.name=?1",
             )?
-            .query_row([name], |r| {
+            .query_row(params![name, floor], |r| {
                 Ok(State {
                     head: r.get(0)?,
                     family: r.get(1)?,
@@ -983,20 +1148,27 @@ impl Database {
                     start: r.get(4)?,
                     start_depth: r.get(5)?,
                     before: r.get(6)?,
-                    turn_seq: r.get(7)?,
                     unsummarized: super::ContextUsage {
-                        bytes: r.get::<_, i64>(8)? as usize,
-                        items: r.get::<_, i64>(9)? as usize,
+                        bytes: r.get::<_, i64>(7)? as usize,
+                        items: r.get::<_, i64>(8)? as usize,
                     },
-                    history: r.get(17)?,
+                    history: r.get(16)?,
                     note: r
-                        .get::<_, Option<i64>>(10)?
-                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(11)?)) })
+                        .get::<_, Option<i64>>(9)?
+                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(10)?)) })
                         .transpose()?,
                     compaction: r
-                        .get::<_, Option<i64>>(12)?
+                        .get::<_, Option<i64>>(11)?
                         .map(|id| -> rusqlite::Result<_> {
-                            Ok((id, r.get(13)?, r.get(14)?, r.get(15)?, r.get(16)?))
+                            Ok((id, r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?))
+                        })
+                        .transpose()?,
+                    elided: r.get(17)?,
+                    saved: r.get(18)?,
+                    pinned: r
+                        .get::<_, Option<i64>>(19)?
+                        .map(|id| -> rusqlite::Result<_> {
+                            Ok((id, r.get(20)?, r.get(21)?, r.get(22)?, r.get(23)?))
                         })
                         .transpose()?,
                 })
@@ -1006,51 +1178,119 @@ impl Database {
         let Some(head) = state.head else {
             return Ok(None);
         };
-        let head_total = state.total;
-        let head_depth = state.depth;
-        let current = state
-            .start
-            .map(|start| (start, state.start_depth, state.before, state.turn_seq));
-        let fits = |depth: i64, before: i64| {
-            head_total - before + head_depth - depth <= context_bytes
-                && head_depth - depth < context_items
+        // One walk from the head: back to the saved start, or, without one,
+        // over what could still fit. Sizes come from the cumulative columns;
+        // no item is read here.
+        struct Row {
+            id: i64,
+            parent: Option<i64>,
+            depth: i64,
+            /// Cumulative bytes as sent, through this node.
+            total: i64,
+            thinking: i64,
+            turn_seq: Option<i64>,
+        }
+        let row = |r: &rusqlite::Row<'_>| {
+            Ok(Row {
+                id: r.get(0)?,
+                parent: r.get(1)?,
+                depth: r.get(2)?,
+                total: r.get(3)?,
+                thinking: r.get(4)?,
+                turn_seq: r.get(5)?,
+            })
         };
-        let chosen = match current {
-            Some((start, depth, before, seq)) if fits(depth, before) => (start, depth, before, seq),
+        let rows: Vec<Row> = match state.start {
+            Some(_) => self
+                .conn
+                .prepare_cached(
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq) AS (
+                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?3),thinking,turn_seq
+                        FROM nodes WHERE id=?1
+                        UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?3),
+                            n.thinking,n.turn_seq
+                        FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
+                     SELECT id,parent,depth,total_bytes,thinking,turn_seq FROM chain ORDER BY depth DESC",
+                )?
+                .query_map(params![head, state.start_depth, state.saved], row)?
+                .collect::<rusqlite::Result<_>>()?,
+            None => self
+                .conn
+                .prepare_cached(
+                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking,turn_seq) AS (
+                        SELECT id,parent,depth,total_bytes-MIN(total_elided,?6),thinking,turn_seq
+                        FROM nodes WHERE id=?1
+                        UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?6),
+                            n.thinking,n.turn_seq
+                        FROM nodes n JOIN chain c ON n.id=c.parent
+                        WHERE ?2 - c.total_bytes <= ?3 AND ?4 - c.depth <= ?5)
+                     SELECT id,parent,depth,total_bytes,thinking,turn_seq FROM chain ORDER BY depth DESC",
+                )?
+                .query_map(
+                    params![
+                        head,
+                        state.total,
+                        context_bytes,
+                        state.depth,
+                        context_items,
+                        state.saved
+                    ],
+                    row,
+                )?
+                .collect::<rusqlite::Result<_>>()?,
+        };
+        // Bytes before the oldest row: the saved start's parent, or else
+        // the parent of wherever the walk stopped.
+        let before = match (state.start, rows.last().and_then(|r| r.parent)) {
+            (Some(_), _) => state.before,
+            (None, Some(parent)) => self
+                .conn
+                .prepare_cached("SELECT total_bytes-MIN(total_elided,?2) FROM nodes WHERE id=?1")?
+                .query_row(params![parent, state.saved], |r| r.get(0))?,
+            (None, None) => 0,
+        };
+        // Newest first: what each row sends, and what a window starting at
+        // each row sends in all.
+        let mut sent = Vec::with_capacity(rows.len());
+        let mut through = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            sent.push(row.total - rows.get(index + 1).map_or(before, |r| r.total));
+            through.push(state.total - rows.get(index + 1).map_or(before, |r| r.total));
+        }
+        let saved_start = rows.len() - 1;
+        // A saved start inside a turn is a compaction's cut: that turn's
+        // prompt goes whole ahead of it, as one more item.
+        let pinned = state
+            .pinned
+            .filter(|&(.., at_start)| at_start && state.start.is_some())
+            .map(|(id, size, seq, depth, _)| (id, size, seq, depth));
+        let lead = |index: usize| match pinned {
+            Some((_, size, ..)) if index == saved_start => (size + 1, 1),
+            _ => (0, 0),
+        };
+        let fits = |index: usize, bytes_limit: i64, items_limit: i64| {
+            let (bytes, items) = lead(index);
+            through[index] + index as i64 + bytes <= bytes_limit
+                && index as i64 + items < items_limit
+        };
+        let chosen = match state.start {
+            Some(_) if fits(saved_start, context_bytes, context_items) => saved_start,
             _ => {
-                // Walk back from the head over turn starts while the tail
-                // still fits, keeping the oldest boundary under the target.
+                // Over turn starts from the head, while the tail still fits,
+                // keeping the oldest boundary under the target.
                 let target_bytes = context_bytes / 4 * 3;
                 let target_items = context_items / 4 * 3;
-                let mut statement = self.conn.prepare_cached(
-                    "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq) AS (
-                        SELECT id,parent,depth,total_bytes,turn_seq FROM nodes WHERE id=?1
-                        UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
-                        WHERE ?2 - c.total_bytes <= ?3 AND ?4 - c.depth <= ?5)
-                     SELECT c.id,c.depth,COALESCE(p.total_bytes,0),c.turn_seq FROM chain c LEFT JOIN nodes p ON p.id=c.parent
-                     WHERE c.turn_seq IS NOT NULL ORDER BY c.depth DESC",
-                )?;
-                let candidates = statement.query_map(
-                    params![head, head_total, context_bytes, head_depth, context_items],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i64>(1)?,
-                            r.get::<_, i64>(2)?,
-                            r.get::<_, i64>(3)?,
-                        ))
-                    },
-                )?;
                 let mut pick = None;
-                for candidate in candidates {
-                    let (id, depth, before, seq) = candidate?;
-                    if !fits(depth, before) {
+                for (index, row) in rows.iter().enumerate() {
+                    if row.turn_seq.is_none() {
+                        continue;
+                    }
+                    if !fits(index, context_bytes, context_items) {
                         break;
                     }
-                    let within_target = head_total - before + head_depth - depth <= target_bytes
-                        && head_depth - depth < target_items;
+                    let within_target = fits(index, target_bytes, target_items);
                     if within_target || pick.is_none() {
-                        pick = Some((id, depth, before, seq));
+                        pick = Some(index);
                     }
                     if !within_target {
                         break;
@@ -1064,76 +1304,223 @@ impl Database {
                 };
                 self.conn.execute(
                     "UPDATE bots SET context_start=? WHERE name=?",
-                    params![pick.0, name],
+                    params![rows[pick].id, name],
                 )?;
                 pick
             }
         };
-        let (_, start_depth, before, turn_seq) = chosen;
-        let mut statement = self.conn.prepare_cached(
-            "WITH RECURSIVE chain(id,parent,depth,total_bytes,thinking) AS (
-                SELECT id,parent,depth,total_bytes,thinking FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.thinking FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
-             SELECT id,total_bytes,thinking FROM chain ORDER BY depth",
-        )?;
-        // Sizes come from the cumulative byte column, no item is read here.
-        let mut ids = Vec::new();
-        let mut sizes = Vec::new();
-        let mut thinking = Vec::new();
-        let mut previous = before;
-        for row in statement.query_map(params![head, start_depth], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })? {
-            let (id, total, own) = row?;
-            ids.push(id);
-            sizes.push((total - previous).clamp(0, u32::MAX as i64) as u32);
-            thinking.push(own.clamp(0, u32::MAX as i64) as u32);
-            previous = total;
-        }
+        let start = &rows[chosen];
+        let window = &rows[..=chosen];
+        let pinned = pinned.filter(|_| chosen == saved_start);
         let compaction = match state.compaction {
             Some((version, summary, prompts, from, to)) => Some(CompactionView {
                 version,
                 summary,
                 prompts: serde_json::from_str(&prompts)?,
                 covered: (from, to),
+                partial: state.pinned.is_some(),
             }),
             None => None,
         };
+        let clamp = |bytes: i64| bytes.clamp(0, u32::MAX as i64) as u32;
+        let (mut ids, mut sizes, mut thinking) = match pinned {
+            // A prompt carries no thinking.
+            Some((id, size, ..)) => (vec![id], vec![clamp(size)], vec![0]),
+            None => Default::default(),
+        };
+        ids.extend(window.iter().rev().map(|r| r.id));
+        sizes.extend(sent[..=chosen].iter().rev().map(|&b| clamp(b)));
+        thinking.extend(window.iter().rev().map(|r| clamp(r.thinking)));
+        // The view since the summary includes the prompt it keeps in full.
+        let mut unsummarized = state.unsummarized;
+        if let Some((_, size, ..)) = state.pinned {
+            unsummarized.bytes += size as usize;
+            unsummarized.items += 1;
+        }
         Ok(Some(Window {
             family: Family::parse(&state.family).ok_or(Error::new("store_family_unsupported"))?,
             ids,
             sizes,
             thinking,
-            item_bytes: head_total - before,
-            unsummarized: state.unsummarized,
-            omitted_items: start_depth - 1,
-            omitted_turns: turn_seq - 1,
+            item_bytes: through[chosen] + pinned.map_or(0, |(_, size, ..)| size),
+            unsummarized,
+            omitted_items: pinned.map_or(start.depth, |(.., depth)| depth) - 1,
+            omitted_turns: pinned.map_or(start.turn_seq.unwrap_or(1), |(_, _, seq, _)| seq) - 1,
+            omitted_in_turn: pinned.map_or(0, |(.., depth)| start.depth - 1 - depth),
             history: state.history,
             note: state.note,
             compaction,
+            elided: state.elided,
         }))
     }
-    fn compaction_view(&self, name: &str) -> Result<Option<CompactionView>> {
-        let row: Option<(i64, String, String, i64, i64)> = self
+    /// Where to move the bot's elision floor so the newest `keep_bytes` of
+    /// its window stay verbatim, and what that saves. Only results the model
+    /// has already answered go: the floor stays below its newest output.
+    /// `None` when the move saves less than `min_saving`. Only the running
+    /// turn moves the head, so the reader plans what the writer would.
+    pub fn elision_plan(
+        &self,
+        name: &str,
+        keep_bytes: i64,
+        min_saving: i64,
+    ) -> Result<Option<ElisionPlan>> {
+        let state: Option<(i64, i64, i64, i64, i64)> = self
             .conn
             .prepare_cached(
-                "SELECT c.node,c.summary,c.prompts,c.covered_from,c.covered_to
-                 FROM bots b JOIN compactions c ON c.node=b.compaction WHERE b.name=?",
+                "SELECT b.head,s.depth,COALESCE(e.saved,0),
+                    COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0),COALESCE(e.through,0)
+                 FROM bots b JOIN nodes s ON s.id=b.context_start LEFT JOIN nodes p ON p.id=s.parent
+                 LEFT JOIN elisions e ON e.node=b.elision WHERE b.name=? AND b.head IS NOT NULL",
             )?
             .query_row([name], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })
             .optional()?;
+        let Some((head, start_depth, saved, before, elided)) = state else {
+            return Ok(None);
+        };
+        // Newest first: id, cumulative bytes as sent, what its stub saves.
+        let rows: Vec<(i64, i64, i64)> = self
+            .conn
+            .prepare_cached(
+                "WITH RECURSIVE chain(id,parent,depth,total_bytes,elided) AS (
+                    SELECT id,parent,depth,total_bytes-MIN(total_elided,?3),elided FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?3),n.elided
+                    FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?2)
+                 SELECT id,total_bytes,elided FROM chain ORDER BY depth DESC",
+            )?
+            .query_map(params![head, start_depth, saved], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        // The newest model output: results after it are still unanswered.
+        // A result with a stub is a result, so only the others are read.
+        let mut item = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut answered = None;
+        for (index, (id, _, saves)) in rows.iter().enumerate() {
+            if *saves == 0
+                && item.query_row([id], |r| {
+                    Ok(super::context::model_output(r.get_ref(0)?.as_blob()?))
+                })?
+            {
+                answered = Some(index);
+                break;
+            }
+        }
+        let Some(answered) = answered else {
+            return Ok(None);
+        };
+        // Newest first, the verbatim tail takes rows while it stays within
+        // `keep_bytes`; the floor goes through the first row it cannot take.
+        let size = |index: usize| rows[index].1 - rows.get(index + 1).map_or(before, |r| r.1);
+        let mut kept = 0;
+        let mut edge = rows.len();
+        for index in 0..rows.len() {
+            kept += size(index);
+            if kept > keep_bytes {
+                edge = index;
+                break;
+            }
+        }
+        let floor = edge.max(answered);
+        let Some(&(through, _, _)) = rows.get(floor) else {
+            return Ok(None);
+        };
+        let (mut results, mut saved_bytes) = (0, 0);
+        for row in &rows[floor..] {
+            if let &(id, _, saves) = row
+                && id > elided
+                && saves > 0
+            {
+                results += 1;
+                saved_bytes += saves;
+            }
+        }
+        Ok(
+            (results > 0 && saved_bytes >= min_saving).then_some(ElisionPlan {
+                through,
+                results,
+                saved_bytes,
+            }),
+        )
+    }
+    /// Move the bot's elision floor as planned: a new version at the head,
+    /// which forks from later checkpoints inherit.
+    pub fn elide(&mut self, name: &str, plan: &ElisionPlan) -> Result<Value> {
+        let bot = self.inspect(name)?;
+        let head = bot.head.ok_or(Error::new("storage_error"))?;
+        let (elided, previous): (i64, Option<i64>) = match bot.elision {
+            Some(version) => self
+                .conn
+                .prepare_cached("SELECT through,previous FROM elisions WHERE node=?")?
+                .query_row([version], |r| Ok((r.get(0)?, r.get(1)?)))?,
+            None => (0, None),
+        };
+        if plan.through <= elided || plan.through > head {
+            return fail("elision_not_forward");
+        }
+        if bot.elision == Some(head) && elision_shared(&self.conn, head, name)? {
+            return fail("elision_version_shared");
+        }
+        let tx = self.conn.savepoint()?;
+        // The version records what every stub through its floor saves, so
+        // any node's bytes as sent are one subtraction (`sent_total`).
+        let previous = if bot.elision == Some(head) {
+            // A second move before the model answers at this head: the
+            // view still could not fit beside what goes ahead of it, so the
+            // forced move goes further. No other bot sees the version, so
+            // only this bot's requests at this head send it as it ends.
+            tx.execute(
+                "UPDATE elisions SET through=id,saved=total_elided FROM nodes
+                 WHERE elisions.node=? AND nodes.id=?",
+                params![head, plan.through],
+            )?;
+            previous
+        } else {
+            tx.execute(
+                "INSERT INTO elisions(node,previous,through,saved)
+                 SELECT ?,?,id,total_elided FROM nodes WHERE id=?",
+                params![head, bot.elision, plan.through],
+            )?;
+            tx.execute(
+                "UPDATE bots SET elision=? WHERE name=?",
+                params![head, name],
+            )?;
+            bot.elision
+        };
+        let data = json!({"version":head,"previous":previous,"through":plan.through,
+            "results":plan.results,"saved_bytes":plan.saved_bytes});
+        let cursor = event(&tx, name, bot.running_turn, "elided", data.clone())?;
+        tx.commit()?;
+        Ok(entry(cursor, name, bot.running_turn, "elided", data))
+    }
+    fn compaction_view(&self, name: &str) -> Result<Option<CompactionView>> {
+        let row: Option<(i64, String, String, i64, i64, bool)> = self
+            .conn
+            .prepare_cached(
+                "SELECT c.node,c.summary,c.prompts,c.covered_from,c.covered_to,c.pinned IS NOT NULL
+                 FROM bots b JOIN compactions c ON c.node=b.compaction WHERE b.name=?",
+            )?
+            .query_row([name], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .optional()?;
         Ok(match row {
-            Some((version, summary, prompts, from, to)) => Some(CompactionView {
+            Some((version, summary, prompts, from, to, partial)) => Some(CompactionView {
                 version,
                 summary,
                 prompts: serde_json::from_str(&prompts)?,
                 covered: (from, to),
+                partial,
             }),
             None => None,
         })
@@ -1146,10 +1533,12 @@ impl Database {
         Ok(self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(h.total_bytes,0)-COALESCE(p.total_bytes,0)
+                "SELECT COALESCE(h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),0)
+                    -COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0)
                  FROM bots b LEFT JOIN nodes h ON h.id=b.head
                  LEFT JOIN compactions c ON c.node=b.compaction
                  LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
+                 LEFT JOIN elisions e ON e.node=b.elision
                  WHERE b.name=?",
             )?
             .query_row([name], |r| r.get(0))?)
@@ -1168,35 +1557,58 @@ impl Database {
         keep_items: i64,
         max_bytes: i64,
         max_items: i64,
+        again: bool,
     ) -> Result<Option<Planning>> {
         let bot = self.inspect(name)?;
         let Some(head) = bot.head else {
             return Ok(None);
         };
-        // A resumed model call must not summarize again at the same head.
-        if bot.compaction == Some(head) {
+        // A resumed model call must not summarize again at the same head,
+        // unless the view still cannot fit (`again`): then another step
+        // extends the summary made here, while no other bot sees it.
+        if bot.compaction == Some(head) && (!again || compaction_shared(&self.conn, head, name)?) {
             return Ok(None);
         }
         // Constant-count indexed reads size the span before any walk:
         // previous cut, head's totals, and the totals before the cut.
-        type Span = (i64, i64, i64, i64, i64);
-        let (previous_cut, head_total, head_depth, before, depth_before): Span = self
-            .conn
-            .prepare_cached(
-                "SELECT COALESCE(c.cut,-1),h.total_bytes,h.depth,
-                        COALESCE(p.total_bytes,0),COALESCE(p.depth,0)
+        // Bytes count as the summarizer is sent them: stubs through the
+        // bot's elision floor, as the model last saw the span.
+        // A previous cut inside a turn also names that turn's prompt.
+        type Span = (i64, i64, i64, i64, i64, i64, i64, Option<(i64, i64)>);
+        let (previous_cut, head_total, head_depth, before, depth_before, elided, saved, partial): Span =
+            self.conn
+                .prepare_cached(
+                    "SELECT COALESCE(c.cut,-1),h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0)),
+                        h.depth,COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0),
+                        COALESCE(p.depth,0),COALESCE(e.through,0),COALESCE(e.saved,0),c.pinned,pn.turn_seq
                  FROM nodes h LEFT JOIN compactions c ON c.node=?2
                  LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes p ON p.id=cut.parent
+                 LEFT JOIN nodes pn ON pn.id=c.pinned
+                 LEFT JOIN elisions e ON e.node=?3
                  WHERE h.id=?1",
-            )?
-            .query_row(params![head, bot.compaction], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?;
+                )?
+                .query_row(params![head, bot.compaction, bot.elision], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get::<_, Option<i64>>(7)?
+                            .map(|id| -> rusqlite::Result<_> { Ok((id, r.get(8)?)) })
+                            .transpose()?,
+                    ))
+                })?;
         if head_total - before > max_bytes || head_depth - depth_before > max_items {
             return Ok(Some(Planning::CatchUp(CatchUp {
                 head,
                 previous_cut,
                 totals: (head_total, before, depth_before),
+                elision: (elided, saved),
+                partial,
+                newest_prompt: self.running_prompt_depth(&bot)?,
                 bounds: (keep_bytes, keep_items, max_bytes, max_items),
                 next: Some((head, None, None)),
                 rows: Vec::new(),
@@ -1207,10 +1619,11 @@ impl Database {
         // and return bounded text rather than whole native items to Rust.
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,total_bytes,turn_seq) AS (
-                SELECT id,parent,total_bytes,turn_seq FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.total_bytes,n.turn_seq FROM nodes n JOIN chain c ON n.id=c.parent
+                SELECT id,parent,total_bytes-MIN(total_elided,?4),turn_seq FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.total_bytes-MIN(n.total_elided,?4),n.turn_seq
+                FROM nodes n JOIN chain c ON n.id=c.parent
                 WHERE c.id IS NOT ?2)
-             SELECT c.id,c.total_bytes,COALESCE(p.total_bytes,0),c.turn_seq,
+             SELECT c.id,c.total_bytes,COALESCE(p.total_bytes-MIN(p.total_elided,?4),0),c.turn_seq,
                 CASE WHEN c.turn_seq IS NOT NULL THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?3)
                      FROM nodes WHERE id=c.id) END
@@ -1220,40 +1633,88 @@ impl Database {
         type SpanRow = (i64, i64, i64, Option<i64>, Option<String>);
         let rows: Vec<SpanRow> = statement
             .query_map(
-                params![head, previous_cut, Self::COMPACTION_PROMPT_BYTES as i64 + 1],
+                params![
+                    head,
+                    previous_cut,
+                    Self::COMPACTION_PROMPT_BYTES as i64 + 1,
+                    saved
+                ],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?
             .collect::<rusqlite::Result<_>>()?;
-        // The newest prompt whose tail reaches either retention target.
+        // The newest boundary whose tail reaches either retention target: a
+        // turn's prompt, or, inside the newest turn, a round start: the first
+        // item after a tool result that is not one, a model output or an
+        // absorbed steer, so no call is parted from its result and a steer
+        // is kept whole. Only items near the boundary are read.
+        let newest_prompt = rows.iter().position(|r| r.3.is_some());
+        let mut item = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut results: Vec<Option<bool>> = vec![None; rows.len()];
+        let mut result = |index: usize| -> Result<bool> {
+            if let Some(result) = results[index] {
+                return Ok(result);
+            }
+            let result = item.query_row([rows[index].0], |r| {
+                Ok(super::context::is_tool_result(r.get_ref(0)?.as_blob()?))
+            })?;
+            results[index] = Some(result);
+            Ok(result)
+        };
         let mut cut = None;
         for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
-            if seq.is_some()
-                && (head_total - before >= keep_bytes || (index + 1) as i64 >= keep_items)
-            {
-                cut = Some((index, *id));
+            if head_total - before < keep_bytes && ((index + 1) as i64) < keep_items {
+                continue;
+            }
+            if seq.is_some() {
+                cut = Some((index, *id, false));
+                break;
+            }
+            let in_turn = newest_prompt.is_none_or(|p| index + 1 < p) && index + 1 < rows.len();
+            if in_turn && result(index + 1)? && !result(index)? {
+                cut = Some((index, *id, true));
                 break;
             }
         }
-        let Some((cut_index, cut)) = cut else {
+        let Some((cut_index, cut, within)) = cut else {
             return Ok(None);
         };
-        // Everything older than the cut, back to and including the previous cut.
+        // Everything older than the cut, back to and including the previous
+        // cut: whole turns, or the rest of a turn a previous cut split.
         let older = &rows[cut_index + 1..];
-        if !older.iter().any(|r| r.3.is_some()) {
+        if older.is_empty() {
             return Ok(None);
         }
+        // A cut inside the turn keeps its prompt in view: the newest prompt
+        // walked, or, when the previous cut was inside this turn too, the
+        // prompt that one kept.
+        let pinned = match (within, newest_prompt) {
+            (false, _) => None,
+            (true, Some(p)) => Some((rows[p].0, rows[p].3.ok_or(Error::new("storage_error"))?)),
+            (true, None) => Some(partial.ok_or(Error::new("storage_error"))?),
+        };
         let span = older
             .iter()
             .rev()
             .map(|(id, total, before, seq, prompt)| (*id, total - before, *seq, prompt.as_deref()));
         let previous_summary = self.previous_summary(&bot)?;
-        let plan = Self::span_plan(
+        let mut plan = Self::span_plan(
             cut,
             span,
             previous_summary,
             false,
             (max_bytes as usize / 3).min(64 * 1024),
+            elided,
         );
+        // A turn split by the previous cut is covered now, in part or whole.
+        if let Some((_, turn)) = partial {
+            plan.covered = (plan.covered.0.min(turn), plan.covered.1.max(turn));
+        }
+        if let Some((prompt, turn)) = pinned {
+            plan.pinned = Some(prompt);
+            plan.covered = (plan.covered.0.min(turn), turn);
+        }
         let (head_frame, tail_frame) = CompactionPlan::frame(
             bot.family()?,
             plan.previous_summary.as_deref(),
@@ -1271,12 +1732,27 @@ impl Database {
                 head,
                 previous_cut,
                 totals: (head_total, before, depth_before),
+                elision: (elided, saved),
+                partial,
+                newest_prompt: self.running_prompt_depth(&bot)?,
                 bounds: (keep_bytes, keep_items, max_bytes, max_items),
                 next: Some((head, None, None)),
                 rows: Vec::new(),
             })));
         }
         Ok(Some(Planning::Plan(plan)))
+    }
+    /// The depth of the running turn's prompt, which a catch-up walk would
+    /// otherwise find by passing every prompt back to it.
+    fn running_prompt_depth(&self, bot: &Bot) -> Result<Option<i64>> {
+        let Some(turn) = bot.running_turn else {
+            return Ok(None);
+        };
+        Ok(self
+            .conn
+            .prepare_cached("SELECT depth FROM nodes WHERE turn=?")?
+            .query_row([turn], |r| r.get(0))
+            .optional()?)
     }
     /// One piece of a catch-up walk: at most `limit` nodes further back
     /// along the head's lineage toward the previous cut, reading node
@@ -1288,20 +1764,24 @@ impl Database {
         };
         let (_, before, depth_before) = walk.totals;
         let (_, _, max_bytes, max_items) = walk.bounds;
+        let (_, saved) = walk.elision;
         // Each row carries its child on the lineage, so cutting at a prompt
         // child needs no parent lookup: the span ends at this row. Only rows
-        // inside the budget and the piece's oldest row leave SQLite.
+        // inside the budget, the piece's oldest row, and, until the newest
+        // prompt is found, prompts leave SQLite.
         let mut statement = self.conn.prepare_cached(
             "WITH RECURSIVE chain(id,parent,depth,total_bytes,turn_seq,child,child_seq,k) AS (
-                SELECT id,parent,depth,total_bytes,turn_seq,?3,?4,1 FROM nodes WHERE id=?1
-                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes,n.turn_seq,c.id,c.turn_seq,c.k+1
+                SELECT id,parent,depth,total_bytes-MIN(total_elided,?9),turn_seq,?3,?4,1
+                FROM nodes WHERE id=?1
+                UNION ALL SELECT n.id,n.parent,n.depth,n.total_bytes-MIN(n.total_elided,?9),
+                    n.turn_seq,c.id,c.turn_seq,c.k+1
                 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.id IS NOT ?2 AND c.k<?5)
              SELECT c.id,c.parent,c.depth,c.total_bytes,c.turn_seq,c.child,c.child_seq,
                 CASE WHEN c.turn_seq IS NOT NULL AND c.total_bytes<=?7 AND c.depth<=?8 THEN
                     (SELECT substr(json_extract(CAST(item AS TEXT),'$.content[0].text'),1,?6)
                      FROM nodes WHERE id=c.id) END
              FROM chain c WHERE (c.total_bytes<=?7 AND c.depth<=?8)
-                OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL",
+                OR c.k=?5 OR c.id IS ?2 OR c.parent IS NULL OR (?10 AND c.turn_seq IS NOT NULL)",
         )?;
         let (max_total, max_depth) = (
             before.saturating_add(max_bytes),
@@ -1315,7 +1795,9 @@ impl Database {
             limit.max(1),
             Self::COMPACTION_PROMPT_BYTES as i64 + 1,
             max_total,
-            max_depth
+            max_depth,
+            saved,
+            walk.newest_prompt.is_none()
         ])?;
         let mut last: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
         while let Some(r) = rows.next()? {
@@ -1324,6 +1806,9 @@ impl Database {
             if total <= max_total && depth <= max_depth {
                 walk.rows
                     .push((id, depth, total, seq, r.get(5)?, r.get(6)?, r.get(7)?));
+            }
+            if seq.is_some() && walk.newest_prompt.is_none_or(|newest| depth > newest) {
+                walk.newest_prompt = Some(depth);
             }
             if last.is_none_or(|(_, oldest, _, _)| depth < oldest) {
                 last = Some((id, depth, parent, seq));
@@ -1337,9 +1822,11 @@ impl Database {
         };
         Ok(())
     }
-    /// Choose a finished catch-up walk's step: the longest run of whole
-    /// turns from the previous cut whose summarizer request, previous
-    /// summary included, fits the budget, cut at the next prompt.
+    /// Choose a finished catch-up walk's step: the longest run from the
+    /// previous cut whose summarizer request, previous summary included,
+    /// fits the budget, cut at the next prompt or, inside the newest turn,
+    /// at the next round that follows a tool result. A turn older than the
+    /// newest that alone exceeds the budget is cut at a round too.
     pub fn catch_up_plan(&self, name: &str, walk: CatchUp) -> Result<Option<CompactionPlan>> {
         let bot = self.inspect(name)?;
         if walk.next.is_some() || bot.head != Some(walk.head) {
@@ -1347,6 +1834,9 @@ impl Database {
         }
         let CatchUp {
             totals: (head_total, before, depth_before),
+            elision: (elided, _),
+            partial,
+            newest_prompt,
             bounds: (keep_bytes, keep_items, max_bytes, max_items),
             mut rows,
             ..
@@ -1370,28 +1860,61 @@ impl Database {
                 .query_row("SELECT depth FROM nodes WHERE id=?", [walk.head], |r| {
                     r.get(0)
                 })?;
-        let mut prompted = false;
+        // The rest of a turn a previous cut split may end a step alone.
+        let first_prompt = rows.iter().position(|row| row.3.is_some());
+        let prompted = |index: usize| partial.is_some() || first_prompt.is_some_and(|p| p <= index);
+        // The newest turn: after the newest prompt, or all of it when the
+        // previous cut split that turn and no later prompt followed.
+        let newest_depth = newest_prompt.unwrap_or(depth_before);
+        let fits = rows
+            .iter()
+            .take_while(|(_, depth, total, ..)| {
+                let items = depth - depth_before;
+                items <= span_items && total - before + items <= span_bytes
+            })
+            .count();
+        let mut item = self
+            .conn
+            .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
+        let mut result = |id: i64| -> Result<bool> {
+            Ok(item.query_row([id], |r| {
+                Ok(super::context::is_tool_result(r.get_ref(0)?.as_blob()?))
+            })?)
+        };
+        // The longest step, newest end first: a prompt child, or a round
+        // start inside the newest turn; failing both, a round start inside
+        // the oldest turn, which alone exceeds the budget. Only items at
+        // candidate ends are read.
         let mut end = None;
-        for (index, (_, depth, total, seq, _, child_seq, _)) in rows.iter().enumerate() {
-            prompted |= seq.is_some();
-            let items = depth - depth_before;
-            if items > span_items || total - before + items > span_bytes {
-                break;
-            }
-            if prompted
-                && child_seq.is_some()
-                && (head_total - total >= keep_bytes || head_depth - depth >= keep_items)
-            {
-                end = Some(index);
+        'search: for any_turn in [false, true] {
+            for index in (0..fits).rev() {
+                let (id, depth, total, _, child, child_seq, _) = rows[index];
+                if !prompted(index)
+                    || (head_total - total < keep_bytes && head_depth - depth < keep_items)
+                {
+                    continue;
+                }
+                if child_seq.is_some() {
+                    end = Some((index, false));
+                    break 'search;
+                }
+                if let Some(child) = child
+                    && (any_turn || depth > newest_depth)
+                    && result(id)?
+                    && !result(child)?
+                {
+                    end = Some((index, true));
+                    break 'search;
+                }
             }
         }
-        let Some(end) = end else {
+        let Some((end, within)) = end else {
             return fail_with(
                 "compaction_span_limit",
                 "the oldest unsummarized turn exceeds the context budget; original history remains available",
             );
         };
-        // The cut is the prompt that follows the span on the head's lineage.
+        // The cut is the node that follows the span on the head's lineage.
         let cut = rows[end].4.ok_or(Error::new("storage_error"))?;
         let mut previous = before;
         let span = rows[..=end]
@@ -1401,13 +1924,53 @@ impl Database {
                 previous = *total;
                 (*id, size, *seq, prompt.as_deref())
             });
-        Ok(Some(Self::span_plan(
+        let mut plan = Self::span_plan(
             cut,
             span,
             previous_summary,
             true,
             (max_bytes as usize / 3).min(64 * 1024),
-        )))
+            elided,
+        );
+        if let Some((_, turn)) = partial {
+            plan.covered = (plan.covered.0.min(turn), plan.covered.1.max(turn));
+        }
+        // A step ending inside a turn keeps that turn's prompt.
+        if within {
+            let (prompt, turn) = rows[..=end]
+                .iter()
+                .rev()
+                .find_map(|row| row.3.map(|seq| (row.0, seq)))
+                .or(partial)
+                .ok_or(Error::new("storage_error"))?;
+            plan.pinned = Some(prompt);
+            plan.covered = (plan.covered.0.min(turn), turn);
+        }
+        Ok(Some(plan))
+    }
+    /// The start of the newest round that follows a tool result, walking
+    /// back from `head` no further than `stop`. Rounds are short, so the
+    /// walk reads a few items.
+    fn newest_round(&self, head: i64, stop: i64) -> Result<Option<i64>> {
+        let mut node = self
+            .conn
+            .prepare_cached("SELECT parent,item FROM nodes WHERE id=?")?;
+        let (mut id, mut start) = (head, None);
+        while id != stop {
+            let (parent, is_result) = node.query_row([id], |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    super::context::is_tool_result(r.get_ref(1)?.as_blob()?),
+                ))
+            })?;
+            if is_result && start.is_some() {
+                return Ok(start);
+            }
+            start = (!is_result).then_some(id);
+            let Some(parent) = parent else { break };
+            id = parent;
+        }
+        Ok(None)
     }
     fn previous_summary(&self, bot: &Bot) -> Result<Option<String>> {
         Ok(match bot.compaction {
@@ -1427,6 +1990,7 @@ impl Database {
         previous_summary: Option<String>,
         catch_up: bool,
         summary_bytes: usize,
+        elided: i64,
     ) -> CompactionPlan {
         let (mut ids, mut sizes, mut prompts) = (Vec::new(), Vec::new(), Vec::new());
         let (mut from, mut to) = (i64::MAX, 0);
@@ -1442,6 +2006,7 @@ impl Database {
         bound_prompts(&mut prompts);
         CompactionPlan {
             cut,
+            pinned: None,
             ids,
             sizes,
             prompts,
@@ -1449,6 +2014,7 @@ impl Database {
             previous_summary,
             catch_up,
             summary_bytes,
+            elided,
         }
     }
     /// Record a compaction at the current head. The separate cut marks the
@@ -1464,6 +2030,15 @@ impl Database {
         input_limit: super::ContextUsage,
     ) -> Result<Value> {
         let bot = self.inspect(name)?;
+        if let Some(head) = bot.head
+            && bot.compaction == Some(head)
+            && compaction_shared(&self.conn, head, name)?
+        {
+            return fail_with(
+                "compaction_version_shared",
+                "another bot sees the summary made at this head, so it cannot be extended",
+            );
+        }
         // A compaction stands for everything since the first: the summary
         // merged the previous one, and the kept prompts carry over, bounded.
         let (mut prompts, mut covered_from) = (Vec::new(), plan.covered.0);
@@ -1486,23 +2061,30 @@ impl Database {
             summary: summary.to_owned(),
             prompts,
             covered: (covered_from, plan.covered.1),
+            partial: plan.pinned.is_some(),
         };
         candidate.bound_prompt_bytes(bot.family()?, input_limit.bytes / 2)?;
         let old = self.compaction_view(name)?;
-        let old_cut = bot
-            .compaction
-            .map(|id| {
-                self.conn
-                    .query_row("SELECT cut FROM compactions WHERE node=?", [id], |r| {
-                        r.get::<_, i64>(0)
-                    })
-            })
-            .transpose()?;
-        let before =
-            self.compaction_context_usage(&bot, old_cut, old.as_ref(), note_turns, input_limit)?;
+        let (old_cut, old_pinned) = match bot.compaction {
+            Some(id) => self.conn.query_row(
+                "SELECT cut,pinned FROM compactions WHERE node=?",
+                [id],
+                |r| Ok((Some(r.get::<_, i64>(0)?), r.get(1)?)),
+            )?,
+            None => (None, None),
+        };
+        let before = self.compaction_context_usage(
+            &bot,
+            old_cut,
+            old_pinned,
+            old.as_ref(),
+            note_turns,
+            input_limit,
+        )?;
         let after = self.compaction_context_usage(
             &bot,
             Some(plan.cut),
+            plan.pinned,
             Some(&candidate),
             note_turns,
             input_limit,
@@ -1520,11 +2102,27 @@ impl Database {
         if !after.fits(input_limit)
             && let Some(turn) = bot.running_turn
         {
-            let start: i64 =
+            // The least the active turn can be cut to: its prompt ahead of
+            // its newest round, or, before its first result, all of it.
+            let prompt: i64 =
                 self.conn
                     .query_row("SELECT id FROM nodes WHERE turn=?", [turn], |r| r.get(0))?;
-            let minimum =
-                self.compaction_context_usage(&bot, Some(start), Some(&candidate), 0, input_limit)?;
+            let head = bot.head.ok_or(Error::new("storage_error"))?;
+            let (start, pinned) = match self.newest_round(head, prompt)? {
+                Some(round) => (round, Some(prompt)),
+                None => match plan.pinned {
+                    Some(pinned) => (plan.cut, Some(pinned)),
+                    None => (prompt, None),
+                },
+            };
+            let minimum = self.compaction_context_usage(
+                &bot,
+                Some(start),
+                pinned,
+                Some(&candidate),
+                0,
+                input_limit,
+            )?;
             if !minimum.fits(input_limit) {
                 return fail_with(
                     "compaction_context_limit",
@@ -1533,23 +2131,50 @@ impl Database {
             }
         }
         let tx = self.conn.savepoint()?;
-        tx.execute(
-            "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to) VALUES (?,?,?,?,?,?,?)",
-            params![
-                bot.head,
-                bot.compaction,
-                plan.cut,
-                summary,
-                serde_json::to_string(&candidate.prompts)?,
-                covered_from,
-                plan.covered.1
-            ],
-        )?;
+        let previous = if bot.compaction == bot.head {
+            // Another step before the model answers at this head, since the
+            // view still could not fit: it merged the summary made here and
+            // takes its place. No other bot sees the version, so only this
+            // bot's requests at this head send it as it ends.
+            tx.execute(
+                "UPDATE compactions SET cut=?,summary=?,prompts=?,covered_from=?,covered_to=?,pinned=?
+                 WHERE node=?",
+                params![
+                    plan.cut,
+                    summary,
+                    serde_json::to_string(&candidate.prompts)?,
+                    covered_from,
+                    plan.covered.1,
+                    plan.pinned,
+                    bot.head
+                ],
+            )?;
+            tx.query_row(
+                "SELECT previous FROM compactions WHERE node=?",
+                [bot.head],
+                |r| r.get(0),
+            )?
+        } else {
+            tx.execute(
+                "INSERT INTO compactions(node,previous,cut,summary,prompts,covered_from,covered_to,pinned) VALUES (?,?,?,?,?,?,?,?)",
+                params![
+                    bot.head,
+                    bot.compaction,
+                    plan.cut,
+                    summary,
+                    serde_json::to_string(&candidate.prompts)?,
+                    covered_from,
+                    plan.covered.1,
+                    plan.pinned
+                ],
+            )?;
+            bot.compaction
+        };
         tx.execute(
             "UPDATE bots SET compaction=?,context_start=? WHERE name=?",
             params![bot.head, plan.cut, name],
         )?;
-        let data = json!({"version":bot.head,"cut":plan.cut,"previous":bot.compaction,"covered_turns":[covered_from, plan.covered.1],
+        let data = json!({"version":bot.head,"cut":plan.cut,"pinned":plan.pinned,"previous":previous,"covered_turns":[covered_from, plan.covered.1],
             "span_turns":[plan.covered.0, plan.covered.1],
             "items":plan.ids.len(),"bytes":plan.sizes.iter().map(|s| *s as u64).sum::<u64>(),
             "summary_bytes":summary.len(),"prompt_bytes":plan.prompts.iter().map(|(_, p)| p.len()).sum::<usize>(),
@@ -1574,20 +2199,42 @@ impl Database {
         tx.commit()?;
         Ok(entry(cursor, name, bot.running_turn, "compacted", data))
     }
+    /// The view a compaction leaves: `view` ahead of the items from `cut`,
+    /// or, for a cut inside a turn, ahead of that turn's `pinned` prompt and
+    /// then the items from the cut.
     fn compaction_context_usage(
         &self,
         bot: &Bot,
         cut: Option<i64>,
+        pinned: Option<i64>,
         view: Option<&CompactionView>,
         note_turns: usize,
         input_limit: super::ContextUsage,
     ) -> Result<super::ContextUsage> {
-        let (bytes, items, omitted, turns): (i64, i64, i64, i64) = self.conn.query_row(
-            "SELECT h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0),
-                COALESCE(p.depth,0),COALESCE(c.turn_seq,1)-1
-             FROM nodes h LEFT JOIN nodes c ON c.id=?2 LEFT JOIN nodes p ON p.id=c.parent WHERE h.id=?1",
-            params![bot.head, cut], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
-        )?;
+        let (mut bytes, mut items, mut omitted, mut turns): (i64, i64, i64, i64) =
+            self.conn.query_row(
+                "SELECT h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0))
+                    -COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0),
+                h.depth-COALESCE(p.depth,0),COALESCE(p.depth,0),COALESCE(c.turn_seq,1)-1
+             FROM nodes h LEFT JOIN nodes c ON c.id=?2 LEFT JOIN nodes p ON p.id=c.parent
+             LEFT JOIN elisions e ON e.node=?3 WHERE h.id=?1",
+                params![bot.head, cut, bot.elision],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        let mut in_turn = 0;
+        if let Some(prompt) = pinned {
+            let (size, seq, depth): (i64, i64, i64) = self.conn.query_row(
+                "SELECT n.total_bytes-COALESCE(p.total_bytes,0),n.turn_seq,n.depth
+                 FROM nodes n LEFT JOIN nodes p ON p.id=n.parent WHERE n.id=?",
+                [prompt],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            bytes += size;
+            items += 1;
+            in_turn = omitted - depth;
+            omitted = depth - 1;
+            turns = seq - 1;
+        }
         let note: Option<(i64, String)> = self
             .conn
             .query_row(
@@ -1596,8 +2243,10 @@ impl Database {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let listed = match cut {
-            Some(cut) if note_turns > 0 && omitted > 0 => self.omitted_turns(cut, note_turns)?,
+        let listed = match pinned.or(cut) {
+            Some(start) if note_turns > 0 && omitted > 0 => {
+                self.omitted_turns(start, note_turns)?
+            }
             _ => Vec::new(),
         };
         let prefix = super::context::context_prefix(
@@ -1606,6 +2255,7 @@ impl Database {
             note.as_ref(),
             omitted,
             turns,
+            in_turn,
             bot.tools.iter().any(|tool| tool == "history"),
             &listed,
             input_limit.bytes * 2 / 3,
@@ -1653,17 +2303,38 @@ impl Database {
         Ok(out)
     }
     /// Encoded items for a batch of window ids, in order, comma-separated.
-    /// Items joined by commas; those with ids below `floor` go without
-    /// their thinking blocks, and one that held only thinking is left out.
-    pub fn items_by_ids(&self, ids: &[i64], floor: i64) -> Result<Vec<u8>> {
+    /// Items joined by commas; those `strip` names go without their
+    /// thinking blocks, and one that held only thinking is left out.
+    pub fn items_by_ids(
+        &self,
+        ids: &[i64],
+        strip: impl Into<Strip>,
+        elided: i64,
+    ) -> Result<Vec<u8>> {
+        let strip = strip.into();
         let mut statement = self
             .conn
             .prepare_cached("SELECT item,thinking FROM nodes WHERE id=?")?;
+        // A stub replaces its result without the result's row being read.
+        let mut stubs = self
+            .conn
+            .prepare_cached("SELECT item FROM stubs WHERE node=?")?;
         let mut out = Vec::new();
         for id in ids {
+            if *id <= elided
+                && let Some(stub) = stubs
+                    .query_row([id], |r| Ok(r.get_ref(0)?.as_blob()?.to_vec()))
+                    .optional()?
+            {
+                if !out.is_empty() {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&stub);
+                continue;
+            }
             statement.query_row([id], |r| {
                 let item = r.get_ref(0)?.as_blob()?;
-                let item = match (*id < floor && r.get::<_, i64>(1)? > 0)
+                let item = match (strip.strips(*id) && r.get::<_, i64>(1)? > 0)
                     .then(|| super::without_thinking(item))
                     .flatten()
                 {
@@ -1704,24 +2375,63 @@ impl Database {
             })
             .collect()
     }
-    /// Record the context fingerprint a bot's requests now start with and
-    /// the first node whose thinking is bound to it.
-    pub fn set_thinking(&mut self, name: &str, prefix: i64, floor: i64) -> Result<()> {
+    /// Record the context fingerprint a bot's requests now start with, the
+    /// nodes they send without thinking, and the elision floor.
+    pub fn set_thinking(
+        &mut self,
+        name: &str,
+        prefix: i64,
+        strip: Strip,
+        elided: i64,
+    ) -> Result<()> {
         self.conn
-            .prepare_cached("UPDATE bots SET thinking_prefix=?,thinking_floor=? WHERE name=?")?
-            .execute(params![prefix, floor, name])?;
+            .prepare_cached(
+                "UPDATE bots SET thinking_prefix=?,thinking_floor=?,thinking_from=?,thinking_to=?,
+                    thinking_elided=? WHERE name=?",
+            )?
+            .execute(params![
+                prefix,
+                strip.below,
+                strip.from,
+                strip.to,
+                elided,
+                name
+            ])?;
         Ok(())
     }
+    /// The first of `ids` that has a stub.
+    pub fn first_stub(&self, ids: &[i64]) -> Result<Option<i64>> {
+        let mut statement = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM stubs WHERE node=?)")?;
+        for id in ids {
+            if statement.query_row([id], |r| r.get::<_, bool>(0))? {
+                return Ok(Some(*id));
+            }
+        }
+        Ok(None)
+    }
     /// Bytes and items in the active turn alone. Older turns can be removed
-    /// from the context window; the current turn cannot. The indexed first
-    /// node and head supply cumulative totals without walking the turn.
+    /// from the context window; the current turn cannot, though a compaction
+    /// cut inside it leaves only its prompt and what follows the cut. The
+    /// indexed first node, cut, and head supply cumulative totals without
+    /// walking the turn.
     pub fn turn_usage(&self, name: &str, turn: i64) -> Result<(Family, usize, usize)> {
         let row: Option<(String, i64, i64)> = self
             .conn
             .prepare_cached(
-                "SELECT b.family,h.total_bytes-COALESCE(p.total_bytes,0),h.depth-COALESCE(p.depth,0)
+                "SELECT b.family,
+                    h.total_bytes-MIN(h.total_elided,COALESCE(e.saved,0))
+                        -CASE WHEN c.node IS NULL
+                            THEN COALESCE(p.total_bytes-MIN(p.total_elided,COALESCE(e.saved,0)),0)
+                            ELSE cp.total_bytes-MIN(cp.total_elided,COALESCE(e.saved,0))
+                                -s.total_bytes+COALESCE(p.total_bytes,0) END,
+                    h.depth-CASE WHEN c.node IS NULL THEN COALESCE(p.depth,0) ELSE cp.depth-1 END
              FROM bots b JOIN nodes h ON h.id=b.head JOIN nodes s ON s.turn=?2
-             LEFT JOIN nodes p ON p.id=s.parent WHERE b.name=?1 AND b.running_turn=?2",
+             LEFT JOIN nodes p ON p.id=s.parent LEFT JOIN elisions e ON e.node=b.elision
+             LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
+             LEFT JOIN nodes cut ON cut.id=c.cut LEFT JOIN nodes cp ON cp.id=cut.parent
+             WHERE b.name=?1 AND b.running_turn=?2",
             )?
             .query_row(params![name, turn], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -1779,20 +2489,26 @@ impl Database {
         note_override: Option<&(i64, String)>,
     ) -> Result<(Family, super::ContextUsage)> {
         let (family, bytes, items) = self.turn_usage(name, turn)?;
-        let (omitted, turns, history, note) = self
+        // A compaction cut inside this turn also leaves out its messages
+        // between the prompt and the cut.
+        let (omitted, turns, in_turn, history, note) = self
             .conn
             .prepare_cached(
-                "SELECT s.depth-1,s.turn_seq-1,instr(','||b.tools||',',',history,')>0,n.node,n.text
+                "SELECT s.depth-1,s.turn_seq-1,COALESCE(cut.depth-1-s.depth,0),
+                    instr(','||b.tools||',',',history,')>0,n.node,n.text
              FROM bots b JOIN nodes s ON s.turn=?2 LEFT JOIN notes n ON n.node=b.note
+             LEFT JOIN compactions c ON c.node=b.compaction AND c.pinned=s.id
+             LEFT JOIN nodes cut ON cut.id=c.cut
              WHERE b.name=?1 AND b.running_turn=?2",
             )?
             .query_row(params![name, turn], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, i64>(1)?,
-                    r.get::<_, bool>(2)?,
-                    r.get::<_, Option<i64>>(3)?
-                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get::<_, String>(4)?)) })
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, Option<i64>>(4)?
+                        .map(|id| -> rusqlite::Result<_> { Ok((id, r.get::<_, String>(5)?)) })
                         .transpose()?,
                 ))
             })?;
@@ -1802,6 +2518,7 @@ impl Database {
             note_override.or(note.as_ref()),
             omitted,
             turns,
+            in_turn,
             history,
             &[],
             0,
@@ -2323,6 +3040,7 @@ impl Database {
         through: Option<i64>,
         context_bytes: usize,
         context_items: usize,
+        reserved: super::ContextUsage,
     ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
@@ -2336,11 +3054,13 @@ impl Database {
         };
         // Absorbed steers join the running turn's own items, which the window
         // must carry whole. Budget them against the same three-quarter target
-        // the window keeps, less what the turn already holds; what does not
-        // fit stays queued and starts as its own turn when the line moves.
+        // the window keeps, less what the turn already holds and what the
+        // view sends ahead of it (`reserved`: its summary, pinned context,
+        // and notes); what does not fit stays queued and starts as its own
+        // turn when the line moves.
         let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
-        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes);
-        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items);
+        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes + reserved.bytes);
+        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items + reserved.items);
         let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
         let mut more = false;
         let mut capped = false;
@@ -2381,7 +3101,10 @@ impl Database {
                 steers.push((row.get(0)?, item, size));
             }
         }
-        let mut absorbed = Absorbed::default();
+        let mut absorbed = Absorbed {
+            capped,
+            ..Absorbed::default()
+        };
         if steers.is_empty() {
             return Ok(absorbed);
         }
@@ -2530,7 +3253,8 @@ impl Database {
         outcome: &Outcome,
     ) -> Result<(Bytes, Value)> {
         let bot = self.active(turn)?;
-        let item = bot.family()?.tool_result_item(call_id, &outcome.output)?;
+        let family = bot.family()?;
+        let item = family.tool_result_item(call_id, &outcome.output)?;
         let tx = self.conn.savepoint()?;
         if tx.execute(
             "UPDATE tools SET status='completed' WHERE turn=? AND call_id=? AND status='executing'",
@@ -2542,7 +3266,28 @@ impl Database {
         for (stream, data) in &outcome.artifacts {
             artifact::put(&tx, turn, call_id, stream, data)?;
         }
-        let head = node(&tx, bot.head, &item)?;
+        // The stub names the result's node, so it is made for the id the
+        // insert takes, and its savings go in with the node. Written with
+        // the result, eliding it later reads no output. A bot without the
+        // read tool never elides, since the model could not follow a stub,
+        // so it gets none.
+        let next = next_node(&tx)?;
+        let stub = if bot.tools.iter().any(|tool| tool == "read") {
+            super::context::stub(family, call_id, &outcome.output, next, item.len())?
+        } else {
+            None
+        };
+        let elided = stub
+            .as_ref()
+            .map_or(0, |stub| (item.len() - stub.len()) as i64);
+        let head = insert_node(&tx, bot.head, &item, None, elided)?;
+        if head != next {
+            return fail("storage_error");
+        }
+        if let Some(stub) = stub {
+            tx.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
+                .execute(params![head, stub])?;
+        }
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
             params![head, bot.name],
@@ -2735,6 +3480,7 @@ impl Database {
             call_spent_ms: 0,
             compaction: false,
             route: route.map(str::to_owned),
+            copied: None,
         };
         let tx = self.conn.savepoint()?;
         tx.execute(
@@ -2760,6 +3506,7 @@ impl Database {
         retries: u64,
         paced_ms: u64,
         compaction: bool,
+        copied: Option<CopiedCall>,
         route: Option<&str>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
@@ -2779,6 +3526,7 @@ impl Database {
             call_spent_ms,
             compaction,
             route: route.map(str::to_owned),
+            copied,
         };
         let tx = self.conn.savepoint()?;
         tx.execute(
@@ -3055,11 +3803,22 @@ impl Database {
         if parent.status == "deleting" {
             return fail_with("bot_not_found", format!("{source} is being deleted"));
         }
+        // Every strip was recorded by a request that sent nodes up to it.
+        let before = checkpoint.map_or(0, |c| c + 1);
+        let thinking = if parent.thinking.below <= before && parent.thinking.to <= before {
+            (
+                parent.thinking_prefix,
+                parent.thinking,
+                parent.thinking_elided,
+            )
+        } else {
+            (None, Strip::default(), 0)
+        };
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
         let created_by_id = Self::creator_id(&tx, created_by, created_by_id)?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -3082,11 +3841,12 @@ impl Database {
                 // its window. Carry that over only if it was already in
                 // place at the checkpoint; the fork's first request compares
                 // its own context against it.
-                (parent.thinking_floor <= checkpoint.map_or(0, |c| c + 1))
-                    .then_some(parent.thinking_prefix)
-                    .flatten(),
-                parent.thinking_floor,
-                parent.fallbacks
+                thinking.0,
+                thinking.1.below,
+                parent.fallbacks,
+                thinking.1.from,
+                thinking.1.to,
+                thinking.2
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -3114,6 +3874,19 @@ impl Database {
             }
             tx.execute(
                 "UPDATE bots SET compaction=?1,context_start=(SELECT cut FROM compactions WHERE node=?1) WHERE name=?2",
+                params![version, name],
+            )?;
+            // The elision floor the source had at the checkpoint.
+            let mut version = parent.elision;
+            while let Some(node_id) = version.filter(|v| *v > node) {
+                version = tx.query_row(
+                    "SELECT previous FROM elisions WHERE node=?",
+                    [node_id],
+                    |r| r.get(0),
+                )?;
+            }
+            tx.execute(
+                "UPDATE bots SET elision=? WHERE name=?",
                 params![version, name],
             )?;
         }
@@ -3270,7 +4043,7 @@ impl Database {
             // any piece commits. RETURNING shares the existing indexed lookup
             // with the global watermark, without another query per piece.
             let pruned: i64 = tx.query_row(
-                "UPDATE bots SET status='deleting',context_start=NULL,note=NULL,compaction=NULL,
+                "UPDATE bots SET status='deleting',context_start=NULL,note=NULL,compaction=NULL,elision=NULL,
                     pruned_cursor=MAX(pruned_cursor,
                         COALESCE((SELECT MAX(id) FROM events WHERE bot=?1),0))
                  WHERE name=?1 RETURNING pruned_cursor",
@@ -3330,10 +4103,11 @@ impl Database {
                 return Ok(out);
             }
             let referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR note=?1 OR compaction=?1))
+                "SELECT EXISTS(SELECT 1 FROM bots WHERE name!=?2 AND (head=?1 OR context_start=?1 OR note=?1 OR compaction=?1 OR elision=?1))
                     OR EXISTS(SELECT 1 FROM nodes WHERE parent=?1)
                     OR EXISTS(SELECT 1 FROM notes WHERE previous=?1)
-                    OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)",
+                    OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)
+                    OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)",
                 params![id, name],
                 |r| r.get(0),
             )?;
@@ -3345,6 +4119,8 @@ impl Database {
             tx.execute("UPDATE bots SET head=? WHERE name=?", params![parent, name])?;
             tx.execute("DELETE FROM notes WHERE node=?", [id])?;
             tx.execute("DELETE FROM compactions WHERE node=?", [id])?;
+            tx.execute("DELETE FROM elisions WHERE node=?", [id])?;
+            tx.execute("DELETE FROM stubs WHERE node=?", [id])?;
             tx.execute("DELETE FROM nodes WHERE id=?", [id])?;
             freed += 1;
             node = parent;
@@ -3817,6 +4593,39 @@ impl Database {
             return self.missing_artifact(turn);
         };
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
+    }
+    /// A recorded tool result on the bot's own lineage, as text, for the
+    /// model's own `read` of what an elided result's stub names. `checked`
+    /// says the caller's running turn already found `node` there: that
+    /// turn only appends to the lineage, so its later pages skip the walk.
+    pub fn result_lines(
+        &self,
+        name: &str,
+        node: i64,
+        offset: usize,
+        limit: usize,
+        checked: bool,
+        max_bytes: usize,
+    ) -> Result<String> {
+        if offset == 0 || !(1..=5000).contains(&limit) {
+            return fail("invalid_tool_arguments");
+        }
+        if !checked {
+            let head: Option<Option<i64>> = self
+                .conn
+                .query_row("SELECT head FROM bots WHERE name=?", [name], |r| r.get(0))
+                .optional()?;
+            if !self.in_lineage(head.flatten(), node)? {
+                return fail("result_not_found");
+            }
+        }
+        let item: Vec<u8> =
+            self.conn
+                .query_row("SELECT item FROM nodes WHERE id=?", [node], |r| r.get(0))?;
+        let Some((_, _, output)) = super::context::tool_result(&item) else {
+            return fail("result_not_found");
+        };
+        crate::tools::page_pieces(&output, offset, limit, max_bytes)
     }
     pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
         self.authorize_artifact(name, turn, call_id)?;
@@ -4354,6 +5163,53 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
             }
         }
     }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='elision')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 28 -> 29: tool result stubs and versioned elision floors, schema
+        // only. Results stored before have no stub and are always sent
+        // whole: a backfilled saving would change the cumulative total of
+        // every later node on its lineage, rewriting most of the store.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS stubs(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                item BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS elisions(node INTEGER PRIMARY KEY REFERENCES nodes(id),
+                previous INTEGER REFERENCES elisions(node), through INTEGER NOT NULL,
+                saved INTEGER NOT NULL);
+             ALTER TABLE bots ADD COLUMN elision INTEGER REFERENCES elisions(node);
+             ALTER TABLE nodes ADD COLUMN elided INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE nodes ADD COLUMN total_elided INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('compactions') WHERE name='pinned')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 29 -> 30: a cut inside a turn keeps that turn's prompt in view.
+        // Every earlier cut is a turn's prompt, so none has one.
+        conn.execute_batch(
+            "ALTER TABLE compactions ADD COLUMN pinned INTEGER REFERENCES nodes(id);
+             CREATE INDEX IF NOT EXISTS compactions_pinned ON compactions(pinned) WHERE pinned IS NOT NULL;",
+        )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='thinking_elided')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 30 -> 31: a stub strips thinking only from the nodes after it.
+        // The fingerprint no longer covers the elision floor, so each bot's
+        // first request strips its window's thinking once, as a change of
+        // context does.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN thinking_from INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE bots ADD COLUMN thinking_to INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE bots ADD COLUMN thinking_elided INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 /// Keep the oldest and newest excerpts within the text/metadata budget.
@@ -4550,11 +5406,51 @@ fn node_with_turn(
     item: &[u8],
     turn: Option<i64>,
 ) -> Result<i64> {
-    let (bytes, depth): (i64, i64) = match parent {
+    insert_node(conn, parent, item, turn, 0)
+}
+/// Whether a bot other than `name` sees the compaction version at `node`:
+/// bound to it, or through a later version made on it. A version made at
+/// a bot's head is extended in place only while it is the bot's alone, so
+/// what a fork taken between the steps sees does not change under it.
+fn compaction_shared(conn: &Connection, node: i64, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE compaction=?1 AND name!=?2)
+             OR EXISTS(SELECT 1 FROM compactions WHERE previous=?1)",
+        )?
+        .query_row(params![node, name], |r| r.get(0))?)
+}
+/// `compaction_shared` for the elision floor's versions.
+fn elision_shared(conn: &Connection, node: i64, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE elision=?1 AND name!=?2)
+             OR EXISTS(SELECT 1 FROM elisions WHERE previous=?1)",
+        )?
+        .query_row(params![node, name], |r| r.get(0))?)
+}
+/// The id the next node insert takes, inside the caller's transaction.
+fn next_node(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1
+             FROM node_sequence WHERE singleton=1",
+        )?
+        .query_row([], |r| r.get(0))?)
+}
+/// `elided`: what a request saves by sending the item's stub instead.
+fn insert_node(
+    conn: &Connection,
+    parent: Option<i64>,
+    item: &[u8],
+    turn: Option<i64>,
+    elided: i64,
+) -> Result<i64> {
+    let (bytes, depth, saved): (i64, i64, i64) = match parent {
         Some(id) => conn
-            .prepare_cached("SELECT total_bytes,depth FROM nodes WHERE id=?")?
-            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?,
-        None => (0, 0),
+            .prepare_cached("SELECT total_bytes,depth,total_elided FROM nodes WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?,
+        None => (0, 0, 0),
     };
     if bytes < 0 || depth < 0 {
         return fail("storage_error");
@@ -4568,8 +5464,8 @@ fn node_with_turn(
     // ever committed. Allocate atomically in the insert, avoiding a separate
     // counter write for every message. Callers already hold a transaction.
     conn.prepare_cached(
-        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking)
-         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?
+        "INSERT INTO nodes(id,parent,item,total_bytes,depth,turn,turn_seq,thinking,elided,total_elided)
+         SELECT MAX(last_id,COALESCE((SELECT MAX(id) FROM nodes),0))+1,?,?,?,?,?,?,?,?,?
          FROM node_sequence WHERE singleton=1",
     )?
     .execute(params![
@@ -4579,7 +5475,9 @@ fn node_with_turn(
         depth + 1,
         turn,
         turn_seq,
-        super::thinking_bytes(item) as i64
+        super::thinking_bytes(item) as i64,
+        elided,
+        saved + elided
     ])?;
     Ok(conn.last_insert_rowid())
 }

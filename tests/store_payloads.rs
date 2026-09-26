@@ -1,6 +1,6 @@
 use agent_runtime::{
     codec::Family,
-    store::{Binding, Database, Delivery, Fork, TurnOptions},
+    store::{Binding, ContextUsage, Database, Delivery, Fork, TurnOptions},
 };
 use rusqlite::{Connection, params};
 
@@ -56,7 +56,7 @@ fn shared_prompts_survive_queue_steer_restart_and_source_deletion() {
             db.begin("bot", "steer", &prompt, true, &steer, |_, _| Ok(()))
                 .unwrap();
             assert_eq!(
-                db.absorb(first, None, 8 << 20, 4096)
+                db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
                     .unwrap()
                     .outcomes
                     .len(),
@@ -97,9 +97,9 @@ fn shared_prompts_survive_queue_steer_restart_and_source_deletion() {
             db.finish(queued, None).unwrap();
             db.fork("bot", "fork", Fork::default()).unwrap();
             let before = db.window("fork", i64::MAX, i64::MAX).unwrap().unwrap();
-            let bytes = db.items_by_ids(&before.ids, 0).unwrap();
+            let bytes = db.items_by_ids(&before.ids, 0, 0).unwrap();
             db.delete_bot("bot").unwrap();
-            assert_eq!(db.items_by_ids(&before.ids, 0).unwrap(), bytes);
+            assert_eq!(db.items_by_ids(&before.ids, 0, 0).unwrap(), bytes);
             let decoded: serde_json::Value =
                 serde_json::from_slice(&[b"[", &bytes[..], b"]"].concat()).unwrap();
             assert_eq!(decoded[0]["content"][0]["text"], prompt);

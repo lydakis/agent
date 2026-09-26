@@ -74,14 +74,14 @@ class Connection:
 
 
 class SocketClient:
-    def __init__(self, binary, path, url, tools):
+    def __init__(self, binary, path, url, tools, extra=()):
         # Keep AF_UNIX paths short even in deep remote snapshot directories.
         self.directory = tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp')
         self.socket_path = Path(self.directory.name) / 'daemon.sock'
         self.followers, self.turns = {}, {}
         self.control = None
         self.process = subprocess.Popen(
-            [str(binary), *serve_args(path, url), '--socket', str(self.socket_path)],
+            [str(binary), *serve_args(path, url, extra=extra), '--socket', str(self.socket_path)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, env=clean_env())
         try:

@@ -91,7 +91,7 @@ impl Tool {
                 "required":["command"],"additionalProperties":false}),
             ),
             Tool::Read => (
-                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts. Use offset (1-based line) and limit (lines, default 500) to page.",
+                "Read UTF-8 text with line numbers: a file by path (relative to the workspace unless absolute), or a retained tool output by artifact reference: 'TURN/CALL_ID/STREAM' as listed in a truncated result's artifacts, or 'result/NODE' as an elided result names it, whose lines longer than 4 KiB are split into numbered pieces. Use offset (1-based line) and limit (lines, default 500) to page.",
                 json!({"type":"object","properties":{"path":{"type":"string"},"artifact":{"type":"string"},
                 "offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":5000}},
                 "additionalProperties":false}),
@@ -280,10 +280,21 @@ pub enum ReadSource {
         call_id: String,
         stream: String,
     },
+    /// A recorded tool result, whole: what an elided result's stub names.
+    Result {
+        node: i64,
+    },
 }
 impl ReadSource {
-    /// `TURN/CALL_ID/STREAM`, the reference a truncated result lists.
+    /// `TURN/CALL_ID/STREAM`, the reference a truncated result lists, or
+    /// `result/NODE`, the one an elided result gives.
     pub fn parse_artifact(text: &str) -> Result<ReadSource> {
+        if let Some(node) = text.strip_prefix("result/")
+            && let Ok(node) = node.parse::<i64>()
+            && node > 0
+        {
+            return Ok(ReadSource::Result { node });
+        }
         let mut parts = text.splitn(3, '/');
         if let (Some(turn), Some(call_id), Some(stream)) =
             (parts.next(), parts.next(), parts.next())
@@ -687,7 +698,7 @@ impl Registry {
                 Ok(self.shell_outcome(stdout, stderr, exit))
             }
             Prepared::Read {
-                source: ReadSource::Artifact { .. },
+                source: ReadSource::Artifact { .. } | ReadSource::Result { .. },
                 ..
             } => fail("artifact_requires_runtime"),
             Prepared::Read {
@@ -834,15 +845,50 @@ impl Registry {
 /// Number lines from a 1-based offset within the page budget. A single line
 /// beyond the budget is an explicit error rather than a silent cut.
 pub fn page_lines(text: &str, offset: usize, limit: usize) -> Result<String> {
-    let total = text.lines().count();
+    page(text.lines(), offset, limit, PREVIEW_BYTES)
+}
+
+/// The widest piece `page_pieces` numbers as a line.
+pub const PIECE_BYTES: usize = 4096;
+
+/// `page_lines` with every line longer than `PIECE_BYTES` split at
+/// character boundaries into numbered pieces, so a text with no byte-level
+/// reader, such as one stored tool result on a single line, pages whole.
+/// A page stays within `max_bytes` as well as the preview bound.
+pub fn page_pieces(text: &str, offset: usize, limit: usize, max_bytes: usize) -> Result<String> {
+    page(text.lines().flat_map(pieces), offset, limit, max_bytes)
+}
+
+fn pieces(line: &str) -> impl Iterator<Item = &str> + Clone {
+    let mut rest = Some(line);
+    std::iter::from_fn(move || {
+        let line = rest?;
+        if line.len() <= PIECE_BYTES {
+            rest = None;
+            return Some(line);
+        }
+        let (piece, tail) = line.split_at(boundary(line, PIECE_BYTES));
+        rest = Some(tail);
+        Some(piece)
+    })
+}
+
+fn page<'a>(
+    lines: impl Iterator<Item = &'a str> + Clone,
+    offset: usize,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<String> {
+    let total = lines.clone().count();
+    let budget = max_bytes.min(PREVIEW_BYTES).saturating_sub(128);
     let mut output = String::new();
     let mut shown = 0;
-    for (index, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
+    for (index, line) in lines.enumerate().skip(offset - 1).take(limit) {
         // Reserve space for continuation/line-count notices. Check
         // lengths before copying a potentially multi-megabyte line.
         let prefix = format!("{:>6}\t", index + 1);
         let entry_bytes = prefix.len() + line.len() + 1;
-        if output.len() + entry_bytes > PREVIEW_BYTES - 128 {
+        if output.len() + entry_bytes > budget {
             if shown == 0 {
                 return crate::fail_with(
                     "read_line_too_long",

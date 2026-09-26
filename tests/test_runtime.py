@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import signal
 import sqlite3
 import subprocess
@@ -16,6 +17,15 @@ import unittest
 from bench.targets import clean_env
 from bench.runtime_client import Client, serve_args
 
+
+
+def is_summary(request):
+    """A summary request in either form: a copy of the bot's call, or a
+    request of its own over a span. Both end in the compaction request."""
+    items = request.get('input') or request.get('messages') or []
+    content = items[-1].get('content') if items else None
+    return (isinstance(content, list) and bool(content) and items[-1].get('role') == 'user'
+            and content[-1].get('text', '').startswith('[compaction request]'))
 
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -40,7 +50,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.server.routes.append(self.headers.get('x-codex-turn-state'))
             if hasattr(self.server, 'expected_authorization'):
                 self.server.auth_checks.append(self.headers.get('Authorization') == self.server.expected_authorization)
-            if getattr(self.server, 'reject_compaction', False) and request.get('instructions') == 'Summarize.':
+            if getattr(self.server, 'reject_compaction', False) and is_summary(request):
                 body = b'{"error":{"message":"synthetic compaction refusal"}}'
                 self.send_response(400)
                 self.send_header('Content-Length', str(len(body)))
@@ -48,7 +58,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 self.wfile.flush()
                 return
-            if request.get('instructions') == 'Summarize.' and getattr(self.server, 'compaction_refusals', 0):
+            if is_summary(request) and getattr(self.server, 'compaction_refusals', 0):
                 self.server.compaction_refusals -= 1
                 body = b'{"error":{"message":"synthetic compaction rate limit"}}'
                 self.send_response(429)
@@ -60,11 +70,26 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             assert self.path == '/v1/responses'
-            assert request['model'] == 'synthetic-model'
-            user = [i for i in request['input'] if i.get('role') == 'user'][-1]['content'][0]['text']
+            assert request['model'] in getattr(self.server, 'models', ('synthetic-model',))
+            texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
+            # A `steer:` message joins the running task, which its prompt drives.
+            user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
+            pace_at = getattr(self.server, 'pace_at', None)
+            if (pace_at is not None and not is_summary(request)
+                    and sum(i.get('type') == 'function_call_output' for i in request['input']) >= pace_at):
+                # Once, after that many results: a 429 that parks the turn.
+                self.server.pace_at = None
+                body = b'{"error":{"message":"try later"}}'
+                self.send_response(429)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Retry-After', '0.3')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if user == 'tool:park-rounds' and (attempt <= 8 or attempt == 10):
                 body = b'{"error":{"message":"try later"}}'
                 self.send_response(429 if attempt <= 8 else 503)
@@ -113,11 +138,71 @@ class Model(http.server.BaseHTTPRequestHandler):
                             'arguments': json.dumps({'handles': [user[7:] if count == 100 else 'proc:999']})}]
                           if count <= 205 else [{'type': 'message', 'role': 'assistant',
                                                  'content': [{'type': 'output_text', 'text': text}]}])
+            elif getattr(self.server, 'task_script', None) is not None:
+                # A scripted agent: one shell command a model call, then an
+                # answer quoting the throughput the last result reported.
+                step = self.server.task_step
+                if not is_summary(request):
+                    self.server.task_step += 1
+                text = ''
+                if step < len(self.server.task_script):
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'task-{step}',
+                               'arguments': json.dumps({'command': self.server.task_script[step]})}]
+                else:
+                    found = re.search(r'throughput: ([0-9]+)', last.get('output', ''))
+                    text = f"Done. make bench reports throughput: {found.group(1) if found else '?'} rows/s."
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif last.get('type') == 'function_call_output' and user.startswith('bgwait:') and '"handle"' in last['output']:
                 # Second step of a start-then-wait turn: park on the process handle.
                 text = ''
                 output = [{'type': 'function_call', 'name': 'wait', 'call_id': 'wait-1',
                            'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
+            elif user.startswith('long:'):
+                # One long task: a shell call a round, each result about
+                # 11 KiB and each appending its round to rounds.log, then a
+                # read of the first elided result, then done.
+                # `long:COUNTxLINES,...` sets each round's lines instead.
+                # Progress is the newest call since the prompt: a cut inside
+                # the turn summarizes older rounds but keeps the prompt.
+                start = max(n for n, i in enumerate(request['input']) if i.get('role') == 'user'
+                            and not i['content'][0]['text'].startswith('steer:'))
+                calls = [i for i in request['input'][start:] if i.get('type') == 'function_call']
+                done = max((int(c['call_id'][5:]) + 1 for c in calls if c['call_id'][5:].isdigit()), default=0)
+                stubs = [i for i in request['input'] if i.get('type') == 'function_call_output'
+                         and i['output'].startswith('[tool result elided')]
+                spec = user[5:]
+                sizes = ([600] * int(spec) if 'x' not in spec else
+                         [int(lines) for part in spec.split(',')
+                          for count, lines in [part.split('x')] for _ in range(int(count))])
+                text = ''
+                if done < len(sizes):
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{done}',
+                               'arguments': json.dumps({'command': f"seq -f 'round {done} line %g' 1 {sizes[done]}; echo {done} >> rounds.log",
+                                                        'timeout_ms': 5000})}]
+                elif stubs and not any(c['name'] == 'read' for c in calls):
+                    reference = re.search(r'artifact "(result/[0-9]+)"', stubs[0]['output']).group(1)
+                    output = [{'type': 'function_call', 'name': 'read', 'call_id': 'long-read',
+                               'arguments': json.dumps({'artifact': reference})}]
+                else:
+                    text = f'done after {done} rounds'
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
+            elif user == 'script' and getattr(self.server, 'call_script', None):
+                # One call a round from `call_script`, then an answer; a cut
+                # inside the turn keeps at least its newest call in view.
+                done = max((int(i['call_id'][7:]) + 1 for i in request['input']
+                            if i.get('type') == 'function_call' and i['call_id'].startswith('script-')),
+                           default=0)
+                text = ''
+                if done < len(self.server.call_script):
+                    name, arguments = self.server.call_script[done]
+                    output = [{'type': 'function_call', 'name': name, 'call_id': f'script-{done}',
+                               'arguments': json.dumps(arguments)}]
+                else:
+                    text = 'done'
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif user == 'cached:reused-call':
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'same-id',
@@ -199,13 +284,17 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = getattr(self.server, 'reply_text', 'reply:' + user)
                 output = [{'id': 'msg_text', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
-            if request.get('instructions') == 'Summarize.':
+            if is_summary(request):
                 text = getattr(self.server, 'compaction_text', 'A short synthetic summary.')
                 output = [{'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
+                if getattr(self.server, 'compaction_call', False):
+                    # A copy offers the bot's tools, and a model may call one.
+                    output.append({'type': 'function_call', 'name': 'echo', 'call_id': 'summary-call',
+                                   'arguments': json.dumps({'text': 'instead'})})
             if getattr(self.server, 'history_reasoning', None):
                 output.insert(0, self.server.history_reasoning)
-            if getattr(self.server, 'empty_compaction', False) and request.get('instructions') == 'Summarize.':
+            if getattr(self.server, 'empty_compaction', False) and is_summary(request):
                 text, output = '', []
             events = [{'type': 'response.created', 'response': {'id': 'response_test'}}]
             if text:
@@ -320,11 +409,14 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             for block in request.get('system', []):
                 assert block['text'] and block['cache_control'] == cache
             assert request['cache_control'] == cache
-            summary = request.get('system', [{}])[0].get('text') == 'Summarize.'
+            summary = is_summary(request)
+            # A summary of its own disables tool calls; a copy of the bot's
+            # call keeps its tool choice, which the message cache covers.
+            own = request.get('system', [{}])[0].get('text') == 'Summarize.'
             history_uses_tools = any(b['type'] in ('tool_use', 'tool_result')
                                      for m in request['messages'] for b in m['content'])
             if (history_uses_tools and not request.get('tools')) or (
-                    summary and request.get('tools') and request.get('tool_choice') != {'type': 'none'}):
+                    own and request.get('tools') and request.get('tool_choice') != {'type': 'none'}):
                 body = b'{"error":{"message":"tool history needs definitions; summarization must disable tool calls"}}'
                 self.send_response(400)
                 self.send_header('Content-Length', str(len(body)))
@@ -332,9 +424,9 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 self.wfile.flush()
                 return
-            if not summary:
+            if not own:
                 assert 'tool_choice' not in request
-            assert [t['name'] for t in request['tools']] == ['echo', 'shell']
+            assert [t['name'] for t in request['tools']][:2] == ['echo', 'shell']
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'
@@ -377,7 +469,23 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                             return
                 signature = thinking_binding(request, request['messages'])
             blocks = [{'type': 'thinking', 'thinking': 'plan', 'signature': signature}]
-            if last['content'][0]['type'] == 'tool_result':
+            prompt = next((b['text'] for m in request['messages'] if m['role'] == 'user'
+                           for b in m['content'] if b['type'] == 'text' and b['text'].startswith('long:')), '')
+            if prompt and not summary:
+                # The Messages form of the long task: shell rounds, then done.
+                start = max(n for n, m in enumerate(request['messages'])
+                            if any(b['type'] == 'text' and b['text'] == prompt for b in m['content']))
+                calls = max((int(b['id'][11:]) + 1 for m in request['messages'][start:]
+                             for b in m['content'] if b['type'] == 'tool_use'
+                             and b['id'].startswith('toolu_long_')), default=0)
+                if calls < int(prompt[5:]):
+                    blocks.append({'type': 'tool_use', 'id': f'toolu_long_{calls}', 'name': 'shell',
+                                   'input': {'command': f"seq -f 'round {calls} line %g' 1 600"}})
+                    stop = 'tool_use'
+                else:
+                    blocks.append({'type': 'text', 'text': f'done after {calls} rounds'})
+                    stop = 'end_turn'
+            elif last['content'][0]['type'] == 'tool_result':
                 blocks.append({'type': 'text', 'text': 'echo:' + last['content'][0]['content']})
                 stop = 'end_turn'
             else:

@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{ContextPrefix, ContextUsage, Store, Window},
+    store::{ContextPrefix, ContextUsage, Store, Strip, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -55,24 +55,26 @@ const CATCH_UP_PIECE_NODES: i64 = 1024;
 const WINDOW_BATCH: usize = 64;
 const WINDOW_BATCH_BYTES: u64 = 256 * 1024;
 
-/// Stored items to stream: ids with their sizes, and the bytes each loses
-/// without thinking.
+/// Stored items to stream: ids with their sizes as sent, the bytes each
+/// loses without thinking, and the elision floor the sizes count stubs to.
 #[derive(Clone, Copy)]
 struct Span<'a> {
     ids: &'a [i64],
     sizes: &'a [u32],
     thinking: &'a [u32],
+    elided: i64,
 }
 impl Span<'_> {
     const EMPTY: Span<'static> = Span {
         ids: &[],
         sizes: &[],
         thinking: &[],
+        elided: 0,
     };
 }
 
-/// A stable fingerprint of the context in front of a window: its encoded
-/// prefix and first item. FNV-1a, so it survives restarts and upgrades.
+/// A stable fingerprint of the context in front of a window: the encoded
+/// prefix and the first item. FNV-1a, so it survives restarts and upgrades.
 fn fingerprint(prefix: &[u8], first: i64) -> i64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in prefix.iter().chain(&first.to_le_bytes()) {
@@ -107,7 +109,8 @@ fn batches(ids: &[i64], sizes: &[u32]) -> Vec<Vec<i64>> {
 fn item_chunks(
     store: Store,
     chunks: Arc<[Vec<i64>]>,
-    floor: i64,
+    strip: Strip,
+    elided: i64,
 ) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + 'static {
     let mut started = false;
     stream::iter(0..chunks.len())
@@ -116,7 +119,7 @@ fn item_chunks(
             async move {
                 store
                     .read("items_by_ids", move |db| {
-                        db.items_by_ids(&chunks[index], floor)
+                        db.items_by_ids(&chunks[index], strip, elided)
                     })
                     .await
                     .map_err(|error| std::io::Error::other(error.code))
@@ -136,7 +139,9 @@ fn item_chunks(
 /// whose cache it shares (its own, or a fork's source) under the store's
 /// identity, so bots of different stores (every Harbor container's first
 /// bot is id 1) never share a key, and a daemon restart keeps every bot's
-/// cache affinity. Summaries have their own prefix, so their own key.
+/// cache affinity. A summary sent as a request of its own has its own
+/// prefix, so its own key; one sent as a copy of the bot's call shares the
+/// bot's.
 fn cache_key(identity: u128, bot: i64, summary: bool) -> String {
     let suffix = if summary { "-summary" } else { "" };
     format!("{identity:032x}-{bot}{suffix}")
@@ -167,6 +172,8 @@ pub struct Turn {
     /// bot's pending steer.
     pub steers: Arc<AtomicBool>,
     pub tokens: Arc<TokenTotals>,
+    /// Results this turn's `read` found on the bot's lineage.
+    pub read_results: std::sync::Mutex<Vec<i64>>,
 }
 
 /// Provider-reported tokens across every turn since the daemon started:
@@ -239,6 +246,9 @@ struct Accounting {
     parked_until: u64,
     /// Persist the call's phase with its existing park transaction.
     compaction: bool,
+    /// What the summary call copies, kept in the park record so its retry
+    /// sends the same request.
+    copied: Option<agent_runtime::store::CopiedCall>,
     /// A prompt-cache refresh in flight while a reply streams or a tool runs.
     refresh: Option<Pending>,
     /// When the last call's cache was last read by a refresh sent while the
@@ -350,6 +360,7 @@ impl Turn {
         let flushed = if let Ok(Round::Paced(at)) = &result {
             let (at, attempts, spent) = (*at, accounting.call_attempts, accounting.call_spent_ms);
             let compaction = accounting.compaction;
+            let copied = accounting.copied.take().filter(|_| compaction);
             let route = accounting.route.get().cloned();
             // Commit the park and its accounting together, outside cancellation.
             self.store
@@ -362,6 +373,7 @@ impl Turn {
                         retries,
                         paced_ms,
                         compaction,
+                        copied,
                         route.as_deref(),
                     )
                     .map(|_| ())
@@ -404,11 +416,22 @@ impl Turn {
     /// Prepare metadata and the encoded prefix once per model round. Retries
     /// stream the same immutable nodes without rebuilding the context view.
     async fn context(&self, bytes: usize, count: usize, prefix_budget: usize) -> Result<Context> {
+        self.context_under(bytes, count, prefix_budget, None).await
+    }
+
+    /// `context`, under an earlier elision floor when one is given.
+    async fn context_under(
+        &self,
+        bytes: usize,
+        count: usize,
+        prefix_budget: usize,
+        floor: Option<i64>,
+    ) -> Result<Context> {
         let bot = self.bot.clone();
         let window = self
             .store
             .op("window", move |db| {
-                db.window(&bot, bytes as i64, count as i64)
+                db.window_under(&bot, bytes as i64, count as i64, floor)
             })
             .await?;
         let Some(window) = window else {
@@ -418,7 +441,7 @@ impl Turn {
         Ok(Context {
             window: Some(window),
             prefix,
-            thinking_floor: 0,
+            thinking: Strip::default(),
         })
     }
 
@@ -445,6 +468,18 @@ impl Turn {
             bytes: self.context_bytes,
             items: self.context_items,
         }
+    }
+
+    /// The view at the configured budget, fitted to the input limit.
+    async fn fitted_context(&self) -> Result<Context> {
+        let context = self
+            .context(
+                self.context_bytes,
+                self.context_items,
+                self.context_bytes * 2 / 3,
+            )
+            .await?;
+        self.fit_context(context, self.input_limit()).await
     }
 
     async fn fit_context(&self, mut context: Context, limit: ContextUsage) -> Result<Context> {
@@ -506,77 +541,207 @@ impl Turn {
                     ids: &w.ids,
                     sizes: &w.sizes,
                     thinking: &w.thinking,
+                    elided: w.elided,
                 },
-                context.thinking_floor,
+                context.thinking,
             ),
-            None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, 0),
+            None => self.window_items(context.prefix.bytes.clone(), Span::EMPTY, Strip::default()),
         }
     }
 
     /// Anthropic thinking replay. Each thinking block is bound to the exact
-    /// context before it, so once the context in front of the window changes
+    /// context before it. Once the context in front of the window changes
     /// (the window slides, a compaction or note lands, or a fork starts from
-    /// other instructions) the blocks written under the old one are sent
-    /// without thinking; blocks written after the change keep theirs. Other
-    /// families send items unchanged.
-    async fn thinking_floor(
+    /// other instructions), every block written under the old one is sent
+    /// without thinking. When the elision floor moves, only the blocks after
+    /// the first newly stubbed result are: those before it still follow what
+    /// they were written after, and the provider's cache still holds them.
+    /// Blocks written after a change keep theirs. Other families send items
+    /// unchanged.
+    async fn bind_thinking(
         &self,
         record: &mut agent_runtime::store::Bot,
         context: &mut Context,
     ) -> Result<()> {
-        let Some(window) = context
-            .window
-            .as_ref()
-            .filter(|w| w.family == agent_runtime::codec::Family::Anthropic && !w.ids.is_empty())
-        else {
-            return Ok(());
-        };
-        let prefix = fingerprint(&context.prefix.bytes, window.ids[0]);
-        if record.thinking_prefix != Some(prefix) {
-            let floor = window.ids[window.ids.len() - 1] + 1;
-            let bot = self.bot.clone();
-            self.store
-                .op("set_thinking", move |db| {
-                    db.set_thinking(&bot, prefix, floor)
-                })
-                .await?;
-            record.thinking_prefix = Some(prefix);
-            record.thinking_floor = floor;
+        if let Some(window) = &context.window {
+            context.thinking = self.bound(record, &context.prefix.bytes, window).await?;
         }
-        context.thinking_floor = record.thinking_floor;
         Ok(())
     }
 
+    /// The strip for `window` sent behind `prefix`, recorded on the bot as
+    /// what its next request sends.
+    async fn bound(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        prefix: &[u8],
+        window: &Window,
+    ) -> Result<Strip> {
+        if window.family != agent_runtime::codec::Family::Anthropic || window.ids.is_empty() {
+            return Ok(Strip::default());
+        }
+        let prefix = fingerprint(prefix, window.ids[0]);
+        let (next, elided) = (window.ids[window.ids.len() - 1] + 1, window.elided);
+        let mut strip = record.thinking;
+        if record.thinking_prefix != Some(prefix) || elided < record.thinking_elided {
+            strip = Strip::from(next);
+        } else if elided > record.thinking_elided {
+            // Ids grow along a lineage, so the window's are ascending.
+            let start = window
+                .ids
+                .partition_point(|id| *id <= record.thinking_elided);
+            let end = window.ids.partition_point(|id| *id <= elided);
+            let moved = window.ids[start..end].to_vec();
+            let first = self
+                .store
+                .read("first_stub", move |db| db.first_stub(&moved))
+                .await?;
+            if let Some(first) = first {
+                strip = strip.and(first, next);
+            }
+        }
+        if (
+            record.thinking_prefix,
+            record.thinking,
+            record.thinking_elided,
+        ) != (Some(prefix), strip, elided)
+        {
+            let bot = self.bot.clone();
+            self.store
+                .op("set_thinking", move |db| {
+                    db.set_thinking(&bot, prefix, strip, elided)
+                })
+                .await?;
+            record.thinking_prefix = Some(prefix);
+            record.thinking = strip;
+            record.thinking_elided = elided;
+        }
+        Ok(strip)
+    }
+
     /// The context prefix, then the items of `ids` read from the store in
-    /// batches as the request streams; items below `floor` without thinking.
-    fn window_items(&self, prefix: Bytes, span: Span<'_>, floor: i64) -> Items {
+    /// batches as the request streams; those `strip` names without thinking.
+    fn window_items(&self, prefix: Bytes, span: Span<'_>, strip: Strip) -> Items {
+        self.framed_items(prefix, span, strip, Bytes::new())
+    }
+
+    /// A copy of the bot's call with the compaction request after it.
+    fn copied_items(&self, copy: Copied<'_>) -> Items {
+        let window = copy.window;
+        let span = Span {
+            ids: &window.ids,
+            sizes: &window.sizes,
+            thinking: &window.thinking,
+            elided: window.elided,
+        };
+        self.framed_items(
+            copy.prefix.clone(),
+            span,
+            copy.thinking,
+            copy.request.clone(),
+        )
+    }
+
+    /// Window items between `prefix` and `tail`, a trailing item with its
+    /// leading comma, or nothing.
+    fn framed_items(&self, prefix: Bytes, span: Span<'_>, strip: Strip, tail: Bytes) -> Items {
         let Span {
             ids,
             sizes,
             thinking,
+            elided,
         } = span;
         let stripped: usize = ids
             .iter()
             .zip(thinking)
-            .filter(|(id, _)| **id < floor)
+            .filter(|(id, _)| strip.strips(**id))
             .map(|(_, &bytes)| bytes as usize)
             .sum();
         let total = (prefix.len()
             + sizes.iter().map(|&size| size as usize).sum::<usize>()
-            + ids.len().saturating_sub(1))
+            + ids.len().saturating_sub(1)
+            + tail.len())
         .saturating_sub(stripped);
         let (store, chunks): (_, Arc<[_]>) = (self.store.clone(), batches(ids, sizes).into());
         Items::new(total, move || {
-            stream::iter([Ok(prefix.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), floor))
-                .boxed()
+            let items = stream::iter([Ok(prefix.clone())]).chain(item_chunks(
+                store.clone(),
+                chunks.clone(),
+                strip,
+                elided,
+            ));
+            if tail.is_empty() {
+                items.boxed()
+            } else {
+                items.chain(stream::iter([Ok(tail.clone())])).boxed()
+            }
         })
+    }
+
+    /// Whether the window has reached the compaction threshold, the point
+    /// where answered tool results start going as stubs.
+    fn elision_due(&self, context: &Context, output_bytes: Option<usize>) -> bool {
+        let limit = self.input_limit();
+        let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
+        context.usage().bytes
+            >= (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
+    }
+
+    /// Elision at a round boundary: tool results the model has answered,
+    /// older than the newest `compact_keep` percent of the budget, go to it
+    /// as stubs from this request on. No model call; each result stays whole
+    /// in the store and the read tool returns it. A move must save a
+    /// sixteenth of the budget, so a context of mostly other text does not
+    /// rewrite its cached prefix each round for a little room. When the
+    /// window cannot fit without it (`forced`), every answered result goes,
+    /// whatever the keep target, and any saving counts. Returns whether the
+    /// floor moved.
+    async fn elide(&self, prefix: usize, forced: bool) -> Result<bool> {
+        let limit = self.input_limit();
+        let (keep, min_saving) = if forced {
+            (0, 1)
+        } else {
+            let keep = (self.context_bytes / 100 * self.compact_keep)
+                .min(limit.bytes.saturating_sub(prefix) * self.compact_keep / self.compact_at)
+                .max(1);
+            (keep as i64, (self.context_bytes / 16) as i64)
+        };
+        let bot = self.bot.clone();
+        let Some(plan) = self
+            .store
+            .read("elision_plan", move |db| {
+                db.elision_plan(&bot, keep, min_saving)
+            })
+            .await?
+        else {
+            return Ok(false);
+        };
+        let bot = self.bot.clone();
+        match self
+            .store
+            .op("elide", move |db| db.elide(&bot, &plan))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "elision_not_forward" | "elision_version_shared"
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Compaction at a round boundary: once the turns since the last summary
     /// hold `compact_at` percent of the budget, summarize everything older
     /// than the newest `compact_keep` percent with the client's instructions
-    /// and summarizer, and record the result as the new context start. A
+    /// and summarizer, and record the result as the new context start. The
+    /// summary request copies the view as the bot's last call sent it
+    /// (`sent`: the view before this boundary's stubs, if any, and what
+    /// that call sent ahead of its window) when it can. A
     /// backlog larger than the budget is summarized oldest first, one bounded
     /// span per round boundary, until it fits. A failed summary
     /// leaves the context view unchanged and is reported live; the turn goes on
@@ -591,10 +756,11 @@ impl Turn {
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
         context: &mut Context,
+        sent: (Option<&Context>, Option<&LastCall>, &str),
         output_bytes: Option<usize>,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         }
         let pressure = context.pressure();
         let limit = self.input_limit();
@@ -602,7 +768,7 @@ impl Turn {
         if pressure.bytes < (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
             && pressure.items < (self.context_items * self.compact_at / 100).min(limit.items)
         {
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         }
         let keep = (self.context_bytes / 100 * self.compact_keep)
             .min(
@@ -616,20 +782,124 @@ impl Turn {
                     / self.compact_at,
             )
             .max(1) as i64;
+        let (before, last, model) = sent;
+        let compaction = self
+            .compact(
+                record,
+                model_rounds,
+                turn,
+                accounting,
+                tools,
+                (keep, keep_items),
+                Some(Sent {
+                    view: before.unwrap_or(context),
+                    last,
+                    model,
+                }),
+            )
+            .await?;
+        if let Compaction::Done = compaction {
+            *context = self
+                .context(
+                    self.context_bytes,
+                    self.context_items,
+                    self.context_bytes * 2 / 3,
+                )
+                .await?;
+        }
+        Ok(compaction)
+    }
+
+    /// The current turn cannot fit the budget, alone or beside what goes
+    /// ahead of it. Elide what the model has answered and look again; if it
+    /// still cannot fit, summarize all but the newest boundary, a round
+    /// inside the turn or its prompt, and look again. Each look fits the
+    /// view to the input limit, prefix included, so `Fits` is a view that
+    /// can be sent. Stuck when neither applies or the view still cannot fit.
+    async fn overflow(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+        elides: bool,
+    ) -> Result<Overflow> {
+        let fits = |context: Result<Context>| match context {
+            Ok(context) => Ok(Some(context)),
+            Err(error) if error.code == "context_limit" => Ok(None),
+            Err(error) => Err(error),
+        };
+        if elides
+            && self.elide(0, true).await?
+            && let Some(context) = fits(self.fitted_context().await)?
+        {
+            return Ok(Overflow::Fits(Box::new(context)));
+        }
+        if record.compaction_instructions.is_none() {
+            return Ok(Overflow::Stuck);
+        }
+        // A backlog larger than the summarizer's budget takes several
+        // catch-up steps at this head; each must shrink the view, and each
+        // counts as a model round, so the steps end.
+        loop {
+            match self
+                .compact(record, model_rounds, turn, accounting, tools, (1, 1), None)
+                .await?
+            {
+                Compaction::Parked(until) => return Ok(Overflow::Parked(until)),
+                Compaction::Skipped => return Ok(Overflow::Stuck),
+                Compaction::Done => {
+                    if let Some(context) = fits(self.fitted_context().await)? {
+                        return Ok(Overflow::Fits(Box::new(context)));
+                    }
+                    if *model_rounds >= MAX_ROUNDS {
+                        return Ok(Overflow::Stuck);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One summary: plan the span older than the newest boundary whose tail
+    /// reaches the keep targets, summarize it with the client's
+    /// instructions and summarizer, and record it as the new context start.
+    /// When the summarizer is the model that made the bot's last call and
+    /// `sent`, the view as that call sent it, holds the whole span, the
+    /// request is a copy of that call with the instructions in a request after it, so
+    /// the provider reads it from cache. Otherwise, as for a step through a
+    /// backlog larger than the budget, it is a request of its own: the
+    /// instructions, then the span. A failed summary leaves the view
+    /// unchanged and is reported live.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        model_rounds: &mut usize,
+        turn: i64,
+        accounting: &mut Accounting,
+        tools: &serde_json::value::RawValue,
+        (keep, keep_items): (i64, i64),
+        sent: Option<Sent<'_>>,
+    ) -> Result<Compaction> {
+        let limit = self.input_limit();
         let (max_bytes, max_items) = (limit.bytes as i64, limit.items as i64);
         // Nodes are immutable and only this turn moves the bot's head, so
         // the reader's snapshot plans what the worker would. A catch-up walk
         // over a long backlog goes in pieces, so neither other bots' commits
         // nor their context reads wait behind all of it.
+        // Without `sent` the view cannot fit (overflow), and a summary
+        // already made at this head may take another step.
+        let again = sent.is_none();
         let plan = match self
-            .plan_compaction(keep, keep_items, max_bytes, max_items)
+            .plan_compaction(keep, keep_items, max_bytes, max_items, again)
             .await
         {
             Ok(Some(plan)) => plan,
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok(Compaction::Skipped),
             Err(error) if error.code == "compaction_span_limit" => {
                 self.compaction_failed(turn, &error).await?;
-                return Ok(None);
+                return Ok(Compaction::Skipped);
             }
             Err(error) => return Err(error),
         };
@@ -643,19 +913,67 @@ impl Turn {
                         "error":"provider_unavailable","detail":name}),
                 )
                 .await?;
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         };
-        let instructions = record.compaction_instructions.clone().unwrap();
+        let mut instructions = record.compaction_instructions.clone().unwrap();
+        // A turn may run on another model than the bot's, and then the
+        // bot's summarizer can neither read that call's cache nor take its
+        // routing token or thinking.
+        accounting.copied = None;
+        let copy = match sent.filter(|sent| sent.model == reference && !plan.catch_up) {
+            Some(Sent { view, last, .. }) => {
+                let request = Bytes::from(agent_runtime::store::CompactionPlan::request(
+                    summarizer.family(),
+                    &instructions,
+                    plan.summary_bytes,
+                )?);
+                match self.copy_of(view, last, &plan, &request) {
+                    Some((prefix, items, window)) => {
+                        let thinking = self.bound(record, &prefix, window).await?;
+                        // A park keeps what is copied, and the prefix
+                        // itself only when the view no longer sends it.
+                        let prefix_text = if prefix == view.prefix.bytes {
+                            None
+                        } else {
+                            let text = std::str::from_utf8(&prefix)
+                                .map_err(|_| Error::new("storage_error"))?;
+                            Some((text.to_owned(), items))
+                        };
+                        accounting.copied = Some(agent_runtime::store::CopiedCall {
+                            floor: window.elided,
+                            first: window.ids[0],
+                            prefix: prefix_text,
+                        });
+                        Some((prefix, window, thinking, request))
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         // Messages requires definitions for historical tool blocks. Reuse the
         // already encoded bot selection; tool_choice disables new calls.
-        // Responses accepts historical calls without definitions.
+        // Responses accepts historical calls without definitions. A copy
+        // keeps the call's tools and tool choice, which the cache covers.
         let empty;
-        let summary_tools = match summarizer.family() {
-            agent_runtime::codec::Family::Anthropic => tools,
-            agent_runtime::codec::Family::Responses => {
-                empty = self.registry.encoded(summarizer.family(), &[])?;
-                &empty
+        let (body, summary_tools) = match &copy {
+            Some((prefix, window, thinking, request)) => {
+                instructions = record.instructions.clone();
+                let copied = Copied {
+                    prefix,
+                    window,
+                    thinking: *thinking,
+                    request,
+                };
+                (Body::Copied(copied), tools)
             }
+            None => match summarizer.family() {
+                agent_runtime::codec::Family::Anthropic => (Body::Span(&plan), tools),
+                agent_runtime::codec::Family::Responses => {
+                    empty = self.registry.encoded(summarizer.family(), &[])?;
+                    (Body::Span(&plan), &*empty)
+                }
+            },
         };
         let completion = match self
             .call_with(
@@ -663,7 +981,7 @@ impl Turn {
                 model,
                 &instructions,
                 summary_tools,
-                Body::Span(&plan),
+                body,
                 record,
                 model_rounds,
                 turn,
@@ -671,9 +989,13 @@ impl Turn {
             )
             .await
         {
-            Ok(Some(completion)) => completion,
-            Ok(None) => return Ok(Some(accounting.parked_until)),
+            Ok(Some(completion)) => {
+                accounting.copied = None;
+                completion
+            }
+            Ok(None) => return Ok(Compaction::Parked(accounting.parked_until)),
             Err(error) => {
+                accounting.copied = None;
                 self.hub
                     .live(
                         &self.bot,
@@ -681,7 +1003,7 @@ impl Turn {
                             "error":error.code,"detail":error.detail}),
                     )
                     .await?;
-                return Ok(None);
+                return Ok(Compaction::Skipped);
             }
         };
         // Success is billable even if its text is empty or too large to use.
@@ -696,7 +1018,10 @@ impl Turn {
             .usage
             .map(|usage| summarizer_usage(usage, name, model));
         let summary = completion_text(&completion.items);
-        let invalid = if summary.len() > plan.summary_bytes {
+        // A copy offers the bot's tools; a call there is not a summary.
+        let invalid = if !completion.calls.is_empty() {
+            Some(Error::new("compaction_tool_call"))
+        } else if summary.len() > plan.summary_bytes {
             Some(Error::new("compaction_summary_limit"))
         } else if summary.trim().is_empty() {
             Some(Error::new("empty_summary"))
@@ -710,7 +1035,7 @@ impl Turn {
                 })
                 .await?;
             self.compaction_failed(turn, &error).await?;
-            return Ok(None);
+            return Ok(Compaction::Skipped);
         }
         let bot = self.bot.clone();
         let billed = usage.clone();
@@ -737,21 +1062,46 @@ impl Turn {
                 .await?;
             if matches!(
                 error.code.as_str(),
-                "compaction_not_smaller" | "compaction_context_limit"
+                "compaction_not_smaller" | "compaction_context_limit" | "compaction_version_shared"
             ) {
                 self.compaction_failed(turn, &error).await?;
-                return Ok(None);
+                return Ok(Compaction::Skipped);
             }
             return Err(error);
         }
-        *context = self
-            .context(
-                self.context_bytes,
-                self.context_items,
-                self.context_bytes * 2 / 3,
-            )
-            .await?;
-        Ok(None)
+        Ok(Compaction::Done)
+    }
+
+    /// What a summary copies of the bot's call: the view's window, behind
+    /// what the last call sent ahead of it when that call's window started
+    /// at the same node under the same floor (a note written since does
+    /// not show), else behind the view's own. None when the window does not
+    /// hold the whole span, or the copy and `request` exceed the input limit.
+    fn copy_of<'a>(
+        &self,
+        view: &'a Context,
+        last: Option<&LastCall>,
+        plan: &agent_runtime::store::CompactionPlan,
+        request: &[u8],
+    ) -> Option<(Bytes, usize, &'a Window)> {
+        let window = view.window.as_ref()?;
+        let at = window.ids.binary_search(plan.ids.first()?).ok()?;
+        if window.ids.get(at + plan.ids.len() - 1) != plan.ids.last() {
+            return None;
+        }
+        let (prefix, items) = match last {
+            Some(last) if last.first == window.ids[0] && last.elided == window.elided => {
+                (last.prefix.clone(), last.items)
+            }
+            _ => (view.prefix.bytes.clone(), view.prefix.items),
+        };
+        let usage = ContextUsage {
+            bytes: prefix.len() + window.item_bytes as usize + window.ids.len() - 1 + request.len(),
+            items: items + window.ids.len() + 1,
+        };
+        usage
+            .fits(self.input_limit())
+            .then_some((prefix, items, window))
     }
 
     async fn plan_compaction(
@@ -760,13 +1110,14 @@ impl Turn {
         keep_items: i64,
         max_bytes: i64,
         max_items: i64,
+        again: bool,
     ) -> Result<Option<agent_runtime::store::CompactionPlan>> {
         use agent_runtime::store::Planning;
         let bot = self.bot.clone();
         let planning = self
             .store
             .read("compaction_plan", move |db| {
-                db.compaction_plan(&bot, keep, keep_items, max_bytes, max_items)
+                db.compaction_plan(&bot, keep, keep_items, max_bytes, max_items, again)
             })
             .await?;
         let mut walk = match planning {
@@ -839,9 +1190,16 @@ impl Turn {
         let (head, tail) = (Bytes::from(head), Bytes::from(tail));
         let (store, chunks): (_, Arc<[_]>) =
             (self.store.clone(), batches(&plan.ids, &plan.sizes).into());
+        // Elided results go as the stubs the model last saw.
+        let elided = plan.elided;
         Ok(Items::new(total, move || {
             stream::iter([Ok(head.clone())])
-                .chain(item_chunks(store.clone(), chunks.clone(), i64::MAX))
+                .chain(item_chunks(
+                    store.clone(),
+                    chunks.clone(),
+                    Strip::from(i64::MAX),
+                    elided,
+                ))
                 .chain(stream::iter([Ok(tail.clone())]))
                 .boxed()
         }))
@@ -879,6 +1237,8 @@ impl Turn {
             environment.push(("AGENT_PARENT_ID".to_owned(), id.to_string()));
         }
         let mut resume_window = false;
+        // What a summary that parked had copied, for its retry to copy.
+        let mut copied = None;
         if self.resume {
             let (waiting, _, steers) =
                 match self.store.op("resume", move |db| db.resume(turn)).await {
@@ -902,6 +1262,7 @@ impl Turn {
                 accounting.call_attempts = waiting.call_attempts;
                 accounting.call_spent_ms = waiting.call_spent_ms;
                 resume_window = !waiting.compaction;
+                copied = waiting.copied.filter(|_| waiting.compaction);
             } else {
                 let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
                 let id = waiting.call_id;
@@ -925,10 +1286,17 @@ impl Turn {
             }
         }
         let mut model_rounds = context.model_rounds;
+        let called = context.model.as_str();
         // This bot's tools, encoded once per distinct selection and shared.
         let tools = self.registry.encoded(provider.family(), &record.tools)?;
-        // Steers submitted since the last boundary go in before this call.
-        self.absorb().await?;
+        // A stub names the `read` call that returns its result, so only a
+        // bot that has the tool elides.
+        let elides = record.tools.iter().any(|tool| tool == "read");
+        // What went ahead of the turn when a steer stayed queued for lack
+        // of room, while one is still queued.
+        let mut capped = None;
+        // What this task's last call sent ahead of its window.
+        let mut last = None;
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
@@ -946,15 +1314,102 @@ impl Turn {
             // Resume the parked call, not the whole boundary. In particular,
             // an exhausted summary must not start over when the ordinary call
             // parks on the same pool. A later model round may compact again.
-            let mut context = self
+            let resuming = std::mem::take(&mut resume_window);
+            let restore = copied.take();
+            let output_bytes = provider.output_byte_estimate(model);
+            let mut made_room = false;
+            let mut context = match self
                 .context(
                     self.context_bytes,
                     self.context_items,
                     self.context_bytes * 2 / 3,
                 )
-                .await?;
-            if !std::mem::take(&mut resume_window)
-                && let Some(parked) = self
+                .await
+            {
+                Ok(context) => context,
+                Err(error) if error.code == "context_limit" => match self
+                    .overflow(
+                        &mut record,
+                        &mut model_rounds,
+                        turn,
+                        accounting,
+                        &tools,
+                        elides,
+                    )
+                    .await?
+                {
+                    Overflow::Fits(context) => {
+                        made_room = true;
+                        *context
+                    }
+                    Overflow::Parked(until) => return Ok(Round::Paced(until)),
+                    Overflow::Stuck => return Err(error),
+                },
+                Err(error) => return Err(error),
+            };
+            // While the view sends what the last call sent ahead of its
+            // window, a summary copies the view's own; the older bytes go.
+            if last
+                .as_ref()
+                .is_some_and(|last: &LastCall| last.prefix == context.prefix.bytes)
+            {
+                last = None;
+            }
+            // Steers go in before this call, measured against what this
+            // view must send ahead of the turn: its summary, pinned context,
+            // and notes, a note a tool wrote this round included, but not
+            // the previews of omitted turns, which yield. One that goes in
+            // sends the view back through the overflow, elision, and
+            // compaction steps.
+            if self.absorb(&context.prefix, &mut capped).await? {
+                resume_window = resuming;
+                copied = restore;
+                continue;
+            }
+            // A summary copies the view as the last call sent it, before
+            // this boundary's stubs. A summary that parked copies again what
+            // it copied: the view under the floor that call was read under,
+            // behind what it sent ahead of that view, unless a forced
+            // summary has replaced that view since.
+            let mut before = None;
+            if let Some(call) = restore.filter(|_| !made_room) {
+                if context.window.as_ref().map(|window| window.elided) != Some(call.floor) {
+                    before = Some(
+                        self.context_under(
+                            self.context_bytes,
+                            self.context_items,
+                            self.context_bytes * 2 / 3,
+                            Some(call.floor),
+                        )
+                        .await?,
+                    );
+                }
+                if let Some((prefix, items)) = call.prefix {
+                    last = Some(LastCall {
+                        prefix: Bytes::from(prefix),
+                        items,
+                        first: call.first,
+                        elided: call.floor,
+                    });
+                }
+            }
+            if elides
+                && !resuming
+                && self.elision_due(&context, output_bytes)
+                && self.elide(context.prefix.bytes.len(), false).await?
+            {
+                made_room = true;
+                let elided = self
+                    .context(
+                        self.context_bytes,
+                        self.context_items,
+                        self.context_bytes * 2 / 3,
+                    )
+                    .await?;
+                before = Some(std::mem::replace(&mut context, elided));
+            }
+            if !resuming {
+                match self
                     .compact_if_due(
                         &mut record,
                         &mut model_rounds,
@@ -962,11 +1417,26 @@ impl Turn {
                         accounting,
                         &tools,
                         &mut context,
-                        provider.output_byte_estimate(model),
+                        (before.as_ref(), last.as_ref(), called),
+                        output_bytes,
                     )
                     .await?
-            {
-                return Ok(Round::Paced(parked));
+                {
+                    Compaction::Parked(parked) => return Ok(Round::Paced(parked)),
+                    Compaction::Done => made_room = true,
+                    Compaction::Skipped => {}
+                }
+            }
+            drop(before);
+            // A steer the turn had no room for is tried again once elision
+            // or a summary makes some, and so is one that arrived while this
+            // boundary summarized.
+            if capped.is_some() && made_room {
+                self.steers.store(true, Relaxed);
+            }
+            if self.absorb(&context.prefix, &mut capped).await? {
+                resume_window = resuming;
+                continue;
             }
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
@@ -974,8 +1444,34 @@ impl Turn {
             if model_rounds >= MAX_ROUNDS {
                 return fail("tool_round_limit");
             }
-            let mut context = self.fit_context(context, self.input_limit()).await?;
-            self.thinking_floor(&mut record, &mut context).await?;
+            // The view fits the budget alone but not beside what goes ahead
+            // of it: the same forced recovery, then the steps again.
+            let mut context = match self.fit_context(context, self.input_limit()).await {
+                Ok(context) => context,
+                Err(error) if error.code == "context_limit" => match self
+                    .overflow(
+                        &mut record,
+                        &mut model_rounds,
+                        turn,
+                        accounting,
+                        &tools,
+                        elides,
+                    )
+                    .await?
+                {
+                    Overflow::Fits(_) => {
+                        if capped.is_some() {
+                            self.steers.store(true, Relaxed);
+                        }
+                        resume_window = resuming;
+                        continue;
+                    }
+                    Overflow::Parked(until) => return Ok(Round::Paced(until)),
+                    Overflow::Stuck => return Err(error),
+                },
+                Err(error) => return Err(error),
+            };
+            self.bind_thinking(&mut record, &mut context).await?;
             let Some(response) = self
                 .call(
                     provider,
@@ -991,6 +1487,12 @@ impl Turn {
             else {
                 return Ok(Round::Paced(accounting.parked_until));
             };
+            last = context.window.as_ref().map(|window| LastCall {
+                prefix: context.prefix.bytes.clone(),
+                items: context.prefix.items,
+                first: window.ids.first().copied().unwrap_or_default(),
+                elided: window.elided,
+            });
             model_rounds += 1;
             if let Some(usage) = &response.usage {
                 record.tokens_used = record
@@ -1024,7 +1526,7 @@ impl Turn {
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard.
-                if self.absorb().await? {
+                if self.absorb(&context.prefix, &mut capped).await? {
                     continue;
                 }
                 return Ok(Round::Finished);
@@ -1067,35 +1569,50 @@ impl Turn {
             if parked {
                 return Ok(Round::Parked);
             }
-            self.absorb().await?;
         }
         fail("tool_round_limit")
     }
 
     /// The round boundary: queued steers become user items after everything
-    /// recorded so far. The worker publishes each batch and answers the
-    /// steers' waiters. One atomic read when nothing is waiting; the flag
-    /// clears before the read, so a steer landing during it is seen next.
-    async fn absorb(&self) -> Result<bool> {
-        if !self.steers.swap(false, Relaxed) {
+    /// recorded so far, while they fit beside what the view must send
+    /// `ahead` of the turn; optional previews of omitted turns yield. The worker publishes each batch and answers the steers'
+    /// waiters. One atomic read when nothing is waiting; the flag clears
+    /// before the read, so a steer landing during it is seen next. A steer
+    /// that stayed queued for lack of room is tried again once less goes
+    /// ahead, a note cleared or shrunk. Returns whether any went in;
+    /// `capped` holds what went ahead when one stayed queued, and is left
+    /// alone when nothing was tried.
+    async fn absorb(
+        &self,
+        ahead: &ContextPrefix,
+        capped: &mut Option<ContextUsage>,
+    ) -> Result<bool> {
+        let reserved = ahead.required;
+        let shrunk =
+            capped.is_some_and(|at| reserved.bytes < at.bytes || reserved.items < at.items);
+        if !self.steers.swap(false, Relaxed) && !shrunk {
             return Ok(false);
         }
+        let (mut steered, mut stayed) = (false, false);
         let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
         let mut through = None;
-        let mut steered = false;
         loop {
             let absorbed = self
                 .store
-                .op("absorb", move |db| db.absorb(turn, through, bytes, items))
+                .op("absorb", move |db| {
+                    db.absorb(turn, through, bytes, items, reserved)
+                })
                 .await?;
             through = absorbed.next_through;
             steered |= !absorbed.outcomes.is_empty();
+            stayed |= absorbed.capped;
             // Release the batch before loading another; new arrivals beyond
             // the initial snapshot wait for the next model-round boundary.
             if through.is_none() {
                 break;
             }
         }
+        *capped = stayed.then_some(reserved);
         Ok(steered)
     }
 
@@ -1144,7 +1661,8 @@ impl Turn {
         turn: i64,
         accounting: &mut Accounting,
     ) -> Result<Option<agent_runtime::provider::Completion>> {
-        accounting.compaction = matches!(body, Body::Span(_));
+        let summary = !matches!(body, Body::Window(_));
+        accounting.compaction = summary;
         let started = std::time::Instant::now();
         let mut attempt = std::mem::take(&mut accounting.call_attempts);
         let prior_spent =
@@ -1155,15 +1673,16 @@ impl Turn {
             record.cache_bot(),
             matches!(body, Body::Span(_)),
         );
-        // A summary's cache is its own and read once; only the turn's call
+        // A summary's view is replaced once it lands; only the turn's call
         // is refreshed while it streams.
         let warm_after = match body {
             Body::Window(_) => provider.keep_warm_after(model, record.reasoning.as_deref()),
-            Body::Span(_) => None,
+            Body::Copied(_) | Body::Span(_) => None,
         };
         loop {
             let items = match body {
                 Body::Window(context) => self.items(context),
+                Body::Copied(copy) => self.copied_items(copy),
                 Body::Span(plan) => self.span_items(plan).await?,
             };
             accounting.begin(attempt > 0);
@@ -1175,19 +1694,20 @@ impl Turn {
                         instructions,
                         reasoning: record.reasoning.as_deref(),
                         tools,
-                        allow_tool_calls: matches!(body, Body::Window(_)),
+                        allow_tool_calls: !matches!(body, Body::Span(_)),
                         fallbacks: record.fallbacks,
                         cache_key: Some(&cache_key),
                         items,
                         chain: Some(self.chain(body)),
-                        // A summary is a request of its own, off the turn's route.
-                        route: matches!(body, Body::Window(_)).then_some(&accounting.route),
+                        // A summary of its own goes off the turn's route; a
+                        // copy follows it to the server that holds its cache.
+                        route: (!matches!(body, Body::Span(_))).then_some(&accounting.route),
                         sent: Some(&sent),
                     },
                     |delta| {
                         let (kind, text) = match delta {
-                            Delta::Text(text) => (if matches!(body, Body::Span(_)) { "compaction_text_delta" } else { "text_delta" }, text),
-                            Delta::Thinking(text) => (if matches!(body, Body::Span(_)) { "compaction_thinking_delta" } else { "thinking_delta" }, text),
+                            Delta::Text(text) => (if summary { "compaction_text_delta" } else { "text_delta" }, text),
+                            Delta::Thinking(text) => (if summary { "compaction_thinking_delta" } else { "thinking_delta" }, text),
                         };
                         self.hub.live(
                             &self.bot,
@@ -1280,7 +1800,7 @@ impl Turn {
                     .saturating_add(usage.output_tokens);
             }
             let usage = accounting.report.usage.take();
-            if matches!(body, Body::Span(_)) {
+            if summary {
                 if let Some(usage) = usage {
                     let reference = summarizer(record);
                     let usage = summarizer_usage(usage, split_model(&reference)?.0, model);
@@ -1360,17 +1880,18 @@ impl Turn {
             Body::Window(Context {
                 window: Some(window),
                 prefix,
-                thinking_floor,
+                thinking,
             }) => Chain {
                 bot: &self.bot,
-                window: Some((&prefix.bytes[..], &window.ids[..])),
+                window: Some((&prefix.bytes[..], window.elided, &window.ids[..])),
                 tail: Box::new(move |skip| {
                     let span = Span {
                         ids: &window.ids[skip..],
                         sizes: &window.sizes[skip..],
                         thinking: &window.thinking[skip..],
+                        elided: window.elided,
                     };
-                    self.window_items(Bytes::new(), span, *thinking_floor)
+                    self.window_items(Bytes::new(), span, *thinking)
                 }),
             },
             _ => Chain {
@@ -1674,6 +2195,14 @@ impl Turn {
                         Err(error) => failure(error),
                     }
                 }
+                Ok(Prepared::Read {
+                    source: ReadSource::Result { node },
+                    offset,
+                    limit,
+                }) => match self.result_page(&call.call_id, node, offset, limit).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => failure(error),
+                },
                 Ok(Prepared::History {
                     turn: wanted,
                     offset,
@@ -1728,6 +2257,76 @@ impl Turn {
         Ok(false)
     }
 
+    /// Room for a page the model asked for: a share of what the input
+    /// limit leaves beside the running turn and what goes ahead of it. Old
+    /// turns can leave the window; the current turn and pinned items
+    /// cannot. Indexed accounting avoids rebuilding a full window per read.
+    async fn page_budget(
+        &self,
+        share: usize,
+        exhausted: &str,
+    ) -> Result<(agent_runtime::codec::Family, usize)> {
+        let allowance = self.input_limit();
+        let (bot, turn) = (self.bot.clone(), self.turn);
+        let (family, used) = self
+            .store
+            .read("history_usage", move |db| db.history_usage(&bot, turn))
+            .await?;
+        let budget = allowance.bytes.saturating_sub(used.bytes + 1) / share;
+        if used.items >= allowance.items || budget < 256 {
+            return fail(exhausted);
+        }
+        Ok((family, budget))
+    }
+
+    /// A page of a result that went as its stub. It stays beside its call
+    /// until the model answers it, so neither elision nor a cut can make
+    /// room for it later: it takes at most the room the turn leaves.
+    async fn result_page(
+        &self,
+        call_id: &str,
+        node: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Outcome> {
+        let (family, budget) = self.page_budget(1, "read_context_exhausted").await?;
+        let mut checked = self.read_results.lock().unwrap().contains(&node);
+        let mut bytes = budget;
+        loop {
+            let bot = self.bot.clone();
+            let page = match self
+                .store
+                .read("result_lines", move |db| {
+                    db.result_lines(&bot, node, offset, limit, checked, bytes)
+                })
+                .await
+            {
+                Ok(page) => page,
+                // A piece wider than the room left is not the text's fault.
+                Err(error) if error.code == "read_line_too_long" => {
+                    return fail("read_context_exhausted");
+                }
+                Err(error) => return Err(error),
+            };
+            if !checked {
+                self.read_results.lock().unwrap().push(node);
+                checked = true;
+            }
+            // Numbering, JSON escaping, redaction, and the result envelope
+            // all count: shrink the page by what the item overshoots until
+            // the item itself fits.
+            let output = self.registry.redact_text(page);
+            let item = family.tool_result_item(call_id, &output)?.len();
+            if item <= budget {
+                return Ok(Outcome::text(output));
+            }
+            bytes = (bytes * budget / item).min(bytes.saturating_sub(1));
+            if bytes == 0 {
+                return fail("read_context_exhausted");
+            }
+        }
+    }
+
     async fn history(
         &self,
         call_id: &str,
@@ -1735,18 +2334,7 @@ impl Turn {
         offset: u64,
         limit: usize,
     ) -> Result<Outcome> {
-        // Old turns can leave the window; the current turn and pinned items
-        // cannot. Indexed accounting avoids rebuilding a full window per read.
-        let allowance = self.input_limit();
-        let (bot, turn) = (self.bot.clone(), self.turn);
-        let (family, used) = self
-            .store
-            .read("history_usage", move |db| db.history_usage(&bot, turn))
-            .await?;
-        let budget = allowance.bytes.saturating_sub(used.bytes + 1) / 2;
-        if used.items >= allowance.items || budget < 256 {
-            return fail("history_context_exhausted");
-        }
+        let (family, budget) = self.page_budget(2, "history_context_exhausted").await?;
         let bot = self.bot.clone();
         let mut page = self
             .store
@@ -1992,8 +2580,8 @@ use agent_runtime::store::pinned_item;
 struct Context {
     window: Option<Window>,
     prefix: ContextPrefix,
-    /// Items with ids below this go without their thinking blocks.
-    thinking_floor: i64,
+    /// The items sent without their thinking blocks.
+    thinking: Strip,
 }
 impl Context {
     fn empty() -> Self {
@@ -2002,8 +2590,9 @@ impl Context {
             prefix: ContextPrefix {
                 bytes: Bytes::new(),
                 items: 0,
+                required: ContextUsage::default(),
             },
-            thinking_floor: 0,
+            thinking: Strip::default(),
         }
     }
     fn usage(&self) -> ContextUsage {
@@ -2022,11 +2611,62 @@ impl Context {
     }
 }
 
-/// What a model call sends: the bot's window, or a compaction's span.
+/// How a summary attempt ended: recorded, parked on its pool until the
+/// time given, or not made (not due, nothing to cut, or a failure reported
+/// live).
+enum Compaction {
+    Done,
+    Parked(u64),
+    Skipped,
+}
+
+/// A turn over its budget after `overflow`: its view now fits, its summary
+/// parked, or nothing more can be reclaimed.
+enum Overflow {
+    Fits(Box<Context>),
+    Parked(u64),
+    Stuck,
+}
+
+/// What a model call sends: the bot's window, a copy of the bot's call
+/// asking for a summary, or a summary request of its own over a span.
 #[derive(Clone, Copy)]
 enum Body<'a> {
     Window(&'a Context),
+    Copied(Copied<'a>),
     Span(&'a agent_runtime::store::CompactionPlan),
+}
+
+/// A summary request sent as a copy of the bot's call: what went ahead of
+/// the window when it was last sent, the window read under the same
+/// elision floor and thinking strip, and the compaction request after it.
+/// It shares the call's instructions, tools, model, and cache key, so the
+/// provider reads all but the newest items from cache.
+#[derive(Clone, Copy)]
+struct Copied<'a> {
+    prefix: &'a Bytes,
+    window: &'a Window,
+    thinking: Strip,
+    request: &'a Bytes,
+}
+
+/// The view as this task's last call sent it, what that call sent ahead
+/// of its window if a note changed it since, and the turn's model, which
+/// made the call.
+struct Sent<'a> {
+    view: &'a Context,
+    last: Option<&'a LastCall>,
+    /// `provider/model`, the bot's or the turn's override.
+    model: &'a str,
+}
+
+/// What the bot's last call in this task sent ahead of its window, and
+/// where that window started, for a summary to copy.
+struct LastCall {
+    prefix: Bytes,
+    items: usize,
+    first: i64,
+    elided: i64,
 }
 
 /// The assistant text of a completion's items, in either family encoding.
@@ -2229,6 +2869,7 @@ mod tests {
             resume: false,
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),
+            read_results: Default::default(),
         };
         let running = tokio::spawn(async move { task.execute(cancelled).await });
         let last = steers[31];

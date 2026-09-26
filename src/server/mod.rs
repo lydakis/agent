@@ -1540,6 +1540,7 @@ impl Service {
             resume,
             steers,
             tokens: self.tokens.clone(),
+            read_results: Default::default(),
         };
         let keep = self.retain_turns;
         self.jobs.spawn(async move {
@@ -3465,7 +3466,7 @@ mod tests {
         let bob = running(&store, &["Bob".into()]).await[0].1;
         store
             .call(move |db| {
-                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None)
+                db.suspend_paced(bob, 0, 0, 0, 0, 0, false, None, None)
                     .map(|_| ())
             })
             .await

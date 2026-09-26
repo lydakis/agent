@@ -2,7 +2,10 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, TurnOptions},
+    store::{
+        Binding, Bot, CompactionPlan, ContextUsage, Database, Delivery, Fork, Planning, Strip,
+        TurnOptions,
+    },
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -23,6 +26,8 @@ fn assistant(text: &str) -> Bytes {
 fn db() -> Database {
     Database::initialize(Connection::open_in_memory().unwrap()).unwrap()
 }
+/// The read tool, which a bot needs for its results to get stubs.
+static READ: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| vec!["read".into()]);
 fn binding() -> Binding<'static> {
     Binding {
         provider: "openai",
@@ -31,7 +36,7 @@ fn binding() -> Binding<'static> {
         instructions: "test",
         reasoning: None,
         budget_tokens: None,
-        tools: &[],
+        tools: &READ,
         created_by: None,
         created_by_id: None,
         compaction_instructions: None,
@@ -47,7 +52,7 @@ fn compaction_plan(
     max_bytes: i64,
     max_items: i64,
 ) -> Result<Option<CompactionPlan>> {
-    match db.compaction_plan(name, keep, i64::MAX, max_bytes, max_items)? {
+    match db.compaction_plan(name, keep, i64::MAX, max_bytes, max_items, false)? {
         None => Ok(None),
         Some(Planning::Plan(plan)) => Ok(Some(plan)),
         Some(Planning::CatchUp(mut walk)) => {
@@ -63,7 +68,7 @@ fn stored(db: &mut Database, name: &str) -> Vec<Value> {
     let Some(window) = db.window(name, i64::MAX, i64::MAX).unwrap() else {
         return Vec::new();
     };
-    let joined = db.items_by_ids(&window.ids, 0).unwrap();
+    let joined = db.items_by_ids(&window.ids, 0, 0).unwrap();
     serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap()
 }
 fn result(output: &str) -> Outcome {
@@ -1718,7 +1723,7 @@ fn context_windows_start_at_turn_boundaries_and_move_with_hysteresis() {
     let all = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
     assert_eq!(all.ids.len(), 20);
     assert_eq!((all.omitted_items, all.omitted_turns), (0, 0));
-    let joined = db.items_by_ids(&all.ids, 0).unwrap();
+    let joined = db.items_by_ids(&all.ids, 0, 0).unwrap();
     assert_eq!(joined.len() as i64, all.item_bytes + 19);
     let parsed: Vec<Value> = serde_json::from_slice(&[b"[", &joined[..], b"]"].concat()).unwrap();
     assert_eq!(parsed[0]["content"][0]["text"], "p1");
@@ -1856,7 +1861,7 @@ fn history_preserves_content_beyond_the_preview() {
         .unwrap();
     db.finish(turn, None).unwrap();
     let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
-    let replay = db.items_by_ids(&window.ids, 0).unwrap();
+    let replay = db.items_by_ids(&window.ids, 0, 0).unwrap();
     let page = db.history_read("Bob", 1, 0, 65536).unwrap();
     assert!(page["text"].as_str().unwrap().contains("final fact"));
     // The reading view keeps reasoning summaries but excludes opaque state.
@@ -1888,7 +1893,7 @@ fn history_preserves_content_beyond_the_preview() {
     assert_eq!(records.len(), 3);
     assert_eq!(records[1]["summary"][0]["text"], "Résumé 🦀");
     assert_eq!(records[1]["type"], "reasoning");
-    assert_eq!(db.items_by_ids(&window.ids, 0).unwrap(), replay);
+    assert_eq!(db.items_by_ids(&window.ids, 0, 0).unwrap(), replay);
     assert!(
         String::from_utf8(replay)
             .unwrap()
@@ -1966,7 +1971,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
             .unwrap();
         db.finish(turn, None).unwrap();
         let window = db.window(name, i64::MAX, i64::MAX).unwrap().unwrap();
-        let replay = db.items_by_ids(&window.ids, 0).unwrap();
+        let replay = db.items_by_ids(&window.ids, 0, 0).unwrap();
         assert!(replay.ends_with(item.as_bytes()));
         let mut joined = String::new();
         let mut offset = 0;
@@ -1992,7 +1997,7 @@ fn history_normalizes_multiline_items_without_changing_fields_or_replay() {
         if !item.contains(['\r', '\n']) {
             assert_eq!(joined.lines().nth(1).unwrap(), item);
         }
-        assert_eq!(db.items_by_ids(&window.ids, 0).unwrap(), replay);
+        assert_eq!(db.items_by_ids(&window.ids, 0, 0).unwrap(), replay);
     }
 }
 
@@ -2550,7 +2555,9 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert!(db.turn_outcome("Bob", second.turn).unwrap().is_none());
 
     // The boundary takes the steer, not the queued turn, and answers its waiters.
-    let absorbed = db.absorb(first.turn, None, 8 << 20, 4096).unwrap();
+    let absorbed = db
+        .absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     assert_eq!(absorbed.outcomes.len(), 1);
     let (steered, outcome) = &absorbed.outcomes[0];
     assert_eq!(*steered, third.turn);
@@ -2568,7 +2575,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(items[1]["content"][0]["text"], "third");
     assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "queued");
     assert!(
-        db.absorb(first.turn, None, 8 << 20, 4096)
+        db.absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -2879,7 +2886,9 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         )
         .unwrap()
         .turn;
-    let result = db.absorb(first, None, 8 << 20, 4096).unwrap();
+    let result = db
+        .absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     assert_eq!(
         result
             .outcomes
@@ -2889,7 +2898,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         [matched]
     );
     assert!(
-        db.absorb(first, None, 8 << 20, 4096)
+        db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -2899,7 +2908,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(moved, allow_provider).unwrap();
     assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
     assert!(
-        db.absorb(moved, None, 8 << 20, 4096)
+        db.absorb(moved, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -2908,7 +2917,10 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(changed, allow_provider).unwrap();
     assert_eq!(db.context(changed).unwrap().model, "openai/other");
     assert_eq!(
-        db.absorb(changed, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+        db.absorb(changed, None, 8 << 20, 4096, ContextUsage::default())
+            .unwrap()
+            .outcomes[0]
+            .0,
         inherited
     );
     assert!(!db.steers_waiting("Bob").unwrap());
@@ -2953,7 +2965,9 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         let mut through = None;
         let mut late = None;
         while seen.len() < count {
-            let absorbed = db.absorb(first, through, 8 << 20, 4096).unwrap();
+            let absorbed = db
+                .absorb(first, through, 8 << 20, 4096, ContextUsage::default())
+                .unwrap();
             through = absorbed.next_through;
             assert_eq!(absorbed.outcomes.len(), batch.min(count - seen.len()));
             seen.extend(absorbed.outcomes.into_iter().map(|(id, _)| id));
@@ -2970,11 +2984,14 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         assert_eq!(seen, submitted);
         assert_eq!(db.turn_status("Bob", late.unwrap()).unwrap(), "queued");
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+                .unwrap()
+                .outcomes[0]
+                .0,
             late.unwrap()
         );
         assert!(
-            db.absorb(first, None, 8 << 20, 4096)
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
                 .unwrap()
                 .outcomes
                 .is_empty()
@@ -3135,7 +3152,9 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         )
         .unwrap();
     assert_eq!(hit.status, "queued");
-    let absorbed = db.absorb(first.turn, None, 8 << 20, 4096).unwrap();
+    let absorbed = db
+        .absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     assert_eq!(absorbed.outcomes[0].0, hit.turn);
     // One that misses its boundary is never absorbed by the next turn and
     // never starts as new work.
@@ -3187,7 +3206,7 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         "stale_turn"
     );
     assert!(
-        db.absorb(plain.turn, None, 8 << 20, 4096)
+        db.absorb(plain.turn, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -3845,7 +3864,15 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
     // Bytes: a 4 KiB context keeps three quarters, 3,072 bytes, for the
     // running turn; its prompt item takes some, and two of three 1,000-byte
     // steers fit. Items: with room for two more items, two fit as well.
-    for (context_bytes, context_items) in [(4096usize, 4096usize), (8 << 20, 4)] {
+    // What the view sends ahead of the turn, a summary or notes, leaves
+    // room for one.
+    let reserved = |bytes, items| ContextUsage { bytes, items };
+    for (context_bytes, context_items, ahead, fit) in [
+        (4096usize, 4096usize, reserved(0, 0), 2),
+        (8 << 20, 4, reserved(0, 0), 2),
+        (4096, 4096, reserved(1100, 1), 1),
+        (8 << 20, 4, reserved(0, 1), 1),
+    ] {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let first = db
@@ -3878,23 +3905,24 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
             })
             .collect();
         let absorbed = db
-            .absorb(first, None, context_bytes, context_items)
+            .absorb(first, None, context_bytes, context_items, ahead)
             .unwrap();
         let taken: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
-        assert_eq!(taken, steers[..2]);
-        assert!(absorbed.next_through.is_none());
-        // The third does not fit now and is not retried into a full turn.
-        assert!(
-            db.absorb(first, None, context_bytes, context_items)
-                .unwrap()
-                .outcomes
-                .is_empty()
-        );
-        assert_eq!(db.turn_status("Bob", steers[2]).unwrap(), "queued");
+        assert_eq!(taken, steers[..fit]);
+        assert!(absorbed.capped && absorbed.next_through.is_none());
+        // The next does not fit now and is not retried into a full turn.
+        let again = db
+            .absorb(first, None, context_bytes, context_items, ahead)
+            .unwrap();
+        assert!(again.outcomes.is_empty() && again.capped);
+        assert_eq!(db.turn_status("Bob", steers[fit]).unwrap(), "queued");
         // With room it would have been taken: the budget is the only reason.
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
-            steers[2]
+            db.absorb(first, None, 8 << 20, 4096, ahead)
+                .unwrap()
+                .outcomes[0]
+                .0,
+            steers[fit]
         );
     }
 }
@@ -3950,7 +3978,8 @@ fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
         allow_provider,
     )
     .unwrap();
-    db.absorb(bob, None, 8 << 20, 4096).unwrap();
+    db.absorb(bob, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     let (_, bytes, count) = db.turn_usage("Bob", bob).unwrap();
     assert_eq!(count, 66);
     assert_eq!(
@@ -4051,7 +4080,10 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
         db.set_pending_limits(0, 0);
         // Leaving: absorbed into the running turn, cancelled, started.
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+                .unwrap()
+                .outcomes[0]
+                .0,
             third
         );
         assert_eq!(db.pending().unwrap(), (3, 15));
@@ -4442,7 +4474,7 @@ fn fork_prompt_views_survive_source_deletion_and_reopen() {
             assert_eq!(view.covered, (1, 3));
             assert_eq!(view.prompts, expected);
             // Compaction leaves the original native items retrievable.
-            let raw = db.items_by_ids(&plan.ids, 0).unwrap();
+            let raw = db.items_by_ids(&plan.ids, 0, 0).unwrap();
             let items: Vec<Value> =
                 serde_json::from_slice(&[b"[", &raw[..], b"]"].concat()).unwrap();
             assert_eq!(items.len(), 6);
@@ -4917,7 +4949,7 @@ fn catch_up_is_bounded_by_items_and_rejects_a_turn_larger_than_the_budget() {
     // The walk's pieces do not change the plan, whatever their size.
     for piece in [1, 7, 4096] {
         let Some(Planning::CatchUp(mut walk)) = db
-            .compaction_plan("Bob", 1, i64::MAX, i64::MAX, 16)
+            .compaction_plan("Bob", 1, i64::MAX, i64::MAX, 16, false)
             .unwrap()
         else {
             panic!("expected a catch-up walk");
@@ -5205,8 +5237,8 @@ fn schema_27_migrates_cache_lineage_and_thinking_sizes() {
         window.thinking.iter().map(|&t| t as usize).sum::<usize>(),
         stripped
     );
-    let full = db.items_by_ids(&window.ids, 0).unwrap();
-    let sent = db.items_by_ids(&window.ids, i64::MAX).unwrap();
+    let full = db.items_by_ids(&window.ids, 0, 0).unwrap();
+    let sent = db.items_by_ids(&window.ids, i64::MAX, 0).unwrap();
     assert_eq!(full.len() - sent.len(), stripped);
     assert!(!String::from_utf8(sent).unwrap().contains("\"thinking\""));
     let bob = db.inspect("Bob").unwrap();
@@ -5253,4 +5285,1423 @@ fn a_store_keeps_its_identity_and_forks_inherit_fallbacks() {
     assert_ne!(other.store_identity().unwrap(), identity);
     drop((db, other));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// One answered model round in a running turn: the model's call, then its
+/// result. Returns the call's node and the result's.
+fn exchange(db: &mut Database, turn: i64, call_id: &str, output: &str) -> (i64, i64) {
+    let call = ToolCall {
+        name: "shell".into(),
+        call_id: call_id.into(),
+        arguments: "{}".into(),
+    };
+    let item = json!({"type":"function_call","call_id":call_id,"name":"shell","arguments":"{}"});
+    let entries = db
+        .append(
+            turn,
+            vec![serde_json::to_vec(&item).unwrap().into()],
+            std::slice::from_ref(&call),
+            None,
+        )
+        .unwrap();
+    let asked = entries
+        .iter()
+        .find_map(|entry| entry["data"]["node"].as_i64())
+        .unwrap();
+    db.tool_start(turn, &call).unwrap();
+    let (_, entry) = db.tool_finish(turn, call_id, &result(output)).unwrap();
+    (asked, entry["data"]["node"].as_i64().unwrap())
+}
+fn lines(tag: usize, count: usize) -> String {
+    (0..count)
+        .map(|n| format!("result {tag} line {n}\n"))
+        .collect()
+}
+/// A window's items as the runtime sends them, checked against the sizes
+/// the window counted for them.
+fn sent(db: &Database, window: &agent_runtime::store::Window) -> Vec<Value> {
+    let mut items = Vec::new();
+    for (id, size) in window.ids.iter().zip(&window.sizes) {
+        let bytes = db.items_by_ids(&[*id], 0, window.elided).unwrap();
+        assert_eq!(bytes.len(), *size as usize, "node {id}");
+        items.push(serde_json::from_slice(&bytes).unwrap());
+    }
+    let joined = db.items_by_ids(&window.ids, 0, window.elided).unwrap();
+    assert_eq!(
+        joined.len() as i64 + 1,
+        window.item_bytes + window.ids.len() as i64
+    );
+    items
+}
+
+#[test]
+fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
+    let path = std::env::temp_dir().join(format!("agent-elision-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let mut rounds = Vec::new();
+    for n in 0..6 {
+        rounds.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 400)));
+    }
+    let before = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(before.elided, 0);
+    let full = sent(&db, &before);
+    // Keep about two results verbatim. The newest result is not answered
+    // yet, so however little is kept, the floor stays below its call.
+    let size = full[2].to_string().len() as i64;
+    let plan = db.elision_plan("Bob", 2 * size, 1).unwrap().unwrap();
+    assert!(plan.through < rounds[5].0);
+    let tight = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    assert_eq!(tight.through, rounds[5].0);
+    assert!(
+        db.elision_plan("Bob", 2 * size, plan.saved_bytes + 1)
+            .unwrap()
+            .is_none()
+    );
+    let entry = db.elide("Bob", &plan).unwrap();
+    assert_eq!(entry["event"], "elided");
+    assert_eq!(entry["turn"], turn);
+    assert_eq!(entry["data"]["through"], plan.through);
+    assert_eq!(entry["data"]["results"], plan.results);
+    // Moving the floor is forward only.
+    assert_eq!(
+        db.elide("Bob", &plan).unwrap_err().code,
+        "elision_not_forward"
+    );
+    let after = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(after.ids, before.ids);
+    assert_eq!(after.elided, plan.through);
+    assert_eq!(before.item_bytes - after.item_bytes, plan.saved_bytes);
+    assert_eq!(
+        before.unsummarized.bytes - after.unsummarized.bytes,
+        plan.saved_bytes as usize
+    );
+    let items = sent(&db, &after);
+    let mut stubs = 0;
+    for (item, id) in items.iter().zip(&after.ids) {
+        let output = item["output"].as_str().unwrap_or("");
+        if output.starts_with("[tool result elided") {
+            stubs += 1;
+            assert!(*id <= plan.through);
+            // The same call id, the size, the reference, both ends.
+            assert!(item["call_id"].as_str().unwrap().starts_with('c'));
+            assert!(output.contains(&format!("artifact \"result/{id}\"")));
+            let whole = db
+                .result_lines("Bob", *id, 1, 5000, false, usize::MAX)
+                .unwrap();
+            assert!(whole.contains("line 399"), "{whole}");
+            assert!(output.contains("line 0") && output.contains("line 399"));
+        } else if item["type"] == "function_call_output" {
+            assert!(*id > plan.through, "{id}");
+        }
+    }
+    assert_eq!(stubs, plan.results);
+    // The stored transcript itself is unchanged.
+    assert_eq!(stored(&mut db, "Bob"), full);
+    // A result that is not on the reader's lineage is not theirs to read.
+    db.create("Other", Some("/synthetic"), binding()).unwrap();
+    assert_eq!(
+        db.result_lines("Other", rounds[0].1, 1, 10, false, usize::MAX)
+            .unwrap_err()
+            .code,
+        "result_not_found"
+    );
+    assert_eq!(
+        db.result_lines("Bob", rounds[0].0, 1, 10, false, usize::MAX)
+            .unwrap_err()
+            .code,
+        "result_not_found"
+    );
+    // Forks see what the source saw at their checkpoint: before the move,
+    // every result whole; after it, the same stubs.
+    let early = rounds[4].1;
+    db.fork(
+        "Bob",
+        "Early",
+        Fork {
+            checkpoint: Some(early),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Early").unwrap().elision, None);
+    let window = db.window("Early", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(window.elided, 0);
+    assert_eq!(sent(&db, &window), full[..window.ids.len()]);
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    let checkpoint = db.finish(turn, None).unwrap().last().unwrap()["data"]["checkpoint"]
+        .as_i64()
+        .unwrap();
+    db.fork(
+        "Bob",
+        "Late",
+        Fork {
+            checkpoint: Some(checkpoint),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(db.inspect("Late").unwrap().elision, bob.elision);
+    let late = db.window("Late", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(late.elided, plan.through);
+    let source = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(sent(&db, &late), sent(&db, &source));
+    // The version outlives its bot while a fork holds it, then goes with the
+    // last holder; stubs go with their nodes.
+    db.delete_bot("Bob").unwrap();
+    assert_eq!(
+        db.window("Late", 1 << 20, 1024).unwrap().unwrap().elided,
+        plan.through
+    );
+    db.delete_bot("Late").unwrap();
+    let count = |table: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("elisions"), 0);
+    // Early keeps its own stubs, for results up to its checkpoint.
+    assert_eq!(count("stubs"), 5);
+    db.delete_bot("Early").unwrap();
+    assert_eq!(count("stubs"), 0);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_current_turn_over_budget_fits_once_its_answered_results_are_elided() {
+    for family in [Family::Responses, Family::Anthropic] {
+        let mut db = db();
+        let mut binding = binding();
+        binding.family = family;
+        db.create("Bob", Some("/synthetic"), binding).unwrap();
+        converse(&mut db, "Bob", 1);
+        let turn = db
+            .begin(
+                "Bob",
+                "r2",
+                "long task",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        for n in 0..8 {
+            let call = ToolCall {
+                name: "shell".into(),
+                call_id: format!("c{n}"),
+                arguments: "{}".into(),
+            };
+            let item = match family {
+                Family::Responses => {
+                    json!({"type":"function_call","call_id":call.call_id,"name":"shell","arguments":"{}"})
+                }
+                Family::Anthropic => json!({"role":"assistant","content":[
+                    {"type":"tool_use","id":call.call_id,"name":"shell","input":{}}]}),
+            };
+            db.append(
+                turn,
+                vec![serde_json::to_vec(&item).unwrap().into()],
+                std::slice::from_ref(&call),
+                None,
+            )
+            .unwrap();
+            db.tool_start(turn, &call).unwrap();
+            db.tool_finish(turn, &call.call_id, &result(&lines(n, 800)))
+                .unwrap();
+            // The runtime reads the window each round, which saves its start.
+            if n == 0 {
+                db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+            }
+        }
+        // The turn alone exceeds 64 KiB.
+        assert_eq!(
+            db.window("Bob", 64 << 10, 1024).unwrap_err().code,
+            "context_limit"
+        );
+        let plan = db.elision_plan("Bob", 16 << 10, 1).unwrap().unwrap();
+        db.elide("Bob", &plan).unwrap();
+        let window = db.window("Bob", 64 << 10, 1024).unwrap().unwrap();
+        assert!(window.item_bytes + window.ids.len() as i64 - 1 <= 64 << 10);
+        // With the stubs, the saved start fits again: the earlier turn stays.
+        assert_eq!(window.omitted_turns, 0);
+        let items = sent(&db, &window);
+        let stubbed = items
+            .iter()
+            .filter(|item| item.to_string().contains("[tool result elided"))
+            .count();
+        assert_eq!(stubbed as i64, plan.results);
+        // Admission for history reads and notes counts the stubs as well.
+        let (_, bytes, items) = db.turn_usage("Bob", turn).unwrap();
+        let current = &window.sizes[window.ids.len() - items..];
+        assert_eq!(bytes, current.iter().map(|&b| b as usize).sum::<usize>());
+    }
+}
+
+#[test]
+fn a_result_on_one_line_reads_back_whole_in_pieces() {
+    // A shell result is one JSON line, often longer than a read page.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let wide = format!("{}{}", "é".repeat(30_000), "z".repeat(50_000));
+    let (_, node) = exchange(&mut db, turn, "wide", &format!("short\n{wide}\nend"));
+    let mut read = Vec::new();
+    let mut offset = 1;
+    loop {
+        let page = db
+            .result_lines("Bob", node, offset, 5000, false, usize::MAX)
+            .unwrap();
+        assert!(page.len() < agent_runtime::tools::PREVIEW_BYTES);
+        let mut next = None;
+        for line in page.lines() {
+            match line.split_once('\t') {
+                Some((number, piece)) if number.trim().parse::<usize>().is_ok() => {
+                    read.push(piece.to_owned())
+                }
+                _ => {
+                    if let Some(n) = line.split("offset=").nth(1) {
+                        next = Some(n.trim_end_matches(']').parse::<usize>().unwrap());
+                    }
+                }
+            }
+        }
+        match next {
+            Some(n) => offset = n,
+            None => break,
+        }
+    }
+    assert_eq!(read.first().unwrap(), "short");
+    assert_eq!(read.last().unwrap(), "end");
+    let pieces = &read[1..read.len() - 1];
+    assert!(
+        pieces
+            .iter()
+            .all(|p| p.len() <= agent_runtime::tools::PIECE_BYTES)
+    );
+    assert_eq!(pieces.concat(), wide);
+}
+
+#[test]
+fn a_bot_without_read_stores_no_stubs() {
+    // A stub names a read the model could not make, so its results carry
+    // no stub and no saving, and nothing is ever planned for elision.
+    let path = std::env::temp_dir().join(format!("agent-no-read-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let shell = vec!["shell".to_owned()];
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &shell,
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "c0", &lines(0, 400));
+    exchange(&mut db, turn, "c1", &lines(1, 400));
+    let stored = |sql: &str| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(stored("SELECT count(*) FROM stubs"), 0);
+    assert_eq!(stored("SELECT count(*) FROM nodes WHERE elided>0"), 0);
+    db.window("Bob", 1 << 20, 1 << 20).unwrap();
+    assert!(db.elision_plan("Bob", 1, 1).unwrap().is_none());
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_29_adds_elision_without_rewriting_stored_results() {
+    let path = std::env::temp_dir().join(format!("agent-stubs-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let savings = |path: &std::path::Path| {
+        let conn = Connection::open(path).unwrap();
+        let nodes: Vec<(i64, i64, i64)> = conn
+            .prepare("SELECT id,elided,total_elided FROM nodes ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let stubs: Vec<i64> = conn
+            .prepare("SELECT node FROM stubs ORDER BY node")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        (nodes, stubs)
+    };
+    let old = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let turn = db
+            .begin(
+                "Bob",
+                "r1",
+                "task",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        exchange(&mut db, turn, "small", "short");
+        exchange(&mut db, turn, "large", &lines(0, 400));
+        db.append(turn, vec![assistant("done")], &[], None).unwrap();
+        db.finish(turn, None).unwrap();
+        drop(db);
+        savings(&path).0.iter().map(|n| n.0).collect::<Vec<_>>()
+    };
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX bots_elision; ALTER TABLE bots DROP COLUMN elision;
+             ALTER TABLE nodes DROP COLUMN elided; ALTER TABLE nodes DROP COLUMN total_elided;
+             DROP TABLE stubs; DROP TABLE elisions; PRAGMA user_version=28;",
+        )
+        .unwrap();
+    }
+    // Opening reads no stored result: earlier results have no stub and no
+    // saving, and are always sent whole.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.inspect("Bob").unwrap().elision, None);
+    let (nodes, stubs) = savings(&path);
+    assert_eq!(nodes, old.iter().map(|&id| (id, 0, 0)).collect::<Vec<_>>());
+    assert!(stubs.is_empty());
+    // A result recorded after the migration gets its stub, and savings
+    // accumulate from there.
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, turn, "later", &lines(0, 400));
+    exchange(&mut db, turn, "last", "short");
+    let (nodes, stubs) = savings(&path);
+    assert_eq!(stubs.len(), 1);
+    let saved = nodes.iter().find(|n| n.0 == stubs[0]).unwrap().1;
+    assert!(saved > 0);
+    assert_eq!(nodes.last().unwrap().2, saved);
+    assert!(nodes.windows(2).all(|w| w[1].2 == w[0].2 + w[1].1));
+    // The floor moves over it and leaves the earlier result whole.
+    db.window("Bob", 1 << 20, 1 << 20).unwrap();
+    let plan = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    assert_eq!((plan.results, plan.saved_bytes), (1, saved));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn compaction_counts_and_summarizes_stubs_under_the_elision_floor() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let older = db
+        .begin(
+            "Bob",
+            "r1",
+            "p1",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    exchange(&mut db, older, "old", &lines(100, 800));
+    db.append(older, vec![assistant("r1")], &[], None).unwrap();
+    db.finish(older, None).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    for n in 0..8 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 800));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let raw = db.unsummarized_bytes("Bob").unwrap();
+    let plan = db.elision_plan("Bob", 16 << 10, 1).unwrap().unwrap();
+    db.elide("Bob", &plan).unwrap();
+    // Bytes not yet summarized count the stubs, one subtraction per node.
+    let unsummarized = db.unsummarized_bytes("Bob").unwrap();
+    assert_eq!(unsummarized, raw - plan.saved_bytes);
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!(
+        window.unsummarized.bytes as i64, window.item_bytes,
+        "the whole unsummarized span is in view"
+    );
+    // The raw span is over the summarizer's 64 KiB; as sent, it plans in
+    // one step, the older turn with its result as the stub the model saw.
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    assert!(raw > limit.bytes as i64 && unsummarized < limit.bytes as i64);
+    // Keeping the whole current turn cuts at its prompt.
+    let (_, current, _) = db.turn_usage("Bob", turn).unwrap();
+    let summarized = compaction_plan(&db, "Bob", current as i64, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summarized.pinned, None);
+    assert!(!summarized.catch_up);
+    assert_eq!(summarized.covered, (1, 1));
+    assert_eq!(summarized.elided, window.elided);
+    let items = db
+        .items_by_ids(&summarized.ids, i64::MAX, summarized.elided)
+        .unwrap();
+    assert_eq!(
+        items.len() + 1,
+        summarized
+            .sizes
+            .iter()
+            .map(|&s| s as usize + 1)
+            .sum::<usize>()
+    );
+    let text = String::from_utf8(items).unwrap();
+    assert!(text.contains("[tool result elided from this request"));
+    assert!(!text.contains("result 100 line 400"));
+    // The current turn fits only as sent; the new view is checked the same
+    // way, so the summary installs.
+    db.compact("Bob", &summarized, "summary", None, 0, limit)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.omitted_turns, 1);
+    assert_eq!(window.unsummarized.bytes as i64, window.item_bytes);
+    let (_, bytes, _) = db.turn_usage("Bob", turn).unwrap();
+    assert_eq!(bytes as i64, window.item_bytes);
+}
+
+#[test]
+fn an_elided_event_counts_what_the_move_takes_off_the_view() {
+    // A cut summarizes a result the floor had not reached. The next move
+    // stubs it too, since a floor covers everything below it, but it is
+    // never sent again: the event counts the results and bytes the move
+    // takes off the view.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let mut calls = Vec::new();
+    for n in 0..8 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 800)));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let first = db.elision_plan("Bob", 40 << 10, 1).unwrap().unwrap();
+    assert!(first.through < calls[6].1);
+    db.elide("Bob", &first).unwrap();
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.cut, calls[7].0);
+    let limit = ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    db.compact("Bob", &plan, "summary", None, 0, limit).unwrap();
+    for n in 8..10 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 800)));
+    }
+    let before = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    let second = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    let event = db.elide("Bob", &second).unwrap();
+    let after = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    // Results 7 and 8, answered in view; 6 went with the summary.
+    assert_eq!(event["data"]["results"], 2);
+    assert_eq!(
+        event["data"]["saved_bytes"].as_i64().unwrap(),
+        before.item_bytes - after.item_bytes
+    );
+    assert_eq!(after.ids, before.ids);
+}
+
+/// The request prefix a window's view renders, as JSON items.
+fn prefix_items(window: &agent_runtime::store::Window) -> Vec<Value> {
+    let prefix = window.prefix(&[], usize::MAX).unwrap().bytes;
+    let prefix = &prefix[..prefix.len().saturating_sub(1)];
+    serde_json::from_slice(&[b"[", prefix, b"]"].concat()).unwrap()
+}
+
+#[test]
+fn a_cut_inside_the_running_turn_keeps_its_prompt_ahead_of_the_tail() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls = Vec::new();
+    for n in 0..6 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    // Keeping one byte cuts at the newest round that follows a result.
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.cut, plan.pinned), (calls[5].0, Some(prompt)));
+    assert_eq!(plan.covered, (1, 2));
+    assert_eq!(
+        plan.prompts
+            .iter()
+            .map(|(o, p)| (*o, p.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "p1"), (2, "long task")]
+    );
+    // The span ends with a completed exchange: every call has its result.
+    assert_eq!(*plan.ids.last().unwrap(), calls[4].1);
+    let span: Vec<Value> = {
+        let items = db.items_by_ids(&plan.ids, i64::MAX, 0).unwrap();
+        serde_json::from_slice(&[b"[", &items[..], b"]"].concat()).unwrap()
+    };
+    let ids = |kind: &str| -> Vec<String> {
+        span.iter()
+            .filter(|i| i["type"] == kind)
+            .map(|i| i["call_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("function_call"), ids("function_call_output"));
+    let event = db
+        .compact("Bob", &plan, "summary one", None, 0, limit)
+        .unwrap();
+    assert_eq!(event["data"]["pinned"], json!(prompt));
+    let first = db.inspect("Bob").unwrap().compaction.unwrap();
+    // The turn's prompt goes whole, ahead of the tail from the cut.
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, calls[5].0]);
+    assert_eq!(window.omitted_turns, 1);
+    // Turn one's two messages, and all of turn two's before the cut but
+    // its prompt.
+    assert_eq!(window.omitted_items, 2);
+    assert_eq!(window.omitted_in_turn as usize, plan.ids.len() - 3);
+    let items = sent(&db, &window);
+    assert_eq!(items[0]["content"][0]["text"], "long task");
+    assert_eq!(window.unsummarized.bytes as i64, window.item_bytes);
+    let (_, bytes, count) = db.turn_usage("Bob", turn).unwrap();
+    assert_eq!((bytes as i64, count), (window.item_bytes, window.ids.len()));
+    // The summary says it covers the start of this turn, and lists only
+    // the earlier turns' prompts.
+    let view = prefix_items(&window)[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(view.starts_with(&format!(
+        "[compaction summary, version {first}, covering turns 1 to 1 and the start of turn 2]"
+    )));
+    assert!(view.contains("\n1: p1") && !view.contains("long task"));
+    assert_eq!(
+        prefix_items(&window)[1]["content"][0]["text"],
+        "[context note] 1 earlier turn(s) with 2 messages, and 10 earlier messages of turn 2, are not shown."
+    );
+
+    // A second cut in the same turn summarizes from the first, keeping
+    // the same prompt in view.
+    for n in 6..9 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)));
+    }
+    let second = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((second.cut, second.pinned), (calls[8].0, Some(prompt)));
+    assert_eq!(second.covered, (2, 2));
+    assert_eq!(second.ids.first(), Some(&calls[5].0));
+    assert_eq!(second.previous_summary.as_deref(), Some("summary one"));
+    db.compact("Bob", &second, "summary two", None, 0, limit)
+        .unwrap();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+
+    // The next turn's window still starts at the cut with its prompt, and
+    // a cut at that turn's own prompt covers the earlier one whole.
+    converse(&mut db, "Bob", 3);
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, calls[8].0]);
+    let third = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(third.pinned, None);
+    assert_eq!(third.covered, (2, 2));
+    db.compact("Bob", &third, "summary three", None, 0, limit)
+        .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(window.omitted_turns, 2);
+    let view = prefix_items(&window)[0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(view.contains("covering turns 1 to 2]"));
+    assert!(view.contains("\n1: p1\n2: long task"));
+
+    // A fork from between the two cuts in turn two binds the first, and
+    // sees the prompt ahead of its cut as the source did.
+    db.fork(
+        "Bob",
+        "Branch",
+        Fork {
+            checkpoint: Some(calls[7].1),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.inspect("Branch").unwrap().compaction, Some(first));
+    let window = db.window("Branch", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, calls[5].0]);
+    assert_eq!(*window.ids.last().unwrap(), calls[7].1);
+}
+
+/// A running turn of four small exchanges, then a steer absorbed after the
+/// last result, which the model answers with one large exchange.
+fn steered_turn(db: &mut Database) -> (i64, i64, Vec<(i64, i64)>) {
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls: Vec<(i64, i64)> = (0..4)
+        .map(|n| exchange(db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Bob",
+        "s",
+        "use the other table",
+        true,
+        &steer,
+        allow_provider,
+    )
+    .unwrap();
+    let absorbed = db
+        .absorb(turn, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
+    let steered = absorbed.outcomes[0].1["node"].as_i64().unwrap();
+    calls.push(exchange(db, turn, "c4", &lines(4, 400)));
+    (prompt, steered, calls)
+}
+
+#[test]
+fn a_cut_inside_a_turn_may_start_at_a_steer_that_follows_a_result() {
+    // The model's next output follows the steer, not the result, so the
+    // steer starts that round: the tail may begin with it, whole.
+    let mut db = db();
+    let (prompt, steered, calls) = steered_turn(&mut db);
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.cut, plan.pinned), (steered, Some(prompt)));
+    assert_eq!(plan.ids.last(), Some(&calls[3].1));
+    db.compact(
+        "Bob",
+        &plan,
+        "summary",
+        None,
+        0,
+        ContextUsage {
+            bytes: 64 << 10,
+            items: 256,
+        },
+    )
+    .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..3], &[prompt, steered, calls[4].0]);
+    assert_eq!(
+        sent(&db, &window)[1]["content"][0]["text"],
+        "use the other table"
+    );
+}
+
+#[test]
+fn a_catch_up_step_may_end_before_a_steer_that_follows_a_result() {
+    // The large result leaves no room for the step to reach the newest
+    // round, so the step ends at the steer, keeping the prompt.
+    let mut db = db();
+    let (prompt, steered, calls) = steered_turn(&mut db);
+    let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, false)
+        .unwrap()
+    else {
+        panic!("expected a catch-up walk");
+    };
+    while !walk.done() {
+        db.catch_up_piece(&mut walk, 16).unwrap();
+    }
+    let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+    assert_eq!((plan.cut, plan.pinned), (steered, Some(prompt)));
+    assert_eq!(plan.ids.last(), Some(&calls[3].1));
+}
+
+/// Every step of a catch-up walk through a bot's backlog, recorded with
+/// numbered summaries, one step per round as the runtime takes them; each
+/// step must end at a completed exchange of the long turn and keep its
+/// prompt.
+fn catch_up_steps(
+    db: &mut Database,
+    turn: i64,
+    turn_prompt: i64,
+    calls: &mut Vec<(i64, i64)>,
+    max_bytes: i64,
+) -> Vec<CompactionPlan> {
+    let mut steps: Vec<CompactionPlan> = Vec::new();
+    while let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256, false)
+        .unwrap()
+    {
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, 16).unwrap();
+        }
+        let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        assert!(plan.catch_up);
+        assert_eq!(plan.pinned, Some(turn_prompt));
+        let round = calls
+            .iter()
+            .position(|(asked, _)| *asked == plan.cut)
+            .expect("each step cuts at a round");
+        // The span ends with the previous round's result, and every call
+        // in it has its result.
+        assert_eq!(plan.ids.last(), Some(&calls[round - 1].1));
+        let span: Vec<Value> = {
+            let items = db.items_by_ids(&plan.ids, i64::MAX, 0).unwrap();
+            serde_json::from_slice(&[b"[", &items[..], b"]"].concat()).unwrap()
+        };
+        let ids = |kind: &str| -> Vec<String> {
+            span.iter()
+                .filter(|i| i["type"] == kind)
+                .map(|i| i["call_id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(ids("function_call"), ids("function_call_output"));
+        assert!(plan.sizes.iter().map(|&s| s as i64).sum::<i64>() <= max_bytes);
+        if let Some(previous) = steps.last() {
+            assert_eq!(plan.ids.first(), Some(&previous.cut));
+            assert_eq!(
+                plan.previous_summary,
+                Some(format!("summary {}", steps.len() - 1))
+            );
+        }
+        let event = db
+            .compact(
+                "Bob",
+                &plan,
+                &format!("summary {}", steps.len()),
+                None,
+                0,
+                agent_runtime::store::ContextUsage {
+                    bytes: max_bytes as usize,
+                    items: 256,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (&event["data"]["catch_up"], &event["data"]["pinned"]),
+            (&json!(true), &json!(turn_prompt))
+        );
+        steps.push(plan);
+        assert!(steps.len() < 64, "catch-up does not converge");
+        let n = calls.len();
+        calls.push(exchange(db, turn, &format!("c{n}"), &lines(n, 50)));
+    }
+    steps
+}
+
+#[test]
+fn catch_up_through_a_turn_larger_than_the_budget_cuts_at_its_rounds() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls: Vec<(i64, i64)> = (0..40)
+        .map(|n| exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    let max_bytes = 8192;
+    // The walk's pieces do not change the first step, whatever their size.
+    let mut first = Vec::new();
+    for piece in [1, 7, 4096] {
+        let Some(Planning::CatchUp(mut walk)) = db
+            .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256, false)
+            .unwrap()
+        else {
+            panic!("expected a catch-up walk");
+        };
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, piece).unwrap();
+        }
+        let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        first.push((plan.cut, plan.pinned, plan.ids, plan.covered, plan.prompts));
+    }
+    assert!(first.windows(2).all(|pair| pair[0] == pair[1]));
+    // The first step takes turn one whole and the long turn's start.
+    let (_, _, ids, covered, prompts) = &first[0];
+    assert_eq!(*covered, (1, 2));
+    assert_eq!(
+        prompts
+            .iter()
+            .map(|(o, p)| (*o, p.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "p1"), (2, "long task")]
+    );
+    assert!(ids.contains(&prompt));
+
+    // Steps walk through the turn a round boundary at a time, then the
+    // rest fits one ordinary summary that cuts at the newest round.
+    let steps = catch_up_steps(&mut db, turn, prompt, &mut calls, max_bytes);
+    assert!(steps.len() > 1);
+    assert!(steps[1..].iter().all(|step| step.covered == (2, 2)));
+    let last = compaction_plan(&db, "Bob", 1, max_bytes, 256)
+        .unwrap()
+        .unwrap();
+    assert!(!last.catch_up);
+    assert_eq!(
+        (last.cut, last.pinned),
+        (calls.last().unwrap().0, Some(prompt))
+    );
+    assert_eq!(last.ids.first(), Some(&steps.last().unwrap().cut));
+    // The view sends the prompt whole, then the tail from the last cut.
+    let window = db.window("Bob", max_bytes, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, steps.last().unwrap().cut]);
+    // The transcript is intact.
+    assert_eq!(
+        db.history_read("Bob", 2, 0, 65536).unwrap()["items"],
+        1 + 2 * calls.len()
+    );
+}
+
+#[test]
+fn catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds() {
+    // A finished turn outgrew a budget set after it ran: the walk cuts it
+    // at its rounds, keeping its prompt, then goes on at turn boundaries.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let calls: Vec<(i64, i64)> = (0..40)
+        .map(|n| exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+    for n in 2..=4 {
+        converse(&mut db, "Bob", n);
+    }
+    let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, false)
+        .unwrap()
+    else {
+        panic!("expected a catch-up walk");
+    };
+    while !walk.done() {
+        db.catch_up_piece(&mut walk, 16).unwrap();
+    }
+    let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+    assert_eq!(plan.pinned, Some(prompt));
+    assert_eq!(plan.covered, (1, 1));
+    assert!(calls[1..].iter().any(|(asked, _)| *asked == plan.cut));
+    db.compact(
+        "Bob",
+        &plan,
+        "summary 0",
+        None,
+        0,
+        agent_runtime::store::ContextUsage {
+            bytes: 8192,
+            items: 256,
+        },
+    )
+    .unwrap();
+    // The view keeps the old turn's prompt ahead of the rest of that turn
+    // and the turns after it.
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!(&window.ids[..2], &[prompt, plan.cut]);
+    // Later steps, one a turn, carry on through the old turn and then at
+    // turn boundaries until the rest fits.
+    let mut cuts = vec![plan.cut];
+    let mut n = 5;
+    converse(&mut db, "Bob", n);
+    while let Some(Planning::CatchUp(mut walk)) = db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, false)
+        .unwrap()
+    {
+        while !walk.done() {
+            db.catch_up_piece(&mut walk, 16).unwrap();
+        }
+        let next = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+        assert_eq!(next.ids.first(), cuts.last());
+        assert_eq!(next.covered.0, 1);
+        cuts.push(next.cut);
+        db.compact(
+            "Bob",
+            &next,
+            "summary",
+            None,
+            0,
+            agent_runtime::store::ContextUsage {
+                bytes: 8192,
+                items: 256,
+            },
+        )
+        .unwrap();
+        n += 1;
+        converse(&mut db, "Bob", n);
+        assert!(n < 64, "catch-up does not converge");
+    }
+    // The steps cut inside the old turn; the rest then fits one ordinary
+    // summary, cut at the newest turn's prompt.
+    assert!(cuts.len() > 1);
+    assert!(
+        cuts.iter()
+            .all(|cut| calls.iter().any(|(asked, _)| asked == cut))
+    );
+    let last = compaction_plan(&db, "Bob", 1, 8192, 256).unwrap().unwrap();
+    assert_eq!((last.pinned, last.covered), (None, (1, n as i64 - 1)));
+    assert_eq!(last.ids.first(), cuts.last());
+    assert_eq!(
+        db.history_read("Bob", 1, 0, 65536).unwrap()["items"],
+        1 + 2 * calls.len() + 1
+    );
+}
+
+#[test]
+fn schema_30_adds_the_prompt_a_cut_inside_a_turn_keeps() {
+    let path = std::env::temp_dir().join(format!("agent-pinned-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=6 {
+            converse(&mut db, "Bob", n);
+        }
+        let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
+            .unwrap()
+            .unwrap();
+        let limit = agent_runtime::store::ContextUsage {
+            bytes: 4096,
+            items: 256,
+        };
+        db.compact("Bob", &plan, "summary", None, 0, limit).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX compactions_pinned; ALTER TABLE compactions DROP COLUMN pinned;
+             PRAGMA user_version=29;",
+        )
+        .unwrap();
+    // Every earlier cut is a turn's prompt: none keeps one.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let pinned: Vec<Option<i64>> = Connection::open(&path)
+        .unwrap()
+        .prepare("SELECT pinned FROM compactions")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(pinned, vec![None]);
+    let window = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    assert_eq!((window.omitted_turns, window.omitted_in_turn), (5, 0));
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_stub_strips_thinking_from_itself_up_to_the_request_that_sent_it() {
+    // Nodes below 10 lost their context; the first stub is node 20 and the
+    // request that sent it ended at node 30.
+    let one = Strip::from(10).and(20, 31);
+    assert_eq!(
+        one,
+        Strip {
+            below: 10,
+            from: 20,
+            to: 31
+        }
+    );
+    assert_eq!(
+        (0..33).filter(|id| !one.strips(*id)).collect::<Vec<_>>(),
+        [(10..20).collect::<Vec<_>>(), vec![31, 32]].concat()
+    );
+    // A later stub inside the range, or past it, extends it to the new
+    // request; the nodes between two ranges go with them.
+    for first in [25, 35] {
+        assert_eq!(
+            one.and(first, 41),
+            Strip {
+                below: 10,
+                from: 20,
+                to: 41
+            }
+        );
+    }
+    // A stub at or below the floor strips everything up to the request.
+    assert_eq!(one.and(10, 41), Strip::from(41));
+    assert_eq!(Strip::default().and(1, 5).from, 1);
+}
+
+#[test]
+fn schema_31_keeps_each_bots_thinking_and_forks_carry_a_strip_from_before_them() {
+    let path = std::env::temp_dir().join(format!("agent-strip-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=3 {
+            converse(&mut db, "Bob", n);
+        }
+        db.set_thinking("Bob", 7, Strip::from(3), 0).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN thinking_from; ALTER TABLE bots DROP COLUMN thinking_to;
+             ALTER TABLE bots DROP COLUMN thinking_elided; PRAGMA user_version=30;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!(
+        (bob.thinking_prefix, bob.thinking, bob.thinking_elided),
+        (Some(7), Strip::from(3), 0)
+    );
+    // A strip recorded by a request that sent the head carries to a fork
+    // there, and not to one from before it.
+    let head = bob.head.unwrap();
+    let strip = Strip {
+        below: 3,
+        from: head - 2,
+        to: head + 1,
+    };
+    db.set_thinking("Bob", 7, strip, head - 2).unwrap();
+    for (name, checkpoint, carried) in [("Now", None, true), ("Before", Some(head - 2), false)] {
+        db.fork(
+            "Bob",
+            name,
+            Fork {
+                checkpoint,
+                ..Fork::default()
+            },
+        )
+        .unwrap();
+        let fork = db.inspect(name).unwrap();
+        let expected = if carried {
+            (Some(7), strip, head - 2)
+        } else {
+            (None, Strip::default(), 0)
+        };
+        assert_eq!(
+            (fork.thinking_prefix, fork.thinking, fork.thinking_elided),
+            expected
+        );
+    }
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn lineage_checks_reject_a_node_on_another_branch_at_any_depth() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let shared = db.inspect("Bob").unwrap().head.unwrap();
+    db.fork(
+        "Bob",
+        "Branch",
+        Fork {
+            checkpoint: Some(shared),
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    converse(&mut db, "Bob", 2);
+    for n in 3..6 {
+        converse(&mut db, "Branch", n);
+    }
+    let bob = db.inspect("Bob").unwrap().head.unwrap();
+    let branch = db.inspect("Branch").unwrap().head.unwrap();
+    // Bob's head is shallower than the branch's: the walk down the branch
+    // reaches that depth at another node. The branch's head is deeper than
+    // anything on Bob's lineage.
+    for (reader, node) in [("Branch", bob), ("Bob", branch)] {
+        assert_eq!(
+            db.item(reader, node).unwrap_err().code,
+            "item_not_in_bot_history"
+        );
+    }
+    for reader in ["Bob", "Branch"] {
+        assert_eq!(db.item(reader, shared).unwrap()["content"][0]["text"], "r1");
+    }
+    assert_eq!(
+        db.item("Branch", branch).unwrap()["content"][0]["text"],
+        "r5"
+    );
+}
+
+#[test]
+fn catch_up_steps_at_one_head_extend_the_summary_made_there() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let calls: Vec<(i64, i64)> = (0..40)
+        .map(|n| exchange(&mut db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    let head = db.inspect("Bob").unwrap().head;
+    let max_bytes = 8192;
+    let plan = |db: &Database, again: bool| match db
+        .compaction_plan("Bob", 1, i64::MAX, max_bytes, 256, again)
+        .unwrap()
+    {
+        None => None,
+        Some(Planning::Plan(plan)) => Some(plan),
+        Some(Planning::CatchUp(mut walk)) => {
+            while !walk.done() {
+                db.catch_up_piece(&mut walk, 16).unwrap();
+            }
+            db.catch_up_plan("Bob", walk).unwrap()
+        }
+    };
+    // No model call answers between the steps, as when a round overflows
+    // with a backlog several summarizer budgets long.
+    let mut steps: Vec<(CompactionPlan, Value)> = Vec::new();
+    while let Some(step) = plan(&db, !steps.is_empty()) {
+        let event = db
+            .compact(
+                "Bob",
+                &step,
+                &format!("summary {}", steps.len()),
+                None,
+                0,
+                agent_runtime::store::ContextUsage {
+                    bytes: max_bytes as usize,
+                    items: 256,
+                },
+            )
+            .unwrap();
+        if steps.is_empty() {
+            // A resumed call at this head does not summarize again.
+            assert!(plan(&db, false).is_none());
+        } else {
+            assert_eq!(
+                step.previous_summary,
+                Some(format!("summary {}", steps.len() - 1))
+            );
+            assert_eq!(step.ids.first(), Some(&steps.last().unwrap().0.cut));
+        }
+        let done = !step.catch_up;
+        steps.push((step, event));
+        assert!(steps.len() < 64, "catch-up does not converge");
+        if done {
+            break;
+        }
+    }
+    assert!(steps.len() > 2);
+    for (_, event) in &steps {
+        assert_eq!(event["data"]["version"], json!(head));
+        assert_eq!(event["data"]["previous"], Value::Null);
+    }
+    // The version at the head is the last step, cut at the newest round.
+    let (last, _) = steps.last().unwrap();
+    assert_eq!(
+        (last.cut, last.pinned),
+        (calls.last().unwrap().0, Some(prompt))
+    );
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(bot.compaction, head);
+    let window = db.window("Bob", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(window.ids[..2], [prompt, last.cut]);
+}
+
+#[test]
+fn a_version_a_fork_sees_is_not_extended_under_it() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    for n in 0..40 {
+        exchange(&mut db, turn, &format!("c{n}"), &lines(n, 100));
+    }
+    let head = db.inspect("Bob").unwrap().head;
+    let limit = agent_runtime::store::ContextUsage {
+        bytes: 8192,
+        items: 256,
+    };
+    let plan = |db: &Database, again: bool| match db
+        .compaction_plan("Bob", 1, i64::MAX, 8192, 256, again)
+        .unwrap()
+    {
+        None => None,
+        Some(Planning::Plan(plan)) => Some(plan),
+        Some(Planning::CatchUp(mut walk)) => {
+            while !walk.done() {
+                db.catch_up_piece(&mut walk, 16).unwrap();
+            }
+            db.catch_up_plan("Bob", walk).unwrap()
+        }
+    };
+    let first = plan(&db, false).unwrap();
+    assert!(first.catch_up);
+    db.compact("Bob", &first, "summary 0", None, 0, limit)
+        .unwrap();
+    let floor = db.elision_plan("Bob", 4096, 1).unwrap().unwrap();
+    db.elide("Bob", &floor).unwrap();
+    // The next step is planned; a fork at the head binds both versions
+    // while its summary is being written.
+    let second = plan(&db, true).unwrap();
+    db.fork(
+        "Bob",
+        "Side",
+        Fork {
+            checkpoint: head,
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    let seen = db.window("Side", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(
+        db.compact("Bob", &second, "summary 1", None, 0, limit)
+            .unwrap_err()
+            .code,
+        "compaction_version_shared"
+    );
+    assert!(plan(&db, true).is_none());
+    let further = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    assert!(further.through > floor.through);
+    assert_eq!(
+        db.elide("Bob", &further).unwrap_err().code,
+        "elision_version_shared"
+    );
+    let after = db.window("Side", 1 << 20, 1024).unwrap().unwrap();
+    assert_eq!(after.ids, seen.ids);
+    assert_eq!(after.elided, floor.through);
+    assert_eq!(after.compaction.unwrap().summary, "summary 0");
 }

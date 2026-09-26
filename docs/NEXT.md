@@ -542,17 +542,36 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     unsummarized-span query is gone from the turn loop. Performance evidence is
     recorded in [the matched screen](DAEMON_MEASUREMENTS.md#effective-context-budgeting).
     Within-turn reclamation remains item 34.
-34. Compaction inside a running turn. Cuts land only at submitted-turn
-    starts and the window must hold the whole current turn, so one long
-    autonomous task with many tool rounds in a single turn still reaches
-    `context_limit`. First, deterministic tool-result elision: in the
-    request view replace older bulk tool outputs with a short stub naming
-    the call, the size, and how to read it back, never touching the store
-    and never splitting a call from its result; the observation-masking
-    result in the survey makes this the baseline to beat. Then a cut at any
-    completed tool exchange within the turn, the turn's prompt kept
-    verbatim, the turn still running for everyone outside. (From Astra
-    Pro's compaction review.)
+34. Compaction inside a running turn. Cuts landed only at submitted-turn
+    starts and the window had to hold the whole current turn, so one long
+    autonomous task with many tool rounds in a single turn reached
+    `context_limit`. Two slices done. [Deterministic tool-result
+    elision](RUST_PROTOTYPE.md#tool-result-elision) (schema 29): answered
+    results below a versioned floor go as stubs with their size, excerpts,
+    and a `result/NODE` read reference; the store keeps every result whole,
+    no call is split from its result, and forks bind the floor at their
+    checkpoint. It runs before compaction at the same thresholds, and when
+    the current turn alone overflows. Then [cuts inside a
+    turn](RUST_PROTOTYPE.md#cuts-inside-a-turn) (schema 30): the summary
+    cut may land at any model round after a completed tool exchange in the
+    newest turn, with that turn's prompt kept whole ahead of the tail and
+    the turn still running for its clients. Store costs of both are in
+    [the measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). A
+    round that overflows before compaction is due forces a summary after
+    the forced elision, and catch-up steps cut at rounds inside a turn too
+    large for one step. A steer the turn had no room for is tried again at
+    the boundary where elision or a summary makes some, rather than only
+    after the turn ends. Catch-up steps and forced moves at one head extend
+    the version made there until the view fits, unless a fork taken
+    between them already sees it. Still open: steers absorbed before an in-turn cut are
+    summarized, not kept verbatim like the prompt; and every window and
+    planning walk traverses the item
+    overflow pages because the metadata columns sit after `item`, where a
+    covering index cut a probe of the walk from 4.0 to 1.45 ms, to be
+    measured in the daemon before adopting. The evaluation of both slices
+    on one task is item 36, and its acceptance cases are in
+    [LONG_TASK_EVAL.md](LONG_TASK_EVAL.md). (From Astra Pro's compaction
+    review.)
 35. Thinking-prefix compatibility. Anthropic binds preserved thinking to
     the request prefix on newer accounts; a compaction rewrites that prefix
     and the summarizer replays native items under other instructions. Read
@@ -560,7 +579,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     prefix enforcement, and either drop invalidated thinking with the loss
     reported or use the documented handling, before Fable is offered
     compaction. Benchmark a provider-native compactor behind the versioned
-    view while there. (From Astra Pro's compaction review.)
+    view while there. An elision move now drops only thinking written after
+    its first newly stubbed result, so the prefix before that result stays
+    cached. (From Astra Pro's compaction review.)
 36. The evaluation that challenges the summary, and the soak's second
     half in one: a single substantial repository task on luna that crosses
     several compactions, with facts that live only in tool results (a
@@ -573,8 +594,25 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     after a compaction; record the context-view version with each model
     call; measure total input and output, cache reads and writes, and
     summarizer latency per correctly completed task. Compare a few
-    threshold policies on it before changing the 75/25 defaults. (From
-    Astra Pro's compaction review, and the remainder of item 16.)
+    threshold policies on it before changing the 75/25 defaults. First
+    slice built: [`bench/long_task_eval.py`](LONG_TASK_EVAL.md) runs one
+    synthetic repository task with those four facts and a steered
+    correction, in a small-budget and a full-context condition from fresh
+    starts, scored from the workspace and the events. In [live run
+    1](LONG_TASK_EVAL.md#live-run-1) every bot kept the four facts; the
+    one wrong answer came from a steer the runtime left queued, since
+    fixed; compacting served 28% of model input from cache against 75%,
+    and no summary request read any. Summary requests on the bot's own
+    model now copy its last call, as Claude Code and Codex send theirs,
+    and [run 2](LONG_TASK_EVAL.md#live-run-2) scored 3/3 in both
+    conditions with 34% of summary input read from cache; per correct task
+    compacting still sent twice the uncached input of full context on this
+    short task. Still open: stub passes and cuts that break the cache on
+    separate rounds; branching from identical checkpoints, the
+    omission-listing, elision-only, and prompt-excerpts conditions, a
+    realistic budget and preamble, threshold policies, and enough trials
+    to attribute differences in compactions and retrievals. (From Astra
+    Pro's compaction review, and the remainder of item 16.)
 37. Context construction cost, measured before built. Item 33 shares an
     encoded prefix across retries, combines window metadata, removes the
     separate `unsummarized_bytes` lookup, and avoids full-window construction

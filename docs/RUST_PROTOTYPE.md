@@ -322,8 +322,8 @@ bound; the operating system is then the only limit.
 | `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
 | `--context-items` | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
 | `--note-turns` | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
-| `--compact-at` | Percent of either context envelope that triggers compaction. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
-| `--compact-keep` | Target percent of either context envelope kept verbatim as newest whole turns, reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
+| `--compact-at` | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
+| `--compact-keep` | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
 | `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
@@ -468,7 +468,8 @@ header that the ChatGPT backend routes on: the store's identity plus the id
 of the bot whose cache the call shares. That is the bot's own id, except that
 a fork shares its source's key, because a fork copies its source's
 instructions and tools and so its first call repeats the source's prefix.
-Summaries add `-summary`, since their prefix differs.
+A summary sent as a copy of the bot's call uses the bot's key; one sent as a
+request of its own adds `-summary`, since its prefix differs.
 
 Within a turn, Responses calls over HTTP also return the ChatGPT backend's
 sticky-routing token. The backend sends `x-codex-turn-state` on a turn's
@@ -476,7 +477,9 @@ first response, and each later call of that turn sends the first token back,
 so the backend can route it to the server holding the turn's cache. Codex
 does the same and never carries a token into another turn (openai/codex
 aa38089, `core/src/client.rs`, read 2026-09-25). A new turn and a summary
-start without one. A turn that parks on a wait or a rate limit keeps its token
+request of its own start without one; a summary sent as a copy of the call
+sends the turn's token, so it reaches the server that holds the call's
+cache. A turn that parks on a wait or a rate limit keeps its token
 in the park record, so its calls after resuming send it too. The socket path
 does not carry the token. On short Terminal-Bench tasks over HTTP on
 2026-09-25, 1 to 4 calls per task read nothing from the cache, while the calls
@@ -494,8 +497,9 @@ item); when the fingerprint differs from the bot's last, the window slid or a
 compaction or note landed, and
 every node written before that request is sent without its thinking from
 then on. Removing a leading run of blocks is allowed; later blocks keep
-theirs. Summarizer requests carry no thinking, since their instructions
-differ. Each node records at write time how many bytes its thinking takes,
+theirs. A summary sent as a copy of the bot's call replays what that call
+would, bound the same way; a summary request of its own carries no
+thinking, since its instructions differ. Each node records at write time how many bytes its thinking takes,
 so a request still knows its length before it reads the items it streams;
 the bot records the fingerprint and the first node still bound to it. This
 costs the reasoning in the stripped blocks once per change, which already
@@ -1063,12 +1067,23 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   batch's commit, event publication, and waiter notifications before stopping;
   it does not drain further batches. Unabsorbed work stays durable.
   Absorption is budgeted against the context: a boundary takes steers,
-  oldest first, only while the running turn's own items plus each encoded
-  steer stay within three quarters of `--context-bytes` and
+  oldest first, only while what the view must send ahead of the running
+  turn (its summary, pinned context, notes, and the context note without
+  the previews of omitted turns, which yield to the turn), the turn's own
+  items, and each
+  encoded steer stay within three quarters of `--context-bytes` and
   `--context-items`, the target the window itself keeps, so a burst of
   large steers cannot make the running turn exceed its context and fail
-  with `context_limit`. Steers that do not fit stay queued and start as
-  their own turns when the line moves; later steers do not overtake them.
+  with `context_limit`. A boundary builds the view first, so a note a tool
+  wrote during the round counts, and a steer that goes in sends the view
+  back through the same overflow, elision, and compaction steps before the
+  model call. A steer that does not fit stays queued, and later steers do
+  not overtake it. Once elision or a summary makes room in the running
+  turn, the same boundary tries it again, and so does a later boundary
+  whose view sends less ahead of the turn, a note cleared or shrunk, so a
+  correction reaches a long task that compacts; one still queued when the turn ends starts as its
+  own turn when the line moves (a strict steer, which names that turn,
+  fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
   of the turn's first node, found through a partial `nodes(turn)` index. This
   takes a fixed number of indexed lookups regardless of current-turn length;
@@ -1143,6 +1158,13 @@ to avoid reference/index overhead. Idempotency and turn listings resolve the
 same original text. Absorbed steers share their own user node. Migration shares
 exact indexed matches; older steers without that mapping keep their inline
 text. The prompt-node foreign key has a partial index for deletion checks.
+Schema 29 adds [tool-result elision](#tool-result-elision) without reading
+stored items: results recorded before it have no stub and are always sent
+whole. A backfilled saving would change the cumulative savings of every
+later node on its lineage, rewriting most of the store at open. Every bot
+starts with no elision floor. Schema 30 adds the prompt a [cut inside a
+turn](#cuts-inside-a-turn) keeps; earlier cuts are all at a turn's prompt,
+so none needs one.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1383,14 +1405,14 @@ character returns `invalid_history_page`. No summaries are made and nothing is
 deleted; compaction with summaries remains future work in [LONG_HISTORY.md](LONG_HISTORY.md).
 
 The window always contains the whole current turn. If that turn alone exceeds
-a budget, the turn fails with `context_limit` rather than sending a truncated
-request. Both limits are daemon flags forwarded by the client, reported in
+a budget even with its answered tool results [elided](#tool-result-elision),
+the turn fails with `context_limit` rather than sending a truncated request. Both limits are daemon flags forwarded by the client, reported in
 `ready` as `limits.context_bytes` and `limits.context_items`, and advertised as
 the `context_window` capability. Version 20 repairs previously blocked
 `uncertain` bots once, appending missing tool results without rewriting original
 history. If operational tool records were pruned, repair reconstructs unanswered
 calls from the interrupted turn's durable transcript. Stores are schema version
-20; supported migrations run at open. Store initialization and migration run in one
+30; supported migrations run at open. Store initialization and migration run in one
 transaction. [Project policy](../AGENTS.md#no-compatibility-branches) allows
 one-way migrations but no legacy runtime behavior for earlier Agent versions.
 
@@ -1594,27 +1616,136 @@ cancelled turn. Without a committed result the tool outcome is unknown, not a
 claim that all work stopped. The turn ends `interrupted` and the bot stays
 usable; history tells the model to inspect current state before retrying.
 
+### Tool-result elision
+
+Most of a long tool-using turn is tool output the model has already read.
+At a round boundary, after steers are absorbed and before compaction, once
+the window and its pinned context hold `--compact-at` percent of the byte
+envelope, or the current turn cannot fit at all, alone or beside the
+summary, pinned context, and notes sent ahead of it, the daemon moves the
+bot's elision floor. Every tool result at or below the floor goes to the model as
+a stub instead of its output: a result for the same call id that states the
+output's size, the `read` reference that returns it whole
+(`artifact: "result/NODE"`), and its first and last 256 bytes. Everything
+else, the model's own messages and calls, user prompts and steers, and
+small results, stays verbatim, and no call is ever separated from its
+result. There is no model call. The floor goes through the newest item the
+verbatim tail of `--compact-keep` percent cannot take, and never past the
+model's newest output, so the model reads every result whole in the request
+that answers it. A move must save a sixteenth of the byte envelope, so a
+context of mostly other text does not rewrite its cached prefix each round
+for a little room. When the current turn cannot fit otherwise, the floor
+goes to the model's newest output, whatever the keep target, and any saving
+counts. Only a bot that has the `read` tool elides, since a stub names a
+`read` call; any other bot's results get no stub and stay whole, and a
+turn that outgrows the window ends with `context_limit`, as before. Elision works with or without compaction instructions: it is how a
+single long turn outgrows the window, and it comes first because it costs
+no call and keeps the model's own reasoning in view. Compaction then runs as
+before if the view is still over its threshold.
+
+A result is elidable when its stub saves at least 1 KiB. For a bot with
+`read`, the stub is made when the result is recorded, with the node id its insert takes, and stored
+beside it. Each node records what its stub saves and, like its byte total,
+the cumulative savings along its lineage; each floor version records the
+cumulative savings through its floor. A node's bytes as sent are then its
+byte total less the smaller of the two, so the window, turn admission, and
+compaction accounting stay constant-time lookups and read no item. A
+request reads the stub in place of the result's row. The stored transcript
+is never rewritten: `item`, `history`, and forks see every result whole,
+and `read` with `result/NODE` returns one on the bot's own lineage. A
+shell result is one JSON line, often longer than a `read` page, so that
+read splits lines longer than 4 KiB into numbered pieces and pages them.
+A page stays beside its call until the model answers it, where neither
+elision nor a cut can take it, so it takes at most the room the running
+turn and what goes ahead of it leave; with no room for one piece, the read
+fails with `read_context_exhausted`.
+The lineage check walks from the head counting steps down to the result's
+depth, reading only each node's parent, since `depth` follows the item in
+a row; a turn checks each result once, and its later pages skip the walk,
+since a running turn only appends to its lineage. Compaction sizes and plans its span as sent, and the summarizer reads it
+as the model last saw it, stubs included, so a long turn whose results
+are several budgets as stored can still be summarized in one request.
+
+The floor is versioned like notes and compactions: `elided` events record
+each move (version node, previous version, `through`, and what the move
+takes off the view: the results it newly stubs there and the bytes that
+saves). A floor covers everything below it, so a move also stubs results
+the view left behind before the floor reached them, summarized or outside
+the budget; the view's start only moves forward, so the bot sends none of
+them again, and the event does not count them. A bot's `elision`
+names its current version, and a historical fork binds to the newest version at or before its
+checkpoint, so it sees what its source saw there. When the boundary's move
+leaves the view unable to fit and the forced move goes further before the
+model answers, that move extends the version made at the same head in
+place, and its event repeats the version and its previous. A version
+another bot sees, bound by a fork taken between the moves or through a
+version made on it, is never changed under it: that move fails with
+`elision_version_shared`, and a further summary step at such a head with
+`compaction_version_shared`, so the round ends with `context_limit`. Moving the floor rewrites
+items the provider has cached from the first newly stubbed result on, so it
+is a prompt-cache break there: the Responses WebSocket chain key includes the
+floor. On Anthropic, only thinking written after that result and before the
+move is sent without it afterwards. The bot records the floor its last
+request was read under and, beside the floor below which the context
+changed, one range of nodes whose thinking goes: from the first newly
+stubbed node to the move's request. A later move extends the range; one
+apart from it takes in the nodes between, which costs only some valid
+thinking. Thinking before the first new stub, and after the move, keeps its
+own, so the cached prefix up to that stub stays as it was sent. Between
+moves the prefix is stable and the cache extends as usual. Anthropic documents
+server-side tool-result clearing (context editing) as not counting as an edit
+for its binding check, which would keep that thinking; it is family-specific
+and has not been compared with elision (item 35). Admission for
+`history` results and notes counts the current turn's stubs rather than
+its raw results.
+
 ### Compaction
 
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
 model call, when the effective view since the last summary reaches
-`--compact-at` percent of either envelope, the daemon summarizes everything older than the newest whole turns
-that hold `--compact-keep` percent verbatim, limited by the room left after
-pinned context. The item dimension can choose the cut even when small messages
-have barely consumed the byte budget. The summary is one model call
-under the bot's compaction instructions, with tool calls disabled, to the bot's own
-model or the `compaction_model` the client named at creation (same family;
-another family's items cannot be replayed to it). Its request carries the
-previous summary first, if any, so the summarizer merges rather than
-restarts, then the span's items as stored, then a request to write. The
-call is paced, retried, billed against the bot's budget, and counted as a
-model round like any other; if it parks on a closed pool, the turn parks.
-Anthropic summaries retain the bot's tool definitions because the span may
-contain native tool-use/result blocks, and set `tool_choice: {"type":"none"}`.
-The runtime borrows the already encoded tool selection. Responses summaries
-continue to send an empty tool list, which that family permits with historical
-calls. Stored history is not rewritten for summarization.
+`--compact-at` percent of either envelope, the daemon summarizes everything
+older than the newest boundary whose tail holds `--compact-keep` percent
+verbatim, limited by the room left after pinned context. A boundary is a
+turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), a round
+start: the first item after a tool result that is not one, a model output or
+an absorbed steer. The item dimension can choose the cut even when small messages
+have barely consumed the byte budget. The summary is one model call, to the
+bot's own model or the `compaction_model` the client named at creation (same
+family; another family's items cannot be replayed to it).
+
+When the summarizer is the model the bot's last call ran on (the bot's, or
+the turn's override), and the view as that call sent it holds the whole
+span, the request is a copy of that call, as Claude Code and Codex
+send theirs: the bot's instructions, tools, tool choice, reasoning, cache
+key, and routing token, the prefix and window that call sent, read under
+its elision floor and thinking strip, and the items since, then one user
+item, the compaction request, carrying the client's compaction
+instructions and the maximum summary size. All but the newest items read
+from the provider cache. The copy takes what the last call sent ahead of
+its window, so a note written since does not show, and the window from
+before any stubs this boundary made. A summary that parks on a rate limit
+keeps in its park record the floor that window was read under, where it
+starts, and that prefix when the view no longer sends it, so its retry,
+after a restart too, copies the same call. It does not set `tool_choice`, which on
+Anthropic would invalidate the message cache, so the request asks for text
+and a reply that calls a tool is billed and not installed
+(`compaction_tool_call`). The summary covers everything the copy shows,
+the verbatim tail included. Otherwise (a step through a backlog larger than
+the budget, below; a copy that would exceed the input limit; or another
+summarizer, which cannot read that call's cache, as when a turn
+overrides the bot's model and the bot's summarizer summarizes it) the
+request is one of its own: the compaction instructions as its instructions, the previous summary
+first, if any, so the summarizer merges rather than restarts, then the
+span's items as stored, then a request to write. Anthropic requests of this
+form retain the bot's tool definitions because the span may contain native
+tool-use/result blocks, and set `tool_choice: {"type":"none"}`; the runtime
+borrows the already encoded tool selection. Responses requests of this form
+send an empty tool list, which that family permits with historical calls.
+
+Either way the call is paced, retried, billed against the bot's budget, and
+counted as a model round like any other; if it parks on a closed pool, the
+turn parks. Stored history is not rewritten for summarization.
 The park record identifies the unfinished call as summary or ordinary model
 work. Resumption, including after restart, continues that call. Once a summary
 exhausts its retries, parking the following ordinary call does not restart the
@@ -1664,16 +1795,18 @@ running turn moves its bot's head, so the reader's snapshot plans what the
 worker would. Indexed byte/item accounting sizes the unsummarized span first,
 without walking the transcript. A span larger than the context budget, left
 by failed summaries or a round that outgrew the budget, is caught up oldest
-first. Each round boundary summarizes the longest run of whole turns from
-the previous cut whose summarizer request fits the budget, including the
-previous summary and the request marker. The cut moves to the next prompt,
-and the window keeps omitting what is still behind it until the steps
-reach the tail. The `compacted` event says `catch_up`. Finding the oldest
+first. Each round boundary summarizes the longest run from the previous cut
+whose summarizer request fits the budget, including the previous summary
+and the request marker. The cut moves to the next prompt, or to a round
+inside a turn too large for one step (see [cuts inside a
+turn](#cuts-inside-a-turn)), and the window keeps omitting what is still
+behind it until the steps reach the tail. The `compacted` event says `catch_up`. Finding the oldest
 turns means walking the lineage back from the head, since nodes only point
 to their parents and forks give a node several children. That walk reads
 metadata in pieces of 1,024 nodes, so other bots' reads interleave with it,
-and only rows inside the budget leave SQLite. A turn larger than the whole
-budget cannot be summarized and answers `compaction_span_limit`. Catch-up
+and only rows inside the budget leave SQLite; the newest turn's prompt is
+the running turn's, or, with none running, the first the walk passes. A
+round larger than the whole budget cannot be summarized and answers `compaction_span_limit`. Catch-up
 converges while a step covers more than one round adds. The complete
 summarizer input is byte-bounded including its previous summary and request
 marker and the item count, and the final marker gives the summarizer its
@@ -1761,6 +1894,66 @@ summaries compact that window as described above.
 
 CLI syntax, option scope, output, and exit conventions: [CLI.md](CLI.md).
 
+### Cuts inside a turn
+
+One long task can outgrow the budget inside a single submitted turn, even
+with its results [elided](#tool-result-elision): its own calls, messages,
+and stubs keep growing. So the newest turn offers more boundaries than its
+prompt: every model round after a completed tool exchange. The newest
+boundary whose tail reaches the keep target wins, whether a prompt or a
+round, so compaction leaves about `--compact-keep` percent verbatim however
+the view is split into turns; a turn smaller than that is never cut. The
+summarizer reads the span up to the cut, which ends with a whole exchange:
+every call in it has its result, and the tail begins with the model's
+next output, or with a steer absorbed after that exchange, so no call is
+separated from its result on either side and a steer at the boundary goes
+verbatim.
+
+The turn's prompt stays in view whole. The compaction records it as the
+version's `pinned` node, and while the window starts at that cut, the
+request carries the prompt as its first item after the pinned context,
+then the items from the cut. The summary header says `covering turns A to
+B and the start of turn C`, or `covering the start of turn C`, and its
+list of verbatim user messages leaves out turn C's prompt, which follows
+in full; the list keeps it for when a later compaction covers the whole
+turn. The context note counts the messages it leaves out of turn C
+separately from earlier turns. A second cut in the same turn summarizes
+from the first, merging the previous summary, and keeps the same prompt.
+Once the turn has ended, a later cut at a turn's prompt covers it whole.
+The turn keeps running for its clients throughout: events, steers,
+approvals, and its checkpoint are unchanged; only what the next request
+carries differs. Admission for steers, notes, and `history` results counts
+the turn from its prompt and cut, as the window does. A historical fork
+binds the version at or before its checkpoint and restores its cut, so a
+fork from inside a split turn sees that prompt and the tail from the cut.
+Steers absorbed before the cut are summarized with the rounds around them,
+as a covered turn's steers are. Schema 30 adds the `pinned` column; every
+earlier cut is a turn's prompt, so none has one.
+
+A round can take the turn past its budget before compaction is due, for
+example one large result after several small ones, or a turn that fits
+alone but not beside its summary, pinned context, and notes. The runtime
+then elides what the model has answered, as above, and if the view still
+cannot fit, it
+summarizes at once with a keep target of one byte, so the cut lands at the
+newest round that follows a result, and the round goes on. When elision
+cannot make room and the bot has no summarizer instructions, or when even
+the newest round cannot fit, the turn ends with `context_limit`. A span that big usually outgrows
+the summarizer's own budget, so the summary is a [catch-up](#compaction)
+step. Catch-up steps end at a prompt, or at a round start inside the newest
+turn, whichever leaves the longer step; a turn older than the newest that
+alone exceeds the budget, for example after the budget was lowered, is cut
+at its rounds too, keeping its prompt, rather than failing with
+`compaction_span_limit`. A step
+may leave the view over budget as long as the running turn's prompt and
+newest round still fit beside the new summary; the round then takes
+further steps at the same head until the view fits, a step is skipped, or
+the turn reaches its round limit. Each extends the version made at that
+head in place, and its `compacted` event repeats the version and its
+previous. A resumed call that fits does not summarize again at a head that
+has a version, and a version another bot sees is not extended, as with
+the [elision floor](#tool-result-elision).
+
 ### Compaction and prompt-cache reuse
 
 Compaction replaces part of the request, so it cannot preserve cache hits for
@@ -1787,12 +1980,14 @@ and [Anthropic caching guide](https://platform.claude.com/docs/en/build-with-cla
 provider hits: minimum sizes, expiration, routing, and model capabilities still
 matter.
 
-The summarizer currently has different instructions and disables tool calls,
-so its request must not be assumed to reuse the agent's cache. Anthropic retains
-tool definitions but changes tool choice; Responses omits tool definitions.
-A future comparison could keep
-that prefix identical and append the summarization instruction, but must prevent
-tool execution and verify model compliance and provider cache invalidation rules.
+A summary on the model that made the last call keeps that prefix
+identical and appends the compaction request (see [compaction](#compaction)). It keeps the tool
+choice, since changing it invalidates Anthropic's message cache, so a reply
+that calls a tool is rejected and billed rather than prevented; how often
+models comply, and the hit rates providers give it, are for the
+[evaluation](LONG_TASK_EVAL.md) to measure. A summary request of its own,
+on another model or for a catch-up step, has different instructions and
+must not be assumed to reuse the agent's cache.
 Measure agent calls and summarizer calls separately, then total input/output,
 cache reads/writes, latency, and objective task quality. The old evaluation lacks
 successful summarizer usage and cannot establish total compaction cost.

@@ -90,7 +90,11 @@ task-quality evaluation decide how far down the list to go.
    deterministic, cache-friendly, and lossless because the original is one
    tool call away. This should let the window hold several times as many
    turns and composes with the window's hysteresis, artifacts, and the
-   history tool as they are.
+   history tool as they are. Built 2026-09-26 as [tool-result
+   elision](RUST_PROTOTYPE.md#tool-result-elision), triggered by size
+   rather than age, and within the running turn too: a versioned floor
+   below the model's newest output, a stub with the size, head and tail
+   excerpts, and a `result/NODE` read reference.
 2. **A pinned, agent-owned note.** One durable item per bot, always first in
    context, and a tool that rewrites it. The agent records what it knows it
    will need: constraints, decisions, paths, what is left. The harness
@@ -107,6 +111,10 @@ task-quality evaluation decide how far down the list to go.
    decisions, open items, facts with their turn numbers) preserves more than
    prose and lets the model fetch a source turn by ordinal. Concurrent forks
    share completed summaries rather than each paying for the same prefix.
+   Since 2026-09-26 a summary can also [cut inside the running
+   turn](RUST_PROTOTYPE.md#cuts-inside-a-turn), at a round after a
+   completed tool exchange, keeping that turn's prompt whole ahead of the
+   tail, so one long task can compact several times before it ends.
 
 Prior art to read before building, with what to take from each: Prime
 Agent's compaction (summary plus retained originals, rebuilding context from
