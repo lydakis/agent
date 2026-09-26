@@ -201,39 +201,60 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   stores, reports in `resume`, `bots`, and `approval_requested`, and copies
   with the list, but never interprets. Clients use it to decide who answers
   (see the modes above).
-- **A fork copies it and can only add to it,** the mirror of the allowed
-  list, which a fork can only narrow. Tool definitions never change, so the
-  prompt cache is untouched.
-- **Bots created from inside a gated bot inherit its list.** When `create`
-  names a creator that has an `approve` list, the new bot's list is the
-  union of both, intersected with the new bot's own tools, so it stays a
-  subset of them. A read-only child of a bot gated on `shell,write,edit`
-  gets nothing to approve, because it has none of those tools. A fork keeps
-  its source's tools, so its list stays a subset even when the fork's
-  allowed list is narrower; an entry for a tool the fork may not call never
-  comes up. This is a guard against accidents, not a boundary: the
+- **Gates only accumulate.** A new bot's list is the union of every list
+  it descends from, intersected with its own tools so it stays a subset of
+  them:
+  - `create`: the list it asks for, plus its creator's when it names one.
+  - `fork`: the source's list, plus the list it asks for, plus its
+    creator's when a bot forks from its shell. A gated bot that forks an
+    ungated one gets a gated fork, and a fork never drops its source's gate.
+
+  A read-only child of a bot gated on `shell,write,edit` gets nothing to
+  approve, because it has none of those tools. A fork keeps its source's
+  tools, so its list stays a subset even when its allowed list is
+  narrower; an entry for a tool the fork may not call never comes up. The
+  tag goes with the list: the bot's own requested tag if it asked for a
+  list, else the source's if the source had one, else the creator's. Tool
+  definitions never change, so the prompt cache is untouched. This is a guard against accidents, not a boundary: the
   creator is declared by the shell's environment, and a command that clears
   it creates an ungated bot. The approver sees that command first.
 - **The request rides the plan commit.** When `append` records a model
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
-  `{"calls":[{"call_id","name","node","arguments","arguments_truncated"}]}`.
+  `{"calls":[{"call_id","request","name","node","arguments","arguments_truncated"}]}`.
   Each call names its own node: an Anthropic round keeps all its calls in
   one assistant item, but a Responses round stores each `function_call` as
   an item of its own. Arguments are previewed to 2,048 characters, as
   `tool_started` already does; an approver reads a longer one (a large
   `write`) with `item` on that call's node.
   One event per round, not per call, and no extra commit.
-- **`answer` decides one call.**
-  `{"op":"answer","bot","turn","call_id","decision":"allow"|"deny","reason"?,"by"?}`.
-  The first answer wins. A second gets `approval_already_answered`, an
-  unknown call `no_pending_approval`, a finished turn `stale_turn`. `by` is
+- **`answer` decides one request.**
+  `{"op":"answer","bot","turn","call_id","request","decision":"allow"|"deny","reason"?,"by"?}`.
+  `request` is the number the call was announced with, and it changes each
+  time the call is announced again. The first answer to the current request
+  wins. A second gets `approval_already_answered`; an answer to an earlier
+  request of the same call, computed before an earlier call failed, gets
+  `approval_superseded` and changes nothing; an unknown call gets
+  `no_pending_approval`, a finished turn `stale_turn`. `by` is
   a label the client chooses, recorded for audit and not verified. Any
   client can answer, including a bot's shell; see the security section.
-- **`approvals` lists what is pending,** optionally for one bot, from the
-  store, so an approver that connects late or restarts can catch up. `stats`
-  counts pending verdicts.
+- **`approvals` lists what is pending,** optionally for one bot or one tag,
+  so an approver that connects late or restarts can catch up. It runs on
+  the storage worker, like `answer`, and leaves out calls whose verdict is
+  in the worker's map but not yet written, so it never offers a call that
+  would only fail with `approval_already_answered`. `stats` counts pending
+  verdicts the same way.
+- **One session serves a tag's approvals.** `serve_approvals {"tag"}` hands
+  a session the pending requests for bots with that tag and then streams
+  only new `approval_requested` events for them, from the same worker job,
+  so nothing falls between the list and the stream. At most one session
+  holds a tag; a second is refused with `approvals_served` and may retry
+  when the holder disconnects. The approver never reads the fleet's other
+  events, so its cost grows with gated calls, not with everything the
+  bots stream, and two automatic approvers (the app and `agent approver`)
+  never both pay Jev for the same call. Any session can still `answer`,
+  which is how a person overrides.
 - **Every planned call of a round is announced at once,** so an approver
   judges them in parallel and can judge each in light of the others (a
   `write` of `run.sh` followed by `sh run.sh`). Execution stays in order,
@@ -242,7 +263,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
 - **A verdict is for the round as planned.** When a call ends denied, with
   an error, or as a shell command that exits nonzero, every later gated
   call in the round whose verdict arrived before that happened loses it and
-  is announced again with the failed call named. The approver judged
+  is announced again, with a new `request` number and the failed call
+  named. The approver judged
   `sh run.sh` expecting the planned `write`; if the write was refused, the
   file it would run is not the one it saw. The new request rides the failed
   call's own finishing commit, and a rules-only approver answers it again
@@ -303,14 +325,14 @@ denies on its own clock.
 
 - **Chosen per bot at creation.** `agent run --new --approval auto`, or
   `AGENT_APPROVAL=auto` in the environment, as `AGENT_MODEL` sets a model.
-  `--approve LIST` changes which tools are gated. A child or fork gets its
-  creator's mode, as the daemon section says.
+  `--approve LIST` changes which tools are gated. A child or fork keeps
+  every gate it descends from, as the daemon section says.
 - **The daemon sees no modes.** The CLI turns a mode into two `create`
   fields: the `approve` list, and an `approver` tag the daemon stores and
   reports but never reads (`auto` or `manual`). The automatic approver
   answers only bots tagged `auto`; the app offers Allow and Deny only on
   bots tagged `manual`. So one daemon can run bots in all three modes at
-  once, and a program can invent its own tag and answer those bots itself.
+  once, and a program can invent its own tag and serve those bots itself.
 - **`auto` needs its approver running.** The CLI already starts the daemon
   when it is not running; with `auto` it starts `agent approver` the same
   way. A gated call with no approver waits, parked and visible in
@@ -336,8 +358,8 @@ denies on its own clock.
 
 The approver is a client program with its policy as data, like the CLI's
 default compaction text: `agent approver`, a long-running command, and the
-same module inside the app. It follows `approval_requested` on every bot
-(`follow --all`) and answers in layers:
+same module inside the app. It holds the `auto` tag with `serve_approvals`,
+so only one instance runs at a time, and answers in layers:
 
 1. **Daemon gate.** Only tools in a bot's `approve` list reach it. The
    suggested list is `shell,write,edit,read`. `read` is gated because a
@@ -357,9 +379,14 @@ same module inside the app. It follows `approval_requested` on every bot
      wrote this turn, so a command that runs one of those files is judged
      with the file's content in view.
    - `read` inside the workspace is allowed, except files that look like
-     secrets (`.env*`, `*.pem`, `*.key`, `id_*`, anything under `.ssh/`,
-     `.aws/`, `.gnupg/`, or named `credentials`). Those, and reads outside
-     the workspace, go to the model.
+     secrets or commonly hold them: `.env*`, `*.pem`, `*.key`, `*.p12`,
+     `*.pfx`, `*.keystore`, `id_*`, `.npmrc`, `.pypirc`, `.netrc`,
+     `.git-credentials`, `.git/config` (remote URLs can carry tokens),
+     `*.tfvars`, `.terraformrc`, anything under `.ssh/`, `.aws/`, `.gnupg/`,
+     `.docker/`, or `.kube/`, and any file named `credentials` or
+     `secrets.*`. Those, and reads outside the workspace, go to the model.
+     This is a list, and a secret in a file it does not name reaches the
+     provider. The daemon's redaction only catches its own provider keys.
    - A shell command is split the way Codex splits it: only plain words
      joined by `&&`, `||`, `;`, or `|`. It is allowed only if every part is
      a command on the read-only list, every flag it uses is on that
@@ -438,10 +465,25 @@ content written to steer it "can move the answer", and a planned call is
 model-written text too: a command can carry a comment claiming the user
 approved it. So the intent question is asked of the human prompts, and a
 high risk that the prompts do not name is denied whatever the command
-says about itself. For a bot created by another bot, the prompt was
-written by a model; the approver follows `created_by` to the first bot a
-person prompted and shows that prompt as the user's intent, the child's
-prompt as a model-written task.
+says about itself.
+
+**Whose words a prompt is.** A turn a bot submits to another bot carries a
+prompt a model wrote. `created_by` names only a bot, not which of its turns
+did the delegating, so the daemon records it per turn: a tool shell's
+environment gains `AGENT_TURN` next to `AGENT_BOT`, the CLI run from that
+shell sends `from: {bot, turn}` with `submit`, `create`, and `fork`, and
+the daemon stores it on the new turn and reports it in
+`approval_requested`. The approver follows `from` turn by turn until it
+reaches a turn submitted without one, and only that turn's prompt counts
+as the caller's words; every prompt below it is a model-written task.
+Like the creator, `from` is declared, not verified: a command that clears
+the environment submits a turn that looks like the caller's. The rules
+deny `agent` commands that clear or override these variables (`env -i`,
+`env -u AGENT_…`, `AGENT_BOT=…`), which stops the obvious form. On Linux
+the daemon could also refuse a submission without `from` from a process
+descended from its own tools, but a process that double-forks escapes that,
+and macOS has no equivalent. Consent, like the gate, is advisory without
+isolation.
 
 **The intent view is bounded.** Jev takes at most 32k tokens of state, and
 a long-lived bot's prompts outgrow that. The approver sends, in this
@@ -471,9 +513,13 @@ with 64k tokens per request of which 32k can be state. The sustained live
 fleet ran 60 model calls a second through one daemon; if every round there
 needed Jev, that is three times the request limit. Hence one request per
 round rather than per call, the rules layer in front, and a pace in the
-approver that backs off on 429 and 529 as TypeSafe's docs ask. A call
-waiting on a paced Jev request stays pending and, past the hold, parks
-like any other.
+approver that backs off on 429 and 529 as TypeSafe's docs ask. The pace
+has a bound: each round gets 10 s from announcement to verdict, queue time
+included, and the queue holds at most as many rounds as Jev's current
+limit admits in that time. A round that would wait longer, or runs out of
+time, is denied at once with "not reviewed: the approver is overloaded".
+Under sustained overload `auto` then fails closed and visibly, instead of
+growing a queue of parked turns.
 
 ## Performance
 
@@ -548,7 +594,8 @@ as one.
   that cannot see results; that is Rehberger's attack on Claude Code.
 - **A bot can reach the approval channel.** Its shell can call `answer` on
   its own pending calls, create a bot without the gate, hand its task to
-  an existing bot that has none, or edit the store.
+  an existing bot that has none, submit a message that looks like its
+  caller's consent, or edit the store.
   The rules layer denies the obvious forms; a determined command can hide
   them from any text-based judge. Making this a boundary means running the
   tools where the socket and the store are out of reach, in a container or
