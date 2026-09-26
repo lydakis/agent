@@ -2,8 +2,8 @@
 //! content-block events and stored as one native item, including thinking
 //! signatures so tool-using turns can continue.
 use super::{
-    Completion, Delta, Frame, MAX_CALL_ID, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of,
-    encoded_len,
+    Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
+    valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -373,10 +373,7 @@ impl State {
                     };
                     let parsed: Value = serde_json::from_str(&arguments)
                         .map_err(|_| Error::new("invalid_tool_arguments"))?;
-                    if id.is_empty()
-                        || encoded_len(&id) > MAX_CALL_ID
-                        || calls.iter().any(|c| c.call_id == id)
-                    {
+                    if !valid_call_id(&id) || calls.iter().any(|c| c.call_id == id) {
                         return fail("invalid_tool_call_id");
                     }
                     calls.push(ToolCall {
@@ -405,6 +402,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::MAX_CALL_ID;
     fn feed(state: &mut State, frames: &[&str]) -> Vec<String> {
         let mut deltas = Vec::new();
         for frame in frames {
@@ -445,6 +443,7 @@ mod tests {
         for (id, code) in [
             ("c".repeat(MAX_CALL_ID), None),
             ("c".repeat(MAX_CALL_ID + 1), Some("invalid_tool_call_id")),
+            ("x\0y".into(), Some("invalid_tool_call_id")),
         ] {
             let mut state = State::default();
             let start = json!({"type":"content_block_start","index":0,

@@ -719,8 +719,9 @@ Current limits: 8 MiB / 4,096 items of model context per request (stored
 history is unbounded), 256 KiB input prompt, 64 KiB instructions, 768 KiB JSON-encoded terminal provider output
 (a full 128,000-token answer, under the 1 MiB event cap; tool call ids and
 names count toward it), 64 KiB JSON-encoded
-tool call id (a longer one fails the response with `invalid_tool_call_id`, so
-every gated call can be listed and answered), 2 MiB SSE frame,
+tool call id without NUL (a longer one, or one with a NUL, fails the response
+with `invalid_tool_call_id`, so every gated call can be listed and answered
+by a command naming it alone), 2 MiB SSE frame,
 16 MiB response stream, 200 provider rounds per turn, and the configurable
 active-turn, process, and connection-startup bounds below. Provider startup
 admission, when bounded, has a 60-second timeout and releases its permit when
