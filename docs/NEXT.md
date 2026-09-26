@@ -608,12 +608,25 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     conditions with 34% of summary input read from cache; per correct task
     compacting still sent twice the uncached input of full context on this
     short task, and the copies sent more uncached summary input than fresh
-    requests. Still open: whether the copy saves anything at a realistic
-    budget, the next evaluation once item 34 lands (Astra's order); stub
-    passes and cuts that break the cache on separate rounds; branching from identical checkpoints, the
-    omission-listing, elision-only, and prompt-excerpts conditions, a
-    realistic budget and preamble, threshold policies, and enough trials
-    to attribute differences in compactions and retrievals. (From Astra
+    requests. Built after item 34 landed (Astra's order): a large version
+    of the task whose required steps print about 357 KB, run at a 256 KiB
+    budget with the default tools (stubs alone make room), without `read`
+    (summaries alone make room, with the copy and with a fresh-request
+    measurement build), and at 4 MiB. Live runs 3 and 4
+    ([record](LONG_TASK_EVAL.md#live-run-3)): 60 of 60 correct; the model
+    kept its context under 83k tokens, so at 256 KiB 2 of 15 bots
+    compacted, and at 128 KiB compacting cost more than full context; the
+    copy cost the same per byte summarized as a fresh request at 128 KiB
+    and less at 256 KiB (one summary), and half the copy arm's summaries
+    at 128 KiB fell back to requests of their own after an oversized
+    result. Still open: choosing per summary between the copy and a
+    request of its own by estimated cost, and trimming the copy on
+    overflow as Claude Code and Codex do; stub
+    passes and cuts that break the cache on separate rounds; branching
+    from identical checkpoints, the omission-listing and prompt-excerpts
+    conditions, a realistic preamble, a task long enough that summaries
+    run beside stubs, threshold policies, and enough trials to attribute
+    differences in compactions and retrievals. (From Astra
     Pro's compaction review, and the remainder of item 16.)
 37. Context construction cost, measured before built. Item 33 shares an
     encoded prefix across retries, combines window metadata, removes the
