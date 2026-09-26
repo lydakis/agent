@@ -686,11 +686,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     their claim, not ours. The prototype is built: family `responses-ws`,
     one connection per bot, delta input only when the request extends the
     previous one exactly, the full input on every other case including
-    `previous_response_not_found`; the store stays the only history. Next,
-    the matched HTTP versus WebSocket screen in
-    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap, with a
-    prompt cache key in both arms. Open: lanes to share a connection among
-    bots, pacing without per-call headers, and HTTP after a failed upgrade.
+    `previous_response_not_found`; the store stays the only history. HTTP
+    stays the default. Next, the matched experiment in
+    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan): per-call bytes and time to
+    first token, the turn-state token on the socket, then a synthetic
+    resource screen with a synchronized loss of continuation state and a live
+    screen on the ChatGPT plan. Before any default change, an
+    [aggregate bound on full-send bytes](WEBSOCKET.md#a-bound-on-concurrent-full-send-bytes).
+    Open: lanes to share a connection among bots, pacing without per-call
+    headers, and HTTP after a failed upgrade.
 41. Several daemons, moving bots, and watching them: the
     [provisional roadmap](MULTI_DAEMON.md) separates shared durability,
     identity, admission, and execution-ownership contracts from later
@@ -804,6 +808,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Next: a labeled dangerous set to
     measure false allows before thresholds are fixed.
+46. The model that answered. A usage event names a model other than the
+    requested one only when Anthropic's fallback splits a call or a
+    summarizer runs elsewhere. Keep the model each provider names in its
+    response, stored only when it differs from the requested name, so a task
+    comparison can show what served every call, as Claude Code's records
+    already do ([the gap](COMPARISON_CONTRACT.md#task-comparisons)).
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
