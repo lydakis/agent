@@ -184,10 +184,17 @@ Reconnects, retention, overload, compaction and recovery.
 - **Compaction.** Long conversations of many turns are compacted with the
   original history kept. On luna, the evaluation's final file and every
   filler survived, and summaries restated the rule, with summarizer cost
-  excluded (2026-09-19). Not built: compaction inside one long turn, which is
-  what a long autonomous coding task needs. Not measured: whether summaries
-  keep discoveries from tool results, failed approaches and later
-  corrections. [Record](LONG_HISTORY.md).
+  excluded (2026-09-19). [Record](LONG_HISTORY.md).
+- **Within-turn compaction.** One synthetic repository task, three bots
+  per condition, on the ChatGPT plan's `gpt-6-sol`, macOS arm64,
+  2026-09-26. With a 20 KiB budget forcing two or three summaries and two stub
+  passes per bot, 3 of 3 finished correctly and kept every fact that lived
+  only in tool results and the steered correction, as did 3 of 3 with full
+  context. Summary requests, sent as copies of the bot's last call, served
+  34% of their input from cache (0% when built fresh). Counting the
+  summarizer, compacting sent twice the uncached input of full context per
+  correct task (25,637 against 12,669 tokens) on a task this short.
+  `51d8744`. [Record](LONG_TASK_EVAL.md#live-run-2).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -199,8 +206,8 @@ Reconnects, retention, overload, compaction and recovery.
 
 - Any Terminal-Bench score: five tasks are a screen.
 - The five-harness screen at the current build.
-- Within-turn compaction, and compaction quality on real coding tasks with
-  summarizer and retrieval costs included.
+- Compaction quality and cost on real coding tasks, beyond one synthetic
+  task with three bots per condition, and at a realistic budget.
 - Admission batching and whole group-commit latency (enqueue to
   acknowledgement) for small control operations.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on

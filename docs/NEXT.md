@@ -598,18 +598,21 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     slice built: [`bench/long_task_eval.py`](LONG_TASK_EVAL.md) runs one
     synthetic repository task with those four facts and a steered
     correction, in a small-budget and a full-context condition from fresh
-    starts, scored from the workspace and the events. [Run live
-    once](LONG_TASK_EVAL.md#live-run-1): every bot kept the four facts; the
+    starts, scored from the workspace and the events. In [live run
+    1](LONG_TASK_EVAL.md#live-run-1) every bot kept the four facts; the
     one wrong answer came from a steer the runtime left queued, since
     fixed; compacting served 28% of model input from cache against 75%,
     and no summary request read any. Summary requests on the bot's own
-    model now copy its last call, as Claude Code and Codex send theirs, so
-    they read the bot's cache. Still open: stub passes and cuts
-    that break the cache on separate rounds; branching from identical
-    checkpoints, the omission-listing, elision-only, and prompt-excerpts
-    conditions, a realistic budget and preamble, threshold policies, and a
-    rerun that measures the copies. (From Astra Pro's compaction review, and the remainder of item
-    16.)
+    model now copy its last call, as Claude Code and Codex send theirs,
+    and [run 2](LONG_TASK_EVAL.md#live-run-2) scored 3/3 in both
+    conditions with 34% of summary input read from cache; per correct task
+    compacting still sent twice the uncached input of full context on this
+    short task. Still open: stub passes and cuts that break the cache on
+    separate rounds; branching from identical checkpoints, the
+    omission-listing, elision-only, and prompt-excerpts conditions, a
+    realistic budget and preamble, threshold policies, and enough trials
+    to attribute differences in compactions and retrievals. (From Astra
+    Pro's compaction review, and the remainder of item 16.)
 37. Context construction cost, measured before built. Item 33 shares an
     encoded prefix across retries, combines window metadata, removes the
     separate `unsummarized_bytes` lookup, and avoids full-window construction

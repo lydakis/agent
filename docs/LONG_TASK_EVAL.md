@@ -219,13 +219,14 @@ read 2026-09-26:
   user context, system context, and tool definitions as the parent
   conversation", then the parent's messages, then the compaction prompt as
   a new user message.
-- Codex: the request shape (the turn's request with a `compaction_trigger`
-  item appended, answered by one encrypted compaction item) was read in
-  `core/src/compact_remote_v2_attempt.rs` on `openai/codex` main at a
-  revision that was not recorded, so it is an unpinned source observation.
-  The Codex CLI 0.157.1 release of the same day (npm `@openai/codex`,
-  linux-x64 binary) contains that source file and the `compaction_trigger`
-  item type; the binary does not show the request's shape.
+- Codex: `codex-rs/core/src/compact_remote_v2_attempt.rs` on `openai/codex`
+  main at `b334d5b` (2026-09-26T15:48:27Z); the newest commit touching the
+  file is `20f4d12` (2026-09-16). It builds the input from the turn's
+  history, appends a `CompactionTrigger` item, and sends it with the
+  turn's base instructions and model-visible tools through the turn's
+  client session; the reply is one encrypted compaction item, and the
+  trigger is popped afterwards. It sets a reasoning effort of its own for
+  compaction.
 - Pi: npm `@mariozechner/pi-coding-agent` 0.73.1, published 2026-05-07,
   the newest under that name. `generateSummary` in
   `dist/core/compaction/compaction.js` sends its own system prompt and one
@@ -236,8 +237,63 @@ model are now built that way: the bot's last call as it was sent, the
 items since, then the compaction request carrying the client's
 instructions ([details](RUST_PROTOTYPE.md#compaction)). A separate
 summarizer model, and a catch-up step over history larger than the budget,
-keep the request of their own. This run predates it; the rerun measures
-it.
+keep the request of their own. This run predates it;
+[live run 2](#live-run-2) measures it.
+
+## Live run 2
+
+2026-09-26, commit `51d8744`: summary requests on the bot's own model are
+copies of its last call, and the steer fix of acceptance case 6 is in.
+Same model, plan, seed and three bots per condition as run 1, with no API
+key. The JSON is kept in the same ignored directory.
+
+| | compact (20 KiB) | full (4 MiB) |
+| --- | --- | --- |
+| Completed / correct | 3/3 / 3/3 | 3/3 / 3/3 |
+| Steered, vendor intact, migrated once, number reported | 3/3 each | 3/3 each |
+| `make quick` runs | 0, 0, 0 | 0, 0, 0 |
+| Compactions / elisions per bot | 3/2, 3/2, 2/2 | none |
+| Retrieval calls per bot | 0, 0, 0 | 0, 0, 0 |
+| Model calls | 32 | 34 |
+| Model input / cached / output tokens | 83,831 / 28,032 / 3,008 | 160,247 / 122,240 / 3,360 |
+| Summarizer input / cached / output tokens | 32,119 / 11,008 / 5,444 | none |
+| Model input served from cache | 33% | 76% |
+| Summarizer input served from cache | 34% (5 of 8 summaries read any) | none |
+| Summary time holding the model back | 117.5 s over 8 summaries | none |
+| Condition wall time | 89.0 s | 52.2 s |
+
+Every bot passed the hidden tests (9/9), kept the four facts and the
+steered correction, and repeated no command after its first compaction.
+Against run 1's compact condition:
+
+- Summaries read the bot's cache: 11,008 of 32,119 input tokens, against
+  none. The five that read any reused 1,664 to 2,432 tokens each; one read
+  2,304 of the 2,412 tokens its preceding call sent. The calls just before
+  the eight summaries sent about 22,300 tokens between them, so summaries
+  read about half of what they could. Three read nothing, and ordinary
+  calls missed the same way: 4 of the 15 calls whose prefix had not
+  changed read nothing. That these misses are the provider's is inferred.
+- Each summary request is larger, since it carries the bot's instructions,
+  tools and every item since its last call: 4,015 input tokens on average
+  against 1,601. Uncached summarizer input rose from 17,606 to 21,111
+  tokens over three fewer summaries, and a summary took about 14.7 s
+  against 13.4 s. Summarizer output fell from 7,185 to 5,444 tokens.
+- Uncached input, model and summarizer together, fell from 92,043 to
+  76,910 tokens and summary time from 147.8 to 117.5 s, because there were
+  fewer compactions (8 against 11) and model calls (32 against 38). With
+  three bots per condition, that drop and the drop in retrievals cannot be
+  attributed to the copy.
+- The first call after every summary read no cache (8 of 8). Only the
+  instructions and tools stay ahead of the summary, about 1,023 tokens
+  here, one under OpenAI's minimum; a realistic preamble would cache that
+  part. Claude Code and Codex also replace the history with the summary,
+  so their next call can reuse no more than that either. Stub passes
+  still rewrite the view near its front on rounds of their own.
+
+Per correct task, compact sent 25,637 uncached input tokens (model and
+summarizer) against full's 12,669. The task is short enough that full
+context never grows large, so here compacting costs more than it saves;
+the 20 KiB budget exists to force boundaries, not to save tokens.
 
 ## Not covered yet
 
@@ -245,4 +301,4 @@ The rest of item 36: branching every condition from identical
 checkpoints rather than fresh starts, the omission-listing, elision-only,
 and prompt-excerpts conditions, a condition with a realistic budget and
 preamble, comparing threshold policies before changing the 75/25 defaults,
-and a rerun after the steer fix with summary requests sent as copies.
+and enough trials to attribute differences in compactions and retrievals.
