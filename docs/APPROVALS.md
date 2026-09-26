@@ -34,7 +34,7 @@ has to be counted per call.
    whose calls wait for a verdict. The daemon announces those calls when the
    model plans them, waits for an `answer` from any client, runs or refuses
    the call, and records who decided. It has no rules, no prompts, no model,
-   and no verdict timeout of its own.
+   and no verdict timeout beyond one the gate's creator sets.
 3. **Manual and automatic are clients.** The mode names live in the CLI and
    the app; the daemon sees gates, each a list of tools and an opaque tag
    naming which approver answers.
@@ -207,7 +207,13 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
 - **`create` also takes an `approver` tag,** an opaque string the daemon
   stores, reports in `resume`, `bots`, and `approval_requested`, but never
   interprets. Clients use it to decide who answers (see the modes above).
-  A list and its tag together make a **gate**.
+  A list and its tag together make a **gate**. A gate may also carry an
+  `expire_ms` its creator chooses: a call whose verdict for that gate has
+  not arrived that long after it was announced is denied by the daemon
+  with the reason "not reviewed: no verdict", so a crashed approver stops
+  its bots instead of stalling them. The CLI sets 15 s on `auto` gates
+  (the approver's own 10 s Jev deadline plus margin) and none on
+  `manual` ones, since a person may take hours.
 - **Gates only accumulate.** A new bot keeps every gate it descends from
   and adds the one it asks for:
   - `create`: its own gate, plus its creator's when it names one.
@@ -216,7 +222,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
     gated fork, and a fork never drops its source's gate.
 
   Each gate's list is intersected with the new bot's tools, and gates with
-  the same tag merge. A call needs an allow from every gate whose list
+  the same tag merge, keeping the shorter expiry. A call needs an allow from every gate whose list
   names its tool, and the first deny from any of them denies it. So a bot
   under `manual` that forks an `auto` bot gets a fork whose calls need
   both, and nothing a bot asks for can replace a gate it inherited. Mixed
@@ -232,17 +238,27 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   response whose calls include gated tools, the same transaction marks
   those `tools` rows as needing a verdict and writes one
   `approval_requested` event for the round:
-  `{"calls":[{"call_id","request","announced_ms","gates","name","node","arguments","arguments_truncated"}]}`,
-  where `gates` lists the tags whose answer the call needs and
-  `announced_ms` is when this request was written. `approvals` and
+  `{"calls":[{"call_id","request","announced_ms","gates","name","node","path"?}]}`,
+  where `gates` lists the tags whose answer the call needs, `path` is the
+  resolved file for `read`, `write`, and `edit` (see the rules), and
+  `announced_ms` is when this request was written. The stored event holds
+  no arguments, since the node already does; a few dozen bytes per call.
+  What is sent to approvers also carries, per gate, the bot's
+  `denials: {"in_row","in_turn"}` for that tag. The daemon keeps these
+  two counts on the bot's row, updated in the commits that already record
+  a denial or start an allowed call, so an approver that restarts or
+  takes over sees the same counts its predecessor did and the circuit
+  breaker does not reset. `approvals` and
   `serve_approvals` return it too, so an approver that takes over a
   pending request knows how much of the client's deadline is left.
   Each call names its own node: an Anthropic round keeps all its calls in
   one assistant item, but a Responses round stores each `function_call` as
-  an item of its own. Arguments are previewed to 2,048 characters, as
-  `tool_started` already does; an approver reads a longer one (a large
-  `write`) with `item` on that call's node.
-  One event per round, not per call, and no extra commit.
+  an item of its own. Only what is sent to a serving approver, and what
+  `approvals` lists, adds an `arguments` preview to 2,048 characters with
+  `arguments_truncated`, as `tool_started` already does, taken from the
+  node the worker has just written; an approver reads a longer one (a
+  large `write`) with `item` on that call's node. Bot followers get the
+  compact event. One event per round, not per call, and no extra commit.
 - **`answer` decides one request.**
   `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"until_prior"?,"lease"?}`.
   `request` is the number the call was announced with, and it changes each
@@ -330,7 +346,10 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   has not arrived waits in memory for `--approval-hold-ms` (proposed default
   2,000). After that the turn parks the way `wait` does: one `suspend`
   commit, no task, no active slot, restart-safe. A verdict for a parked turn
-  is committed when it arrives and resumes the turn. The hold keeps model
+  is committed when it arrives, and resumes the turn only if the turn is
+  parked on that call's verdict. A turn parked on an earlier call's
+  `wait` stays parked; the verdict waits in the store until execution
+  reaches its call. The hold keeps model
   verdicts off the park path and keeps a person's wait off the task table.
 - **Verdicts are durable no later than the call starts, and the storage
   worker holds them until then.** `answer` is a job on the storage worker,
@@ -339,7 +358,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   the job records the verdict there and wakes the task, with no commit. The
   next commit the turn makes anyway takes it out and writes it: that
   call's start, its denial, or a park. For a parked turn, the job commits
-  the verdict and resumes the turn. Because `answer`, `suspend`, and
+  the verdict, and resumes the turn only if it parked on that call.
+  Because `answer`, `suspend`, and
   `tool_start` all run on that one thread, a verdict that lands as the hold
   expires is either in the map when `suspend` runs, and written with the
   park, or it arrives after, finds the turn parked, and is committed. The
@@ -360,10 +380,12 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   show a call that never ran. Deny with a reason instead. Persisting "always
   allow this" is client state, not daemon state.
 
-The daemon never judges a call, never writes text for the model beyond the
-error code, and never times out a verdict. A client that wants a deadline
-denies on its own clock. The one clock the daemon keeps is the serving
-lease, on the period its holder chose.
+The daemon never judges a call and never writes text for the model beyond
+the error code and the fixed "not reviewed: no verdict" reason. Its only
+clocks are ones a client chose: a gate's `expire_ms`, kept like a parked
+`wait`'s deadline (stored with the park, so it survives a restart), and
+the serving lease. A client that wants a shorter deadline denies on its
+own clock.
 
 ### The three modes
 
@@ -386,7 +408,10 @@ lease, on the period its holder chose.
 - **`auto` needs its approver running.** The CLI already starts the daemon
   when it is not running; with `auto` it starts `agent approver` the same
   way. A gated call with no approver waits, parked and visible in
-  `approvals`, rather than running or failing silently.
+  `approvals`, rather than running or failing silently, until its gate's
+  15 s expiry denies it. So if the approver dies and nothing restarts it,
+  each auto bot gets denials with that reason, trips the circuit
+  breaker's count, and stops, instead of hanging.
 - **Software callers keep `full`.** A program that drives bots gains nothing
   from a gate it has to answer itself, and `full` pays nothing.
 
@@ -447,7 +472,16 @@ so only one instance runs at a time, and answers in layers:
      counts as outside. An earlier call in the same round can change what
      a path resolves to, so when one could change files, an allow that
      rests on a resolved path is sent with `until_prior` and judged again
-     after that call runs.
+     after that call runs. Other processes can change it too: a
+     background command from an earlier round, a watcher, or anything
+     else the user runs. For `read`, `write`, and `edit` the daemon closes
+     that gap. It reports each call's resolved path in the announcement,
+     and at execution it opens the file, asks the OS which file it opened
+     (`F_GETPATH` on macOS, `/proc/self/fd` on Linux), and fails the call
+     as `path_changed` if that is not the path announced, which
+     re-announces the rest of the round like any failure. A shell
+     command resolves its own paths when it runs, so there the gap stays:
+     oversight, not containment.
    - `read` inside the workspace is allowed, except files that look like
      secrets or commonly hold them: `.env*`, `*.pem`, `*.key`, `*.p12`,
      `*.pfx`, `*.keystore`, `id_*`, `.npmrc`, `.pypirc`, `.netrc`,
@@ -519,8 +553,16 @@ so only one instance runs at a time, and answers in layers:
    - Does it download and run code from the network?
 
    Each risk has a consent question asked beside it that names the same
-   effect: did the caller ask for this deletion, this destination, this
-   use or change of credentials, this system change, this download? The
+   effect: does the caller's request for this turn ask for this deletion,
+   this destination, this use or change of credentials, this system
+   change, this download? The request for this turn is its prompt and
+   steers, or those of the person-written turn that delegated it; earlier
+   turns' prompts are shown for context but do not consent, so a deploy
+   asked for yesterday does not cover one today. Later messages override
+   earlier ones, so "don't deploy after all" withdraws consent. A request
+   to do something once is used up by a call of this turn that did it and
+   succeeded, which is why the already allowed calls are shown with their
+   exit status; a retry after a failure is still covered. The
    consent question has to cover everything its risk question does: in
    the labeled run, asking about "this credential change" beside a risk
    that also covers using credentials denied a requested package upload
@@ -569,7 +611,8 @@ so only one instance runs at a time, and answers in layers:
    the check failed", so the model can tell a refusal from an outage. A Jev
    request gets 10 s, the SDK's default, before it counts as failed.
 5. **Circuit breaker.** After 3 denials in a row for a bot, or 20 in one
-   turn, the approver denies the call with a reason asking the model to
+   turn, counted from the daemon's `denials` so a restart does not reset
+   them, the approver denies the call with a reason asking the model to
    stop and report what it needs, then ends the turn with `interrupt` at
    its next gated round or 30 s later, whichever comes first. A model that
    reports ends the turn itself first; one that keeps going is stopped
@@ -580,9 +623,11 @@ so only one instance runs at a time, and answers in layers:
    variations of a denied action is the pattern this catches.
 
 **What Jev is shown.** The human prompts, the round's planned calls, the
-calls already allowed in this turn, the workspace path, and the user's
-environment note (trusted remotes and hosts). Not tool results, not the
-model's prose, and not the model's reasoning. Jev's own limits page says
+calls already allowed in this turn with whether each succeeded, the
+workspace path, and the user's environment note (trusted remotes and
+hosts). Not tool results, not the model's prose, and not the model's
+reasoning. An exit status is one word the harness writes, so it carries
+no text from a tool. Jev's own limits page says
 content written to steer it "can move the answer", and a planned call is
 model-written text too: a command can carry a comment claiming the user
 approved it. So the consent questions are asked of the human prompts, and a
@@ -613,6 +658,20 @@ the daemon could also refuse a submission without `from` from a process
 descended from its own tools, but a process that double-forks escapes that,
 and macOS has no equivalent. Consent, like the gate, is advisory without
 isolation.
+
+**Secrets are redacted before Jev sees them.** A planned call can carry a
+secret the model learned from an earlier result, such as a token in a
+`curl -H 'Authorization: …'`, and sending it to Jev would disclose it
+to one more service before the call is judged. So the approver runs a
+local detector over everything it sends: the values of credential
+variables in its own environment and the daemon's provider keys, known
+key formats (provider prefixes, PEM blocks, JWTs, cloud access keys),
+`Authorization` and cookie headers, URLs with a password, and long
+high-entropy strings assigned to a name like `token`, `secret`, `key`,
+or `password`. Each match is replaced with a typed placeholder such as
+`[secret: bearer token]`, so Jev still sees that a secret is sent and
+where, and judges the destination. A secret the detector does not
+recognize is sent as is; like the `read` list, this is a list.
 
 **The intent view is bounded.** Jev takes at most 32k tokens of state, and
 a long-lived bot's prompts outgrow that. The approver sends, in this
@@ -841,17 +900,19 @@ as one.
    until then.
 3. **The daemon path.** On the lifecycle screen with `approve` set and a
    rules-only approver, confirm zero added commits per call and under 1 ms
-   added per gated call; then the park path with a delayed answer.
+   added per gated call, and record the bytes each gated call adds to the
+   store and WAL and to the approver's socket, against the same screen
+   without `approve`; then the park path with a delayed answer.
 
 ## Open decisions
 
 Settled by George on 2026-09-26: three modes, `full` stays the default,
 `AGENT_APPROVAL` picks the mode, and `auto` denies what is dangerous or
-unclear without asking anyone. Installing a dependency the task needs but
-does not name counts as unconsented, so `auto` denies it (2% of real
-Harbor calls); what that costs in pass rate is measured once `auto` runs. Settled by this design: the daemon
-enforces gate inheritance, so a bot cannot drop a gate by going around
-the CLI.
+unclear without asking anyone. Installing a dependency the task needs
+but does not name counts as unconsented, so `auto` denies it (2% of real
+Harbor calls); what that costs in pass rate is measured once `auto`
+runs. Settled by this design: the daemon enforces gate inheritance, so a
+bot cannot drop a gate by going around the CLI.
 
 - The hold before parking: 2 s covers a Jev verdict with margin; shorter
   frees slots sooner for people.
