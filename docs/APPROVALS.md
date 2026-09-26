@@ -96,6 +96,11 @@ PEERS_PLACEHOLDER
   the user's messages and the bare tool calls; the model's own prose and
   every tool output are stripped, so text in a file or web page cannot
   address the judge. Adding them made results worse on its test set.
+- **Static rules do most of the work.** CARE (2026) scored 85.0% F1 on
+  command safety with static rules alone at 0.34 ms a command, and 85.6%
+  with a model behind them. Anthropic's API traffic had 0.8% of actions
+  that looked irreversible. A model belongs on the few calls rules cannot
+  settle.
 - **Ask narrow questions.** Anthropic's classifier answers against named
   rules and denies with a rule tag. Our own Jev probes found the same: a
   question that names the judgment ("does turn N state a rule that applies
@@ -111,6 +116,12 @@ PEERS_PLACEHOLDER
   after 50 prompts, and approved 93 to 97% of all prompts (claims from
   Anthropic's posts). A manual mode is for rare, high-stakes calls or for
   watching a new bot, not for every `ls`.
+- **Monitors can be talked to.** A model under watch can write text aimed
+  at its monitor: in one study GPT-4.1 as a monitor scored all 375
+  backdoored samples as unsuspicious once they carried such text
+  (Terekhov et al., 2025), and adaptive attacks broke 12 published
+  injection defenses, most at over 90% success (Nasr et al., 2025). No
+  published pre-execution gate claims to resist an adaptive attacker.
 - **A classifier is not a boundary.** Rehberger's August 2026 chain got
   Claude Code's auto mode to run attacker code in 60 to 80% of tries: each
   step the classifier saw looked benign. Anthropic's answer was that auto
@@ -219,7 +230,14 @@ same module inside the app. It follows `approval_requested` on every bot
 2. **Deterministic rules, microseconds.**
    - `write` and `edit` inside the turn's workspace are allowed. The path is
      resolved before judging, and a symlink that leaves the workspace does
-     not count as inside.
+     not count as inside. Files a later command will execute are the
+     exception and go to the model: `.git/`, `.agent/`, `AGENTS.md`, build
+     and hook files (`Makefile`, `package.json`, `.envrc`, CI workflows).
+     An independent test of Claude Code's auto mode found 36.8% of
+     state-changing actions went around its classifier as in-project file
+     edits (Ji et al., 2026). The approver also remembers what each bot
+     wrote this turn, so a command that runs one of those files is judged
+     with the file's content in view.
    - A shell command that is one simple command from a read-only list (`ls`,
      `cat`, `rg`, `git status`, `git diff`, `git log`, and so on) is allowed.
      Anything with a pipe, `;`, `&&`, `$(`, a backtick, or a redirect goes
@@ -230,8 +248,9 @@ same module inside the app. It follows `approval_requested` on every bot
      daemon's socket, the store file) are denied outright.
    - Rules the user adds ("allow `cargo test`", "deny `git push`") are
      checked here. "Always allow" from the manual UI adds a rule here.
-3. **Jev, about 0.4 s.** One request per call, answering a few questions,
-   each naming one judgment, each returning a probability:
+3. **Jev, about 0.4 s.** One request per round: the state is the context
+   below plus the round's calls, and each call gets a few `noul` (true or
+   false) questions, each naming one judgment and returning a probability:
    - Did the user ask for this action, or for something that needs it?
    - Does it delete or overwrite data outside the workspace, or rewrite
      history someone else has (a force push)?
@@ -244,8 +263,12 @@ same module inside the app. It follows `approval_requested` on every bot
 
    Allow when every risk is low. Deny, with the question as the reason (like
    Claude Code's rule tags), when a risk is high and the user did not ask
-   for it. Everything else goes to step 4. The thresholds start as guesses
-   and are set from a labeled run (below).
+   for it. Everything else goes to step 4. The starting thresholds are
+   TypeSafe's guardrail cookbook's: below 0.35 is low, 0.70 or more is
+   high. TypeSafe publishes no calibration figures; a third-party benchmark
+   (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
+   task-dependent below it. So the thresholds are set from our own labeled
+   run (below), per question.
 4. **Unclear.** With a person attached (the app is open, or `agent
    approver --escalate`), the approver answers nothing and marks the call
    for the person, who sees only these. Unattended, it asks a larger model
@@ -260,7 +283,12 @@ same module inside the app. It follows `approval_requested` on every bot
 **What Jev is shown.** The human prompts, the round's planned calls, the
 calls already allowed in this turn, the workspace path, and the user's
 environment note (trusted remotes and hosts). Not tool results, not the
-model's prose, and not the model's reasoning. For a bot created by another
+model's prose, and not the model's reasoning. Jev's own limits page says
+content written to steer it "can move the answer", and a planned call is
+model-written text too: a command can carry a comment claiming the user
+approved it. So the intent question is asked of the human prompts, and a
+high risk that the prompts do not name is denied whatever the command
+says about itself. For a bot created by another
 bot, the prompt was written by a model; the approver follows `created_by` to
 the first bot a person prompted and shows that prompt as the user's intent,
 the child's prompt as a model-written task. Anthropic reports that most of
@@ -269,6 +297,16 @@ chain is where consent is easiest to fake.
 
 **Where the key lives.** The approver process holds the Jev key. Bots never
 see it: their shells are children of the daemon, not of the approver.
+
+**Jev's limits bound a fleet.** The published limits for `jev-1.13.0` are
+1,200 requests a minute and 250k tokens a second, "adjusting dynamically",
+with 64k tokens per request of which 32k can be state. The sustained live
+fleet ran 60 model calls a second through one daemon; if every round there
+needed Jev, that is three times the request limit. Hence one request per
+round rather than per call, the rules layer in front, and a pace in the
+approver that backs off on 429 and 529 as TypeSafe's docs ask. A call
+waiting on a paced Jev request stays pending and, past the hold, parks
+like any other.
 
 ## Performance
 
@@ -301,9 +339,11 @@ see it: their shells are children of the daemon, not of the approver.
   (2026-09-26 rerun); if every round needed Jev that is 14 to 23 s more per
   trial. How many rounds reach Jev is the number that decides whether this
   is acceptable, and it is not measured yet (below).
-- **Cost.** The probe billed 420 to 1,970 input tokens per request and no
-  output, about $0.00003 to $0.0001 per check. A trial of 50 checks costs
-  under a cent.
+- **Cost.** Jev bills input only, at $0.042 per million tokens (TypeSafe's
+  models page, read 2026-09-26). The probe's requests were 420 to 1,970
+  input tokens, so $0.00002 to $0.00008 each. A trial of 50 checks costs
+  well under a cent. For comparison, the same 2,000 tokens cost $0.002 on
+  Haiku 4.5 before any output.
 - **A person's wait.** Parking and recording the verdict are two commits,
   about 11 ms on an idle Mac; the call's start after resuming is a commit it
   makes anyway. A parked turn then costs a store row and a registry entry
