@@ -4481,3 +4481,212 @@ benefit survives the fix, with no observed CPU or tail regression in this
 probe. The varying baseline tails preclude attributing a further speedup to
 the boundary check. This does not resolve the mixed-soak or long-history gaps
 above, or measure the added commit cost when retention conflicts for one bot.
+
+### Fixed-work mixed-load diagnosis
+
+On 2026-09-26, a diagnostic held the mixed soak's logical work fixed to
+investigate its lower candidate turn count. The saved baseline was `15d629c`
+(binary SHA-256 `c34bb494356faa3a9f6b66299eef95df60270557f1b06591b69af609f5e57e3b`);
+the candidate included the completion and retention-publication changes in
+`a7746cd` (binary SHA-256
+`d196f434ba7255990ffb478970b6d10c29dd04b7f1145060f36688da881e1e83`).
+Both kept full flushing. These saved binaries isolate the completion change;
+they do not measure the subsequent rebase onto the routing-token change.
+
+The same macOS arm64 host ran baseline/candidate, then candidate/baseline,
+sequentially after one smaller warmup per build. Each run used 192 bots with
+the soak's seven roles, 512 KiB context and 12-turn operational retention.
+Per-bot quotas were 32 long, 8 noisy, 24 background, 24 parent, 24 child,
+16 flaky and 32 plain turns. Prompt choices were seeded per bot and turn,
+and child delays cycled through 500, 1,500 and 3,000 ms. One in-flight turn
+per bot was refilled immediately, rather than selecting work by elapsed time.
+
+All four runs completed 4,608 primary turns plus six turns on three historical
+forks. The normalized prompt digest, per-bot turn/model-round/retry totals,
+7,046 provider requests and 256 retries matched exactly; there were no failures
+or refusals. Fork, two follow-up turns and deletion ran after the primary work,
+taking 0.17–0.34 seconds per fork across the four runs. This separates their
+cost from sustained throughput, but does not test concurrent fork/deletion
+contention. Cancellation, slow readers, crash recovery and compaction are also
+outside this diagnostic. Its synthetic provider does not validate exact
+conversation contents.
+
+| Order | Baseline / candidate primary-work wall | Baseline / candidate daemon CPU | Baseline / candidate sampled peak daemon RSS |
+| --- | ---: | ---: | ---: |
+| baseline then candidate | 94.62 / 78.57 s | 21.50 / 19.52 s | 25.08 / 28.78 MiB |
+| candidate then baseline | 104.96 / 83.88 s | 20.56 / 18.69 s | 26.64 / 26.50 MiB |
+
+Wall and CPU exclude bot creation and the later fork phase. CPU covers only
+the daemon, not shell descendants or the provider/observer. RSS was sampled
+approximately every five seconds and is not an allocation high-water mark.
+Across primary and fork turns, p99 was 3,196 / 3,115 ms in the first pair and
+3,335 / 3,139 ms in the reversed pair; the 3-second child delay contributes
+to these tails. Two samples per build support a workload-specific improvement,
+not a general speedup or memory-parity claim.
+
+Store-operation counters identify the remaining cost:
+
+| Order | Baseline / candidate commit groups | Baseline / candidate commit execution | Baseline / candidate total store execution |
+| --- | ---: | ---: | ---: |
+| baseline then candidate | 16,121 / 12,213 | 77.14 / 60.44 s | 92.46 / 74.10 s |
+| candidate then baseline | 15,985 / 12,049 | 82.59 / 63.99 s | 100.97 / 78.27 s |
+
+Commit groups include read-only groups, so their count is not a count of disk
+flushes. The candidate used 24–25% fewer groups, took 17–20% less wall time,
+and used about 9% less daemon CPU. Commit execution remained about 82% of
+measured candidate store execution. Candidate `begin` execution cost
+5.22–5.76 seconds, versus 0.30–0.37 seconds for context preparation and
+1.22–1.23 seconds for window selection. Those job timings exclude the shared
+commit and queue wait. Admission/creation batching remains the next hypothesis
+to test, preserving capacity reservation, same-bot ordering and durable
+acknowledgements; these results do not justify a context cache first.
+
+Re-reading the original timed soak also found unequal noisy-tool output:
+97.44 MB on the baseline versus 108.10 MB on the candidate, including 69
+versus 87 one-megabyte outputs. The candidate nevertheless ran more turns
+in its first minute and slowed later. Neither fixed-work candidate reproduced
+that abrupt slowdown. Work-mix differences invalidate the original raw turn
+comparison, but do not establish the cause of its late slowdown. The original
+capture lacks per-operation time samples; concurrent fork contention and host
+flush variability remain unproven explanations. Keep an instrumented mixed
+operational soak as a separate follow-up before claiming sustained parity.
+
+Ignored evidence: `.local/throughput-diagnosis/` contains the diagnostic driver,
+per-operation samples, exact-work checks and comparison summary.
+Separately, the rebased `7120b48` passed all 187 Rust tests, a release build,
+and three focused Python checks for routing-token persistence and compaction
+budgets. These are post-rebase correctness checks, not performance measurements.
+
+### Instrumented operational follow-up
+
+On 2026-09-26, the same host ran the timed 192-bot soak for three minutes
+per build, baseline first. The baseline was the saved `15d629c` binary above;
+the current build was `7120b48`, SHA-256
+`438c5734a02f86b42f260c8d2c278494d8768d6d1b280c590d42eebe30ccfbdc`.
+An isolated observer recorded the existing per-operation store counters,
+daemon CPU, command latencies and driver phases. Neither runtime was
+instrumented or given a weaker durability policy. Unlike the fixed-work
+diagnostic, this exercised concurrent historical forks/deletion, retention,
+slow readers, compaction, cancellation, replay and crash recovery.
+
+| Observation | Baseline | Current |
+| --- | ---: | ---: |
+| Turns drained | 8,380 | 11,314 |
+| Unexpected failures / replay mismatches / unfinished turns | 0 / 0 / 0 | 0 / 0 / 0 |
+| Deliberate interruptions | 6 | 6 |
+| Compactions | 21 | 43 |
+| Historical forks / deletions | 2 / 2 | 2 / 2 |
+| Turn p50 / p95 | 298 / 3,062 ms | 176 / 3,040 ms |
+| Sampled peak daemon RSS | 32.08 MiB | 29.03 MiB |
+| Final database / WAL | 53.12 / 4.15 MiB | 62.34 / 4.16 MiB |
+| Restarted interrupted turns | 16 | 16 |
+
+Both recovered with 176 completed and 16 interrupted bot states. No follower
+disconnect was observed; this does not establish whether buffered slow readers
+had already been disconnected server-side. The larger current turn count and
+smaller peak RSS are operational observations, not matched-work throughput or
+memory claims. There was only one timed run per build, in one order, and work
+selection still depends on completion timing. Three minutes does not establish
+long-term memory or store-growth bounds.
+
+Neither run reproduced the earlier abrupt slowdown. Baseline fork commands
+took 6–9 ms and deletion 37–50 ms; current fork commands took 6–13 ms and
+deletion 21–25 ms. These calls did not produce a multi-second stall in these
+runs. Commits accounted for about 83% / 80% of cumulative store execution.
+The driver spent 178.7 / 158.3 seconds waiting on submit replies: it submits
+sequentially over one connection. Batching concurrent admissions therefore
+needs its own measurement; this soak alone cannot validate that benefit.
+
+That separate diagnostic opened 32 client connections, submitted simultaneously,
+and gated provider completions until every admission was acknowledged. On
+`7120b48`, a captured repeat series completed one warmup and eleven measured
+runs. Median time to all admission replies was 284.8 ms, median daemon CPU
+was 72.8 ms, and every run recorded 32 `begin` jobs and 34 commit groups in
+the admission interval. Median commit execution was 239 ms. These counters
+also include preparation jobs for the admitted turns; commit groups include
+read-only groups. The steadily increasing reply latencies agree with the
+service's serial dispatch path. This identifies a batching opportunity, not
+the size of an implemented improvement.
+
+**Unresolved diagnostic failure:** an earlier admission attempt lost a
+connection after its warmup. Its database contains three terminal
+`storage_error` outcomes and two running turns. That attempt discarded daemon
+stderr, and that build mapped SQLite failures to `storage_error` without
+retaining their underlying codes. Sixteen subsequent runs with stderr capture
+completed successfully and emitted no daemon error. The failure is excluded
+from timing summaries, but remains open as a correctness concern. After the
+runs, the host reported only about 2.7 GiB available; no space measurement or
+SQLite error code was captured at the failure, so disk pressure is a possible
+factor, not an established cause.
+
+Before changing admission concurrency, preserve safe SQLite error codes at
+the failure boundary and resolve or reproduce this failure. Then measure a
+bounded batch of queued admissions, with no batching delay for a lone caller,
+per-request rollback, capacity reserved only for fresh running turns, and
+same-bot ordering. Acknowledgements and provider execution must remain after
+commit. Keep the original unexplained soak slowdown distinct from this new
+storage failure.
+
+Ignored evidence is under `.local/throughput-diagnosis/`: `operational-before`,
+`operational-current`, their command/phase traces and summary, and the
+`admission-current`, `admission-captured` and `admission-repeat` probe series.
+
+### SQLite failure diagnostics
+
+On 2026-09-26, the diagnostic change on `7120b48` retained numeric SQLite
+primary and extended codes in `storage_error` details. It excludes engine
+messages, SQL, paths and parameter names. Begin/commit failures preserve their
+codes for every affected caller; a statement that rolls back its whole group
+supplies the original code instead of the subsequent missing-transaction error.
+Successful jobs retain the same grouping and publication boundaries, with no
+new queries or diagnostic allocations on success. Admission batching is unchanged.
+
+Regression tests exercised deferred foreign-key failure at commit, automatic
+transaction rollback, group recovery and removal of sensitive diagnostics.
+The accounting fixture verified identical error details in live and replayed
+terminal events. All 189 Rust tests passed; the final diagnostic cases, strict
+all-targets Clippy and the focused Python fixture also passed.
+
+The 32-client gated admission probe now captures free space at startup,
+creation, admission and completion, plus failure state and daemon stderr.
+All 97 fresh-daemon runs passed: 16 baseline runs and 81 diagnostic-build runs,
+3,104 completed turns total. No storage error or daemon stderr was observed.
+Available space ranged from about 2.2 to 1.9 GiB during these probes; there is
+still no space measurement from the original failure. It remains unresolved,
+not fixed by adding diagnostics.
+
+Two reversed-order admission pairs used eight runs per build per pair, dropping
+each cell's first run as warmup. Median admission wall time was 250.5 to 290.2 ms
+in pair A and 273.1 to 277.2 ms in pair B. Median daemon CPU was 65.4 to 72.8 ms
+and 70.1 to 71.7 ms respectively. These short results do not establish parity.
+The additional 65 candidate runs, including one warmup, had medians of 279.7 ms
+wall and 71.2 ms daemon CPU.
+
+A larger fixed-work check then ran baseline/candidate/candidate/baseline,
+sequentially with no concurrent builds or tests. Each run performed 1,152
+primary turns across 192 bots plus six historical-fork turns, 1,766 provider
+requests and 64 expected retries. Every run completed without errors and had
+identical per-bot work counts and logical digest
+`2005388ee4e14cfe90e303dac0f4483964db84ed043a6e79c350a5075317ab20`.
+Wall and daemon CPU below cover primary work, excluding creation and the later
+fork phase. RSS is the peak of periodic samples.
+
+| Fixed-work metric | Baseline A | Diagnostic A | Baseline B | Diagnostic B |
+| --- | ---: | ---: | ---: | ---: |
+| Elapsed | 19.85 s | 19.93 s | 19.27 s | 19.16 s |
+| Daemon CPU | 4.034 s | 4.091 s | 4.210 s | 4.167 s |
+| Sampled peak RSS | 25.88 MiB | 24.70 MiB | 25.38 MiB | 24.53 MiB |
+| Commit execution | 14.74 s | 15.61 s | 13.96 s | 13.87 s |
+
+Elapsed differences were +0.4% and -0.6%; CPU differences were +1.4% and -1.0%.
+This screen found no material regression; two pairs do not prove a speedup or
+sustained parity. It exercised no compaction, cancellation, crash recovery or
+slow-reader pressure. The original operational slowdown and intermittent
+storage failure remain separate open investigations.
+
+The baseline binary SHA-256 is
+`438c5734a02f86b42f260c8d2c278494d8768d6d1b280c590d42eebe30ccfbdc`;
+the diagnostic binary is
+`05d13ff8b530e4325e2810dbed19f0bb7b642581f5a50342b67cf0dc2b74f8ad`.
+Ignored evidence under `.local/sqlite-diagnostics/` includes both binaries,
+test logs, the admission driver and captures, and all four `mixed-*` results.

@@ -759,8 +759,22 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     The bot remains durably busy until commit, and publication keeps commit
     order. Same-bot retention jobs cross a publication boundary; independent
     bots still group. The [completion burst](DAEMON_MEASUREMENTS.md#completion-scheduling-and-macos-flush-attribution)
-    improves substantially; ordinary streaming tails remain mixed. Next,
-    admission and creation: the service still awaits their commits before
+    improves substantially; ordinary streaming tails remain mixed. A
+    [fixed-work mixed-load diagnostic](DAEMON_MEASUREMENTS.md#fixed-work-mixed-load-diagnosis)
+    completed identical work in 17–20% less time with about 9% less daemon
+    CPU across two reversed-order pairs. Peak RSS was higher in one pair;
+    the original timed soak's late slowdown remains unexplained. The
+    [instrumented operational follow-up](DAEMON_MEASUREMENTS.md#instrumented-operational-follow-up)
+    passed replay, compaction and restart checks without reproducing that
+    slowdown. A concurrent admission probe confirms serial acknowledgements,
+    but also exposed one unreproduced storage failure. Safe SQLite codes now
+    survive statement and group-commit failures; 81 diagnostic-build admission
+    retries passed with disk-space capture. A matched mixed-load screen found
+    no material regression, but the original failure remains unresolved
+    ([diagnostics](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics)). Resolve
+    that concern before changing concurrency. Next, admission
+    and creation: commits still account for about 82% of measured store
+    execution, and the service awaits admission commits before
     handling another request. Letting those jobs group needs a design for
     capacity reservation, same-bot ordering, and item 21's guarantees. Client
     acknowledgements, publication, and provider execution must stay after

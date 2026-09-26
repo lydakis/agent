@@ -32,7 +32,8 @@ const GROUP_JOBS: usize = 32;
 trait Job: Send {
     fn run(&mut self, db: &mut Database);
     fn pruning_bot(&self) -> Option<&str>;
-    fn answer(self: Box<Self>, committed: bool);
+    fn error(&self) -> Option<&Error>;
+    fn answer(self: Box<Self>, failure: Option<&Error>);
 }
 struct Queued<F, T> {
     operation: Option<F>,
@@ -62,11 +63,17 @@ where
     fn pruning_bot(&self) -> Option<&str> {
         self.pruning_bot.as_deref()
     }
-    fn answer(self: Box<Self>, committed: bool) {
+    fn error(&self) -> Option<&Error> {
+        self.outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().err())
+    }
+    fn answer(self: Box<Self>, failure: Option<&Error>) {
         // A job's own error was decided against writes that the failed
         // commit took back, so it no longer describes the store.
-        let outcome = match self.outcome {
-            Some(outcome) if committed => outcome,
+        let outcome = match (failure, self.outcome) {
+            (Some(error), _) => Err(error.clone()),
+            (None, Some(outcome)) => outcome,
             _ => Err(Error::new("storage_error")),
         };
         let _ = self.reply.send(outcome);
@@ -150,8 +157,21 @@ pub struct Store {
 }
 
 impl From<rusqlite::Error> for Error {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::new("storage_error")
+    fn from(error: rusqlite::Error) -> Self {
+        // SQLite's message and other rusqlite variants can contain SQL,
+        // paths or caller data. Numeric engine codes are safe diagnostics.
+        match error {
+            rusqlite::Error::SqliteFailure(code, _)
+            | rusqlite::Error::SqlInputError { error: code, .. } => Self::with(
+                "storage_error",
+                format!(
+                    "sqlite_primary={} sqlite_extended={}",
+                    code.extended_code & 255,
+                    code.extended_code
+                ),
+            ),
+            _ => Self::new("storage_error"),
+        }
     }
 }
 
@@ -254,8 +274,8 @@ impl Store {
                         let mut deferred = None;
                         while let Some(job) = deferred.take().or_else(|| receiver.blocking_recv()) {
                             group.push(job);
-                            let begun = db.begin_group().is_ok();
-                            if begun {
+                            let begun = db.begin_group();
+                            if begun.is_ok() {
                                 let mut ran = 0;
                                 // Whatever queued while the last group
                                 // synced shares this one's sync.
@@ -285,25 +305,44 @@ impl Store {
                                     }
                                 }
                             }
-                            let committed = begun && {
+                            let committed = begun.and_then(|()| {
                                 let started = std::time::Instant::now();
-                                let committed = db.commit_group().is_ok();
+                                let committed = db.commit_group();
                                 worker_counters.record(
                                     "commit",
                                     0,
                                     started.elapsed().as_nanos() as u64,
                                 );
                                 committed
-                            };
+                            });
+                            let failure = committed.err().map(|error| {
+                                // A statement can make SQLite roll back the entire
+                                // transaction. Preserve that statement's error,
+                                // not just the subsequent missing-transaction check.
+                                let error = if error.code == "storage_group_rolled_back" {
+                                    group
+                                        .last()
+                                        .and_then(|job| job.error())
+                                        .cloned()
+                                        .unwrap_or(error)
+                                } else {
+                                    error
+                                };
+                                if error.code == "storage_error" {
+                                    error
+                                } else {
+                                    Error::new("storage_error")
+                                }
+                            });
                             // A group that did not commit leaves nothing
                             // durable; its bookkeeping goes with it. If the
                             // recount fails too, the next group retries it
                             // before running anything.
-                            if !committed {
+                            if failure.is_some() {
                                 let _ = db.abandon_group();
                             }
                             for job in group.drain(..) {
-                                job.answer(committed);
+                                job.answer(failure.as_ref());
                             }
                             let _ = db.publish_since(&mut watermark, |publication| {
                                 publisher.blocking_send(publication).is_ok()
@@ -677,6 +716,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_diagnostics_survive_commit_and_transaction_rollback() {
+        for (name, setup, write, extended) in [
+            (
+                "diagnostic-commit",
+                "CREATE TABLE parent(x PRIMARY KEY); CREATE TABLE child(x REFERENCES parent(x) DEFERRABLE INITIALLY DEFERRED);",
+                "INSERT INTO child VALUES (9)",
+                rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            ),
+            (
+                "diagnostic-rollback",
+                "CREATE TRIGGER reject_two BEFORE INSERT ON t WHEN NEW.x=2 BEGIN SELECT RAISE(ROLLBACK,'private SQL message'); END;",
+                "INSERT INTO t VALUES (2)",
+                rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
+            ),
+        ] {
+            let store = scratch_store(name).await;
+            store
+                .call(move |db| Ok(db.connection().execute_batch(setup)?))
+                .await
+                .unwrap();
+            let (held, gate) = hold(&store).await;
+            let one = queue(&store, insert(1)).await;
+            let refused = queue(&store, |_| crate::fail::<()>("bot_busy")).await;
+            let failed = queue(&store, move |db| {
+                Ok(db.connection().execute_batch(write)?)
+            })
+            .await;
+            gate.send(()).unwrap();
+            for job in [held, one, refused, failed] {
+                let error = job.await.unwrap().unwrap_err();
+                assert_eq!(error.code, "storage_error");
+                assert_eq!(
+                    error.detail,
+                    Some(format!("sqlite_primary=19 sqlite_extended={extended}"))
+                );
+            }
+            assert!(rows(&store).await.is_empty());
+            store.call(insert(3)).await.unwrap();
+            assert_eq!(rows(&store).await, [3]);
+        }
+    }
+
+    #[test]
+    fn sqlite_diagnostics_exclude_messages_and_sql() {
+        for code in [
+            rusqlite::ffi::SQLITE_FULL,
+            rusqlite::ffi::SQLITE_IOERR_FSYNC,
+            rusqlite::ffi::SQLITE_BUSY,
+        ] {
+            let error: Error = rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                Some("private SQL, path and message".into()),
+            )
+            .into();
+            assert_eq!(error.code, "storage_error");
+            assert_eq!(
+                error.detail,
+                Some(format!(
+                    "sqlite_primary={} sqlite_extended={code}",
+                    code & 255
+                ))
+            );
+        }
+        let error: Error = rusqlite::Error::InvalidParameterName("private parameter".into()).into();
+        assert_eq!(error, Error::new("storage_error"));
+        let error: Error = rusqlite::Error::SqlInputError {
+            error: rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            msg: "private message".into(),
+            sql: "private SQL".into(),
+            offset: 1,
+        }
+        .into();
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("sqlite_primary=1 sqlite_extended=1")
+        );
+    }
+
+    #[tokio::test]
     async fn a_group_rolled_back_under_its_jobs_answers_none_of_them_ok() {
         let store = scratch_store("rollback").await;
         let (held, gate) = hold(&store).await;
@@ -751,7 +869,12 @@ mod tests {
             .await;
         assert_eq!(lost.unwrap_err().code, "storage_error");
         let refused = store.call(|db| db.pending()).await;
-        assert_eq!(refused.unwrap_err().code, "storage_error");
+        let refused = refused.unwrap_err();
+        assert_eq!(refused.code, "storage_error");
+        assert_eq!(
+            refused.detail.as_deref(),
+            Some("sqlite_primary=1 sqlite_extended=1")
+        );
         Connection::open(scratch_path("recount"))
             .unwrap()
             .execute_batch("ALTER TABLE turns_away RENAME TO turns;")
