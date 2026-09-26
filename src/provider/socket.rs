@@ -513,11 +513,14 @@ fn plan(last: Option<&Last>, key: u64, ids: Option<&[i64]>) -> Plan {
     }
 }
 
-/// Digest of a request's non-input fields and the context ahead of its window.
-pub(super) fn key(fields: &[u8], head: &[u8]) -> u64 {
+/// Digest of a request's non-input fields, the context ahead of its window,
+/// and the elision floor its items were read under: moving the floor
+/// rewrites items the server already holds.
+pub(super) fn key(fields: &[u8], head: &[u8], elided: i64) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     fields.hash(&mut hasher);
     head.hash(&mut hasher);
+    elided.hash(&mut hasher);
     hasher.finish()
 }
 

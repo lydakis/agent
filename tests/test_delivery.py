@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import ModelFixture, is_summary
 from bench.runtime_client import Client
 
 
@@ -333,20 +333,23 @@ class DeliveryTests(ModelFixture):
         requests = []
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
-        # The summarizer's own call: the client's instructions, no tools, the
-        # span's items, and the request to write, whose echo became the summary.
-        summarizer = [r for r in requests if r.get('instructions') == 'Summarize the conversation.']
+        # A copy of Bob's call, his instructions, tools, and window, with the
+        # request to write after it carrying the client's instructions.
+        summarizer = [r for r in requests if is_summary(r)]
         self.assertGreaterEqual(len(summarizer), 1)
-        self.assertEqual(summarizer[0]['tools'], [])
-        self.assertTrue(summarizer[0]['input'][-1]['content'][0]['text'].startswith('[compaction request]'))
+        work = [r for r in requests if not is_summary(r)
+                and r['prompt_cache_key'] == summarizer[0]['prompt_cache_key']]
+        self.assertEqual(summarizer[0]['tools'], work[0]['tools'])
+        self.assertEqual(summarizer[0]['instructions'], work[0]['instructions'])
+        self.assertTrue(summarizer[0]['input'][-1]['content'][0]['text'].endswith('Summarize the conversation.'))
         # Bob's later requests carry the summary and the covered prompts verbatim, ahead of the window.
-        later = [r for r in requests if r.get('instructions') != 'Summarize the conversation.'
+        later = [r for r in requests if not is_summary(r)
                  and any(i.get('role') == 'user' and i['content'][0]['text'].startswith('[compaction summary')
                          for i in r['input'])]
         self.assertGreaterEqual(len(later), 1)
         text = [i for i in later[-1]['input'] if i.get('role') == 'user'
                 and i['content'][0]['text'].startswith('[compaction summary')][0]['content'][0]['text']
-        self.assertIn('reply:[compaction request]', text)
+        self.assertIn('A short synthetic summary.', text)
         self.assertIn('User messages from those turns, verbatim:', text)
         self.assertIn('\n1: Task 1: 111', text)
         bob = client.request('resume', bot='Bob')['result']
@@ -413,6 +416,94 @@ class DeliveryTests(ModelFixture):
         refused = client.request('submit', bot='Plain', request_id='1', prompt='note:x')['result']['turn']
         self.assertEqual(client.finished(refused)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.tool_output(client, 'Plain', 'note-1'))['error'], 'tool_not_available')
+
+    def test_a_steer_is_measured_against_a_note_written_in_the_same_round(self):
+        # The steer arrives while the model is asked; the model's answer
+        # writes a large carry-forward note. Beside that note the steer does
+        # not fit, though it would have beside the request that was sent.
+        client = self.client('echo,note', extra=('--context-bytes', '8192'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
+        self.model.note_text = 'N' * 3500
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        self.model.requests.get(timeout=5)
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:' + 'x' * 2000,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        ended = client.finished(turn)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+            self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 8192)
+
+    def test_a_steer_with_no_room_beside_a_note_goes_in_once_the_note_is_cleared(self):
+        # The steer arrives while the model is asked; beside the bot's large
+        # note it does not fit at the next boundary. The model then clears
+        # the note, and the steer goes in at the boundary after that,
+        # before the answer, rather than failing when the turn ends.
+        client = self.client('echo,note', extra=('--context-bytes', '8192'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
+        self.model.note_text = 'N' * 3500
+        noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
+        self.assertEqual(client.finished(noted)['data']['status'], 'completed')
+        del self.model.note_text
+        while not self.model.requests.empty():
+            self.model.requests.get()
+        self.model.call_script = [('echo', {'text': 'a'}), ('note', {'text': ''})]
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='2', prompt='script')['result']['turn']
+        self.model.requests.get(timeout=5)
+        correction = 'steer:' + 'x' * 2500
+        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        outcome = client.finished(steer)['data']
+        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        carries = [any(i.get('role') == 'user' and i['content'][0]['text'] == correction for i in r['input'])
+                   for r in requests]
+        # Asked after the echo without it, after the note is cleared with it.
+        self.assertEqual(carries, [False, True])
+
+    def test_a_steer_is_admitted_beside_the_context_note_without_its_previews(self):
+        # A long history leaves most turns out of view, and the context note
+        # lists how each began. Those previews yield to the running turn, so
+        # a strict steer that fits beside the note without them goes in.
+        client = self.client('echo', extra=('--context-bytes', '16384'))
+        client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'])
+        for n in range(50):
+            turn = client.request('submit', bot='Bob', request_id=str(n),
+                                  prompt=f'Task {n}: ' + 'p' * 300)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        while not self.model.requests.empty():
+            self.model.requests.get()
+        self.model.call_script = [('echo', {'text': 'a'})]
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='run', prompt='script')['result']['turn']
+        first = self.model.requests.get(timeout=5)
+        note = first['input'][0]['content'][0]['text']
+        self.assertIn('How they began', note)
+        self.assertGreater(len(note), 4000)
+        correction = 'steer:' + 'x' * 9000
+        steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        outcome = client.finished(steer)['data']
+        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        while not self.model.requests.empty():
+            request = self.model.requests.get()
+            self.assertLessEqual(len(json.dumps(request['input'], separators=(',', ':')).encode()) - 2, 16384)
 
     def test_context_note_lists_how_omitted_turns_began(self):
         prompts = [f'Task {n}: ' + f'{n}' * 700 for n in range(1, 8)]
