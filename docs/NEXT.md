@@ -607,8 +607,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     and [run 2](LONG_TASK_EVAL.md#live-run-2) scored 3/3 in both
     conditions with 34% of summary input read from cache; per correct task
     compacting still sent twice the uncached input of full context on this
-    short task. Still open: stub passes and cuts that break the cache on
-    separate rounds; branching from identical checkpoints, the
+    short task, and the copies sent more uncached summary input than fresh
+    requests. Still open: whether the copy saves anything at a realistic
+    budget, the next evaluation once item 34 lands (Astra's order); stub
+    passes and cuts that break the cache on separate rounds; branching from identical checkpoints, the
     omission-listing, elision-only, and prompt-excerpts conditions, a
     realistic budget and preamble, threshold policies, and enough trials
     to attribute differences in compactions and retrievals. (From Astra
