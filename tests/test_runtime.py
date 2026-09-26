@@ -74,9 +74,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if (user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1) or user.startswith('limited-forever:'):
+            if ((user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1)
+                    or user.startswith('limited-forever:') or (user == 'tool:limited' and attempt == 2)):
                 # Transport-level refusals: a 503 or a CDN's 520 the next
-                # attempt clears, a 429 with Retry-After, or a 429 that never lifts.
+                # attempt clears, a 429 with Retry-After (for tool:limited, on
+                # the call after the tool), or a 429 that never lifts.
                 body = json.dumps({'error': {'message': 'try later'}}).encode()
                 self.send_response(520 if user.startswith('origin:') else
                                    503 if user.startswith(('flaky:', 'waitretry:')) else 429)
@@ -914,6 +916,22 @@ class RuntimeTests(ModelFixture):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         # Each turn is two calls; the second carries the token the first got back.
         self.assertEqual(self.model.routes, [None, 'route-1', None, 'route-3'])
+
+    def test_a_turn_keeps_its_routing_token_across_a_wait_and_a_rate_limit_park(self):
+        self.model.routes = []
+        self.model.retry_delays = ['0.3']
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        # Start a process, then park on it until it exits.
+        turn = client.request('submit', bot='Bob', request_id='w', prompt='bgwait:sleep .2')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # The call after the tool is refused for pace and the turn parks.
+        turn = client.request('submit', bot='Bob', request_id='p', prompt='tool:limited')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        # Each resumed call still carries its turn's first token.
+        self.assertEqual(self.model.routes, [None, 'route-1', 'route-1', None, 'route-4', 'route-4'])
 
     def test_each_calls_usage_records_when_it_was_sent(self):
         client = self.client()

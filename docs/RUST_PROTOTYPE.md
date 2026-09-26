@@ -474,10 +474,13 @@ first response, and each later call of that turn sends the first token back,
 so the backend can route it to the server holding the turn's cache. Codex
 does the same and never carries a token into another turn (openai/codex
 aa38089, `core/src/client.rs`, read 2026-09-25). A new turn and a summary
-start without one. The socket path does not carry the token. On short
-Terminal-Bench tasks over HTTP on 2026-09-25, 1 to 4 calls per task read
-nothing from the cache, while the calls around them read the whole previous
-request. Whether the token removes those misses has not been measured yet.
+start without one. A turn that parks on a wait or a rate limit keeps its token
+in the park record, so its calls after resuming send it too. The socket path
+does not carry the token. On short Terminal-Bench tasks over HTTP on
+2026-09-25, 1 to 4 calls per task read nothing from the cache, while the calls
+around them read the whole previous request. An A/B run that day (18 trials
+per arm) found the token left those misses unchanged, but calls that read only
+an older prefix fell from 21 to 4.
 
 Newer Claude models bind each replayed thinking block to the exact
 conversation before it (system prompt, tools, and earlier messages) and, for

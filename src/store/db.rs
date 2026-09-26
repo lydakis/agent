@@ -207,6 +207,10 @@ pub struct Waiting {
     /// Which model call to resume; ordinary calls bypass compaction once.
     #[serde(default)]
     pub compaction: bool,
+    /// The provider's sticky-routing token for the turn, so its calls after
+    /// the park keep going to the server that holds its cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
 }
 impl Waiting {
     fn paced_elapsed_ms(&self) -> i64 {
@@ -2653,6 +2657,7 @@ impl Database {
         Ok(Some(waiting))
     }
     /// Park a running turn on handles while its wait call is executing.
+    #[allow(clippy::too_many_arguments)]
     pub fn suspend(
         &mut self,
         turn: i64,
@@ -2661,6 +2666,7 @@ impl Database {
         deadline_ms: Option<u64>,
         any: bool,
         pending: &[ToolCall],
+        route: Option<&str>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         let executing: bool = self.conn.query_row(
@@ -2683,6 +2689,7 @@ impl Database {
             call_attempts: 0,
             call_spent_ms: 0,
             compaction: false,
+            route: route.map(str::to_owned),
         };
         let tx = self.conn.savepoint()?;
         tx.execute(
@@ -2708,6 +2715,7 @@ impl Database {
         retries: u64,
         paced_ms: u64,
         compaction: bool,
+        route: Option<&str>,
     ) -> Result<Value> {
         let bot = self.active(turn)?;
         if bot.status != "running" {
@@ -2725,6 +2733,7 @@ impl Database {
             call_attempts,
             call_spent_ms,
             compaction,
+            route: route.map(str::to_owned),
         };
         let tx = self.conn.savepoint()?;
         tx.execute(
