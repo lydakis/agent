@@ -78,7 +78,7 @@ class Agent(BaseInstalledAgent):
     ERROR_PATTERNS: ClassVar[list[ErrorPattern]] = [
         ErrorPattern(r'"error":"provider_(?:rate_limited|http_429|paced)"', ApiRateLimitError),
         ErrorPattern(r'"error":"provider_quota_exhausted"', ApiUsageLimitError),
-        ErrorPattern(r'"error":"provider_http_(?:500|502|504)"', ApiInternalServerError),
+        ErrorPattern(r'"error":"provider_http_5(?!03"|29")\d\d"', ApiInternalServerError),
         ErrorPattern(r'"error":"provider_(?:http_503|http_529|unavailable)"', ApiOverloadedError),
         ErrorPattern(r'"error":"provider_stream_stalled"', ApiResponseStalledError),
         ErrorPattern(r'"error":"(?:provider_connection_[a-z0-9_]+|provider_stream_failed'

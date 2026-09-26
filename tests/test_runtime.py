@@ -74,14 +74,15 @@ class Model(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if (user.startswith(('flaky:', 'limited:', 'waitretry:')) and attempt == 1) or user.startswith('limited-forever:'):
-                # Transport-level refusals: a 503 the next attempt clears, a
-                # 429 with Retry-After, or a 429 that never lifts.
+            if (user.startswith(('flaky:', 'origin:', 'limited:', 'waitretry:')) and attempt == 1) or user.startswith('limited-forever:'):
+                # Transport-level refusals: a 503 or a CDN's 520 the next
+                # attempt clears, a 429 with Retry-After, or a 429 that never lifts.
                 body = json.dumps({'error': {'message': 'try later'}}).encode()
-                self.send_response(503 if user.startswith(('flaky:', 'waitretry:')) else 429)
+                self.send_response(520 if user.startswith('origin:') else
+                                   503 if user.startswith(('flaky:', 'waitretry:')) else 429)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
-                if not user.startswith(('flaky:', 'waitretry:')):
+                if not user.startswith(('flaky:', 'origin:', 'waitretry:')):
                     delays = getattr(self.server, 'retry_delays', ['0.05'])
                     self.send_header('Retry-After', delays[min(attempt - 1, len(delays) - 1)])
                 self.end_headers()
@@ -1478,13 +1479,14 @@ class RuntimeTests(ModelFixture):
 
         for prompt, code in (('flaky:1', 'provider_http_503'), ('limited:1', 'provider_http_429'),
                              ('streamlimit:1', 'provider_rate_limited'),
-                             ('streamlimit-flat:1', 'provider_rate_limited')):
+                             ('streamlimit-flat:1', 'provider_rate_limited'),
+                             ('origin:1', 'provider_http_520')):
             with self.subTest(prompt=prompt):
                 data, retries = run(prompt)
                 self.assertEqual(data['status'], 'completed', data)
                 self.assertEqual([(r['attempt'], r['error']) for r in retries], [(1, code)])
         turns = client.request('turns', bot='Bob')['result']['turns']
-        self.assertEqual([t['retries'] for t in turns], [1, 1, 1, 1])
+        self.assertEqual([t['retries'] for t in turns], [1, 1, 1, 1, 1])
         self.assertGreaterEqual(turns[1]['paced_ms'], 40)   # the retry waited for the pool's Retry-After
         self.assertGreaterEqual(turns[2]['paced_ms'], 250)  # and for the delay named in the stream
         self.assertGreaterEqual(turns[3]['paced_ms'], 250)  # top-level error uses the same pool delay
