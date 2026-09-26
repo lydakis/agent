@@ -183,6 +183,27 @@ class DaemonTests(ModelFixture):
             self.assertEqual(everyone.finished(turn)['data']['status'], 'completed')
         self.assertEqual(len([e for e in everyone.durable if e['event'] == 'turn_finished']), 9)
 
+    def test_large_creations_sent_together_all_answer(self):
+        client = SocketClient(self.binary, self.path/'state.db', self.url, 'echo')
+        self.addCleanup(client.close)
+        # Each reply repeats both texts, so 32 replies are twice what one
+        # session's output queue holds at once.
+        text = 'x' * (64 * 1024)
+        creates = [dict(op='create', bot=f'big{n}', workspace=str(self.path), model='openai/synthetic-model',
+                        instructions=text, compaction_instructions=text, tools=['echo']) for n in range(32)]
+        lines = [dict(id=n, **r) for n, r in enumerate(creates)] + [dict(id=len(creates), op='stats')]
+        # A bad id is refused after the admission queued before it.
+        lines.insert(1, dict(id=dict(bad=True), op='submit', bot='big0', request_id='r1', prompt='hi'))
+        together = Connection(client.socket_path)
+        self.addCleanup(together.close)
+        together.socket.sendall(''.join(json.dumps(line) + '\n' for line in lines).encode())
+        replies = [together.receive(lambda e: 'id' in e and 'event' not in e) for _ in lines]
+        self.assertEqual([r['id'] for r in replies], [0, None, *range(1, len(creates) + 1)])
+        self.assertEqual(replies[1]['error'], 'invalid_request_id')
+        for reply in replies[:1] + replies[2:-1]:
+            self.assertEqual(reply['result']['instructions'], text)
+        self.assertIn('result', replies[-1])
+
     def test_stats_count_shared_transport_once_across_providers(self):
         self.model.release_headers = threading.Event()
         self.model.all_streaming = threading.Barrier(2)

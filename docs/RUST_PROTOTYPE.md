@@ -676,7 +676,12 @@ start a turn holds one `--max-active` slot until it is answered, so queued
 submissions never start more turns than the limit; when only promised slots
 stand between a submission and the limit, it waits too, since whether one
 frees up depends on how the earlier ones end. A burst therefore gets the
-answers it would get one request at a time. A lost group answers each of its
+answers it would get one request at a time. Queued replies go out back to
+back once their commit lands, faster than any client reads them, so an
+admission also waits when its session's output queue could not take its
+reply together with those already promised to that session. Each reply is
+bounded from its request: a creation's record repeats the request's strings
+and adds the canonical workspace. A lost group answers each of its
 admissions with `storage_error`, starts no turn, and frees their slots.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending

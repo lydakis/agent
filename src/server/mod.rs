@@ -10,7 +10,7 @@ use agent_runtime::{
     Error, Result,
     codec::{Family, split_model},
     fail, fail_with,
-    output::Output,
+    output::{self, Output},
     provider::{Provider, STREAMS_PER_CONNECTION, Transport},
     store::{Answer, Binding, Bot, Delivery, Fork, Publication, Started, Store, TurnOptions},
     tools::Registry,
@@ -39,6 +39,58 @@ use turn::Turn;
 /// idle one waits for no company. Anything else waits for those already
 /// queued, and they are answered in the order they arrived.
 const ADMISSION_WINDOW: usize = 32;
+/// A canonical workspace in a reply: the path limit, every byte escaped.
+const WORKSPACE_REPLY: usize = 6 * 4096 + 2;
+/// The rest of a reply: its envelope, keys, numbers, and short fixed strings.
+const REPLY_FIELDS: usize = 1024;
+
+/// At least the encoded bytes of an admission's reply. Queued admissions
+/// are answered back to back once their commit lands, faster than any
+/// client reads, so a session's replies must fit its output queue together.
+/// A creation answers with the bot's record, which repeats the request's
+/// strings (escaped no longer than the request wrote them) and the
+/// canonical workspace; a submission names its bot twice. A refusal says
+/// no more, and may name what it refused.
+fn reply_bound(command: &Command, id: &Value) -> usize {
+    let strings = match command {
+        Command::Create {
+            bot,
+            model,
+            instructions,
+            reasoning,
+            tools,
+            created_by,
+            compaction_instructions,
+            compaction_model,
+            ..
+        } => output::encoded_len(&(
+            id,
+            bot,
+            model,
+            instructions,
+            reasoning,
+            tools,
+            created_by,
+            compaction_instructions,
+            compaction_model,
+        )),
+        Command::Submit {
+            bot,
+            request_id,
+            model,
+            delivery,
+            ..
+        } => output::encoded_len(&(id, bot, bot, request_id, model, delivery)),
+        _ => return 0,
+    };
+    let workspace = match command {
+        Command::Create {
+            workspace: Some(_), ..
+        } => WORKSPACE_REPLY,
+        _ => 0,
+    };
+    strings.unwrap_or(output::MAX_EVENT) + workspace + REPLY_FIELDS
+}
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -505,6 +557,8 @@ struct Admission {
     session: u64,
     output: Output,
     id: Value,
+    /// `reply_bound` of its request: room it holds in the session's queue.
+    reply_bytes: usize,
     pending: Pending,
 }
 enum Pending {
@@ -889,29 +943,36 @@ pub async fn run(config: Configuration) -> Result<()> {
                     }
                     Inbound::Request(id, request) => {
                         let Some(output) = sessions.get(&id).cloned() else { continue };
+                        // A bad id is refused like a malformed line, after the
+                        // admissions queued before it.
+                        let request = request.and_then(|request| match &request.id {
+                            Value::Number(number) if number.is_u64() => Ok(request),
+                            Value::String(text) if text.len() <= 128 => Ok(request),
+                            _ => fail("invalid_request_id"),
+                        });
+                        let reply_bytes = request.as_ref().map_or(0, |r| reply_bound(&r.command, &r.id));
                         // Everything but an admission with room waits for the
                         // admissions already queued, keeping request order.
-                        while service.must_settle(request.as_ref().ok().map(|r| &r.command)) {
+                        while service.must_settle(request.as_ref().ok().map(|r| &r.command), id, &output, reply_bytes) {
                             let (session, output, id, result) = service.settle().await;
                             reply(&mut service, &mut sessions, stdio_owner, session, &output, id, result).await?;
                         }
                         let (request_id, result, shutdown) = match request {
-                            Ok(request) if request.id.is_u64() || request.id.as_str().is_some_and(|id| id.len() <= 128) => {
+                            Ok(request) => {
                                 let shutdown = match request.command {
                                     Command::Shutdown { grace_ms } => Some(grace_ms),
                                     _ => None,
                                 };
                                 let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
-                                let result = service.dispatch(request.command, id, &output, request.id.clone()).await;
+                                let result = service.dispatch(request.command, id, &output, request.id.clone(), reply_bytes).await;
                                 if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                 // A refused admission still answers after those queued before it.
                                 if admission && !service.admissions.is_empty() {
-                                    service.admissions.push_back(Admission { session: id, output, id: request.id, pending: Pending::Settled(result) });
+                                    service.admissions.push_back(Admission { session: id, output, id: request.id, reply_bytes, pending: Pending::Settled(result) });
                                     continue;
                                 }
                                 (request.id, result, shutdown)
                             }
-                            Ok(_) => (Value::Null, fail("invalid_request_id"), None),
                             Err(error) => (Value::Null, Err(error), None),
                         };
                         let shutdown = shutdown.filter(|_| result.is_ok());
@@ -1040,17 +1101,38 @@ impl Service {
 
     /// Whether a request must wait for queued admissions to be answered
     /// before it is handled. Only an admission may join them, and only while
-    /// the window has room and its capacity answer is the one the serial
-    /// order would give: with no slot left unpromised, whether one frees up
-    /// depends on how the queued admissions end.
-    fn must_settle(&self, command: Option<&Command>) -> bool {
+    /// the window has room, its session's output queue can take its reply
+    /// with those already promised to it, and its capacity answer is the one
+    /// the serial order would give: with no slot left unpromised, whether one
+    /// frees up depends on how the queued admissions end.
+    fn must_settle(
+        &self,
+        command: Option<&Command>,
+        session: u64,
+        output: &Output,
+        reply_bytes: usize,
+    ) -> bool {
         if self.admissions.is_empty() {
             return false;
         }
+        let full = || {
+            if self.admissions.len() >= ADMISSION_WINDOW {
+                return true;
+            }
+            let (bytes, packets) = output.room();
+            let (promised, replies) = self
+                .admissions
+                .iter()
+                .filter(|admission| admission.session == session)
+                .fold((reply_bytes, 1), |(bytes, count), admission| {
+                    (bytes + admission.reply_bytes, count + 1)
+                });
+            promised > bytes || replies > packets
+        };
         match command {
-            Some(Command::Create { .. }) => self.admissions.len() >= ADMISSION_WINDOW,
+            Some(Command::Create { .. }) => full(),
             Some(Command::Submit { .. }) => {
-                self.admissions.len() >= ADMISSION_WINDOW
+                full()
                     || (!self.draining
                         && self.limit_active != 0
                         && self.reserved > 0
@@ -1074,6 +1156,7 @@ impl Service {
             output,
             id,
             pending,
+            ..
         } = self.admissions.pop_front().expect("an admission is queued");
         let result = match pending {
             Pending::Submit {
@@ -1311,6 +1394,7 @@ impl Service {
         session: u64,
         output: &Output,
         id: Value,
+        reply_bytes: usize,
     ) -> Result<Value> {
         let store = &self.store;
         match command {
@@ -1402,6 +1486,7 @@ impl Service {
                     session,
                     output: output.clone(),
                     id,
+                    reply_bytes,
                     pending: Pending::Create {
                         answer,
                         answered: None,
@@ -1785,6 +1870,7 @@ impl Service {
                     session,
                     output: output.clone(),
                     id,
+                    reply_bytes,
                     pending: Pending::Submit {
                         bot,
                         request_id,
@@ -2266,6 +2352,7 @@ mod tests {
                 0,
                 &output,
                 Value::Null,
+                0,
             )
             .await
             .unwrap_err();
@@ -2279,6 +2366,7 @@ mod tests {
                 0,
                 &output,
                 Value::Null,
+                0,
             )
             .await
             .unwrap();
@@ -2539,12 +2627,15 @@ mod tests {
     ) -> Vec<(Value, Result<Value>)> {
         let mut answers = Vec::new();
         for (index, command) in commands.into_iter().enumerate() {
-            while service.must_settle(Some(&command)) {
+            let reply_bytes = reply_bound(&command, &json!(index));
+            while service.must_settle(Some(&command), 0, output, reply_bytes) {
                 let (_, _, id, result) = service.settle().await;
                 answers.push((id, result));
             }
             let admission = matches!(command, Command::Create { .. } | Command::Submit { .. });
-            let result = service.dispatch(command, 0, output, json!(index)).await;
+            let result = service
+                .dispatch(command, 0, output, json!(index), reply_bytes)
+                .await;
             if result.as_ref().is_err_and(|e| e.code == "deferred") {
                 continue;
             }
@@ -2553,6 +2644,7 @@ mod tests {
                     session: 0,
                     output: output.clone(),
                     id: json!(index),
+                    reply_bytes,
                     pending: Pending::Settled(result),
                 });
                 continue;
@@ -2912,17 +3004,28 @@ mod tests {
         commands.push(submit("A", "r2"));
         let count = commands.len();
         for (index, command) in commands.into_iter().enumerate() {
-            assert!(!service.must_settle(Some(&command)), "the window has room");
-            let deferred = service.dispatch(command, 0, &output, json!(index)).await;
+            let bytes = reply_bound(&command, &json!(index));
+            assert!(
+                !service.must_settle(Some(&command), 0, &output, bytes),
+                "the window has room"
+            );
+            let deferred = service
+                .dispatch(command, 0, &output, json!(index), bytes)
+                .await;
             assert_eq!(deferred.unwrap_err().code, "deferred");
         }
         assert_eq!(service.admissions.len(), count);
         assert_eq!(service.reserved, 6, "every submission holds a slot");
         assert!(
-            service.must_settle(Some(&Command::Interrupt {
-                bot: "A".into(),
-                turn: 1
-            })),
+            service.must_settle(
+                Some(&Command::Interrupt {
+                    bot: "A".into(),
+                    turn: 1
+                }),
+                0,
+                &output,
+                0
+            ),
             "anything else waits for queued admissions"
         );
         gate.send(()).unwrap();
@@ -2960,6 +3063,99 @@ mod tests {
             "one turn started per fresh submission"
         );
         assert_eq!(service.reserved, 0);
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_queues_no_more_admissions_than_its_output_can_take() {
+        let dir = scratch("admit-room");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        // A client that has read nothing yet: its queue holds every reply.
+        let (near, _far) = tokio::io::duplex(64);
+        let output = Output::writer(near);
+        let large = |bot: String| {
+            let mut command = create(&bot, &dir);
+            if let Command::Create {
+                instructions,
+                compaction_instructions,
+                ..
+            } = &mut command
+            {
+                *instructions = Some("i".repeat(64 * 1024));
+                *compaction_instructions = Some("c".repeat(64 * 1024));
+            }
+            command
+        };
+        let mut queued = 0;
+        while queued < ADMISSION_WINDOW {
+            let command = large(format!("B{queued}"));
+            let bytes = reply_bound(&command, &json!(queued));
+            if service.must_settle(Some(&command), 1, &output, bytes) {
+                break;
+            }
+            let deferred = service
+                .dispatch(command, 1, &output, json!(queued), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            queued += 1;
+        }
+        assert!(queued > 1, "replies that fit share the window");
+        assert!(queued < ADMISSION_WINDOW, "the session's queue fills first");
+        let elsewhere = Output::writer(tokio::io::sink());
+        let command = large("Elsewhere".into());
+        let bytes = reply_bound(&command, &json!(0));
+        assert!(
+            !service.must_settle(Some(&command), 2, &elsewhere, bytes),
+            "another session's admission still joins"
+        );
+        // Sent back to back, as the run loop sends them, every reply fits.
+        while !service.admissions.is_empty() {
+            let (_, output, id, result) = service.settle().await;
+            output.try_respond(id, Ok(result.unwrap())).unwrap();
+        }
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_bounds_cover_the_replies() {
+        let dir = scratch("reply-bound");
+        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let mut service = admitting(&store, 1024);
+        let output = Output::writer(tokio::io::sink());
+        // Every character here is escaped in JSON, or longer than one byte.
+        let awkward = "\"\\\u{1}\n/é".repeat(1000);
+        let id = json!("\u{1}".repeat(128));
+        let mut create = create("Bot", &dir);
+        if let Command::Create {
+            instructions,
+            reasoning,
+            compaction_instructions,
+            compaction_model,
+            ..
+        } = &mut create
+        {
+            *instructions = Some(awkward.clone());
+            *reasoning = Some("high".into());
+            *compaction_instructions = Some(awkward);
+            *compaction_model = Some("openai/synthetic".into());
+        }
+        for command in [create, submit("Bot", "r1")] {
+            let bytes = reply_bound(&command, &id);
+            assert!(!service.must_settle(Some(&command), 0, &output, bytes));
+            let deferred = service
+                .dispatch(command, 0, &output, id.clone(), bytes)
+                .await;
+            assert_eq!(deferred.unwrap_err().code, "deferred");
+            let (_, _, _, result) = service.settle().await;
+            let reply = json!({"id": id, "result": result.unwrap()});
+            let sent = output::encoded_len(&reply).unwrap() + 1;
+            assert!(sent <= bytes, "{sent} bytes sent, {bytes} promised");
+        }
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -3052,7 +3248,7 @@ mod tests {
         let (held, gate) = hold(&store).await;
         for (index, bot) in ["Alice", "Bob"].into_iter().enumerate() {
             let deferred = service
-                .dispatch(submit(bot, "r1"), 0, &output, json!(index))
+                .dispatch(submit(bot, "r1"), 0, &output, json!(index), 0)
                 .await;
             assert_eq!(deferred.unwrap_err().code, "deferred");
         }

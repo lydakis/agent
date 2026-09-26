@@ -4863,11 +4863,22 @@ phases RSS was 20.5 MiB serial and 20.8 MiB windowed, ranges not
 overlapping. Up to 32 admissions and their replies now live at once; what
 holds the extra 0.3 MiB was not isolated.
 
+A creation's reply repeats its instructions and compaction instructions,
+64 KiB each at most. In a unit test without the check below, 32 such
+replies sent back to back overflowed a session's 2 MiB output queue
+(`output_lagged`), which closes a socket session after its bots were
+created. An admission now waits when its session's queue could not take
+its reply with the ones already promised to that session. With both at
+64 KiB, 13 share a window. On the burst above, where replies are small, the check changed
+nothing measurable: five runs each, last reply 5.11 ms before and 5.14 ms
+after for submissions, 4.41 and 4.29 ms for creations.
+
 Ordering tests cover a shared commit answered in request order, a retry and
 busy work queued behind the admission they depend on, the active limit with
 a promised slot that goes unused, a lost group commit that starts nothing
-and frees its slots, an interrupt behind the admission it names, and four
-clients sending the same submission at once. Shutdown with queued
+and frees its slots, an interrupt behind the admission it names, large
+creations that must fit their session's output queue, and four clients
+sending the same submission at once. Shutdown with queued
 admissions is covered by reading the code, not by a test. All of this is one
 Linux container with an injected sync delay; macOS, where a flush costs
 about 5.4 ms, is not measured. The burst uses one connection; many clients

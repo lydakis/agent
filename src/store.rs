@@ -1090,11 +1090,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(30));
         });
         inside.recv().unwrap();
-        queue_labelled(&store, "held", insert(1))
-            .await
-            .await
-            .unwrap()
-            .unwrap();
+        // Nothing holds the worker, so the job may leave its channel before
+        // `queue_labelled` sees it there; wait for the answer alone.
+        store.enqueue("held", None, insert(1)).await.unwrap();
         snapshot.join().unwrap();
         let held = &store.stats()["operations"]["held"];
         assert!(held["ran_ms"].as_u64().unwrap() < 30);
