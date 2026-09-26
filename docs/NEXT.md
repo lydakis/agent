@@ -619,9 +619,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     copy cost the same per byte summarized as a fresh request at 128 KiB
     and less at 256 KiB (one summary), and half the copy arm's summaries
     at 128 KiB fell back to requests of their own after an oversized
-    result. Still open: choosing per summary between the copy and a
-    request of its own by estimated cost, and trimming the copy on
-    overflow as Claude Code and Codex do; stub
+    result. Each summary now estimates both from the sizes the store
+    keeps and sends the cheaper, copying the call through the span's end
+    when the view is over the limit, as Claude Code and Codex trim theirs.
+    In [run 5](LONG_TASK_EVAL.md#live-run-5) the choice sent 10 of 11
+    summaries as copies, catch-up steps included, at 0.093
+    token-equivalents per byte summarized against 0.330 copying the whole
+    call and 0.337 for requests of their own. Still open: a steer that
+    waits while one result in the newest boundary fills the room it needs
+    (two of 50 bots in run 5; a scripted task shows it on main too); stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts
     conditions, a realistic preamble, a task long enough that summaries

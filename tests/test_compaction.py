@@ -746,6 +746,27 @@ class SummaryCopyTests(ModelFixture):
         self.assertEqual((compacted['request']['form'], compacted['request']['items']), ('copy', 5))
         self.assertGreater(compacted['request']['estimate']['own'], 4 * compacted['request']['estimate']['copy'])
 
+    def test_a_paced_summary_the_budget_forces_copies_the_same_call_after_a_restart(self):
+        # The view the retry reads is still over the budget; the call it
+        # copies was not, and the retry sends that call again.
+        client = self.start(tools='shell', budget=16384)
+        self.model.compaction_refusals = 1
+        turn = client.request('submit', bot='Bob', request_id='1',
+                              prompt='long:2x100,1x700,1x10')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        client.close(kill=True)
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell',
+                        extra=('--context-bytes', '16384', '--compact-at', '50'))
+        self.addCleanup(client.close)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = self.requests()
+        paced, retry = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual((self.copies(requests[:retry]), retry), ([paced], paced + 1))
+        self.assertEqual(requests[retry], requests[paced])
+        compacted, = [e['data'] for e in self.events(client, 'compacted')]
+        self.assertTrue(compacted['catch_up'])
+        self.assertEqual((compacted['request']['form'], compacted['request']['items']), ('copy', 5))
+
     def test_a_copy_that_calls_a_tool_is_billed_and_asked_again_on_its_own(self):
         # As Claude Code does: the copy's reply is not installed, and the
         # summary is asked for again at once, without tools.

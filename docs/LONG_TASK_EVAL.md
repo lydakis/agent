@@ -502,6 +502,72 @@ more at 20 KiB (runs 1 and 2, different commits), the same per byte at
 128 KiB, and 54% less at 256 KiB (one summary each). It pays when the span
 is large beside what is new since the last call.
 
+## Live run 5
+
+2026-09-26, 22:03 to 22:08 UTC, the per-summary choice at commit
+`dd95047` (binary `8a88f4b0…`, also used for `large-compact` and
+`large-full`), against the commit before it, which copies whenever the
+copy fits (`d9ecbcf`, `663831db…`), and `dd95047` with the copy turned off
+(`eecdf4a3…`). Same model, plan, seed and host as runs 3 and 4; ten bots
+per arm, all five arms at once, at 128 KiB except `large-full`.
+
+| | large-compact | summary, choice | summary, always copy | summary, own | large-full |
+| --- | --- | --- | --- | --- | --- |
+| Completed, vendor intact, migrated once | 10/10 each | 10/10 each | 10/10 each | 10/10 each | 10/10 each |
+| Correct and steered | 10/10 | 9/10 | 10/10 | 9/10 | 10/10 |
+| Number reported | 10/10 | 9/10 | 10/10 | 10/10 | 10/10 |
+| Bots that ran `make quick` (none twice) | 3 | 1 | 0 | 1 | 0 |
+| Bots that stubbed / summarized | 7 / 2 | 0 / 6 | 0 / 6 | 0 / 5 | 0 / 0 |
+| Summaries (catch-up steps) | 2 (0) | 11 (3) | 17 (6) | 11 (6) | none |
+| Peak input tokens per bot | 21,384 to 34,510 | 21,249 to 36,002 | 21,267 to 34,742 | 21,596 to 35,362 | 25,059 to 83,673 |
+| Model calls | 137 | 135 | 144 | 135 | 145 |
+| Model input / cached / output tokens | 2,693,866 / 1,998,848 / 15,378 | 2,994,329 / 2,432,768 / 13,607 | 3,217,943 / 2,478,080 / 14,608 | 2,939,962 / 2,331,776 / 14,283 | 4,300,903 / 3,860,224 / 16,056 |
+| Model input served from cache | 74% | 81% | 77% | 79% | 90% |
+| Summarizer input / cached / output tokens | 2,674 / 0 / 918 | 238,176 / 193,024 / 7,263 | 482,520 / 129,536 / 13,012 | 251,401 / 0 / 7,600 | none |
+| Summarizer token-equivalents per byte summarized | 0.229 | 0.093 | 0.330 | 0.337 | none |
+| Input token-equivalents per bot, cached at a tenth | 89,758 | 86,929 | 135,361 | 109,276 | 82,670 |
+| Summary time holding the model back | 60.7 s | 450.0 s | 701.6 s | 381.0 s | none |
+| Condition wall time | 201.3 s | 220.5 s | 250.1 s | 232.7 s | 217.0 s |
+
+- The choice sent 10 of its 11 summaries as copies, catch-up steps
+  included, each of the call through the span's end. Nine read 97.8% to
+  99.2% of their input from cache: about 2,400 token-equivalents for a
+  62 KB span, where a request of its own for a span that size cost about
+  21,000 in the arm with no copy. One copy read no cache and cost 21,420,
+  about what a request of its own costs, since the copy stops at the
+  span's end.
+- The estimates tracked the bill. The copies the cache read came to 3.0
+  to 3.3 estimated bytes per token-equivalent. The choice's own estimates
+  for 62 KB spans, about 64,000, came to about 3.05 per token of the other
+  arm's requests of their own for spans that size. So the estimated ratio
+  of copy to own held within about 10%. The estimate does not model a
+  cache miss.
+- The eleventh summary was a catch-up step whose first request was paced.
+  Its retry rebuilt the view it had copied under the budget, which that
+  view was over, so it went as a request of its own with no estimate. That
+  is fixed after this run, and a scripted test paces the same step and
+  checks that the retry sends the paced copy again; not measured live.
+- The commit before copied the whole call rather than through the span,
+  and sent every catch-up step as a request of its own. Its summaries read
+  27% of their input from cache and cost as much per byte as requests of
+  their own. It also ran more summaries (17 in 6 bots, against 11 in 6),
+  which depends on what each model trajectory printed (inferred from the
+  views).
+- Two bots lost the steered correction: one in the choice arm and one in
+  the arm with no copy, each after a catch-up step left one large result
+  filling most of the budget. The steer waited for room that no summary
+  could make, since the result was part of the newest boundary, and failed
+  with `stale_turn` when the task ended (hidden tests 5/9; the cause is
+  inferred from their views). A scripted task reproduces it on `d9ecbcf`
+  as well, so the choice did not cause it.
+- Summaries held the model back about 41 s each in the choice arm, against
+  35 s for requests of their own; fifty bots ran at once, and a summary of
+  908 uncached tokens took 51.6 s, so the time here is the backend's
+  queue, not the request's size (inferred).
+- Compacting still did not pay on this task: full context cost 82,670
+  token-equivalents per bot against 86,929 with the choice, the cheapest
+  of the compacting arms.
+
 ## Not covered yet
 
 The rest of item 36: branching every condition from identical
@@ -510,8 +576,6 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 1,000 tokens with the tools), a task long enough that summaries run
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
-compactions and retrievals. From runs 3 and 4: choosing per summary
-between the copy and a request of its own from the byte sizes the store
-already keeps, trimming the copy rather than dropping it when the view is
-over the limit, and a task whose context grows well past the budget,
-where compacting could pay.
+compactions and retrievals. From runs 3 to 5: a task whose context grows
+well past the budget, where compacting could pay, and a steer that waits
+while one result fills the room it needs.

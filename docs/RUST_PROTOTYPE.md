@@ -1748,7 +1748,10 @@ and `items`, the window items copied) with both estimates, `null` where a
 way could not be sent. A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
 starts, and that prefix when the view no longer sends it, so its retry,
-after a restart too, can copy the same call through the span. It does not set `tool_choice`, which on
+after a restart too, can copy the same call through the span. A summary
+the budget forced keeps that prefix, and its retry reads the window past
+the budget, since the view it summarizes is over it and the call it
+copied was not. The copy does not set `tool_choice`, which on
 Anthropic would invalidate the message cache, so the request asks for text
 and a reply that calls a tool (`compaction_tool_call`) or has no text
 (`empty_summary`) is billed and not installed. As Claude Code does, the

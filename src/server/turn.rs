@@ -49,6 +49,8 @@ const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 /// Nodes per piece of a compaction catch-up walk: a few milliseconds of
 /// metadata reads, after which other bots' reads may run.
 const CATCH_UP_PIECE_NODES: i64 = 1024;
+/// A window budget no view reaches, for reading one whole.
+const UNBOUNDED: usize = i64::MAX as usize / 4;
 /// Read-ahead while a body streams: a batch stops at either bound, so the
 /// memory held per in-flight request is a number, not a function of item
 /// sizes. An item larger than the byte bound travels alone.
@@ -1207,19 +1209,23 @@ impl Turn {
 
     /// The view a parked summary copied, rebuilt for its retry: under the
     /// floor its call was read under, behind what that call sent ahead of
-    /// it when the view no longer sends that. `None` when the window no
-    /// longer starts where the call's did.
+    /// it when the view no longer sends that. A summary made because the
+    /// view outgrew the budget kept what went ahead, and its window is
+    /// read past the budget, as the call sent less than the view now
+    /// holds. `None` when the window no longer starts where the call's did.
     async fn restored(&self, call: agent_runtime::store::CopiedCall) -> Result<Option<LastCall>> {
-        let mut view = match self
-            .context_under(
-                self.context_bytes,
-                self.context_items,
-                self.context_bytes * 2 / 3,
-                Some(call.floor),
-            )
-            .await
-        {
+        let prefix_budget = self.context_bytes * 2 / 3;
+        let under =
+            |bytes, items| self.context_under(bytes, items, prefix_budget, Some(call.floor));
+        let mut view = match under(self.context_bytes, self.context_items).await {
             Ok(view) => view,
+            Err(error) if error.code == "context_limit" && call.prefix.is_some() => {
+                match under(UNBOUNDED, UNBOUNDED).await {
+                    Ok(view) => view,
+                    Err(error) if error.code == "context_limit" => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            }
             Err(error) if error.code == "context_limit" => return Ok(None),
             Err(error) => return Err(error),
         };
