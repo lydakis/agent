@@ -3,6 +3,7 @@
 //! signatures so tool-using turns can continue.
 use super::{
     Completion, Delta, Frame, MAX_OUTPUT, ModelTokens, ToolCall, Usage, detail_of, encoded_len,
+    valid_call_id,
 };
 use crate::{Error, Result, fail, fail_with};
 use bytes::Bytes;
@@ -147,7 +148,7 @@ impl State {
                 ) {
                     self.account(frame.len())?;
                 }
-                self.blocks.push(match block["type"].as_str() {
+                let started = match block["type"].as_str() {
                     Some("text") => Block::Text(String::new()),
                     Some("thinking") => Block::Thinking {
                         thinking: String::new(),
@@ -162,13 +163,20 @@ impl State {
                         self.fallbacks.push((from, to.to_owned()));
                         Block::Fallback(block.clone())
                     }
-                    Some("tool_use") => Block::ToolUse {
-                        id: string("id")?,
-                        name: string("name")?,
-                        input: String::new(),
-                    },
+                    Some("tool_use") => {
+                        // Stored in the item, and a gated call's id again in
+                        // its announcement, so they count like any output.
+                        let (id, name) = (string("id")?, string("name")?);
+                        self.account(encoded_len(&id) + encoded_len(&name))?;
+                        Block::ToolUse {
+                            id,
+                            name,
+                            input: String::new(),
+                        }
+                    }
                     _ => return fail("unsupported_content"),
-                });
+                };
+                self.blocks.push(started);
                 Ok(Frame::Quiet)
             }
             Some("content_block_delta") => {
@@ -380,7 +388,7 @@ impl State {
                     };
                     let parsed: Value = serde_json::from_str(&arguments)
                         .map_err(|_| Error::new("invalid_tool_arguments"))?;
-                    if id.is_empty() || calls.iter().any(|c| c.call_id == id) {
+                    if !valid_call_id(&id) || calls.iter().any(|c| c.call_id == id) {
                         return fail("invalid_tool_call_id");
                     }
                     calls.push(ToolCall {
@@ -409,6 +417,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::MAX_CALL_ID;
     fn feed(state: &mut State, frames: &[&str]) -> Vec<String> {
         let mut deltas = Vec::new();
         for frame in frames {
@@ -420,6 +429,51 @@ mod tests {
             }
         }
         deltas
+    }
+    #[test]
+    fn tool_use_ids_count_toward_the_output_limit() {
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#)
+            .unwrap();
+        // Each id is within its own bound; together they pass the output's.
+        let mut failed = None;
+        for index in 0..=MAX_OUTPUT / MAX_CALL_ID {
+            let id = format!("{index:02}{}", "c".repeat(MAX_CALL_ID - 2));
+            let start = json!({"type":"content_block_start","index":index,
+                "content_block":{"type":"tool_use","id":id,"name":"shell","input":{}}});
+            if let Err(error) = state.frame(start.to_string().as_bytes()) {
+                failed = Some((index, error.code));
+                break;
+            }
+        }
+        // Twelve ids alone fill the limit, so the twelfth block's name passes it.
+        assert_eq!(
+            failed,
+            Some((MAX_OUTPUT / MAX_CALL_ID - 1, "output_limit".to_owned()))
+        );
+    }
+    #[test]
+    fn a_tool_use_id_over_the_bound_fails() {
+        for (id, code) in [
+            ("c".repeat(MAX_CALL_ID), None),
+            ("c".repeat(MAX_CALL_ID + 1), Some("invalid_tool_call_id")),
+            ("x\0y".into(), Some("invalid_tool_call_id")),
+        ] {
+            let mut state = State::default();
+            let start = json!({"type":"content_block_start","index":0,
+                "content_block":{"type":"tool_use","id":id,"name":"shell","input":{}}});
+            feed(
+                &mut state,
+                &[
+                    r#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+                    &start.to_string(),
+                    r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}"#,
+                    r#"{"type":"message_stop"}"#,
+                ],
+            );
+            assert_eq!(state.finish().err().map(|e| e.code).as_deref(), code);
+        }
     }
     #[test]
     fn thinking_text_and_tool_use_become_one_native_assistant_item() {

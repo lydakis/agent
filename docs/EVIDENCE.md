@@ -1,9 +1,10 @@
 # Current evidence
 
 Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
-updated at `095ff68` for admission batching and disk-full containment and at
-`e707632` and `6a81bd6` for the realistic-budget long-task runs. This
-is the one place that says what is currently known. The documents it links to
+updated at `095ff68` for admission batching and disk-full containment, at
+`e707632` and `6a81bd6` for the realistic-budget long-task runs, and at
+`973be14`, the change that built tool approval, for its cost and a store
+lock fix. This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -63,6 +64,20 @@ more turns is not here, because its work changes with its speed; it is under
   with only `temp_store=MEMORY` added (the line `4260673` landed),
   2026-09-26; macOS, where creating a file may cost more, is not measured.
   [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
+- **Tool approval.** One synthetic `shell` call per turn, 200 turns on one
+  bot, medians of three rotated runs, with the screen itself answering
+  `allow`. An ungated bot pays nothing: the same commits and fsyncs as main
+  (11 and 6.24 a turn), p50 13.3 against 13.4 ms, and 266 against 260
+  turns a second over 32 bots. A call answered within the hold adds no
+  durable commit and about 0.7 ms at the median (14.0 ms, the screen's
+  answering round trip included); one answered after its turn parks adds
+  three durable commits and about 2.6 ms (9.32 fsyncs a turn, 16.0 ms).
+  With one screen answering 32 bots, the screen becomes the wait: 391 turns
+  a second ungated (main 381), 292 held, 192 parked. Linux x86_64
+  container, `973be14` against main at `ddf3f8b`, with within-turn
+  compaction, 2026-09-26; an earlier run at `7238c6c` found the same.
+  macOS and the automatic approver's own cost are not measured.
+  [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB
   and 24.9 s, opencode 927 MiB and 14.4 s, Claude Code 6,494 MiB and 23.8 s.
@@ -192,6 +207,17 @@ Reconnects, retention, overload, compaction and recovery.
   before it exited. Linux x86_64 container, `8724f22` against `4260673` and
   `095ff68`, 2026-09-26; no run on a nearly full macOS disk.
   [Record](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment).
+- **A group takes the write lock when it begins.** Groups began deferred,
+  so a job that read before it wrote asked for SQLite's write lock inside
+  the transaction, where SQLite answers `SQLITE_BUSY` at once rather than
+  wait; the daemon's reader holds that lock for a moment when it catches
+  the WAL header mid-update. With 32 bots at 25 turns under strace, 6 of
+  11 runs failed a turn with `storage_error`, on main at `3bfb0b0` and on
+  the approval branch alike; beginning each group `IMMEDIATE`, none of 9
+  did. The untraced runs never hit it. Linux x86_64 container, `a72a2ec`,
+  2026-09-26; the store test
+  `a_group_waits_for_a_write_lock_another_connection_holds` reproduces the
+  error without strace.
 - **Retention.** A race that could lose a completion event under
   `--retain-turns 1` (2 of 10 runs) is fixed (0 of 10). Retention halves
   per-turn store growth (1.4 against 2.8 KB).
@@ -260,4 +286,6 @@ Reconnects, retention, overload, compaction and recovery.
   it per operation, but no run has recorded it.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
-- Multi-daemon operation, approvals, and concurrent tool calls: designs only.
+- Tool approval on macOS.
+- Multi-daemon operation, the automatic approver (rules and Jev), and
+  concurrent tool calls: designs only.
