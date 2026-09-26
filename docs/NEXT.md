@@ -767,16 +767,18 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     5.4 ms on an M1 Max, paid once per group; the service loop above now
     matters on a Mac as much as on slow Linux storage.
 
-45. Approving tool calls. Every allowed call runs without a verdict today.
-    [The design](APPROVALS.md) gives a bot an `approve` list of tools whose
-    calls wait for an `answer` from any client: the request rides the plan
-    commit, the verdict rides the call's start or its denial, and a verdict
-    that has not arrived within a short hold parks the turn like `wait`.
-    The daemon has no rules, prompts, or model. Manual approval is the CLI
-    or the app answering; automatic approval is a client that answers from
-    deterministic rules first, then asks Jev a few narrow questions per
-    round, and escalates or denies what stays unclear. It is oversight, not
-    a sandbox. First, count the tool mix in the Harbor transcripts to see
+45. Approving tool calls. Every allowed call runs without a verdict today,
+    and that stays the default. [The design](APPROVALS.md) adds two more
+    modes, chosen per bot with `--approval` or `AGENT_APPROVAL`: `auto`,
+    where a client answers from deterministic rules first, then asks Jev a
+    few narrow questions per round, and denies what is dangerous or unclear
+    without asking anyone; and `manual`, where a person or program answers.
+    The daemon only gets an `approve` list of tools whose calls wait for an
+    `answer` from any client, and an opaque approver tag: the request rides
+    the plan commit, the verdict rides the call's start or its denial, and a
+    verdict that has not arrived within a short hold parks the turn like
+    `wait`. It has no rules, prompts, or model. It is oversight, not a
+    sandbox. First, count the tool mix in the Harbor transcripts to see
     how many rounds would reach Jev; then a labeled Jev run, which is paid
     and waits for George.
 

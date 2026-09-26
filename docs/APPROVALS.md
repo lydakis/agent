@@ -24,27 +24,36 @@ has to be counted per call.
 
 ## Recommendation in brief
 
-1. **The daemon gets one mechanism and no policy.** A bot can name tools
+1. **Three modes, and full access stays the default.** `full` is today's
+   behavior: every allowed call runs, and nothing new is paid. `auto`
+   lets an automatic approver decide with no person in the loop. `manual`
+   waits for a person or a program to answer each gated call. The CLI
+   takes the mode from `--approval` or `AGENT_APPROVAL` when it creates a
+   bot, like `AGENT_MODEL`; unset means `full` (George, 2026-09-26).
+2. **The daemon gets one mechanism and no policy.** A bot can name tools
    whose calls wait for a verdict. The daemon announces those calls when the
    model plans them, waits for an `answer` from any client, runs or refuses
    the call, and records who decided. It has no rules, no prompts, no model,
    and no timeout of its own.
-2. **Manual and automatic are clients.** Which one answers is the mode.
-   Switching modes, or running both with the model escalating to a person,
-   needs no change to the bot.
-3. **The automatic approver is layered, and most calls never reach a
-   model.** Ungated tools skip it entirely. Deterministic rules in the client
-   answer the obvious cases in microseconds. Jev answers a handful of narrow
-   questions about the rest in about 0.4 s. Whatever stays unclear goes to a
-   person, a larger model, or a denial, never to a silent allow.
-4. **The fast path adds no storage commit.** Requests ride the commit that
+3. **Manual and automatic are clients.** The mode names live in the CLI and
+   the app; the daemon sees a list of gated tools and an opaque tag naming
+   which approver answers.
+4. **Auto is hands-off.** Deterministic rules in the client answer the
+   obvious cases in microseconds, and Jev answers a handful of narrow
+   questions about the rest in about 0.4 s. What is dangerous or unclear is
+   denied, never silently allowed and never sent to a person. The model
+   gets the reason and tries another way, or tells its caller what it
+   needs. If the caller then says yes in a message that names the action,
+   the approver reads that as the user's consent on the retry. Nobody
+   approves anything in a separate step.
+5. **The fast path adds no storage commit.** Requests ride the commit that
    already records the model's plan, and verdicts ride the commit that
    already starts or finishes the call. A verdict answered by rules costs
    one socket round trip, measured at 0.13 ms median, and one job on the
    storage worker that commits nothing. A person's slow answer
    parks the turn durably, like `wait`, so it holds no task and no slot and
    survives a restart.
-5. **It is oversight, not containment.** An allowed shell command runs with
+6. **It is oversight, not containment.** An allowed shell command runs with
    the user's permissions and can reach the daemon's socket. Approval
    catches mistakes and overeager actions; only a sandbox around the tools
    bounds what an approved command can do.
@@ -188,6 +197,10 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   cost. Like `tools`, it is fixed for the bot's life; there is no operation
   that removes a tool from it, because the bot's own shell could call that
   operation. The CLI flag is `run --approve shell,write,edit`.
+- **`create` also takes an `approver` tag,** an opaque string the daemon
+  stores, reports in `resume`, `bots`, and `approval_requested`, and copies
+  with the list, but never interprets. Clients use it to decide who answers
+  (see the modes above).
 - **A fork copies it and can only add to it,** the mirror of the allowed
   list, which a fork can only narrow. Tool definitions never change, so the
   prompt cache is untouched.
@@ -280,6 +293,31 @@ The daemon never judges a call, never writes text for the model beyond the
 error code, and never times out a verdict. A client that wants a deadline
 denies on its own clock.
 
+### The three modes
+
+| Mode | Gated tools | Who answers | Default |
+| --- | --- | --- | --- |
+| `full` | none | nobody; every allowed call runs | yes |
+| `auto` | `shell,write,edit,read` | the automatic approver | |
+| `manual` | `shell,write,edit,read` | a person, through the app or `agent answer`, or a program | |
+
+- **Chosen per bot at creation.** `agent run --new --approval auto`, or
+  `AGENT_APPROVAL=auto` in the environment, as `AGENT_MODEL` sets a model.
+  `--approve LIST` changes which tools are gated. A child or fork gets its
+  creator's mode, as the daemon section says.
+- **The daemon sees no modes.** The CLI turns a mode into two `create`
+  fields: the `approve` list, and an `approver` tag the daemon stores and
+  reports but never reads (`auto` or `manual`). The automatic approver
+  answers only bots tagged `auto`; the app offers Allow and Deny only on
+  bots tagged `manual`. So one daemon can run bots in all three modes at
+  once, and a program can invent its own tag and answer those bots itself.
+- **`auto` needs its approver running.** The CLI already starts the daemon
+  when it is not running; with `auto` it starts `agent approver` the same
+  way. A gated call with no approver waits, parked and visible in
+  `approvals`, rather than running or failing silently.
+- **Software callers keep `full`.** A program that drives bots gains nothing
+  from a gate it has to answer itself, and `full` pays nothing.
+
 ### Manual mode
 
 - **CLI:** `agent approvals [--bot NAME]` lists pending calls;
@@ -288,8 +326,8 @@ denies on its own clock.
   it. `agent answer` refuses to run inside a tool shell (it sees
   `AGENT_BOT`), the same kind of guard as the creator identity: it stops
   accidents, not a determined command.
-- **App:** a pending call renders as a card on the bot's timeline with Allow
-  and Deny (with an optional note). The app already follows every bot, so it
+- **App:** on a bot tagged `manual`, a pending call renders as a card on
+  the bot's timeline with Allow and Deny (with an optional note). The app already follows every bot, so it
   gets `approval_requested` with no new subscription.
 - **Program:** any process that follows events can answer. A CI job can
   allow a fixed set of commands and deny the rest with no model at all.
@@ -364,22 +402,33 @@ same module inside the app. It follows `approval_requested` on every bot
    (jev-bench, 12 tasks, 2026-09-20) found answers reliable at 0.9 and
    task-dependent below it. So the thresholds are set from our own labeled
    run (below), per question.
-4. **Unclear.** With a person attached (the app is open, or `agent
-   approver --escalate`), the approver answers nothing and marks the call
-   for the person, who sees only these. Unattended, it asks a larger model
-   if one is configured, else denies. That larger model can be a bot in the
-   same daemon with only `read`, working as Codex's reviewer does: a
-   separate turn that may look at files before it answers. It never allows
-   on an unclear, failed, or timed-out verdict. As in Codex, the reason
-   says which it was: "judged risky: REASON" or "not reviewed: the check
-   failed", so the model can tell a refusal from an outage. A Jev request
-   gets 10 s, the SDK's default, before it counts as failed.
+4. **Unclear or dangerous: deny, and let consent come through messages.**
+   The approver denies with a reason and moves on; it never pages a
+   person. The reason tells the model what was refused and that it can ask
+   its caller for an explicit go-ahead. If the caller's next message (a new
+   turn or a steer) names the action, the intent question now finds it in
+   a prompt the caller wrote, and the retry is allowed. This is how Claude
+   Code's auto mode already weighs explicit user intent, and it needs no
+   approval screen: consent is part of the conversation. Only prompts from
+   the caller count, never a prompt one bot wrote for another, and the
+   message has to name the action, not just say "go ahead". The hard
+   denies (a force push to a protected branch, `rm -rf` outside the
+   workspace, the approval channel itself) stay denied whatever the prompt
+   says; changing those is an edit to the approver's rules. An optional
+   larger model can take the unclear band before the denial: a bot in the
+   same daemon with only `read`, working as Codex's reviewer does, a
+   separate turn that may look at files before it answers. The approver
+   never allows on an unclear, failed, or timed-out verdict. As in Codex,
+   the reason says which it was: "judged risky: REASON" or "not reviewed:
+   the check failed", so the model can tell a refusal from an outage. A Jev
+   request gets 10 s, the SDK's default, before it counts as failed.
 5. **Circuit breaker.** After 3 denials in a row for a bot, or 20 in one
-   turn, the approver stops answering that bot automatically and escalates
-   everything, or interrupts the turn when no one is attached. Claude Code
-   uses 3 and 20 per session and then asks; Codex uses 3 in a row or 10 of
-   the last 50 and interrupts. A model that keeps trying variations of a
-   denied action is the pattern this catches.
+   turn, the approver denies every call of that turn that the rules do not
+   allow outright, with a reason asking the model to stop and report what it
+   needs. The turn ends with that report instead of more attempts. Claude
+   Code uses 3 and 20 per session and then asks the person; Codex uses 3 in
+   a row or 10 of the last 50 and interrupts. A model that keeps trying
+   variations of a denied action is the pattern this catches.
 
 **What Jev is shown.** The human prompts, the round's planned calls, the
 calls already allowed in this turn, the workspace path, and the user's
@@ -529,10 +578,16 @@ as one.
 
 ## Open decisions
 
+Settled by George on 2026-09-26: three modes, `full` stays the default,
+`AGENT_APPROVAL` picks the mode, and `auto` denies what is dangerous or
+unclear without asking anyone.
+
 - The hold before parking: 2 s covers a Jev verdict with margin; shorter
   frees slots sooner for people.
 - Whether bots created from a gated bot inherit its list in the daemon, or
   only by the CLI passing it on.
-- Unattended and unclear: deny (proposed default), or a larger model.
+- Whether auto sends the unclear band to a larger model before denying, or
+  denies straight away (proposed: straight away, and measure how often the
+  band is hit).
 - Where the automatic approver runs: the app, `agent approver`, or both
   (proposed: both, one module).
