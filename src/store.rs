@@ -45,6 +45,8 @@ struct Timing {
     queued: std::time::Instant,
     waited_ns: u64,
     ran_ns: Option<u64>,
+    /// Answered `storage_error`: its own SQLite failure, or its group's.
+    storage_error: bool,
 }
 struct Queued<F, T> {
     operation: Option<F>,
@@ -123,13 +125,15 @@ struct Operation {
     answered_ns: u64,
     slowest_ns: u64,
     slowest_answered_ns: u64,
+    storage_errors: u64,
     ran: [u64; BUCKETS_US.len() + 1],
     queued: [u64; BUCKETS_US.len() + 1],
     answered: [u64; BUCKETS_US.len() + 1],
 }
 impl Operation {
-    fn add(&mut self, queued_ns: u64, ran_ns: u64, answered_ns: u64) {
+    fn add(&mut self, queued_ns: u64, ran_ns: u64, answered_ns: u64, storage_error: bool) {
         self.count += 1;
+        self.storage_errors += u64::from(storage_error);
         self.queued_ns += queued_ns;
         self.ran_ns += ran_ns;
         self.answered_ns += answered_ns;
@@ -159,13 +163,14 @@ fn bucket(ns: u64) -> usize {
 }
 impl Counters {
     /// A job answered as soon as it ran: reads, which join no group.
-    fn record(&self, label: &'static str, queued_ns: u64, ran_ns: u64) {
+    fn record(&self, label: &'static str, queued_ns: u64, ran_ns: u64, storage_error: bool) {
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .operations
-            .entry(label)
-            .or_default()
-            .add(queued_ns, ran_ns, queued_ns + ran_ns);
+        inner.operations.entry(label).or_default().add(
+            queued_ns,
+            ran_ns,
+            queued_ns + ran_ns,
+            storage_error,
+        );
     }
     /// A group whose callers are answered at `answered`, with its COMMIT
     /// time when it began.
@@ -185,18 +190,19 @@ impl Counters {
                 Some(ran_ns) => (job.waited_ns, ran_ns),
                 None => (residence, 0),
             };
-            inner
-                .operations
-                .entry(job.label)
-                .or_default()
-                .add(queued_ns, ran_ns, residence);
+            inner.operations.entry(job.label).or_default().add(
+                queued_ns,
+                ran_ns,
+                residence,
+                job.storage_error,
+            );
         }
         if let Some(commit_ns) = commit_ns {
             inner
                 .operations
                 .entry("commit")
                 .or_default()
-                .add(0, commit_ns, commit_ns);
+                .add(0, commit_ns, commit_ns, false);
         }
         let groups = &mut inner.groups;
         groups.count += 1;
@@ -213,18 +219,21 @@ impl Counters {
         // and aggregate sums cannot stall the worker or observe later writes.
         let inner = self.inner.lock().unwrap().clone();
         let (mut jobs, mut queued_ns, mut ran_ns, mut answered_ns) = (0u64, 0u64, 0u64, 0u64);
+        let mut storage_errors = 0u64;
         let mut out = serde_json::Map::new();
         for (label, o) in inner.operations.iter() {
             jobs += o.count;
             queued_ns += o.queued_ns;
             ran_ns += o.ran_ns;
             answered_ns += o.answered_ns;
+            storage_errors += o.storage_errors;
             out.insert(
                 (*label).to_owned(),
                 serde_json::json!({"count": o.count, "queued_ms": o.queued_ns / 1_000_000,
                     "ran_ms": o.ran_ns / 1_000_000, "answered_ms": o.answered_ns / 1_000_000,
                     "slowest_ms": o.slowest_ns / 1_000_000,
                     "slowest_answered_ms": o.slowest_answered_ns / 1_000_000,
+                    "storage_errors": o.storage_errors,
                     "ran": o.ran, "queued": o.queued, "answered": o.answered}),
             );
         }
@@ -234,6 +243,7 @@ impl Counters {
             "queued_ms": queued_ns / 1_000_000,
             "ran_ms": ran_ns / 1_000_000,
             "answered_ms": answered_ns / 1_000_000,
+            "storage_errors": storage_errors,
             "buckets_us": BUCKETS_US,
             "operations": out,
             "groups": {"count": g.count, "jobs": g.jobs, "size_bounds": GROUP_SIZES,
@@ -436,7 +446,11 @@ impl Store {
                             // in any stats it reads next; about a microsecond.
                             let answered = std::time::Instant::now();
                             worker_counters.group(
-                                group.iter().map(|job| job.timing()),
+                                group.iter().map(|job| Timing {
+                                    storage_error: failure.is_some()
+                                        || job.error().is_some_and(|e| e.code == "storage_error"),
+                                    ..job.timing()
+                                }),
                                 answered,
                                 commit_ns,
                             );
@@ -549,6 +563,7 @@ impl Store {
                     queued: std::time::Instant::now(),
                     waited_ns: 0,
                     ran_ns: None,
+                    storage_error: false,
                 },
             }))
             .await
@@ -571,12 +586,14 @@ impl Store {
         self.reader
             .send(Box::new(move |db| {
                 let started = std::time::Instant::now();
-                let _ = sender.send(operation(db));
+                let outcome = operation(db);
                 counters.record(
                     label,
                     (started - queued).as_nanos() as u64,
                     started.elapsed().as_nanos() as u64,
+                    outcome.as_ref().is_err_and(|e| e.code == "storage_error"),
                 );
+                let _ = sender.send(outcome);
             }))
             .await
             .map_err(|_| Error::new("storage_worker_failed"))?;
@@ -914,6 +931,8 @@ mod tests {
     #[tokio::test]
     async fn a_group_rolled_back_under_its_jobs_answers_none_of_them_ok() {
         let store = scratch_store("rollback").await;
+        let errors = |store: &Store| store.stats()["storage_errors"].as_u64().unwrap();
+        let before = errors(&store);
         let (held, gate) = hold(&store).await;
         let one = queue(&store, insert(1)).await;
         // A refusal decided against writes the group then loses no longer
@@ -935,6 +954,9 @@ mod tests {
         ] {
             assert_eq!(answer.unwrap_err().code, "storage_error");
         }
+        // Every job the lost group answered is counted as a storage error,
+        // so a failure is visible without the daemon's stderr.
+        assert_eq!(errors(&store) - before, 4);
         assert!(rows(&store).await.is_empty());
         // The worker recovers: the next group commits normally.
         store.call(insert(4)).await.unwrap();
@@ -1012,6 +1034,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reader, 1);
+    }
+
+    #[tokio::test]
+    async fn the_writer_keeps_savepoint_journals_in_memory() {
+        // A job's savepoint journal past 64 KiB would otherwise go to a
+        // temporary file, created for every admission and refused on a full disk.
+        let store = scratch_store("temp-store").await;
+        let mode = store.call(|db| Ok(db.pragma("temp_store"))).await.unwrap();
+        assert_eq!(mode, 2, "MEMORY");
     }
 
     #[tokio::test]
@@ -1100,6 +1131,7 @@ mod tests {
                         if index % 2 == 0 { "read" } else { "write" },
                         1_000_000,
                         2_000_000,
+                        index % 3 == 0,
                     );
                 }
             });
@@ -1112,6 +1144,7 @@ mod tests {
                     ("queued_ms", "queued_ms"),
                     ("ran_ms", "ran_ms"),
                     ("answered_ms", "answered_ms"),
+                    ("storage_errors", "storage_errors"),
                 ] {
                     let sum: u64 = operations
                         .values()

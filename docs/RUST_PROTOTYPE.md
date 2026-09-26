@@ -853,7 +853,9 @@ does not, and each is one op:
   the disk is the bottleneck; jobs on the storage reader are counted the
   same way under their operation), the same per operation under `operations`
   (each store method's count, queued, ran and answered totals, slowest run
-  and slowest answer, and three fourteen-bucket latency histograms, `ran`,
+  and slowest answer, `storage_errors` for the jobs answered `storage_error`
+  by their own SQLite failure or their group's, with the total at the top,
+  and three fourteen-bucket latency histograms, `ran`,
   `queued` and `answered`, over the log-spaced bounds in `buckets_us`, so a
   controller can see which jobs make the tail and how often), and the
   handle registry's size. `answered` runs from queueing to the caller's
@@ -1065,7 +1067,12 @@ immutable history nodes, turns, completed checkpoints, tool intents/results,
 retained tool artifacts, and durable event cursors. On macOS a plain fsync
 leaves writes in the drive's cache, so both connections also set `fullfsync`
 and `checkpoint_fullfsync`: every commit and checkpoint is an F_FULLFSYNC and
-survives a power cut. Other platforms ignore both. The store allows one owning
+survives a power cut. Other platforms ignore both. The writer sets
+`temp_store=MEMORY`: a job's savepoint journal (the pages it changed, kept so
+it can roll back alone) stays in memory and is freed when the job ends,
+instead of spilling past 64 KiB to a temporary file. Without it every
+admission created, wrote and deleted such a file, and a full disk refused it
+mid-job. The store allows one owning
 process. A second owner fails before it can mark the first owner's work
 interrupted. Ownership uses the canonical database path with an appended
 `.owner-lock` suffix; symlinks resolve to the same lock and hard-linked database
@@ -1436,6 +1443,15 @@ needs, and one optional policy composes them:
   same bot cross a commit-and-publication boundary so later retention cannot
   erase an unpublished terminal event. Different bots still share commits.
   The service then retires the task, without another storage round trip.
+  A completion the store refuses (a full disk fails its group with
+  `storage_error`) left nothing durable, so the task submits the same
+  completion again with backoff, 10 ms doubling to one second, while the bot
+  stays durably busy and other bots go on; `stats` counts each refusal under
+  the `finish` operation's `storage_errors`. Only shutdown stops the retries:
+  the turn stays running in the store, the next start ends it as
+  interrupted, and the daemon exits with the storage error after draining
+  every other completion. Before, one refused completion ended the daemon
+  and every running turn with it.
   Shutdown drains completions through the
   same path, including cancellation events and pending turn-wait results.
 

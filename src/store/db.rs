@@ -415,10 +415,17 @@ impl Database {
         // On macOS a plain fsync leaves writes in the drive's cache, so FULL
         // survives a power cut only with F_FULLFSYNC, which SQLite sends when
         // these are on. Elsewhere they change nothing.
+        //
+        // Each job runs in a savepoint inside its group's transaction, and
+        // SQLite journals the pages a savepoint changes so it can roll back
+        // alone. Past 64 KiB that journal spills to a temporary file: a file
+        // created, written and deleted for every admission, and a write that
+        // fails with SQLITE_FULL when the disk is. In memory it is freed
+        // when the job ends, bounded by the pages one job changes.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;
-            PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048;",
+            PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let has_tables: bool = conn.query_row(

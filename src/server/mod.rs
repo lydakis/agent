@@ -872,12 +872,22 @@ pub async fn run(config: Configuration) -> Result<()> {
     // explicit pruning can be reissued. Await drops before joining stdout.
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
-    for active in service.active.values() {
+    // Release every slot as it is cancelled: a turn interrupted earlier keeps
+    // its first cause, and its dropped sender still stops a finish retry.
+    for active in std::mem::take(&mut service.active).into_values() {
         active.cancel(turn::SHUTDOWN);
     }
+    // A completion that could not commit leaves its turn for the next start
+    // to end as interrupted; the rest still drain, and the exit reports it.
+    let mut failed = None;
     while let Some(result) = service.jobs.join_next().await {
-        let (bot, turn, task, exit) = result.map_err(|_| Error::new("turn_task_failed"))?;
-        service.complete(bot, turn, task, exit).await?;
+        let completed = match result.map_err(|_| Error::new("turn_task_failed")) {
+            Ok((bot, turn, task, exit)) => service.complete(bot, turn, task, exit).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = completed {
+            failed.get_or_insert(error);
+        }
     }
     service.replays.abort_all();
     while service.replays.join_next().await.is_some() {}
@@ -914,7 +924,7 @@ pub async fn run(config: Configuration) -> Result<()> {
         .join()
         .map_err(|_| Error::new("output_worker_failed"))??;
     drop(socket_owner);
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 // Runs on the storage worker using the bot already read for admission. No
@@ -1072,17 +1082,15 @@ impl Service {
             let (bot, id) = (task.bot.clone(), task.turn);
             // Keep the cancellation receiver alive through completion so an
             // interrupt cannot mistake this task for an unreaped parked turn.
+            let mut cancelled = cancelled;
             let exit = task.execute(cancelled.clone()).await;
-            let result = if let turn::Exit::Finished(error) = &exit {
-                let (bot, error) = (bot.clone(), error.clone());
-                task.store
-                    .op_pruning("finish", bot.clone(), move |db| {
-                        turn::Finished::record(db, &bot, id, error.as_ref(), keep)
-                    })
-                    .await
-                    .map(|_| exit)
-            } else {
-                Ok(exit)
+            let result = match &exit {
+                turn::Exit::Finished(error) => {
+                    commit_finish(&task.store, &bot, id, error.as_ref(), keep, &mut cancelled)
+                        .await
+                        .map(|()| exit)
+                }
+                _ => Ok(exit),
             };
             drop(cancelled);
             (bot, id, task_id, result)
@@ -1647,6 +1655,39 @@ impl Service {
                 Ok(json!({"shutting_down":true}))
             }
         }
+    }
+}
+
+/// Commit a finished turn. A group that cannot commit (a full disk, say)
+/// leaves nothing durable, so the same completion is tried again, with
+/// backoff, while the bot stays busy and other bots go on. Only shutdown
+/// stops it (its cause, or the service dropping the turn's slot): the turn
+/// then stays running in the store, and the next start ends it as interrupted.
+async fn commit_finish(
+    store: &Store,
+    bot: &str,
+    turn: i64,
+    error: Option<&Error>,
+    keep: Option<usize>,
+    cancelled: &mut watch::Receiver<Option<&'static str>>,
+) -> Result<()> {
+    let mut backoff = Duration::from_millis(10);
+    loop {
+        let (name, error) = (bot.to_owned(), error.cloned());
+        let failure = match store
+            .op_pruning("finish", bot.to_owned(), move |db| {
+                turn::Finished::record(db, &name, turn, error.as_ref(), keep)
+            })
+            .await
+        {
+            Err(failure) if failure.code == "storage_error" => failure,
+            done => return done,
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = cancelled.wait_for(|cause| *cause == Some(turn::SHUTDOWN)) => return Err(failure),
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
 }
 
@@ -2232,83 +2273,9 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("agent-concurrent-finish-{}", std::process::id()));
         let (store, mut publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
-        let turns = store
-            .call(|db| {
-                (0..8)
-                    .map(|n| {
-                        let bot = format!("bot{n}");
-                        db.create(
-                            &bot,
-                            Some("/synthetic"),
-                            Binding {
-                                provider: "openai",
-                                family: Family::Responses,
-                                model: "synthetic",
-                                instructions: "",
-                                reasoning: None,
-                                budget_tokens: None,
-                                tools: &[],
-                                created_by: None,
-                                created_by_id: None,
-                                compaction_instructions: None,
-                                compaction_model: None,
-                                fallbacks: false,
-                            },
-                        )?;
-                        let turn = db
-                            .begin(
-                                &bot,
-                                "first",
-                                "work",
-                                true,
-                                &TurnOptions::default(),
-                                |_, _| Ok(()),
-                            )?
-                            .turn;
-                        Ok((bot, turn))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .await
-            .unwrap();
-        let registry = Registry::new("echo").unwrap();
-        let transport = Transport::new(64, 1).unwrap();
-        let mut service = Service {
-            identity: 0,
-            store: store.clone(),
-            transport,
-            providers: Arc::new(HashMap::new()),
-            registry,
-            hub: Hub::default(),
-            handles: Handles::new(mpsc::unbounded_channel().0),
-            limits: Limits {
-                pending: 0,
-                pending_bytes: 0,
-                processes: 16,
-                detached: 16,
-                active: 1024,
-                connecting: 64,
-                connections: 11,
-                context_bytes: 8 << 20,
-                context_items: 4096,
-                note_turns: 48,
-                compact_at: 75,
-                compact_keep: 25,
-            },
-            retain_turns: None,
-            sessions: 0,
-            background_failures: mpsc::unbounded_channel().0,
-            limit_active: 1024,
-            active: HashMap::new(),
-            next_task: 0,
-            jobs: JoinSet::new(),
-            replays: JoinSet::new(),
-            retention: JoinSet::new(),
-            ready_hint: false,
-            tokens: Arc::default(),
-            paced: std::collections::BinaryHeap::new(),
-            draining: false,
-        };
+        let names: Vec<String> = (0..8).map(|n| format!("bot{n}")).collect();
+        let turns = running(&store, &names).await;
+        let mut service = bare_service(&store);
         // Missing providers make the real turn tasks finish without network I/O.
         // Their durable completion must not depend on the service reaping them.
         for (bot, turn) in &turns {
@@ -2340,6 +2307,206 @@ mod tests {
             }
         }
         assert_eq!(terminal, turns.len(), "one terminal event per turn");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Bots with one running turn each, bound to a provider the test service
+    /// does not have, so their tasks finish at once without network I/O.
+    async fn running(store: &Store, names: &[String]) -> Vec<(String, i64)> {
+        let names = names.to_vec();
+        store
+            .call(move |db| {
+                names
+                    .iter()
+                    .map(|bot| {
+                        db.create(
+                            bot,
+                            Some("/synthetic"),
+                            Binding {
+                                provider: "openai",
+                                family: Family::Responses,
+                                model: "synthetic",
+                                instructions: "",
+                                reasoning: None,
+                                budget_tokens: None,
+                                tools: &[],
+                                created_by: None,
+                                created_by_id: None,
+                                compaction_instructions: None,
+                                compaction_model: None,
+                                fallbacks: false,
+                            },
+                        )?;
+                        let turn = db
+                            .begin(
+                                bot,
+                                "first",
+                                "work",
+                                true,
+                                &TurnOptions::default(),
+                                |_, _| Ok(()),
+                            )?
+                            .turn;
+                        Ok((bot.clone(), turn))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .await
+            .unwrap()
+    }
+    fn bare_service(store: &Store) -> Service {
+        Service {
+            identity: 0,
+            store: store.clone(),
+            transport: Transport::new(64, 1).unwrap(),
+            providers: Arc::new(HashMap::new()),
+            registry: Registry::new("echo").unwrap(),
+            hub: Hub::default(),
+            handles: Handles::new(mpsc::unbounded_channel().0),
+            limits: Limits {
+                pending: 0,
+                pending_bytes: 0,
+                processes: 16,
+                detached: 16,
+                active: 1024,
+                connecting: 64,
+                connections: 11,
+                context_bytes: 8 << 20,
+                context_items: 4096,
+                note_turns: 48,
+                compact_at: 75,
+                compact_keep: 25,
+            },
+            retain_turns: None,
+            sessions: 0,
+            background_failures: mpsc::unbounded_channel().0,
+            limit_active: 1024,
+            active: HashMap::new(),
+            next_task: 0,
+            jobs: JoinSet::new(),
+            replays: JoinSet::new(),
+            retention: JoinSet::new(),
+            ready_hint: false,
+            tokens: Arc::default(),
+            paced: std::collections::BinaryHeap::new(),
+            draining: false,
+        }
+    }
+    /// Refuse Bob's completion the way a full disk refuses a commit: the
+    /// finish job fails and leaves nothing durable. Another connection
+    /// installs it, as an operator's disk would, between the worker's groups.
+    fn refuse_bobs_finish(path: &Path, refuse: bool) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(if refuse {
+                "CREATE TRIGGER refuse_finish BEFORE UPDATE OF status ON turns
+                 WHEN NEW.bot='Bob' AND NEW.status!='running'
+                 BEGIN SELECT RAISE(ABORT,'refused'); END;"
+            } else {
+                "DROP TRIGGER refuse_finish;"
+            })
+            .unwrap();
+    }
+    async fn finish_errors(store: &Store, at_least: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.stats()["operations"]["finish"]["storage_errors"]
+            .as_u64()
+            .unwrap_or(0)
+            < at_least
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "finish never failed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finish_that_cannot_commit_retries_while_other_bots_go_on() {
+        let dir = std::env::temp_dir().join(format!("agent-finish-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.sqlite");
+        let (store, mut publications) = Store::open(&path).await.unwrap();
+        let turns = running(&store, &["Bob".into(), "Alice".into()]).await;
+        refuse_bobs_finish(&path, true);
+        let mut service = bare_service(&store);
+        for (bot, turn) in &turns {
+            service.spawn(bot.clone(), *turn, false, false);
+        }
+        // Alice finishes while Bob's completion keeps failing; nothing ends
+        // the daemon, and Bob stays durably busy.
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        assert_eq!(bot, "Alice");
+        service.complete(bot, turn, task, exit).await.unwrap();
+        finish_errors(&store, 3).await;
+        assert!(
+            service.jobs.try_join_next().is_none(),
+            "Bob is still retrying"
+        );
+        let bob = turns[0].1;
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "running");
+        // Once the store takes it, the same completion commits.
+        refuse_bobs_finish(&path, false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        assert_eq!((bot.as_str(), turn), ("Bob", bob));
+        service.complete(bot, turn, task, exit).await.unwrap();
+        assert!(service.active.is_empty());
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "the provider was missing, as recorded");
+        let mut terminal = Vec::new();
+        while let Ok(publication) = publications.try_recv() {
+            if let Publication::Event(entry) = publication
+                && entry["event"] == "turn_finished"
+            {
+                terminal.push(entry["bot"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(
+            terminal,
+            ["Alice", "Bob"],
+            "one terminal event each, in commit order"
+        );
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_a_finish_retry_and_leaves_the_turn_for_recovery() {
+        let dir = std::env::temp_dir().join(format!("agent-finish-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let turns = running(&store, &["Bob".into()]).await;
+        refuse_bobs_finish(&path, true);
+        let mut service = bare_service(&store);
+        let bob = turns[0].1;
+        service.spawn("Bob".into(), bob, false, false);
+        // An interrupt that lands first keeps its cause; shutdown releasing
+        // the slot still stops the retries.
+        assert!(service.active["Bob"].cancel(turn::INTERRUPTED));
+        finish_errors(&store, 2).await;
+        for active in std::mem::take(&mut service.active).into_values() {
+            active.cancel(turn::SHUTDOWN);
+        }
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        let error = service.complete(bot, turn, task, exit).await.unwrap_err();
+        assert_eq!(error.code, "storage_error");
+        let status = store
+            .call(move |db| db.turn_status("Bob", bob))
+            .await
+            .unwrap();
+        assert_eq!(status, "running", "the next start ends it as interrupted");
         drop(service);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

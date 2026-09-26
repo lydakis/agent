@@ -4690,3 +4690,95 @@ the diagnostic binary is
 `05d13ff8b530e4325e2810dbed19f0bb7b642581f5a50342b67cf0dc2b74f8ad`.
 Ignored evidence under `.local/sqlite-diagnostics/` includes both binaries,
 test logs, the admission driver and captures, and all four `mixed-*` results.
+
+### Disk-full cause and containment
+
+On 2026-09-26 a read-only inspection of a copy of the failed attempt's store,
+the probe's own records and the host's system log on the same macOS arm64
+host found the likely cause: the volume ran out of space. Nothing was
+changed on that host. The facts, with times relative to the attempt's first
+run directory:
+
+- The volume had been in macOS's very-low-disk state for about ten minutes,
+  with roughly 140–250 MB free. At +2.165 s the system log records another
+  process's SQLite WAL write failing with `ENOSPC`, the only one that hour,
+  22 ms after the commit that recorded the three `storage_error` completions.
+  Free space was back near 3 GB by +11.7 s; what freed it was not identified.
+  The captured and repeat series ran later, with about 2.9 GB free.
+- The store copy passed `integrity_check`. Its WAL holds 39 valid commits,
+  six uncommitted frames of the next group (the fifth turn's completion), and
+  the 24-byte header of a seventh frame whose data was never written. That
+  cut matches SQLite's frame append failing on the data write as the WAL grew.
+  A process kill would have to land in the same microsecond window to leave it.
+- Commit 38 admitted the fifth turn and recorded the other three turns'
+  failures. Commit 39 changed nothing logically but rewrote 16 pages that
+  admissions touch with unchanged contents, consistent with admission jobs
+  rolling back to their savepoints inside a group that still committed. That
+  is an inference from page contents.
+- Only one measured run's store was affected; 27 of its 32 submissions never
+  committed. The probe saw `runtime exited before expected response`. On that
+  build a completion that failed to commit returned an error through the
+  service loop, and the daemon exited, closing every connection. Stderr went
+  to `/dev/null` and the exit status was not recorded.
+
+Two code paths turn a full disk into that pattern. Both were reproduced on a
+Linux container, on this branch before the changes below (`8724f22`), with an
+`LD_PRELOAD` shim that makes writes fail with `ENOSPC` while a flag file
+exists. One mode refuses only writes that would grow a regular file, like a
+full volume; the other refuses every regular-file write. Each run used 32
+socket clients submitting at once to a gated synthetic provider.
+
+- Group commit runs each job in a savepoint. SQLite keeps the pages a
+  savepoint changes so it can roll back alone, and past 64 KiB it spills them
+  to a temporary file. Every admission that starts a turn crossed that line.
+  Traced opens counted one temporary file per such admission, 8 of 8, and none
+  on the build before group commit, `2d03ac2`. With growth refused, all 32
+  admissions failed with `storage_error: sqlite_primary=13 sqlite_extended=13`
+  (`SQLITE_FULL`), and every refused write was to those temporary files.
+- With every write refused for 0.5 s as the held replies were released, the
+  daemon exited with status 1 and `agent: storage_error: sqlite_primary=13
+  sqlite_extended=13`. All 32 turns were left `running`, and the next start
+  ended them `interrupted` with `process_interrupted`, discarding replies the
+  provider had already sent. The store passed `integrity_check`.
+
+Changes:
+
+- The writer sets `temp_store=MEMORY`. A job's savepoint journal stays in
+  memory and is freed when the job ends, bounded by the pages one job
+  changes. Refused growth now fails admissions only at the COMMIT's WAL
+  append, still as `SQLITE_FULL`. No temporary files were opened.
+- A completion that fails to commit is submitted again, with backoff from
+  10 ms to one second, while its bot stays durably busy. Only shutdown stops
+  the retries; the turn is then left for the next start, and the daemon exits
+  with the error after draining the other completions.
+- `stats` counts jobs answered `storage_error` per operation and in total,
+  so a refusal is visible without the daemon's stderr.
+
+On the changed build, the same 0.5 s refusal left the daemon running. All 32
+turns ended `failed` with `storage_error` and `sqlite_primary=13`, delivered
+as terminal events. Each completion was refused six times in that half
+second, counted as 192 `finish` storage errors in `stats`, and committed on
+the first retry after writes were accepted; three runs gave the same counts. Their replies were still lost: the jobs that append a reply are
+not retried, so a turn whose reply cannot be stored fails. Integrity checks
+passed.
+
+Sequential admission cost, 256 bots each receiving one held turn, eight
+alternating runs per build, native container sync:
+
+| Median per admission | `8724f22` | `temp_store=MEMORY` |
+| --- | ---: | ---: |
+| `begin` job execution | 451 µs | 164 µs |
+| Submit round trip | 1.45 ms | 1.26 ms |
+| Daemon CPU | 1.09 ms | 0.98 ms |
+| Daemon RSS after admission | 27.2 MiB | 27.2 MiB |
+
+These come from one Linux container. Creating a temporary file costs more on
+some filesystems, so macOS needs its own measurement. The per-group counter
+change measured flat in a 320,000-job no-op microbenchmark: median
+2.66 versus 2.57 µs per job, with overlapping ranges.
+
+Still unproven: the SQLite codes of the original failure, since that build
+kept none; which operation failed first for the three failed turns; and
+whether the host's disk was at zero at exactly those instants. The
+reproduction injects the error. A run on a nearly full disk image on macOS
+would settle the platform question.

@@ -133,6 +133,7 @@ class DaemonTests(ModelFixture):
             self.assertEqual(sum(operations[label]['answered']), operations[label]['count'])
             self.assertGreaterEqual(operations[label]['slowest_answered_ms'], operations[label]['slowest_ms'])
         self.assertEqual(sum(o['count'] for o in operations.values()), stats['store']['jobs'])
+        self.assertEqual(stats['store']['storage_errors'], 0)
         # Every write group is counted once, by size and by its oldest job's
         # wait from queueing to its answer.
         groups = stats['store']['groups']

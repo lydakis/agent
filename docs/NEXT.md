@@ -767,15 +767,24 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     [instrumented operational follow-up](DAEMON_MEASUREMENTS.md#instrumented-operational-follow-up)
     passed replay, compaction and restart checks without reproducing that
     slowdown. A concurrent admission probe confirms serial acknowledgements,
-    but also exposed one unreproduced storage failure. Safe SQLite codes now
-    survive statement and group-commit failures; 81 diagnostic-build admission
-    retries passed with disk-space capture. A matched mixed-load screen found
-    no material regression, but the original failure remains unresolved
-    ([diagnostics](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics)). Resolve
-    that concern before changing concurrency. Next, admission
-    and creation: commits still account for about 82% of measured store
-    execution, and the service awaits admission commits before
-    handling another request. Letting those jobs group needs a design for
+    but also exposed one storage failure. Safe SQLite codes now survive
+    statement and group-commit failures; 81 diagnostic-build admission
+    retries passed with disk-space capture, and a matched mixed-load screen
+    found no material regression ([diagnostics](DAEMON_MEASUREMENTS.md#sqlite-failure-diagnostics)).
+    The failure's likely cause is a full disk
+    ([cause and containment](DAEMON_MEASUREMENTS.md#disk-full-cause-and-containment)):
+    the host had about 150–250 MB free, the system log shows `ENOSPC` 22 ms
+    after the failed commit, and one refused completion made the daemon exit.
+    An injected full disk reproduces both paths on the current build. Each
+    job's savepoint journal no longer spills to a temporary file (each
+    admission wrote one), and a completion the store refuses is retried
+    rather than ending the daemon. The original SQLite codes were never
+    captured, so the cause stays an inference. Appends that store a reply
+    are not retried; a turn whose reply cannot be stored still fails. Next,
+    admission and creation: commits are about 82% of measured storage
+    execution (job and commit time on the storage worker, not task time or
+    daemon CPU), and the service awaits admission commits before handling
+    another request. Letting those jobs group needs a design for
     capacity reservation, same-bot ordering, and item 21's guarantees. Client
     acknowledgements, publication, and provider execution must stay after
     commit. Also done: on macOS
