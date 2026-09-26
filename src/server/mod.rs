@@ -497,6 +497,20 @@ struct Active {
     cancel: watch::Sender<Option<&'static str>>,
     steers: Arc<std::sync::atomic::AtomicBool>,
 }
+impl Active {
+    /// Cancel the turn with `code` unless a cause is already set: the first
+    /// cause wins, so shutdown never relabels a client's pending interrupt.
+    /// False when the task has already dropped its receiver.
+    fn cancel(&self, code: &'static str) -> bool {
+        self.cancel.send_if_modified(|cause| {
+            cause.is_none() && {
+                *cause = Some(code);
+                true
+            }
+        });
+        !self.cancel.is_closed()
+    }
+}
 
 /// The one path durable events take to followers and waiters. The storage
 /// worker hands over what each job committed, in commit order, so a
@@ -859,7 +873,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     service.retention.abort_all();
     while service.retention.join_next().await.is_some() {}
     for active in service.active.values() {
-        let _ = active.cancel.send(Some(turn::SHUTDOWN));
+        active.cancel(turn::SHUTDOWN);
     }
     while let Some(result) = service.jobs.join_next().await {
         let (bot, turn, task, exit) = result.map_err(|_| Error::new("turn_task_failed"))?;
@@ -1565,7 +1579,7 @@ impl Service {
             }
             Command::Interrupt { bot, turn } => {
                 if let Some(active) = self.active.get(&bot).filter(|a| a.turn == turn) {
-                    if active.cancel.send(Some(turn::INTERRUPTED)).is_ok() {
+                    if active.cancel(turn::INTERRUPTED) {
                         return Ok(json!({"interrupt_requested":true,"turn":turn}));
                     }
                     // The task exited but its JoinSet result has not been reaped.
@@ -1644,6 +1658,22 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_cancel_cause_wins() {
+        let (cancel, cancelled) = watch::channel(None);
+        let active = Active {
+            turn: 1,
+            task: 1,
+            cancel,
+            steers: Arc::default(),
+        };
+        assert!(active.cancel(turn::INTERRUPTED));
+        assert!(active.cancel(turn::SHUTDOWN));
+        assert_eq!(*cancelled.borrow(), Some(turn::INTERRUPTED));
+        drop(cancelled);
+        assert!(!active.cancel(turn::SHUTDOWN));
+    }
 
     #[tokio::test]
     async fn retention_replies_backpressure_stdio_but_evict_lagged_sockets() {
