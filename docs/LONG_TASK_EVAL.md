@@ -122,16 +122,17 @@ as the context evaluation does, and the tools `shell, read, write, edit,
 history`.
 
 Scores come from the workspace and the event log, not the model's account
-of itself: hidden tests passed, vendor checksum intact, `make quick` runs
-in total and after the first compaction, migrations applied, whether the
-correction reached the task (its steer turn's final status, not the submit
-reply), whether the answer carries the measured number, commands repeated
-after the first compaction, retrieval calls (`history`, or `read` of a
-`result/` reference), compactions, elisions, the context-view version each
-model call was made under, input, cached input, and output tokens for the
-model and the summarizer separately, and summarizer latency from its send
-to the send of the model call it held back. Failed summaries are live-only
-events, so the runner collects them as they arrive.
+of itself: hidden tests passed, every file under `vendor/` unchanged with
+none added or removed, `make quick` runs in total and after the first
+compaction, migrations applied, whether the correction reached the task
+(its steer turn's final status, not the submit reply), whether the answer
+carries the measured number, commands repeated after the first compaction,
+retrieval calls (`history`, or `read` of a `result/` reference),
+compactions, elisions, the context-view version each model call was made
+under, input, cached input, and output tokens for the model and the
+summarizer separately, and summarizer latency from its send to the send of
+the model call it held back. Failed summaries are live-only events, so the
+runner collects them as they arrive.
 
 ## Running it
 
@@ -200,10 +201,26 @@ Compaction's cost in this run:
 
 Claude Code and Codex send the summary request as a copy of the call just
 made, with the compaction instruction appended, so most of it reads from
-cache. Sources: Anthropic's "Lessons from building Claude Code: Prompt
-caching is everything" and Codex's `compact_remote_v2_attempt.rs` on
-`openai/codex` main, both checked 2026-09-26. Pi builds a fresh summary
-prompt, as this runtime does.
+cache. Pi builds a fresh summary prompt, as this runtime does. Sources,
+read 2026-09-26:
+
+- Claude Code: Thariq Shihipar, [Lessons from building Claude Code: Prompt
+  caching is everything](https://claude.com/blog/lessons-from-building-claude-code-prompt-caching-is-everything),
+  published 2026-04-30. Compaction uses "the exact same system prompt,
+  user context, system context, and tool definitions as the parent
+  conversation", then the parent's messages, then the compaction prompt as
+  a new user message.
+- Codex: the request shape (the turn's request with a `compaction_trigger`
+  item appended, answered by one encrypted compaction item) was read in
+  `core/src/compact_remote_v2_attempt.rs` on `openai/codex` main at a
+  revision that was not recorded, so it is an unpinned source observation.
+  The Codex CLI 0.157.1 release of the same day (npm `@openai/codex`,
+  linux-x64 binary) contains that source file and the `compaction_trigger`
+  item type; the binary does not show the request's shape.
+- Pi: npm `@mariozechner/pi-coding-agent` 0.73.1, published 2026-05-07,
+  the newest under that name. `generateSummary` in
+  `dist/core/compaction/compaction.js` sends its own system prompt and one
+  user message holding the conversation serialized as text, with no tools.
 
 ## Not covered yet
 

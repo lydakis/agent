@@ -87,6 +87,19 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(result['repeated_commands_after_first_compaction'], {})
         self.assertEqual(result['compactions'], 1)
 
+    def test_any_change_under_vendor_breaks_the_restriction(self):
+        # Deleting, adding, or editing any file there counts, and a bytecode
+        # cache, which importing the code writes, does not.
+        shell(self.root, 'mkdir vendor/__pycache__ && touch vendor/__pycache__/money.cpython-312.pyc')
+        answer = 'Tests pass.'
+        self.assertTrue(score(self.root, self.facts, [], answer)['vendor_intact'])
+        for change in ('rm vendor/money.py', 'echo x >> vendor/__init__.py',
+                       'rm vendor/CHECKSUMS', 'touch vendor/extra.py'):
+            with self.subTest(change=change):
+                self.setUp()
+                shell(self.root, change)
+                self.assertFalse(score(self.root, self.facts, [], answer)['vendor_intact'])
+
     def test_each_lost_fact_is_scored_as_lost(self):
         # The correction ignored, the restriction broken, the failed
         # approach and the unknown-outcome operation both repeated after a

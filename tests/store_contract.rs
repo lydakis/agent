@@ -2,7 +2,10 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, Strip, TurnOptions},
+    store::{
+        Binding, Bot, CompactionPlan, ContextUsage, Database, Delivery, Fork, Planning, Strip,
+        TurnOptions,
+    },
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -2477,7 +2480,9 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert!(db.turn_outcome("Bob", second.turn).unwrap().is_none());
 
     // The boundary takes the steer, not the queued turn, and answers its waiters.
-    let absorbed = db.absorb(first.turn, None, 8 << 20, 4096).unwrap();
+    let absorbed = db
+        .absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     assert_eq!(absorbed.outcomes.len(), 1);
     let (steered, outcome) = &absorbed.outcomes[0];
     assert_eq!(*steered, third.turn);
@@ -2495,7 +2500,7 @@ fn queued_turns_wait_for_the_bot_and_steers_join_the_running_turn() {
     assert_eq!(items[1]["content"][0]["text"], "third");
     assert_eq!(db.turn_status("Bob", second.turn).unwrap(), "queued");
     assert!(
-        db.absorb(first.turn, None, 8 << 20, 4096)
+        db.absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -2806,7 +2811,9 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         )
         .unwrap()
         .turn;
-    let result = db.absorb(first, None, 8 << 20, 4096).unwrap();
+    let result = db
+        .absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     assert_eq!(
         result
             .outcomes
@@ -2816,7 +2823,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
         [matched]
     );
     assert!(
-        db.absorb(first, None, 8 << 20, 4096)
+        db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -2826,7 +2833,7 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(moved, allow_provider).unwrap();
     assert_eq!(db.context(moved).unwrap().workspace, "/elsewhere");
     assert!(
-        db.absorb(moved, None, 8 << 20, 4096)
+        db.absorb(moved, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -2835,7 +2842,10 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
     db.start(changed, allow_provider).unwrap();
     assert_eq!(db.context(changed).unwrap().model, "openai/other");
     assert_eq!(
-        db.absorb(changed, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+        db.absorb(changed, None, 8 << 20, 4096, ContextUsage::default())
+            .unwrap()
+            .outcomes[0]
+            .0,
         inherited
     );
     assert!(!db.steers_waiting("Bob").unwrap());
@@ -2880,7 +2890,9 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         let mut through = None;
         let mut late = None;
         while seen.len() < count {
-            let absorbed = db.absorb(first, through, 8 << 20, 4096).unwrap();
+            let absorbed = db
+                .absorb(first, through, 8 << 20, 4096, ContextUsage::default())
+                .unwrap();
             through = absorbed.next_through;
             assert_eq!(absorbed.outcomes.len(), batch.min(count - seen.len()));
             seen.extend(absorbed.outcomes.into_iter().map(|(id, _)| id));
@@ -2897,11 +2909,14 @@ fn steer_batches_bound_count_and_utf8_bytes_without_losing_the_remainder() {
         assert_eq!(seen, submitted);
         assert_eq!(db.turn_status("Bob", late.unwrap()).unwrap(), "queued");
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+                .unwrap()
+                .outcomes[0]
+                .0,
             late.unwrap()
         );
         assert!(
-            db.absorb(first, None, 8 << 20, 4096)
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
                 .unwrap()
                 .outcomes
                 .is_empty()
@@ -3060,7 +3075,9 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         )
         .unwrap();
     assert_eq!(hit.status, "queued");
-    let absorbed = db.absorb(first.turn, None, 8 << 20, 4096).unwrap();
+    let absorbed = db
+        .absorb(first.turn, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     assert_eq!(absorbed.outcomes[0].0, hit.turn);
     // One that misses its boundary is never absorbed by the next turn and
     // never starts as new work.
@@ -3112,7 +3129,7 @@ fn strict_steers_are_for_one_running_turn_or_nobody() {
         "stale_turn"
     );
     assert!(
-        db.absorb(plain.turn, None, 8 << 20, 4096)
+        db.absorb(plain.turn, None, 8 << 20, 4096, ContextUsage::default())
             .unwrap()
             .outcomes
             .is_empty()
@@ -3766,7 +3783,15 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
     // Bytes: a 4 KiB context keeps three quarters, 3,072 bytes, for the
     // running turn; its prompt item takes some, and two of three 1,000-byte
     // steers fit. Items: with room for two more items, two fit as well.
-    for (context_bytes, context_items) in [(4096usize, 4096usize), (8 << 20, 4)] {
+    // What the view sends ahead of the turn, a summary or notes, leaves
+    // room for one.
+    let reserved = |bytes, items| ContextUsage { bytes, items };
+    for (context_bytes, context_items, ahead, fit) in [
+        (4096usize, 4096usize, reserved(0, 0), 2),
+        (8 << 20, 4, reserved(0, 0), 2),
+        (4096, 4096, reserved(1100, 1), 1),
+        (8 << 20, 4, reserved(0, 1), 1),
+    ] {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let first = db
@@ -3799,23 +3824,24 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
             })
             .collect();
         let absorbed = db
-            .absorb(first, None, context_bytes, context_items)
+            .absorb(first, None, context_bytes, context_items, ahead)
             .unwrap();
         let taken: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
-        assert_eq!(taken, steers[..2]);
-        assert!(absorbed.next_through.is_none());
-        // The third does not fit now and is not retried into a full turn.
-        assert!(
-            db.absorb(first, None, context_bytes, context_items)
-                .unwrap()
-                .outcomes
-                .is_empty()
-        );
-        assert_eq!(db.turn_status("Bob", steers[2]).unwrap(), "queued");
+        assert_eq!(taken, steers[..fit]);
+        assert!(absorbed.capped && absorbed.next_through.is_none());
+        // The next does not fit now and is not retried into a full turn.
+        let again = db
+            .absorb(first, None, context_bytes, context_items, ahead)
+            .unwrap();
+        assert!(again.outcomes.is_empty() && again.capped);
+        assert_eq!(db.turn_status("Bob", steers[fit]).unwrap(), "queued");
         // With room it would have been taken: the budget is the only reason.
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
-            steers[2]
+            db.absorb(first, None, 8 << 20, 4096, ahead)
+                .unwrap()
+                .outcomes[0]
+                .0,
+            steers[fit]
         );
     }
 }
@@ -3871,7 +3897,8 @@ fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
         allow_provider,
     )
     .unwrap();
-    db.absorb(bob, None, 8 << 20, 4096).unwrap();
+    db.absorb(bob, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
     let (_, bytes, count) = db.turn_usage("Bob", bob).unwrap();
     assert_eq!(count, 66);
     assert_eq!(
@@ -3972,7 +3999,10 @@ fn pending_counters_follow_every_transition_and_bound_admission() {
         db.set_pending_limits(0, 0);
         // Leaving: absorbed into the running turn, cancelled, started.
         assert_eq!(
-            db.absorb(first, None, 8 << 20, 4096).unwrap().outcomes[0].0,
+            db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
+                .unwrap()
+                .outcomes[0]
+                .0,
             third
         );
         assert_eq!(db.pending().unwrap(), (3, 15));
@@ -5665,6 +5695,60 @@ fn compaction_counts_and_summarizes_stubs_under_the_elision_floor() {
     assert_eq!(bytes as i64, window.item_bytes);
 }
 
+#[test]
+fn an_elided_event_counts_what_the_move_takes_off_the_view() {
+    // A cut summarizes a result the floor had not reached. The next move
+    // stubs it too, since a floor covers everything below it, but it is
+    // never sent again: the event counts the results and bytes the move
+    // takes off the view.
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let mut calls = Vec::new();
+    for n in 0..8 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 800)));
+        if n == 0 {
+            db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+        }
+    }
+    let first = db.elision_plan("Bob", 40 << 10, 1).unwrap().unwrap();
+    assert!(first.through < calls[6].1);
+    db.elide("Bob", &first).unwrap();
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.cut, calls[7].0);
+    let limit = ContextUsage {
+        bytes: 64 << 10,
+        items: 256,
+    };
+    db.compact("Bob", &plan, "summary", None, 0, limit).unwrap();
+    for n in 8..10 {
+        calls.push(exchange(&mut db, turn, &format!("c{n}"), &lines(n, 800)));
+    }
+    let before = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    let second = db.elision_plan("Bob", 1, 1).unwrap().unwrap();
+    let event = db.elide("Bob", &second).unwrap();
+    let after = db.window("Bob", i64::MAX, i64::MAX).unwrap().unwrap();
+    // Results 7 and 8, answered in view; 6 went with the summary.
+    assert_eq!(event["data"]["results"], 2);
+    assert_eq!(
+        event["data"]["saved_bytes"].as_i64().unwrap(),
+        before.item_bytes - after.item_bytes
+    );
+    assert_eq!(after.ids, before.ids);
+}
+
 /// The request prefix a window's view renders, as JSON items.
 fn prefix_items(window: &agent_runtime::store::Window) -> Vec<Value> {
     let prefix = window.prefix(&[], usize::MAX).unwrap().bytes;
@@ -5812,6 +5896,96 @@ fn a_cut_inside_the_running_turn_keeps_its_prompt_ahead_of_the_tail() {
     let window = db.window("Branch", 64 << 10, 256).unwrap().unwrap();
     assert_eq!(&window.ids[..2], &[prompt, calls[5].0]);
     assert_eq!(*window.ids.last().unwrap(), calls[7].1);
+}
+
+/// A running turn of four small exchanges, then a steer absorbed after the
+/// last result, which the model answers with one large exchange.
+fn steered_turn(db: &mut Database) -> (i64, i64, Vec<(i64, i64)>) {
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "long task",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = db.inspect("Bob").unwrap().head.unwrap();
+    let mut calls: Vec<(i64, i64)> = (0..4)
+        .map(|n| exchange(db, turn, &format!("c{n}"), &lines(n, 50)))
+        .collect();
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin(
+        "Bob",
+        "s",
+        "use the other table",
+        true,
+        &steer,
+        allow_provider,
+    )
+    .unwrap();
+    let absorbed = db
+        .absorb(turn, None, 8 << 20, 4096, ContextUsage::default())
+        .unwrap();
+    let steered = absorbed.outcomes[0].1["node"].as_i64().unwrap();
+    calls.push(exchange(db, turn, "c4", &lines(4, 400)));
+    (prompt, steered, calls)
+}
+
+#[test]
+fn a_cut_inside_a_turn_may_start_at_a_steer_that_follows_a_result() {
+    // The model's next output follows the steer, not the result, so the
+    // steer starts that round: the tail may begin with it, whole.
+    let mut db = db();
+    let (prompt, steered, calls) = steered_turn(&mut db);
+    let plan = compaction_plan(&db, "Bob", 1, 64 << 10, 256)
+        .unwrap()
+        .unwrap();
+    assert_eq!((plan.cut, plan.pinned), (steered, Some(prompt)));
+    assert_eq!(plan.ids.last(), Some(&calls[3].1));
+    db.compact(
+        "Bob",
+        &plan,
+        "summary",
+        None,
+        0,
+        ContextUsage {
+            bytes: 64 << 10,
+            items: 256,
+        },
+    )
+    .unwrap();
+    let window = db.window("Bob", 64 << 10, 256).unwrap().unwrap();
+    assert_eq!(&window.ids[..3], &[prompt, steered, calls[4].0]);
+    assert_eq!(
+        sent(&db, &window)[1]["content"][0]["text"],
+        "use the other table"
+    );
+}
+
+#[test]
+fn a_catch_up_step_may_end_before_a_steer_that_follows_a_result() {
+    // The large result leaves no room for the step to reach the newest
+    // round, so the step ends at the steer, keeping the prompt.
+    let mut db = db();
+    let (prompt, steered, calls) = steered_turn(&mut db);
+    let Some(Planning::CatchUp(mut walk)) =
+        db.compaction_plan("Bob", 1, i64::MAX, 8192, 256).unwrap()
+    else {
+        panic!("expected a catch-up walk");
+    };
+    while !walk.done() {
+        db.catch_up_piece(&mut walk, 16).unwrap();
+    }
+    let plan = db.catch_up_plan("Bob", walk).unwrap().unwrap();
+    assert_eq!((plan.cut, plan.pinned), (steered, Some(prompt)));
+    assert_eq!(plan.ids.last(), Some(&calls[3].1));
 }
 
 /// Every step of a catch-up walk through a bot's backlog, recorded with

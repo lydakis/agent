@@ -313,7 +313,9 @@ pub struct CompactionView {
     pub partial: bool,
 }
 /// Where an elision moves a bot's floor: tool results with stubs through
-/// this node go as their stubs, newly `results` of them, saving `saved_bytes`.
+/// this node go as their stubs. In the view, `results` of them are new,
+/// saving `saved_bytes`. Results the view left behind take the floor too
+/// but are not counted: its start only moves forward, so none is sent.
 #[derive(Debug, Clone, Copy)]
 pub struct ElisionPlan {
     pub through: i64,
@@ -324,7 +326,8 @@ pub struct ElisionPlan {
 #[derive(Debug, Clone)]
 pub struct CompactionPlan {
     /// Where the verbatim tail starts, the new context start: a turn's
-    /// prompt, or the first output of a model round inside a turn.
+    /// prompt, or a round start inside a turn: the first item after a tool
+    /// result that is not one, a model output or an absorbed steer.
     pub cut: i64,
     /// For a cut inside a turn, that turn's prompt, sent whole ahead of it.
     pub pinned: Option<i64>,
@@ -1534,27 +1537,24 @@ impl Database {
             )?
             .collect::<rusqlite::Result<_>>()?;
         // The newest boundary whose tail reaches either retention target: a
-        // turn's prompt, or, inside the newest turn, the first output of a
-        // model round that follows a tool result. Only items near the
-        // boundary are read, to tell outputs from results.
+        // turn's prompt, or, inside the newest turn, a round start: the first
+        // item after a tool result that is not one, a model output or an
+        // absorbed steer, so no call is parted from its result and a steer
+        // is kept whole. Only items near the boundary are read.
         let newest_prompt = rows.iter().position(|r| r.3.is_some());
         let mut item = self
             .conn
             .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
-        let mut kinds: Vec<Option<(bool, bool)>> = vec![None; rows.len()];
-        let mut kind = |index: usize| -> Result<(bool, bool)> {
-            if let Some(kind) = kinds[index] {
-                return Ok(kind);
+        let mut results: Vec<Option<bool>> = vec![None; rows.len()];
+        let mut result = |index: usize| -> Result<bool> {
+            if let Some(result) = results[index] {
+                return Ok(result);
             }
-            let kind = item.query_row([rows[index].0], |r| {
-                let item = r.get_ref(0)?.as_blob()?;
-                Ok((
-                    super::context::model_output(item),
-                    super::context::is_tool_result(item),
-                ))
+            let result = item.query_row([rows[index].0], |r| {
+                Ok(super::context::is_tool_result(r.get_ref(0)?.as_blob()?))
             })?;
-            kinds[index] = Some(kind);
-            Ok(kind)
+            results[index] = Some(result);
+            Ok(result)
         };
         let mut cut = None;
         for (index, (id, _, before, seq, _)) in rows.iter().enumerate() {
@@ -1566,7 +1566,7 @@ impl Database {
                 break;
             }
             let in_turn = newest_prompt.is_none_or(|p| index + 1 < p) && index + 1 < rows.len();
-            if in_turn && kind(index)?.0 && kind(index + 1)?.1 {
+            if in_turn && result(index + 1)? && !result(index)? {
                 cut = Some((index, *id, true));
                 break;
             }
@@ -1770,13 +1770,9 @@ impl Database {
         let mut item = self
             .conn
             .prepare_cached("SELECT item FROM nodes WHERE id=?")?;
-        let mut kind = |id: i64| -> Result<(bool, bool)> {
+        let mut result = |id: i64| -> Result<bool> {
             Ok(item.query_row([id], |r| {
-                let item = r.get_ref(0)?.as_blob()?;
-                Ok((
-                    super::context::model_output(item),
-                    super::context::is_tool_result(item),
-                ))
+                Ok(super::context::is_tool_result(r.get_ref(0)?.as_blob()?))
             })?)
         };
         // The longest step, newest end first: a prompt child, or a round
@@ -1798,8 +1794,8 @@ impl Database {
                 }
                 if let Some(child) = child
                     && (any_turn || depth > newest_depth)
-                    && kind(id)?.1
-                    && kind(child)?.0
+                    && result(id)?
+                    && !result(child)?
                 {
                     end = Some((index, true));
                     break 'search;
@@ -1846,27 +1842,25 @@ impl Database {
         }
         Ok(Some(plan))
     }
-    /// The start of the newest model round that follows a tool result,
-    /// walking back from `head` no further than `stop`. Rounds are short,
-    /// so the walk reads a few items.
+    /// The start of the newest round that follows a tool result, walking
+    /// back from `head` no further than `stop`. Rounds are short, so the
+    /// walk reads a few items.
     fn newest_round(&self, head: i64, stop: i64) -> Result<Option<i64>> {
         let mut node = self
             .conn
             .prepare_cached("SELECT parent,item FROM nodes WHERE id=?")?;
-        let (mut id, mut output) = (head, None);
+        let (mut id, mut start) = (head, None);
         while id != stop {
-            let (parent, is_output, is_result) = node.query_row([id], |r| {
-                let item = r.get_ref(1)?.as_blob()?;
+            let (parent, is_result) = node.query_row([id], |r| {
                 Ok((
                     r.get::<_, Option<i64>>(0)?,
-                    super::context::model_output(item),
-                    super::context::is_tool_result(item),
+                    super::context::is_tool_result(r.get_ref(1)?.as_blob()?),
                 ))
             })?;
-            if is_result && output.is_some() {
-                return Ok(output);
+            if is_result && start.is_some() {
+                return Ok(start);
             }
-            output = is_output.then_some(id);
+            start = (!is_result).then_some(id);
             let Some(parent) = parent else { break };
             id = parent;
         }
@@ -2905,6 +2899,7 @@ impl Database {
         through: Option<i64>,
         context_bytes: usize,
         context_items: usize,
+        reserved: super::ContextUsage,
     ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
@@ -2918,11 +2913,13 @@ impl Database {
         };
         // Absorbed steers join the running turn's own items, which the window
         // must carry whole. Budget them against the same three-quarter target
-        // the window keeps, less what the turn already holds; what does not
-        // fit stays queued and starts as its own turn when the line moves.
+        // the window keeps, less what the turn already holds and what the
+        // view sends ahead of it (`reserved`: its summary, pinned context,
+        // and notes); what does not fit stays queued and starts as its own
+        // turn when the line moves.
         let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
-        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes);
-        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items);
+        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes + reserved.bytes);
+        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items + reserved.items);
         let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
         let mut more = false;
         let mut capped = false;

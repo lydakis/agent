@@ -1008,16 +1008,22 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   batch's commit, event publication, and waiter notifications before stopping;
   it does not drain further batches. Unabsorbed work stays durable.
   Absorption is budgeted against the context: a boundary takes steers,
-  oldest first, only while the running turn's own items plus each encoded
-  steer stay within three quarters of `--context-bytes` and
+  oldest first, only while what the view sends ahead of the running turn
+  (its summary, pinned context, and notes), the turn's own items, and each
+  encoded steer stay within three quarters of `--context-bytes` and
   `--context-items`, the target the window itself keeps, so a burst of
   large steers cannot make the running turn exceed its context and fail
-  with `context_limit`. A steer that does not fit stays queued, and later
-  steers do not overtake it. Once elision or a summary makes room in the
-  running turn, the same boundary tries it again before the model call, so
-  a correction reaches a long task that compacts; one still queued when the
-  turn ends starts as its own turn when the line moves (a strict steer, which
-  names that turn, fails with `stale_turn`).
+  with `context_limit`. Steers that arrive during a round are measured
+  against what the round's call sent ahead of the turn; at a turn's first
+  boundary, for steers that arrive while a boundary summarizes, and for a
+  retry, the view is built first, and a steer that goes in sends it back
+  through the same overflow, elision, and compaction steps before the
+  model call. A steer that does not fit stays queued, and later steers do
+  not overtake it. Once elision or a summary makes room in the running
+  turn, the same boundary tries it again, so a correction reaches a long
+  task that compacts; one still queued when the turn ends starts as its
+  own turn when the line moves (a strict steer, which names that turn,
+  fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
   of the turn's first node, found through a partial `nodes(turn)` index. This
   takes a fixed number of indexed lookups regardless of current-turn length;
@@ -1563,9 +1569,13 @@ as the model last saw it, stubs included, so a long turn whose results
 are several budgets as stored can still be summarized in one request.
 
 The floor is versioned like notes and compactions: `elided` events record
-each move (version node, previous version, `through`, the number of newly
-elided results, and the bytes saved), a bot's `elision` names its current
-version, and a historical fork binds to the newest version at or before its
+each move (version node, previous version, `through`, and what the move
+takes off the view: the results it newly stubs there and the bytes that
+saves). A floor covers everything below it, so a move also stubs results
+the view left behind before the floor reached them, summarized or outside
+the budget; the view's start only moves forward, so the bot sends none of
+them again, and the event does not count them. A bot's `elision`
+names its current version, and a historical fork binds to the newest version at or before its
 checkpoint, so it sees what its source saw there. Moving the floor rewrites
 items the provider has cached from the first newly stubbed result on, so it
 is a prompt-cache break there: the Responses WebSocket chain key includes the
@@ -1592,8 +1602,9 @@ model call, when the effective view since the last summary reaches
 `--compact-at` percent of either envelope, the daemon summarizes everything
 older than the newest boundary whose tail holds `--compact-keep` percent
 verbatim, limited by the room left after pinned context. A boundary is a
-turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), the first
-output of a model round that follows a tool result. The item dimension can choose the cut even when small messages
+turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), a round
+start: the first item after a tool result that is not one, a model output or
+an absorbed steer. The item dimension can choose the cut even when small messages
 have barely consumed the byte budget. The summary is one model call
 under the bot's compaction instructions, with tool calls disabled, to the bot's own
 model or the `compaction_model` the client named at creation (same family;
@@ -1766,7 +1777,9 @@ round, so compaction leaves about `--compact-keep` percent verbatim however
 the view is split into turns; a turn smaller than that is never cut. The
 summarizer reads the span up to the cut, which ends with a whole exchange:
 every call in it has its result, and the tail begins with the model's
-next output, so no call is separated from its result on either side.
+next output, or with a steer absorbed after that exchange, so no call is
+separated from its result on either side and a steer at the boundary goes
+verbatim.
 
 The turn's prompt stays in view whole. The compaction records it as the
 version's `pinned` node, and while the window starts at that cut, the

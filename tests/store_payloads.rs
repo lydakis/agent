@@ -1,6 +1,6 @@
 use agent_runtime::{
     codec::Family,
-    store::{Binding, Database, Delivery, Fork, TurnOptions},
+    store::{Binding, ContextUsage, Database, Delivery, Fork, TurnOptions},
 };
 use rusqlite::{Connection, params};
 
@@ -56,7 +56,7 @@ fn shared_prompts_survive_queue_steer_restart_and_source_deletion() {
             db.begin("bot", "steer", &prompt, true, &steer, |_, _| Ok(()))
                 .unwrap();
             assert_eq!(
-                db.absorb(first, None, 8 << 20, 4096)
+                db.absorb(first, None, 8 << 20, 4096, ContextUsage::default())
                     .unwrap()
                     .outcomes
                     .len(),

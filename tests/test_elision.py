@@ -169,6 +169,32 @@ class ElisionTests(ModelFixture):
         self.assertGreater(stubs(work[steered[0]]), stubs(work[steered[0] - 1]))
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
 
+    def test_a_steer_is_admitted_only_with_room_beside_the_summary(self):
+        # A large summary and a large steer: once a cut shrinks the turn,
+        # the steer would fit the turn's three quarters on its own, but not
+        # beside the summary sent ahead of it. It stays queued rather than
+        # pushing the view over the budget, and the task finishes.
+        self.model.compaction_text = 'S' * 7800
+        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               tools=['shell', 'read'], compaction_instructions='Summarize.'))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40x40')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == turn
+                       and m.get('data', {}).get('call_id') == 'long-10')
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:' + 'x' * 11000,
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        ended = client.finished(turn, timeout=30)
+        self.assertEqual(ended['data']['status'], 'completed', ended)
+        self.assertEqual(client.finished(steer)['data']['error'], 'stale_turn')
+        work = [r for r in drain(self.model) if r.get('instructions') != 'Summarize.']
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
+        # Each cut left the turn room for the steer on its own.
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        compacted = [e['data'] for e in events if e['event'] == 'compacted']
+        self.assertGreaterEqual(len(compacted), 2)
+        for data in compacted:
+            self.assertEqual(data['summary_bytes'], 7800)
+            self.assertLessEqual(data['context_after']['bytes'] - 7800 + 11000, 24576 // 4 * 3)
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicElisionTests(ModelFixture):
