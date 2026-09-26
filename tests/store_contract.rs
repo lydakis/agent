@@ -5393,7 +5393,7 @@ fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
             // The same call id, the size, the reference, both ends.
             assert!(item["call_id"].as_str().unwrap().starts_with('c'));
             assert!(output.contains(&format!("artifact \"result/{id}\"")));
-            let whole = db.result_lines("Bob", *id, 1, 5000).unwrap();
+            let whole = db.result_lines("Bob", *id, 1, 5000, false).unwrap();
             assert!(whole.contains("line 399"), "{whole}");
             assert!(output.contains("line 0") && output.contains("line 399"));
         } else if item["type"] == "function_call_output" {
@@ -5406,13 +5406,15 @@ fn answered_tool_results_go_as_stubs_below_a_versioned_elision_floor() {
     // A result that is not on the reader's lineage is not theirs to read.
     db.create("Other", Some("/synthetic"), binding()).unwrap();
     assert_eq!(
-        db.result_lines("Other", rounds[0].1, 1, 10)
+        db.result_lines("Other", rounds[0].1, 1, 10, false)
             .unwrap_err()
             .code,
         "result_not_found"
     );
     assert_eq!(
-        db.result_lines("Bob", rounds[0].0, 1, 10).unwrap_err().code,
+        db.result_lines("Bob", rounds[0].0, 1, 10, false)
+            .unwrap_err()
+            .code,
         "result_not_found"
     );
     // Forks see what the source saw at their checkpoint: before the move,
@@ -5565,7 +5567,7 @@ fn a_result_on_one_line_reads_back_whole_in_pieces() {
     let mut read = Vec::new();
     let mut offset = 1;
     loop {
-        let page = db.result_lines("Bob", node, offset, 5000).unwrap();
+        let page = db.result_lines("Bob", node, offset, 5000, false).unwrap();
         assert!(page.len() < agent_runtime::tools::PREVIEW_BYTES);
         let mut next = None;
         for line in page.lines() {
@@ -6489,4 +6491,44 @@ fn schema_31_keeps_each_bots_thinking_and_forks_carry_a_strip_from_before_them()
     }
     drop(db);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn lineage_checks_reject_a_node_on_another_branch_at_any_depth() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let shared = db.inspect("Bob").unwrap().head.unwrap();
+    db.fork(
+        "Bob",
+        "Branch",
+        Fork {
+            checkpoint: Some(shared),
+            workspace: Some("/synthetic"),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    converse(&mut db, "Bob", 2);
+    for n in 3..6 {
+        converse(&mut db, "Branch", n);
+    }
+    let bob = db.inspect("Bob").unwrap().head.unwrap();
+    let branch = db.inspect("Branch").unwrap().head.unwrap();
+    // Bob's head is shallower than the branch's: the walk down the branch
+    // reaches that depth at another node. The branch's head is deeper than
+    // anything on Bob's lineage.
+    for (reader, node) in [("Branch", bob), ("Bob", branch)] {
+        assert_eq!(
+            db.item(reader, node).unwrap_err().code,
+            "item_not_in_bot_history"
+        );
+    }
+    for reader in ["Bob", "Branch"] {
+        assert_eq!(db.item(reader, shared).unwrap()["content"][0]["text"], "r1");
+    }
+    assert_eq!(
+        db.item("Branch", branch).unwrap()["content"][0]["text"],
+        "r5"
+    );
 }

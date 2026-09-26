@@ -1653,7 +1653,10 @@ is never rewritten: `item`, `history`, and forks see every result whole,
 and `read` with `result/NODE` returns one on the bot's own lineage. A
 shell result is one JSON line, often longer than a `read` page, so that
 read splits lines longer than 4 KiB into numbered pieces and pages them.
-Compaction sizes and plans its span as sent, and the summarizer reads it
+The lineage check walks from the head counting steps down to the result's
+depth, reading only each node's parent, since `depth` follows the item in
+a row; a turn checks each result once, and its later pages skip the walk,
+since a running turn only appends to its lineage. Compaction sizes and plans its span as sent, and the summarizer reads it
 as the model last saw it, stubs included, so a long turn whose results
 are several budgets as stored can still be summarized in one request.
 
@@ -1698,8 +1701,9 @@ have barely consumed the byte budget. The summary is one model call, to the
 bot's own model or the `compaction_model` the client named at creation (same
 family; another family's items cannot be replayed to it).
 
-On the bot's own model, when the view as the bot's last call sent it holds
-the whole span, the request is a copy of that call, as Claude Code and Codex
+When the summarizer is the model the bot's last call ran on (the bot's, or
+the turn's override), and the view as that call sent it holds the whole
+span, the request is a copy of that call, as Claude Code and Codex
 send theirs: the bot's instructions, tools, tool choice, reasoning, cache
 key, and routing token, the prefix and window that call sent, read under
 its elision floor and thinking strip, and the items since, then one user
@@ -1713,8 +1717,9 @@ and a reply that calls a tool is billed and not installed
 (`compaction_tool_call`). The summary covers everything the copy shows,
 the verbatim tail included. Otherwise (a step through a backlog larger than
 the budget, below; a copy that would exceed the input limit; or another
-summarizer, which cannot read the bot's cache) the request is one of its
-own: the compaction instructions as its instructions, the previous summary
+summarizer, which cannot read that call's cache, as when a turn
+overrides the bot's model and the bot's summarizer summarizes it) the
+request is one of its own: the compaction instructions as its instructions, the previous summary
 first, if any, so the summarizer merges rather than restarts, then the
 span's items as stored, then a request to write. Anthropic requests of this
 form retain the bot's tool definitions because the span may contain native
@@ -1955,8 +1960,8 @@ and [Anthropic caching guide](https://platform.claude.com/docs/en/build-with-cla
 provider hits: minimum sizes, expiration, routing, and model capabilities still
 matter.
 
-A summary on the bot's own model keeps that prefix identical and appends
-the compaction request (see [compaction](#compaction)). It keeps the tool
+A summary on the model that made the last call keeps that prefix
+identical and appends the compaction request (see [compaction](#compaction)). It keeps the tool
 choice, since changing it invalidates Anthropic's message cache, so a reply
 that calls a tool is rejected and billed rather than prevented; how often
 models comply, and the hit rates providers give it, are for the

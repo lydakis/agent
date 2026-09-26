@@ -704,6 +704,26 @@ class SummaryCopyTests(ModelFixture):
                             for m in client.saved))
         self.assertEqual(self.events(client, 'tool_started'), [])
 
+    def test_a_turn_on_another_model_than_the_summarizer_gets_a_request_of_its_own(self):
+        self.model.models = ('synthetic-model', 'synthetic-large')
+        self.model.routes = []
+        client = self.start()
+        for n in range(3):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 500,
+                                  model='openai/synthetic-large')['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        summary = requests[index]
+        # The bot's summarizer cannot read the cache of the turn's model,
+        # nor take its routing token.
+        self.assertEqual({r['model'] for r in requests if not is_summary(r)}, {'synthetic-large'})
+        self.assertEqual((summary['model'], summary['instructions'], summary['tools']),
+                         ('synthetic-model', 'Summarize.', []))
+        self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
+        self.assertIsNone(self.model.routes[index])
+        self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+
     def test_a_summary_by_another_model_is_a_request_of_its_own(self):
         self.model.models = ('synthetic-model', 'synthetic-small')
         client = self.start(compaction_model='openai/synthetic-small')

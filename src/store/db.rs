@@ -1027,21 +1027,28 @@ impl Database {
         let Some(head) = head else {
             return Ok(false);
         };
-        let depth: Option<i64> = self
+        let depths: Option<(i64, i64)> = self
             .conn
-            .query_row("SELECT depth FROM nodes WHERE id=?", [node], |r| r.get(0))
+            .query_row(
+                "SELECT h.depth,n.depth FROM nodes h, nodes n WHERE h.id=?1 AND n.id=?2",
+                params![head, node],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .optional()?;
-        let Some(depth) = depth else {
+        let Some((from, to)) = depths.filter(|(from, to)| to <= from) else {
             return Ok(false);
         };
+        // A node's depth is its parent's plus one, so the walk counts its
+        // steps: `depth` follows the item in a row, and reading it would
+        // page through every large result on the way.
         Ok(self
             .conn
             .query_row(
-                "WITH RECURSIVE chain(id,parent,depth) AS (
-                    SELECT id,parent,depth FROM nodes WHERE id=?1
-                    UNION ALL SELECT n.id,n.parent,n.depth FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.depth>?3)
-                 SELECT 1 FROM chain WHERE id=?2 LIMIT 1",
-                params![head, node, depth],
+                "WITH RECURSIVE chain(id,parent,steps) AS (
+                    SELECT id,parent,?3 FROM nodes WHERE id=?1
+                    UNION ALL SELECT n.id,n.parent,c.steps-1 FROM nodes n JOIN chain c ON n.id=c.parent WHERE c.steps>0)
+                 SELECT 1 FROM chain WHERE steps=0 AND id=?2",
+                params![head, node, from - to],
                 |_| Ok(()),
             )
             .optional()?
@@ -4502,23 +4509,28 @@ impl Database {
         crate::tools::page_lines(&String::from_utf8_lossy(&data), offset, limit)
     }
     /// A recorded tool result on the bot's own lineage, as text, for the
-    /// model's own `read` of what an elided result's stub names.
+    /// model's own `read` of what an elided result's stub names. `checked`
+    /// says the caller's running turn already found `node` there: that
+    /// turn only appends to the lineage, so its later pages skip the walk.
     pub fn result_lines(
         &self,
         name: &str,
         node: i64,
         offset: usize,
         limit: usize,
+        checked: bool,
     ) -> Result<String> {
         if offset == 0 || !(1..=5000).contains(&limit) {
             return fail("invalid_tool_arguments");
         }
-        let head: Option<Option<i64>> = self
-            .conn
-            .query_row("SELECT head FROM bots WHERE name=?", [name], |r| r.get(0))
-            .optional()?;
-        if !self.in_lineage(head.flatten(), node)? {
-            return fail("result_not_found");
+        if !checked {
+            let head: Option<Option<i64>> = self
+                .conn
+                .query_row("SELECT head FROM bots WHERE name=?", [name], |r| r.get(0))
+                .optional()?;
+            if !self.in_lineage(head.flatten(), node)? {
+                return fail("result_not_found");
+            }
         }
         let item: Vec<u8> =
             self.conn

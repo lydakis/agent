@@ -172,6 +172,8 @@ pub struct Turn {
     /// bot's pending steer.
     pub steers: Arc<AtomicBool>,
     pub tokens: Arc<TokenTotals>,
+    /// Results this turn's `read` found on the bot's lineage.
+    pub read_results: std::sync::Mutex<Vec<i64>>,
 }
 
 /// Provider-reported tokens across every turn since the daemon started:
@@ -731,7 +733,7 @@ impl Turn {
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
         context: &mut Context,
-        sent: (Option<&Context>, Option<&LastCall>),
+        sent: (Option<&Context>, Option<&LastCall>, &str),
         output_bytes: Option<usize>,
     ) -> Result<Compaction> {
         if record.compaction_instructions.is_none() {
@@ -757,7 +759,7 @@ impl Turn {
                     / self.compact_at,
             )
             .max(1) as i64;
-        let (before, last) = sent;
+        let (before, last, model) = sent;
         let compaction = self
             .compact(
                 record,
@@ -766,7 +768,11 @@ impl Turn {
                 accounting,
                 tools,
                 (keep, keep_items),
-                Some((before.unwrap_or(context), last)),
+                Some(Sent {
+                    view: before.unwrap_or(context),
+                    last,
+                    model,
+                }),
             )
             .await?;
         if let Compaction::Done = compaction {
@@ -824,9 +830,9 @@ impl Turn {
     /// One summary: plan the span older than the newest boundary whose tail
     /// reaches the keep targets, summarize it with the client's
     /// instructions and summarizer, and record it as the new context start.
-    /// When the summarizer is the bot's own model and `sent`, the view as
-    /// the bot's last call sent it, holds the whole span, the request is a
-    /// copy of that call with the instructions in a request after it, so
+    /// When the summarizer is the model that made the bot's last call and
+    /// `sent`, the view as that call sent it, holds the whole span, the
+    /// request is a copy of that call with the instructions in a request after it, so
     /// the provider reads it from cache. Otherwise, as for a step through a
     /// backlog larger than the budget, it is a request of its own: the
     /// instructions, then the span. A failed summary leaves the view
@@ -840,7 +846,7 @@ impl Turn {
         accounting: &mut Accounting,
         tools: &serde_json::value::RawValue,
         (keep, keep_items): (i64, i64),
-        sent: Option<(&Context, Option<&LastCall>)>,
+        sent: Option<Sent<'_>>,
     ) -> Result<Compaction> {
         let limit = self.input_limit();
         let (max_bytes, max_items) = (limit.bytes as i64, limit.items as i64);
@@ -873,9 +879,11 @@ impl Turn {
             return Ok(Compaction::Skipped);
         };
         let mut instructions = record.compaction_instructions.clone().unwrap();
-        let own = reference == format!("{}/{}", record.provider, record.model);
-        let copy = match sent.filter(|_| own && !plan.catch_up) {
-            Some((view, last)) => {
+        // A turn may run on another model than the bot's, and then the
+        // bot's summarizer can neither read that call's cache nor take its
+        // routing token or thinking.
+        let copy = match sent.filter(|sent| sent.model == reference && !plan.catch_up) {
+            Some(Sent { view, last, .. }) => {
                 let request = Bytes::from(agent_runtime::store::CompactionPlan::request(
                     summarizer.family(),
                     &instructions,
@@ -1216,6 +1224,7 @@ impl Turn {
             }
         }
         let mut model_rounds = context.model_rounds;
+        let called = context.model.as_str();
         // This bot's tools, encoded once per distinct selection and shared.
         let tools = self.registry.encoded(provider.family(), &record.tools)?;
         // A stub names the `read` call that returns its result, so only a
@@ -1320,7 +1329,7 @@ impl Turn {
                         accounting,
                         &tools,
                         &mut context,
-                        (before.as_ref(), last.as_ref()),
+                        (before.as_ref(), last.as_ref(), called),
                         output_bytes,
                     )
                     .await?
@@ -2104,14 +2113,20 @@ impl Turn {
                     limit,
                 }) => {
                     let bot = self.bot.clone();
+                    let checked = self.read_results.lock().unwrap().contains(&node);
                     let text = self
                         .store
                         .read("result_lines", move |db| {
-                            db.result_lines(&bot, node, offset, limit)
+                            db.result_lines(&bot, node, offset, limit, checked)
                         })
                         .await;
                     match text {
-                        Ok(page) => Outcome::text(self.registry.redact_text(page)),
+                        Ok(page) => {
+                            if !checked {
+                                self.read_results.lock().unwrap().push(node);
+                            }
+                            Outcome::text(self.registry.redact_text(page))
+                        }
                         Err(error) => failure(error),
                     }
                 }
@@ -2503,6 +2518,16 @@ struct Copied<'a> {
     request: &'a Bytes,
 }
 
+/// The view as this task's last call sent it, what that call sent ahead
+/// of its window if a note changed it since, and the turn's model, which
+/// made the call.
+struct Sent<'a> {
+    view: &'a Context,
+    last: Option<&'a LastCall>,
+    /// `provider/model`, the bot's or the turn's override.
+    model: &'a str,
+}
+
 /// What the bot's last call in this task sent ahead of its window, and
 /// where that window started, for a summary to copy.
 struct LastCall {
@@ -2712,6 +2737,7 @@ mod tests {
             resume: false,
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),
+            read_results: Default::default(),
         };
         let running = tokio::spawn(async move { task.execute(cancelled).await });
         let last = steers[31];

@@ -4953,6 +4953,15 @@ under prefix enforcement across floor moves. A store test pages a result
 of one 80 KB line back whole in pieces. No live provider run was made for
 this change.
 
+`read` of `result/NODE` checks that the result is on the bot's lineage by
+walking parents from the head. The walk read each node's `depth`, which
+follows the item BLOB, so it paged through large results. Counting steps
+instead reads only `parent`. In a Python `sqlite3` probe on 2026-09-26 (one
+chain of 20,000 nodes, every other one a 12 KB result, warm cache, medians
+of seven), a check 1,000 nodes back took 1.9 ms before and 1.0 ms after, and
+10,000 back 22 and 9.7 ms. A turn now checks each result once; its later
+pages skip the walk.
+
 ### Cuts inside a turn
 
 Store costs of [cuts inside a turn](RUST_PROTOTYPE.md#cuts-inside-a-turn),

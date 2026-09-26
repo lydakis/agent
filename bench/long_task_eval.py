@@ -366,13 +366,17 @@ def score(root, facts, events, answer):
         return sum(row.get(field) or 0 for row in rows)
 
     # A summary's latency: from its send to the send of the model call it
-    # held back, which also counts recording the compaction.
-    held = 0
-    for index, row in enumerate(usage):
-        if row.get('purpose') == 'compaction' and row.get('sent_ms'):
-            after = next((u['sent_ms'] for u in usage[index + 1:]
-                          if u.get('purpose') != 'compaction' and u.get('sent_ms')), None)
-            held += after - row['sent_ms'] if after else 0
+    # held back, which also counts recording the compaction. Attempts in a
+    # row, such as a retry after one that failed, are one interval.
+    held, start = 0, None
+    for row in usage:
+        if not row.get('sent_ms'):
+            continue
+        if row.get('purpose') == 'compaction':
+            start = row['sent_ms'] if start is None else start
+        elif start is not None:
+            held += row['sent_ms'] - start
+            start = None
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,

@@ -1540,6 +1540,7 @@ impl Service {
             resume,
             steers,
             tokens: self.tokens.clone(),
+            read_results: Default::default(),
         };
         let keep = self.retain_turns;
         self.jobs.spawn(async move {

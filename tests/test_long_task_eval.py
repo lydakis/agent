@@ -113,6 +113,16 @@ class LongTaskScoreTests(unittest.TestCase):
             passed, total, failure = long_task_eval.hidden_tests(self.root)
         self.assertEqual((passed, failure), (total, None))
 
+    def test_summary_time_counts_retried_attempts_once(self):
+        usage = lambda cursor, sent, purpose=None: {
+            'cursor': cursor, 'event': 'usage', 'data': {'sent_ms': sent, 'purpose': purpose}}
+        # A failed summary retried before the call it held back, then a
+        # second summary later in the task.
+        events = [usage(1, 1000), usage(2, 2000, 'compaction'), usage(3, 5000, 'compaction'),
+                  usage(4, 9000), usage(5, 10000, 'compaction'), usage(6, 12000)]
+        result = score(self.root, self.facts, events, '')
+        self.assertEqual(result['summarizer_ms'], 7000 + 2000)
+
     def test_each_lost_fact_is_scored_as_lost(self):
         # The correction ignored, the restriction broken, the failed
         # approach and the unknown-outcome operation both repeated after a
