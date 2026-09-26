@@ -112,3 +112,35 @@ identical protocol and guards. See [the adapter notes](BENCHMARKS.md#claude-code
 4. Re-run a matched earlier profile after adding a feature to catch regressions.
    Maintain cross-engine observations as exploratory until the same contracts
    and measurement boundary have been independently verified.
+
+## Task comparisons
+
+Added 2026-09-26. A task benchmark ([HARBOR.md](HARBOR.md)) runs several
+harnesses on the same tasks with a real model. Two arms that request the same
+model do not necessarily run the same model policy, so each arm records what
+it asked for and what actually answered, each from that harness's own records:
+
+- **Requested model**, as passed to the harness.
+- **Served models**, with the calls each answered. Ours come from the trial
+  metadata's `served_calls`, which counts every billed attempt, including
+  provider-side fallbacks, delegated bots and summarizers. Codex's come from
+  its session rollout. Claude Code's come from its per-model usage, which
+  includes any auxiliary model it calls.
+- **Fallback policy as configured.** Our adapter creates task bots with
+  `--fallbacks`, so a declined Anthropic request finishes on the model
+  Anthropic recommends; the flag does nothing on the OpenAI or ChatGPT
+  providers. Each baseline's flags or settings come from its adapter's source
+  at the pinned Harbor version. The record also says whether any fallback
+  call happened.
+- **Everything else that shapes the work:** reasoning effort, concurrency,
+  timeouts, harness and Harbor versions, dataset and task names, the Agent
+  commit, and the run window. Both arms run together, and a baseline is
+  always rerun, never reused.
+
+A pass rate or cost is compared only when both arms served the requested model
+for the task work, or the difference is stated beside the numbers.
+
+Gap: the daemon knows a call's served model only when a provider-side fallback
+splits it (Anthropic's `iterations`) or a summarizer ran on another model. It
+does not read the model a provider names in its response, so a change of
+snapshot behind the same model name would not show.

@@ -1,10 +1,13 @@
 # Harbor task benchmarks
 
-Status, 2026-09-23. The runtime runs under [Harbor](https://github.com/laude-institute/harbor),
+Status, 2026-09-26. The runtime runs under [Harbor](https://github.com/laude-institute/harbor),
 the evaluation framework from the Terminal-Bench authors, through
-`bench/harbor_agent.py`. It has passed a local Harbor trial against a scripted
-model. It has not been run against a real model or a published dataset, so
-there is no pass rate or cost to report yet.
+`bench/harbor_agent.py`. Since 2026-09-24 it has run matched comparisons on
+five Terminal-Bench 2.1 tasks with real models: on the ChatGPT plan against
+Codex, and on Sonnet 5 against Claude Code. The [matched runs](#matched-runs)
+below give each arm's pass rate, cost, served models and fallback policy, and
+[EVIDENCE.md](EVIDENCE.md) summarizes them with the runtime measurements.
+Five tasks make a screen, not a Terminal-Bench score.
 
 These are task-quality benchmarks. They measure whether the model, driven by
 this harness, finishes real tasks and what the tokens cost. They are not the
@@ -81,6 +84,10 @@ the same model can drive each harness on the same tasks.
    (`cache_write_1h_tokens`, under `--cache-ttl 1h`) is priced at the table's
    one-hour write rate, or twice input when it has none. It is left
    empty when any model used is missing from the table, rather than reported low.
+   The trial's metadata records the requested model, `served_calls` (billed
+   calls per model that answered, fallbacks and delegated bots included) and
+   `fallbacks: true`, so a comparison can check that both arms ran the same
+   model ([COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md#task-comparisons)).
    Provider failures map to Harbor's retryable error types, for example
    `provider_http_429` to `ApiRateLimitError`, `provider_stream_failed` to
    `NetworkConnectionError` and `provider_http_401` to `AgentAuthenticationError`.

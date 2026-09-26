@@ -686,11 +686,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     their claim, not ours. The prototype is built: family `responses-ws`,
     one connection per bot, delta input only when the request extends the
     previous one exactly, the full input on every other case including
-    `previous_response_not_found`; the store stays the only history. Next,
-    the matched HTTP versus WebSocket screen in
-    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan) under a spend cap, with a
-    prompt cache key in both arms. Open: lanes to share a connection among
-    bots, pacing without per-call headers, and HTTP after a failed upgrade.
+    `previous_response_not_found`; the store stays the only history. HTTP
+    stays the default. Next, the matched experiment in
+    [WEBSOCKET.md](WEBSOCKET.md#measurement-plan): per-call bytes and time to
+    first token, the turn-state token on the socket, then a synthetic
+    resource screen with a synchronized loss of continuation state and a live
+    screen on the ChatGPT plan. Before any default change, an
+    [aggregate bound on full-send bytes](WEBSOCKET.md#a-bound-on-concurrent-full-send-bytes).
+    Open: lanes to share a connection among bots, pacing without per-call
+    headers, and HTTP after a failed upgrade.
 41. Several daemons, moving bots, and watching them: the
     [provisional roadmap](MULTI_DAEMON.md) separates shared durability,
     identity, admission, and execution-ownership contracts from later

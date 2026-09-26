@@ -281,8 +281,10 @@ class Agent(BaseInstalledAgent):
                     usage.n_cache_tokens += sign * attempt['cached_input_tokens']
                     usage.n_output_tokens += sign * attempt['output_tokens']
         # Cache writes are inside input tokens; they are priced above input,
-        # hour-long ones higher still.
+        # hour-long ones higher still. Each billed attempt also counts as a
+        # call on the model that ran it.
         writes: dict[str, tuple[int, int]] = {}
+        served: dict[str, int] = {}
         for model, data in events:
             provider = model.split('/', 1)[0] + '/' if '/' in model else ''
             for attempt in data.get('models') or [data]:
@@ -290,6 +292,7 @@ class Agent(BaseInstalledAgent):
                 total, hourly = writes.get(key, (0, 0))
                 writes[key] = (total + attempt.get('cache_write_tokens', 0),
                                hourly + attempt.get('cache_write_1h_tokens', 0))
+                served[key] = served.get(key, 0) + 1
         # A turn sticky routing served entirely elsewhere leaves nothing to price.
         for model in moved:
             usage = models[model]
@@ -311,6 +314,10 @@ class Agent(BaseInstalledAgent):
                                 for key in ('model_rounds', 'retries', 'paced_ms')}
             context.metadata['status'] = [t['status'] for t in turns if t['bot'] == BOT]
             context.metadata['bots'] = len({t['bot'] for t in turns})
+        # Two arms asking for one model are matched only if both ran it, so
+        # say what was asked, what ran, and that task bots may fall back.
+        context.metadata = {**(context.metadata or {}), 'requested_model': self.model_name,
+                            'served_calls': served, 'fallbacks': True}
 
     def _store_turns(self) -> list[dict[str, Any]] | None:
         """Every turn in the store copied after the daemon exited, or None when

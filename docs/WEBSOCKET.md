@@ -4,9 +4,11 @@ Question (2026-09-24): would OpenAI's WebSocket mode for the Responses API make
 this runtime faster? Short answer: probably yes for tool-heavy turns on the
 `openai` and `chatgpt` providers, mostly through server-side work it lets
 OpenAI skip, not through the socket itself. The size of the win for this
-runtime is unmeasured. It needs a paid, matched screen before it counts as a
-result. The [prototype](#prototype) exists so that the comparison that matters,
-this daemon over HTTP against this daemon over WebSocket, can be run.
+runtime is unmeasured. It needs the matched experiment in the
+[measurement plan](#measurement-plan) before it counts as a result, and HTTP
+stays the default until then. The [prototype](#prototype) exists so that the
+comparison that matters, this daemon over HTTP against this daemon over
+WebSocket, can be run.
 
 ## Source facts
 
@@ -210,23 +212,107 @@ connection.
 
 ## Measurement plan
 
-The launch numbers are OpenAI's; this runtime needs its own. Follow
+Revised 2026-09-26 after an outside review. HTTP stays the default for every
+preset until this experiment says otherwise. The question is not only whether
+one bot's tool loop gets faster. It is also whether the socket keeps the
+many-bot resource profile this project exists for, because two costs grow
+with the fleet: one connection per bot, and a full send assembled in memory
+instead of streamed from the store. Follow
 [COMPARISON_CONTRACT.md](COMPARISON_CONTRACT.md): same daemon build, model,
-reasoning level, tools, prompts, and fixture repository, with only the
-transport changed.
+reasoning level, tools, prompts and tasks, with only the transport changed.
+Every live run uses the ChatGPT plan; no paid API runs.
 
-- Workload: tool-heavy tasks of 5, 20, and 50 model rounds, a few runs each,
-  from the synthetic fixtures.
-- Per round: time to first token, time to the terminal event, request bytes,
-  input, cached, and output tokens. Per turn: wall time, p50, p95, and p99,
-  daemon CPU time and RSS.
-- Fleet: a ramp of active bots to show lane leasing, reconnect cost, and
-  whether the missing rate-limit headers hurt pacing.
-- Report cache hit rate (delta sends over total sends) so a miss-heavy run is
-  not read as a transport loss.
-- Needs an API key and a stated spend cap; the ChatGPT preset repeats a small
-  subset under a plan login. This thread has no key, so these runs are
-  George's.
+### Before it runs
+
+1. **Per-call fields.** Neither arm records what the experiment compares.
+   Each `usage` event gains, beside `sent_ms`: `request_bytes` (the HTTP body
+   or the socket message), `first_event_ms` (the provider's first content
+   event, on the same clock) and, on the socket, `continued` (sent as a delta
+   with `previous_response_id`).
+2. **Equal routing.** The socket carries the ChatGPT turn-state token in
+   `client_metadata` and reads it from `response.metadata`, as Codex does, so
+   a cache difference between arms is not credited to the transport. An
+   earlier A/B found the token left full misses unchanged
+   ([RUST_PROTOTYPE.md](RUST_PROTOTYPE.md)), so this is for parity, not gain.
+3. **Out of both arms:** prewarming with `generate: false` and lanes. The
+   report names them as untested.
+
+### Part 1: resources, against a synthetic endpoint
+
+Model-free and repeatable, and where the fleet risk shows. A local endpoint
+serves the same scripted tool loop over SSE and over the socket, keeping
+response state per connection as OpenAI's does.
+
+- **Grid:** 32, 256 and 1,024 active bots; windows of 64 KiB, 1 MiB and
+  8 MiB (the default `--context-bytes`) at the loss point; 20 model rounds a
+  turn; three runs per cell, arms alternating.
+- **Normal operation:** every turn runs its rounds without a loss.
+- **Synchronized loss:** at round 10 the endpoint closes every connection and
+  forgets every response, so every bot's next call is a full send at the
+  same moment. A second variant forgets without closing, so every bot gets
+  `previous_response_not_found` and resends in full on its open connection.
+- **Record:** uploaded bytes per call and in total, full-send frequency (full
+  sends over all sends), peak and median daemon RSS sampled every 100 ms as
+  in the other screens, daemon CPU time, open sockets over time from `stats`,
+  round latency p50 and p99, turn wall time, and failures. The endpoint's
+  reply timing is scripted, so latency differences are the daemon's.
+- **Reference:** the HTTP arm streams each body from the store. By
+  arithmetic, not measurement: 1,024 bots at the default 8 MiB window can
+  hold up to 8 GiB of assembled input on the socket arm at the loss point.
+
+### Part 2: live, on the ChatGPT plan
+
+Real time to first token and cache behavior.
+
+- **Normal operation:** the five Terminal-Bench tasks of the matched reruns
+  ([HARBOR.md](HARBOR.md)), three trials per arm, both arms started together
+  with the same model, effort and concurrency.
+- **Synchronized loss:** 16 bots, each part-way through a task with a
+  conversation of about 200 KiB, lose their continuation state at once (every
+  socket dropped). Compare each bot's next call with its call before the loss.
+- **Record per call:** time to first token, time to the terminal event,
+  uploaded bytes, full or delta, and input, cached and output tokens. Per
+  trial: pass, task wall time, and cost at API prices. Per daemon: open
+  sockets and peak RSS. Report the cache rate by arm, so a routing difference
+  is not read as a transport effect.
+
+### What would make it the default
+
+All of these: under synchronized loss at 1,024 bots, the socket arm with the
+bound below stays within a stated margin of the HTTP arm's peak RSS and has
+no failures; the live arm shows lower time to first token and task time
+with no lower pass rate; and one socket per active bot is acceptable for the
+target fleet. Otherwise the socket stays an opt-in family.
+
+## A bound on concurrent full-send bytes
+
+Proposed, not built. A per-request size limit does not bound the fleet: every
+bot can be at its limit at once, which is exactly what a correlated reconnect
+produces.
+
+- **One daemon-wide byte budget** (`--max-send-bytes`) that a socket send
+  takes before assembling its message, sized by the message's encoded bytes.
+  The window already carries each item's encoded length (`Window.sizes`), so
+  the size is known before any copy is made.
+- **Released when the message is written**, not when the response ends,
+  since the assembled copy is dropped once sent.
+- **Every send takes its size**, continuations included, from one FIFO
+  budget, so a flood of small sends cannot starve a full one. A send larger
+  than the whole budget waits for all of it and goes alone.
+- **Waiting is pacing, not a stall**, like the startup permit of
+  `--max-connecting`, so the stall guard does not end a turn that is only
+  queued.
+- **`stats` reports** bytes held, waiters and the peak, so the budget's cost
+  shows in the experiment.
+- **Size from Part 1:** the smallest budget that keeps synchronized-loss round
+  p99 within a stated margin of the unbounded arm. The starting point is
+  64 MiB, eight full sends at the default window.
+
+A cheaper alternative, unverified: RFC 6455 lets one message span several
+frames, so a full send could stream from the store like the HTTP body. That
+needs OpenAI's endpoint to accept fragmented messages and the socket library
+to write a message frame by frame. If both hold, the budget bounds only wire
+bytes and can be much smaller.
 
 ## Prompt cache key
 

@@ -123,7 +123,9 @@ class HarborAgentTest(unittest.TestCase):
         self.assertAlmostEqual(usage['gw/small'].cost_usd, 2000e-7 + 200e-6)
         self.assertAlmostEqual(context.cost_usd, usage['gw/m'].cost_usd + usage['gw/small'].cost_usd)
         self.assertEqual(context.metadata, {'model_rounds': 6, 'retries': 3, 'paced_ms': 15,
-                                            'status': ['completed', 'interrupted'], 'bots': 2})
+                                            'status': ['completed', 'interrupted'], 'bots': 2,
+                                            'requested_model': 'gw/m', 'served_calls': {},
+                                            'fallbacks': True})
         self.assertIsNone(unpriced.cost_usd)
         self.assertEqual(unpriced.n_output_tokens, 300)
 
@@ -152,6 +154,10 @@ class HarborAgentTest(unittest.TestCase):
                           usage['gw/backup'].n_output_tokens), (400, 100, 30))
         # Totals are unchanged; only the split moves.
         self.assertEqual((context.n_input_tokens, context.n_output_tokens), (1000, 100))
+        # The trial names what it asked for and every model that answered.
+        self.assertEqual((context.metadata['requested_model'], context.metadata['served_calls'],
+                          context.metadata['fallbacks']),
+                         ('gw/m', {'gw/m': 2, 'gw/backup': 1}, True))
 
     def test_cache_writes_are_priced_at_the_write_rate(self):
         rates = {'gw/m': {'input_cost_per_token': 1e-6, 'output_cost_per_token': 1e-5,
