@@ -849,14 +849,61 @@ class RuntimeTests(ModelFixture):
         client.process.stdin.flush()
         self.assertTrue(client.request('shutdown')['result']['shutting_down'])
         terminal = client.finished(turn)
-        self.assertEqual(terminal['data']['error'], 'cancelled')
+        self.assertEqual((terminal['data']['status'], terminal['data']['error']), ('interrupted', 'daemon_shutdown'))
         waited = client.receive(lambda e: e.get('id') == 'waiter')['result']
-        self.assertEqual(waited['results'][handle]['error'], 'cancelled')
+        self.assertEqual(waited['results'][handle]['error'], 'daemon_shutdown')
         self.assertEqual(waited['pending'], [])
         self.assertEqual(client.process.wait(timeout=2), 0)
         restarted = self.client()
         replay = restarted.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual(next(e for e in replay if e['event'] == 'turn_finished')['data'], terminal['data'])
+
+    def test_shutdown_grace_lets_running_turns_finish_and_holds_new_ones(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        client.request('create', bot='Alice', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='running', prompt='gate')['result']['turn']
+        self.model.requests.get(timeout=3)
+        self.assertEqual(client.request('shutdown', grace_ms=86_400_001)['error'], 'invalid_timeout')
+        self.assertFalse(client.request('stats')['result']['draining'])
+        self.assertTrue(client.request('shutdown', grace_ms=5000)['result']['shutting_down'])
+        self.assertTrue(client.request('stats')['result']['draining'])
+        # Nothing new starts while draining: work that would start now is
+        # refused, and queued work waits durably for the next start.
+        refused = client.request('submit', bot='Alice', request_id='refused', prompt='hello')
+        self.assertEqual(refused['error'], 'daemon_draining')
+        held = client.request('submit', bot='Alice', request_id='held', prompt='hello', delivery='queue')['result']
+        self.assertEqual(held['status'], 'ready')
+        self.model.release_headers.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.process.wait(timeout=3), 0)
+        self.assertTrue(self.model.requests.empty())
+        # The next start runs what the drain held.
+        restarted = self.client()
+        handle = f"turn:Alice/{held['turn']}"
+        waited = restarted.request('wait', handles=[handle], timeout_ms=5000)['result']
+        self.assertEqual(waited['results'][handle]['status'], 'completed')
+
+    def test_shutdown_grace_expiry_cancels_with_the_shutdown_cause(self):
+        client = self.client()
+        self.addCleanup(lambda: client.close(kill=True))
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='running', prompt='wait')['result']['turn']
+        self.model.requests.get(timeout=3)
+        self.assertTrue(client.request('shutdown', grace_ms=60_000)['result']['shutting_down'])
+        # A later shutdown can only bring the deadline closer.
+        started = time.monotonic()
+        self.assertTrue(client.request('shutdown', grace_ms=300)['result']['shutting_down'])
+        terminal = client.finished(turn)
+        self.assertEqual((terminal['data']['status'], terminal['data']['error']), ('interrupted', 'daemon_shutdown'))
+        self.assertGreaterEqual(time.monotonic() - started, .25)
+        self.assertEqual(client.process.wait(timeout=3), 0)
+        restarted = self.client()
+        result = restarted.request('result', bot='Bob', turn=turn)['result']
+        self.assertEqual((result['status'], result['error']), ('interrupted', 'daemon_shutdown'))
 
     def test_request_startup_is_bounded_but_established_streams_are_not(self):
         self.model.release_headers = threading.Event()

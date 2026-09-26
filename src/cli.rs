@@ -80,8 +80,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "shutdown",
-        usage: "shutdown [OPTIONS]",
-        flags: "",
+        usage: "shutdown [--grace SECONDS]",
+        flags: "--grace",
         startup: false,
     },
     Command {
@@ -222,6 +222,10 @@ fn print_flags(flags: &str) {
                 "A new bot's declined Anthropic requests rerun on the recommended model",
             ),
             "--retain-turns" => ("N", "Automatically retain N turns' operational records"),
+            "--grace" => (
+                "SECONDS",
+                "Let running turns finish for up to this long, starting none; default 0",
+            ),
             _ => unreachable!("flag missing help"),
         };
         println!(
@@ -332,6 +336,9 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             }
             if flag == "--keep-warm" && !value.parse::<u64>().is_ok_and(|n| n < 300) {
                 return fail_with("usage", "--keep-warm needs seconds below 300 (0 disables)");
+            }
+            if flag == "--grace" && !value.parse::<u64>().is_ok_and(|n| n <= 86_400) {
+                return fail_with("usage", "--grace needs seconds up to 86400");
             }
             if flag == "--after" && !value.parse::<i64>().is_ok_and(|n| n >= 0) {
                 return fail_with("usage", "--after needs a nonnegative integer");

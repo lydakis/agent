@@ -2610,8 +2610,12 @@ impl Database {
             )?;
         }
         let code = error.map(|e| e.code.as_str());
-        let status = if matches!(code, Some("process_interrupted" | "cancelled"))
-            || (pending && code.is_none())
+        // Interrupted, by cause: a client's interrupt, the daemon shutting
+        // down around the turn, or a daemon that died with it running.
+        let status = if matches!(
+            code,
+            Some("cancelled" | "daemon_shutdown" | "process_interrupted")
+        ) || (pending && code.is_none())
         {
             "interrupted"
         } else if code.is_some() {

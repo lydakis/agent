@@ -330,7 +330,12 @@ fn admission_reconciles_retries_without_accepting_fresh_work_at_capacity() {
 #[test]
 fn unfinished_tools_are_answered_truthfully_without_disabling_the_bot() {
     for family in [Family::Responses, Family::Anthropic] {
-        for error in ["cancelled", "process_interrupted", "provider_failed"] {
+        for error in [
+            "cancelled",
+            "daemon_shutdown",
+            "process_interrupted",
+            "provider_failed",
+        ] {
             let mut db = db();
             db.create(
                 "Bob",

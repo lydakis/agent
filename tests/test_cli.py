@@ -104,6 +104,21 @@ class SocketAndCliTests(ModelFixture):
             status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
         self.assertNotIn(status, ('queued', 'ready', 'running'))
 
+    def test_shutdown_grace_lets_the_running_turn_finish(self):
+        self.model.release_headers = threading.Event()
+        self.model.all_streaming = self.model.release_headers
+        handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'gate').stdout)
+        self.model.requests.get(timeout=3)
+        for bad in ('-1', '86401', 'soon'):
+            usage = self.agent('shutdown', '--store', str(self.store), '--grace', bad, check=False)
+            self.assertEqual(usage.returncode, 2, usage.stderr)
+        threading.Timer(.3, self.model.release_headers.set).start()
+        self.agent('shutdown', '--store', str(self.store), '--grace', '5')
+        self.assertFalse(self.socket.exists())
+        with sqlite3.connect(self.store) as db:
+            status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
+        self.assertEqual(status, 'completed')
+
     def test_stats_and_wait_any_from_the_cli(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)
@@ -410,9 +425,10 @@ class SocketAndCliTests(ModelFixture):
         # arrives on the independent control connection.
         follower.request('resume', bot='Bob')
         client.request('shutdown')
-        self.assertEqual(client.finished(turn)['data']['error'], 'cancelled')
+        # Shutdown, not a client, cancelled the turn: the cause is its error.
+        self.assertEqual(client.finished(turn)['data']['error'], 'daemon_shutdown')
         result = follower.receive(lambda e: e.get('id') == 'waiter')['result']
-        self.assertEqual(result['results'][handle]['error'], 'cancelled')
+        self.assertEqual(result['results'][handle]['error'], 'daemon_shutdown')
         self.assertEqual(result['pending'], [])
         self.assertEqual(client.process.wait(timeout=2), 0)
 

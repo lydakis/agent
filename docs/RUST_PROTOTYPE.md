@@ -724,6 +724,17 @@ active turns, commits their records and closes the database. The `ready` line
 carries the daemon's `pid` for this. The command fails with
 `daemon_shutdown_timeout` after 30 seconds.
 
+`shutdown` takes an optional `grace_ms`, up to 86,400,000. With it the daemon
+answers, then drains: running turns go on for up to that long and no turn
+starts. A `reject` submission answers `daemon_draining`; `queue` and `steer`
+submissions are recorded as usual, and queued work starts on the next daemon
+start. Parked and paced turns stay parked, as on any shutdown. `stats` reports
+`draining: true`. The daemon exits when no turn is running or the deadline
+passes, whichever comes first. A later `shutdown` can only bring the deadline
+closer; SIGTERM and SIGINT still exit at once. Turns still running at exit are
+cancelled like any others at shutdown. `agent shutdown --grace SECONDS` sends
+it and waits that much longer than 30 seconds.
+
 On shutdown, committed turn events get up to five seconds to drain through
 the publisher. Background commands can keep the storage stream open; when
 that deadline expires, the service cancels and awaits the publisher before
@@ -771,6 +782,7 @@ own path from the turn. Example requests:
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":12,"op":"shutdown"}
+{"id":21,"op":"shutdown","grace_ms":30000}
 ```
 
 `history_nodes` lists immutable node references in a bot's lineage, newest first,
@@ -852,7 +864,8 @@ does not, and each is one op:
   open, including when the caller used a symlink. The counters cost three
   clock reads and one short lock per storage job, and allocate only the
   first time an operation is seen. Stats copies the operation records under
-  that lock, then derives totals and builds JSON outside it. The totals and
+  that lock, then derives totals and builds JSON outside it. `draining` is
+  true while a shutdown's grace period runs. The totals and
   histograms describe the same snapshot; time totals are summed before
   rounding to milliseconds.
 
@@ -1100,6 +1113,12 @@ inspect current state before deciding what to do. The same rule applies to
 explicit cancellation and other terminal failures. Uncertainty never blocks the
 named bot, and no external request or tool is automatically repeated. Existing
 queued work remains eligible to start. Explicitly stopped turns stay stopped.
+
+An interrupted turn's `turn_finished` error names the cause, so a client can
+decide whether to resubmit: `cancelled` for a client's `interrupt`,
+`daemon_shutdown` when the daemon shut down around it (`shutdown` or a
+signal), and `process_interrupted` when the daemon died with it running and the
+next open ended it. The daemon never continues such a turn on its own.
 
 `resume` restores access to the exact identity and reports its state; it does not
 automatically continue an interrupted network request. A new submission is an

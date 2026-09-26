@@ -33,6 +33,10 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub const MAX_ROUNDS: usize = 200;
+/// The error a cancelled turn ends with, sent on its cancel channel: a
+/// client's interrupt, or the daemon shutting down around it.
+pub const INTERRUPTED: &str = "cancelled";
+pub const SHUTDOWN: &str = "daemon_shutdown";
 /// Attempts per model call before its failure is the turn's failure, and the
 /// wall-clock budget those attempts may span. A model call has no side
 /// effects, so retrying one is always safe; a tool is never rerun.
@@ -303,12 +307,19 @@ impl Finished {
 }
 
 impl Turn {
-    pub async fn execute(&self, mut cancelled: watch::Receiver<bool>) -> Exit {
-        // Only an explicit interrupt cancels. A dropped sender (the service
-        // replacing this task's slot) must not end the turn.
+    pub async fn execute(&self, mut cancelled: watch::Receiver<Option<&'static str>>) -> Exit {
+        // Only an explicit interrupt or shutdown cancels, naming its error. A
+        // dropped sender (the service replacing this task's slot) must not
+        // end the turn.
         let interrupt = async {
-            if cancelled.wait_for(|c| *c).await.is_err() {
-                std::future::pending::<()>().await;
+            // Release the channel's read guard before any await.
+            let code = cancelled
+                .wait_for(Option::is_some)
+                .await
+                .map(|code| code.unwrap_or(INTERRUPTED));
+            match code {
+                Ok(code) => code,
+                Err(_) => std::future::pending().await,
             }
         };
         let mut accounting = Accounting::default();
@@ -316,7 +327,7 @@ impl Turn {
         // to its commit, and the worker publishes whatever committed.
         let mut result = tokio::select! {
             biased;
-            _ = interrupt => fail("cancelled"),
+            code = interrupt => fail(code),
             result = self.rounds(&mut accounting) => result,
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
@@ -362,8 +373,10 @@ impl Turn {
         }
         // An interrupt may arrive while the non-cancellable flush is pending.
         // Honor it before retiring a parked task whose receiver is still live.
-        if result.is_ok() && *cancelled.borrow() {
-            result = fail("cancelled");
+        if result.is_ok()
+            && let Some(code) = *cancelled.borrow()
+        {
+            result = fail(code);
         }
         let error = match result {
             Ok(Round::Parked) => return Exit::Parked,
@@ -2176,7 +2189,7 @@ mod tests {
                 },
             )
             .await;
-        let (cancel, cancelled) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(None);
         let task = Turn {
             identity: 0,
             bot: "Bob".into(),
@@ -2219,7 +2232,8 @@ mod tests {
         })
         .await
         .unwrap();
-        cancel.send(true).unwrap();
+        // Cancelled by shutdown: the turn ends with the error its cause names.
+        cancel.send(Some(SHUTDOWN)).unwrap();
         drop(output);
         let drain = tokio::spawn(async move {
             let mut bytes = Vec::new();
@@ -2230,7 +2244,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == "cancelled"));
+        assert!(matches!(exit, Exit::Finished(Some(error)) if error.code == SHUTDOWN));
         // The worker publishes every committed batch regardless of the task;
         // ending the store ends the stream once all of it is delivered.
         drop(store);
