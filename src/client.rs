@@ -1488,6 +1488,18 @@ fn one_line(text: &str, cut: bool) -> String {
     }
 }
 
+/// Every line of a pending call's field, each escaped: a later line of a
+/// command runs too, so whoever allows it must see it. The field is the
+/// listing's preview, at most 2,048 characters, which bounds the display;
+/// a field cut short ends marked.
+fn every_line(text: &str, cut: bool) -> String {
+    let mut shown = text.lines().map(visible).collect::<Vec<_>>().join("\n  │ ");
+    if cut {
+        shown.push_str(" …");
+    }
+    shown
+}
+
 /// Model-written text as a terminal should show it: control characters
 /// and bidirectional overrides escaped, so a call cannot clear the screen
 /// or reorder what the person reads before they allow it.
@@ -1640,7 +1652,9 @@ fn call_line(call: &Value) -> String {
                 || call["arguments_omitted"].as_u64().unwrap_or(0) > 0,
         ),
         keys => summary_field(keys, |key| {
-            arguments[key].as_str().map(|text| one_line(text, cut(key)))
+            arguments[key]
+                .as_str()
+                .map(|text| every_line(text, cut(key)))
         })
         .unwrap_or_else(|missing| format!("[no {missing} in the arguments]")),
     };
@@ -1859,7 +1873,13 @@ mod tests {
                 "shell",
                 json!({"arguments":{"command":"echo hi\nrm x"},"arguments_cut":["command"]})
             ),
-            "shell echo hi … (+1 more lines, then cut)"
+            "shell echo hi\n  │ rm x …"
+        );
+        // A long first line hides nothing after it either.
+        let long = format!("echo {}; rm x", "a".repeat(300));
+        assert_eq!(
+            line("shell", json!({"arguments":{"command":long}})),
+            format!("shell {long}")
         );
         assert_eq!(
             line(

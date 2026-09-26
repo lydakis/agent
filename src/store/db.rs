@@ -3188,7 +3188,9 @@ impl Database {
             }
         };
         let tag = gate.tag.clone();
-        if request.verdicts.iter().any(|v| v.tag == tag) {
+        // The first deny decides the call, and only its reason is used, so
+        // an answer after it is refused rather than held.
+        if request.verdicts.iter().any(|v| v.tag == tag || !v.allow) {
             return fail("approval_already_answered");
         }
         // A gate's expiry is a deadline for its verdict, even before the

@@ -918,7 +918,16 @@ impl Turn {
                 // A verdict park resumes at its gated call, which has not
                 // started; a wait park first records the wait's result.
                 if !waiting.approval {
-                    let outcome = Outcome::text(wait_result(self.handles.take(turn)).to_string());
+                    // A later call's lapse can wake the wait before its
+                    // handles resolve: those are reported pending, as the
+                    // wait's own timeout reports them.
+                    let mut results = self.handles.take(turn);
+                    for handle in &waiting.handles {
+                        results
+                            .entry(handle.clone())
+                            .or_insert_with(|| Arc::new(json!({"pending":true})));
+                    }
+                    let outcome = Outcome::text(wait_result(results).to_string());
                     let id = waiting.call_id.clone();
                     self.store
                         .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))

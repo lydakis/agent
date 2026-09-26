@@ -772,6 +772,54 @@ fn an_expiry_that_came_first_beats_a_later_denial() {
 }
 
 #[test]
+fn a_deny_decides_the_call_and_later_answers_are_refused() {
+    let mut db = db();
+    let ann = gated_bot(&mut db, "Ann", "second", None, None).unwrap();
+    gated_bot(&mut db, "Bob", "manual", None, Some(&ann)).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let long = "y".repeat(16 * 1024);
+    let answer = |db: &mut Database, tag, allow, reason| {
+        db.answer(Decision {
+            bot: "Bob",
+            turn,
+            call_id: "s1",
+            request: 1,
+            tag: Some(tag),
+            allow,
+            reason,
+            by: Some("test"),
+        })
+    };
+    let denied = answer(&mut db, "manual", false, Some("no")).unwrap();
+    assert_eq!(denied.reply["pending"], json!([]));
+    // Neither verdict nor reason is kept once the call is denied.
+    for (allow, reason) in [(true, None), (false, Some(long.as_str()))] {
+        let late = answer(&mut db, "second", allow, reason);
+        assert_eq!(
+            late.err().map(|e| e.to_string()).as_deref(),
+            Some("approval_already_answered")
+        );
+    }
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Denied
+    ));
+}
+
+#[test]
 fn a_turn_parked_on_one_verdict_ends_when_a_later_call_lapses_first() {
     let mut db = db();
     let tools = ["shell".to_owned(), "write".to_owned()];

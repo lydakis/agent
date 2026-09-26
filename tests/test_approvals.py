@@ -298,6 +298,9 @@ class ApprovalTests(ModelFixture):
         self.assertLess(time.monotonic() - parked, 2)
         self.assertEqual(client.request('resume', bot='Alice')['result']['status'], 'running')
         self.assertTrue(self.tool_output(client, 'shell-1')[0]['expired'])
+        # The wait returned with its handle unresolved, not as a success.
+        self.assertEqual(self.tool_output(client, 'wait-1')[1],
+                         {'results': {alice['handle']: {'pending': True}}, 'pending': [alice['handle']]})
 
     def test_a_parked_verdict_survives_restart_and_interrupt_cancels_it(self):
         client = self.gated(extra=('--approval-hold-ms', '0'))

@@ -271,7 +271,8 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `request` is the number the call was announced with, and it changes each
   time the call is announced again. `tag` names the gate answered and may
   be left out when the call has one. The first answer to the current
-  request wins, per gate. A second gets `approval_already_answered`; an
+  request wins, per gate. A second gets `approval_already_answered`, and
+  so does any answer after a deny, which decided the call already; an
   answer to an earlier
   request of the same call, computed before an earlier call failed, gets
   `approval_superseded` and changes nothing; an unknown call gets

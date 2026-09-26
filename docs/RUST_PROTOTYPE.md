@@ -1630,7 +1630,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   left out when the call has one gate, and `reason` goes only with a deny
   (`invalid_reason` otherwise). The reply lists the gates still
   `pending`. Errors: `no_pending_approval` (unknown call, request, or tag),
-  `approval_superseded` (an earlier request), `approval_already_answered`,
+  `approval_superseded` (an earlier request), `approval_already_answered`
+  (this gate answered, or the call denied already),
   `approval_expired` (the gate's expiry has passed, even if the turn has
   not yet denied the call), `approval_tag_required`, `stale_turn`, and
   `turn_not_found`.
