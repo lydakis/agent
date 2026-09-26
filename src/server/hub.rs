@@ -83,6 +83,24 @@ impl Hub {
             !subs.is_empty()
         });
     }
+    /// How many copies of one of `bot`'s events `session` receives: once
+    /// for the firehose, once following `*`, and once following the bot.
+    pub fn deliveries(&self, bot: &str, session: u64) -> usize {
+        let inner = self.inner.lock().unwrap();
+        let follows = |name: &str| {
+            inner.subs.get(name).map_or(0, |subs| {
+                subs.iter()
+                    .filter(|sub| sub.lock().unwrap().session == session)
+                    .count()
+            })
+        };
+        let firehose = inner
+            .firehose
+            .iter()
+            .filter(|(id, _)| *id == session)
+            .count();
+        firehose + follows(ALL) + if bot == ALL { 0 } else { follows(bot) }
+    }
     fn firehose(&self) -> Vec<Output> {
         self.inner
             .lock()

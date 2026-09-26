@@ -4815,39 +4815,48 @@ medians of ten measured runs at native sync and eight at 2 ms:
 
 | Per phase | Serial, native | Window, native | Serial, 2 ms | Window, 2 ms |
 | --- | ---: | ---: | ---: | ---: |
-| 32 submissions at once, last reply | 37.3 ms | 5.2 ms | 113.8 ms | 7.5 ms |
-| Median reply | 13.0 ms | 4.8 ms | 49.1 ms | 7.2 ms |
-| Daemon CPU | 27.6 ms | 5.2 ms | 32.3 ms | 6.0 ms |
-| Write groups | 37.5 | 4 | 35 | 4 |
-| 32 creations at once, last reply | 15.8 ms | 4.1 ms | 90.2 ms | 6.5 ms |
-| Daemon CPU | 10.4 ms | 3.7 ms | 15.2 ms | 4.0 ms |
-| One submission alone, median / p99 | 1.25 / 2.34 ms | 1.26 / 2.75 ms | 5.69 / 11.37 ms | 5.72 / 11.23 ms |
+| 32 submissions at once, last reply | 47.1 ms | 5.3 ms | 131.1 ms | 7.9 ms |
+| Median reply | 19.6 ms | 5.0 ms | 57.9 ms | 7.6 ms |
+| Daemon CPU | 36.6 ms | 13.4 ms | 43.6 ms | 13.8 ms |
+| Write groups | 37 | 4 | 35 | 4.5 |
+| 32 creations at once, last reply | 21.2 ms | 4.3 ms | 105.7 ms | 6.6 ms |
+| Daemon CPU | 12.2 ms | 3.5 ms | 20.8 ms | 3.9 ms |
+| One submission alone, median / p99 | 1.67 / 2.97 ms | 1.61 / 3.72 ms | 6.46 / 12.80 ms | 6.52 / 13.04 ms |
 
 The burst rows' ranges do not overlap between builds. A submission that
-arrives alone is not delayed: its median and daemon CPU match, and its p99,
-the slowest of 32 samples per run, varies within the same range in both.
-Groups count every write job of the phase: 128 for 32 submissions, each
-admission and its turn's three start-up jobs. They were recounted, six runs
-per build at native sync and three at 2 ms, after the bench stopped counting
-its own closing `stats` request, which is a storage job too. That fix changes
-no other row.
+arrives alone is not delayed: its median, its daemon CPU, and its p99 (the
+slowest of 32 samples per run) vary within the same range in both builds.
+A phase ends once its turns have reached the model, for CPU and store work
+alike, so both count every submitted turn's start-up wherever it falls:
+groups count 128 write jobs for 32 submissions, each admission and its
+turn's three start-up jobs. The bench leaves out its own closing `stats`
+request, which is a storage job too.
 
-Window sizes, same bench, eight runs at native sync and six at 2 ms, with
-groups recounted over three runs at native sync as above:
+An earlier run ended CPU at the last reply and counted the closing `stats`
+job. The windowed build starts its turns only as it replies, so that
+boundary left out most of their start-up and credited the window with a
+fivefold CPU saving on submissions (27.6 against 5.2 ms). Counted to the
+same end, the saving is about threefold: 2.7 times at native sync and 3.2
+at 2 ms. That run's container was quieter: its burst took 37.3 and 5.2 ms,
+and a lone submission 1.25 ms.
+
+Window sizes, same bench, eight runs at native sync and six at 2 ms:
 
 | Window | Native: last reply / median | Groups | 2 ms: last reply / median | Daemon CPU at 2 ms |
 | --- | ---: | ---: | ---: | ---: |
-| Serial | 41.2 / 13.9 ms | 37 | 114.4 / 48.6 ms | 30.8 ms |
-| 1 | 38.1 / 13.1 ms | 37 | 112.3 / 49.2 ms | 32.9 ms |
-| 4 | 12.3 / 5.2 ms | 12 | 30.7 / 15.0 ms | 16.4 ms |
-| 8 | 8.5 / 4.2 ms | 9 | 18.7 / 8.6 ms | 12.2 ms |
-| 16 | 5.9 / 3.1 ms | 5 | 12.2 / 5.3 ms | 7.1 ms |
-| 32 | 5.2 / 4.9 ms | 4 | 7.3 / 7.0 ms | 5.9 ms |
+| Serial | 45.7 / 16.4 ms | 37 | 126.8 / 57.0 ms | 45.1 ms |
+| 1 | 48.1 / 15.9 ms | 38 | 122.9 / 56.4 ms | 44.1 ms |
+| 4 | 16.0 / 6.5 ms | 12 | 35.1 / 18.0 ms | 22.0 ms |
+| 8 | 9.7 / 4.7 ms | 7 | 18.8 / 9.2 ms | 17.6 ms |
+| 16 | 6.7 / 3.7 ms | 5.5 | 12.2 / 5.7 ms | 14.7 ms |
+| 32 | 5.4 / 4.8 ms | 4 | 7.1 / 6.6 ms | 16.3 ms |
 
 A window of 16 answers half the burst after the first commit, so its median
-reply is the lowest; 32 answers the whole burst soonest with the least CPU,
-and its lead grows as syncs slow down. It also equals the storage worker's
-group limit and queue, so one full window fills one group. The default is 32.
+reply is the lowest; 32 answers the whole burst soonest, and its lead grows
+as syncs slow down. From 8 up, daemon CPU ranges overlap at both sync
+speeds; what remains is mostly the turns' own start-up. 32 also equals the
+storage worker's group limit and queue, so one full window fills one group.
+The default is 32.
 
 Sustained load, the group-commit screen above (64 bots resubmitting as each
 turn finishes, 200 ms model replies, 10 s measured), alternating pairs:
@@ -4873,8 +4882,11 @@ A creation's reply repeats its instructions and compaction instructions,
 replies sent back to back overflowed a session's 2 MiB output queue
 (`output_lagged`), which closes a socket session after its bots were
 created. An admission now waits when its session's queue could not take
-its reply and event with those already promised to that session. With both
-texts at 64 KiB, 11 share a window. On the burst above, where replies are small, the check changed
+its reply, and its event once for each way the session follows the bot,
+with those already promised to that session. With both texts at 64 KiB, 13
+share a window on a session that follows none of the bots, 11 on one that
+follows them one way, and 9 on one that follows them both by name and
+through `*`. On the burst above, where replies are small, the check changed
 nothing measurable: five runs each, last reply 5.11 ms before and 5.14 ms
 after for submissions, 4.41 and 4.29 ms for creations.
 

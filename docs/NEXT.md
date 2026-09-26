@@ -790,8 +790,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     until answered, so a burst gets the answers it would one at a time.
     Acknowledgements, publication and provider execution stay after commit
     ([measured](DAEMON_MEASUREMENTS.md#admission-window): 32 simultaneous
-    submissions answered in 5.2 ms instead of 37 ms, and 7.5 ms instead of
-    114 ms at a 2 ms sync, with a fifth of the daemon CPU; 64 sustained bots
+    submissions answered in 5.3 ms instead of 47 ms, and 7.9 ms instead of
+    131 ms at a 2 ms sync, with about a third of the daemon CPU; 64 sustained bots
     at a 10 ms sync went from 56 to 131 turns per second; a lone admission
     is unchanged). `stats` reports group sizes and each group's oldest wait,
     the evidence a group work or byte budget would need; none is added.

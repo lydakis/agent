@@ -682,7 +682,8 @@ answers it would get one request at a time. Queued replies go out back to
 back once their commit lands, faster than any client reads them, so an
 admission also waits when its session's output queue could not take what it
 and the admissions already queued for that session will send: each reply,
-and each event should the session follow the bot. Both are bounded from the
+and its event once for each way the session follows the bot (by name,
+through `*`, or as the stdio firehose). Both are bounded from the
 request: a creation's record repeats the request's strings, and a reply or
 event adds at most a canonical workspace and a model reference. A lost group answers each of its
 admissions with `storage_error`, starts no turn, and frees their slots. A
@@ -1445,8 +1446,10 @@ needs, and one optional policy composes them:
   turn's tool intents or move retention past work that has not finished.
   A completion's own retention pass never removes that turn's records:
   the storage worker publishes what the store holds after the job, so the
-  terminal event stays published and replayable until the next pass, at
-  most one turn beyond `keep_turns` per bot.
+  terminal event stays published and replayable until the next pass. That
+  turn is the one beyond `keep_turns` a pass leaves behind; older turns
+  remain past it only while a backlog drains, one piece per completion
+  (below), or until an explicit `prune` clears them.
   Running process rows survive so their results can commit; a later prune
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the

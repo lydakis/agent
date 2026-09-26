@@ -69,18 +69,19 @@ def phase(client, process, model, send, turns=0):
     `stats` runs a job on the storage worker and counts it before answering,
     so the snapshot that ends a phase includes its own job. Two snapshots
     back to back first measure one idle request's share, which is subtracted.
-    The phase's turns reach the model before the ending snapshot, so their
-    start-up jobs are counted and cannot share its group."""
+    CPU and store work both end once the phase's turns reach the model: a
+    build may start its turns before its last reply or after it, and either
+    way their start-up is counted, never the closing snapshot's group."""
     base = client.request('stats')['result']['store']
     before = client.request('stats')['result']['store']
     started = model.requests
     cpu = cpu_ms(process)
     replies, elapsed = send()
-    spent = cpu_ms(process) - cpu
     deadline = time.monotonic() + 10
     while model.requests - started < turns:
         assert time.monotonic() < deadline, 'turns did not reach the model'
         time.sleep(.001)
+    spent = cpu_ms(process) - cpu
     after = client.request('stats')['result']['store']
     for reply, _ in replies:
         assert 'result' in reply, reply
