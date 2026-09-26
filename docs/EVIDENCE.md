@@ -91,9 +91,11 @@ the per-arm tables are in [HARBOR.md](HARBOR.md#matched-runs).
   timeouts each cut off a call that left no record. What that shows differs
   by record: Claude Code's
   name the model the API reported for each response, so its arm ran that
-  model; Codex's name the model once per turn, and ours name the requested
-  model unless a fallback or summarizer answered, so a provider-side reroute
-  in those arms would not show. Our task bots' `--fallbacks` acts only on
+  model; Codex's name the model once per turn, and ours, at these commits,
+  name the requested model unless a fallback or summarizer answered, so a
+  provider-side reroute in those arms would not show. Builds after `095ff68`
+  keep the model each response names
+  ([the gap](COMPARISON_CONTRACT.md#task-comparisons)). Our task bots' `--fallbacks` acts only on
   Anthropic requests, so it was live only in the Sonnet run; Claude Code ran
   without `--fallback-model`, and Harbor's Codex adapter has no fallback
   option.
