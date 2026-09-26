@@ -57,10 +57,11 @@ where
         );
     }
     fn answer(self: Box<Self>, committed: bool) {
+        // A job's own error was decided against writes that the failed
+        // commit took back, so it no longer describes the store.
         let outcome = match self.outcome {
-            Some(Ok(_)) if !committed => Err(Error::new("storage_error")),
-            Some(outcome) => outcome,
-            None => Err(Error::new("storage_error")),
+            Some(outcome) if committed => outcome,
+            _ => Err(Error::new("storage_error")),
         };
         let _ = self.reply.send(outcome);
     }
@@ -274,9 +275,9 @@ impl Store {
                                 committed
                             };
                             // A group that did not commit leaves nothing
-                            // durable; its bookkeeping goes with it. A
-                            // storage error in the recount has no caller
-                            // to answer; the next job's read reports it.
+                            // durable; its bookkeeping goes with it. If the
+                            // recount fails too, the next group retries it
+                            // before running anything.
                             if !committed {
                                 let _ = db.abandon_group();
                             }
@@ -413,10 +414,15 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
 
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("agent-group-{name}-{}", std::process::id()))
+            .join("state.sqlite")
+    }
     async fn scratch_store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("agent-group-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (store, _publications) = Store::open(&dir.join("state.sqlite")).await.unwrap();
+        let path = scratch_path(name);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (store, _publications) = Store::open(&path).await.unwrap();
         store
             .call(|db| Ok(db.connection().execute_batch("CREATE TABLE t(x INTEGER)")?))
             .await
@@ -511,6 +517,9 @@ mod tests {
         let store = scratch_store("rollback").await;
         let (held, gate) = hold(&store).await;
         let one = queue(&store, insert(1)).await;
+        // A refusal decided against writes the group then loses no longer
+        // describes the store either.
+        let refused = queue(&store, |_| crate::fail::<()>("bot_busy")).await;
         // What SQLite does to the whole transaction on a full disk or an
         // I/O error: nothing the group ran may be reported as written.
         let lost = queue(&store, |db| {
@@ -519,13 +528,71 @@ mod tests {
         })
         .await;
         gate.send(()).unwrap();
-        for answer in [held.await.unwrap(), one.await.unwrap(), lost.await.unwrap()] {
+        for answer in [
+            held.await.unwrap(),
+            one.await.unwrap(),
+            refused.await.unwrap(),
+            lost.await.unwrap(),
+        ] {
             assert_eq!(answer.unwrap_err().code, "storage_error");
         }
         assert!(rows(&store).await.is_empty());
         // The worker recovers: the next group commits normally.
         store.call(insert(4)).await.unwrap();
         assert_eq!(rows(&store).await, [4]);
+    }
+
+    #[tokio::test]
+    async fn no_job_runs_until_a_failed_recount_succeeds() {
+        let store = scratch_store("recount").await;
+        let waiting = store
+            .call(|db| {
+                db.create(
+                    "Bob",
+                    Some("/synthetic"),
+                    Binding {
+                        provider: "openai",
+                        family: crate::codec::Family::Responses,
+                        model: "synthetic-model",
+                        instructions: "test",
+                        reasoning: None,
+                        budget_tokens: None,
+                        tools: &[],
+                        created_by: None,
+                        created_by_id: None,
+                        compaction_instructions: None,
+                        compaction_model: None,
+                        fallbacks: false,
+                    },
+                )?;
+                let options = TurnOptions {
+                    delivery: Delivery::Queue,
+                    ..TurnOptions::default()
+                };
+                for (id, prompt) in [("first", "work"), ("second", "more")] {
+                    db.begin("Bob", id, prompt, true, &options, |_, _| Ok(()))?;
+                }
+                db.pending()
+            })
+            .await
+            .unwrap();
+        assert_eq!(waiting, (1, 4));
+        // The group is lost, and its recount cannot read the turns.
+        let lost = store
+            .call(|db| {
+                db.connection()
+                    .execute_batch("ROLLBACK; ALTER TABLE turns RENAME TO turns_away;")?;
+                Ok(())
+            })
+            .await;
+        assert_eq!(lost.unwrap_err().code, "storage_error");
+        let refused = store.call(|db| db.pending()).await;
+        assert_eq!(refused.unwrap_err().code, "storage_error");
+        Connection::open(scratch_path("recount"))
+            .unwrap()
+            .execute_batch("ALTER TABLE turns_away RENAME TO turns;")
+            .unwrap();
+        assert_eq!(store.call(|db| db.pending()).await.unwrap(), (1, 4));
     }
 
     #[tokio::test]

@@ -345,6 +345,9 @@ pub struct Database {
     /// events. Captured inside the job, so retention in the same job
     /// cannot remove what a waiter is owed.
     outcomes: Vec<(String, i64, Value)>,
+    /// A group was abandoned and `pending` not yet recounted from the rows;
+    /// no job runs until a recount succeeds.
+    pending_stale: bool,
 }
 
 /// The share of input tokens the provider served from its prompt cache,
@@ -397,6 +400,7 @@ impl Database {
             pending_limits: (0, 0),
             pending: (0, 0),
             outcomes: Vec::new(),
+            pending_stale: false,
         })
     }
 
@@ -542,6 +546,7 @@ impl Database {
             pending_limits: (0, 0),
             pending: (0, 0),
             outcomes: Vec::new(),
+            pending_stale: false,
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -579,6 +584,7 @@ impl Database {
     /// Count the waiting turns from their rows: one pass over the queued
     /// and ready rows, through their partial indexes.
     fn recount_pending(&mut self) -> Result<()> {
+        self.pending_stale = true;
         self.pending = (0, 0);
         for statement in [
             "SELECT COUNT(*),COALESCE(SUM(length(CAST(prompt AS BLOB))),0) FROM turns WHERE status='queued'",
@@ -590,12 +596,18 @@ impl Database {
             self.pending.0 += turns;
             self.pending.1 += bytes;
         }
+        self.pending_stale = false;
         Ok(())
     }
     /// Open the transaction a group of jobs shares. Each job's own
     /// transaction is a savepoint inside it, so a failed job rolls back
     /// alone and the group still commits once.
     pub fn begin_group(&mut self) -> Result<()> {
+        // A group that could not be abandoned cleanly finishes that first:
+        // admission must not run on counts the rolled-back jobs changed.
+        if self.pending_stale {
+            self.abandon_group()?;
+        }
         self.conn.prepare_cached("BEGIN")?.execute([])?;
         Ok(())
     }
@@ -616,10 +628,11 @@ impl Database {
     /// open, drop the outcomes its jobs announced, and recount the waiting
     /// turns they counted.
     pub fn abandon_group(&mut self) -> Result<()> {
+        self.outcomes.clear();
+        self.pending_stale = true;
         if self.in_group() {
             self.conn.prepare_cached("ROLLBACK")?.execute([])?;
         }
-        self.outcomes.clear();
         self.recount_pending()
     }
     /// The newest committed event id: the publication watermark at open.

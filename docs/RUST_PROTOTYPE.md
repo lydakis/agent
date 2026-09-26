@@ -645,8 +645,10 @@ a write before it is durable, an idle daemon's group is one job and waits for
 nothing, and under load the jobs that queued during one sync share the next.
 If SQLite rolls back the whole transaction under a job (a full disk, an I/O
 error), or the COMMIT fails, every job in the group is answered with
-`storage_error`, the outcomes it announced are dropped, and the waiting-turn
-counts are recounted from the rows.
+`storage_error`, including jobs that failed on their own, since they decided
+against writes the group lost. The outcomes it announced are dropped and the
+waiting-turn counts are recounted from the rows; if that recount fails, no
+job runs until one succeeds.
 
 History items are immutable, reference-counted encoded JSON buffers. Appending
 allocates the new item; an in-memory fork shares its prefix. Requests stream
