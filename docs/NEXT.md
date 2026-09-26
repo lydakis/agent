@@ -612,8 +612,16 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     of the task whose required steps print about 357 KB, run at a 256 KiB
     budget with the default tools (stubs alone make room), without `read`
     (summaries alone make room, with the copy and with a fresh-request
-    measurement build), and at 4 MiB. Still open: its live run, which
-    answers whether the copy saves anything at a realistic budget; stub
+    measurement build), and at 4 MiB. Live runs 3 and 4
+    ([record](LONG_TASK_EVAL.md#live-run-3)): 60 of 60 correct; the model
+    kept its context under 83k tokens, so at 256 KiB 2 of 15 bots
+    compacted, and at 128 KiB compacting cost more than full context; the
+    copy cost the same per byte summarized as a fresh request at 128 KiB
+    and less at 256 KiB (one summary), and half the copy arm's summaries
+    at 128 KiB fell back to requests of their own after an oversized
+    result. Still open: choosing per summary between the copy and a
+    request of its own by estimated cost, and trimming the copy on
+    overflow as Claude Code and Codex do; stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts
     conditions, a realistic preamble, a task long enough that summaries

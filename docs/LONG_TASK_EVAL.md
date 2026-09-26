@@ -6,8 +6,8 @@ cases that combine compaction with the runtime's other guarantees, run
 against scripted providers, and an evaluation of a real model on one
 synthetic repository task (roadmap [item 36](NEXT.md)). Written 2026-09-26.
 The acceptance cases pass. The evaluation has run twice live on the small
-task, recorded [below](#live-run-1), and once on the large task at a
-realistic budget ([live run 3](#live-run-3)).
+task, recorded [below](#live-run-1), and twice on the large task at
+realistic budgets ([live runs 3 and 4](#live-run-3)).
 
 ## Acceptance cases
 
@@ -413,11 +413,86 @@ the ignored `.local/` directory of the machine that ran them.
   the benchmark after its passing check and never compacted, so no
   compaction lost it.
 
-The copy needs more summaries than this task makes at 256 KiB. The next
-run repeats the three 256 KiB arms at 128 KiB (`--context-bytes 131072`),
-beside `large-full` at 4 MiB, with ten bots each. By this run's peaks,
-most bots would pass a 128 KiB trigger, and each summary would still be
-about ten times the size of the 20 KiB test's.
+The copy needs more summaries than this task makes at 256 KiB, so
+[live run 4](#live-run-4) repeats the three 256 KiB arms at 128 KiB.
+
+## Live run 4
+
+2026-09-26, 19:47 to 19:50 UTC, commit `6a81bd6`, which changes only the
+eval and docs since run 3, so the same two binaries ran (`ed2e4ece…`, and
+`de6b3569…` for the fresh arm). Same model, plan, seed and host as run 3;
+ten bots per arm, all four arms at once. The three `large-` arms of run 3
+ran at 128 KiB (`--context-bytes 131072`), `large-full` at its own 4 MiB.
+
+| | large-compact | large-summary, copy | large-summary, fresh | large-full |
+| --- | --- | --- | --- | --- |
+| Budget | 128 KiB | 128 KiB | 128 KiB | 4 MiB |
+| Completed, correct, steered, vendor intact, migrated once | 10/10 each | 10/10 each | 10/10 each | 10/10 each |
+| Number reported | 10/10 | 10/10 | 9/10 | 10/10 |
+| Bots that ran `make quick` (none twice) | 3 | 0 | 1 | 2 |
+| Bots that stubbed / summarized | 7 / 1 | 0 / 5 | 0 / 3 | 0 / 0 |
+| Summaries | 1 | 10 | 5 | none |
+| Peak input tokens per bot | 21,382 to 34,927 | 21,246 to 34,646 | 21,580 to 34,510 | 24,878 to 38,256 |
+| Model calls | 135 | 142 | 139 | 142 |
+| Model input / cached / output tokens | 2,483,189 / 1,917,056 / 13,631 | 3,080,929 / 2,571,264 / 15,495 | 2,931,991 / 2,520,576 / 14,724 | 3,891,280 / 3,506,944 / 15,690 |
+| Model input served from cache | 77% | 83% | 86% | 90% |
+| Summarizer input / cached / output tokens | 34,891 / 0 / 736 | 319,029 / 99,456 / 7,167 | 110,854 / 0 / 3,343 | none |
+| Input token-equivalents per bot, cached at a tenth | 79,273 | 99,631 | 77,433 | 73,503 |
+| Summary time holding the model back | 47.7 s | 323.6 s | 265.7 s | none |
+| Condition wall time | 147.1 s | 196.4 s | 174.7 s | 148.9 s |
+
+Summaries that could be copies, being no catch-up step and taken from a
+view within the input limit, one row each (token-equivalents count cached
+input at a tenth):
+
+| Arm | Span bytes | View bytes | Input / cached tokens | Token-equivalents |
+| --- | --- | --- | --- | --- |
+| copy | 63,317 | 100,650 | 34,742 / 21,504 | 15,388 |
+| copy | 63,337 | 102,952 | 35,168 / 21,504 | 15,814 |
+| copy | 62,066 | 111,740 | 37,752 / 21,120 | 18,744 |
+| copy | 62,414 | 130,154 | 46,945 / 20,736 | 28,283 |
+| copy | 37,324 | 101,349 | 33,775 / 14,592 | 20,642 |
+| fresh | 63,279 | 101,153 | 21,032 / 0 | 21,032 |
+| fresh | 61,853 | 99,706 | 21,034 / 0 | 21,034 |
+| fresh | 37,845 | 101,297 | 13,965 / 0 | 13,965 |
+
+- Every bot finished correctly with the correction, 40 of 40; none ran
+  `make quick` twice or applied the migration twice. The one answer
+  without the benchmark's number came from a bot whose only summary came
+  three calls into the task, before the benchmark ran, so no compaction
+  removed it (inferred from its views).
+- Per byte summarized, the copy and the fresh request cost the same at
+  this budget: 0.343 and 0.344 token-equivalents (98,871 over 288,458
+  bytes, against 56,031 over 162,977). A copy pays full price for what is
+  new since the bot's last call, here mostly the result that crossed the
+  trigger, and a tenth for the rest; a fresh request pays for the span.
+  So the copies were cheaper for spans of about 62 KB taken from views of
+  about 100 KB, and dearer for a 37 KB span and for a copy of a view at the
+  limit. Copies read 53% of their input from cache.
+- Half the copy arm's summaries could not be copies. In two bots one
+  result took the view to about 168 KB, past the budget, and the two
+  catch-up steps that followed each sent a request of its own; one more
+  summary's view (134,849 bytes) was over the limit for a copy. The fresh
+  arm met the same overflow in one bot. Claude Code and Codex trim the copy
+  instead in that case (Claude Code 2.1.283's bundle and `openai/codex`
+  main at `7f6c0f9`, read 2026-09-26).
+- The default-tools arm's one summary was a copy of a 111 KB view for a
+  5,837-byte span and read no cache: 34,891 tokens, where a request of its
+  own would have sent a few thousand (inferred from the fresh rows).
+- Compacting did not pay on this task. Full context peaked at 24,878 to
+  38,256 tokens, and cost 73,503 token-equivalents per bot, against 79,273
+  with stubs, which cut the model's cache hits from 90% to 77%. The two
+  summary arms' totals differ mostly in how many bots crossed the trigger
+  (5 against 3), not in the copy.
+- Summaries held the model back 32 s each on average in the copy arm, 53 s
+  in the fresh arm and 47.7 s for the one in `large-compact`, against 12
+  to 17 s in run 3. Forty bots ran at once here against twenty; that this
+  is the cause is inferred.
+
+Across budgets, per summary against a fresh request, the copy cost 73%
+more at 20 KiB (runs 1 and 2, different commits), the same per byte at
+128 KiB, and 54% less at 256 KiB (one summary each). It pays when the span
+is large beside what is new since the last call.
 
 ## Not covered yet
 
@@ -427,5 +502,8 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 1,000 tokens with the tools), a task long enough that summaries run
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
-compactions and retrievals. The realistic-budget conditions are built and
-pass against the scripted model; their live run is next.
+compactions and retrievals. From runs 3 and 4: choosing per summary
+between the copy and a request of its own from the byte sizes the store
+already keeps, trimming the copy rather than dropping it when the view is
+over the limit, and a task whose context grows well past the budget,
+where compacting could pay.

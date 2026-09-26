@@ -2,7 +2,7 @@
 
 Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
 updated at `095ff68` for admission batching and disk-full containment and at
-`e707632` for the realistic-budget long-task run. This
+`e707632` and `6a81bd6` for the realistic-budget long-task runs. This
 is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -227,7 +227,12 @@ Reconnects, retention, overload, compaction and recovery.
   the task at a 256 KiB budget, five bots per arm, 20 of 20 finished
   correctly, but only 2 of the 15 bots at 256 KiB reached the compaction
   trigger: the model kept its context to 25,127 to 82,585 tokens.
-  `e707632`, 2026-09-26. [Record](LONG_TASK_EVAL.md#live-run-3).
+  `e707632`, 2026-09-26. [Record](LONG_TASK_EVAL.md#live-run-3). At
+  128 KiB, ten bots per arm, 40 of 40 finished correctly; compacting cost
+  more than full context on this task (79,273 input token-equivalents per
+  bot with stubs against 73,503, counting cached input at a tenth), since
+  full context never passed 38,256 tokens. `6a81bd6`, 2026-09-26.
+  [Record](LONG_TASK_EVAL.md#live-run-4).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -244,10 +249,12 @@ Reconnects, retention, overload, compaction and recovery.
 - Whether sending summary requests as copies of the bot's call saves
   anything. At the 20 KiB test budget the copies read cache but sent more
   uncached summary input than fresh requests (21,111 against 17,606 tokens,
-  over 8 summaries against 11). At 256 KiB, one summary per arm points the
-  other way: 24,708 token-equivalents for the copy (74% of its input
-  cached) against 54,079 for a fresh request, counting cached input at a
-  tenth (`e707632`, macOS arm64).
+  over 8 summaries against 11). At 128 KiB the two cost the same per byte
+  summarized, 0.343 and 0.344 token-equivalents counting cached input at a
+  tenth, over 5 copies and 3 fresh requests, and half the copy arm's
+  summaries could not be copies because the view was over the limit
+  (`6a81bd6`). At 256 KiB, one summary per arm: 24,708 token-equivalents
+  for the copy against 54,079 (`e707632`). Both on macOS arm64.
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.
