@@ -9,8 +9,8 @@ use crate::{
 use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc};
+use serde_json::{Value, json, value::RawValue};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use tokio::sync::Notify;
 
 // Sharing tiny prompts adds an index entry without avoiding an overflow page.
@@ -385,27 +385,99 @@ fn failed(output: &str) -> bool {
             || v.get("success") == Some(&Value::Bool(false))
     })
 }
-/// The node among a round's items that holds a call: the quoted id appears
-/// in the item that plans it. A round's last item if none matches.
-fn call_node(items: &[(i64, Bytes)], call_id: &str) -> i64 {
-    let needle = format!("\"{call_id}\"");
-    let needle = needle.as_bytes();
-    items
-        .iter()
-        .find(|(_, item)| item.windows(needle.len()).any(|w| w == needle))
-        .or(items.last())
-        .map_or(0, |(id, _)| *id)
+/// The fields of a stored item that say which calls it plans, in either
+/// encoding: a Responses `function_call`, or an Anthropic message's
+/// `tool_use` blocks. Everything else is skipped, and arguments stay raw.
+#[derive(serde::Deserialize)]
+struct Plans<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    call_id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    arguments: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    content: Option<&'a RawValue>,
 }
-/// A planned call's arguments from its stored item, in either encoding.
-fn call_arguments(item: &Value, call_id: &str) -> Option<String> {
-    if item["type"] == "function_call" && item["call_id"] == call_id {
-        return item["arguments"].as_str().map(str::to_owned);
+#[derive(serde::Deserialize)]
+struct PlansBlock<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    input: Option<&'a RawValue>,
+}
+/// The calls a stored item plans, each with its raw arguments: a Responses
+/// call's arguments string, or an Anthropic tool use's input.
+fn planned_calls(item: &[u8]) -> Vec<(Cow<'_, str>, &RawValue)> {
+    let Ok(item) = serde_json::from_slice::<Plans>(item) else {
+        return Vec::new();
+    };
+    if item.kind.as_deref() == Some("function_call") {
+        return item.call_id.zip(item.arguments).into_iter().collect();
     }
-    item["content"]
-        .as_array()?
-        .iter()
-        .find(|block| block["type"] == "tool_use" && block["id"] == call_id)
-        .map(|block| block["input"].to_string())
+    item.content
+        .filter(|content| content.get().starts_with('['))
+        .and_then(|content| serde_json::from_str::<Vec<PlansBlock>>(content.get()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|block| block.kind.as_deref() == Some("tool_use"))
+        .filter_map(|block| block.id.zip(block.input))
+        .collect()
+}
+/// Up to `max` characters of a call's raw arguments, and whether more
+/// follow, decoding nothing past them.
+fn preview(arguments: &RawValue, max: usize) -> (String, bool) {
+    let raw = arguments.get();
+    if raw.starts_with('"') {
+        return string_prefix(raw, max);
+    }
+    let end = raw.char_indices().nth(max).map_or(raw.len(), |(i, _)| i);
+    (raw[..end].to_owned(), end < raw.len())
+}
+/// The first `max` characters of a JSON string literal, and whether more
+/// follow. The literal is valid JSON; a lone surrogate reads as U+FFFD.
+fn string_prefix(literal: &str, max: usize) -> (String, bool) {
+    fn hex(digits: &str) -> u32 {
+        u32::from_str_radix(digits.get(..4).unwrap_or_default(), 16).unwrap_or(0xFFFD)
+    }
+    let (mut out, mut count) = (String::new(), 0);
+    let mut chars = literal[1..].chars();
+    loop {
+        let c = match chars.next() {
+            None | Some('"') => return (out, false),
+            Some('\\') => match chars.next() {
+                Some('n') => '\n',
+                Some('t') => '\t',
+                Some('r') => '\r',
+                Some('b') => '\u{8}',
+                Some('f') => '\u{c}',
+                Some('u') => {
+                    let high = hex(chars.as_str());
+                    chars.nth(3);
+                    // A high surrogate pairs only with a low one right after it.
+                    let low = chars.as_str().strip_prefix("\\u").map_or(0, hex);
+                    let code =
+                        if (0xD800..0xDC00).contains(&high) && (0xDC00..0xE000).contains(&low) {
+                            chars.nth(5);
+                            0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                        } else {
+                            high
+                        };
+                    char::from_u32(code).unwrap_or('\u{FFFD}')
+                }
+                Some(c) => c,
+                None => return (out, false),
+            },
+            Some(c) => c,
+        };
+        if count == max {
+            return (out, true);
+        }
+        out.push(c);
+        count += 1;
+    }
 }
 /// The bounded request context: ordered node ids and exact item bytes.
 #[derive(Debug)]
@@ -2644,14 +2716,16 @@ impl Database {
         let tx = self.conn.savepoint()?;
         let mut head = bot.head;
         let mut entries = Vec::new();
-        // Only a gated round keeps its items, to find each call's node.
+        // A gated round notes which item plans each call.
         let gated = calls.iter().any(|call| bot.gated(&call.name));
-        let mut written = Vec::new();
+        let mut planned = HashMap::new();
         for item in items {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if gated {
-                written.push((id, item));
+                for (call_id, _) in planned_calls(&item) {
+                    planned.insert(call_id.into_owned(), id);
+                }
             }
             let data = json!({"node":id});
             let cursor = event(&tx, &bot.name, Some(turn), "message", data.clone())?;
@@ -2684,7 +2758,7 @@ impl Database {
                 if gates.is_empty() {
                     continue;
                 }
-                let node = call_node(&written, &call.call_id);
+                let node = planned.get(&call.call_id).copied().unwrap_or(0);
                 let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
                 tx.prepare_cached(
                     "INSERT INTO approvals(turn,call_id,name,node,request,announced_ms,gates) VALUES (?,?,?,?,1,?,?)",
@@ -3037,29 +3111,36 @@ impl Database {
         if answer.request > request.request {
             return fail("no_pending_approval");
         }
-        let tag = match answer.tag {
+        let gate = match answer.tag {
             Some(tag) => request
                 .gates
                 .iter()
                 .find(|g| g.tag == tag)
-                .ok_or(Error::new("no_pending_approval"))?
-                .tag
-                .clone(),
-            None if request.gates.len() == 1 => request.gates[0].tag.clone(),
+                .ok_or(Error::new("no_pending_approval"))?,
+            None if request.gates.len() == 1 => &request.gates[0],
             None => {
                 let tags: Vec<&str> = request.gates.iter().map(|g| g.tag.as_str()).collect();
                 return fail_with("approval_tag_required", tags.join(","));
             }
         };
+        let tag = gate.tag.clone();
         if request.verdicts.iter().any(|v| v.tag == tag) {
             return fail("approval_already_answered");
+        }
+        // A gate's expiry is a deadline for its verdict, even before the
+        // turn gets to deny the call for it.
+        let at_ms = epoch_ms();
+        if gate.expire_ms.is_some_and(|ms| {
+            (request.announced_ms.max(0) as u64).saturating_add(ms) <= at_ms as u64
+        }) {
+            return fail("approval_expired");
         }
         let verdict = Verdict {
             tag: tag.clone(),
             allow: answer.allow,
             reason: answer.reason.map(str::to_owned),
             by: answer.by.map(str::to_owned),
-            at_ms: epoch_ms(),
+            at_ms,
         };
         request.verdicts.push(verdict.clone());
         let pending: Vec<&str> = if request.denial().is_some() {
@@ -3122,6 +3203,9 @@ impl Database {
         let mut rows = statement.query(params![after, bot, READ as i64])?;
         let (mut listed, mut bytes, mut read, mut last, mut more) =
             (Vec::new(), 0, 0, after, false);
+        // Previews of the calls in the last item read: an Anthropic item
+        // plans every call of its round, so it is read and scanned once.
+        let mut previews: (i64, Vec<(String, String, bool)>) = (0, Vec::new());
         while let Some(r) = rows.next()? {
             read += 1;
             let (id, turn, call_id): (i64, i64, String) = (r.get(0)?, r.get(2)?, r.get(3)?);
@@ -3153,21 +3237,33 @@ impl Database {
                 continue;
             }
             let node: i64 = r.get(5)?;
-            let item: Option<Vec<u8>> = self
-                .conn
-                .prepare_cached("SELECT item FROM nodes WHERE id=?")?
-                .query_row([node], |r| r.get(0))
-                .optional()?;
-            let arguments = item
-                .and_then(|item| serde_json::from_slice::<Value>(&item).ok())
-                .and_then(|item| call_arguments(&item, &call_id))
-                .unwrap_or_default();
-            let preview: String = arguments.chars().take(2048).collect();
+            if previews.0 != node {
+                let item: Option<Vec<u8>> = self
+                    .conn
+                    .prepare_cached("SELECT item FROM nodes WHERE id=?")?
+                    .query_row([node], |r| r.get(0))
+                    .optional()?;
+                let calls = item.as_deref().map(planned_calls).unwrap_or_default();
+                previews = (
+                    node,
+                    calls
+                        .into_iter()
+                        .map(|(id, arguments)| {
+                            let (text, more) = preview(arguments, 2048);
+                            (id.into_owned(), text, more)
+                        })
+                        .collect(),
+                );
+            }
+            let (arguments, truncated) = previews
+                .1
+                .iter()
+                .find(|(id, ..)| *id == call_id)
+                .map_or(("", false), |(_, text, more)| (text.as_str(), *more));
             let entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
                 "request":request.request,"announced_ms":request.announced_ms,
                 "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
-                "node":node,"arguments":preview,
-                "arguments_truncated":preview.len() < arguments.len()});
+                "node":node,"arguments":arguments,"arguments_truncated":truncated});
             let size = crate::output::encoded_len(&entry)? + 1;
             if listed.len() == limit || bytes + size > 256 * 1024 {
                 more = true;
@@ -5362,5 +5458,53 @@ impl Database {
         self.conn
             .pragma_query_value(None, name, |r| r.get(0))
             .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn string_prefixes_decode_only_what_they_keep() {
+        let prefix = |text: &str, max| {
+            let literal = serde_json::to_string(text).unwrap();
+            string_prefix(&literal, max)
+        };
+        assert_eq!(prefix("ab\"c\\d\n", 64), ("ab\"c\\d\n".into(), false));
+        assert_eq!(prefix("abc", 3), ("abc".into(), false));
+        assert_eq!(prefix("abcd", 3), ("abc".into(), true));
+        assert_eq!(prefix("é😀x", 2), ("é😀".into(), true));
+        // Escaped forms, surrogate pairs included, and a lone surrogate.
+        assert_eq!(
+            string_prefix(r#""\u00e9\ud83d\ude00\/\t\ud800z\ud800\u0041\udc00""#, 64),
+            ("é😀/\t\u{FFFD}z\u{FFFD}A\u{FFFD}".into(), false)
+        );
+    }
+
+    #[test]
+    fn planned_calls_are_found_by_their_ids_not_their_bytes() {
+        // A Responses item whose own item id is another call's id.
+        let decoy = br#"{"type":"function_call","id":"c2","call_id":"c1","name":"shell","arguments":"{\"command\":\"echo \\\"c2\\\"\"}"}"#;
+        let [(id, arguments)] = planned_calls(decoy).try_into().unwrap();
+        assert_eq!(id, "c1");
+        assert_eq!(
+            preview(arguments, 64),
+            (r#"{"command":"echo \"c2\""}"#.into(), false)
+        );
+        let message = br#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"\"c2\""}]}"#;
+        assert!(planned_calls(message).is_empty());
+        // An Anthropic message plans every tool use it holds; input is JSON as is.
+        let anthropic = br#"{"role":"assistant","content":[{"type":"text","text":"\"t2\""},{"type":"tool_use","id":"t1","name":"read","input":{"path":"t2"}},{"type":"tool_use","id":"t2","name":"shell","input":{"command":"ls"}}]}"#;
+        let calls = planned_calls(anthropic);
+        let ids: Vec<&str> = calls.iter().map(|(id, _)| id.as_ref()).collect();
+        assert_eq!(ids, ["t1", "t2"]);
+        assert_eq!(
+            preview(calls[1].1, 64),
+            (r#"{"command":"ls"}"#.into(), false)
+        );
+        assert_eq!(preview(calls[1].1, 4), ("{\"co".into(), true));
+        let text = br#"{"role":"user","content":"plain"}"#;
+        assert!(planned_calls(text).is_empty());
     }
 }

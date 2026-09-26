@@ -790,9 +790,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Built (2026-09-26): the daemon
     mechanism and `manual` mode with `agent approvals` and `agent answer`.
-    Next: the rules-only `auto` approver with `serve_approvals`, then Jev,
-    and a labeled dangerous set to measure false allows before thresholds
-    are fixed.
+    Next, parked on 2026-09-26 behind within-turn compaction, the storage
+    failure, and admission batching: the rules-only `auto` approver with
+    `serve_approvals`, then Jev, and a labeled dangerous set to measure
+    false allows before thresholds are fixed.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

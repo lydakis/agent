@@ -2,7 +2,10 @@ use agent_runtime::{
     Error, Result,
     codec::Family,
     provider::{ToolCall, Usage},
-    store::{Binding, Bot, CompactionPlan, Database, Delivery, Fork, Planning, TurnOptions},
+    store::{
+        Answer, Binding, Bot, CompactionPlan, Database, Delivery, Fork, Gate, Gated, Planning,
+        TurnOptions,
+    },
     tools::Outcome,
 };
 use bytes::Bytes;
@@ -589,6 +592,95 @@ fn tool_results_and_cursor_events_commit_together() {
             .iter()
             .any(|e| e["event"] == "tool_completed")
     );
+}
+
+#[test]
+fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
+    let mut db = db();
+    let tools = ["shell".to_owned()];
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["shell".into()],
+        expire_ms: Some(1),
+    };
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            gate: Some(&gate),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "request",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    // The first item's own id is the second call's id.
+    let item = |id: &str, call_id: &str, command: &str| -> Bytes {
+        serde_json::to_vec(&json!({"type":"function_call","id":id,"call_id":call_id,
+            "name":"shell","arguments":json!({"command":command}).to_string()}))
+        .unwrap()
+        .into()
+    };
+    let call = |call_id: &str, command: &str| ToolCall {
+        name: "shell".into(),
+        call_id: call_id.into(),
+        arguments: json!({"command":command}).to_string(),
+    };
+    let calls = [call("s1", "true"), call("s2", "ls")];
+    db.append(
+        turn,
+        vec![item("s2", "s1", "true"), item("fc_2", "s2", "ls")],
+        &calls,
+        None,
+    )
+    .unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let listed = listed["approvals"].as_array().unwrap();
+    let [first, second] = &listed[..] else {
+        panic!("{listed:?}")
+    };
+    assert_eq!(second["call_id"], "s2");
+    assert_eq!(second["arguments"], r#"{"command":"ls"}"#);
+    assert_eq!(second["arguments_truncated"], false);
+    assert_eq!(
+        second["node"].as_i64(),
+        first["node"].as_i64().map(|n| n + 1)
+    );
+    // An answer after the gate's expiry is refused, even before the turn
+    // gets to deny the call for it.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let late = db.answer(Answer {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: None,
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    });
+    assert_eq!(
+        late.err().map(|e| e.to_string()).as_deref(),
+        Some("approval_expired")
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert!(matches!(
+        db.approval_start(turn, &calls[0], now_ms).unwrap(),
+        Gated::Expired
+    ));
 }
 
 #[test]

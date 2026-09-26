@@ -1473,7 +1473,7 @@ impl Service {
                     "deny" => false,
                     _ => return fail_with("invalid_decision", "allow or deny"),
                 };
-                if call_id.is_empty() || call_id.len() > 256 {
+                if call_id.is_empty() {
                     return fail("invalid_call_id");
                 }
                 if let Some(tag) = &tag {

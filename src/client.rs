@@ -1077,9 +1077,9 @@ fn approvals(options: &Options) -> Result<i32> {
                             .collect::<Vec<_>>()
                             .join(", "))
                         .unwrap_or_default(),
-                    call["bot"].as_str().unwrap_or(""),
+                    shell_word(call["bot"].as_str().unwrap_or("")),
                     call["turn"],
-                    call["call_id"].as_str().unwrap_or(""),
+                    shell_word(call["call_id"].as_str().unwrap_or("")),
                     call["request"],
                 );
             } else {
@@ -1354,10 +1354,11 @@ impl Renderer {
                     println!(
                         "{}",
                         self.dim(&format!(
-                            "⏸ {} waits for {gates} · agent answer --bot {bot} --turn {} --call {} --request {} allow|deny",
+                            "⏸ {} waits for {gates} · agent answer --bot {} --turn {} --call {} --request {} allow|deny",
                             call["name"].as_str().unwrap_or("tool"),
+                            shell_word(bot),
                             event["turn"],
-                            call["call_id"].as_str().unwrap_or(""),
+                            shell_word(call["call_id"].as_str().unwrap_or("")),
                             call["request"],
                         ))
                     );
@@ -1441,6 +1442,36 @@ fn summary(name: &str, arguments: &str) -> String {
         .collect()
 }
 
+/// A value as one shell word, for a command a person copies: bare when it
+/// is plainly safe, single-quoted otherwise, and ANSI-C quoted when it has
+/// control characters, which would otherwise reach the terminal raw.
+fn shell_word(value: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-.,:/@%+=".contains(c);
+    if !value.is_empty() && value.chars().all(plain) {
+        return value.to_owned();
+    }
+    if !value.chars().any(char::is_control) {
+        return format!("'{}'", value.replace('\'', r"'\''"));
+    }
+    let mut word = String::from("$'");
+    for c in value.chars() {
+        match c {
+            '\\' | '\'' => {
+                word.push('\\');
+                word.push(c);
+            }
+            c if c.is_control() => {
+                for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                    word.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    word.push('\'');
+    word
+}
+
 /// A bounded, readable slice of a tool result for the terminal.
 fn preview(output: &str) -> String {
     let text = match serde_json::from_str::<Value>(output) {
@@ -1480,6 +1511,16 @@ fn preview(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_words_keep_ids_one_argument() {
+        assert_eq!(shell_word("call_Ab-9.x"), "call_Ab-9.x");
+        assert_eq!(shell_word(""), "''");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("$(touch x)"), "'$(touch x)'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("a\nb'\x1b"), r"$'a\x0ab\'\x1b'");
+    }
 
     #[test]
     fn agent_provider_names_the_providers_in_place_of_key_variables() {

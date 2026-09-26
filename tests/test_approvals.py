@@ -1,12 +1,13 @@
 """Tool approval: gated calls wait for an answer, run or are denied, and park."""
 import json
 import os
+import shlex
 import subprocess
 import time
 import unittest
 
 from bench.targets import clean_env
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import ODD_CALL_ID, ModelFixture
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -256,6 +257,26 @@ class ApprovalCliTests(ModelFixture):
                                          str(call['turn']), '--call', 'shell-1', '--request', '1',
                                          'allow').stdout)
         self.assertEqual((answered['decision'], answered['pending']), ('allow', []))
+        result = self.agent('wait', '--store', str(self.store), submitted['handle'])
+        self.assertEqual(json.loads(result.stdout)['results'][submitted['handle']]['status'], 'completed')
+
+    def test_a_printed_answer_keeps_any_call_id_one_word(self):
+        submitted = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach',
+                                          'oddshell:printf ok', env={'AGENT_APPROVAL': 'manual'}).stdout)
+        deadline = time.monotonic() + 10
+        while not (pending := json.loads(self.agent('approvals', '--store', str(self.store)).stdout)):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.assertEqual([c['call_id'] for c in pending], [ODD_CALL_ID])
+        pretty = self.agent('approvals', '--store', str(self.store), '--pretty').stdout
+        [line] = [line for line in pretty.splitlines() if ' · agent answer ' in line]
+        command = line.split(' · ', 1)[1].replace(
+            'agent answer', f'{shlex.quote(str(self.binary))} answer --store {shlex.quote(str(self.store))}', 1)
+        pasted = subprocess.run(['bash', '-c', command.replace('allow|deny', 'allow')], cwd=self.path,
+                                env=clean_env(), capture_output=True, text=True, timeout=30)
+        self.assertEqual(pasted.returncode, 0, pasted.stderr)
+        self.assertEqual(json.loads(pasted.stdout)['pending'], [])
+        self.assertFalse((self.path / 'pwned').exists())
         result = self.agent('wait', '--store', str(self.store), submitted['handle'])
         self.assertEqual(json.loads(result.stdout)['results'][submitted['handle']]['status'], 'completed')
 

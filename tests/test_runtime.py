@@ -15,6 +15,9 @@ import unittest
 from bench.targets import clean_env
 from bench.runtime_client import Client, serve_args
 
+# Longer than 256 bytes, with text a shell would run if pasted unquoted.
+ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
+
 
 class Model(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -200,6 +203,11 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'shell', 'call_id': 'shell-1',
                            'arguments': json.dumps({'command': user[6:], 'timeout_ms': 2000})}]
+            elif user.startswith('oddshell:'):
+                # A long call id a shell would read as syntax.
+                text = ''
+                output = [{'type': 'function_call', 'name': 'shell', 'call_id': ODD_CALL_ID,
+                           'arguments': json.dumps({'command': user[9:], 'timeout_ms': 2000})}]
             elif user.startswith('tool:'):
                 text = ''
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'echo-1',

@@ -1020,6 +1020,9 @@ Where it differs from the design above:
   started or denied, rather than counting pending gates.
 - A verdict committed for a parked turn just before a crash is picked up
   at the next start, which checks every turn parked on a verdict once.
+- An answer that arrives after its gate's expiry is refused with
+  `approval_expired`, even when the turn has not yet denied the call, so a
+  late allow cannot outrun the expiry.
 
 Not built yet: the automatic approver (rules and Jev), with
 `serve_approvals`, its lease, and `approvals_lost`; `until_prior`; `path`
