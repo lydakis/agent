@@ -2997,13 +2997,23 @@ impl Database {
         } else if expired {
             // No approver answered in time: the daemon's fixed reason, and
             // the turn ends, since nothing further in it could run.
-            // The verdicts it got, then each gate that lapsed: a deny by no one.
+            // The verdicts it got, then each gate that lapsed, a deny by no
+            // one; a gate still open with a later lapse or none has no entry.
             let mut lapsed = request.approvals();
             if let Value::Array(entries) = &mut lapsed {
-                entries.extend(request.unanswered().map(|g| {
-                    json!({"tag":g.tag,"by":null,"allow":false,
-                        "waited_ms":(now_ms as i64 - request.announced_ms).max(0)})
-                }));
+                let announced = request.announced_ms.max(0) as u64;
+                entries.extend(
+                    request
+                        .unanswered()
+                        .filter(|g| {
+                            g.expire_ms
+                                .is_some_and(|ms| now_ms >= announced.saturating_add(ms))
+                        })
+                        .map(|g| {
+                            json!({"tag":g.tag,"by":null,"allow":false,
+                                "waited_ms":(now_ms as i64 - request.announced_ms).max(0)})
+                        }),
+                );
             }
             let tx = self.conn.savepoint()?;
             deny(

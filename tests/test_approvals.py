@@ -248,6 +248,18 @@ class ApprovalTests(ModelFixture):
         self.assertEqual([(a['tag'], a['by'], a['allow']) for a in completed['approvals']],
                          [('manual', 'test', True), ('second', None, False)])
 
+    def test_only_a_gate_that_lapsed_is_recorded_as_lapsed(self):
+        client = self.gated(approve_expire_ms=300)
+        client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['shell'],
+                       approver='second')
+        turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['turn']
+        finished = client.finished(turn)['data']
+        self.assertEqual((finished['status'], finished['error']), ('interrupted', 'approval_expired'))
+        # The gate without an expiry was still open, not lapsed.
+        completed, _ = self.tool_output(client, 'shell-1', bot='Carol')
+        self.assertEqual([(a['tag'], a['by'], a['allow']) for a in completed['approvals']],
+                         [('manual', None, False)])
+
     def test_a_gate_lapses_on_time_while_its_turn_waits_on_a_handle(self):
         client = self.gated(approve_expire_ms=300)
         client.request('create', bot='Alice', workspace=str(self.path))

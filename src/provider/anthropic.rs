@@ -140,7 +140,7 @@ impl State {
                 ) {
                     self.account(frame.len())?;
                 }
-                self.blocks.push(match block["type"].as_str() {
+                let started = match block["type"].as_str() {
                     Some("text") => Block::Text(String::new()),
                     Some("thinking") => Block::Thinking {
                         thinking: String::new(),
@@ -155,13 +155,20 @@ impl State {
                         self.fallbacks.push((from, to.to_owned()));
                         Block::Fallback(block.clone())
                     }
-                    Some("tool_use") => Block::ToolUse {
-                        id: string("id")?,
-                        name: string("name")?,
-                        input: String::new(),
-                    },
+                    Some("tool_use") => {
+                        // Stored in the item, and a gated call's id again in
+                        // its announcement, so they count like any output.
+                        let (id, name) = (string("id")?, string("name")?);
+                        self.account(encoded_len(&id) + encoded_len(&name))?;
+                        Block::ToolUse {
+                            id,
+                            name,
+                            input: String::new(),
+                        }
+                    }
                     _ => return fail("unsupported_content"),
-                });
+                };
+                self.blocks.push(started);
                 Ok(Frame::Quiet)
             }
             Some("content_block_delta") => {
@@ -409,6 +416,29 @@ mod tests {
             }
         }
         deltas
+    }
+    #[test]
+    fn tool_use_ids_count_toward_the_output_limit() {
+        let mut state = State::default();
+        state
+            .frame(br#"{"type":"message_start","message":{"usage":{"input_tokens":1}}}"#)
+            .unwrap();
+        // Each id is within its own bound; together they pass the output's.
+        let mut failed = None;
+        for index in 0..=MAX_OUTPUT / MAX_CALL_ID {
+            let id = format!("{index:02}{}", "c".repeat(MAX_CALL_ID - 2));
+            let start = json!({"type":"content_block_start","index":index,
+                "content_block":{"type":"tool_use","id":id,"name":"shell","input":{}}});
+            if let Err(error) = state.frame(start.to_string().as_bytes()) {
+                failed = Some((index, error.code));
+                break;
+            }
+        }
+        // Twelve ids alone fill the limit, so the twelfth block's name passes it.
+        assert_eq!(
+            failed,
+            Some((MAX_OUTPUT / MAX_CALL_ID - 1, "output_limit".to_owned()))
+        );
     }
     #[test]
     fn a_tool_use_id_over_the_bound_fails() {
