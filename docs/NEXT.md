@@ -520,8 +520,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
       pay for it. Jev was not used: its probes showed it answers the
       judgments, but not that it beats the static rule of keeping user
       prompts verbatim, and the daemon knows structurally when a boundary
-      is stable. If Jev has a place it is in permission automation, which
-      is deferred. Still open: a real 8 MiB window over a long task, Sonnet,
+      is stable. If Jev has a place it is in permission automation, now
+      [item 45](APPROVALS.md). Still open: a real 8 MiB window over a long task, Sonnet,
       the summarizer's latency at size, and an evaluation that can see a
       summary dropping something the verbatim prompts do not carry.
     Items 16, 17, and 19 follow this; item 9 is deprioritized, since the
@@ -766,6 +766,27 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     fsync there leaves commits in the drive cache. A flush costs about
     5.4 ms on an M1 Max, paid once per group; the service loop above now
     matters on a Mac as much as on slow Linux storage.
+
+45. Approving tool calls. Every allowed call runs without a verdict today,
+    and that stays the default. [The design](APPROVALS.md) adds two more
+    modes, chosen per bot with `--approval` or `AGENT_APPROVAL`: `auto`,
+    where a client answers from deterministic rules first, then asks Jev a
+    few narrow questions per round, and denies what is dangerous or unclear
+    without asking anyone; and `manual`, where a person or program answers.
+    The daemon only gets an `approve` list of tools whose calls wait for an
+    `answer` from any client, and an opaque approver tag: the request rides
+    the plan commit, the verdict rides the call's start or its denial, and a
+    verdict that has not arrived within a short hold parks the turn like
+    `wait`. It has no rules, prompts, or model. It is oversight, not a
+    sandbox. The Harbor tool mix (2026-09-26) sends at least 64 to 76% of
+    rounds to Jev, about 1 to 2% of median trial time, and caps one Jev
+    key at roughly 26 to 31 `auto` rounds a second at most; the count
+    treated four git commands as read-only, which the design no longer
+    does. A labeled Jev run on 341
+    calls (2026-09-26, $0.07) answered in 0.26 s median with no false
+    allows, but at the starting thresholds it refused 23% of benign calls;
+    tuned thresholds cut that sharply. Next: a labeled dangerous set to
+    measure false allows before thresholds are fixed.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.
