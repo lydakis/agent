@@ -1086,7 +1086,9 @@ survives a power cut. Other platforms ignore both. The writer sets
 it can roll back alone) stays in memory and is freed when the job ends,
 instead of spilling past 64 KiB to a temporary file. Without it every
 admission created, wrote and deleted such a file, and a full disk refused it
-mid-job. The store allows one owning
+mid-job. The journal holds rewritten table and index pages, not the large
+values a deletion frees, and completion retention works a piece at a time, so
+no job holds a long history's pages. The store allows one owning
 process. A second owner fails before it can mark the first owner's work
 interrupted. Ownership uses the canonical database path with an appended
 `.owner-lock` suffix; symlinks resolve to the same lock and hard-linked database
@@ -1450,14 +1452,18 @@ needs, and one optional policy composes them:
   its turns finishes, including cancelled or failed queued work and interruption
   while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention
-  left it. Each turn task submits its completion to the storage worker, allowing
+  left it. Each completion removes one piece, the four oldest turns past N at
+  most, like explicit pruning: every page a job rewrites is held in memory
+  until it ends, so a backlog (retention newly enabled, or N lowered) drains
+  over later turns, or at once with `agent prune`. Each turn task submits its completion to the storage worker, allowing
   concurrent finishes to share a commit. The bot stays durably busy until that
   commit; the worker publishes its terminal event before a successor's accepted
   event. Completion, cancellation, explicit pruning, and deletion jobs for the
   same bot cross a commit-and-publication boundary so later retention cannot
   erase an unpublished terminal event. Different bots still share commits.
   The service then retires the task, without another storage round trip.
-  A completion the store refuses (a full disk fails its group with
+  The completion, its outcome and its retention commit together or not at
+  all. A completion the store refuses (a full disk fails its group with
   `storage_error`) left nothing durable, so the task submits the same
   completion again with backoff, 10 ms doubling to one second, while the bot
   stays durably busy and other bots go on; `stats` counts each refusal under

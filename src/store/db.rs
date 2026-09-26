@@ -625,6 +625,22 @@ impl Database {
         self.conn.prepare_cached("BEGIN")?.execute([])?;
         Ok(())
     }
+    /// Run several writes as one: if `work` fails, none of what it wrote
+    /// stays in the group, and the waiting-turn counts are recounted. The
+    /// methods it calls release their own savepoints into this one.
+    pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("SAVEPOINT atomic")?;
+        let done = work(self);
+        if done.is_ok() {
+            self.conn.execute_batch("RELEASE atomic")?;
+        } else if self.in_group() {
+            // Unless SQLite already rolled back the whole transaction.
+            self.conn
+                .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
+            self.recount_pending()?;
+        }
+        done
+    }
     /// Whether the group's transaction is still open. A full disk or an I/O
     /// error can make SQLite roll back the whole transaction mid-job.
     pub fn in_group(&self) -> bool {
@@ -3328,11 +3344,18 @@ impl Database {
     /// and the turn rows themselves stay: retention here bounds what replay
     /// and tool retrieval keep, never what the model said.
     pub fn prune(&mut self, name: &str, keep_turns: usize) -> Result<Value> {
-        self.prune_except(name, keep_turns, None)
+        if !self.exists(name)? {
+            return fail("bot_not_found");
+        }
+        self.prune_records(name, keep_turns, None, 0, None)
     }
     /// Retention as part of a completion: the turn ending in this job keeps
     /// its records, so its terminal event is published and replayable until
     /// the next pass. Live delivery is what the store holds, never more.
+    /// One piece of the oldest turns per completion, like explicit pruning:
+    /// the job's savepoint journal holds every page it rewrites in memory,
+    /// so a backlog (retention newly enabled, or fewer turns kept) drains
+    /// over later completions instead of in one unbounded job.
     pub fn prune_except(
         &mut self,
         name: &str,
@@ -3342,7 +3365,7 @@ impl Database {
         if !self.exists(name)? {
             return fail("bot_not_found");
         }
-        self.prune_records(name, keep_turns, protect, 0, None)
+        self.prune_records(name, keep_turns, protect, 0, Some(Self::RETENTION_PIECE))
     }
     /// One identity-bound piece: the records of up to `limit` prunable turns
     /// after `after`, oldest first. `next_after` names where the next piece

@@ -2052,6 +2052,34 @@ fn deleting_a_bot_frees_only_its_exclusive_history() {
 }
 
 #[test]
+fn completion_retention_prunes_one_piece_of_the_oldest_turns() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=7 {
+        converse(&mut db, "Bob", n);
+    }
+    // A backlog drains a piece per completion, so no one job rewrites a
+    // long history: six turns past the one kept, three events each.
+    let piece = Database::RETENTION_PIECE;
+    assert_eq!(
+        db.prune_except("Bob", 1, None).unwrap()["events"],
+        3 * piece
+    );
+    assert_eq!(
+        db.prune_except("Bob", 1, None).unwrap()["events"],
+        3 * (6 - piece)
+    );
+    assert_eq!(db.prune_except("Bob", 1, None).unwrap()["events"], 0);
+    let left = db.events("Bob", 0, 256).unwrap()["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["event"] == "turn_finished")
+        .count();
+    assert_eq!(left, 1);
+}
+
+#[test]
 fn pruning_keeps_the_transcript_and_marks_the_replay_gap() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

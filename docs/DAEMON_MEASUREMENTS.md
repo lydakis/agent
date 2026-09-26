@@ -4777,6 +4777,21 @@ some filesystems, so macOS needs its own measurement. The per-group counter
 change measured flat in a 320,000-job no-op microbenchmark: median
 2.66 versus 2.57 µs per job, with overlapping ranges.
 
+A review asked whether an in-memory journal lets one retention job hold a
+turn's artifacts in memory. It does not hold them: a freed large value's
+overflow pages are not journaled. One completion pruning 16, 64 and 160
+turns of one near-1 MiB artifact each (14, 57 and 142 MiB stored) raised the
+daemon's peak RSS by 3.0–3.3, 3.3–3.7 and 3.3–4.0 MiB, with or without the
+journal in memory (one or two runs each, same container). What the journal holds is every table and
+index page the job rewrites: pruning 5,000 extra 300-byte event rows raised
+the peak by 4.8 MiB in memory against 3.0 MiB spilling to a file, one run
+each. Since
+completion retention used to prune a whole backlog in one job, it now removes
+one piece of at most four turns per completion, like explicit pruning. A
+build that raised SQLite's spill threshold to 1 MiB instead answered that
+5,000-row prune with `SQLITE_FULL` on a disk with 26 GB free, cause not
+found, so it was dropped.
+
 Still unproven: the SQLite codes of the original failure, since that build
 kept none; which operation failed first for the three failed turns; and
 whether the host's disk was at zero at exactly those instants. The

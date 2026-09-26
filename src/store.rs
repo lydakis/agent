@@ -162,25 +162,30 @@ fn bucket(ns: u64) -> usize {
         .unwrap_or(BUCKETS_US.len())
 }
 impl Counters {
-    /// A job answered as soon as it ran: reads, which join no group.
-    fn record(&self, label: &'static str, queued_ns: u64, ran_ns: u64, storage_error: bool) {
+    /// A job answered as soon as it ran: reads, which join no group. The
+    /// answer leaves once this lock is released, so waiting for it counts.
+    fn record(
+        &self,
+        label: &'static str,
+        queued: std::time::Instant,
+        started: std::time::Instant,
+        storage_error: bool,
+    ) {
+        let ran_ns = started.elapsed().as_nanos() as u64;
         let mut inner = self.inner.lock().unwrap();
         inner.operations.entry(label).or_default().add(
-            queued_ns,
+            started.saturating_duration_since(queued).as_nanos() as u64,
             ran_ns,
-            queued_ns + ran_ns,
+            queued.elapsed().as_nanos() as u64,
             storage_error,
         );
     }
-    /// A group whose callers are answered at `answered`, with its COMMIT
-    /// time when it began.
-    fn group(
-        &self,
-        jobs: impl Iterator<Item = Timing>,
-        answered: std::time::Instant,
-        commit_ns: Option<u64>,
-    ) {
+    /// A group whose callers are answered once this lock is released, with
+    /// its COMMIT time when it began.
+    fn group(&self, jobs: impl Iterator<Item = Timing>, commit_ns: Option<u64>) {
         let mut inner = self.inner.lock().unwrap();
+        // A `stats` snapshot holding the lock delays every answer.
+        let answered = std::time::Instant::now();
         let (mut oldest, mut size) = (0, 0);
         for job in jobs {
             size += 1;
@@ -457,14 +462,12 @@ impl Store {
                             }
                             // Counted before answering, so a caller's own job is
                             // in any stats it reads next; about a microsecond.
-                            let answered = std::time::Instant::now();
                             worker_counters.group(
                                 group.iter().map(|job| Timing {
                                     storage_error: failure.is_some()
                                         || job.error().is_some_and(|e| e.code == "storage_error"),
                                     ..job.timing()
                                 }),
-                                answered,
                                 commit_ns,
                             );
                             for job in group.drain(..) {
@@ -618,8 +621,8 @@ impl Store {
                 let outcome = operation(db);
                 counters.record(
                     label,
-                    (started - queued).as_nanos() as u64,
-                    started.elapsed().as_nanos() as u64,
+                    queued,
+                    started,
                     outcome.as_ref().is_err_and(|e| e.code == "storage_error"),
                 );
                 let _ = sender.send(outcome);
@@ -1075,6 +1078,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_answer_held_up_by_a_stats_snapshot_counts_the_wait() {
+        let store = scratch_store("counter-lock").await;
+        // A snapshot holds the counters while the job commits; the worker
+        // cannot answer until it lets go.
+        let (locked, inside) = std::sync::mpsc::channel();
+        let counters = store.counters.clone();
+        let snapshot = std::thread::spawn(move || {
+            let _held = counters.inner.lock().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        });
+        inside.recv().unwrap();
+        queue_labelled(&store, "held", insert(1))
+            .await
+            .await
+            .unwrap()
+            .unwrap();
+        snapshot.join().unwrap();
+        let held = &store.stats()["operations"]["held"];
+        assert!(held["ran_ms"].as_u64().unwrap() < 30);
+        assert!(held["answered_ms"].as_u64().unwrap() >= 25);
+    }
+
+    #[tokio::test]
     async fn a_cheap_job_answered_with_a_costly_group_reports_the_wait() {
         let store = scratch_store("answered").await;
         let before = store.stats();
@@ -1156,10 +1183,11 @@ mod tests {
             scope.spawn(move || {
                 ready.wait();
                 for index in 0..100_000 {
+                    let now = std::time::Instant::now();
                     counters.record(
                         if index % 2 == 0 { "read" } else { "write" },
-                        1_000_000,
-                        2_000_000,
+                        now,
+                        now,
                         index % 3 == 0,
                     );
                 }
@@ -1179,7 +1207,13 @@ mod tests {
                         .values()
                         .map(|o| o[field].as_u64().unwrap())
                         .sum();
-                    assert_eq!(stats[total].as_u64().unwrap(), sum, "{total}");
+                    // Each part is rounded down to whole milliseconds on its
+                    // own, the total once.
+                    let total = stats[total].as_u64().unwrap();
+                    assert!(
+                        (sum..=sum + operations.len() as u64).contains(&total),
+                        "{field}: {total} against parts summing to {sum}"
+                    );
                 }
                 for operation in operations.values() {
                     for histogram in ["ran", "queued", "answered"] {

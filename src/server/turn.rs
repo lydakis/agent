@@ -279,8 +279,8 @@ pub enum Exit {
 }
 
 /// Completion as one storage job: the terminal event, the outcome its
-/// waiters get, and retention, in that order. The worker publishes all of
-/// it after the job commits.
+/// waiters get, and retention, all or nothing, so a failed completion can
+/// be submitted again. The worker publishes all of it after the job commits.
 pub struct Finished;
 
 impl Finished {
@@ -291,17 +291,20 @@ impl Finished {
         error: Option<&Error>,
         keep: Option<usize>,
     ) -> Result<()> {
-        db.finish(turn, error)?;
-        let outcome = db
-            .turn_outcome(bot, turn)?
-            .ok_or_else(|| Error::new("stale_turn"))?;
+        let outcome = db.atomic(|db| {
+            db.finish(turn, error)?;
+            let outcome = db
+                .turn_outcome(bot, turn)?
+                .ok_or_else(|| Error::new("stale_turn"))?;
+            // A later steer may already be terminal, placing this completion
+            // outside retention: the outcome is captured above, and the
+            // turn's own records are kept so its terminal event is published.
+            if let Some(keep) = keep {
+                db.prune_except(bot, keep, Some(turn))?;
+            }
+            Ok(outcome)
+        })?;
         db.announce(bot, turn, outcome);
-        // A later steer may already be terminal, placing this completion
-        // outside retention: the outcome is captured above, and the turn's
-        // own records are kept so its terminal event is published.
-        if let Some(keep) = keep {
-            db.prune_except(bot, keep, Some(turn))?;
-        }
         Ok(())
     }
 }

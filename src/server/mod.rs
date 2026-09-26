@@ -2744,6 +2744,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_completion_whose_retention_fails_leaves_nothing_and_retries() {
+        let dir = scratch("finish-prune");
+        let path = dir.join("state.sqlite");
+        let (store, _publications) = Store::open(&path).await.unwrap();
+        let first = running(&store, &["Bob".into()]).await[0].1;
+        let last = store
+            .call(move |db| {
+                db.finish(first, None)?;
+                let next = |db: &mut agent_runtime::store::Database, request: &str| {
+                    db.begin(
+                        "Bob",
+                        request,
+                        "work",
+                        true,
+                        &TurnOptions::default(),
+                        |_, _| Ok(()),
+                    )
+                    .map(|started| started.turn)
+                };
+                let second = next(db, "second")?;
+                db.finish(second, None)?;
+                next(db, "third")
+            })
+            .await
+            .unwrap();
+        // The completion commits, then its retention is refused: Bob's
+        // older events cannot be deleted.
+        let refuse = |on: bool| {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(if on {
+                    "CREATE TRIGGER refuse_prune BEFORE DELETE ON events WHEN OLD.bot='Bob'
+                     BEGIN SELECT RAISE(ABORT,'refused'); END;"
+                } else {
+                    "DROP TRIGGER refuse_prune;"
+                })
+                .unwrap()
+        };
+        refuse(true);
+        let mut service = bare_service(&store);
+        service.retain_turns = Some(1);
+        service.spawn("Bob".into(), last, false, false);
+        finish_errors(&store, 2).await;
+        let status = || {
+            let store = store.clone();
+            async move { store.call(move |db| db.turn_status("Bob", last)).await }
+        };
+        assert_eq!(
+            status().await.unwrap(),
+            "running",
+            "the refused retention took the finish back with it"
+        );
+        refuse(false);
+        let (bot, turn, task, exit) = service.jobs.join_next().await.unwrap().unwrap();
+        service.complete(bot, turn, task, exit).await.unwrap();
+        assert_eq!(status().await.unwrap(), "failed");
+        let kept: i64 = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM events WHERE turn=?", [first], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 0, "retention ran with the completion");
+        drop(service);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_stops_a_finish_retry_and_leaves_the_turn_for_recovery() {
         let dir = std::env::temp_dir().join(format!("agent-finish-stop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
