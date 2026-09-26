@@ -556,15 +556,20 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     cut may land at any model round after a completed tool exchange in the
     newest turn, with that turn's prompt kept whole ahead of the tail and
     the turn still running for its clients. Store costs of both are in
-    [the measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). Still
-    open: when one turn overflows even after a forced elision, the round
-    fails with `context_limit` rather than forcing a summary; steers
-    absorbed before an in-turn cut are summarized, not kept verbatim like
-    the prompt; and every window and planning walk traverses the item
+    [the measurements](DAEMON_MEASUREMENTS.md#tool-result-elision). A
+    round that overflows before compaction is due forces a summary after
+    the forced elision, and catch-up steps cut at rounds inside a turn too
+    large for one step. Still open: an overflowing round whose one catch-up
+    step leaves the view over budget ends with `context_limit`, since one
+    step is recorded per head; steers absorbed before an in-turn cut are
+    summarized, not kept verbatim like the prompt; and every window and
+    planning walk traverses the item
     overflow pages because the metadata columns sit after `item`, where a
     covering index cut a probe of the walk from 4.0 to 1.45 ms, to be
     measured in the daemon before adopting. The evaluation of both slices
-    on one task is item 36. (From Astra Pro's compaction review.)
+    on one task is item 36, and its acceptance cases are in
+    [LONG_TASK_EVAL.md](LONG_TASK_EVAL.md). (From Astra Pro's compaction
+    review.)
 35. Thinking-prefix compatibility. Anthropic binds preserved thinking to
     the request prefix on newer accounts; a compaction rewrites that prefix
     and the summarizer replays native items under other instructions. Read
@@ -585,8 +590,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     after a compaction; record the context-view version with each model
     call; measure total input and output, cache reads and writes, and
     summarizer latency per correctly completed task. Compare a few
-    threshold policies on it before changing the 75/25 defaults. (From
-    Astra Pro's compaction review, and the remainder of item 16.)
+    threshold policies on it before changing the 75/25 defaults. First
+    slice built, not yet run live: [`bench/long_task_eval.py`](LONG_TASK_EVAL.md)
+    runs one synthetic repository task with those four facts and a
+    steered correction, in a small-budget and a full-context condition
+    from fresh starts, scored from the workspace and the events. Still
+    open: branching from identical checkpoints, the omission-listing,
+    elision-only, and prompt-excerpts conditions, threshold policies, and
+    the live runs on the ChatGPT plan. (From Astra Pro's compaction review,
+    and the remainder of item 16.)
 37. Context construction cost, measured before built. Item 33 shares an
     encoded prefix across retries, combines window metadata, removes the
     separate `unsummarized_bytes` lookup, and avoids full-window construction

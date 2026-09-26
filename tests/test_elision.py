@@ -76,21 +76,21 @@ class ElisionTests(ModelFixture):
         self.assertTrue(all(encoded(r['input']) <= 65536 for r in branch))
 
     def test_a_turn_over_budget_elides_answered_results_inside_the_keep_target(self):
-        # Half the budget kept verbatim. Forty small results, too small to
-        # elide, then two large ones: the turn overflows while both large
+        # Half the budget kept verbatim. Thirty-six small results, too small
+        # to elide, then two large ones: the turn overflows while both large
         # results, answered, are still inside that tail.
         client = self.client(tools='shell,read', extra=('--context-bytes', '65536', '--compact-keep', '50'))
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'])
         turn = client.request('submit', bot='Bob', request_id='1',
-                              prompt='long:40x40,2x600,10x40')['result']['turn']
+                              prompt='long:36x40,2x600,10x40')['result']['turn']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 65536 for r in requests))
         last = {i['call_id']: i['output'] for i in requests[-1]['input']
                 if i.get('type') == 'function_call_output'}
-        self.assertTrue(last['long-40'].startswith(STUB) and last['long-41'].startswith(STUB))
-        self.assertFalse(last['long-51'].startswith(STUB))
+        self.assertTrue(last['long-36'].startswith(STUB) and last['long-37'].startswith(STUB))
+        self.assertFalse(last['long-47'].startswith(STUB))
 
     def test_a_bot_without_read_never_elides(self):
         # A stub names a read the model could not make.

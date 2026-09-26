@@ -113,6 +113,21 @@ class Model(http.server.BaseHTTPRequestHandler):
                             'arguments': json.dumps({'handles': [user[7:] if count == 100 else 'proc:999']})}]
                           if count <= 205 else [{'type': 'message', 'role': 'assistant',
                                                  'content': [{'type': 'output_text', 'text': text}]}])
+            elif getattr(self.server, 'task_script', None) is not None:
+                # A scripted agent: one shell command a model call, then an
+                # answer quoting the throughput the last result reported.
+                step = self.server.task_step
+                if request.get('instructions') != 'Summarize.':
+                    self.server.task_step += 1
+                text = ''
+                if step < len(self.server.task_script):
+                    output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'task-{step}',
+                               'arguments': json.dumps({'command': self.server.task_script[step]})}]
+                else:
+                    found = re.search(r'throughput: ([0-9]+)', last.get('output', ''))
+                    text = f"Done. make bench reports throughput: {found.group(1) if found else '?'} rows/s."
+                    output = [{'type': 'message', 'role': 'assistant',
+                               'content': [{'type': 'output_text', 'text': text}]}]
             elif last.get('type') == 'function_call_output' and user.startswith('bgwait:') and '"handle"' in last['output']:
                 # Second step of a start-then-wait turn: park on the process handle.
                 text = ''
@@ -120,7 +135,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                            'arguments': json.dumps({'handles': [json.loads(last['output'])['handle']]})}]
             elif user.startswith('long:'):
                 # One long task: a shell call a round, each result about
-                # 11 KiB, then a read of the first elided result, then done.
+                # 11 KiB and each appending its round to rounds.log, then a
+                # read of the first elided result, then done.
                 # `long:COUNTxLINES,...` sets each round's lines instead.
                 # Progress is the newest call since the prompt: a cut inside
                 # the turn summarizes older rounds but keeps the prompt.
@@ -136,7 +152,7 @@ class Model(http.server.BaseHTTPRequestHandler):
                 text = ''
                 if done < len(sizes):
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'long-{done}',
-                               'arguments': json.dumps({'command': f"seq -f 'round {done} line %g' 1 {sizes[done]}",
+                               'arguments': json.dumps({'command': f"seq -f 'round {done} line %g' 1 {sizes[done]}; echo {done} >> rounds.log",
                                                         'timeout_ms': 5000})}]
                 elif stubs and not any(c['name'] == 'read' for c in calls):
                     reference = re.search(r'artifact "(result/[0-9]+)"', stubs[0]['output']).group(1)
