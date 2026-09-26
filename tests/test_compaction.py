@@ -791,6 +791,7 @@ class SummaryCopyTests(ModelFixture):
                          ('own', None))
 
     def test_a_turn_on_another_model_than_the_summarizer_gets_a_request_of_its_own(self):
+        self.model.bodies = []
         self.model.models = ('synthetic-model', 'synthetic-large')
         self.model.routes = []
         client = self.start()
@@ -809,8 +810,46 @@ class SummaryCopyTests(ModelFixture):
         self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
         self.assertIsNone(self.model.routes[index])
         self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+
+    def test_a_turn_back_on_the_summarizer_does_not_copy_a_call_another_model_sent(self):
+        self.model.bodies = []
+        # The history this turn starts from was sent by the previous turn's
+        # model, which the summarizer's cache never saw.
+        self.model.models = ('synthetic-model', 'synthetic-large')
+        client = self.start()
+        for n in range(3):
+            model = {'model': 'openai/synthetic-large'} if n < 2 else {}
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 500,
+                                  **model)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        summary = requests[index]
+        self.assertEqual(requests[index - 1]['model'], 'synthetic-large')
+        self.assertEqual((summary['model'], summary['instructions'], summary['tools']),
+                         ('synthetic-model', 'Summarize.', []))
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+
+    def request_of_its_own(self, client):
+        """The one summary's `request`: a request of its own, priced."""
+        compacted, = self.events(client, 'compacted')
+        request = compacted['data']['request']
+        self.assertEqual((request['form'], request['items'], request['estimate']['copy']), ('own', None, None))
+        return request['estimate']['own']
+
+    def own_bytes(self, summary):
+        """What a Responses request of its own sends, as the summary is
+        priced: its instructions, its empty tool list, and its input's
+        items as they went, read from the request's body."""
+        body, = [b for b in self.model.bodies if json.loads(b) == summary]
+        text = body.decode()
+        start = text.index('"input":') + len('"input":')
+        _, end = json.JSONDecoder().raw_decode(text, start)
+        return len(summary['instructions']) + len(json.dumps(summary['tools'])) + len(text[start:end].encode()) - 2
 
     def test_a_summary_by_another_model_is_a_request_of_its_own(self):
+        self.model.bodies = []
         self.model.models = ('synthetic-model', 'synthetic-small')
         client = self.start(compaction_model='openai/synthetic-small')
         for n in range(3):
@@ -820,3 +859,4 @@ class SummaryCopyTests(ModelFixture):
                          ('synthetic-small', 'Summarize.', []))
         self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
         self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))

@@ -1867,9 +1867,9 @@ way could not be sent. A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
 starts, and that prefix when the view no longer sends it, so its retry,
 after a restart too, can copy the same call through the span. A summary
-the budget forced keeps that prefix, and its retry reads the window past
-the budget, since the view it summarizes is over it and the call it
-copied was not. The copy does not set `tool_choice`, which on
+the budget forced keeps that prefix, and its retry reads the window from
+the saved start the call's window was read from, past the budget, since
+the view it summarizes holds one round more than the call it copied. The copy does not set `tool_choice`, which on
 Anthropic would invalidate the message cache, so the request asks for text
 and a reply that calls a tool (`compaction_tool_call`) or has no text
 (`empty_summary`) is billed and not installed. As Claude Code does, the
@@ -1880,7 +1880,8 @@ the copy shows, the part of the verbatim tail a whole copy sends included.
 Otherwise (no view a call sent holds the span, a copy that cannot fit the
 input limit, or another summarizer, which cannot read that call's cache, as
 when a turn overrides the bot's model and the bot's summarizer summarizes
-it), or when it is estimated cheaper, the request is one of its own: the
+it, or the next turn inherits the view that model sent), or when it is
+estimated cheaper, the request is one of its own: the
 compaction instructions as its instructions, the previous summary
 first, if any, so the summarizer merges rather than restarts, then the
 span's items as stored, then a request to write. Anthropic requests of this

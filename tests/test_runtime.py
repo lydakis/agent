@@ -38,8 +38,11 @@ class Model(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            request = json.loads(body)
             self.server.requests.put(request)
+            if hasattr(self.server, 'bodies'):
+                self.server.bodies.append(body)
             if hasattr(self.server, 'request_gates'):
                 try:
                     gate = self.server.request_gates.get_nowait()

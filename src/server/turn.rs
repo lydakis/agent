@@ -51,8 +51,9 @@ const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
 /// Nodes per piece of a compaction catch-up walk: a few milliseconds of
 /// metadata reads, after which other bots' reads may run.
 const CATCH_UP_PIECE_NODES: i64 = 1024;
-/// A window budget no view reaches, for reading one whole.
-const UNBOUNDED: usize = i64::MAX as usize / 4;
+/// A window budget no view reaches, for reading one whole from its saved
+/// start.
+const UNBOUNDED: i64 = i64::MAX / 4;
 /// Read-ahead while a body streams: a batch stops at either bound, so the
 /// memory held per in-flight request is a number, not a function of item
 /// sizes. An item larger than the byte bound travels alone.
@@ -1010,6 +1011,17 @@ impl Turn {
             if !copied {
                 choice.copy = None;
             }
+            if choice.own_cost.is_none() {
+                let family = summarizer.family();
+                let stripped = match family {
+                    agent_runtime::codec::Family::Anthropic => self.span_thinking(&plan).await?,
+                    agent_runtime::codec::Family::Responses => 0,
+                };
+                choice.own_cost = Some(
+                    self.own_fixed(family, &instructions, tools)?
+                        + own_items(family, &plan)?.saturating_sub(stripped),
+                );
+            }
             // Messages requires definitions for historical tool blocks. Reuse the
             // already encoded bot selection; tool_choice disables new calls.
             // Responses accepts historical calls without definitions. A copy
@@ -1180,17 +1192,6 @@ impl Turn {
             plan.summary_bytes,
         )?);
         let thinking = self.bound(record, &view.prefix.bytes, window).await?;
-        let (head, tail) = agent_runtime::store::CompactionPlan::frame(
-            family,
-            plan.previous_summary.as_deref(),
-            plan.summary_bytes,
-        )?;
-        let own_tools = match family {
-            agent_runtime::codec::Family::Anthropic => tools.get().len(),
-            agent_runtime::codec::Family::Responses => {
-                self.registry.encoded(family, &[])?.get().len()
-            }
-        };
         let sent = if whole { window.ids.len() } else { span.end };
         let choice = choose(&Shape {
             family,
@@ -1207,11 +1208,8 @@ impl Turn {
                 items: view.prefix.items,
             },
             request: request.len(),
-            own_fixed: instructions.len() + own_tools,
-            own_items: head.len()
-                + plan.sizes.iter().map(|&size| size as usize).sum::<usize>()
-                + plan.ids.len().saturating_sub(1)
-                + tail.len(),
+            own_fixed: self.own_fixed(family, instructions, tools)?,
+            own_items: own_items(family, plan)?,
             limit: self.input_limit(),
         });
         let Some(len) = choice.copy else {
@@ -1236,19 +1234,41 @@ impl Turn {
     /// floor its call was read under, behind what that call sent ahead of
     /// it when the view no longer sends that. A summary made because the
     /// view outgrew the budget kept what went ahead, and its window is
-    /// read past the budget, as the call sent less than the view now
-    /// holds. `None` when the window no longer starts where the call's did.
+    /// read from the saved start past the budget, as the call sent less
+    /// than the view now holds. `None` when the window no longer starts
+    /// where the call's did.
     async fn restored(&self, call: agent_runtime::store::CopiedCall) -> Result<Option<LastCall>> {
         let prefix_budget = self.context_bytes * 2 / 3;
-        let under =
-            |bytes, items| self.context_under(bytes, items, prefix_budget, Some(call.floor));
-        let mut view = match under(self.context_bytes, self.context_items).await {
+        let under = self.context_under(
+            self.context_bytes,
+            self.context_items,
+            prefix_budget,
+            Some(call.floor),
+        );
+        let mut view = match under.await {
             Ok(view) => view,
             Err(error) if error.code == "context_limit" && call.prefix.is_some() => {
-                match under(UNBOUNDED, UNBOUNDED).await {
-                    Ok(view) => view,
-                    Err(error) if error.code == "context_limit" => return Ok(None),
-                    Err(error) => return Err(error),
+                // Only back to the saved start, where the call's window was
+                // read from: the call fit the budget, and the view since
+                // holds the results of one round more.
+                let (bot, floor) = (self.bot.clone(), call.floor);
+                let window = self
+                    .store
+                    .op("window", move |db| {
+                        if db.context_start(&bot)?.is_none() {
+                            return Ok(None);
+                        }
+                        db.window_under(&bot, UNBOUNDED, UNBOUNDED, Some(floor))
+                    })
+                    .await?;
+                let Some(window) = window else {
+                    return Ok(None);
+                };
+                let prefix = self.prefix(&window, prefix_budget).await?;
+                Context {
+                    window: Some(window),
+                    prefix,
+                    thinking: Strip::default(),
                 }
             }
             Err(error) if error.code == "context_limit" => return Ok(None),
@@ -1310,6 +1330,35 @@ impl Turn {
             .await
     }
 
+    /// What a request of its own sends besides its items: the summarizer's
+    /// instructions and tools, none on Responses.
+    fn own_fixed(
+        &self,
+        family: agent_runtime::codec::Family,
+        instructions: &str,
+        tools: &serde_json::value::RawValue,
+    ) -> Result<usize> {
+        Ok(instructions.len()
+            + match family {
+                agent_runtime::codec::Family::Anthropic => tools.get().len(),
+                agent_runtime::codec::Family::Responses => {
+                    self.registry.encoded(family, &[])?.get().len()
+                }
+            })
+    }
+
+    /// The thinking bytes a request of its own leaves out of the span.
+    async fn span_thinking(&self, plan: &agent_runtime::store::CompactionPlan) -> Result<usize> {
+        let ids = plan.ids.clone();
+        Ok(self
+            .store
+            .read("thinking_of", move |db| db.thinking_of(&ids))
+            .await?
+            .iter()
+            .map(|&bytes| bytes as usize)
+            .sum())
+    }
+
     /// The summarizer's request body: the previous summary, if any, then
     /// the span's items in store-read batches, then the request to write.
     async fn span_items(&self, plan: &agent_runtime::store::CompactionPlan) -> Result<Items> {
@@ -1325,22 +1374,12 @@ impl Turn {
         )?;
         // The summarizer's instructions differ from the bot's, so no
         // thinking block in the span is bound to this request.
-        let stripped: usize = if family == agent_runtime::codec::Family::Anthropic {
-            let ids = plan.ids.clone();
-            self.store
-                .read("thinking_of", move |db| db.thinking_of(&ids))
-                .await?
-                .iter()
-                .map(|&bytes| bytes as usize)
-                .sum()
+        let stripped = if family == agent_runtime::codec::Family::Anthropic {
+            self.span_thinking(plan).await?
         } else {
             0
         };
-        let total = (head.len()
-            + plan.sizes.iter().map(|s| *s as usize).sum::<usize>()
-            + plan.ids.len().saturating_sub(1)
-            + tail.len())
-        .saturating_sub(stripped);
+        let total = own_items(family, plan)?.saturating_sub(stripped);
         if total > self.input_limit().bytes
             || plan.ids.len() + 1 + usize::from(plan.previous_summary.is_some())
                 > self.input_limit().items
@@ -1458,8 +1497,11 @@ impl Turn {
         let mut last: Option<LastCall> = None;
         // Until this task calls or changes the view, the view is taken as
         // the bot's call before a new prompt or a wait sent it, through
-        // its newest boundary, and its cache as still held.
-        let mut inherited = true;
+        // its newest boundary, and its cache as still held, when that call
+        // was on this turn's model: this turn's own before a wait, else
+        // the previous turn's.
+        let mut inherited =
+            context.model_rounds > 0 || context.previous_model.as_deref() == Some(called);
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
@@ -2954,6 +2996,23 @@ struct LastCall {
 /// models discount less, so there the estimate favors a copy a little
 /// more than their bills do.
 const CACHED_SHARE: usize = 10;
+
+/// The items of a request of its own for the span, framed, with its
+/// thinking still in.
+fn own_items(
+    family: agent_runtime::codec::Family,
+    plan: &agent_runtime::store::CompactionPlan,
+) -> Result<usize> {
+    let (head, tail) = agent_runtime::store::CompactionPlan::frame(
+        family,
+        plan.previous_summary.as_deref(),
+        plan.summary_bytes,
+    )?;
+    Ok(head.len()
+        + plan.sizes.iter().map(|&size| size as usize).sum::<usize>()
+        + plan.ids.len().saturating_sub(1)
+        + tail.len())
+}
 
 /// The estimated cost of `bytes` of input of which `cached` are read from
 /// the provider's cache.
