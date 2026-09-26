@@ -38,7 +38,7 @@ pub(crate) fn usage(usage: &Value, hour: bool) -> Usage {
         cached_input_tokens: read,
         cache_write_tokens: created,
         cache_write_1h_tokens: hourly,
-        models: Vec::new(),
+        ..Usage::default()
     }
 }
 
@@ -286,6 +286,7 @@ impl State {
             cache_write_tokens: models.iter().map(|m| m.cache_write_tokens).sum(),
             cache_write_1h_tokens: models.iter().map(|m| m.cache_write_1h_tokens).sum(),
             models,
+            ..Usage::default()
         };
         self.saw_usage = true;
     }
@@ -440,6 +441,7 @@ mod tests {
                 cached_input_tokens: 3,
                 cache_write_tokens: 5,
                 cache_write_1h_tokens: 0,
+                sent_ms: 0,
                 models: Vec::new(),
             })
         );

@@ -231,6 +231,11 @@ pub struct Usage {
     /// minutes, which Anthropic bills at twice the input rate.
     #[serde(skip_serializing_if = "is_zero")]
     pub cache_write_1h_tokens: u64,
+    /// When the request was sent, in milliseconds since the Unix epoch, so
+    /// a cache miss can be set against the time since the call before it.
+    /// Set by the caller that knows it; zero when unknown.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub sent_ms: u64,
     /// The billed attempts, when a provider-side fallback ran more than one
     /// model for the call, or the summarizer's model on a compaction call,
     /// so each can be priced at its model's rates. The totals above are

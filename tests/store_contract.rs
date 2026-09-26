@@ -870,6 +870,7 @@ fn budgets_count_tokens_and_turn_listings_carry_accounting() {
         cached_input_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
+        sent_ms: 0,
         models: Vec::new(),
     };
     db.append(turn, vec![assistant("one")], &[], Some(&usage))
@@ -3134,6 +3135,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cached_input_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
+        sent_ms: 0,
         models: Vec::new(),
     };
     let warm = Usage {
@@ -3142,6 +3144,7 @@ fn cached_input_tokens_are_kept_per_turn_and_per_bot_with_their_ratio() {
         cached_input_tokens: 240,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
+        sent_ms: 0,
         models: Vec::new(),
     };
     db.append(turn, vec![assistant("one")], &[], Some(&cold))
@@ -3203,6 +3206,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                         cached_input_tokens: cached,
                         cache_write_tokens: 0,
                         cache_write_1h_tokens: 0,
+                        sent_ms: 0,
                         output_tokens: 10,
                         models: Vec::new(),
                     }),
@@ -3237,6 +3241,7 @@ fn cache_migration_rebuilds_retained_usage_or_rolls_back_when_pruned() {
                     cached_input_tokens: 40,
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
+                    sent_ms: 0,
                     output_tokens: 10,
                     models: Vec::new(),
                 },

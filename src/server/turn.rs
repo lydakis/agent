@@ -320,8 +320,8 @@ impl Turn {
         };
         // The rounds future is gone, so cancellation cannot discard this flush.
         // A refresh it had already sent is billed: record what it cost.
-        if let Some(Ok((usage, _))) = settle(&mut accounting.refresh).await
-            && let Err(error) = self.record_refresh(usage).await
+        if let Some(Ok((usage, sent_at))) = settle(&mut accounting.refresh).await
+            && let Err(error) = self.record_refresh(usage, sent_at).await
         {
             result = Err(error);
         }
@@ -1181,9 +1181,11 @@ impl Turn {
                 }
                 _ => call.await,
             };
+            let sent_ms = sent.get().map_or(0, |&at| epoch_ms(at));
             let error = match result {
-                Ok(completion) => {
-                    if let Some(usage) = &completion.usage {
+                Ok(mut completion) => {
+                    if let Some(usage) = &mut completion.usage {
+                        usage.sent_ms = sent_ms;
                         self.tokens.add(usage);
                     }
                     for (from, to) in &completion.fallbacks {
@@ -1226,7 +1228,8 @@ impl Turn {
                 return Ok(None);
             }
             // Whatever the provider billed for a failed attempt is still spent.
-            if let Some(usage) = &accounting.report.usage {
+            if let Some(usage) = &mut accounting.report.usage {
+                usage.sent_ms = sent_ms;
                 self.tokens.add(usage);
                 *model_rounds += 1;
                 record.tokens_used = record
@@ -1526,11 +1529,16 @@ impl Turn {
             }
         };
         let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-        self.record_refresh(usage).await?;
+        self.record_refresh(usage, sent_at).await?;
         Ok(Some((tokens, sent_at)))
     }
 
-    async fn record_refresh(&self, usage: agent_runtime::provider::Usage) -> Result<()> {
+    async fn record_refresh(
+        &self,
+        mut usage: agent_runtime::provider::Usage,
+        sent_at: tokio::time::Instant,
+    ) -> Result<()> {
+        usage.sent_ms = epoch_ms(sent_at);
         self.tokens.add(&usage);
         let turn = self.turn;
         self.store
@@ -1858,6 +1866,11 @@ async fn settle(
     };
     *pending = None;
     refreshed
+}
+
+/// When `at` was, in milliseconds since the Unix epoch.
+fn epoch_ms(at: tokio::time::Instant) -> u64 {
+    now_ms().saturating_sub(at.elapsed().as_millis() as u64)
 }
 
 fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {

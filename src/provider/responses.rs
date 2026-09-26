@@ -230,9 +230,7 @@ fn parse_usage(usage: &Value) -> Usage {
         cached_input_tokens: usage["input_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or(0),
-        cache_write_tokens: 0,
-        cache_write_1h_tokens: 0,
-        models: Vec::new(),
+        ..Usage::default()
     }
 }
 
@@ -272,6 +270,7 @@ mod tests {
                 cached_input_tokens: 4,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                sent_ms: 0,
                 models: Vec::new(),
             })
         );
