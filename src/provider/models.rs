@@ -23,8 +23,8 @@ const LIMIT: usize = 8 * 1024 * 1024;
 /// SHA-256 of an empty body, for a signer that signs the payload.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// Listings kept across all providers, about two replies' worth; past it
-/// a listing is answered but not kept.
+/// Listings and refusals kept across all providers, about two replies'
+/// worth; past it an answer is given but not kept.
 const KEPT: usize = 2 * crate::output::MAX_EVENT;
 
 /// The last answer, a refusal included, so a client asking again within
@@ -63,7 +63,11 @@ impl Provider {
                     )),
                 }
             });
-        let held = if listed.is_ok() { size } else { 0 };
+        // A refusal holds its code and detail; it counts like a listing.
+        let held = match &listed {
+            Ok(_) => size,
+            Err(error) => 64 + error.code.len() + error.detail.as_ref().map_or(0, String::len),
+        };
         let room =
             self.transport
                 .listed
@@ -319,6 +323,25 @@ mod tests {
         provider::{Provider, Transport},
     };
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_kept_refusal_counts_against_the_shared_budget() {
+        use std::sync::atomic::Ordering;
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap();
+        let refused = provider.models().await.unwrap_err();
+        let held = transport.listed.load(Ordering::Relaxed);
+        assert!(held >= refused.code.len(), "{held}");
+        // Asked again, the kept refusal answers and is not counted twice.
+        assert_eq!(provider.models().await.unwrap_err(), refused);
+        assert_eq!(transport.listed.load(Ordering::Relaxed), held);
+    }
 
     #[test]
     fn openai_offers_only_models_a_turn_can_run() {

@@ -901,8 +901,9 @@ does not, and each is one op:
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
   list. It runs off the dispatch path, only when asked, under the same
   connection admission as a turn, and each provider keeps its answer, a
-  refusal included, five minutes, while the listings kept across all
-  providers stay within 2 MiB (past that a listing is answered, not kept). The reply fits one event: a listing past
+  refusal included, five minutes, while the listings and refusals kept
+  across all providers stay within 2 MiB (past that an answer is given, not
+  kept). The reply fits one event: a listing past
   what is left of it is `provider_models_limit` for that provider. Bedrock
   Mantle is asked at the host's `/v1/models`, and each binding offers only
   its own family (`anthropic.` models on the Messages route, the rest on
