@@ -286,8 +286,9 @@ Reconnects, retention, overload, compaction and recovery.
   correct, and compacting took 39 to 45% less input per correct task than
   full context (416k input token-equivalents with stubs at 128 KiB, 438k
   with summaries only, 457k with stubs at 256 KiB, against 754k). Bots
-  with stubs finished as fast as full context (p50 347 against 374 s);
-  bots with summaries only took 541 s, and their summarizer wrote 113k
+  with stubs matched full context's median time (p50 347 against 374 s)
+  but not its tail (max 530 against 383 s); bots with summaries only
+  took 541 s at the median, and their summarizer wrote 113k
   output tokens that the token-equivalents leave out. `7c1904d`,
   2026-09-27. [Record](LONG_TASK_EVAL.md#live-run-9).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport

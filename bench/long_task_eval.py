@@ -645,16 +645,20 @@ def step_command_faults(command, unread=False):
     """Whether a command that runs a step filters its output, and whether
     it runs more than one step or loops over them. A call run in the
     background or detached returns a handle, not the output, so a step in
-    it goes unread."""
-    # List separators, a lone `&` included; `2>&1`, `&>` and `|&` are
-    # redirects and pipes, not separators.
-    segments = re.split(r'&&|\|\||;|\n|(?<![>&|])&(?![&>])', command)
+    it goes unread; so does a step in a command substitution, whose output
+    goes to the command around it."""
+    # List separators, a lone `&` included, and the openings of command
+    # and process substitutions; `2>&1`, `&>` and `|&` are redirects and
+    # pipes, not separators.
+    parts = re.split(r'(&&|\|\||;|\n|(?<![>&|])&(?![&>])|\$\(|<\(|`)', command)
+    segments, openers = parts[0::2], [''] + parts[1::2]
     runs = [bool(STEP_RUN.match(segment)) for segment in segments]
     steps = [segment for segment, run in zip(segments, runs) if run]
+    substituted = any(run and opener in ('$(', '<(', '`') for run, opener in zip(runs, openers))
 
     def sends(segment):
         return '|' in segment or '>' in segment.replace('2>&1', '')
-    filtered = unread and bool(steps) or any(sends(step) for step in steps) or any(
+    filtered = (unread or substituted) and bool(steps) or any(sends(step) for step in steps) or any(
         GROUP_END.match(segment) and sends(segment) and any(runs[:n]) for n, segment in enumerate(segments))
     looped = any(re.match(r'[\s({]*do\s', step) for step in steps) or bool(
         re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
@@ -702,27 +706,55 @@ MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July', '
                'November', 'December')
 
 
+def close_labels(text, months):
+    """Each close label in a text, by position: the month as the prompt
+    names it, 2026-01, or its name, January or Jan."""
+    labels = []
+    for month in months:
+        year, n = month.split('-')
+        name = MONTH_NAMES[int(n) - 1]
+        labels += [(found.start(), month) for found in re.finditer(rf'\b(?:{year}-{n}|{name}|{name[:3]})\b', text)]
+    return sorted(labels)
+
+
+def column_label(header, line, position, months):
+    """The close a number heads under when the labels above it run across
+    a line: the label in its table cell, or with no table, the label in
+    its place when the line has one number for each."""
+    if '|' in header and '|' in line:
+        cells = header.split('|')
+        cell = line[:position].count('|')
+        labels = close_labels(cells[cell], months) if cell < len(cells) else []
+        return labels[0][1] if len(labels) == 1 else None
+    labels = [month for _, month in close_labels(header, months)]
+    values = [found.start() for found in re.finditer(r'(?<![\d.])\d+(?!\.?\d)', line)]
+    return labels[values.index(position)] if len(values) == len(labels) and position in values else None
+
+
 def reported_closes(answer, numbers):
     """The closes an answer gives its own number for: the number whole, as
     `reports` finds it, under that close's label. A number's label is the
     last close label before it on its line, else the first after it on its
-    line, else the last on a line above. A label is the month as the prompt
-    names it, 2026-01, or its name, January or Jan."""
-    reported, above = set(), None
+    line. With none on its line, it is the label its column heads when the
+    last labelled line above holds several, as a table's heading row does,
+    else that line's last label."""
+    reported, above, header = set(), None, None
     for line in (answer or '').replace(',', '').splitlines():
-        labels = []
-        for month in numbers:
-            year, n = month.split('-')
-            name = MONTH_NAMES[int(n) - 1]
-            labels += [(found.start(), month) for found in re.finditer(rf'\b(?:{year}-{n}|{name}|{name[:3]})\b', line)]
-        labels.sort()
+        labels = close_labels(line, numbers)
         for month, number in numbers.items():
             for found in whole(number).finditer(line):
                 before = [label for start, label in labels if start < found.start()]
                 after = [label for start, label in labels if start > found.start()]
-                if (before[-1:] or after[:1] or [above]) == [month]:
+                if labels:
+                    label = (before[-1:] or after[:1])[0]
+                elif header is not None:
+                    label = column_label(header, line, found.start(), numbers)
+                else:
+                    label = above
+                if label == month:
                     reported.add(month)
-        above = labels[-1][1] if labels else above
+        if labels:
+            above, header = labels[-1][1], line if len(labels) > 1 else None
     return reported
 
 

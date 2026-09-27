@@ -248,7 +248,14 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('| Close | Throughput |\n' + '\n'.join(f'| {m} | {numbers[m]} |' for m in MONTHS), 3),
                 ('\n'.join(f'{name}:\n- throughput {numbers[m]}'
                            for name, m in zip(('January', 'Feb', 'March'), MONTHS)), 3),
-                (' '.join(str(numbers[m]) for m in MONTHS), 0)):
+                (' '.join(str(numbers[m]) for m in MONTHS), 0),
+                # Across a line, as a table's heading row or a plain one.
+                ('| Close | ' + ' | '.join(MONTHS) + ' |\n|---|---|---|---|\n| Throughput | '
+                 + ' | '.join(str(numbers[m]) for m in MONTHS) + ' |', 3),
+                ('| ' + ' | '.join(MONTHS) + ' |\n| ' + ' | '.join(str(numbers[m]) for m in reversed(MONTHS)) + ' |',
+                 1),
+                ('Jan Feb Mar\n' + ' '.join(str(numbers[m]) for m in MONTHS), 3),
+                ('Jan Feb Mar\n' + ' '.join(str(numbers[m]) for m in MONTHS[:2]), 0)):
             with self.subTest(answer=answer):
                 self.assertEqual(run(*setup, HALF_EVEN, *closed, answer=answer)['closes_reported'], reported)
         unbenched = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)[:2]])
@@ -445,7 +452,13 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('make check CLOSE=2026-01 & tools/settle 2026-01', (False, True)),
                 ('make check CLOSE=2026-01 & wait', (False, False)),
                 ('make check CLOSE=2026-01 &> log', (True, False)),
-                ('make check CLOSE=2026-01 |& tail -5', (True, False))):
+                ('make check CLOSE=2026-01 |& tail -5', (True, False)),
+                # In a command substitution, the output goes to the command
+                # around it.
+                ('out=$(make check CLOSE=2026-01); printf %s "$out" | tail -1', (True, False)),
+                ('n=`make bench CLOSE=2026-01`', (True, False)),
+                ('diff <(tools/settle 2026-01) expected', (True, False)),
+                ('d=$(date); make check CLOSE=2026-01', (False, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 

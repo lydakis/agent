@@ -642,8 +642,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     correction sent once two closes are settled
     ([run 9](LONG_TASK_EVAL.md#live-run-9)), 38 of 40 were correct and
     compacting took 39 to 45% less input per correct task than full
-    context; stubs matched full context's time, and summaries only took
-    45% longer per bot.
+    context; stubs matched full context's median time but not its tail
+    (530 against 383 s), and summaries only took 45% longer at the
+    median.
     Still open: stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts

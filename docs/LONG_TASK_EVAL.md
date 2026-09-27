@@ -253,8 +253,10 @@ benchmark, since its number does not change), how often it was settled,
 whether its `out/` file holds the right entries, and whether the answer
 carries its number under its own close, whole rather than inside a
 longer one, and its benchmark ran. A number's close is the last close
-label before it on its line, else the first after it on its line, else
-the last on a line above; a label is the month (`2026-01`) or its name
+label before it on its line, else the first after it on its line. With
+none on its line, it is the label heading its column when the last
+labelled line above holds several, as a table's heading row does, else
+that line's last label. A label is the month (`2026-01`) or its name
 (`January` or `Jan`). A sustained bot is correct only
 when the hidden tests pass and all six settlements are right, reports its
 numbers only when all six are there, and followed the workflow when it
@@ -262,14 +264,14 @@ ran `tools/env-check` first, every close's steps came in order, and each
 close was first settled after the one before it. Each close's number is
 its own, so one number in an answer credits one close. It
 also counts the step commands that sent their output elsewhere or cut it
-(a pipe, or a redirect other than `2>&1`), or ran them in the
-background or detached, where the call returns a handle rather than the
-output, and those that ran several steps, joined by any list separator
-(`&` included), or looped over them. A step counts where a command runs it,
-inside a conditional or a loop too, not where it reads the step's
-source. In the scripted run at 128 KiB, the default
-tools stub old results nine times and summarize never; without `read`,
-seven summaries make the room.
+(a pipe, or a redirect other than `2>&1`), ran them inside a command
+substitution, or ran them in the background or detached, where the call
+returns a handle rather than the output, and those that ran several
+steps, joined by any list separator (`&` included), or looped over them.
+A step counts where a command runs it, inside a conditional or a loop
+too, not where it reads the step's source. In the scripted run at
+128 KiB, the default tools stub old results nine times and summarize
+never; without `read`, seven summaries make the room.
 
 Every condition also records each bot's shell commands (the first 160
 characters each), its time from submission to its task's end, and the
@@ -805,8 +807,10 @@ closes are settled. Four arms at once, 10 bots each, seed 7,
   39 to 45% less input than full context, counting cached input at a
   tenth and every summary; full context's bots reached 224k to 295k
   tokens. Stubs at 128 KiB cost least and matched full context on
-  correctness and time. Summaries only cost about the same and got 10 of
-  10, but their bots took 45% longer. Output is not in the
+  correctness and median time (347 against 374 s), but not on the tail:
+  their slowest bot took 530 s against full context's 383 s, and the
+  256 KiB arm's 534 s. Summaries only cost about the same and got 10 of
+  10, but their bots took 45% longer at the median. Output is not in the
   token-equivalents: the summaries-only arm's summarizer wrote 113k
   output tokens, about 11k per bot, beside about 2k of the bot's own.
 - Summaries cost time more than input: 6.8% of the summaries-only arm's
