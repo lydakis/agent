@@ -278,6 +278,9 @@ pub struct Intent {
     pub request: Vec<Words>,
     pub planned: Vec<Planned>,
     pub allowed: Vec<Allowed>,
+    /// Calls the turn started were left out of `allowed`, so consent is
+    /// not asked.
+    pub allowed_cut: bool,
     /// Earlier prompts of the bot, newest first. Context, never consent.
     pub earlier: Vec<Words>,
 }
@@ -322,7 +325,7 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         state.insert("environment_note".into(), json!(redactor.redact(note)));
     }
     if let Some(workspace) = &intent.workspace {
-        state.insert("workspace".into(), json!(workspace));
+        state.insert("workspace".into(), json!(redactor.redact(workspace)));
     }
     state.insert(
         "request".into(),
@@ -340,7 +343,9 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
                     entry["files_it_names"] = call
                         .files
                         .iter()
-                        .map(|(path, content)| json!({"path":path,"content":redactor.redact(content)}))
+                        .map(|(path, content)| {
+                            json!({"path":redactor.redact(path),"content":redactor.redact(content)})
+                        })
                         .collect();
                 }
                 entry
@@ -360,7 +365,7 @@ pub fn build(intent: &Intent, redactor: &Redactor) -> State {
         })
         .collect();
     let cost = size(&allowed);
-    let consent = used + cost <= STATE_TOKENS;
+    let consent = !intent.allowed_cut && used + cost <= STATE_TOKENS;
     if consent {
         used += cost;
         state.insert("already_allowed".into(), allowed);
@@ -965,6 +970,7 @@ mod tests {
                 arguments: json!({"command":"make test"}),
                 status: "succeeded",
             }],
+            allowed_cut: false,
             earlier: vec![person("newer"), person("older")],
         };
         let State::Built { state, consent } = build(&intent, &redactor) else {

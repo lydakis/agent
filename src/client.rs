@@ -756,6 +756,22 @@ fn judge(options: &Options, model: Option<String>) -> Result<String> {
         })
 }
 
+/// Whether the approver `pid` logged that it serves, after byte `start`.
+fn serving(log: &std::ffi::OsStr, start: u64, pid: u32) -> Result<bool> {
+    use std::io::{BufRead, Seek};
+    let mut file = std::fs::File::open(log)?;
+    file.seek(std::io::SeekFrom::Start(start))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = serde_json::from_str::<Value>(&line?) else {
+            continue;
+        };
+        if line["event"] == "serving" && line["pid"] == pid {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// An `auto` bot needs an approver serving `auto`. If none is, start one:
 /// detached, logging its verdicts next to the store, judged by the model
 /// `judge` picks, with the bot's own as the last choice.
@@ -776,10 +792,13 @@ fn ensure_approver(
     let judge = judge(options, model)?;
     let mut log = options.store.clone().into_os_string();
     log.push(".approver.log");
+    let path = log;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log)?;
+        .open(&path)?;
+    // Where this approver's lines start: it is ready once it says so there.
+    let start = log.metadata()?.len();
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("approver")
@@ -803,7 +822,9 @@ fn ensure_approver(
         .spawn()?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        if served(connection)? {
+        // The tag is served as soon as the lease is held, before the judge
+        // is ready, so wait for the approver's own word.
+        if serving(&path, start, child.id())? {
             return Ok(());
         }
         // Another approver won the tag first: that one serves it.
@@ -1110,9 +1131,9 @@ fn run(options: &Options) -> Result<i32> {
             create.as_object_mut().expect("object").extend(gate);
         }
         connection.request("create", create)?;
-    } else if options.approval.as_deref() == Some("auto") {
-        // Working in auto mode: a bot of it gets its approver back after a
-        // daemon restart. Other bots are not checked.
+    } else {
+        // Gates are the bot's own, set when it was made: a bot gated for
+        // `auto` gets its approver back, as after a daemon restart.
         let record = connection.request("resume", json!({"bot":bot}))?;
         if answered_by_auto(&record) {
             ensure_approver(options, &mut connection, bot_model(&record))?;
@@ -1206,18 +1227,21 @@ fn fork(options: &Options) -> Result<i32> {
         "budget_tokens":options.budget_tokens,
         "created_by":created_by,"created_by_id":created_by_id});
     // A fork keeps its source's tools and gates; its own gate adds to them.
+    // Its approver starts first, so a missing judge leaves no fork behind.
+    let state = connection.request("resume", json!({"bot":source}))?;
+    let mut auto = answered_by_auto(&state);
     if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
-        let state = connection.request("resume", json!({"bot":source}))?;
         let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
             .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
         if let Value::Object(gate) = requested_gate(options, &tools)? {
+            auto |= gate.get("approver").is_some_and(|tag| tag == "auto");
             request.as_object_mut().expect("object").extend(gate);
         }
     }
-    let result = connection.request("fork", request)?;
-    if answered_by_auto(&result) {
-        ensure_approver(options, &mut connection, bot_model(&result))?;
+    if auto {
+        ensure_approver(options, &mut connection, bot_model(&state))?;
     }
+    let result = connection.request("fork", request)?;
     print_json(&result, options.pretty)?;
     Ok(0)
 }

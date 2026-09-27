@@ -12,7 +12,7 @@ use agent_runtime::{Error, Result};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -56,6 +56,8 @@ const CHAIN: usize = 8;
 /// The largest file written this turn that a judged call may run: a call
 /// that runs a larger one is refused rather than judged on its first part.
 const FILE_BYTES: u64 = 48 * 1024;
+/// The largest answer Jev may send; a larger one is a failed check.
+const REPLY_BYTES: usize = 64 * 1024;
 /// First wait after a 429 or 529 without Retry-After, doubled each time.
 const BACKOFF: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(4);
@@ -101,6 +103,8 @@ struct Usage {
 
 struct Judge {
     via: Via,
+    /// Taken before a round reads anything, so rounds past these wait
+    /// holding only their calls.
     slots: Semaphore,
     /// How long a round may wait for its verdict, from its announcement.
     deadline_ms: u64,
@@ -119,10 +123,6 @@ impl Judge {
         questions: &Value,
         deadline: Instant,
     ) -> Judged {
-        let Ok(Ok(_slot)) = tokio::time::timeout_at(deadline.into(), self.slots.acquire()).await
-        else {
-            return Judged::Overloaded;
-        };
         match &self.via {
             Via::Jev(jev) => jev.ask(state, questions, deadline).await,
             Via::Model(model) => model.ask(client, state, questions, deadline).await,
@@ -193,10 +193,28 @@ impl Jev {
             if !(200..300).contains(&status) {
                 return Judged::Failed(format!("the judge answered {status}"));
             }
-            *self.backoff.lock().unwrap() = (None, BACKOFF);
-            let Ok(bytes) = response.bytes().await else {
-                return Judged::Failed("the check failed".into());
-            };
+            {
+                // An answer to a request sent before another was throttled
+                // leaves that newer wait in place.
+                let mut backoff = self.backoff.lock().unwrap();
+                if backoff.0.is_none_or(|until| until <= Instant::now()) {
+                    *backoff = (None, BACKOFF);
+                }
+            }
+            let mut response = response;
+            let mut bytes = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if bytes.len() + chunk.len() <= REPLY_BYTES => {
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(Some(_)) => {
+                        return Judged::Failed("the judge's answer was too large".into());
+                    }
+                    Ok(None) => break,
+                    Err(_) => return Judged::Failed("the check failed".into()),
+                }
+            }
             let Ok(reply) = serde_json::from_slice::<Value>(&bytes) else {
                 return Judged::Failed("the judge's answer was not JSON".into());
             };
@@ -224,13 +242,25 @@ struct Model {
 
 impl Model {
     /// A fresh base, so a changed judge takes effect, and no forks left by
-    /// an approver that stopped mid-round. Only the tag's holder does this.
+    /// an approver that stopped mid-round. Only the tag's holder does this,
+    /// and it removes only judges: a bot of the same name that is not one
+    /// is refused, not deleted.
     async fn prepare(
         client: &Arc<Client>,
         base: String,
         model: &str,
         reasoning: Option<&str>,
     ) -> Result<Model> {
+        match client.request("resume", json!({"bot":base})).await {
+            Ok(bot) if !judge_bot(&bot) => {
+                return Err(Error::with(
+                    "approver_name_taken",
+                    format!("{base} is a bot that is not a judge; rename it to serve this tag"),
+                ));
+            }
+            Err(error) if error.code != "bot_not_found" => return Err(daemon(error)),
+            _ => {}
+        }
         let prefix = format!("{base}.");
         let mut after = Value::Null;
         loop {
@@ -239,10 +269,11 @@ impl Model {
                 .await
                 .map_err(daemon)?;
             for bot in page["bots"].as_array().into_iter().flatten() {
-                if let Some(name) = bot["name"]
-                    .as_str()
-                    .filter(|name| name.starts_with(&prefix))
-                {
+                if let Some(name) = bot["name"].as_str().filter(|name| {
+                    name.starts_with(&prefix)
+                        && bot["created_by"] == base.as_str()
+                        && bot["tools"].as_array().is_some_and(Vec::is_empty)
+                }) {
                     // Aside, so a turn still ending does not hold up serving.
                     let (client, name) = (client.clone(), name.to_owned());
                     let running = bot["running_turn"].as_i64();
@@ -305,6 +336,18 @@ impl Model {
     }
 }
 
+/// Whether a bot record is a judge an approver made: no tools, and the
+/// judge's instructions.
+fn judge_bot(bot: &Value) -> bool {
+    let opening = policy::JUDGE_INSTRUCTIONS
+        .split_once(". ")
+        .map_or(policy::JUDGE_INSTRUCTIONS, |(first, _)| first);
+    bot["tools"].as_array().is_some_and(Vec::is_empty)
+        && bot["instructions"]
+            .as_str()
+            .is_some_and(|text| text.starts_with(opening))
+}
+
 /// The judge's one turn, and the turn if it is still running.
 async fn turn(
     client: &Client,
@@ -313,10 +356,13 @@ async fn turn(
     questions: &Value,
     deadline: Instant,
 ) -> (Judged, Option<i64>) {
+    // Queued when every slot is taken, often by the turn being judged
+    // until it parks: it starts when one frees, within the deadline.
     let submitted = match client
         .request(
             "submit",
-            json!({"bot":name,"request_id":name,"prompt":policy::model_prompt(state, questions)}),
+            json!({"bot":name,"request_id":name,"prompt":policy::model_prompt(state, questions),
+                "delivery":"queue"}),
         )
         .await
     {
@@ -413,6 +459,9 @@ async fn remove(client: &Client, name: &str, running: Option<i64>) {
     }
 }
 
+/// A bot's latest turn and the requests of it already judged.
+type Seen = (i64, HashSet<(String, i64)>);
+
 struct Shared {
     client: Arc<Client>,
     judge: Judge,
@@ -420,8 +469,9 @@ struct Shared {
     lease: u64,
     note: Option<String>,
     redactor: Redactor,
-    /// Requests already judged, so a call listed and pushed is judged once.
-    seen: Mutex<HashSet<(String, i64, String, i64)>>,
+    /// Requests already judged, so none is judged twice: per bot, only
+    /// those of its latest turn, since a bot's turns run one at a time.
+    seen: Mutex<HashMap<String, Seen>>,
     /// Turns the breaker stopped, still to be interrupted.
     tripped: Mutex<HashSet<(String, i64)>>,
     /// Set when an answer finds the lease gone.
@@ -480,7 +530,9 @@ async fn serve(settings: Settings) -> Result<i32> {
         tripped: Mutex::default(),
         lost: Notify::new(),
     });
-    report(json!({"event":"serving","tag":tag,"lease":lease}));
+    // The CLI that started this process waits for this line: the judge is
+    // ready, not just the lease held.
+    report(json!({"event":"serving","tag":tag,"lease":lease,"pid":std::process::id()}));
     let mut rounds = tokio::task::JoinSet::new();
     // The calls already waiting, page by page up to where serving began;
     // later ones are pushed. Every page first, so a round that spans two
@@ -592,13 +644,17 @@ fn whole_round(
 /// listing may hold several.
 fn group(calls: Vec<Value>) -> Vec<(String, i64, Vec<Value>)> {
     let mut rounds: Vec<(String, i64, Vec<Value>)> = Vec::new();
+    let mut index: HashMap<(String, i64), usize> = HashMap::new();
     for call in calls {
         let (Some(bot), Some(turn)) = (call["bot"].as_str(), call["turn"].as_i64()) else {
             continue;
         };
-        match rounds.iter_mut().find(|(b, t, _)| b == bot && *t == turn) {
-            Some((_, _, calls)) => calls.push(call),
-            None => rounds.push((bot.to_owned(), turn, vec![call])),
+        match index.get(&(bot.to_owned(), turn)) {
+            Some(&at) => rounds[at].2.push(call),
+            None => {
+                index.insert((bot.to_owned(), turn), rounds.len());
+                rounds.push((bot.to_owned(), turn, vec![call]));
+            }
         }
     }
     rounds
@@ -607,15 +663,21 @@ fn group(calls: Vec<Value>) -> Vec<(String, i64, Vec<Value>)> {
 async fn round(shared: Arc<Shared>, bot: String, turn: i64, calls: Vec<Value>) {
     let calls: Vec<Value> = {
         let mut seen = shared.seen.lock().unwrap();
+        let (latest, requests) = seen
+            .entry(bot.clone())
+            .or_insert_with(|| (turn, HashSet::new()));
+        if *latest < turn {
+            *latest = turn;
+            requests.clear();
+        }
         calls
             .into_iter()
             .filter(|call| {
-                seen.insert((
-                    bot.clone(),
-                    turn,
-                    call["call_id"].as_str().unwrap_or_default().to_owned(),
-                    call["request"].as_i64().unwrap_or(0),
-                ))
+                *latest > turn
+                    || requests.insert((
+                        call["call_id"].as_str().unwrap_or_default().to_owned(),
+                        call["request"].as_i64().unwrap_or(0),
+                    ))
             })
             .collect()
     };
@@ -716,6 +778,11 @@ async fn judge(
     calls: &[Value],
     deadline: Instant,
 ) -> std::result::Result<(Vec<Verdict>, Usage), Verdict> {
+    let Ok(Ok(_slot)) =
+        tokio::time::timeout_at(deadline.into(), shared.judge.slots.acquire()).await
+    else {
+        return Err(policy::not_reviewed("the approver is overloaded"));
+    };
     let intent =
         match tokio::time::timeout_at(deadline.into(), intent(shared, bot, turn, calls)).await {
             Err(_) => return Err(policy::not_reviewed("the approver is overloaded")),
@@ -751,6 +818,36 @@ async fn judge(
             Ok((verdicts, usage))
         }
     }
+}
+
+/// A file the turn wrote, as a judged call that names it would run it:
+/// only a regular file, opened without waiting on a FIFO or device, and
+/// read no further than `FILE_BYTES`, whatever size it reported.
+fn written_file(file: &Path) -> std::result::Result<Option<Vec<u8>>, Unjudged> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(opened) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(file)
+    else {
+        return Ok(None);
+    };
+    if !opened.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    let mut content = Vec::new();
+    if opened
+        .take(FILE_BYTES + 1)
+        .read_to_end(&mut content)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if content.len() as u64 > FILE_BYTES {
+        return Err(Unjudged::FileTooLong);
+    }
+    Ok(Some(content))
 }
 
 enum Unjudged {
@@ -867,31 +964,44 @@ async fn intent(
         });
     }
     // A call that names a file this turn wrote is judged with that file
-    // whole, as it is on disk now: what the call would run.
+    // whole, as it is on disk now: what the call would run. One that an
+    // earlier call of this round writes or edits is not on disk yet as the
+    // call will find it, so it points to that call instead.
     let workspace = read["workspace"].as_str().map(PathBuf::from);
+    let mut changing: Vec<(String, String)> = Vec::new();
     for call in &mut planned {
         let text = call.arguments.to_string();
-        for path in &written {
+        let names = |path: &str| {
             let name = std::path::Path::new(path)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or(path);
-            if !text.contains(path.as_str()) && !(name.len() >= 3 && text.contains(name)) {
+            text.contains(path) || (name.len() >= 3 && text.contains(name))
+        };
+        for (path, id) in &changing {
+            if names(path) {
+                call.files.push((
+                    path.clone(),
+                    format!("[{id} in this round changes it before this call runs; see {id}]"),
+                ));
+            }
+        }
+        for path in &written {
+            if !names(path) || changing.iter().any(|(changed, _)| changed == path) {
                 continue;
             }
             let file = workspace
                 .as_deref()
                 .map_or_else(|| PathBuf::from(path), |w| w.join(path));
-            let Ok(meta) = std::fs::metadata(&file) else {
-                continue;
-            };
-            if meta.len() > FILE_BYTES {
-                return Err(Unjudged::FileTooLong);
-            }
-            if let Ok(content) = std::fs::read(&file) {
+            if let Some(content) = written_file(&file)? {
                 call.files
                     .push((path.clone(), String::from_utf8_lossy(&content).into_owned()));
             }
+        }
+        if matches!(call.tool.as_str(), "write" | "edit")
+            && let Some(path) = call.arguments["path"].as_str()
+        {
+            changing.push((path.to_owned(), call.id.clone()));
         }
     }
     let earlier = read["earlier"]
@@ -912,62 +1022,140 @@ async fn intent(
         request,
         planned,
         allowed,
+        allowed_cut: read["calls_more"] == true,
         earlier,
     })
 }
 
 /// The person-written prompts above a model-written one: the turn that
-/// wrote it, and so on up to `CHAIN` delegations. A turn that can no longer
-/// be read (its bot was deleted) has no person above it, so nothing there
-/// consents.
+/// wrote it, and so on up to `CHAIN` delegations, in the order they were
+/// written, so a later word from the person still reads as the later one.
+/// A turn that can no longer be read (its bot was deleted) has no person
+/// above it, so nothing there consents.
 async fn persons_above(
     client: &Client,
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
     request: &mut Vec<Words>,
 ) -> std::result::Result<(), Unjudged> {
-    let mut pending = vec![from.clone()];
-    let mut found = Vec::new();
-    while let Some(from) = pending.pop() {
-        let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) else {
-            continue;
-        };
-        if visited.len() > CHAIN || !visited.insert((bot.to_owned(), turn)) {
-            continue;
-        }
-        let read = match client
-            .request(
-                "prompts",
-                json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
-            )
-            .await
+    // Each delegating turn's prompts in order; a model-written one is
+    // replaced by the prompts above it, depth first.
+    let mut levels: Vec<std::vec::IntoIter<Value>> = Vec::new();
+    let mut next = Some(from.clone());
+    loop {
+        if let Some(from) = next.take()
+            && let Some(prompts) = delegated(client, &from, visited).await?
         {
-            Ok(read) => read,
-            Err(error) if matches!(error.code.as_str(), "bot_not_found" | "turn_not_found") => {
-                continue;
-            }
-            Err(error) => return Err(error.into()),
+            levels.push(prompts.into_iter());
+        }
+        let Some(level) = levels.last_mut() else {
+            return Ok(());
         };
-        for prompt in read["prompts"].as_array().into_iter().flatten() {
-            if prompt["truncated"] == true {
-                return Err(Unjudged::TooLong);
-            }
-            match prompt.get("from") {
-                Some(above) => pending.push(above.clone()),
-                None => found.push(Words {
-                    by: By::Person,
-                    text: prompt["text"].as_str().unwrap_or_default().to_owned(),
-                }),
-            }
+        let Some(prompt) = level.next() else {
+            levels.pop();
+            continue;
+        };
+        if prompt["truncated"] == true {
+            return Err(Unjudged::TooLong);
+        }
+        match prompt.get("from") {
+            Some(above) => next = Some(above.clone()),
+            None => request.push(Words {
+                by: By::Person,
+                text: prompt["text"].as_str().unwrap_or_default().to_owned(),
+            }),
         }
     }
-    request.extend(found);
-    Ok(())
+}
+
+/// The prompts of the turn `from` names, unless it was read already, the
+/// chain is too long, or it is gone.
+async fn delegated(
+    client: &Client,
+    from: &Value,
+    visited: &mut HashSet<(String, i64)>,
+) -> std::result::Result<Option<Vec<Value>>, Unjudged> {
+    let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) else {
+        return Ok(None);
+    };
+    if visited.len() > CHAIN || !visited.insert((bot.to_owned(), turn)) {
+        return Ok(None);
+    }
+    match client
+        .request(
+            "prompts",
+            json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
+        )
+        .await
+    {
+        Ok(mut read) => Ok(match read["prompts"].take() {
+            Value::Array(prompts) => Some(prompts),
+            _ => None,
+        }),
+        Err(error) if matches!(error.code.as_str(), "bot_not_found" | "turn_not_found") => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounds_keep_the_order_their_first_calls_arrived_in() {
+        let call = |bot: &str, turn: i64, id: &str| json!({"bot":bot,"turn":turn,"call_id":id});
+        let rounds = group(vec![
+            call("Bob", 3, "a"),
+            call("Ann", 1, "b"),
+            call("Bob", 3, "c"),
+            call("Bob", 4, "d"),
+        ]);
+        let shape: Vec<(&str, i64, Vec<&str>)> = rounds
+            .iter()
+            .map(|(bot, turn, calls)| {
+                let ids = calls.iter().map(|c| c["call_id"].as_str().unwrap());
+                (bot.as_str(), *turn, ids.collect())
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("Bob", 3, vec!["a", "c"]),
+                ("Ann", 1, vec!["b"]),
+                ("Bob", 4, vec!["d"])
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_tool_less_bot_with_the_judges_instructions_is_a_judge() {
+        let judge = json!({"tools":[],"instructions":policy::JUDGE_INSTRUCTIONS});
+        assert!(judge_bot(&judge));
+        let tools = json!({"tools":["shell"],"instructions":policy::JUDGE_INSTRUCTIONS});
+        assert!(!judge_bot(&tools));
+        assert!(!judge_bot(
+            &json!({"tools":[],"instructions":"Help with the repo."})
+        ));
+    }
+
+    #[test]
+    fn a_written_file_is_read_only_if_regular_and_within_the_limit() {
+        let dir = std::env::temp_dir().join(format!("agent-written-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("run.sh");
+        std::fs::write(&small, "echo hi\n").unwrap();
+        assert!(matches!(written_file(&small), Ok(Some(content)) if content == b"echo hi\n"));
+        let large = dir.join("large.sh");
+        std::fs::write(&large, vec![b'#'; FILE_BYTES as usize + 1]).unwrap();
+        assert!(matches!(written_file(&large), Err(Unjudged::FileTooLong)));
+        // A FIFO with no writer is skipped, not waited on.
+        let fifo = dir.join("fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(matches!(written_file(&fifo), Ok(None)));
+        assert!(matches!(written_file(&dir.join("gone")), Ok(None)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_round_in_parts_is_judged_once_its_last_part_is_in() {

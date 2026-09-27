@@ -4479,13 +4479,18 @@ impl Database {
     }
     /// The most prompt and argument text one `prompts` read returns.
     pub const PROMPTS_BYTES: usize = 256 * 1024;
+    /// What each listed call and earlier prompt counts against `bytes` for
+    /// its fields, so many short entries cannot outgrow a reply.
+    pub const PROMPTS_ENTRY: usize = 64;
     /// A turn's words and calls, as a program judging its calls reads them:
     /// the turn's prompt and each steer it absorbed, in order, with the bot
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
     /// bot's earlier prompts, newest first. Text counts against `bytes` in
-    /// that order; one that does not fit is cut and marked `truncated`, and
-    /// `more` says earlier prompts were left out.
+    /// that order, and each call and earlier prompt also counts
+    /// `PROMPTS_ENTRY`; text that does not fit is cut and marked
+    /// `truncated`, `calls_more` says calls were left out, and `more` says
+    /// earlier prompts were.
     pub fn prompts(&self, name: &str, turn: i64, bytes: usize) -> Result<Value> {
         if !(1..=Self::PROMPTS_BYTES).contains(&bytes) {
             return fail_with(
@@ -4557,8 +4562,14 @@ impl Database {
             "SELECT data FROM events WHERE turn=? AND kind='tool_started' ORDER BY id",
         )?;
         let mut calls = Vec::new();
+        let mut calls_more = false;
         let mut rows = started.query([turn])?;
         while let Some(r) = rows.next()? {
+            if left < Self::PROMPTS_ENTRY {
+                calls_more = true;
+                break;
+            }
+            left -= Self::PROMPTS_ENTRY;
             let data: Value = serde_json::from_str(&r.get::<_, String>(0)?)?;
             let call_id = data["call_id"].as_str().unwrap_or_default().to_owned();
             let mut arguments = data["arguments"].as_str().unwrap_or_default().to_owned();
@@ -4587,10 +4598,11 @@ impl Database {
         )?;
         let mut rows = statement.query(params![name, turn])?;
         while let Some(r) = rows.next()? {
-            if left == 0 {
+            if left < Self::PROMPTS_ENTRY {
                 more = true;
                 break;
             }
+            left -= Self::PROMPTS_ENTRY;
             let mut entry = prompt_entry(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, &mut left);
             if r.get::<_, bool>(4)? {
                 entry["steer"] = json!(true);
@@ -4599,7 +4611,7 @@ impl Database {
         }
         Ok(
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"calls":calls,"earlier":earlier,"more":more}),
+            "prompts":prompts,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
     }
     /// Planned calls announced and not yet started or denied, for `stats`.

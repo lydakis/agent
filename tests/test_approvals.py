@@ -827,13 +827,30 @@ class AutoApproverTests(ModelFixture):
         self.model.reply_for = reply
         self.model.models = ('synthetic-model', 'judge-model')
         daemon = self.daemon()
-        # A fork left by an approver that stopped mid-round is removed.
+        # A bot that only has the judge's name is refused, not replaced.
         daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
-                       instructions='old', tools=[])
-        daemon.request('fork', source='approver.auto', bot='approver.auto.1.0')
+                       instructions='Help with the repo.', tools=[])
+        refused = subprocess.run(
+            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), '--judge', 'openai/judge-model'],
+            env=clean_env(), capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('approver_name_taken', refused.stderr)
+        self.assertEqual(daemon.request('resume', bot='approver.auto')['result']['instructions'],
+                         'Help with the repo.')
+        self.assertIn('result', daemon.request('delete', bot='approver.auto'))
+        # A fork left by an approver that stopped mid-round is removed, and
+        # a bot that only shares its prefix is kept.
+        daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
+                       instructions='You judge tool calls an AI agent has planned, before they run. Old.',
+                       tools=[])
+        daemon.request('fork', source='approver.auto', bot='approver.auto.1.0', created_by='approver.auto')
+        daemon.request('create', bot='approver.auto.notes', workspace='/', model='openai/synthetic-model',
+                       tools=['shell'])
         _, lines = self.approver(daemon, judge='openai/judge-model')
         bots = {b['name']: b for b in daemon.request('bots')['result']['bots']}
-        self.assertEqual(sorted(bots), ['Bob', 'approver.auto'])
+        self.assertEqual(sorted(bots), ['Bob', 'approver.auto', 'approver.auto.notes'])
+        self.assertIn('result', daemon.request('delete', bot='approver.auto.notes'))
         self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools'],
                           bots['approver.auto']['gates']), ('judge-model', [], []))
         safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']

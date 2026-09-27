@@ -412,7 +412,9 @@ own clock.
   once, and a program can invent its own tag and serve those bots itself.
 - **`auto` needs its approver running.** The CLI already starts the daemon
   when it is not running; with `auto` it starts `agent approver` the same
-  way. A gated call with no approver waits, parked and visible in
+  way, whenever it makes, continues, or forks a bot that an `auto` gate
+  answers, so a bot continued after a daemon restart gets its approver
+  back. A gated call with no approver waits, parked and visible in
   `approvals`, rather than running or failing silently, until its gate's
   15 s expiry denies it and ends the turn. So if the approver dies and
   nothing restarts it, each auto bot stops at its next gated call with
@@ -578,10 +580,13 @@ approver the CLI starts.
 - **Any other model** runs through the daemon, with the providers and
   logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
   approver keeps an idle bot, `approver.TAG`, with the judge's
-  instructions and no tools, and made fresh when it starts. Each round
-  forks it, submits one JSON prompt holding the state and the eleven
-  questions (each with what makes it yes or no), reads back one JSON object
-  of probabilities, and deletes the fork. A reply without every answer, or
+  instructions and no tools, and made fresh when it starts; a bot of that
+  name that is not a judge is left alone and the approver refuses to start
+  (`approver_name_taken`). Each round forks it, submits one JSON prompt
+  holding the state and the eleven questions (each with what makes it yes
+  or no), queued when every active slot is taken so it starts within the
+  round's deadline, reads back one JSON object of probabilities, and
+  deletes the fork. A reply without every answer, or
   with one outside 0 to 1, is a failed check. The forks keep rounds apart,
   run them at once, and share the base's prompt cache. Forks left by an
   approver that stopped are deleted when the next one starts.
@@ -1091,15 +1096,19 @@ Built on 2026-09-27, the automatic approver:
   the judge is shown with `prompts` and `item`, follows delegations up to
   8 turns to the person's words, redacts, and asks one judge request per
   round: Jev over its API or any model through the daemon ([Which model
-  judges](#which-model-judges)). It answers under its lease, backs off on
-  429 and 529, denies as not reviewed past the round's deadline, and trips
+  judges](#which-model-judges)). A round takes one of 32 judge slots
+  before it reads anything, so rounds past those wait holding only their
+  calls. It answers under its lease, backs off on 429 and 529 (an answer
+  to an earlier request leaves a newer wait in place), fails a Jev answer
+  past 64 KiB, denies as not reviewed past the round's deadline, and trips
   the breaker. Each round prints one JSON line with the verdicts, the
   judge's time, and its tokens.
 - `from` on `submit`, `AGENT_TURN` in tool shells, and the `prompts` read
   op; `failed` on `tool_completed` and the planning `node` on a gated
   `tool_started`, so the calls already allowed show how they ended.
 - `--approval auto` in the CLI, which starts the approver when nobody
-  serves `auto`.
+  serves `auto` and waits for its `serving` line, printed once the judge
+  is ready rather than when the lease is taken.
 
 Where the approver differs from the design above:
 
@@ -1107,13 +1116,18 @@ Where the approver differs from the design above:
   approver reads authors with `prompts` rather than from
   `approval_requested`.
 - A file the turn wrote is shown whole with a call that names it, by its
-  path or its file name, up to 48 KiB; a larger one is refused as "not
-  reviewed: it runs a file too large to show".
+  path or its file name, up to 48 KiB counted as it is read; a larger one
+  is refused as "not reviewed: it runs a file too large to show", and one
+  that is no longer a regular file is not read. A write or edit planned
+  earlier in the same round is named in its place, since it runs first.
 - A general model is asked the same questions as text, each with what
   makes it yes or no, and answers them as one JSON object.
 
 Not built yet: the app's cards and the app's own approver, and the judge
-comparison (item 4 of Measure). Dropped with the rules on 2026-09-27:
+comparison (item 4 of Measure). Follow-ups from review (2026-09-27): a
+fork's inherited turns in `earlier` (they belong to the source bot, so a
+fork's first checks see none of that history), and rotation for the
+CLI-started approver's log, which grows one line a round. Dropped with the rules on 2026-09-27:
 `until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions

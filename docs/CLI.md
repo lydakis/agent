@@ -58,9 +58,10 @@ an idle bot returns after replay. `follow --all` stays connected for future work
 - `run --new --approval MODE` and `fork --approval MODE` choose whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
   gate), `manual` waits for an answer from any client, and `auto` has a
-  judge model decide each call. For `auto` the CLI starts `agent approver`
-  detached when no session serves the `auto` tag, and gives a call 45 s
-  before its gate lapses.
+  judge model decide each call. For `auto`, and whenever `run` continues or
+  `fork` copies a bot an `auto` gate answers, the CLI starts `agent
+  approver` detached when no session serves the `auto` tag, and gives a
+  call 45 s before its gate lapses.
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
