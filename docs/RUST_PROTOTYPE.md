@@ -897,10 +897,23 @@ does not, and each is one op:
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
   list. It runs off the dispatch path, only when asked, under the same
   connection admission as a turn, and each provider keeps its answer, a
-  refusal included, five minutes. The reply fits one event: a listing past
-  what is left of it is `provider_models_limit` for that provider. Bedrock
-  Mantle is asked at the host's `/v1/models`. Nothing else reads it: a turn
-  runs whatever model it names. `agent models --discover` uses it once to write `~/.agent/models`.
+  refusal included, five minutes, while the listings every provider keeps
+  together fit one event; a listing past that is answered but asked again
+  next time. The reply fits one event: a listing past
+  what is left of it is `provider_models_limit` for that provider. Only
+  models a text turn runs are listed: a provider stating output modalities
+  (OpenRouter) is taken at its word, and otherwise ids naming embeddings,
+  speech, images, video, moderation, realtime, search previews or
+  completions-only models are left out. Bedrock Mantle is asked at the
+  host's `/v1/models`, which names every family, and each route keeps its
+  own: `anthropic.*` for `bedrock`, `openai.*` for `bedrock-openai`. The
+  ChatGPT backend is asked with `client_version` set to the Codex release
+  whose listing it matches (0.157.1), since it refuses a listing without one
+  and lists only the models that release meets. Nothing else reads it: a
+  turn runs whatever model it names. `agent models --discover` uses it once
+  to write `~/.agent/models`, which always reads back: a provider whose lines
+  would pass the file's 1 MiB gets a comment instead, and past even that one
+  last line counts the providers left out.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are

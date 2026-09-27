@@ -115,8 +115,12 @@ fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
 
 /// A first list from the daemon's `provider_models` answer: every model each
 /// provider listed, with what it said about it as the note, and a comment for
-/// a provider that listed nothing.
+/// a provider that listed nothing. It always reads back: a provider whose
+/// lines would pass the 1 MiB limit gets a comment instead, and once even
+/// comments would not fit, one last line counts the providers left out.
 pub fn render(listing: &Value) -> String {
+    /// A comment names its provider and says why, in a line this long at most.
+    const COMMENT: usize = 320;
     let mut text = String::from(
         "# PROVIDER/MODEL per line; clients offer these. Delete what you don't use.\n",
     );
@@ -125,61 +129,92 @@ pub fn render(listing: &Value) -> String {
     };
     let mut names: Vec<&String> = providers.keys().collect();
     names.sort();
+    // Held back for the last line, so it always fits.
+    let room = LIMIT as usize - COMMENT;
+    let mut left_out = 0;
     for name in names {
         let listed = &providers[name];
-        text.push('\n');
-        let Some(models) = listed["models"].as_array() else {
-            let error = listed["error"].as_str().unwrap_or("no listing");
-            let said = match listed["detail"].as_str() {
-                Some(detail) => format!("{name}: {error}: {detail}"),
-                None => format!("{name}: {error}"),
-            };
-            // One comment line, whatever line breaks the provider sent.
-            let said: Vec<&str> = said.split_whitespace().collect();
-            text.push_str(&format!("# {}\n", said.join(" ")));
-            continue;
+        let lines = match listed["models"].as_array() {
+            Some(models) => lines(name, models),
+            None => String::new(),
         };
-        let mut lines = String::new();
-        for model in models {
-            let Some(id) = model["id"].as_str() else {
-                continue;
-            };
-            let mut note = Vec::new();
-            if let Some(display) = model["name"].as_str() {
-                note.push(display.to_owned());
+        let comment = match listed["models"].as_array() {
+            _ if left_out > 0 => None,
+            None => {
+                let error = listed["error"].as_str().unwrap_or("no listing");
+                Some(match listed["detail"].as_str() {
+                    Some(detail) => format!("{name}: {error}: {detail}"),
+                    None => format!("{name}: {error}"),
+                })
             }
-            if let Some(tokens) = model["context_tokens"].as_u64() {
-                note.push(format!("{tokens} context"));
-            }
-            if let Some(tokens) = model["output_tokens"].as_u64() {
-                note.push(format!("{tokens} output"));
-            }
-            let id = format!("{name}/{id}");
-            // A line a model id breaks would not read back; leave it out.
-            if !parse(&id).is_ok_and(|parsed| parsed.len() == 1 && parsed[0].id == id) {
-                continue;
-            }
-            // `#` starts the note, so it cannot appear inside one's text either way.
-            let note = note.join(", ").replace('\n', " ");
-            match note.is_empty() {
-                true => lines.push_str(&format!("{id}\n")),
-                false => lines.push_str(&format!("{id}  # {note}\n")),
-            }
-        }
-        // A provider that answered but gave nothing usable says so by name,
-        // and one that would make the list too long to read back is left out.
-        if lines.is_empty() {
-            text.push_str(&format!("# {name}: no models listed\n"));
-        } else if text.len() + lines.len() + 128 > LIMIT as usize {
-            text.push_str(&format!(
-                "# {name}: {} bytes of models, past the list's 1 MiB\n",
+            Some(_) if lines.is_empty() => Some(format!("{name}: no models listed")),
+            Some(_) if text.len() + 1 + lines.len() > room => Some(format!(
+                "{name}: {} bytes of models, past the list's 1 MiB",
                 lines.len()
-            ));
-        } else {
-            text.push_str(&lines);
+            )),
+            Some(_) => {
+                text.push('\n');
+                text.push_str(&lines);
+                continue;
+            }
+        };
+        // One comment line, whatever line breaks the provider sent.
+        let comment = comment.map(|said| {
+            let said: Vec<&str> = said.split_whitespace().collect();
+            let mut line = format!("\n# {}", said.join(" "));
+            if line.len() > COMMENT - 1 {
+                let mut end = COMMENT - 4;
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line.truncate(end);
+                line.push_str("...");
+            }
+            line + "\n"
+        });
+        match comment {
+            Some(line) if text.len() + line.len() <= room => text.push_str(&line),
+            _ => left_out += 1,
         }
     }
+    if left_out > 0 {
+        text.push_str(&format!(
+            "\n# {left_out} more providers left out, past the list's 1 MiB\n"
+        ));
+    }
     text
+}
+
+/// A provider's models as list lines, each with what it said as the note.
+fn lines(name: &str, models: &[Value]) -> String {
+    let mut lines = String::new();
+    for model in models {
+        let Some(id) = model["id"].as_str() else {
+            continue;
+        };
+        let mut note = Vec::new();
+        if let Some(display) = model["name"].as_str() {
+            note.push(display.to_owned());
+        }
+        if let Some(tokens) = model["context_tokens"].as_u64() {
+            note.push(format!("{tokens} context"));
+        }
+        if let Some(tokens) = model["output_tokens"].as_u64() {
+            note.push(format!("{tokens} output"));
+        }
+        let id = format!("{name}/{id}");
+        // A line a model id breaks would not read back; leave it out.
+        if !parse(&id).is_ok_and(|parsed| parsed.len() == 1 && parsed[0].id == id) {
+            continue;
+        }
+        // `#` starts the note, so it cannot appear inside one's text either way.
+        let note = note.join(", ").replace('\n', " ");
+        match note.is_empty() {
+            true => lines.push_str(&format!("{id}\n")),
+            false => lines.push_str(&format!("{id}  # {note}\n")),
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -236,5 +271,26 @@ mod tests {
         assert!(text.contains(&format!("# {long}: ")));
         let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["openai/gpt-6-luna"]);
+
+        // Once the list is nearly full, the comments of the providers after
+        // it fit too, or are counted in one last line, and a long one is cut.
+        let near: Vec<_> = (0..7_000)
+            .map(|i| json!({"id": format!("model-{i:05}-{}", "x".repeat(130))}))
+            .collect();
+        let mut providers = serde_json::Map::new();
+        providers.insert("a".into(), json!({"models": near}));
+        for i in 0..20_000 {
+            providers.insert(
+                format!("z{i:05}"),
+                json!({"error":"provider_http_500",
+                "detail": "d".repeat(1000)}),
+            );
+        }
+        let text = render(&json!({"providers": providers}));
+        assert!(text.len() <= super::LIMIT as usize, "{}", text.len());
+        assert!(text.lines().all(|line| line.len() < 320));
+        assert!(text.contains("# z00000: provider_http_500: ddd"));
+        assert!(text.ends_with(" more providers left out, past the list's 1 MiB\n"));
+        assert_eq!(parse(&text).unwrap().len(), 7_000);
     }
 }
