@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(300);
 const DEADLINE: Duration = Duration::from_secs(10);
+/// Anthropic's pages hold 1,000 models; nobody lists fifty thousand.
+const PAGES: usize = 50;
 /// OpenRouter's catalog is the largest known, a few hundred KiB.
 const LIMIT: usize = 8 * 1024 * 1024;
 /// SHA-256 of an empty body, for a signer that signs the payload.
@@ -82,8 +84,51 @@ impl Provider {
         url
     }
 
+    /// Every page: Anthropic's listing pages with `has_more` and `last_id`,
+    /// followed until done under the one deadline and body limit.
     async fn fetch_models(&self, session: Option<&super::login::Session>) -> Result<Vec<Value>> {
-        let url = self.models_url();
+        let mut room = LIMIT;
+        let mut entries = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..PAGES {
+            let mut url = self.models_url();
+            if let Some(after) = &after {
+                url.query_pairs_mut().append_pair("after_id", after);
+            }
+            let mut page = self.fetch_page(session, url, &mut room).await?;
+            let listed = match (page["data"].is_array(), page["models"].is_array()) {
+                (true, _) => page["data"].take(),
+                (false, true) => page["models"].take(),
+                _ => return Err(Error::with("invalid_provider_response", "model listing")),
+            };
+            if let Value::Array(listed) = listed {
+                entries.extend(listed);
+            }
+            if page["has_more"] != true {
+                return parse(&json!({"data": entries}));
+            }
+            match page["last_id"].as_str() {
+                Some(last) if after.as_deref() != Some(last) => after = Some(last.to_owned()),
+                _ => {
+                    return Err(Error::with(
+                        "invalid_provider_response",
+                        "model listing has more pages but no new last_id",
+                    ));
+                }
+            }
+        }
+        Err(Error::with(
+            "provider_response_limit",
+            format!("model listing runs past {PAGES} pages"),
+        ))
+    }
+
+    async fn fetch_page(
+        &self,
+        session: Option<&super::login::Session>,
+        url: reqwest::Url,
+        room: &mut usize,
+    ) -> Result<Value> {
         let (client, _lease) = self.transport.lease();
         let key = session.map(|s| &s.token).or(self.key.as_ref());
         let mut http = client.get(url.clone()).header("accept", "application/json");
@@ -130,14 +175,13 @@ impl Provider {
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(connection_error)?;
-            if chunk.len() > LIMIT - body.len() {
-                return fail("provider_response_limit");
-            }
+            *room = room
+                .checked_sub(chunk.len())
+                .ok_or(Error::new("provider_response_limit"))?;
             body.extend_from_slice(&chunk);
         }
-        let listed: Value = serde_json::from_slice(&body)
-            .map_err(|_| Error::with("invalid_provider_response", "model listing"))?;
-        parse(&listed)
+        serde_json::from_slice(&body)
+            .map_err(|_| Error::with("invalid_provider_response", "model listing"))
     }
 }
 

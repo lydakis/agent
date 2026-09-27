@@ -938,6 +938,19 @@ class ListingModel(Model):
         if self.path == '/huge/v1/models':
             # Parses under the listing limit but alone overflows one reply.
             data = [{'id': f'model-{i:04d}-' + 'x' * 120} for i in range(9000)]
+        elif self.path.startswith('/paged/v1/models?'):
+            # Anthropic's paging: has_more with last_id, answered by after_id.
+            if 'after_id=first-model' in self.path:
+                data, more = [{'id': 'second-model'}], {'has_more': False}
+            else:
+                data, more = [{'id': 'first-model'}], {'has_more': True, 'last_id': 'first-model'}
+            body = json.dumps({'data': data, **more}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         elif self.path == '/v1/models':
             data = [{'id': 'synthetic-model', 'display_name': 'Synthetic', 'max_input_tokens': 4096},
                     {'id': 'other-model'}]
@@ -965,7 +978,8 @@ class ModelListTests(ModelFixture):
         self.store = ['--store', str(self.path / 'state.sqlite')]
         self.providers = ['--provider', f'openai=responses,{self.url}',
                           '--provider', 'gone=responses,http://127.0.0.1:1/v1',
-                          '--provider', f'huge=responses,{self.url.removesuffix("/v1")}/huge/v1']
+                          '--provider', f'huge=responses,{self.url.removesuffix("/v1")}/huge/v1',
+                          '--provider', f'paged=anthropic,{self.url.removesuffix("/v1")}/paged/v1']
         self.addCleanup(lambda: self.agent('shutdown', *self.store, check=False))
 
     def agent(self, *args, check=True):
@@ -986,9 +1000,11 @@ class ModelListTests(ModelFixture):
         self.assertRegex(text, r'# gone: provider_\w+')
         # A listing too large for the reply is refused by name; the rest still arrive.
         self.assertIn('# huge: provider_models_limit: ', text)
+        self.assertIn('paged/first-model\npaged/second-model\n', text)
         listed = json.loads(self.agent('models').stdout)
         self.assertEqual(listed, [{'id': 'openai/synthetic-model', 'note': 'Synthetic, 4096 context'},
-                                  {'id': 'openai/other-model'}])
+                                  {'id': 'openai/other-model'}, {'id': 'paged/first-model'},
+                                  {'id': 'paged/second-model'}])
         # It is the user's file from here on: discovery never replaces it.
         again = self.agent('models', '--discover', *self.store, check=False)
         self.assertEqual(again.returncode, 1)
@@ -1004,7 +1020,7 @@ class ModelListTests(ModelFixture):
             answer = next(m for m in map(json.loads, lines) if m.get('id') == 1)
         self.assertEqual([m['id'] for m in answer['result']['providers']['openai']['models']],
                          ['synthetic-model', 'other-model'])
-        self.assertEqual(self.model.listings, 2)
+        self.assertEqual(self.model.listings, 4)
 
         # A bot reads the same list, and a model nobody listed still runs.
         self.model.models = ('synthetic-model', 'unlisted')

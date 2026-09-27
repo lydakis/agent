@@ -115,7 +115,7 @@ pub fn render(listing: &Value) -> String {
             text.push_str(&format!("# {}\n", said.join(" ")));
             continue;
         };
-        let listed = text.len();
+        let mut lines = String::new();
         for model in models {
             let Some(id) = model["id"].as_str() else {
                 continue;
@@ -138,13 +138,21 @@ pub fn render(listing: &Value) -> String {
             // `#` starts the note, so it cannot appear inside one's text either way.
             let note = note.join(", ").replace('\n', " ");
             match note.is_empty() {
-                true => text.push_str(&format!("{id}\n")),
-                false => text.push_str(&format!("{id}  # {note}\n")),
+                true => lines.push_str(&format!("{id}\n")),
+                false => lines.push_str(&format!("{id}  # {note}\n")),
             }
         }
-        // A provider that answered but gave nothing usable says so by name.
-        if text.len() == listed {
+        // A provider that answered but gave nothing usable says so by name,
+        // and one that would make the list too long to read back is left out.
+        if lines.is_empty() {
             text.push_str(&format!("# {name}: no models listed\n"));
+        } else if text.len() + lines.len() + 128 > LIMIT as usize {
+            text.push_str(&format!(
+                "# {name}: {} bytes of models, past the list's 1 MiB\n",
+                lines.len()
+            ));
+        } else {
+            text.push_str(&lines);
         }
     }
     text
@@ -194,5 +202,15 @@ mod tests {
         assert!(text.contains("# quiet: no models listed\n"));
         let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["anthropic/claude-sonnet-5", "openai/gpt-6-luna"]);
+        let many: Vec<_> = (0..40_000)
+            .map(|i| json!({"id": format!("model-{i}")}))
+            .collect();
+        let long = "p".repeat(64);
+        let text = render(&json!({"providers":{
+            "openai":{"models":[{"id":"gpt-6-luna"}]}, long.clone(): {"models": many}}}));
+        assert!(text.len() <= super::LIMIT as usize);
+        assert!(text.contains(&format!("# {long}: ")));
+        let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["openai/gpt-6-luna"]);
     }
 }

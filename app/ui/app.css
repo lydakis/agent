@@ -91,7 +91,7 @@ pre.code .lang{position:absolute;right:10px;top:4px;color:var(--t-faint);font-si
 .picker .row .h{color:var(--t-faint);font-size:12px}
 .picker .row .hit{color:var(--amber)}
 .picker .empty{padding:8px 12px;color:var(--t-faint);font-style:italic}
-.helpbox{background:var(--t-raised);border:1px solid var(--t-line);border-radius:8px;padding:14px 20px;white-space:pre;color:var(--t-ink);line-height:22px;box-shadow:0 24px 60px -20px rgba(0,0,0,.8)}
+.helpbox{max-height:calc(100vh - 120px);overflow:auto;background:var(--t-raised);border:1px solid var(--t-line);border-radius:8px;padding:14px 20px;white-space:pre;color:var(--t-ink);line-height:22px;box-shadow:0 24px 60px -20px rgba(0,0,0,.8)}
 .helpbox b{color:var(--amber);font-weight:500}
 .helpbox i{color:var(--t-faint);font-style:normal}
 

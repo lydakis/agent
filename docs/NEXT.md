@@ -911,8 +911,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     config file clients read (the app, and `agent models`, which the preamble
     names so a bot starting a peer sees the same choices); `agent models
     --discover` writes a first one from the providers' own listings through
-    the daemon's `provider_models`, as Codex, OpenCode and Pi refresh theirs
-    from a catalog service. The daemon never reads the list. Next, in
+    the daemon's `provider_models`. Source read 2026-09-27: Codex (9db8162)
+    refreshes its bundled catalog from the Codex backend's `/models`,
+    OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
+    catalogs. The daemon never reads the list. Next, in
     order: the app shell (projects in the sidebar from coordinator bots and
     `.agent/project.toml`, a side pane with its own composer, the model chip,
     Send with queue, steer or side chat, one ⋯ menu, runs folded to one line);
