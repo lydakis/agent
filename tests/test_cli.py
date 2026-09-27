@@ -119,6 +119,19 @@ class SocketAndCliTests(ModelFixture):
             status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
         self.assertEqual(status, 'completed')
 
+    def test_start_creates_the_store_starts_one_daemon_and_prints_its_ready_line(self):
+        self.assertFalse(self.store.exists())
+        started = json.loads(self.agent('start', *self.common[:4]).stdout)
+        self.assertEqual(started['event'], 'ready')
+        self.assertTrue(self.store.exists())
+        self.assertTrue(self.socket.exists())
+        # A running daemon answers again; nothing new starts.
+        again = json.loads(self.agent('start', '--store', str(self.store)).stdout)
+        self.assertEqual(again['pid'], started['pid'])
+        extra = self.agent('start', '--store', str(self.store), 'now', check=False)
+        self.assertEqual(extra.returncode, 2)
+        self.assertIn('takes no positional arguments', extra.stderr)
+
     def test_stats_and_wait_any_from_the_cli(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)

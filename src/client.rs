@@ -940,6 +940,12 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "answer" => answer(&options),
         "approver" => approver(&options),
         "models" => models(&options),
+        // The daemon's ready line, from the running one or one started now.
+        "start" => {
+            let connection = ensure_daemon(&options)?;
+            print_json(&connection.ready, options.pretty)?;
+            Ok(0)
+        }
         "stats" => {
             let mut connection = ensure_existing_daemon(&options)?;
             let stats = connection.request("stats", json!({}))?;

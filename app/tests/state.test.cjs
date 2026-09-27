@@ -111,6 +111,17 @@ test('retries cannot overlap a slow snapshot and a lost attachment retries after
   assert.equal(p.S.attached, true);
 });
 
+test('a slow login-shell model lookup never delays attaching, and a later answer fills the default', async () => {
+  const lookup = deferred(); let lookups = 0, setups = 0;
+  const p = page({ setup: async () => (++setups, {}), defaultModel: () => (++lookups, lookup.promise), attach: async () => ({ session: 1 }), pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
+  await p.attach(); await settle();
+  assert.equal(p.S.attached, true);
+  assert.equal(lookups, 1);
+  lookup.resolve('anthropic/model-x'); await settle();
+  assert.equal(p.S.config.model, 'anthropic/model-x');
+  assert.equal(setups, 1);
+});
+
 test('stream rendering appends only new characters and resets between messages', () => {
   const p = page(); assert.equal(typeof p.renderTail, 'function');
   const t = p.transcript('Bob'); t.streamingTurn = 1;

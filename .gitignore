@@ -8,3 +8,5 @@ node_modules/
 
 # Tauri regenerates these on every build
 app/src-tauri/gen/
+# The release workflow places the daemon here for bundling
+app/src-tauri/binaries/

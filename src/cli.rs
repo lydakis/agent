@@ -91,6 +91,12 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "start",
+        usage: "start [OPTIONS]",
+        flags: "--pretty",
+        startup: true,
+    },
+    Command {
         name: "stats",
         usage: "stats [OPTIONS]",
         flags: "--pretty --no-spawn",

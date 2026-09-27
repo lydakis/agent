@@ -1,0 +1,21 @@
+name: Release request
+
+# A tag push or a published release runs the workflow file at that tag, which
+# anyone who can push a tag controls. This one therefore holds no secrets and
+# does nothing; release.yml and publish-homebrew.yml run on its completion
+# from main's own definitions and validate the tag themselves.
+
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  request:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "Requested $GITHUB_EVENT_NAME for $GITHUB_REF_NAME"

@@ -1,0 +1,273 @@
+name: Release
+
+# Builds the signed, notarized desktop app for a version tag and leaves it as
+# a draft release. Publishing the draft is the human step; publish-homebrew.yml
+# then updates the tap. A tag push starts release-request.yml, and this runs
+# after it from main's definition, so a tag's own commit never reaches the
+# signing secrets. Re-run a failed release from this workflow's run.
+
+on:
+  workflow_run:
+    workflows: ["Release request"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate release tag
+        env:
+          # A tag push's run names the tag as its head branch.
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'Expected a tag such as v0.1.0 or v0.1.0-rc.1' >&2
+            exit 1
+          fi
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve approved release
+        id: source
+        env:
+          # A tag push's run names the tag as its head branch.
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          # Resolve once, before executing any code from the selected tag.
+          commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          approved_main=$(git rev-parse --verify "refs/remotes/origin/main^{commit}")
+          if ! git merge-base --is-ancestor "$commit" "$approved_main"; then
+            echo 'Release tag must point to a commit on main' >&2
+            exit 1
+          fi
+          # The bundle takes the app crate's version and `agent --version` the
+          # runtime's; both must be the tag's.
+          for manifest in Cargo.toml app/src-tauri/Cargo.toml; do
+            version=$(git show "$commit:$manifest" | python3 -c \
+              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')
+            if [ "v$version" != "$RELEASE_TAG" ]; then
+              echo "$manifest has version $version, not ${RELEASE_TAG#v}" >&2
+              exit 1
+            fi
+          done
+          printf 'tag=%s\ncommit=%s\n' "$RELEASE_TAG" "$commit" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: resolve
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify release checkout
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$RELEASE_COMMIT" ]; then
+            echo 'Release checkout does not match the approved commit' >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" != "$RELEASE_COMMIT" ]; then
+            echo 'Release tag changed after approval' >&2
+            exit 1
+          fi
+      - name: Install Rust targets
+        # rust-toolchain.toml pins the toolchain; both Mac architectures ship.
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Test
+        run: |
+          python3 -m unittest discover -s app/release
+          node --test app/tests/state.test.cjs
+          cargo test --locked --workspace
+      - name: Install the Tauri CLI
+        # From the committed lockfile, before any signing material exists.
+        run: npm ci --ignore-scripts --prefix app/release
+      - name: Build the daemon for both architectures
+        run: |
+          # Tauri bundles externalBin binaries/agent as Contents/MacOS/agent.
+          # A universal build checks each architecture's sidecar, then
+          # bundles the universal one.
+          mkdir -p app/src-tauri/binaries
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --bin agent --target "$target"
+            cp ".local/target/$target/release/agent" "app/src-tauri/binaries/agent-$target"
+          done
+          lipo -create -output app/src-tauri/binaries/agent-universal-apple-darwin \
+            .local/target/aarch64-apple-darwin/release/agent \
+            .local/target/x86_64-apple-darwin/release/agent
+      - name: Prepare Apple signing credentials
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          for name in APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64 APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD \
+            APPLE_DEVELOPER_ID_APPLICATION APP_STORE_CONNECT_API_KEY_P8 \
+            APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required signing secret: $name" >&2
+              exit 1
+            fi
+          done
+          umask 077
+          signing_dir="$RUNNER_TEMP/agent-signing"
+          mkdir "$signing_dir"
+          export AGENT_SIGNING_KEYCHAIN="$signing_dir/signing.keychain-db"
+          export AGENT_NOTARY_KEY="$signing_dir/notary.p8"
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          directory = Path(os.environ["AGENT_SIGNING_KEYCHAIN"]).parent
+          (directory / "certificate.p12").write_bytes(base64.b64decode(
+              os.environ["APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64"], validate=True))
+          Path(os.environ["AGENT_NOTARY_KEY"]).write_text(os.environ["APP_STORE_CONNECT_API_KEY_P8"])
+          PY
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$AGENT_SIGNING_KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$AGENT_SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$AGENT_SIGNING_KEYCHAIN"
+          security import "$signing_dir/certificate.p12" -k "$AGENT_SIGNING_KEYCHAIN" \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$AGENT_SIGNING_KEYCHAIN" >/dev/null
+          # codesign must be able to discover the temporary signing keychain.
+          security list-keychains -d user -s "$AGENT_SIGNING_KEYCHAIN" "$HOME/Library/Keychains/login.keychain-db"
+          python3 - <<'PY_SIGNING'
+          import os, re, subprocess
+          result = subprocess.run([
+              "security", "find-identity", "-v", "-p", "codesigning",
+              os.environ["AGENT_SIGNING_KEYCHAIN"],
+          ], check=True, capture_output=True, text=True)
+          identities = re.findall(r'^\s*\d+\) ([0-9A-F]{40}) "([^"\n]+)"', result.stdout, re.M)
+          expected = os.environ["APPLE_DEVELOPER_ID_APPLICATION"].strip()
+          matches = [(fingerprint, name) for fingerprint, name in identities
+                     if expected in (fingerprint, name)]
+          if len(matches) != 1:
+              raise SystemExit(f"Signing identity preflight failed: {len(identities)} valid identities, "
+                               f"{len(matches)} match the configured identity. Check certificate validity, "
+                               "issuer chain, and APPLE_DEVELOPER_ID_APPLICATION.")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write("AGENT_SIGNING_IDENTITY=" + matches[0][0] + "\n")
+          print("Configured signing identity is valid and available in the CI keychain.")
+          PY_SIGNING
+          rm "$signing_dir/certificate.p12"
+          echo "AGENT_NOTARY_KEY=$AGENT_NOTARY_KEY" >> "$GITHUB_ENV"
+      - name: Build, sign, and notarize the app
+        working-directory: app/src-tauri
+        env:
+          # Tauri signs the app and its bundled daemon with the hardened
+          # runtime, submits the bundle for notarization, and staples it.
+          APPLE_SIGNING_IDENTITY: ${{ env.AGENT_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APPLE_API_KEY_PATH: ${{ env.AGENT_NOTARY_KEY }}
+        run: |
+          ../release/node_modules/.bin/tauri build --ci --target universal-apple-darwin \
+            --bundles app --config tauri.release.conf.json
+      - name: Package the app and cask, and verify them
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          app=.local/target/universal-apple-darwin/release/bundle/macos/Agent.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          for binary in agent-app agent; do
+            archs=" $(lipo -archs "$app/Contents/MacOS/$binary") "
+            [[ "$archs" == *" arm64 "* && "$archs" == *" x86_64 "* ]]
+          done
+          test "$("$app/Contents/MacOS/agent" --version)" = "agent-runtime ${version}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+          mkdir dist
+          archive="dist/Agent_${version}_universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
+          python3 app/release/homebrew_cask.py "$version" "$archive" dist/agent.rb
+          ruby -c dist/agent.rb
+          # Publishing checks the tag still resolves to the commit built here.
+          printf '%s\n' "$RELEASE_COMMIT" > dist/source-commit.txt
+          cd dist
+          shasum -a 256 "Agent_${version}_universal.zip" agent.rb source-commit.txt > checksums.txt
+          shasum -a 256 --check checksums.txt
+          mkdir smoke
+          ditto -x -k "Agent_${version}_universal.zip" smoke
+          codesign --verify --deep --strict smoke/Agent.app
+          xcrun stapler validate smoke/Agent.app
+      - name: Remove temporary signing credentials
+        if: always()
+        run: |
+          signing_dir="$RUNNER_TEMP/agent-signing"
+          if [ -f "$signing_dir/signing.keychain-db" ]; then
+            security delete-keychain "$signing_dir/signing.keychain-db"
+          fi
+          rm -rf "$signing_dir"
+      - name: Attest the release assets
+        # Publishing verifies this: assets swapped on the draft afterwards,
+        # checksums and all, carry no attestation from this workflow.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/Agent_*_universal.zip
+            dist/agent.rb
+            dist/source-commit.txt
+      - name: Verify release tag before publishing
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          remote_refs=$(git ls-remote --exit-code origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          remote_commit=$(printf '%s\n' "$remote_refs" | awk '
+            $2 ~ /\^\{\}$/ { peeled = $1 }
+            $2 !~ /\^\{\}$/ { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }')
+          if [ "$remote_commit" != "$RELEASE_COMMIT" ]; then
+            echo 'Release tag changed during the build' >&2
+            exit 1
+          fi
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/*.zip dist/checksums.txt dist/agent.rb dist/source-commit.txt \
+            --verify-tag --draft --title "$RELEASE_TAG" --generate-notes "${options[@]}"
