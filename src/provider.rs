@@ -14,6 +14,7 @@ mod anthropic;
 pub mod aws;
 pub mod login;
 mod models;
+pub use models::Listed;
 pub mod pace;
 mod responses;
 mod socket;
@@ -906,6 +907,11 @@ impl Provider {
         // none is configured; that is an estimate to reserve against, not a
         // ceiling on what the provider generates or bills, and the usage the
         // response reports corrects it.
+        // Keys the AWS CLI cannot resolve fail the turn here, before it
+        // reserves pace, takes admission or reads the body.
+        if let Some(aws) = &self.aws {
+            aws.current().await?;
+        }
         let pace = self.pools.get(&self.family.pool_key(request.model));
         let prefix = Bytes::from(self.prefix(&request)?);
         let estimate = pace::Cost {
@@ -916,6 +922,12 @@ impl Provider {
         // Bound request startup until response headers arrive; release before
         // reading SSE so established streams are not capped at this limit.
         let admission = self.admit().await?;
+        // Keys again after the waits, and before the body is hashed, so a
+        // refusal costs no read of it.
+        let signer = match &self.aws {
+            Some(aws) => Some((aws, aws.current().await?)),
+            None => None,
+        };
         // Bedrock Runtime signs the body's digest, so its items are read once
         // to hash them and again as they stream; Mantle takes the body
         // unsigned over TLS and reads it once. Hashed under admission, which
@@ -953,10 +965,6 @@ impl Provider {
         if let Some(login) = &self.login {
             *session = Some(login.current()?);
         }
-        let signer = match &self.aws {
-            Some(aws) => Some((aws, aws.current().await?)),
-            None => None,
-        };
         let key = session.as_ref().map(|s| &s.token).or(self.key.as_ref());
         let account = session.as_ref().map(|s| &s.account);
         let mut http = client
@@ -2256,6 +2264,52 @@ mod tests {
                 format!("{host}/openai/v1/responses")
             );
         }
+    }
+
+    /// Keys the AWS CLI cannot resolve refuse the turn before its body is
+    /// read, even on Runtime, which hashes the body to sign it.
+    #[tokio::test]
+    async fn unresolved_bedrock_keys_refuse_before_the_body_is_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let transport = Transport::new(64, 1).unwrap();
+        let mut keys = aws::Keys::new("A".into(), "S".into(), None);
+        keys.expires = Some(std::time::UNIX_EPOCH);
+        let provider = Provider::new(
+            transport,
+            Family::Anthropic,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/anthropic/v1",
+            None,
+        )
+        .unwrap()
+        .with_aws(Arc::new(aws::Aws::fixed("us-east-1", "bedrock", keys)))
+        .unwrap();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let counter = opened.clone();
+        let items = Items::new(2, move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            stream::iter([Ok(Bytes::from_static(b"{}"))]).boxed()
+        });
+        let refused = provider
+            .complete(
+                Request {
+                    model: "anthropic.claude-sonnet-5",
+                    instructions: "i",
+                    reasoning: None,
+                    tools: &none(),
+                    allow_tool_calls: true,
+                    fallbacks: false,
+                    cache_key: None,
+                    items,
+                    chain: None,
+                    route: None,
+                    sent: None,
+                },
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "provider_aws_credentials_expired");
+        assert_eq!(opened.load(Ordering::Relaxed), 0);
     }
 
     #[test]

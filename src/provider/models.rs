@@ -29,15 +29,19 @@ const KEPT: usize = 2 * crate::output::MAX_EVENT;
 
 /// The last answer, a refusal included, so a client asking again within
 /// `KEEP` waits on neither the network nor a provider that is down, with
-/// the bytes it holds of the transport's shared `KEPT`.
+/// the bytes it holds of the transport's shared `KEPT`. A listing is kept
+/// as its JSON text, so what it holds is what it counts.
 #[derive(Default)]
 pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed, usize)>>);
 
-type Listed = Result<Arc<Vec<Value>>>;
+/// A JSON array of `{id, name?, context_tokens?, output_tokens?}`.
+pub type Listed = Result<Arc<str>>;
 
 impl Provider {
     /// `{id, name?, context_tokens?, output_tokens?}` per model, ids without
     /// the provider prefix. Callers asking at once share one request.
+    /// Refused credentials are not kept: a login made meanwhile (`aws sso
+    /// login`, Codex signing in) is used on the next ask.
     pub async fn models(&self) -> Listed {
         let mut kept = self.listing.0.lock().await;
         if let Some((at, listed, _)) = kept.as_ref()
@@ -48,24 +52,30 @@ impl Provider {
         if let Some((_, _, held)) = kept.take() {
             self.transport.listed.fetch_sub(held, Ordering::Relaxed);
         }
-        let mut size = 0;
-        let listed = tokio::time::timeout(DEADLINE, self.list_models())
+        let listed: Listed = tokio::time::timeout(DEADLINE, self.list_models())
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
             .and_then(|models| {
                 // Answered only if one reply could carry it.
-                size = serde_json::to_vec(&models).map_or(usize::MAX, |bytes| bytes.len());
-                match size <= crate::output::MAX_EVENT {
-                    true => Ok(Arc::new(models)),
+                let text = serde_json::to_string(&models)?;
+                match text.len() <= crate::output::MAX_EVENT {
+                    true => Ok(text.into()),
                     false => Err(Error::with(
                         "provider_models_limit",
-                        format!("{} models, {size} bytes listed", models.len()),
+                        format!("{} models, {} bytes listed", models.len(), text.len()),
                     )),
                 }
             });
+        if listed.as_ref().is_err_and(|error| {
+            ["provider_aws_credentials_", "provider_login_"]
+                .iter()
+                .any(|refused| error.code.starts_with(refused))
+        }) {
+            return listed;
+        }
         // A refusal holds its code and detail; it counts like a listing.
         let held = match &listed {
-            Ok(_) => size,
+            Ok(text) => text.len(),
             Err(error) => 64 + error.code.len() + error.detail.as_ref().map_or(0, String::len),
         };
         let room =
@@ -262,7 +272,11 @@ fn openai_text(id: &str) -> bool {
         "sora",
         "search",
     ];
-    !NOT_TEXT.iter().any(|family| id.contains(family))
+    // A fine-tuned model is named `ft:BASE:org:suffix:id`; only BASE says
+    // what it is.
+    let base = id.strip_prefix("ft:").unwrap_or(id);
+    let base = base.split(':').next().unwrap_or(base);
+    !NOT_TEXT.iter().any(|family| base.contains(family))
 }
 
 /// Whether a Mantle model id is one of the family its binding speaks:
@@ -343,6 +357,29 @@ mod tests {
         assert_eq!(transport.listed.load(Ordering::Relaxed), held);
     }
 
+    #[tokio::test]
+    async fn a_refused_login_is_asked_again_not_kept() {
+        use crate::provider::aws::{Aws, Keys};
+        use std::sync::{Arc, atomic::Ordering};
+        let transport = Transport::new(64, 1).unwrap();
+        let mut keys = Keys::new("A".into(), "S".into(), None);
+        keys.expires = Some(std::time::UNIX_EPOCH);
+        let aws = Arc::new(Aws::fixed("us-east-1", "bedrock-mantle", keys));
+        let provider = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://bedrock-mantle.us-east-1.api.aws/v1/responses",
+            None,
+        )
+        .unwrap()
+        .with_aws(aws)
+        .unwrap();
+        let refused = provider.models().await.unwrap_err();
+        assert_eq!(refused.code, "provider_aws_credentials_expired");
+        assert!(provider.listing.0.lock().await.is_none());
+        assert_eq!(transport.listed.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn openai_offers_only_models_a_turn_can_run() {
         use super::openai_text;
@@ -352,6 +389,7 @@ mod tests {
             "o5-mini",
             "gpt-5.6-luna",
             "codex-mini-latest",
+            "ft:gpt-4.1:org:customer-search:abc123",
         ] {
             assert!(openai_text(id), "{id}");
         }
@@ -369,6 +407,7 @@ mod tests {
             "babbage-002",
             "sora-2",
             "gpt-4o-search-preview",
+            "ft:babbage-002:org:chat:abc123",
         ] {
             assert!(!openai_text(id), "{id}");
         }

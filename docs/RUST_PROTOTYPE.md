@@ -381,6 +381,8 @@ its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 daemon starts (no login yet, an expired SSO session) do not stop it: the
 binding's `ready.providers` entry carries `unresolved` with the reason, and
 its next call resolves again, so `aws sso login` fixes it without a restart.
+A call with no usable keys fails before it is paced, admitted or its body
+read.
 Temporary keys are re-resolved in the
 background five minutes before they expire, at most every ten seconds, and
 once on a 401 or 403, which retries the call as `provider_login_refreshed`;
@@ -901,14 +903,17 @@ does not, and each is one op:
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
   list. It runs off the dispatch path, only when asked, under the same
   connection admission as a turn, and each provider keeps its answer, a
-  refusal included, five minutes, while the listings and refusals kept
-  across all providers stay within 2 MiB (past that an answer is given, not
-  kept). The reply fits one event: a listing past
+  refusal included, five minutes, while the listings (kept as their JSON
+  text) and refusals kept across all providers stay within 2 MiB (past that
+  an answer is given, not kept). A refusal for missing or expired
+  credentials is not kept, so a login made meanwhile lists on the next ask.
+  The reply fits one event: a listing past
   what is left of it is `provider_models_limit` for that provider. Bedrock
   Mantle is asked at the host's `/v1/models`, and each binding offers only
   its own family (`anthropic.` models on the Messages route, the rest on
   Responses). OpenAI's own listing leaves out speech, embedding, image,
-  moderation and search models by name, and a ChatGPT login asks the Codex
+  moderation and search models by base model name (a fine-tune by the model
+  it was tuned from), and a ChatGPT login asks the Codex
   backend with `client_version` (the Codex release this repository measures
   against). Nothing else reads it: a turn runs whatever model it names.
   `agent models --discover` uses it once to write `~/.agent/models`.

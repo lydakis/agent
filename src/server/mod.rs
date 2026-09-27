@@ -11,7 +11,7 @@ use agent_runtime::{
     codec::{Family, split_model},
     fail, fail_with,
     output::{self, Output},
-    provider::{Provider, STREAMS_PER_CONNECTION, Transport},
+    provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Started,
         Store, TurnOptions, Waiting, Wake,
@@ -2602,7 +2602,7 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
 /// first, so refusals always fit; more providers than even refusals fit
 /// for fail the request as a whole.
 fn fit_listings(
-    listed: impl ExactSizeIterator<Item = (String, Result<Arc<Vec<Value>>>)>,
+    listed: impl ExactSizeIterator<Item = (String, Listed)>,
     limit: usize,
 ) -> Result<serde_json::Map<String, Value>> {
     const REFUSAL: usize = 160;
@@ -2616,20 +2616,32 @@ fn fit_listings(
     };
     let mut answer = serde_json::Map::new();
     for (name, result) in listed {
-        let mut entry = match result {
-            Ok(models) => json!({"models": models.as_slice()}),
-            Err(error) => json!({"error": error.code, "detail": error.detail}),
-        };
-        let size = entry.to_string().len() + name.len() + 8;
-        match room.checked_sub(size) {
-            Some(left) => room = left,
-            None => {
-                entry = json!({
-                    "error": "provider_models_limit",
-                    "detail": format!("listing is {size} bytes, {room} left in the reply"),
-                });
+        // A kept listing is its JSON text: sized as it is, parsed only once
+        // it fits.
+        let refused = result
+            .as_ref()
+            .err()
+            .map(|error| json!({"error": error.code, "detail": error.detail}));
+        let size = name.len()
+            + 20
+            + match (&result, &refused) {
+                (Ok(models), _) => models.len(),
+                (_, refused) => output::encoded_len(refused)?,
+            };
+        let entry = match (room.checked_sub(size), result, refused) {
+            (Some(left), Ok(models), _) => {
+                room = left;
+                json!({"models": serde_json::from_str::<Value>(&models)?})
             }
-        }
+            (Some(left), Err(_), refused) => {
+                room = left;
+                refused.unwrap_or_default()
+            }
+            (None, _, _) => json!({
+                "error": "provider_models_limit",
+                "detail": format!("listing is {size} bytes, {room} left in the reply"),
+            }),
+        };
         answer.insert(name, entry);
     }
     Ok(answer)
@@ -2641,17 +2653,17 @@ mod tests {
     fn provider_listings_always_fit_one_reply() {
         let model = json!({"id": "m".repeat(100)});
         let limit = 256 * 1024;
-        let big = Arc::new(vec![model.clone(); 1700]);
-        let mut listed = vec![("a-near".to_owned(), Ok(big))];
+        let text = |n| -> Arc<str> { json!(vec![model.clone(); n]).to_string().into() };
+        let mut listed = vec![("a-near".to_owned(), Ok(text(1700)))];
         for i in 0..300 {
-            listed.push((format!("b-{i:03}"), Ok(Arc::new(vec![model.clone(); 20]))));
+            listed.push((format!("b-{i:03}"), Ok(text(20))));
         }
         let answer = fit_listings(listed.into_iter(), limit).unwrap();
         assert!(json!({"providers": answer}).to_string().len() <= limit - 4096);
         assert!(answer["a-near"]["models"].is_array());
         assert_eq!(answer["b-299"]["error"], "provider_models_limit");
         assert_eq!(answer.len(), 301);
-        let many = (0..2000).map(|i| (format!("p-{i}"), Ok(Arc::new(Vec::new()))));
+        let many = (0..2000).map(|i| (format!("p-{i}"), Ok(Arc::from("[]"))));
         assert_eq!(
             fit_listings(many, limit).unwrap_err().code,
             "provider_models_limit"
