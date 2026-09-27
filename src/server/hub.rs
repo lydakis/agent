@@ -69,16 +69,18 @@ pub struct Approver {
     /// only moves later.
     indexed: Instant,
     cursor: i64,
+    /// Calls announced past `cursor` are queued for it.
     live: bool,
+    /// Its serve reply is queued: the lease runs, and its pushes go out.
+    started: bool,
 }
 impl Approver {
-    /// Start delivery after the listing the serving job read: only calls
-    /// announced past `cursor` are new to the approver. The lease period
-    /// starts here, so time queued behind storage does not use it up.
+    /// Queue delivery after the listing the serving job read: only calls
+    /// announced past `cursor` are new to the approver. They wait until
+    /// the serve reply is queued.
     pub fn go_live(&mut self, cursor: i64) {
         self.cursor = cursor;
         self.live = true;
-        self.deadline = Instant::now() + Duration::from_millis(self.lease_ms);
     }
 }
 pub type Serving = Arc<Mutex<Approver>>;
@@ -91,8 +93,9 @@ const FEED_PARTS: usize = 128;
 #[derive(Clone, Copy, PartialEq)]
 enum Flow {
     Open,
-    /// Its session is serving the tag again; the calls wait until the new
-    /// lease replaces this one or the new listing fails.
+    /// Calls wait: a new lease's until its serve reply is queued, and an
+    /// old one's while its session serves the tag again, until the new
+    /// lease replaces it or the new listing fails.
     Paused,
     /// The lease ended: calls still waiting are dropped, and only the
     /// notice that says so goes out.
@@ -106,11 +109,11 @@ struct Feed {
     flow: watch::Sender<Flow>,
 }
 impl Feed {
-    fn new(output: Output) -> Self {
+    fn new(output: Output, flow: Flow) -> Self {
         let (sender, mut receiver) = mpsc::unbounded_channel::<(Value, bool)>();
         let queued = Arc::new(AtomicUsize::new(0));
         let counted = queued.clone();
-        let (flow, mut state) = watch::channel(Flow::Open);
+        let (flow, mut state) = watch::channel(flow);
         tokio::spawn(async move {
             while let Some((message, notice)) = receiver.recv().await {
                 let sent = Self::deliver(&output, &mut state, &message, notice).await;
@@ -245,8 +248,9 @@ impl HubInner {
         self.expiries.remove(&key);
         Some(serving)
     }
-    /// End the leases that ran out and tell their holders. A lease not yet
-    /// live has not started, so it is kept for another period.
+    /// End the leases that ran out and tell their holders. A lease whose
+    /// serve reply is not out yet has not started, so it is kept for
+    /// another period.
     fn expire_due(&mut self, now: Instant) {
         while let Some(entry) = self.expiries.first_entry() {
             if entry.key().0 > now {
@@ -257,12 +261,12 @@ impl HubInner {
                 continue;
             };
             let mut held = serving.lock().unwrap();
-            if held.live && held.deadline <= now {
+            if held.started && held.deadline <= now {
                 held.feed.end(Some(lost(&tag, lease)));
                 drop(held);
                 self.approvers.remove(&tag);
             } else {
-                if !held.live {
+                if !held.started {
                     held.deadline = now + Duration::from_millis(held.lease_ms);
                 }
                 held.indexed = held.deadline;
@@ -293,7 +297,7 @@ impl Hub {
         let now = Instant::now();
         if let Some(held) = inner.approvers.get(tag) {
             let held = held.lock().unwrap();
-            if held.session != session && (!held.live || held.deadline > now) {
+            if held.session != session && (!held.started || held.deadline > now) {
                 return fail("approvals_served");
             }
         }
@@ -317,7 +321,7 @@ impl Hub {
         let lease = inner.next_lease;
         let approver = Arc::new(Mutex::new(Approver {
             session,
-            feed: Feed::new(output.clone()),
+            feed: Feed::new(output.clone(), Flow::Paused),
             output,
             lease,
             lease_ms,
@@ -325,9 +329,25 @@ impl Hub {
             indexed: now,
             cursor: i64::MAX,
             live: false,
+            started: false,
         }));
         inner.insert(tag, approver.clone());
         Ok((lease, approver, before))
+    }
+    /// Start `lease` on `tag` once its serve reply is queued: the lease
+    /// period runs from here, and the pushes held until now go out after
+    /// the reply, so neither the rest of a storage group nor a burst of
+    /// pushes uses them up first.
+    pub fn start(&self, tag: &str, lease: u64) {
+        let inner = self.inner.lock().unwrap();
+        if let Some(held) = inner.approvers.get(tag) {
+            let mut held = held.lock().unwrap();
+            if held.lease == lease {
+                held.started = true;
+                held.deadline = Instant::now() + Duration::from_millis(held.lease_ms);
+                held.feed.resume();
+            }
+        }
     }
     /// Give up `tag` if `lease` still holds it, as when serving it failed,
     /// and put back the lease the session held `before`, whose calls go
@@ -390,7 +410,7 @@ impl Hub {
             .iter()
             .filter(|(_, held)| {
                 let held = held.lock().unwrap();
-                held.live && held.deadline > now
+                held.started && held.deadline > now
             })
             .map(|(tag, _)| tag.clone())
             .collect();
@@ -415,7 +435,7 @@ impl Hub {
             if !held.live || round.cursor <= held.cursor {
                 return;
             }
-            if held.deadline <= Instant::now() {
+            if held.started && held.deadline <= Instant::now() {
                 let (session, lease) = (held.session, held.lease);
                 drop(held);
                 self.expire(tag, session, lease);
@@ -721,9 +741,11 @@ mod tests {
         let quiet = || Output::writer(tokio::io::sink());
         let (ran_out, serving, _) = hub.serve("ran-out", 1, told.clone(), 1).unwrap();
         serving.lock().unwrap().go_live(0);
+        hub.start("ran-out", ran_out);
         // Renewed: its deadline moved past the key it was indexed under.
-        let (_, renewed, _) = hub.serve("renewed", 1, quiet(), 1).unwrap();
+        let (lease, renewed, _) = hub.serve("renewed", 1, quiet(), 1).unwrap();
         renewed.lock().unwrap().go_live(0);
+        hub.start("renewed", lease);
         renewed.lock().unwrap().deadline = Instant::now() + Duration::from_secs(3600);
         // Still being listed, so its lease has not started.
         let (listing, _, _) = hub.serve("listing", 1, quiet(), 1).unwrap();
@@ -789,8 +811,9 @@ mod tests {
         let hub = Hub::default();
         let (writer, reader) = tokio::io::duplex(1 << 16);
         let output = Output::writer(writer);
-        let (_, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
+        let (lease, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
         serving.lock().unwrap().go_live(0);
+        hub.start("auto", lease);
         // 24 parts of 200 KiB, more than twice the session's 2 MiB queue,
         // published at once as one group commit would.
         for cursor in 1..=24 {
@@ -817,6 +840,7 @@ mod tests {
         let output = Output::writer(writer);
         let (lease, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
         serving.lock().unwrap().go_live(0);
+        hub.start("auto", lease);
         for cursor in 1..=24 {
             hub.approval(&part(cursor, 200 * 1024));
         }
@@ -850,6 +874,7 @@ mod tests {
         let (new, serving, before) = hub.serve("auto", 1, output, 60_000).unwrap();
         serving.lock().unwrap().go_live(24);
         hub.replaced(before);
+        hub.start("auto", new);
         hub.approval(&part(25, 16));
         // What the session's output already held goes out; the rest of the
         // old lease's calls are on the new listing, so they do not.
@@ -864,8 +889,9 @@ mod tests {
         let hub = Hub::default();
         let (writer, reader) = tokio::io::duplex(1 << 16);
         let output = Output::writer(writer);
-        let (_, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
+        let (lease, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
         serving.lock().unwrap().go_live(0);
+        hub.start("auto", lease);
         // Two parts of 900 KiB fill the session's 2 MiB output; the third
         // waits for room.
         for cursor in 1..=3 {
@@ -875,6 +901,7 @@ mod tests {
         let (new, serving, before) = hub.serve("auto", 1, output, 60_000).unwrap();
         serving.lock().unwrap().go_live(3);
         hub.replaced(before);
+        hub.start("auto", new);
         hub.approval(&part(4, 16));
         let cursors: Vec<i64> = read(reader, 4).await.into_iter().map(|(_, c)| c).collect();
         assert_eq!(
@@ -906,12 +933,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_lease_and_its_pushes_wait_for_the_serve_reply() {
+        let hub = Hub::default();
+        let (writer, reader) = tokio::io::duplex(1 << 16);
+        let output = Output::writer(writer);
+        let (lease, serving, _) = hub.serve("auto", 1, output.clone(), 100).unwrap();
+        serving.lock().unwrap().go_live(0);
+        // The rest of a storage group outlasts the lease period, and a
+        // round lands, before the reply goes out.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        hub.approval(&part(1, 16));
+        let (_, _, before) = hub
+            .serve("other", 2, Output::writer(tokio::io::sink()), 100)
+            .unwrap();
+        assert!(before.is_none());
+        assert!(hub.served().iter().all(|tag| tag != "auto"), "not started");
+        assert!(
+            hub.inner.lock().unwrap().approvers.contains_key("auto"),
+            "not ended"
+        );
+        output
+            .try_respond(json!(1), Ok(json!({"lease":lease})))
+            .unwrap();
+        hub.start("auto", lease);
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let mut sent = Vec::new();
+        while sent.len() < 2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            sent.push(serde_json::from_str::<Value>(&line).unwrap());
+        }
+        assert_eq!(sent[0]["id"], 1, "the reply goes first");
+        assert_eq!(sent[1]["cursor"], 1);
+        assert_eq!(hub.renew("auto", 1, lease).unwrap(), 100);
+    }
+
+    #[tokio::test]
     async fn a_holder_that_stopped_reading_is_closed() {
         let hub = Hub::default();
         let (writer, _unread) = tokio::io::duplex(1024);
         let output = Output::writer(writer);
-        let (_, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
+        let (lease, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
         serving.lock().unwrap().go_live(0);
+        hub.start("auto", lease);
         for cursor in 1..=400 {
             hub.approval(&part(cursor, 16));
             tokio::task::yield_now().await;

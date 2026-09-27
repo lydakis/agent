@@ -987,7 +987,7 @@ Where it differs from the design above:
 - A holder whose lease ran out keeps its tag until any session next serves
   a tag or the holder renews or answers; the daemon keeps no timer for
   leases. Either way the holder is sent `approvals_lost`. The lease period
-  starts when the listing is read, not when the request arrives.
+  starts when the serve reply is queued, and pushes follow the reply.
 - A lapsed gate's denial is not counted in `denials`: nobody judged the
   call.
 

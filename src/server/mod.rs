@@ -1225,13 +1225,14 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 service.hub.published_through(cursor).await;
                                 if *output.subscribe_closed().borrow() { continue; }
                             }
-                            let (request_id, result, shutdown) = match request {
+                            let (request_id, result, shutdown, serving) = match request {
                                 Ok(request) => {
                                     let shutdown = match request.command {
                                         Command::Shutdown { grace_ms } => Some(grace_ms),
                                         _ => None,
                                     };
                                     let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
+                                    let serves = matches!(request.command, Command::ServeApprovals { .. });
                                     let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
@@ -1239,12 +1240,19 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         service.admissions.push_back(Admission { session: id, output, id: request.id, bound, pending: Pending::Settled(result) });
                                         continue;
                                     }
-                                    (request.id, result, shutdown)
+                                    let serving = result.as_ref().ok().filter(|_| serves).and_then(|page| {
+                                        Some((page["tag"].as_str()?.to_owned(), page["lease"].as_u64()?))
+                                    });
+                                    (request.id, result, shutdown, serving)
                                 }
-                                Err(error) => (Value::Null, Err(error), None),
+                                Err(error) => (Value::Null, Err(error), None, None),
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                            // A served tag's lease and pushes start behind its reply.
+                            if let Some((tag, lease)) = serving {
+                                service.hub.start(&tag, lease);
+                            }
                             if let Some(grace_ms) = shutdown {
                                 // A later shutdown can only bring the deadline closer.
                                 let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);

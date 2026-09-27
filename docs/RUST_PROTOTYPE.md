@@ -1778,9 +1778,11 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   after, not both; a listed call announced again takes a new position past
   `through` and arrives pushed. One session holds a tag: another gets
   `approvals_served` while the holder's session is open and its lease
-  runs or its listing is still being read. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
+  runs or its serve reply is not out yet. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
-  600,000), counted from when the listing is read. A holder whose lease ran out keeps
+  600,000), counted from when its serve reply is queued; pushes follow
+  the reply, so neither the rest of a storage group nor a burst of pushes
+  uses up the lease or the reply's room. A holder whose lease ran out keeps
   the tag until any session next serves a tag, which ends the lease (and
   another may take the tag over under a new one), or until it renews or
   answers, which is refused; either way it is sent
