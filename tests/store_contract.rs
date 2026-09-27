@@ -3016,6 +3016,7 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         )
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.inspect("Bob").unwrap().fork_point, None);
     assert_eq!(
         db.fork("Bob", "early", Fork::default()).unwrap_err().code,
         "fork_point_unknown"
@@ -3054,6 +3055,7 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
     let (item, a) = call("a");
     db.append(turn, vec![item], std::slice::from_ref(&a), None)
         .unwrap();
+    assert_eq!(db.inspect("Bob").unwrap().fork_point, Some(waited));
     assert_eq!(fork_point(&mut db, "Bob", "later").unwrap(), waited);
     drop(db);
     std::fs::remove_file(path).unwrap();

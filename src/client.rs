@@ -1184,9 +1184,9 @@ fn ways_past_busy(connection: &mut Connection, bot: &str, error: Error) -> Error
     if error.code != "bot_busy" {
         return error;
     }
-    let running = connection
-        .request("resume", json!({"bot":bot}))
-        .ok()
+    let record = connection.request("resume", json!({"bot":bot})).ok();
+    let running = record
+        .as_ref()
         .and_then(|record| record["running_turn"].as_i64());
     let join = match running {
         Some(turn) => format!(
@@ -1195,14 +1195,15 @@ fn ways_past_busy(connection: &mut Connection, bot: &str, error: Error) -> Error
         ),
         None => "resend with --delivery queue to run this after it".to_owned(),
     };
+    // A turn from before its finished rounds were kept has no fork point
+    // until its next model response.
+    let fork = if running.is_some() && record.is_some_and(|record| record["fork_point"].is_null()) {
+        String::new()
+    } else {
+        format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW")
+    };
     let fact = error.detail.map(|d| d + "; ").unwrap_or_default();
-    Error::with(
-        "bot_busy",
-        format!(
-            "{fact}{join}; to ask without interrupting, fork --source {bot} --bot NEW \
-             and send it to NEW"
-        ),
-    )
+    Error::with("bot_busy", format!("{fact}{join}{fork}"))
 }
 
 fn follow(options: &Options) -> Result<i32> {

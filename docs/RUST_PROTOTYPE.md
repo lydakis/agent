@@ -1113,7 +1113,11 @@ the turn's id and handle at once, and `wait`, `turns`, and
   `earlier work is waiting`. `agent run` adds the ways past it as flags to
   copy (`--delivery steer --turn N`, `--delivery queue`, or
   `fork --source NAME --bot NEW` to ask without interrupting, which starts
-  at the running turn's newest finished round). A model calling `agent run`
+  at the running turn's newest finished round). It offers the fork only when
+  `resume` reports a `fork_point`: where a fork without a checkpoint starts,
+  the head of an idle bot or that newest finished round, absent while a turn
+  that began before such rounds were kept has had no model response since.
+  A model calling `agent run`
   does not discover them otherwise, and in benchmark runs it ignored a prose
   description of them. Likewise `fork_point_unknown` states the fact and
   `agent fork` adds `--checkpoint`.

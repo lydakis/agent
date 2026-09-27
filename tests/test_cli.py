@@ -163,6 +163,10 @@ class SocketAndCliTests(ModelFixture):
         # upgrade), the daemon states the fact and `agent fork` adds the way past it.
         with sqlite3.connect(self.store) as db:
             db.execute("UPDATE bots SET closed=NULL WHERE name='Bob'")
+        # A refusal then offers no fork it cannot start.
+        refused = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'never', check=False)
+        self.assertIn(f"--delivery steer --turn {busy['turn']}", refused.stderr)
+        self.assertNotIn('fork --source', refused.stderr)
         unknown = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Lost', check=False)
         self.assertEqual(unknown.returncode, 1)
         self.assertIn('fork_point_unknown: this turn began before its finished rounds were kept; '

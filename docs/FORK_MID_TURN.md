@@ -258,7 +258,9 @@ fork on its source's cache.
 - **`bot_busy` from `submit`**: `agent run` offers `fork --source NAME --bot NEW`
   with no checkpoint (the daemon's detail states only the running turn,
   since 2026-09-27). That now means the newest finished round, including on
-  a first turn.
+  a first turn. It is offered only when `resume` reports a `fork_point`,
+  which a turn running across the schema 36 upgrade lacks until its next
+  model response.
 - **The preamble** keeps an executable fork command, `"$AGENT_BIN" fork
   --source NAME --bot NEW`, without the checkpoint, and adds the
   fork-or-fresh sentence above. This is the one opinion kept. It lives in

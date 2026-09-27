@@ -98,6 +98,11 @@ pub struct Bot {
     /// daemon so an approver that restarts or takes over counts on.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub denials: BTreeMap<String, Denials>,
+    /// Where a fork without a checkpoint starts: an idle bot's head, or its
+    /// running turn's newest finished round. `None` when there is none yet:
+    /// no history, or a turn that began before that round was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_point: Option<i64>,
 }
 /// A bot's denials under one gate tag: how many in a row, reset when a call
 /// every gate allowed starts, and how many in the turn that gave the last.
@@ -1325,9 +1330,14 @@ impl Database {
                     )
                 })?,
             },
+            // A running turn's newest closed node is kept as it moves.
+            fork_point: match r.get::<_, Option<i64>>(4)? {
+                Some(_) => r.get(33)?,
+                None => r.get(1)?,
+            },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -5333,22 +5343,15 @@ impl Database {
                 }
                 (Some(node), false)
             }
-            None if parent.running_turn.is_some() => {
-                let closed: Option<i64> =
-                    self.conn
-                        .query_row("SELECT closed FROM bots WHERE name=?", [source], |r| {
-                            r.get(0)
-                        })?;
-                match closed {
-                    Some(closed) => (Some(closed), true),
-                    None => {
-                        return fail_with(
-                            "fork_point_unknown",
-                            "this turn began before its finished rounds were kept",
-                        );
-                    }
+            None if parent.running_turn.is_some() => match parent.fork_point {
+                Some(closed) => (Some(closed), true),
+                None => {
+                    return fail_with(
+                        "fork_point_unknown",
+                        "this turn began before its finished rounds were kept",
+                    );
                 }
-            }
+            },
             None => (parent.head, false),
         };
         if let Some(node) = checkpoint.filter(|_| !validated) {
