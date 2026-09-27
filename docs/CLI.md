@@ -74,8 +74,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   is set, else `AGENT_MODEL`; any model but Jev (`typesafe/jev-*`) runs
   through the daemon, with
   a tag of at most 87 bytes, and `--reasoning` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
-  is text the judge always sees, such as trusted remotes and hosts
-  ([APPROVALS.md](APPROVALS.md#automatic-mode)).
+  is a regular file of at most 96,000 bytes the judge always sees, such as
+  trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
   With `--pretty`, each call shows what it would do (every line of its
   command, or of what a `write` or `edit` puts in its file, terminal

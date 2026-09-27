@@ -689,7 +689,8 @@ chain is where consent is easiest to fake.
 **Where the key lives.** The approver process holds the Jev key, so it is
 not in the environment the bots' shells inherit. When the CLI starts the
 daemon and the approver together, it starts the daemon with the Jev key's
-variable removed and passes it only to the approver; the daemon also adds
+variable removed, unless a `--provider` names it as its key variable, and
+passes it only to the approver; the daemon also adds
 that variable to the set it already strips from tool environments, as it
 does for provider keys, in case it was started some other way. That is
 all it gets. A
@@ -1118,8 +1119,9 @@ Built on 2026-09-27, the automatic approver:
 
 - `agent approver`: serves a tag, groups each round's calls, reads what
   the judge is shown with `prompts` and `item`, follows delegations up to
-  8 turns to the person's words (a deeper chain, or more than 64 delegating
-  turns, is judged too long), redacts, and asks one judge request per
+  8 turns to the person's words (a deeper chain, more than 64 delegating
+  turns, or more prompt text across them than one 128 KiB read holds, is
+  judged too long), redacts, and asks one judge request per
   round: Jev over its API or any model through the daemon ([Which model
   judges](#which-model-judges)). A round takes one of 32 judge slots
   before it reads anything, so rounds past those wait holding only their
@@ -1146,7 +1148,12 @@ Where the approver differs from the design above:
   thread; a larger one is refused as "not reviewed: it runs a file too
   large to show", and one that is no longer a regular file is not read. A
   write or edit that failed shows no file. One planned earlier in the same
-  round is named in its place, since it runs first.
+  round is named in its place, since it runs first. A call no gate covers
+  has no planning `node`, so when its preview was cut its arguments cannot
+  be read back: a write or edit is matched by the path its preview holds,
+  with its size unknown, and is judged too long if the preview ends before
+  the path; any other such call keeps its preview and consent is not
+  counted.
 - A general model is asked the same questions as text, each with what
   makes it yes or no, and answers them as one JSON object.
 - A turn whose steers do not all fit the `prompts` read is denied as
@@ -1165,7 +1172,11 @@ writing the verdict lines so a stalled reader of stdout cannot hold up
 the approver; reading completions in `prompts` only for the calls that
 fit, rather than for the whole turn; and forgetting a bot's judged
 requests once its turn ends, so the dedupe map follows active bots, not
-every bot the approver has seen. Dropped with the rules on 2026-09-27:
+every bot the approver has seen; and showing the judge a round's calls
+that wait on another tag's gate, or on none and have not started yet,
+when they come before the calls it judges, since a manual gate's `write`
+can still run before an `auto` gate's `shell` that runs what it wrote.
+Dropped with the rules on 2026-09-27:
 `until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions

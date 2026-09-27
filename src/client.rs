@@ -625,9 +625,16 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    // The judge's key is the approver's alone.
+    // The judge's key is the approver's alone, unless a provider the daemon
+    // runs names it as its key variable.
+    let provider_key = options.providers.iter().any(|spec| {
+        crate::server::ProviderSpec::parse(spec)
+            .is_ok_and(|spec| spec.key_env.as_deref() == Some(JUDGE_KEY))
+    });
+    if !provider_key {
+        command.env_remove(JUDGE_KEY);
+    }
     let mut child = command
-        .env_remove(JUDGE_KEY)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -1378,23 +1385,47 @@ fn approvals(options: &Options) -> Result<i32> {
 /// The judge's key, which only the approver holds.
 const JUDGE_KEY: &str = agent_runtime::tools::JUDGE_KEY;
 
+/// The approver's note: a regular file no larger than a judge's whole
+/// state, opened without blocking so a FIFO cannot hold startup.
+fn note(path: &Path) -> Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let unreadable = || Error::with("usage", format!("cannot read {}", path.display()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| unreadable())?;
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Err(unreadable());
+    }
+    let limit = agent_client::approver::STATE_TOKENS * 3;
+    let mut note = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut note)
+        .map_err(|_| unreadable())?;
+    if note.len() > limit {
+        return fail_with(
+            "usage",
+            format!(
+                "{} is over {limit} bytes, more than a judge sees",
+                path.display()
+            ),
+        );
+    }
+    String::from_utf8(note).map_err(|_| unreadable())
+}
+
 /// Serve a gate tag, `auto` by default, with a judge model deciding every
 /// call; runs until the daemon goes away or another session takes the tag.
 fn approver(options: &Options) -> Result<i32> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let judge = judge(options, env("AGENT_MODEL"))?;
-    let note = match &options.note {
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .map_err(|_| Error::with("usage", format!("cannot read {}", path.display())))?,
-        ),
-        None => None,
-    };
+    let note = options.note.as_deref().map(note).transpose()?;
     // Jev is `typesafe/jev-*`; any other name, a daemon provider called
     // `typesafe` included, runs through the daemon.
     let judge = match judge
         .strip_prefix("typesafe/")
-        .filter(|model| model.starts_with("jev"))
+        .filter(|model| model.starts_with("jev-"))
     {
         Some(model) => crate::approver::JudgeSpec::Jev {
             url: options

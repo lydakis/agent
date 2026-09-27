@@ -967,6 +967,28 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(asked[1]['state']['already_allowed'],
                          [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': 13}, 'status': 'succeeded'}])
 
+    def test_an_ungated_write_too_long_to_preview_still_shows_its_file(self):
+        def shell_danger(body, id):
+            call, _, question = id.partition('_')
+            [planned] = [c for c in body['state']['planned_calls'] if c['id'] == call]
+            return .9 if question == 'delete' and 'DANGER' in json.dumps(planned) else .05
+        self.judge.answer = shell_danger
+        script = '# padding line\n' * 250 + 'printf DANGER\n'
+        self.model.call_script = [('write', {'path': 'run.sh', 'content': script}),
+                                  ('shell', {'command': 'sh run.sh'})]
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto')
+        self.approver(daemon)
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertTrue(self.denial(daemon, turn, 'script-1').startswith('judged risky'))
+        state = self.judge.requests.get(timeout=5)['body']['state']
+        [shell] = state['planned_calls']
+        self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': script}])
+        self.assertEqual(state['already_allowed'],
+                         [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': None}, 'status': 'succeeded'}])
+
     def test_the_cli_starts_the_approver_for_an_auto_bot(self):
         store = self.path / 'state.sqlite'
         common = ['--store', str(store), '--provider', f'openai=responses,{self.url}',

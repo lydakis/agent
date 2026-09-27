@@ -50,6 +50,7 @@ const RENEW: Duration = Duration::from_secs(1);
 /// deadline, so the queue holds what the deadline allows and no more.
 const IN_FLIGHT: usize = 32;
 /// Text one `prompts` read returns: past the judge's whole state limit.
+/// The prompts of a round's delegating turns share it too.
 const PROMPT_BYTES: usize = 128 * 1024;
 /// How many delegations deep the approver follows up to the person's
 /// words, and how many delegating turns it reads for one round; past either
@@ -270,19 +271,25 @@ impl Model {
             Err(error) if error.code != "bot_not_found" => return Err(daemon(error)),
             _ => {}
         }
+        // Bots are listed in name order, so the judge's forks are the run
+        // of names right after its prefix: only those pages are read.
         let prefix = format!("{base}.");
-        let mut after = Value::Null;
-        loop {
+        let mut after = json!(prefix);
+        'pages: loop {
             let page = client
-                .request("bots", json!({"after":after,"limit":256}))
+                .request("bots", json!({"after":after,"limit":64}))
                 .await
                 .map_err(daemon)?;
             for bot in page["bots"].as_array().into_iter().flatten() {
-                if let Some(name) = bot["name"].as_str().filter(|name| {
-                    name.starts_with(&prefix)
-                        && bot["created_by"] == base.as_str()
-                        && bot["tools"].as_array().is_some_and(Vec::is_empty)
-                }) {
+                let Some(name) = bot["name"]
+                    .as_str()
+                    .filter(|name| name.starts_with(&prefix))
+                else {
+                    break 'pages;
+                };
+                if bot["created_by"] == base.as_str()
+                    && bot["tools"].as_array().is_some_and(Vec::is_empty)
+                {
                     // Aside, so a turn still ending does not hold up serving.
                     let (client, name) = (client.clone(), name.to_owned());
                     let running = bot["running_turn"].as_i64();
@@ -852,6 +859,38 @@ fn mentions(text: &str, path: &str) -> bool {
     })
 }
 
+/// What a `prompts` reply's prompts take from a round's shared budget:
+/// their text, and `PROMPTS_ENTRY` each.
+fn prompt_bytes(prompts: &[Value]) -> usize {
+    prompts
+        .iter()
+        .map(|prompt| {
+            prompt["text"].as_str().map_or(0, str::len)
+                + agent_runtime::store::Database::PROMPTS_ENTRY
+        })
+        .sum()
+}
+
+/// The `path` of a call whose arguments preview was cut, when the preview
+/// holds it whole: the fields before the cut parse, the one it falls in
+/// does not.
+fn preview_path(preview: &str) -> Option<String> {
+    let mut rest = preview.trim_start().strip_prefix('{')?;
+    loop {
+        let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let key = keys.next()?.ok()?;
+        rest = rest[keys.byte_offset()..].trim_start().strip_prefix(':')?;
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        let value = values.next()?.ok()?;
+        if key == "path" {
+            return value.as_str().map(str::to_owned);
+        }
+        rest = rest[values.byte_offset()..]
+            .trim_start()
+            .strip_prefix(',')?;
+    }
+}
+
 /// A file the turn wrote, as a judged call that names it would run it:
 /// only a regular file, opened without waiting on a FIFO or device, and
 /// read no further than `FILE_BYTES`, whatever size it reported.
@@ -916,7 +955,9 @@ async fn intent(
     }
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
-    for prompt in read["prompts"].as_array().into_iter().flatten() {
+    let prompts = read["prompts"].as_array().map_or(&[][..], Vec::as_slice);
+    let mut budget = PROMPT_BYTES.saturating_sub(prompt_bytes(prompts));
+    for prompt in prompts {
         if prompt["truncated"] == true {
             return Err(Unjudged::TooLong);
         }
@@ -927,7 +968,7 @@ async fn intent(
                 text,
             }),
             Some(from) => {
-                persons_above(client, from, &mut visited, &mut request).await?;
+                persons_above(client, from, &mut visited, &mut budget, &mut request).await?;
                 request.push(Words {
                     by: By::Model,
                     text,
@@ -974,6 +1015,9 @@ async fn intent(
         let preview = call["arguments"].as_str().unwrap_or_default();
         let writes = matches!(tool.as_str(), "write" | "edit");
         let cut = call["arguments_truncated"] == true;
+        // Whether a write's size is known: an ungated call has no planning
+        // node to read its whole arguments from.
+        let mut sized = true;
         let mut arguments = match cut {
             false => serde_json::from_str(preview).unwrap_or_else(|_| json!(preview)),
             true => match call["node"].as_i64() {
@@ -988,7 +1032,16 @@ async fn intent(
                     policy::call_arguments(&item, call["call_id"].as_str().unwrap_or_default())
                         .ok_or(Unjudged::Failed)?
                 }
-                None => json!(preview),
+                // Its path is what a later call needs from it; without it,
+                // no file this turn wrote could be matched.
+                None if writes => {
+                    sized = false;
+                    json!({"path":preview_path(preview).ok_or(Unjudged::TooLong)?})
+                }
+                None => {
+                    allowed_cut = true;
+                    json!(preview)
+                }
             },
         };
         // A file's content is not what consent is about: its path and size.
@@ -1004,7 +1057,7 @@ async fn intent(
                 .filter(|(name, _)| name.as_str() != "path")
                 .map(|(_, value)| value.as_str().map_or(0, str::len))
                 .sum();
-            arguments = json!({"path":fields.get("path"),"bytes":bytes});
+            arguments = json!({"path":fields.get("path"),"bytes":sized.then_some(bytes)});
         }
         if cut {
             expanded += arguments.to_string().len();
@@ -1095,6 +1148,7 @@ async fn persons_above(
     client: &Client,
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
+    budget: &mut usize,
     request: &mut Vec<Words>,
 ) -> std::result::Result<(), Unjudged> {
     // Each delegating turn's prompts in order; a model-written one is
@@ -1106,7 +1160,7 @@ async fn persons_above(
             if levels.len() >= CHAIN {
                 return Err(Unjudged::TooLong);
             }
-            if let Some(prompts) = delegated(client, &from, visited).await? {
+            if let Some(prompts) = delegated(client, &from, visited, budget).await? {
                 levels.push(prompts.into_iter());
             }
         }
@@ -1131,11 +1185,12 @@ async fn persons_above(
 }
 
 /// The prompts of the turn `from` names, unless it was read already or is
-/// gone.
+/// gone, read within what is left of the round's `budget`.
 async fn delegated(
     client: &Client,
     from: &Value,
     visited: &mut HashSet<(String, i64)>,
+    budget: &mut usize,
 ) -> std::result::Result<Option<Vec<Value>>, Unjudged> {
     let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) else {
         return Ok(None);
@@ -1143,20 +1198,20 @@ async fn delegated(
     if !visited.insert((bot.to_owned(), turn)) {
         return Ok(None);
     }
-    if visited.len() > DELEGATING {
+    if visited.len() > DELEGATING || *budget == 0 {
         return Err(Unjudged::TooLong);
     }
     match client
-        .request(
-            "prompts",
-            json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
-        )
+        .request("prompts", json!({"bot":bot,"turn":turn,"bytes":*budget}))
         .await
     {
         // Steers left out may hold that person's latest word.
         Ok(read) if read["prompts_more"] == true => Err(Unjudged::TooLong),
         Ok(mut read) => Ok(match read["prompts"].take() {
-            Value::Array(prompts) => Some(prompts),
+            Value::Array(prompts) => {
+                *budget = budget.saturating_sub(prompt_bytes(&prompts));
+                Some(prompts)
+            }
             _ => None,
         }),
         Err(error) if matches!(error.code.as_str(), "bot_not_found" | "turn_not_found") => Ok(None),
@@ -1192,6 +1247,23 @@ mod tests {
                 ("Bob", 4, vec!["d"])
             ]
         );
+    }
+
+    #[test]
+    fn a_cut_preview_gives_a_path_only_when_it_holds_it_whole() {
+        let cut = |text: &str| preview_path(text);
+        assert_eq!(
+            cut(r#"{"path":"run.sh","content":"echo one\necho tw"#).as_deref(),
+            Some("run.sh")
+        );
+        assert_eq!(
+            cut(r#"{ "mode" : 7, "path" : "a \"b\".txt" , "content":"x"#).as_deref(),
+            Some(r#"a "b".txt"#)
+        );
+        assert_eq!(cut(r#"{"content":"echo one","path":"run"#), None);
+        assert_eq!(cut(r#"{"content":"echo one\necho tw"#), None);
+        assert_eq!(cut(r#"{"path":7,"content":"x"#), None);
+        assert_eq!(cut("echo"), None);
     }
 
     #[test]
