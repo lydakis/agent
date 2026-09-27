@@ -138,9 +138,8 @@ Every client command accepts `--store` and `--socket`. Client store selection is
 wins; otherwise `AGENT_SOCKET` applies unless `--store` was explicit. Without a
 socket override, the socket is derived from the selected store.
 
-`run` may start the daemon. `start` starts it if none is running and prints
-the running daemon's ready line; a client with no command of its own (the
-desktop app) uses it to get a daemon. `stats`, `turns`, `result`, `rm`, `prune`,
+`run` may start the daemon. `start` starts it if none is running, with the
+same startup as `run`, and prints the running daemon's ready line. `stats`, `turns`, `result`, `rm`, `prune`,
 `approvals`, and `answer` may restart it only for an existing store. These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
