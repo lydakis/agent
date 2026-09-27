@@ -6,10 +6,15 @@ use super::{Provider, aws, connection_error, error_body, sanitize_error};
 use crate::{Error, Result, codec::Family, fail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(300);
+/// The Codex release whose model list a ChatGPT login is offered: Codex
+/// sends its own version as `client_version` (openai/codex 9db8162, read
+/// 2026-09-27), and the backend answers 400 without it. 0.157.1 is the
+/// release the rest of this repository measures against.
+const CODEX_CLIENT_VERSION: &str = "0.157.1";
 const DEADLINE: Duration = Duration::from_secs(10);
 /// Anthropic's pages hold 1,000 models; nobody lists fifty thousand.
 const PAGES: usize = 50;
@@ -18,38 +23,73 @@ const LIMIT: usize = 8 * 1024 * 1024;
 /// SHA-256 of an empty body, for a signer that signs the payload.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-/// The last answer, a refusal included, so a client asking again within
-/// `KEEP` waits on neither the network nor a provider that is down.
-#[derive(Default)]
-pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed)>>);
+/// Listings and refusals kept across all providers, about two replies'
+/// worth; past it an answer is given but not kept.
+const KEPT: usize = 2 * crate::output::MAX_EVENT;
 
-type Listed = Result<Arc<Vec<Value>>>;
+/// The last answer, a refusal included, so a client asking again within
+/// `KEEP` waits on neither the network nor a provider that is down, with
+/// the bytes it holds of the transport's shared `KEPT`. A listing is kept
+/// as its JSON text, so what it holds is what it counts.
+#[derive(Default)]
+pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed, usize)>>);
+
+/// A JSON array of `{id, name?, context_tokens?, output_tokens?}`.
+pub type Listed = Result<Arc<str>>;
 
 impl Provider {
     /// `{id, name?, context_tokens?, output_tokens?}` per model, ids without
-    /// the provider prefix. Callers asking at once share one request.
+    /// the provider prefix. Cacheable answers within the shared budget
+    /// let concurrent callers share one request.
+    /// Refused credentials are not kept, the provider's own 401 or 403
+    /// included: a login made meanwhile (`aws sso login`, Codex signing in)
+    /// is used on the next ask.
     pub async fn models(&self) -> Listed {
         let mut kept = self.listing.0.lock().await;
-        if let Some((at, listed)) = kept.as_ref()
+        if let Some((at, listed, _)) = kept.as_ref()
             && at.elapsed() < KEEP
         {
             return listed.clone();
         }
-        let listed = tokio::time::timeout(DEADLINE, self.list_models())
+        if let Some((_, _, held)) = kept.take() {
+            self.transport.listed.fetch_sub(held, Ordering::Relaxed);
+        }
+        let listed: Listed = tokio::time::timeout(DEADLINE, self.list_models())
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
             .and_then(|models| {
-                // Kept only if one reply could carry it.
-                let size = serde_json::to_vec(&models).map_or(usize::MAX, |bytes| bytes.len());
-                match size <= crate::output::MAX_EVENT {
-                    true => Ok(Arc::new(models)),
+                // Answered only if one reply could carry it.
+                let text = serde_json::to_string(&models)?;
+                match text.len() <= crate::output::MAX_EVENT {
+                    true => Ok(text.into()),
                     false => Err(Error::with(
                         "provider_models_limit",
-                        format!("{} models, {size} bytes listed", models.len()),
+                        format!("{} models, {} bytes listed", models.len(), text.len()),
                     )),
                 }
             });
-        *kept = Some((Instant::now(), listed.clone()));
+        if listed.as_ref().is_err_and(|error| {
+            ["provider_aws_credentials_", "provider_login_"]
+                .iter()
+                .any(|refused| error.code.starts_with(refused))
+                || ["provider_http_401", "provider_http_403"].contains(&error.code.as_str())
+        }) {
+            return listed;
+        }
+        // A refusal holds its code and detail; it counts like a listing.
+        let held = match &listed {
+            Ok(text) => text.len(),
+            Err(error) => 64 + error.code.len() + error.detail.as_ref().map_or(0, String::len),
+        };
+        let room =
+            self.transport
+                .listed
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
+                    (kept + held <= KEPT).then_some(kept + held)
+                });
+        if room.is_ok() {
+            *kept = Some((Instant::now(), listed.clone(), held));
+        }
         listed
     }
 
@@ -91,6 +131,12 @@ impl Provider {
         if self.family == Family::Anthropic && self.aws.is_none() {
             url.set_query(Some("limit=1000"));
         }
+        if self.login.is_some() {
+            // The Codex backend lists models for a Codex version and refuses
+            // a request without one.
+            url.query_pairs_mut()
+                .append_pair("client_version", CODEX_CLIENT_VERSION);
+        }
         url
     }
 
@@ -115,7 +161,20 @@ impl Provider {
                 entries.extend(listed);
             }
             if page["has_more"] != true {
-                return parse(&json!({"data": entries}));
+                let mut models = parse(&json!({"data": entries}))?;
+                // Mantle lists every family at one address; offer only those
+                // this binding's wire format runs.
+                if self.url.host_str() == Some("api.openai.com") {
+                    models.retain(|model| model["id"].as_str().is_some_and(openai_text));
+                }
+                if matches!(aws::endpoint(&self.url), Some((_, "bedrock-mantle"))) {
+                    models.retain(|model| {
+                        model["id"]
+                            .as_str()
+                            .is_some_and(|id| mantle_runs(self.family, id))
+                    });
+                }
+                return Ok(models);
             }
             match page["last_id"].as_str() {
                 Some(last) if after.as_deref() != Some(last) => after = Some(last.to_owned()),
@@ -195,6 +254,46 @@ impl Provider {
     }
 }
 
+/// OpenAI's listing names every model on the account, speech, embedding,
+/// image and moderation ones included, with nothing to tell them apart but
+/// the name. Leave out those families, which a Responses turn cannot run.
+/// The families are read from OpenAI's model names (inferred from the
+/// listing seen 2026-09-27, not from a published capability field).
+fn openai_text(id: &str) -> bool {
+    const NOT_TEXT: [&str; 13] = [
+        "embedding",
+        "tts",
+        "whisper",
+        "transcribe",
+        "realtime",
+        "audio",
+        "dall-e",
+        "image",
+        "moderation",
+        "davinci",
+        "babbage",
+        "sora",
+        "search",
+    ];
+    // A fine-tuned model is named `ft:BASE:org:suffix:id`; only BASE says
+    // what it is.
+    let base = id.strip_prefix("ft:").unwrap_or(id);
+    let base = base.split(':').next().unwrap_or(base);
+    !NOT_TEXT.iter().any(|family| base.contains(family))
+}
+
+/// Whether a Mantle model id is one of the family its binding speaks:
+/// Anthropic's models (`anthropic.`, perhaps under a routing prefix such as
+/// `global.`) on the Messages route, everything else on Responses.
+///
+/// gpt-oss is listed but refused on the Responses route ("does not support
+/// the '/openai/v1/responses' API", docs/BEDROCK.md), so it is offered on
+/// neither.
+fn mantle_runs(family: Family, id: &str) -> bool {
+    !id.contains("gpt-oss")
+        && id.split('.').any(|part| part == "anthropic") == (family == Family::Anthropic)
+}
+
 /// The shapes providers answer with: `data` (OpenAI, Anthropic, OpenRouter,
 /// Bedrock Mantle) or `models` (the ChatGPT Codex backend, whose `hide` and
 /// `none` entries its own picker leaves out too). Newest first where the
@@ -214,6 +313,14 @@ fn parse(listed: &Value) -> Result<Vec<Value>> {
     Ok(entries
         .into_iter()
         .filter(|entry| entry["visibility"].as_str().is_none_or(|v| v == "list"))
+        // Prefer explicit capabilities. Unknown model names on custom
+        // providers are kept; only known hosts use name-based filtering.
+        .filter(|entry| {
+            entry
+                .pointer("/architecture/output_modalities")
+                .and_then(Value::as_array)
+                .is_none_or(|output| output.iter().any(|mode| mode == "text"))
+        })
         .filter_map(|entry| {
             let id = entry["id"].as_str().or(entry["slug"].as_str())?;
             let mut model = json!({"id": id});
@@ -247,9 +354,163 @@ mod tests {
     };
     use serde_json::json;
 
+    #[tokio::test]
+    async fn a_kept_refusal_counts_against_the_shared_budget() {
+        use std::sync::atomic::Ordering;
+        let transport = Transport::new(64, 1).unwrap();
+        let provider = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "http://127.0.0.1:1/v1",
+            None,
+        )
+        .unwrap();
+        let refused = provider.models().await.unwrap_err();
+        let held = transport.listed.load(Ordering::Relaxed);
+        assert!(held >= refused.code.len(), "{held}");
+        // Asked again, the kept refusal answers and is not counted twice.
+        assert_eq!(provider.models().await.unwrap_err(), refused);
+        assert_eq!(transport.listed.load(Ordering::Relaxed), held);
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_is_asked_again_not_kept() {
+        use crate::provider::aws::{Aws, Keys};
+        use std::sync::{Arc, atomic::Ordering};
+        let transport = Transport::new(64, 1).unwrap();
+        let mut keys = Keys::new("A".into(), "S".into(), None);
+        keys.expires = Some(std::time::UNIX_EPOCH);
+        let aws = Arc::new(Aws::fixed("us-east-1", "bedrock-mantle", keys));
+        let provider = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://bedrock-mantle.us-east-1.api.aws/v1/responses",
+            None,
+        )
+        .unwrap()
+        .with_aws(aws)
+        .unwrap();
+        let refused = provider.models().await.unwrap_err();
+        assert_eq!(refused.code, "provider_aws_credentials_expired");
+        assert!(provider.listing.0.lock().await.is_none());
+        assert_eq!(transport.listed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_key_is_asked_again_not_kept() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.read(&mut [0; 4096]).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let transport = Transport::new(64, 1).unwrap();
+        let provider =
+            Provider::new(transport.clone(), Family::Responses, &url, Some("k".into())).unwrap();
+        let refused = provider.models().await.unwrap_err();
+        assert_eq!(refused.code, "provider_http_401");
+        assert!(provider.listing.0.lock().await.is_none());
+        assert_eq!(transport.listed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn explicit_output_modalities_filter_without_guessing_custom_names() {
+        let models = parse(&json!({"data":[
+            {"id":"vendor/search"},
+            {"id":"vendor/image-chat", "architecture":{"output_modalities":["text","image"]}},
+            {"id":"vendor/paint", "architecture":{"output_modalities":["image"]}},
+            {"id":"vendor/embed", "architecture":{"output_modalities":[]}}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            models,
+            [
+                json!({"id":"vendor/search"}),
+                json!({"id":"vendor/image-chat"})
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_offers_only_models_a_turn_can_run() {
+        use super::openai_text;
+        for id in [
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "o5-mini",
+            "gpt-5.6-luna",
+            "codex-mini-latest",
+            "ft:gpt-4.1:org:customer-search:abc123",
+        ] {
+            assert!(openai_text(id), "{id}");
+        }
+        for id in [
+            "text-embedding-3-large",
+            "tts-1-hd",
+            "whisper-1",
+            "gpt-4o-transcribe",
+            "gpt-realtime",
+            "gpt-audio",
+            "dall-e-3",
+            "gpt-image-1",
+            "omni-moderation-latest",
+            "davinci-002",
+            "babbage-002",
+            "sora-2",
+            "gpt-4o-search-preview",
+            "ft:babbage-002:org:chat:abc123",
+        ] {
+            assert!(!openai_text(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn mantle_offers_each_binding_only_its_own_family() {
+        use super::mantle_runs;
+        assert!(mantle_runs(Family::Anthropic, "anthropic.claude-sonnet-5"));
+        assert!(mantle_runs(
+            Family::Anthropic,
+            "global.anthropic.claude-sonnet-5"
+        ));
+        assert!(!mantle_runs(Family::Anthropic, "openai.gpt-6-luna"));
+        assert!(mantle_runs(Family::Responses, "openai.gpt-6-luna"));
+        assert!(!mantle_runs(Family::Responses, "anthropic.claude-sonnet-5"));
+        assert!(!mantle_runs(Family::Responses, "openai.gpt-oss-20b"));
+        assert!(!mantle_runs(Family::Anthropic, "openai.gpt-oss-120b"));
+    }
+
     #[test]
     fn each_listing_sits_where_its_provider_serves_it() {
         let transport = Transport::new(64, 1).unwrap();
+        let dir = std::env::temp_dir().join(format!("agent-models-login-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"synthetic-token","account_id":"synthetic-account"}}"#,
+        )
+        .unwrap();
+        let login = std::sync::Arc::new(crate::provider::login::Login::open(&auth, None).unwrap());
+        let chatgpt = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://chatgpt.com/backend-api/codex",
+            None,
+        )
+        .unwrap()
+        .with_login(login)
+        .unwrap();
+        assert_eq!(
+            chatgpt.models_url().as_str(),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.157.1"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
         let url = |family, base: &str| {
             Provider::new(transport.clone(), family, base, None)
                 .unwrap()

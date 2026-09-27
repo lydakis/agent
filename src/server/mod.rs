@@ -11,7 +11,7 @@ use agent_runtime::{
     codec::{Family, split_model},
     fail, fail_with,
     output::{self, Output},
-    provider::{Provider, STREAMS_PER_CONNECTION, Transport},
+    provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
         Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Started,
         Store, TurnOptions, Waiting, Wake,
@@ -876,6 +876,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let approval_hold = Duration::from_millis(config.approval_hold_ms.unwrap_or(2000));
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
+    let aws_start = agent_runtime::provider::aws::Start::new();
     let credentials = agent_runtime::tools::Credentials::default();
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
@@ -909,10 +910,25 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.sigv4 {
             let url =
                 reqwest::Url::parse(&spec.url).map_err(|_| Error::new("invalid_provider_url"))?;
-            let aws =
-                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone())).await?;
-            auth = Some(json!({"auth":"sigv4","region":aws.region(),
-                "credentials":aws.source()}));
+            let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
+                &url,
+                Some(credentials.clone()),
+                &aws_start,
+            )
+            .await?;
+            let mut signed = json!({"auth":"sigv4","region":aws.region(),
+                "credentials":aws.source()});
+            // Keys the CLI cannot resolve yet leave this binding waiting on a
+            // login, not the daemon: its calls resolve again when they run.
+            // Its detail is clipped: every SigV4 binding carries the same
+            // one, and `ready` is one event however many there are.
+            if let Some(mut error) = unresolved {
+                if let Some(detail) = &mut error.detail {
+                    detail.truncate(detail.floor_char_boundary(200));
+                }
+                signed["unresolved"] = json!({"error": error.code, "detail": error.detail});
+            }
+            auth = Some(signed);
             provider = provider.with_aws(Arc::new(aws))?;
         }
         if let Some(cap) = config.max_output_tokens {
@@ -935,6 +951,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         }
         bindings.insert(spec.name.clone(), binding);
     }
+    // Bindings own their keys now; release the shared startup result.
+    drop(aws_start);
     if providers.is_empty() {
         return fail("no_providers");
     }
@@ -2683,7 +2701,7 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
 /// first, so refusals always fit; more providers than even refusals fit
 /// for fail the request as a whole.
 fn fit_listings(
-    listed: impl ExactSizeIterator<Item = (String, Result<Arc<Vec<Value>>>)>,
+    listed: impl ExactSizeIterator<Item = (String, Listed)>,
     limit: usize,
 ) -> Result<serde_json::Map<String, Value>> {
     const REFUSAL: usize = 160;
@@ -2697,20 +2715,32 @@ fn fit_listings(
     };
     let mut answer = serde_json::Map::new();
     for (name, result) in listed {
-        let mut entry = match result {
-            Ok(models) => json!({"models": models.as_slice()}),
-            Err(error) => json!({"error": error.code, "detail": error.detail}),
-        };
-        let size = entry.to_string().len() + name.len() + 8;
-        match room.checked_sub(size) {
-            Some(left) => room = left,
-            None => {
-                entry = json!({
-                    "error": "provider_models_limit",
-                    "detail": format!("listing is {size} bytes, {room} left in the reply"),
-                });
+        // A kept listing is its JSON text: sized as it is, parsed only once
+        // it fits.
+        let refused = result
+            .as_ref()
+            .err()
+            .map(|error| json!({"error": error.code, "detail": error.detail}));
+        let size = name.len()
+            + 20
+            + match (&result, &refused) {
+                (Ok(models), _) => models.len(),
+                (_, refused) => output::encoded_len(refused)?,
+            };
+        let entry = match (room.checked_sub(size), result, refused) {
+            (Some(left), Ok(models), _) => {
+                room = left;
+                json!({"models": serde_json::from_str::<Value>(&models)?})
             }
-        }
+            (Some(left), Err(_), refused) => {
+                room = left;
+                refused.unwrap_or_default()
+            }
+            (None, _, _) => json!({
+                "error": "provider_models_limit",
+                "detail": format!("listing is {size} bytes, {room} left in the reply"),
+            }),
+        };
         answer.insert(name, entry);
     }
     Ok(answer)
@@ -2722,17 +2752,17 @@ mod tests {
     fn provider_listings_always_fit_one_reply() {
         let model = json!({"id": "m".repeat(100)});
         let limit = 256 * 1024;
-        let big = Arc::new(vec![model.clone(); 1700]);
-        let mut listed = vec![("a-near".to_owned(), Ok(big))];
+        let text = |n| -> Arc<str> { json!(vec![model.clone(); n]).to_string().into() };
+        let mut listed = vec![("a-near".to_owned(), Ok(text(1700)))];
         for i in 0..300 {
-            listed.push((format!("b-{i:03}"), Ok(Arc::new(vec![model.clone(); 20]))));
+            listed.push((format!("b-{i:03}"), Ok(text(20))));
         }
         let answer = fit_listings(listed.into_iter(), limit).unwrap();
         assert!(json!({"providers": answer}).to_string().len() <= limit - 4096);
         assert!(answer["a-near"]["models"].is_array());
         assert_eq!(answer["b-299"]["error"], "provider_models_limit");
         assert_eq!(answer.len(), 301);
-        let many = (0..2000).map(|i| (format!("p-{i}"), Ok(Arc::new(Vec::new()))));
+        let many = (0..2000).map(|i| (format!("p-{i}"), Ok(Arc::from("[]"))));
         assert_eq!(
             fit_listings(many, limit).unwrap_err().code,
             "provider_models_limit"

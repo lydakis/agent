@@ -312,6 +312,17 @@ ready output, storage waits, failed listing cleanup, and reply ordering.
 The bounded macOS comparison is recorded in APPROVALS.md; it is a small
 non-regression screen, not an efficiency ranking.
 
+Catalog consolidation validation (2026-09-27, based on `f15854f`, with
+explicit output-modality handling from the approach in `985179c`): all
+318 Rust runtime/client tests and 38 release-binary CLI integration tests
+passed, along with Clippy, formatting, and diff checks. A synthetic
+provider with only an invalid model ID reproduced successful discovery
+of a comments-only file before the renderer became fallible; it now
+returns `models_none_listed` and leaves no file. Provider tests cover the
+shared listing budget, refused credentials, and the bounded shared AWS
+startup lookup. These are synthetic checks, not fresh paid-provider
+validation or a catalog performance comparison.
+
 ## Not established
 
 - Any Terminal-Bench score: five tasks are a screen.

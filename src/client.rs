@@ -827,7 +827,7 @@ fn models(options: &Options) -> Result<i32> {
         }
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
-        let text = agent_client::models::render(&listing);
+        let text = agent_client::models::render(&listing).map_err(client_error)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

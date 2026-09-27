@@ -115,77 +115,144 @@ fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
 
 /// A first list from the daemon's `provider_models` answer: every model each
 /// provider listed, with what it said about it as the note, and a comment for
-/// a provider that listed nothing.
-pub fn render(listing: &Value) -> String {
+/// a provider that listed nothing. Refuses output with no usable model
+/// lines, including listings dropped to keep the file within its limit.
+pub fn render(listing: &Value) -> Result<String, Error> {
     let mut text = String::from(
         "# PROVIDER/MODEL per line; clients offer these. Delete what you don't use.\n",
     );
     let Some(providers) = listing["providers"].as_object() else {
-        return text;
+        return Err(Error::with("models_none_listed", "no provider listings"));
     };
     let mut names: Vec<&String> = providers.keys().collect();
     names.sort();
+    // Every block, comments included, is counted against the limit the
+    // list is read back at, with room kept for one closing line.
+    let room = LIMIT as usize - 96;
+    let mut left_out = 0;
+    let mut has_models = false;
     for name in names {
-        let listed = &providers[name];
-        text.push('\n');
-        let Some(models) = listed["models"].as_array() else {
-            let error = listed["error"].as_str().unwrap_or("no listing");
-            let said = match listed["detail"].as_str() {
-                Some(detail) => format!("{name}: {error}: {detail}"),
-                None => format!("{name}: {error}"),
-            };
-            // One comment line, whatever line breaks the provider sent.
-            let said: Vec<&str> = said.split_whitespace().collect();
-            text.push_str(&format!("# {}\n", said.join(" ")));
-            continue;
-        };
-        let mut lines = String::new();
-        for model in models {
-            let Some(id) = model["id"].as_str() else {
-                continue;
-            };
-            let mut note = Vec::new();
-            if let Some(display) = model["name"].as_str() {
-                note.push(display.to_owned());
+        let (block, instead) = provider_block(name, &providers[name]);
+        match [block, instead]
+            .into_iter()
+            .flatten()
+            .find(|block| text.len() + 1 + block.len() <= room)
+        {
+            Some(block) => {
+                has_models |= !block.starts_with('#');
+                text.push('\n');
+                text.push_str(&block);
             }
-            if let Some(tokens) = model["context_tokens"].as_u64() {
-                note.push(format!("{tokens} context"));
-            }
-            if let Some(tokens) = model["output_tokens"].as_u64() {
-                note.push(format!("{tokens} output"));
-            }
-            let id = format!("{name}/{id}");
-            // A line a model id breaks would not read back; leave it out.
-            if !parse(&id).is_ok_and(|parsed| parsed.len() == 1 && parsed[0].id == id) {
-                continue;
-            }
-            // `#` starts the note, so it cannot appear inside one's text either way.
-            let note = note.join(", ").replace('\n', " ");
-            match note.is_empty() {
-                true => lines.push_str(&format!("{id}\n")),
-                false => lines.push_str(&format!("{id}  # {note}\n")),
-            }
-        }
-        // A provider that answered but gave nothing usable says so by name,
-        // and one that would make the list too long to read back is left out.
-        if lines.is_empty() {
-            text.push_str(&format!("# {name}: no models listed\n"));
-        } else if text.len() + lines.len() + 128 > LIMIT as usize {
-            text.push_str(&format!(
-                "# {name}: {} bytes of models, past the list's 1 MiB\n",
-                lines.len()
-            ));
-        } else {
-            text.push_str(&lines);
+            None => left_out += 1,
         }
     }
-    text
+    if left_out > 0 {
+        text.push_str(&format!(
+            "\n# {left_out} more providers left out, past the list's 1 MiB\n"
+        ));
+    }
+    if !has_models {
+        let refused: Vec<_> = providers
+            .iter()
+            .map(|(name, listed)| {
+                format!(
+                    "{name}: {}",
+                    listed["error"].as_str().unwrap_or("no usable models")
+                )
+            })
+            .collect();
+        return Err(Error::with("models_none_listed", &refused.join(", ")));
+    }
+    Ok(text)
+}
+
+/// A provider's lines, and a shorter comment to write in their place when
+/// they do not fit.
+fn provider_block(name: &str, listed: &Value) -> (Option<String>, Option<String>) {
+    let comment = |said: String| {
+        // One comment line, whatever line breaks the provider sent.
+        let said: Vec<&str> = said.split_whitespace().collect();
+        format!("# {}\n", said.join(" "))
+    };
+    let Some(models) = listed["models"].as_array() else {
+        let error = listed["error"].as_str().unwrap_or("no listing");
+        let full = listed["detail"]
+            .as_str()
+            .map(|detail| comment(format!("{name}: {error}: {detail}")));
+        return (full, Some(comment(format!("{name}: {error}"))));
+    };
+    let mut lines = String::new();
+    for model in models {
+        let Some(id) = model["id"].as_str() else {
+            continue;
+        };
+        let mut note = Vec::new();
+        if let Some(display) = model["name"].as_str() {
+            note.push(display.to_owned());
+        }
+        if let Some(tokens) = model["context_tokens"].as_u64() {
+            note.push(format!("{tokens} context"));
+        }
+        if let Some(tokens) = model["output_tokens"].as_u64() {
+            note.push(format!("{tokens} output"));
+        }
+        let id = format!("{name}/{id}");
+        // A line a model id breaks would not read back; leave it out.
+        if !parse(&id).is_ok_and(|parsed| parsed.len() == 1 && parsed[0].id == id) {
+            continue;
+        }
+        // `#` starts the note, so it cannot appear inside one's text either way.
+        let note = note.join(", ").replace('\n', " ");
+        match note.is_empty() {
+            true => lines.push_str(&format!("{id}\n")),
+            false => lines.push_str(&format!("{id}  # {note}\n")),
+        }
+    }
+    // A provider that answered but gave nothing usable says so by name.
+    if lines.is_empty() {
+        return (None, Some(comment(format!("{name}: no models listed"))));
+    }
+    let over = comment(format!(
+        "{name}: {} bytes of models, past the list's 1 MiB",
+        lines.len()
+    ));
+    (Some(lines), Some(over))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse, render};
     use serde_json::json;
+
+    #[test]
+    fn discovery_requires_a_model_that_survives_rendering() {
+        for models in [
+            json!([]),
+            json!([{"id":"bad id"}]),
+            json!([{"id":"x".repeat(257)}]),
+        ] {
+            let listing = json!({"providers":{"custom":{"models":models}}});
+            assert_eq!(render(&listing).unwrap_err().code, "models_none_listed");
+        }
+        let refused = json!({"providers":{"gone":{"error":"provider_connection"}}});
+        assert!(
+            render(&refused)
+                .unwrap_err()
+                .detail
+                .unwrap()
+                .contains("gone: provider_connection")
+        );
+        // Valid ids can also be omitted when the rendered block exceeds the file limit.
+        let large: Vec<_> = (0..5000)
+            .map(|i| json!({"id":format!("m{i}"), "name":"n".repeat(256)}))
+            .collect();
+        assert_eq!(
+            render(&json!({"providers":{"large":{"models":large}}}))
+                .unwrap_err()
+                .code,
+            "models_none_listed"
+        );
+    }
 
     #[test]
     fn lines_are_ids_with_notes_and_comments_and_blanks_are_skipped() {
@@ -217,7 +284,8 @@ mod tests {
                 "context_tokens":1000000,"output_tokens":128000}]},
             "bedrock":{"error":"provider_http_404","detail":"not found"},
             "gone":{"error":"provider_http_500","detail":"down\nother/model\r\nx"},
-            "quiet":{"models":[{"id":"bad id"}]}}}));
+            "quiet":{"models":[{"id":"bad id"}]}}}))
+        .unwrap();
         assert!(text.contains(
             "anthropic/claude-sonnet-5  # Claude Sonnet 5, 1000000 context, 128000 output\n"
         ));
@@ -231,10 +299,27 @@ mod tests {
             .collect();
         let long = "p".repeat(64);
         let text = render(&json!({"providers":{
-            "openai":{"models":[{"id":"gpt-6-luna"}]}, long.clone(): {"models": many}}}));
+            "openai":{"models":[{"id":"gpt-6-luna"}]}, long.clone(): {"models": many}}}))
+        .unwrap();
         assert!(text.len() <= super::LIMIT as usize);
         assert!(text.contains(&format!("# {long}: ")));
         let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["openai/gpt-6-luna"]);
+
+        // Comments count too: a list that nearly fills the file leaves the
+        // rest as one closing line, never past the limit.
+        let fill = (super::LIMIT as usize - 6000) / 15;
+        let fill: Vec<_> = (0..fill)
+            .map(|i| json!({"id": format!("model-{i:06}")}))
+            .collect();
+        let mut listing = json!({"a": {"models": fill}});
+        for i in 0..200 {
+            listing[format!("z-{i:03}")] =
+                json!({"error": "provider_http_500", "detail": "d".repeat(300)});
+        }
+        let text = render(&json!({ "providers": listing })).unwrap();
+        assert!(text.len() <= super::LIMIT as usize);
+        assert!(text.contains("more providers left out, past the list's 1 MiB\n"));
+        assert!(parse(&text).is_ok());
     }
 }

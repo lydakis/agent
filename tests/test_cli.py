@@ -935,9 +935,15 @@ class ListingModel(Model):
 
     def do_GET(self):
         self.server.listings = getattr(self.server, 'listings', 0) + 1
-        if self.path == '/huge/v1/models':
+        self.server.paths = getattr(self.server, 'paths', []) + [self.path]
+        if self.path == '/invalid/v1/models':
+            data = [{'id': 'bad model id'}]
+        elif self.path == '/huge/v1/models':
             # Parses under the listing limit but alone overflows one reply.
             data = [{'id': f'model-{i:04d}-' + 'x' * 120} for i in range(9000)]
+        elif self.path.startswith('/big'):
+            # About 800 KB each: two fit the listings the daemon keeps, three do not.
+            data = [{'id': f'model-{i:05}-' + 'x' * 50} for i in range(11500)]
         elif self.path.startswith('/paged/v1/models?'):
             # Anthropic's paging: has_more with last_id, answered by after_id.
             if 'after_id=first-model' in self.path:
@@ -988,6 +994,37 @@ class ModelListTests(ModelFixture):
         if check:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
+
+    def test_listings_kept_share_one_budget(self):
+        base = self.url.removesuffix('/v1')
+        big = [arg for i in (1, 2, 3) for arg in ('--provider', f'big{i}=responses,{base}/big{i}/v1')]
+        self.agent('models', '--discover', *self.store, *big)
+        self.assertEqual(len(self.model.paths), 3)
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.path / 'state.sqlite.sock'))
+            lines = s.makefile('rw')
+            lines.readline()
+            lines.write(json.dumps({'id': 1, 'op': 'provider_models'}) + '\n')
+            lines.flush()
+            next(m for m in map(json.loads, lines) if m.get('id') == 1)
+        # Two listings fill what the daemon keeps; the third is asked again.
+        self.assertEqual(len(self.model.paths), 4)
+
+    def test_discover_writes_nothing_when_no_provider_lists(self):
+        refused = self.agent('models', '--discover', *self.store,
+                             '--provider', 'gone=responses,http://127.0.0.1:1/v1', check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('models_none_listed', refused.stderr)
+        self.assertIn('gone: provider_', refused.stderr)
+        self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
+
+    def test_discover_writes_nothing_when_rendering_discards_every_model(self):
+        url = self.url.removesuffix('/v1') + '/invalid/v1'
+        refused = self.agent('models', '--discover', *self.store,
+                             '--provider', f'custom=responses,{url}', check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('models_none_listed', refused.stderr)
+        self.assertFalse(self.list.exists())
 
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
         self.assertEqual(json.loads(self.agent('models').stdout), [])
