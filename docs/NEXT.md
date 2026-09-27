@@ -905,10 +905,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     Built (2026-09-27): `serve_approvals` with its lease and the `denials`
     counts; then `agent approver` answering the `auto` tag from Jev or any
     model the daemon serves, `--approval auto`, and who wrote each prompt
-    (`from`, `AGENT_TURN`, `prompts`). Next: Jev against `gpt-6-luna` as
-    the judge on the 341 labeled calls, through the real daemon and
-    approver (approved, about $0.07 of Jev); then a labeled dangerous set
-    to measure false allows before thresholds are fixed. Later, not a
+    (`from`, `AGENT_TURN`, `prompts`). Measured (2026-09-27, George's
+    Mac): on the 341 benign labeled calls, `gpt-6-luna` at low reasoning
+    refused 9 to 11% and Jev 19%, with Jev about 17 times faster at the
+    median (APPROVALS Measure item 4). Next: a labeled set of calls that
+    should not run, to measure false allows before thresholds are fixed. Later, not a
     priority (George, 2026-09-27): rules as an option for manual mode, a
     program answering a `manual` gate from a rule list, starting from the
     rules the design first proposed.

@@ -7,8 +7,9 @@ updated at `095ff68` for admission batching and disk-full containment, at
 lock fix, at `dd95047` for the per-summary choice between a copy and a
 request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
-serving a gate tag to one approver, and at `74f726b` and `aed1669` for
-the automatic approver's own cost. This is the one place that says what is currently
+serving a gate tag to one approver, at `74f726b` and `aed1669` for
+the automatic approver's own cost, and at `81458d2` for the judges
+compared. This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -97,9 +98,21 @@ more turns is not here, because its work changes with its speed; it is under
   interleaved runs of each, six rounds per arm): Jev adds 2.2 against
   2.3 ms and a general model 8.8 against 9.7 ms over the direct client,
   with the same commits, so the fixes cost nothing measurable.
-  Neither includes the judge's own time: Jev answered in 0.26 s at the
-  median in the labeled run, and a general model takes longer.
+  Neither includes the judge's own time, measured below.
   macOS is not measured.
+  [Record](APPROVALS.md#measure-before-building).
+- **Judges compared, benign calls.** George's Mac (macOS 27.0, M1 Max),
+  2026-09-27, at `81458d2` (the approver of `aed1669`): 338 rounds holding
+  341 labeled calls that should all run, replayed through the daemon and
+  `agent approver`, the same rounds, questions, thresholds (0.35, 0.70)
+  and state for both judges, two passes in opposite order. Jev allowed
+  275 and 276 and denied the rest (59 and 60 as unclear), with a judge
+  time of 161 to 170 ms p50 and 305 to 345 ms p99, about 516k input tokens
+  and $0.0217 a pass. `gpt-6-luna` at low reasoning on a ChatGPT plan
+  allowed 303 and 309, denying the rest as risky, with 2.8 to 3.0 s p50,
+  about 12 s p99 and 25.4 s at the worst, against its 30 s deadline; about
+  438k input and 33k output tokens a pass. No check failed in either.
+  Because every call should run, this says nothing about false allows.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB
@@ -367,6 +380,6 @@ the 10 focused hub tests, Clippy, formatting, and diff checks also passed.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
 - Tool approval at fleet scale on macOS.
-- How well Jev and a general model judge as the automatic approver, and
-  how fast, on the labeled calls (planned).
+- How often either judge allows a risky call: the labeled set holds only
+  calls that should run, so it measures false denials, not false allows.
 - Multi-daemon operation and concurrent tool calls: designs only.

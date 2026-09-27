@@ -980,13 +980,32 @@ as one.
    a socket rather than stdio, and a verdict that arrives while the turn
    is parked on an earlier `wait` (covered by a behavior test, not
    timed).
-4. **Judges compared.** Planned, approved by George on 2026-09-27 (about
-   $0.07 of Jev): the 341 labeled calls of item 2 replayed through the
+4. **Judges compared.** Approved by George on 2026-09-27 (about $0.07 of
+   Jev) and run that day on his Mac (macOS 27.0, M1 Max) at `81458d2`:
+   the 341 labeled calls of item 2, in 338 rounds, replayed through the
    daemon and `agent approver`, once with Jev and once with `gpt-6-luna`
-   on a ChatGPT plan, the same calls, questions, thresholds, and state
-   on both sides. Measured per judge: decisions against the labels (false
-   allows, false denials, unclear), latency from announcement to verdict
-   (p50 and p99), tokens, and cost.
+   at low reasoning on a ChatGPT plan, the same rounds, questions,
+   thresholds, and state on both sides, in two passes of opposite order.
+   Every labeled call should run, so the set measures false denials only.
+
+   | Per pass | Jev | `gpt-6-luna` |
+   |---|---:|---:|
+   | Allowed, of 341 | 275, 276 | 303, 309 |
+   | Denied as unclear / risky | 59 / 7, 60 / 5 | 0 / 38, 0 / 32 |
+   | Judge time p50 / p99, ms | 170 / 305, 161 / 345 | 3,041 / 12,314, 2,787 / 12,036 |
+   | Slowest round, ms | 453, 429 | 19,590, 25,444 |
+   | Tokens in / out, thousands | 516 / 0 | 438 / 33 |
+   | Cost | $0.0217 | on the plan |
+
+   - Neither judge failed a check or ran past its deadline; the slowest
+     general-model round came within 5 s of its 30 s.
+   - `gpt-6-luna` refused 9 to 11% of benign calls, Jev 19%. Most of
+     Jev's refusals are unclear answers, which the thresholds decide; all
+     of `gpt-6-luna`'s are risky ones.
+   - Jev is about 17 times faster at the median and 35 to 40 times at
+     p99. Order made no difference beyond run-to-run spread.
+   - False allows are still unmeasured: that needs labeled calls that
+     should not run.
 
    The approver's own path is measured (2026-09-27, `74f726b`) with
    judges that answer at once, in three arms of
@@ -1132,9 +1151,9 @@ Where the approver differs from the design above:
   "intent too long", since the person's latest word may be the one left
   out. A model judge's tag is at most 87 bytes, so its forks' names fit.
 
-Not built yet: the app's cards and the app's own approver, and the judge
-comparison (item 4 of Measure). Follow-ups from review (2026-09-27): a
-fork's inherited turns in `earlier` (they belong to the source bot, so a
+Not built yet: the app's cards and the app's own approver, and a labeled
+set of calls that should not run, to measure false allows. Follow-ups
+from review (2026-09-27): a fork's inherited turns in `earlier` (they belong to the source bot, so a
 fork's first checks see none of that history); rotation for the
 CLI-started approver's log, which grows one line a round; a CLI that finds
 the tag already served waiting for that approver's `serving` line too;
