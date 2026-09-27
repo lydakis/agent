@@ -134,8 +134,10 @@ the environment of the user's login shell (`$SHELL -l -i`), plus
 `~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
 (`export` and quotes allowed, `#` comments), refused unless it is a regular
 file of at most 64 KiB that only its owner can read. That file is the app's; the CLI and the daemon never read it.
-Both are read once per app run, and without `--model` or `AGENT_MODEL` of its
-own the app takes its default model from them too. The
+The login shell is read once per app run, and without `--model` or
+`AGENT_MODEL` of its own the app takes its default model from the file, then
+the shell; the shell's is looked up beside the attach, so a slow profile never
+delays it. The
 store and socket themselves are resolved from the app's own arguments and
 environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
@@ -165,8 +167,9 @@ versions, and leaves `Agent_X.Y.Z_universal.zip`, the generated cask,
 release. Publishing the draft (not a prerelease) runs
 [publish-homebrew.yml](../.github/workflows/publish-homebrew.yml): it
 resolves the tag to a commit on `main` before running any of its code,
-refuses assets built from any other commit (a draft's tag can move), checks
-them against their checksums and the tag's cask generator,
+refuses assets built from any other commit (a draft's tag can move) or
+lacking release.yml's build attestation (a draft's assets can be replaced),
+checks them against their checksums and the tag's cask generator,
 installs and audits the cask, and writes `Casks/agent.rb` to
 [lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
 downgrades the tap or replaces a different cask of the same version. The
@@ -376,7 +379,9 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 2. The first release: create the tap, set the secrets, tag `v0.1.0`.
 3. Refuse a `~/.agent/env` that a macOS ACL makes readable by other
    accounts; today only its POSIX mode is checked.
-4. The rest of the projects design (the "Agent App Concepts" prototype), in
+4. Stop a daemon the app started for a store other than `~/.agent`'s when
+   the cask is uninstalled; the uninstall hook stops only the default one.
+5. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
 
 ## Regression checks

@@ -26,6 +26,9 @@ jobs:
       !contains(github.event.workflow_run.head_branch, '-')
     runs-on: macos-15
     timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: read
     defaults:
       run:
         shell: bash
@@ -74,6 +77,17 @@ jobs:
           gh release download "$RELEASE_TAG" --repo lydakis/agent \
             --pattern agent.rb --pattern checksums.txt --pattern source-commit.txt \
             --pattern "Agent_${RELEASE_TAG#v}_universal.zip" --dir "$RUNNER_TEMP/release"
+      - name: Verify the assets were built by the release workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          cd "$RUNNER_TEMP/release"
+          for asset in "Agent_${RELEASE_TAG#v}_universal.zip" agent.rb source-commit.txt; do
+            gh attestation verify "$asset" --repo lydakis/agent \
+              --signer-workflow lydakis/agent/.github/workflows/release.yml \
+              --deny-self-hosted-runners
+          done
       - name: Check out tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -174,13 +174,11 @@ mod config_tests {
 
 /// What the page needs to create bots and to say where it is.
 /// A window opened from the Dock has no `AGENT_MODEL` of its own; the model
-/// is then the one a daemon the app starts would be given.
+/// is then `~/.agent/env`'s. The login shell's comes later, from
+/// `default_model`, so a slow profile never delays attaching.
 #[tauri::command]
-async fn setup(state: State<'_, Shared>) -> Result<Value, String> {
-    let model = match &state.config.model {
-        Some(model) => Some(model.clone()),
-        None => daemon::model().await,
-    };
+fn setup(state: State<'_, Shared>) -> Result<Value, String> {
+    let model = state.config.model.clone().or_else(daemon::file_model);
     Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
         "model": model,
@@ -219,6 +217,13 @@ fn write_project(dir: String, name: String, model: String) -> Result<(), String>
         &name,
         &model,
     )
+}
+
+/// `AGENT_MODEL` as a daemon this app starts would see it, the login shell's
+/// included. Read again on each call: `~/.agent/env` may have been repaired.
+#[tauri::command]
+async fn default_model() -> Option<String> {
+    daemon::model().await
 }
 
 /// The models to offer, read from `~/.agent/models` each time, so an edit
@@ -373,6 +378,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             setup,
+            default_model,
             policy,
             models,
             project,

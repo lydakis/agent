@@ -39,8 +39,17 @@ async fn login() -> Option<&'static [(OsString, OsString)]> {
 /// `AGENT_MODEL` as a daemon this app starts would see it: `~/.agent/env`
 /// over the login shell.
 pub async fn model() -> Option<String> {
-    let file = env_file().and_then(|file| read_env_file(&file).ok());
-    pick_model(file.as_deref(), login().await)
+    pick_model(file_pairs().as_deref(), login().await)
+}
+
+/// `~/.agent/env`'s `AGENT_MODEL` alone: no shell, so it is quick enough to
+/// be on the path to attaching.
+pub fn file_model() -> Option<String> {
+    pick_model(file_pairs().as_deref(), None)
+}
+
+fn file_pairs() -> Option<Vec<(String, String)>> {
+    env_file().and_then(|file| read_env_file(&file).ok())
 }
 
 fn pick_model(

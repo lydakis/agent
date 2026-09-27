@@ -663,8 +663,10 @@ function attach() {
 }
 async function attachOnce() {
   try {
-    // A model found only later (a repaired ~/.agent/env) is picked up on the next attach.
-    if (!S.config?.model) S.config = await Daemon.setup();
+    if (!S.config) S.config = await Daemon.setup();
+    // The login shell's model, looked up beside the attach so a slow profile never delays it, and
+    // again on each attach while none is known (~/.agent/env may have been repaired meanwhile).
+    if (!S.config.model) Daemon.defaultModel?.().then((m) => { if (m && !S.config.model) S.config.model = m; }, () => {});
     const { session } = await Daemon.attach(S.cursor);
     S.session = session;
     S.deleted = new Set(); S.snapshot = true;

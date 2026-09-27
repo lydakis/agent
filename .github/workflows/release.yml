@@ -78,6 +78,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     defaults:
       run:
         shell: bash
@@ -227,6 +229,23 @@ jobs:
           ditto -x -k "Agent_${version}_universal.zip" smoke
           codesign --verify --deep --strict smoke/Agent.app
           xcrun stapler validate smoke/Agent.app
+      - name: Remove temporary signing credentials
+        if: always()
+        run: |
+          signing_dir="$RUNNER_TEMP/agent-signing"
+          if [ -f "$signing_dir/signing.keychain-db" ]; then
+            security delete-keychain "$signing_dir/signing.keychain-db"
+          fi
+          rm -rf "$signing_dir"
+      - name: Attest the release assets
+        # Publishing verifies this: assets swapped on the draft afterwards,
+        # checksums and all, carry no attestation from this workflow.
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/Agent_*_universal.zip
+            dist/agent.rb
+            dist/source-commit.txt
       - name: Verify release tag before publishing
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
@@ -252,11 +271,3 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" dist/*.zip dist/checksums.txt dist/agent.rb dist/source-commit.txt \
             --verify-tag --draft --title "$RELEASE_TAG" --generate-notes "${options[@]}"
-      - name: Remove temporary signing credentials
-        if: always()
-        run: |
-          signing_dir="$RUNNER_TEMP/agent-signing"
-          if [ -f "$signing_dir/signing.keychain-db" ]; then
-            security delete-keychain "$signing_dir/signing.keychain-db"
-          fi
-          rm -rf "$signing_dir"
