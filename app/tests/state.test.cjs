@@ -722,15 +722,16 @@ test('a steer joins the running turn: it names no model and no workspace', async
   assert.equal(sent.at(-1).delivery, 'queue'); assert.equal('expected_turn' in sent.at(-1), false);
 });
 
-test('a bot keeps its folder: only a bot without one is sent the app\'s, and a turn elsewhere moves it', async () => {
+test('a bot keeps its folder: only a bot without one is sent the app\'s', async () => {
   const sent = [];
   const p = shell({ request: async (op, q) => { sent.push(q); } });
   p.upsert({ name: 'loose', id: 3, provider: 'alpha', model: 'one' });
   p.S.selected = 'loose'; await p.submit('here');
   assert.equal(sent.at(-1).workspace, '/synthetic');
+  // A turn's folder is not the bot's: a steer run elsewhere leaves the bot where it was.
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task' });
-  await p.onEvent({ event: 'accepted', bot: 'task', turn: 5, data: { workspace: '/synthetic/moved' } });
-  assert.equal(p.S.bots.get('task').workspace, '/synthetic/moved');
+  await p.onEvent({ event: 'accepted', bot: 'task', turn: 5, data: { workspace: '/synthetic/steer' } });
+  assert.equal(p.S.bots.get('task').workspace, '/synthetic/task');
 });
 
 test('a steer whose turn ended meanwhile is refused as stale, with a short message, and never queued', async () => {
@@ -858,7 +859,7 @@ test('a new project creates its coordinator in the folder, writes its file once,
   assert.deepEqual([create.bot, create.workspace, create.model], ['weather.lead', '/synthetic/weather', 'alpha/one']);
   // The shared policy first, then the app's own coordinator text: tasks that edit get worktrees.
   assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
-  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
+  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /starts with your own name before \.lead/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
   assert.match(create.instructions, /A task keeps its folder, so later messages to it need no --workspace/);
   // Tasks get the worktree's own policy, failed starts clean up, and a folder without git keeps tasks in place.
   assert.match(create.instructions, /run --detach --new --agents --bot NAME/);

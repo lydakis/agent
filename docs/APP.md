@@ -195,7 +195,8 @@ daemon learns nothing about projects; everything here is client work.
   cache; the daemon refuses a call outside the list.
 - **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
   daemon's. A coordinator the app creates gets, after the shared policy, a
-  short text of the app's own: a task that changes files gets
+  short text of the app's own: a task that changes files, named with the
+  project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
   folder's `.agent/setup` run inside it, and `agent run --new --agents
   --workspace` that worktree, in the project's subfolder of it; the task

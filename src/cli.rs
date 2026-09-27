@@ -176,7 +176,7 @@ fn print_flags(flags: &str) {
             "--timeout-ms" => ("N", "Wait at most N milliseconds; 0 polls immediately"),
             "--workspace" => (
                 "DIR",
-                "A new bot's folder (default: here); moves an existing bot there",
+                "The bot's folder: a new bot's defaults to here, a fork's to its source's; run moves a bot there",
             ),
             "--instructions" => (
                 "TEXT",

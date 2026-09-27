@@ -341,7 +341,7 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
-      const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; if (typeof data.workspace === 'string') learnWorkspace(b, data); }
+      const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
       if (typeof data.node === 'number') pushNode(transcript(name), { kind: 'node', node: data.node, turn });
       break;
     }
@@ -1355,7 +1355,7 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 const COORDINATOR = `
 
 ## Coordinating this project
-You coordinate the work in this folder. When it is a git repository, give a task that changes files its own worktree, so tasks do not collide. Pick a NAME that is also a valid git branch name, and from this folder run
+You coordinate the work in this folder. When it is a git repository, give a task that changes files its own worktree, so tasks do not collide. Pick a NAME that starts with your own name before .lead and a dot, so tasks in different projects do not collide, and that is also a valid git branch name; from this folder run
 git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
 The worktree starts at the last commit, so uncommitted changes here are not in it. If .agent/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
 "$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK
