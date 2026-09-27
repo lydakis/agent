@@ -6,9 +6,10 @@ updated at `095ff68` for admission batching and disk-full containment, at
 `973be14`, the change that built tool approval, for its cost and a store
 lock fix, at `dd95047` for the per-summary choice between a copy and a
 request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
-`7061fab` and `7c1904d` for the sustained task's runs, and at `ea82f7a` for
-serving a gate tag to one approver. This is the one place that says what is
-currently known. The documents it links to
+`7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
+serving a gate tag to one approver, and at `4f83aae` for the automatic
+approver's own cost. This is the one place that says what is currently
+known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -84,7 +85,17 @@ more turns is not here, because its work changes with its speed; it is under
   host, three rotated runs): held p50 15.9 against 15.7 ms, the same
   commits and event and store bytes, and the plan commit's job 0.61
   against 0.57 ms, inside the run-to-run spread.
-  macOS and the automatic approver's own cost are not measured.
+  The automatic approver's own cost (`4f83aae`, 2026-09-27, same host and
+  workload over a Unix socket, three rotated runs, judges that answer at
+  once): against a client that answers directly (p50 16.0 ms, 11.1 ms of
+  daemon CPU and 12 commits a turn), `agent approver` with a stand-in for
+  Jev adds 2.8 ms at the median (18.8 ms), 1.0 ms of daemon CPU for the
+  `prompts` read, and 1.1 ms of its own CPU, with no added commit; a
+  general model through the daemon adds 10.6 ms (26.6 ms), 7.6 ms of daemon
+  CPU, and 11 commits a round for the fork, its turn, and its deletion.
+  Neither includes the judge's own time: Jev answered in 0.26 s at the
+  median in the labeled run, and a general model takes longer.
+  macOS is not measured.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
   64 KiB: Agent 22 MiB peak and 0.6 s CPU, Pi 164 MiB and 1.3 s, Codex 244 MiB
@@ -352,6 +363,6 @@ the 10 focused hub tests, Clippy, formatting, and diff checks also passed.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
 - Tool approval at fleet scale on macOS.
-- Multi-daemon operation, the automatic approver (Jev on every gated
-  round), and
-  concurrent tool calls: designs only.
+- How well Jev and a general model judge as the automatic approver, and
+  how fast, on the labeled calls (planned).
+- Multi-daemon operation and concurrent tool calls: designs only.

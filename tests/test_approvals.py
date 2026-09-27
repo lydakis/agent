@@ -1,4 +1,5 @@
 """Tool approval: gated calls wait for an answer, run or are denied, and park."""
+import http.server
 import json
 import os
 import queue
@@ -9,6 +10,7 @@ import threading
 import time
 import unittest
 
+from bench.runtime_client import Client
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_elision import drain, encoded
@@ -539,6 +541,46 @@ class ServedApprovalTests(ModelFixture):
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class PromptReadTests(ModelFixture):
+    """What a program judging a call reads: who wrote each prompt, and what
+    the turn already ran."""
+
+    def test_a_turn_reads_its_prompts_authors_and_calls(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        first = client.request('submit', bot='Bob', request_id='a', prompt='shell:exit 3')['result']['turn']
+        self.assertEqual(client.finished(first)['data']['status'], 'completed')
+        read = client.request('prompts', bot='Bob', turn=first)['result']
+        self.assertEqual(read['prompts'], [{'turn': first, 'text': 'shell:exit 3'}])
+        [call] = read['calls']
+        self.assertEqual((call['name'], call['done'], call['failed']), ('shell', True, True))
+        self.assertEqual(json.loads(call['arguments'])['command'], 'exit 3')
+        # A prompt a bot's model wrote names that bot's turn; the turn must
+        # be one of that bot's.
+        self.assertEqual(client.request('submit', bot='Bob', request_id='b', prompt='hi',
+                                        **{'from': {'bot': 'Bob', 'turn': first + 99}})['error'], 'invalid_from')
+        second = client.request('submit', bot='Bob', request_id='c', prompt='done',
+                                **{'from': {'bot': 'Bob', 'turn': first}})['result']['turn']
+        self.assertEqual(client.finished(second)['data']['status'], 'completed')
+        read = client.request('prompts', bot='Bob', turn=second, bytes=1024)['result']
+        self.assertEqual(read['prompts'], [{'turn': second, 'text': 'done',
+                                            'from': {'bot': 'Bob', 'turn': first}}])
+        self.assertEqual(read['earlier'], [{'turn': first, 'text': 'shell:exit 3'}])
+        self.assertEqual((read['status'], read['workspace'], read['more']), ('finished', str(self.path), False))
+        self.assertEqual(client.request('prompts', bot='Bob', turn=second, bytes=0)['error'], 'invalid_limit')
+
+    def test_the_approvers_key_never_reaches_a_tool(self):
+        env = {**clean_env(), 'TYPESAFE_API_KEY': 'synthetic-judge-key'}
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell', env=env)
+        self.addCleanup(client.close)
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='a',
+                              prompt='shell:printf "${TYPESAFE_API_KEY-unset}/$AGENT_TURN" > seen')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'seen').read_text(), f'unset/{turn}')
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ApprovalCliTests(ModelFixture):
     def setUp(self):
         super().setUp()
@@ -631,9 +673,11 @@ class ApprovalCliTests(ModelFixture):
         self.assertNotIn('\x1b', shown)
 
     def test_modes_are_validated_before_anything_is_created(self):
-        auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False)
+        # A judge that cannot start leaves no bot waiting on it.
+        auto = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approval', 'auto', 'hi', check=False,
+                          env={'AGENT_APPROVER_JUDGE': 'nowhere/judge'})
         self.assertEqual(auto.returncode, 1)
-        self.assertIn('approval_mode_unsupported', auto.stderr)
+        self.assertIn('approver_start_failed', auto.stderr)
         full = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--approve', 'shell', 'hi', check=False)
         self.assertEqual(full.returncode, 2)
         self.assertIn('--approval manual', full.stderr)
@@ -652,6 +696,277 @@ class ApprovalCliTests(ModelFixture):
         bots = json.loads(listed.stdout) if listed.returncode == 0 else []
         self.assertFalse(any(b['name'] == 'Bob' for b in bots))
 
+
+
+class Judge(http.server.BaseHTTPRequestHandler):
+    """A stand-in for the judge model: every question gets `answer(body, id)`,
+    unless `statuses` holds a failure to send first."""
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        self.server.requests.put({'path': self.path, 'authorization': self.headers.get('Authorization'),
+                                  'body': body})
+        status = self.server.statuses.pop(0) if self.server.statuses else 200
+        headers = {'Content-Type': 'application/json'}
+        if status == 200:
+            answers = {id: {'type': 'noul', 'noul': self.server.answer(body, id)} for id in body['questions']}
+            payload = {'model': body['model'], 'answers': answers,
+                       'usage': {'input_tokens': 1000, 'output_tokens': 0}}
+        else:
+            payload = {'error': 'synthetic'}
+            if status == 429:
+                headers['Retry-After'] = '0.05'
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        for name, value in {**headers, 'Content-Length': str(len(data))}.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def risky(body, id):
+    """Deletion is likely for a planned call whose arguments say DANGER, and
+    nobody asked for it; everything else is low."""
+    call, _, question = id.partition('_')
+    [planned] = [c for c in body['state']['planned_calls'] if c['id'] == call]
+    return .9 if question == 'delete' and 'DANGER' in json.dumps(planned['arguments']) else .05
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class AutoApproverTests(ModelFixture):
+    """`agent approver` serves `auto`: a judge model decides every call."""
+
+    def setUp(self):
+        super().setUp()
+        self.judge = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Judge)
+        self.judge.requests, self.judge.statuses, self.judge.answer = queue.Queue(), [], risky
+        self.judge.daemon_threads = True
+        threading.Thread(target=self.judge.serve_forever, daemon=True).start()
+        self.addCleanup(self.judge.server_close)
+        self.addCleanup(self.judge.shutdown)
+        self.judge_url = f'http://127.0.0.1:{self.judge.server_port}'
+
+    def daemon(self, tools='echo,shell,wait'):
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, tools)
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'], approver='auto',
+                       approve_expire_ms=15000)
+        return daemon
+
+    def approver(self, daemon, env=None, judge=None):
+        """Jev at the stand-in unless `judge` names a model the daemon serves."""
+        judged_by = ['--judge', judge] if judge else ['--judge-url', self.judge_url]
+        key = {} if judge else {'TYPESAFE_API_KEY': 'synthetic-judge-key'}
+        process = subprocess.Popen(
+            [str(self.binary), 'approver', '--store', str(self.path / 'state.sqlite'),
+             '--socket', str(daemon.socket_path), *judged_by],
+            env={**clean_env(), **key, **(env or {})},
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.addCleanup(lambda: (process.kill(), process.wait(), process.stdout.close()))
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(json.loads(line)) for line in process.stdout],
+                         daemon=True).start()
+        self.assertEqual(lines.get(timeout=5)['event'], 'serving')
+        self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
+        return process, lines
+
+    def outcome(self, daemon, turn, call_id='shell-1'):
+        events = daemon.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        return next(e['data'] for e in events if e['turn'] == turn and e['event'] == 'tool_completed'
+                    and e['data']['call_id'] == call_id)
+
+    def denial(self, daemon, turn, call_id='shell-1'):
+        completed = self.outcome(daemon, turn, call_id)
+        self.assertTrue(completed.get('denied'), completed)
+        output = daemon.request('item', bot='Bob', node=completed['node'])['result']['output']
+        return json.loads(output)['detail']
+
+    def test_every_call_is_judged_once_a_round_and_risky_ones_are_denied(self):
+        daemon = self.daemon()
+        _, lines = self.approver(daemon)
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'out').read_text(), 'safe')
+        asked = self.judge.requests.get(timeout=5)
+        self.assertEqual((asked['path'], asked['authorization']), ('/v1/systemone', 'Bearer synthetic-judge-key'))
+        body = asked['body']
+        self.assertEqual(body['model'], 'jev-latest')
+        self.assertEqual(len(body['questions']), 11)
+        self.assertEqual(body['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
+        self.assertEqual(body['state']['planned_calls'][0]['arguments']['command'], 'printf safe > out')
+        self.assertEqual(body['state']['workspace'], str(self.path))
+        judged = lines.get(timeout=5)
+        self.assertEqual((judged['event'], judged['calls'][0]['decision'], judged['input_tokens']),
+                         ('judged', 'allow', 1000))
+        # A risky call nobody asked for is denied with the reason; the
+        # turn's earlier call shows as already allowed, and it succeeded.
+        risky_turn = daemon.request('submit', bot='Bob', request_id='b',
+                                    prompt='shell:printf DANGER')['result']['turn']
+        self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
+        reason = self.denial(daemon, risky_turn)
+        self.assertTrue(reason.startswith('judged risky: it deletes or overwrites'), reason)
+        body = self.judge.requests.get(timeout=5)['body']
+        self.assertEqual(body['state']['earlier_prompts'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
+        self.assertEqual(self.judge.requests.qsize(), 0)
+
+    def test_a_model_the_daemon_serves_judges_without_a_jev_key(self):
+        asked = queue.Queue()
+        parsed = [True]
+
+        def reply(request, user):
+            if request['model'] != 'judge-model':
+                return None
+            round = json.loads(user)
+            asked.put((request, round))
+            answers = {id: risky(round, id) for id in round['questions']}
+            return 'Answers: ' + json.dumps(answers) if parsed[0] else 'They look fine to me.'
+        self.model.reply_for = reply
+        self.model.models = ('synthetic-model', 'judge-model')
+        daemon = self.daemon()
+        # A fork left by an approver that stopped mid-round is removed.
+        daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
+                       instructions='old', tools=[])
+        daemon.request('fork', source='approver.auto', bot='approver.auto.1.0')
+        _, lines = self.approver(daemon, judge='openai/judge-model')
+        bots = {b['name']: b for b in daemon.request('bots')['result']['bots']}
+        self.assertEqual(sorted(bots), ['Bob', 'approver.auto'])
+        self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools'],
+                          bots['approver.auto']['gates']), ('judge-model', [], []))
+        safe = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf safe > out')['result']['turn']
+        self.assertEqual(daemon.finished(safe)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'out').read_text(), 'safe')
+        request, round = asked.get(timeout=5)
+        self.assertEqual(request['model'], 'judge-model')
+        self.assertFalse(request.get('tools'))
+        self.assertIn('You judge tool calls', json.dumps(request))
+        self.assertEqual(round['state']['request'], [{'by': 'person', 'text': 'shell:printf safe > out'}])
+        self.assertEqual(len(round['questions']), 11)
+        self.assertIn(' Yes: ', round['questions']['c1_delete_ok'])
+        judged = lines.get(timeout=5)
+        self.assertEqual((judged['event'], judged['calls'][0]['decision'], judged['input_tokens']),
+                         ('judged', 'allow', 100))
+        risky_turn = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf DANGER')['result']['turn']
+        self.assertEqual(daemon.finished(risky_turn)['data']['status'], 'completed')
+        reason = self.denial(daemon, risky_turn)
+        self.assertTrue(reason.startswith('judged risky: it deletes or overwrites'), reason)
+        # A reply without every answer is a failed check, not an allow.
+        parsed[0] = False
+        vague = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf vague')['result']['turn']
+        self.assertEqual(daemon.finished(vague)['data']['status'], 'completed')
+        self.assertEqual(self.denial(daemon, vague), 'not reviewed: the check failed')
+        events = [lines.get(timeout=5) for _ in range(3)]
+        self.assertIn({'event': 'judge_failed', 'bot': 'Bob', 'turn': vague,
+                       'detail': "the judge's answer did not parse"}, events)
+        self.assertEqual(self.judge.requests.qsize(), 0)
+        # Each round's fork goes once it is answered; the base stays.
+        deadline = time.monotonic() + 5
+        while sorted(b['name'] for b in daemon.request('bots')['result']['bots']) != ['Bob', 'approver.auto']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+
+    def test_secrets_are_redacted_before_the_judge_sees_them(self):
+        daemon = self.daemon()
+        self.approver(daemon)
+        prompt = 'shell:printf "Authorization: Bearer synthetic-secret-value" > sent'
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt=prompt)['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        sent = json.dumps(self.judge.requests.get(timeout=5)['body'])
+        self.assertNotIn('synthetic-secret-value', sent)
+        self.assertIn('[secret: bearer token]', sent)
+
+    def test_a_failed_check_denies_as_not_reviewed_and_a_rate_limit_waits(self):
+        daemon = self.daemon()
+        self.approver(daemon)
+        self.judge.statuses = [500]
+        failed = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
+        self.assertEqual(daemon.finished(failed)['data']['status'], 'completed')
+        self.assertEqual(self.denial(daemon, failed), 'not reviewed: the check failed')
+        # A 429 is retried after its Retry-After, within the round's deadline.
+        self.judge.statuses = [429]
+        paced = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two > two')['result']['turn']
+        self.assertEqual(daemon.finished(paced)['data']['status'], 'completed')
+        self.assertEqual((self.path / 'two').read_text(), 'two')
+        self.assertEqual(self.judge.requests.qsize(), 3)
+
+    def test_the_breaker_stops_a_turn_that_keeps_getting_denied(self):
+        self.model.call_script = [('shell', {'command': f'printf DANGER-{n}'}) for n in range(5)]
+        daemon = self.daemon()
+        self.approver(daemon)
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        finished = daemon.finished(turn)
+        self.assertEqual(finished['data']['status'], 'interrupted', finished)
+        for n in range(3):
+            self.assertTrue(self.denial(daemon, turn, f'script-{n}').startswith('judged risky'))
+        # The fourth is refused without asking, with a reason to stop; the
+        # fifth round ends the turn.
+        self.assertTrue(self.denial(daemon, turn, 'script-3').startswith('stopped: 3 calls in a row'))
+        self.assertEqual(self.judge.requests.qsize(), 3)
+
+    def test_a_delegated_turn_is_judged_on_the_persons_words(self):
+        daemon = self.daemon()
+        daemon.request('create', bot='Carol', workspace=str(self.path), approve=['shell'], approver='auto')
+        self.approver(daemon)
+        # A person asks Bob; Bob's model asks Carol, who plans the call.
+        person = daemon.request('submit', bot='Bob', request_id='a', prompt='delete the build directory')
+        person = person['result']['turn']
+        daemon.finished(person)
+        delegated = daemon.request('submit', bot='Carol', request_id='b', prompt='shell:printf DANGER',
+                                   **{'from': {'bot': 'Bob', 'turn': person}})['result']['turn']
+        daemon.finished(delegated)
+        request = self.judge.requests.get(timeout=5)['body']['state']['request']
+        self.assertEqual(request, [{'by': 'person', 'text': 'delete the build directory'},
+                                   {'by': 'model', 'text': 'shell:printf DANGER'}])
+
+    def test_a_call_is_judged_with_the_files_it_runs_that_the_turn_wrote(self):
+        def shell_danger(body, id):
+            call, _, question = id.partition('_')
+            [planned] = [c for c in body['state']['planned_calls'] if c['id'] == call]
+            return .9 if question == 'delete' and planned['tool'] == 'shell' and 'DANGER' in json.dumps(planned) else .05
+        self.judge.answer = shell_danger
+        self.model.call_script = [('write', {'path': 'run.sh', 'content': 'printf DANGER'}),
+                                  ('shell', {'command': 'sh run.sh'}),
+                                  ('write', {'path': 'big.sh', 'content': 'x' * (49 * 1024)}),
+                                  ('shell', {'command': 'sh ./big.sh'})]
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'shell,write')
+        self.addCleanup(daemon.close)
+        daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell', 'write'], approver='auto')
+        self.approver(daemon)
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='script')['result']['turn']
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        self.assertTrue(self.denial(daemon, turn, 'script-1').startswith('judged risky'))
+        self.assertEqual(self.denial(daemon, turn, 'script-3'), 'not reviewed: it runs a file too large to show')
+        asked = [self.judge.requests.get(timeout=5)['body'] for _ in range(3)]
+        [shell] = asked[1]['state']['planned_calls']
+        self.assertEqual(shell['files_it_names'], [{'path': 'run.sh', 'content': 'printf DANGER'}])
+        self.assertEqual(asked[1]['state']['already_allowed'],
+                         [{'tool': 'write', 'arguments': {'path': 'run.sh', 'bytes': 13}, 'status': 'succeeded'}])
+
+    def test_the_cli_starts_the_approver_for_an_auto_bot(self):
+        store = self.path / 'state.sqlite'
+        common = ['--store', str(store), '--provider', f'openai=responses,{self.url}',
+                  '--model', 'openai/synthetic-model', '--tools', 'echo,shell']
+        env = {**clean_env(), 'AGENT_APPROVAL': 'auto'}
+        def agent(*args):
+            return subprocess.run([str(self.binary), *args], env=env,
+                                  capture_output=True, text=True, timeout=30, cwd=self.path)
+        self.addCleanup(lambda: agent('shutdown', '--store', str(store)))
+        # Without a Jev key the bot's own model judges, through the daemon.
+        self.model.reply_for = lambda request, user: (
+            json.dumps({id: .05 for id in json.loads(user)['questions']})
+            if user.startswith('{"questions"') else None)
+        done = agent('run', *common, '--new', '--bot', 'Bob', 'shell:printf hi > hi')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.path / 'hi').read_text(), 'hi')
+        bots = {b['name']: b for b in json.loads(agent('ls', '--store', str(store)).stdout)}
+        self.assertEqual(bots['Bob']['gates'], [{'tag': 'auto', 'tools': ['shell'], 'expire_ms': 45000}])
+        self.assertEqual((bots['approver.auto']['model'], bots['approver.auto']['tools']), ('synthetic-model', []))
+        stats = json.loads(agent('stats', '--store', str(store)).stdout)
+        self.assertEqual(stats['approvers'], ['auto'])
+        self.assertTrue((self.path / 'state.sqlite.approver.log').exists())
 
 if __name__ == '__main__':
     unittest.main()

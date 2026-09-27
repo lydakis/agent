@@ -550,10 +550,11 @@ class SocketAndCliTests(ModelFixture):
     def test_delegation_through_the_same_daemon_and_follow_replay(self):
         # The daemon exports AGENT_BIN and AGENT_STORE to shell children, so a bot
         # can delegate without knowing where the binary or store lives.
-        # Alice's own shell sees who created her (AGENT_PARENT) and her own
-        # name (AGENT_BOT); her record names Bob as her creator.
+        # Alice's own shell sees who created her (AGENT_PARENT), her own
+        # name (AGENT_BOT), and her turn (AGENT_TURN); her record names Bob
+        # as her creator, and her prompt names Bob's turn as its author.
         nested = ('"$AGENT_BIN" run --detach --no-spawn --new --bot Alice -- '
-                  '\'shell:printf "$AGENT_PARENT/$AGENT_PARENT_ID/$AGENT_BOT" > lineage\'')
+                  '\'shell:printf "$AGENT_PARENT/$AGENT_PARENT_ID/$AGENT_BOT/$AGENT_TURN" > lineage\'')
 
         bob = self.agent('run', *self.common, '--new', '--bot', 'Bob', '--pretty', f'shell:{nested}')
         # Bob's shell tool ran the client, which created Alice on the same daemon.
@@ -571,10 +572,13 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual({b['name']: b['created_by'] for b in listing}, {'Alice': 'Bob', 'Bob': None})
         by_name = {b['name']: b for b in listing}
         self.assertEqual(by_name['Alice']['created_by_id'], by_name['Bob']['id'])
-        self.assertEqual((self.path / 'lineage').read_text(), f"Bob/{by_name['Bob']['id']}/Alice")
         replay = self.agent('follow', '--store', str(self.store), '--bot', 'Alice')
         events = [json.loads(line) for line in replay.stdout.splitlines()]
         self.assertEqual([e['event'] for e in events][:2], ['created', 'accepted'])
+        self.assertEqual((self.path / 'lineage').read_text(),
+                         f"Bob/{by_name['Bob']['id']}/Alice/{events[1]['turn']}")
+        bob_turn = json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)
+        self.assertEqual(events[1]['data']['from'], {'bot': 'Bob', 'turn': bob_turn[0]['turn']})
         self.assertEqual(events[-1]['event'], 'follow_live')
         self.assertTrue(all(e['cursor'] < f['cursor'] for e, f in zip(events[:-2], events[1:-1])))
         # A follower attached while a turn runs replays, then sees live deltas and the end.
@@ -628,6 +632,8 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('result', control.request('delete', bot='Creator'))
         self.agent('run', *self.common, '--new', '--bot', 'Creator', 'replacement')
         replacement = control.request('resume', bot='Creator')['result']
+        # A shell also names its turn, which must be the bot's own.
+        shell_env['AGENT_TURN'] = str(control.request('turns', bot='Creator')['result']['turns'][-1]['turn'])
         for operation in ('create', 'fork'):
             args = (['run', *self.common, '--new', '--bot', 'Child', 'hello']
                     if operation == 'create' else

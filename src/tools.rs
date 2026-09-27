@@ -1004,6 +1004,9 @@ pub enum Exit {
     TimedOut,
 }
 
+/// The variable holding the automatic approver's model key.
+pub const JUDGE_KEY: &str = "TYPESAFE_API_KEY";
+
 /// `/bin/sh -c command` in the workspace, with the registry's environment and
 /// none of the credentials the daemon holds.
 #[cfg(unix)]
@@ -1021,6 +1024,9 @@ fn sh(
     // bot must not pass on one the daemon itself was started with.
     process.env_remove("AGENT_PARENT");
     process.env_remove("AGENT_PARENT_ID");
+    // The automatic approver's key is for the approver alone, however the
+    // daemon was started.
+    process.env_remove(JUDGE_KEY);
     for (name, value) in registry.environment.iter().chain(environment) {
         process.env(name, value);
     }

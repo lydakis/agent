@@ -885,9 +885,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 45. Approving tool calls. Every allowed call runs without a verdict today,
     and that stays the default. [The design](APPROVALS.md) adds two more
     modes, chosen per bot with `--approval` or `AGENT_APPROVAL`: `auto`,
-    where a model (Jev first) judges every gated round with a few narrow
-    questions and denies what is dangerous or unclear without asking
-    anyone, with no rules in front of it (George, 2026-09-27); and
+    where a model judges every gated round with a few narrow questions
+    and denies what is dangerous or unclear without asking anyone, with no
+    rules in front of it (George, 2026-09-27), Jev or whatever model is
+    configured, since often there is no Jev key; and
     `manual`, where a person or program answers.
     The daemon only gets an `approve` list of tools whose calls wait for an
     `answer` from any client, and an opaque approver tag: the request rides
@@ -902,9 +903,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     tuned thresholds cut that sharply. Built (2026-09-26): the daemon
     mechanism and `manual` mode with `agent approvals` and `agent answer`.
     Built (2026-09-27): `serve_approvals` with its lease and the `denials`
-    counts. Next: the automatic approver, `agent approver` answering the
-    `auto` tag from Jev, with `--approval auto`; then a labeled dangerous
-    set to measure false allows before thresholds are fixed. Later, not a
+    counts; then `agent approver` answering the `auto` tag from Jev or any
+    model the daemon serves, `--approval auto`, and who wrote each prompt
+    (`from`, `AGENT_TURN`, `prompts`). Next: Jev against `gpt-6-luna` as
+    the judge on the 341 labeled calls, through the real daemon and
+    approver (approved, about $0.07 of Jev); then a labeled dangerous set
+    to measure false allows before thresholds are fixed. Later, not a
     priority (George, 2026-09-27): rules as an option for manual mode, a
     program answering a `manual` gate from a rule list, starting from the
     rules the design first proposed.
