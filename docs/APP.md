@@ -434,7 +434,7 @@ This measures the ancestry-walk reduction, not an end-to-end fleet capacity clai
 Pulled event batches apply in order, with one visible-history load and render
 per batch. Creation/fork bursts rebuild the fleet tree at most once per pull,
 while retaining the 300-row rail window. The shared client rejects a ready
-handshake unless its protocol is exactly 3.
+handshake unless its protocol is exactly `agent_client::PROTOCOL`, now 4.
 
 The lifecycle regression suite compares committed thinking/answer transcripts
 between live delivery and replay, reconciles fork snapshot/replay ordering,

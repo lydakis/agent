@@ -4,6 +4,7 @@ import os
 import queue
 import sqlite3
 import threading
+from contextlib import closing
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from bench.runtime_client import Client
@@ -538,18 +539,24 @@ class CompactionTests(ModelFixture):
         for n in range(3):
             self.run_turn(client, 'Bob', n, str(n) * 500)
         # A larger budget prevents another compaction while testing pure append.
+        # Settings are fixed at creation, so the test edits the store.
         client.close()
-        client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        settings={'context_bytes': 16384})
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db, db:
+            db.execute('''UPDATE bots SET settings='{"context_bytes":16384}' WHERE name='Bob' ''')
+        client = Client(self.binary, self.path / 'state.sqlite', self.url)
         self.addCleanup(client.close)
         self.requests()
         self.run_turn(client, 'Bob', 'a', 'small-a')
-        first = self.requests()[-1]
+        calls = self.requests()
+        first = calls[-1]
         client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
         self.run_turn(client, 'Bob', 'b', 'small-b')
-        second = self.requests()[-1]
+        calls += self.requests()
+        second = calls[-1]
         self.run_turn(client, 'Alice', 'c', 'small-c')
-        fork = self.requests()[-1]
+        calls += self.requests()
+        fork = calls[-1]
+        self.assertFalse(any(is_summary(r) for r in calls))
         self.assertTrue(first['input'][0]['content'][0]['text'].startswith('[compaction summary'))
         self.assertEqual(first['input'], second['input'][:len(first['input'])])
         self.assertEqual(second['input'][:-1], fork['input'][:-1])

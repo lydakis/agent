@@ -5083,3 +5083,35 @@ this pair. Peak RSS is about 0.9 MiB higher with the flush off in both
 pairs and in the bisect's last row; not isolated, and small against the
 daemon's 20 MiB. Validation: 121 Rust tests, 366 Python tests with 23
 opt-in skips, strict Clippy and formatting.
+
+## Per-bot settings finish cost
+
+Per-bot settings move ten agent limits from daemon flags into each bot's
+record. A finishing turn now reads its bot's `retain_turns` inside the
+finishing commit, one primary-key lookup, and each turn reads its settings
+from the bot record it already loads. This screen checks that the finish
+path did not get slower.
+
+Method: `bench.completion_burst --bots 32 --repeat 5` (see
+[Completion burst](#completion-burst)), the bench at `7a66687`, run against
+release builds of `2df257c` (main, daemon flags) and `7a66687` (per-bot
+settings). Three rounds of one fresh-store invocation per build, main first
+in rounds 1 and 3 and second in round 2; each invocation has one excluded
+warmup and five measured runs, so 15 runs a build. The bots take the default
+settings. Every run completed all 32 turns. Linux x86_64 container,
+2026-09-27; psutil was not installed, so daemon CPU came from a local
+`/proc` reader with 10 ms clock ticks.
+
+| Build | Release-to-terminal p50 | p99 | p99 range | Finish store time | Daemon CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `2df257c`, daemon flags | 12.03 ms | 12.21 ms | 11.00–22.01 ms | 4 ms | 10 or 20 ms |
+| `7a66687`, per-bot settings | 11.90 ms | 12.24 ms | 11.10–19.09 ms | 4 ms | 10 or 20 ms |
+
+Cells are medians over the 15 runs. Finish store time is the growth in the
+`finish` operation's `ran_ms` in `stats` over a run, the 32 finish jobs' run
+time summed. The two builds are equal within noise on tail and finish time.
+CPU is below the reader's resolution: main read one tick in 7 runs, two in 7
+and none in 1; per-bot settings read one tick in 6 runs and two in 9. So this
+screen neither shows nor rules out a CPU difference. It measures bots on the
+defaults; a bot with its own model-call settings also clones the provider for
+its calls, which this screen does not cover.
