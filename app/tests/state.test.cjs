@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, setSideTools };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -647,7 +647,7 @@ test('each composer sends to its own pane, and a working bot gets the sticky que
   assert.equal(storage.get('agent:send'), 'steer');
   assert.equal(shell({}, storage).S.send, 'steer', 'the last pick sticks for the next window');
   const items = p.sendMenuItems('side');
-  assert.deepEqual(Array.from(items, (i) => [i.v ?? i.act, !!i.on, !!i.disabled]), [['queue', false, false], ['steer', true, false], ['side-chat', false, true]]);
+  assert.deepEqual(Array.from(items.filter((i) => i.act), (i) => [i.act, i.v, !!i.on]), [['set-send', 'queue', false], ['set-send', 'steer', true], ['set-send', 'side', false], ['set-side-tools', 'read', true], ['set-side-tools', 'answer', false]]);
 });
 
 test('the model chip switches within the provider and offers other providers as new agents', async () => {
@@ -729,13 +729,36 @@ test('a steer whose turn ended meanwhile is refused as stale, with a short messa
   p.setSend('queue'); await assert.doesNotReject(p.submit('later'));
 });
 
-test('one menu per agent: side chat waits on the daemon, stop while running, fork and delete at rest', () => {
+test('one menu per agent: side chat any time, stop while running, fork and delete at rest', () => {
   const p = shell();
   p.upsert({ name: 'busy', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 4 });
   p.upsert({ name: 'rest', id: 2, provider: 'alpha', model: 'one' });
   const state = (name) => Object.fromEntries(p.botMenuItems(name).filter((i) => i.act).map((i) => [i.act, !i.disabled]));
-  assert.deepEqual(state('busy'), { 'side-chat': false, stop: true, fork: false, delete: false, steps: true });
-  assert.deepEqual(state('rest'), { 'side-chat': false, stop: false, fork: true, delete: true, steps: true });
+  assert.deepEqual(state('busy'), { 'side-chat': true, stop: true, fork: false, delete: false, steps: true });
+  assert.deepEqual(state('rest'), { 'side-chat': true, stop: false, fork: true, delete: true, steps: true });
+});
+
+test('a side chat forks a running bot under it, beside, with read tools or none, and takes the first message', async () => {
+  const sent = [], storage = new Map();
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], next_from: null }; } }, storage);
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic', status: 'running', running_turn: 3, tools: ['shell', 'read', 'write', 'history'] });
+  p.S.selected = 'app.lead';
+  await p.sideChat('app.lead');
+  const forks = () => sent.filter(([op]) => op === 'fork').map(([, q]) => q);
+  assert.deepEqual(forks().map((q) => [q.source, q.bot, q.created_by, q.created_by_id, Array.from(q.allow), q.workspace, 'checkpoint' in q]), [['app.lead', 'app.lead-side', 'app.lead', 1, ['read', 'history'], '/synthetic', false]]);
+  assert.equal(p.S.ui.side, 'app.lead-side'); assert.equal(p.S.bots.get('app.lead-side').parent, 'app.lead');
+  // Send's side pick asks a new side chat with this message; the running source gets nothing.
+  p.setSend('side'); p.setSideTools('answer');
+  await p.submit('what are you waiting on?', 'main');
+  assert.deepEqual(Array.from(forks().at(-1).allow), []); assert.equal(forks().at(-1).bot, 'app.lead-side-2');
+  const submits = sent.filter(([op]) => op === 'submit').map(([, q]) => [q.bot, q.bot_id, q.prompt, q.delivery]);
+  assert.deepEqual(submits, [['app.lead-side-2', 12, 'what are you waiting on?', 'reject']]);
+  assert.equal(p.S.ui.side, 'app.lead-side-2');
+  assert.equal(storage.get('agent:side-tools'), 'answer'); assert.equal(shell({}, storage).S.sideTools, 'answer');
+  // A bot at rest sends normally; the side pick is only for a working one.
+  p.S.bots.get('app.lead').status = 'idle'; p.S.bots.get('app.lead').runningTurn = null;
+  await p.submit('plain', 'main');
+  assert.deepEqual(sent.at(-1)[1].bot, 'app.lead');
 });
 
 test('an open agent menu is rebuilt when its bot changes status and closed when it is deleted', async () => {

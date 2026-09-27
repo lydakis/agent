@@ -22,11 +22,14 @@ const S = {
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(),
+  // What a new side chat may call: 'read' (files and its history) or 'answer' (no tools). Sticky.
+  sideTools: loadSideTools(),
   // Each provider's model family, from the bot records that name both; a turn may run on any
   // provider of its bot's family.
   families: new Map(),
 };
-function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' ? 'steer' : 'queue'; } catch (_) { return 'queue'; } }
+function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
+function loadSideTools() { try { return localStorage.getItem('agent:side-tools') === 'answer' ? 'answer' : 'read'; } catch (_) { return 'read'; } }
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
 const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
@@ -185,7 +188,7 @@ function upsert(record) {
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
-  learnFamily(b, record);
+  learnFamily(b, record); learnTools(b, record);
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
@@ -195,6 +198,10 @@ function upsert(record) {
 function learnFamily(b, record) {
   if (typeof record.family === 'string') { b.family = record.family; if (typeof record.provider === 'string') S.families.set(record.provider, record.family); }
   else b.family ??= S.families.get(record.provider) ?? null;
+}
+// What the bot may call: its allowed list when it has one, else all its tools.
+function learnTools(b, record) {
+  if (Array.isArray(record.allowed)) b.callable = record.allowed; else if (Array.isArray(record.tools)) b.callable = record.tools;
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
@@ -634,7 +641,7 @@ function seat(record, session) {
   if (conflict) return;
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
-  learnFamily(b, record);
+  learnFamily(b, record); learnTools(b, record);
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   seedHistory(record);
@@ -981,7 +988,7 @@ const PANE = {
   main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
   side: { form: 'sideform', input: 'sideinput', model: 'sidemodel', send: 'sidesend', stop: 'sidestop', bot: () => S.ui.side },
 };
-const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer' };
+const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer', side: 'Side chat' };
 // Send starts a turn on a bot at rest; on a working bot it does what the menu last picked.
 // Only a turn that has started can take a steer; one waiting for a slot takes a queue.
 const RUNNING = new Set(['running', 'waiting', 'paced']);
@@ -1002,7 +1009,7 @@ function renderComposer(pane, b) {
   send.textContent = ACTION[mode];
   $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
-  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME [PROVIDER/MODEL]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : '';
+  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME [PROVIDER/MODEL]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
 
 // ---------- sidebar ----------
@@ -1167,12 +1174,12 @@ function refreshMenu() {
   const items = botMenuItems(menuFor);
   if (menuSig(items) !== menuKey) showMenu(items, menuAnchor, menuFor);
 }
-// Side chat needs a fork of a running bot, which the daemon does not do yet; Keep belongs to a side chat.
+// Keep, which turns a side chat into a task, is not built yet.
 function botMenuItems(name) {
   const b = bot(name); if (!b) return [];
   const busy = isActive(b.status);
   return [
-    { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: true },
+    { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: b.id == null },
     { act: 'stop', who: name, label: 'Stop', disabled: b.runningTurn === null },
     { act: 'fork', who: name, label: 'Fork', hint: busy ? 'when idle' : '', disabled: busy },
     { act: 'delete', who: name, label: 'Delete', hint: busy ? 'when idle' : '', disabled: busy },
@@ -1203,10 +1210,13 @@ function sendMenuItems(pane) {
   return [
     { act: 'set-send', pane, v: 'queue', label: 'Queue after this turn', on: S.send === 'queue' },
     { act: 'set-send', pane, v: 'steer', label: 'Steer into this turn', on: S.send === 'steer' },
-    { act: 'side-chat', label: 'Side chat', hint: '⑂', disabled: true },
+    { act: 'set-send', pane, v: 'side', label: 'Ask a side chat', hint: '⑂', on: S.send === 'side' },
+    { sep: true },
+    { act: 'set-side-tools', pane, v: 'read', label: 'Side chats read files', on: S.sideTools === 'read' },
+    { act: 'set-side-tools', pane, v: 'answer', label: 'Side chats only answer', on: S.sideTools === 'answer' },
   ];
 }
-function setSend(mode) { S.send = mode === 'steer' ? 'steer' : 'queue'; try { localStorage.setItem('agent:send', S.send); } catch (_) {} }
+function setSend(mode) { S.send = mode === 'steer' || mode === 'side' ? mode : 'queue'; try { localStorage.setItem('agent:send', S.send); } catch (_) {} }
 function setModel(name, model) {
   const b = bot(name); if (!b || !runsOn(b, model)) return false;
   if (model === b.model) S.override.delete(name); else S.override.set(name, model);
@@ -1241,6 +1251,7 @@ async function submit(text, pane = 'main') {
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
+  if (mode === 'side') { await sideChat(b.name, text); return; }
   // A steer joins the running turn only on that turn's model and folder, so it names neither.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
   // rather than the message landing in whatever turn runs next.
@@ -1250,11 +1261,11 @@ async function submit(text, pane = 'main') {
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
 }
 async function interrupt(name = S.selected) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
-// `NAME-fork`, then `NAME-fork-2` on, with NAME cut whole characters short so the daemon's
-// 128-byte name limit holds.
+// `NAME-fork`, then `NAME-fork-2` on (or `-side`), with NAME cut whole characters short so the
+// daemon's 128-byte name limit holds.
 const NAME_BYTES = 128;
-function forkName(name, k) {
-  const suffix = k > 1 ? `-fork-${k}` : '-fork';
+function forkName(name, k, kind = 'fork') {
+  const suffix = k > 1 ? `-${kind}-${k}` : `-${kind}`;
   let base = '', bytes = 0;
   for (const c of name) {
     const n = c.codePointAt(0) < 0x80 ? 1 : c.codePointAt(0) < 0x800 ? 2 : c.codePointAt(0) < 0x10000 ? 3 : 4;
@@ -1277,6 +1288,26 @@ async function fork(name) {
   S.shapeGen += 1;
   await openBeside(copy);
 }
+// A side chat is a fork of a bot, running or not, from its newest finished round, nested under it
+// and opened beside; the source is untouched. It may read files and its history, or answer only.
+// The first message, if any, goes to the side chat.
+const READ_TOOLS = ['read', 'history'];
+function sideAllow(b) {
+  if (S.sideTools === 'answer') return [];
+  return b.callable ? READ_TOOLS.filter((t) => b.callable.includes(t)) : READ_TOOLS;
+}
+async function sideChat(name, text = '') {
+  const b = bot(name); if (!b) return;
+  if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
+  let copy = forkName(name, 1, 'side'); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k, 'side');
+  const session = S.session;
+  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b), ...(b.workspace ? { workspace: b.workspace } : {}) });
+  await enqueue(() => { if (S.session === session) seat(record, session); });
+  S.shapeGen += 1;
+  if (S.ui.side !== copy) await openBeside(copy);
+  if (text) await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace });
+}
+function setSideTools(v) { S.sideTools = v === 'answer' ? 'answer' : 'read'; try { localStorage.setItem('agent:side-tools', S.sideTools); } catch (_) {} }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // A project in a folder: the folder's `.agent/project.toml` names it, or the folder's own name does,
 // and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
@@ -1389,6 +1420,8 @@ async function act(el) {
     case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
     case 'set-model': setModel(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
     case 'set-send': setSend(v); render(); focusInput(pane); return;
+    case 'set-side-tools': setSideTools(v); render(); focusInput(pane); return;
+    case 'side-chat': await sideChat(who); return;
     case 'stop': await interrupt(who); return;
     case 'stop-pane': await interrupt(PANE[pane].bot()); return;
     case 'fork': await fork(who); return;

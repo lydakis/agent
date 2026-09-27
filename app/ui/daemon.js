@@ -31,15 +31,20 @@ window.Daemon = (() => {
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
 
-  async function create(name, model, createdBy = null, source = null, workspace = null) {
+  async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false };
+    const b = { ...record(name, model), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false, ...(allowed ? { allowed } : {}) };
     S.bots.set(name, b);
-    // A fork shares its source's history up to the source's newest node.
-    if (source) S.lineages.set(name, [...(S.lineages.get(source) ?? [])]);
+    // A fork shares its source's history up to its newest finished round. The demo keeps no call
+    // nodes, only their results, so that is its newest node that is not a tool result.
+    if (source) {
+      const all = S.lineages.get(source) ?? [];
+      let end = all.length; while (end > 0 && S.nodes.get(all[end - 1].node)?.type === 'function_call_output') end--;
+      S.lineages.set(name, all.slice(0, end));
+    }
     const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
-    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(source ? { source, checkpoint } : {}) } });
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(allowed ? { allowed } : {}), ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
@@ -79,7 +84,8 @@ window.Daemon = (() => {
   let calls = 0;
   async function tool(name, turn, tname, args, output, ms = 500) {
     const b = S.bots.get(name) ?? GONE;
-    if (b.interrupted) return;
+    // A tool outside the bot's allowed list is never called.
+    if (b.interrupted || (b.allowed && !b.allowed.includes(tname))) return;
     const call_id = `call_${++calls}`;
     emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: tname, arguments: JSON.stringify(args), arguments_truncated: false } });
     await wait(ms);
@@ -105,6 +111,13 @@ window.Daemon = (() => {
     if (turn === null) return;
     await wait(250);
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
+    // A side chat answers from the history it was forked with.
+    if (/-side(-\d+)?$/.test(name)) {
+      await tool(name, turn, 'read', { path: 'PLAN.md' }, '1.2 KiB · three steps', 400);
+      await stream(name, turn, 'Waiting on three peers: plan is done, build is waiting on its reviewer, and test is running. The release build is still going in the background.');
+      if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+      return;
+    }
     if (/test|check|run/i.test(prompt)) {
       await tool(name, turn, 'shell', { command: 'cargo test -p agent-runtime' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'running 80 tests\ntest result: ok. 80 passed; 0 failed\n', success: true }), 900);
       await stream(name, turn, 'All green. Eighty tests pass, nothing flaky in the store or delivery suites.');
@@ -244,7 +257,8 @@ window.Daemon = (() => {
           if (b.status !== 'idle' && params.delivery === 'steer') { (b.steers ??= []).push(params.prompt); emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
           const turn = S.nextTurn; reply(params.bot, params.prompt); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
-        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); if (src.status !== 'idle') throw new Error('bot_busy'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace); return { ...S.bots.get(params.bot) }; }
+        // A running source forks too, as the daemon's does from its newest finished round.
+        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace, Array.isArray(params.allow) ? params.allow : src.allowed ?? null); return { ...S.bots.get(params.bot) }; }
         case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); b.interrupted = true; S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
         default: throw new Error(`unsupported_in_demo:${op}`);
       }

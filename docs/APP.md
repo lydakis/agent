@@ -28,7 +28,7 @@ A task opened beside the lead, with its own composer.
 
 ![build open beside the lead](app/side-pane.png)
 
-One menu per agent: side chat (not built yet), stop, fork, delete, show all.
+One menu per agent: side chat, stop, fork, delete, show all.
 
 ![The agent menu](app/menu.png)
 
@@ -36,9 +36,14 @@ The model chip: models of the bot's family; others need a new agent.
 
 ![The model chip's menu](app/model-chip.png)
 
-Send on a busy agent: queue after this turn or steer into it.
+Send on a busy agent: queue after this turn, steer into it, or ask a side
+chat, and what side chats may use.
 
-![Send's queue or steer choice](app/send.png)
+![Send's choices](app/send.png)
+
+A side chat asked while the lead works: a fork beside it, the lead untouched.
+
+![A side chat beside the running lead](app/side-chat.png)
 
 New project takes a folder.
 
@@ -162,23 +167,31 @@ daemon learns nothing about projects; everything here is client work.
   records) switch the next turns (sent as `submit`'s `model`); other
   families, and providers no record places, show disabled as "new agent",
   since a bot keeps its family. Send starts a turn on a bot at rest; on a
-  working bot it queues or steers, as picked last from its ▾. A steer names
+  working bot it queues, steers or asks a side chat, as picked last from
+  its ▾. A steer names
   no model or workspace, so it joins the running turn, and it names that
   turn (`expected_turn`): if the turn ended meanwhile, the daemon refuses it
   as `stale_turn` and the message stays in the composer. A model pick is
   remembered for the bot's identity, not its name.
 - **One menu per agent**, from the head's ⋯, a sidebar row's or card's ⋯ on
-  hover, or a right-click: stop, fork (an exact copy of a bot at rest in its
+  hover, or a right-click: side chat, stop, fork (an exact copy of a bot at rest in its
   folder, next to it in the tree, opened beside), delete (confirmed), and every run's
   thoughts and output. An open menu follows its bot's status. A sidebar row
   is one line; its glyph and the pane head say what it waits on.
 - **Runs.** Thinking, tool calls and their output between two messages fold
   to one line: the call in progress with its clock, or the tools used, and
   any failure. A click opens a run or unfolds one long output.
-- **Not built yet.** Side chat shows disabled in the menu and in Send's ▾:
-  it forks a running bot, which needs NEXT item 43. Keep, which turns a side
-  chat into a task, waits with it. Tasks in worktrees, the coordinator's role
-  text, approvals and swarms are later steps of item 47.
+- **Side chats.** A side chat forks a bot, running or not, with no
+  checkpoint, so the daemon copies it at its newest finished round; the
+  source is untouched. The copy is named `NAME-side`, nests under its
+  source, and opens beside. From the ⋯ menu it opens empty; from Send's
+  side pick, the message is its first. It may read files and its history
+  (`allow: ["read","history"]`, the default) or only answer (`allow: []`),
+  the ▾'s sticky choice. Tools stay shown, so the fork keeps its source's
+  cache; the daemon refuses a call outside the list.
+- **Not built yet.** A side chat with all tools in a new worktree waits on
+  tasks in worktrees. Keep, which turns a side chat into a task, and the
+  coordinator's role text, approvals and swarms are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -308,7 +321,8 @@ cannot compose, completed thought timing, and the shell: projects from
 coordinators and lineage, folding, opening alone or beside and swapping,
 per-pane sends with the sticky queue or steer pick, model choices within a
 provider, the agent menu's enabled items and its refresh on a status change,
-fork naming and placement, project creation (no file for a refused model),
+fork naming and placement, side chats (a running source, the allowed list,
+the first message going to the copy), project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, and runs folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving
