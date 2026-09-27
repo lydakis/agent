@@ -20,6 +20,18 @@ The ID stays pinned after deletion, so a replacement with the same name rejects
 the call instead of receiving the work.
 `run` without `--bot` creates a fresh identity. `run --bot NAME` continues an
 existing bot; add `--new` to create that name. A prompt of `-` reads stdin.
+
+A bot works in its own folder: the current directory when it was created,
+or `--workspace`. Continuing it from anywhere runs there; `--workspace` moves
+one turn. A fork starts in its source's folder unless `--workspace` names
+another. `run --new --worktree` gives the new bot a git worktree of the
+folder's repository instead: its `HEAD` checked out on a new branch
+`agent/NAME` in `worktrees/NAME` beside the store (`~/.agent/worktrees/` by
+default). If the repository has `.agent/setup`, it runs there first, as an
+executable or with `sh`, with `AGENT_SOURCE` naming the repository and its
+output on stderr. A setup that fails leaves no bot, folder, or branch
+(`setup_failed`); a name whose folder is left from an earlier bot is refused
+(`worktree_exists`). The worktree and its branch outlive the bot.
 `follow --bot NAME` replays and follows the selected current turn to its end;
 an idle bot returns after replay. `follow --all` stays connected for future work.
 

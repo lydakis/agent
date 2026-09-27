@@ -36,6 +36,7 @@ button:focus-visible,[tabindex]:focus-visible{outline:1px solid var(--amber);out
 .crumbs b{color:var(--t-ink);font-weight:500;flex-shrink:0;max-width:60%;overflow:hidden;text-overflow:ellipsis}
 .crumbs .state{color:var(--t-dim);min-width:0;overflow:hidden;text-overflow:ellipsis}
 .crumbs .sep{color:var(--t-faint)}
+.crumbs .branch{color:var(--t-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:2;min-width:0}
 .crumbs .back{color:var(--t-dim);border-radius:5px;padding:0 4px;margin-left:-4px}
 .crumbs .back:hover{background:var(--t-raised);color:var(--t-ink)}
 .crumbs .glyph,.crumbs .back,.crumbs .sep{flex-shrink:0}

@@ -180,6 +180,13 @@ fn write_project(dir: String, name: String, model: String) -> Result<(), String>
 
 /// The models to offer, read from `~/.agent/models` each time, so an edit
 /// shows without a restart. The daemon has no list.
+/// The branch a bot's folder has checked out when it is a linked git
+/// worktree, as `run --new --worktree` makes; read from files, no git run.
+#[tauri::command]
+fn branch(dir: String) -> Option<String> {
+    agent_client::worktree::linked_branch(std::path::Path::new(&dir))
+}
+
 #[tauri::command]
 fn models() -> Result<Value, String> {
     let path = agent_client::models::path().ok_or("no HOME for ~/.agent/models")?;
@@ -318,6 +325,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             setup,
             policy,
+            branch,
             models,
             project,
             write_project,

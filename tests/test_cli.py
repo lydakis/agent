@@ -70,15 +70,21 @@ class SocketAndCliTests(ModelFixture):
         duplicate = self.agent('run', *self.common, '--new', '--bot', 'Bob', 'hello', check=False)
         self.assertEqual(duplicate.returncode, 1)
         self.assertIn('bot_exists', duplicate.stderr)
-        # A turn runs where it is invoked, not where the bot was created.
+        # A bot works in its own folder wherever it is continued from;
+        # --workspace moves one turn.
         elsewhere = self.path / 'elsewhere'
         elsewhere.mkdir()
+        stayed = subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob',
+                                 'shell:printf home > marker'], env=clean_env(), capture_output=True,
+                                text=True, timeout=30, cwd=elsewhere)
+        self.assertEqual(stayed.returncode, 0, stayed.stderr)
+        self.assertEqual((self.path / 'marker').read_text(), 'home')
+        self.assertFalse((elsewhere / 'marker').exists())
         moved = subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob',
-                                'shell:printf here > marker'], env=clean_env(), capture_output=True,
-                               text=True, timeout=30, cwd=elsewhere)
+                                '--workspace', str(elsewhere), 'shell:printf here > marker'], env=clean_env(),
+                               capture_output=True, text=True, timeout=30, cwd=self.path)
         self.assertEqual(moved.returncode, 0, moved.stderr)
         self.assertEqual((elsewhere / 'marker').read_text(), 'here')
-        self.assertFalse((self.path / 'marker').exists())
         accepted = next(json.loads(l) for l in moved.stdout.splitlines() if json.loads(l).get('event') == 'accepted')
         self.assertEqual(accepted['data']['workspace'], str(elsewhere.resolve()))
         self.assertEqual(accepted['data']['model'], 'openai/synthetic-model')
@@ -90,6 +96,48 @@ class SocketAndCliTests(ModelFixture):
         self.assertIn('missing_completion', pretty.stderr)
         self.agent('shutdown', '--store', str(self.store))
         self.assertFalse(self.socket.exists())
+
+    def test_a_new_bot_can_work_in_its_own_worktree_set_up_by_the_project(self):
+        repo = self.path / 'repo'
+        (repo / '.agent').mkdir(parents=True)
+        git = lambda *a: subprocess.run(['git', '-C', str(repo), *a], check=True, capture_output=True)
+        git('init', '-q', '-b', 'main')
+        (repo / 'a.txt').write_text('one\n')
+        git('add', 'a.txt')
+        git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'one')
+        (repo / '.agent' / 'setup').write_text('echo setting up\nprintf ready > setup-ran\n')
+        run = lambda *a, cwd=repo: subprocess.run([*self.base, 'run', *a], env=clean_env(), capture_output=True,
+                                                  text=True, timeout=30, cwd=cwd)
+        made = run(*self.common, '--new', '--bot', 'wt', '--worktree', 'shell:git branch --show-current > branch')
+        self.assertEqual(made.returncode, 0, made.stderr)
+        tree = self.path / 'worktrees' / 'wt'
+        self.assertEqual((tree / 'branch').read_text().strip(), 'agent/wt')
+        self.assertEqual((tree / 'setup-ran').read_text(), 'ready')
+        self.assertIn('setting up', made.stderr, 'setup output stays off stdout')
+        self.assertTrue(all(json.loads(line) for line in made.stdout.splitlines()))
+        self.assertFalse((repo / 'branch').exists())
+        # Continued from the project folder, it still works in its worktree.
+        self.assertEqual(run(*self.again, '--bot', 'wt', 'shell:printf x > again').returncode, 0)
+        self.assertTrue((tree / 'again').exists()); self.assertFalse((repo / 'again').exists())
+        # A failed setup leaves no bot, no folder, and no branch.
+        (repo / '.agent' / 'setup').write_text('exit 4\n')
+        failed = run(*self.common, '--new', '--bot', 'broken', '--worktree', 'hi')
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn('setup_failed', failed.stderr)
+        self.assertFalse((self.path / 'worktrees' / 'broken').exists())
+        self.assertEqual(subprocess.run(['git', '-C', str(repo), 'branch', '--list', 'agent/broken'],
+                                        capture_output=True, text=True).stdout, '')
+        self.assertIn('bot_not_found', run(*self.again, '--bot', 'broken', 'hi').stderr)
+        # A refused creation takes its worktree back too.
+        (repo / '.agent' / 'setup').unlink()
+        self.assertEqual(run(*self.common, '--new', '--bot', 'plain', 'hi').returncode, 0)
+        taken = run(*self.common, '--new', '--bot', 'plain', '--worktree', 'hi')
+        self.assertIn('bot_exists', taken.stderr)
+        self.assertFalse((self.path / 'worktrees' / 'plain').exists())
+        self.assertEqual(subprocess.run(['git', '-C', str(repo), 'branch', '--list', 'agent/plain'],
+                                        capture_output=True, text=True).stdout, '')
+        # Only a new bot gets a worktree.
+        self.assertEqual(run(*self.again, '--bot', 'wt', '--worktree', 'hi').returncode, 2)
 
     def test_shutdown_returns_once_the_daemon_has_exited(self):
         handle = json.loads(self.agent('run', *self.common, '--new', '--bot', 'Bob', '--detach', 'wait').stdout)

@@ -6,6 +6,7 @@ pub mod approver;
 pub mod models;
 pub mod policy;
 pub mod socket;
+pub mod worktree;
 
 use serde_json::{Value, json};
 use std::{collections::HashMap, os::fd::AsRawFd, path::Path, sync::Arc, time::Duration};

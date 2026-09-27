@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --pretty --no-spawn",
+        flags: "--bot --new --worktree --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -166,6 +166,10 @@ fn print_flags(flags: &str) {
                 "Select a turn; with run --delivery steer, the turn to steer",
             ),
             "--new" => ("", "Create a new bot instead of continuing a named bot"),
+            "--worktree" => (
+                "",
+                "A new bot works on branch agent/NAME in its own git worktree of the workspace, set up by .agent/setup",
+            ),
             "--detach" => ("", "Submit and return a JSON turn handle immediately"),
             "--delivery" => (
                 "MODE",
@@ -351,6 +355,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--pretty"
                 | "--no-spawn"
                 | "--new"
+                | "--worktree"
                 | "--detach"
                 | "--all"
                 | "--any"
@@ -450,13 +455,14 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--fallbacks",
             "--approval",
             "--approve",
+            "--worktree",
         ]
         .iter()
         .any(|f| has(f))
     {
         return fail_with(
             "usage",
-            "instructions, reasoning, budget, and approval are creation options; use --new",
+            "instructions, reasoning, budget, approval, and worktree are creation options; use --new",
         );
     }
     Ok(Some(out))

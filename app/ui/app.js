@@ -189,10 +189,23 @@ function upsert(record) {
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnFamily(b, record); learnTools(b, record);
-  b.workspace = record.workspace ?? null;
+  learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
   seedHistory(record);
+}
+// A new folder means its branch is read again, when the bot is next shown.
+function learnWorkspace(b, record) {
+  const ws = record.workspace ?? null;
+  if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; }
+}
+// A bot in a linked git worktree shows the branch it works on; read once, when its head is first drawn.
+function readBranch(b) {
+  if (b.branch !== undefined) return;
+  b.branch = null;
+  const ws = b.workspace;
+  if (!ws || !Daemon.branch) return;
+  Daemon.branch(ws).then((branch) => { if (branch && b.workspace === ws && bot(b.name) === b) { b.branch = branch; render(); } }, () => {});
 }
 // Records carry the family; creation events do not, so a bot seated from one takes its provider's.
 function learnFamily(b, record) {
@@ -642,7 +655,7 @@ function seat(record, session) {
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnFamily(b, record); learnTools(b, record);
-  b.workspace = record.workspace ?? null;
+  learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   seedHistory(record);
 }
@@ -967,12 +980,13 @@ for (const [id, who] of PANES) {
 function headHTML(b, pane) {
   const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
-  if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
   const lead = b.project ? bot(b.project + LEAD) : null;
   const crumbs = !lead ? `<b>${esc(b.name)}</b>` : lead === b ? `<b>${esc(b.project)}</b>`
     : `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(b.project)}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`;
-  return `<div class="crumbs">${crumbs}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
+  return `<div class="crumbs">${crumbs}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
+const branchHTML = (b) => (b.branch ? `<span class="branch" title="${esc(b.workspace)}">⎇ ${esc(b.branch)}</span>` : '');
 // A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
 const WAIT_SHOWN = 3;
 function waitSummary(b) {
@@ -982,7 +996,8 @@ function waitSummary(b) {
 }
 // Heads change with their bot's status, not with time, so they are written only when that changes.
 function renderHead(el, b, pane) {
-  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}` : '-';
+  if (b) readBranch(b);
+  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}|${b.branch ?? ''}` : '-';
   if (el.dataset.k === key) return; el.dataset.k = key;
   el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME creates one</span></div>' : '';
 }

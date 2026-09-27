@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, setSideTools };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, setSideTools, renderHead };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -392,7 +392,9 @@ test('committed thinking and answer nodes match live, replay, and reconnect tran
     await p.onEvent({event:'turn_finished',bot:'Bob',turn:1,data:{status:'completed'}});
     assert.match(p.itemsHTML(p.transcript('Bob')), /durable answer/);
   }
-  assert.equal(live.itemsHTML(live.transcript('Bob')),replay.itemsHTML(replay.transcript('Bob')));
+  // Live keeps how long it watched the thought, which replay cannot know; the rest must match.
+  const untimed=(html)=>html.replace(/▸ thought [^<]*/,'▸ thought');
+  assert.equal(untimed(live.itemsHTML(live.transcript('Bob'))),replay.itemsHTML(replay.transcript('Bob')));
   await live.onEvent({event:'text_delta',bot:'Bob',turn:2,text:'not committed'});
   live.lost('disconnected');
   assert.equal(live.transcript('Bob').text,'');
@@ -1043,4 +1045,23 @@ test('a side chat learns an unknown tool list first, and a failed first message 
   await p.sideChat('lead');
   assert.deepEqual(sent.filter(([op]) => op === 'resume').map(([, q]) => q.bot), ['lead']);
   assert.deepEqual(Array.from(sent.filter(([op]) => op === 'fork').at(-1)[1].allow), ['history']);
+});
+
+test('a bot in a linked worktree shows its branch in its head, read once per folder', async () => {
+  const asked = [];
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }), branch: async (dir) => { asked.push(dir); return dir.endsWith('/worktrees/app.build') ? 'agent/app.build' : null; } });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/home/u/.agent/worktrees/app.build', created_by: 'app.lead', created_by_id: 1 });
+  p.tree();
+  const head = p.context.document.getElementById('title'), b = p.S.bots.get('app.build');
+  p.renderHead(head, b, 'main'); await new Promise((r) => setImmediate(r));
+  p.renderHead(head, b, 'main');
+  assert.match(head.innerHTML, /⎇ agent\/app\.build/);
+  p.renderHead(head, p.S.bots.get('app.lead'), 'main'); await new Promise((r) => setImmediate(r));
+  assert.doesNotMatch(head.innerHTML, /⎇/, 'a main checkout shows no branch');
+  p.renderHead(head, b, 'side');
+  assert.deepEqual(asked, ['/home/u/.agent/worktrees/app.build', '/synthetic'], 'each folder is read once');
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic', created_by: 'app.lead', created_by_id: 1 });
+  p.renderHead(head, b, 'main'); await new Promise((r) => setImmediate(r));
+  assert.doesNotMatch(head.innerHTML, /⎇/, 'a new folder is read again');
 });

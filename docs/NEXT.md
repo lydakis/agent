@@ -958,9 +958,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     until the app reattaches. After a reattach, task cards inside the side
     pane show no latest line until opened, since only the main pane's peers
     are loaded.
+    Done (2026-09-27): tasks in worktrees. `run --new --worktree` checks out
+    the folder's `HEAD` on `agent/NAME` beside the store and runs the
+    repository's `.agent/setup`; the preamble offers it; a continued bot
+    keeps its folder and a fork starts in its source's; the app shows a
+    worktree bot's branch ([CLI.md](CLI.md)). Follow-up: deleting a bot
+    leaves its worktree and branch, which hold its work; the app should
+    offer to remove them.
     Next, in
-    order: tasks in worktrees (`run --new --worktree` with a setup command, in the
-    client), then side chats with all tools in a new worktree, and Keep; approvals in the
+    order: side chats with all tools in a new worktree, and Keep; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
     text in the client policy; swarms last, since that design is not decided.
     A fork into another provider stays out: history is provider-native.

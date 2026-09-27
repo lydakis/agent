@@ -16,6 +16,7 @@ window.Daemon = (() => {
       models: () => invoke('models'),
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
+      branch: (dir) => invoke('branch', { dir }),
       attach: (after) => invoke('attach', { after }),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
@@ -145,11 +146,13 @@ window.Daemon = (() => {
     const handles = [];
     for (const n of Object.keys(tasks)) {
       if (m.interrupted) return;
-      const cmd = `"$AGENT_BIN" run --new --bot ${n} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
+      // The task that edits code gets its own worktree; the others read the project folder.
+      const tree = n === 'demo.build';
+      const cmd = `"$AGENT_BIN" run --new --bot ${n}${tree ? ' --worktree' : ''} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
-      await create(n, `${m.provider}/${m.model}`, name);
+      await create(n, `${m.provider}/${m.model}`, name, null, tree ? `~/.agent/worktrees/${n}` : m.workspace);
       const t = start(n, tasks[n]);
       handles.push(`turn:${n}/${t}`);
       emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: n, handle: `turn:${n}/${t}`, status: 'running', turn: t }) + '\n', success: true }) }), artifacts: [] } });
@@ -185,7 +188,8 @@ window.Daemon = (() => {
       emit({ event: 'tool_started', bot: n, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
       const b = S.bots.get(n);
-      await create('demo.review', `${b.provider}/${b.model}`, n);
+      // Created from build's shell, the reviewer works in build's worktree.
+      await create('demo.review', `${b.provider}/${b.model}`, n, null, b.workspace);
       const rt = start('demo.review', 'Review the auth diff for regressions.');
       emit({ event: 'tool_completed', bot: n, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: 'demo.review', handle: `turn:demo.review/${rt}`, status: 'running', turn: rt }) + '\n', success: true }) }), artifacts: [] } });
       const wid = `call_${++calls}`;
@@ -210,6 +214,8 @@ window.Daemon = (() => {
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
+    // A task made with --worktree works in `worktrees/NAME` on branch agent/NAME.
+    branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {
       if (!S.bots.size) {
