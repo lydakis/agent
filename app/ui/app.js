@@ -924,7 +924,9 @@ function renderTail(el, name, t) {
 // extends the run on screen redraws that run alone.
 function renderTranscript(el, name) {
   const t = S.transcripts.get(name);
-  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  // Another bot in this pane starts at its newest work, not at the old bot's scroll position.
+  const fresh = el.dataset.who !== name; el.dataset.who = name;
+  const atBottom = fresh || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   const before = el.scrollHeight;
   if (!t) { el.innerHTML = ''; el.dataset.key = ''; return; }
   const key = paneKey(name, t);
@@ -1128,14 +1130,16 @@ let pickerPane = 'main';
 function openPicker() { pickerPane = paneOf(document.activeElement, menuPane); closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
 // A pick opens its bot alone, so focus goes to the main composer; Escape goes back where it was.
 function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
-async function showHelp() {
+let helpPane = 'main';
+async function showHelp(pane = 'main') {
+  helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
   const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot\n Enter sends · Shift-Enter a new line\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: agent models --discover writes ~/.agent/models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
 }
-function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $('input').focus(); }
+function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $(PANE[S.ui.side ? helpPane : 'main'].input).focus(); }
 
 // ---------- menus ----------
 // One menu at a time: an agent's ⋯ (from its head, its sidebar row, its card, or a right-click), the
@@ -1246,7 +1250,7 @@ async function submit(text, pane = 'main') {
     await enqueue(() => { if (S.session === session) seat(record, session); });
     await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
   }
-  if (text === '/help' || text === '?') { showHelp(); return; }
+  if (text === '/help' || text === '?') { showHelp(pane); return; }
   const b = bot(PANE[pane].bot()); if (!b) throw new Error('no bot selected; /new NAME creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
@@ -1281,9 +1285,10 @@ async function fork(name) {
   if (isActive(b.status)) throw new Error('bot_busy: a running bot forks once its turn ends');
   let copy = forkName(name, 1); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k);
   // A task known only by its project prefix sits under the coordinator, and so does its fork.
+  // A root bot's fork is a root too.
   const lead = b.project ? bot(b.project + LEAD) : null;
-  const parent = creatorOf(b) ?? (lead && lead !== b && lead.id != null ? lead : b), session = S.session;
-  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: parent.name, created_by_id: parent.id, ...(b.workspace ? { workspace: b.workspace } : {}) });
+  const parent = creatorOf(b) ?? (lead && lead !== b && lead.id != null ? lead : null), session = S.session;
+  const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}), ...(b.workspace ? { workspace: b.workspace } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   await openBeside(copy);
@@ -1376,7 +1381,9 @@ function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.he
 for (const [pane, ids] of Object.entries(PANE)) {
   $(ids.form).addEventListener('submit', async (e) => {
     e.preventDefault(); const input = $(ids.input); const v = input.value.trim(); if (!v) return; input.value = ''; grow(input);
-    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); input.value = v; grow(input); }
+    // A failed send comes back only to the bot it was for, and never over new typing.
+    const who = PANE[pane].bot();
+    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); if (PANE[pane].bot() === who && !input.value) { input.value = v; grow(input); } }
   });
   $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
   $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });

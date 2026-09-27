@@ -796,6 +796,26 @@ test('fork copies a bot at rest next to it and opens the copy beside', async () 
   await p.fork('app.solo');
   const solo = sent.filter(([op]) => op === 'fork').at(-1)[1];
   assert.deepEqual([solo.created_by, solo.created_by_id], ['app.lead', 1]);
+  // A root bot outside any project forks to a root beside it, not under itself.
+  p.upsert({ name: 'loose', id: 5, provider: 'alpha', model: 'one' }); p.tree();
+  await p.fork('loose');
+  const loose = sent.filter(([op]) => op === 'fork').at(-1)[1];
+  assert.equal('created_by' in loose, false);
+});
+
+test('a failed send comes back only to the bot it was for', async () => {
+  let fail = null;
+  const p = shell({ request: async (op) => { if (op === 'submit') { await new Promise((r) => { fail = r; }); throw new Error('daemon_unavailable'); } return { nodes: [], next_from: null }; } });
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.tree(); p.S.selected = 'app.lead';
+  const doc = p.context.document, side = doc.getElementById('sideinput');
+  await p.openBeside('app.build');
+  side.value = 'for build';
+  const sending = doc.getElementById('sideform').listeners.submit({ preventDefault() {} });
+  await new Promise((r) => setImmediate(r));
+  await p.openBeside('app.test');
+  fail(); await sending;
+  assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'not restored under another bot');
 });
 
 test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'s folder', async () => {
