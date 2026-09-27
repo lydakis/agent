@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -895,6 +895,9 @@ test('swap carries each draft with its bot; a long wait list stays short in the 
   p.swap();
   assert.equal(p.S.selected, 'app.build'); assert.equal(main.value, 'to build');
   assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'to lead');
+  p.upsert({ name: 'app.test', id: 3, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.transcript('app.build').peers = ['app.lead', 'app.test'];
+  await p.nextBeside(); assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'Ctrl-P starts the next bot with an empty draft');
   const b = p.S.bots.get('app.lead'); b.status = 'waiting';
   b.waitingOn = Array.from({ length: 5000 }, (_, i) => `turn:app.t${i}/1`);
   assert.equal(p.waitSummary(b), 'app.t0/1, app.t1/1, app.t2/1 +4997');

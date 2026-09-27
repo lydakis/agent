@@ -1298,6 +1298,13 @@ async function openBeside(name) {
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side ? 'side' : 'main');
 }
+// Ctrl-P puts the next peer beside; like any other bot opened there, it starts with an empty draft.
+async function nextBeside() {
+  const ps = peers().filter((who) => who !== S.selected); if (!ps.length) return;
+  const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next === S.ui.side) return;
+  S.ui.side = next; $('sideinput').value = '';
+  await enqueue(loadVisible); render(); save(); focusInput('side');
+}
 // Drafts travel with their bots.
 function swap() {
   if (!S.ui.side) return;
@@ -1346,7 +1353,7 @@ document.addEventListener('keydown', async (e) => {
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
   if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
-  if (ctrl && k === 'p') { const ps = peers().filter((who) => who !== S.selected); if (ps.length) { const i = ps.indexOf(S.ui.side); S.ui.side = ps[(i + 1) % ps.length]; await enqueue(loadVisible); render(); save(); } e.preventDefault(); return; }
+  if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
   if (k === 'Escape') { if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
   const empty = e.target.id === 'input' && $('input').value === '';
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
