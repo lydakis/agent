@@ -55,7 +55,9 @@ then the AWS CLI's `configure export-credentials`, which is the chain itself
 `credential_process` format. Temporary keys are re-resolved five minutes before
 expiry by one background run while they keep signing, so no call waits on the
 CLI until the keys have actually expired; a 401 or 403 re-resolves once and
-retries the call. The CLI runs at most every ten seconds, so neither a CLI
+retries the call. Keys the CLI cannot resolve at startup leave that binding
+waiting for a login rather than stopping the daemon; its next call resolves
+again. The CLI runs at most every ten seconds, so neither a CLI
 outage nor a refused fleet spawns it per request. Any of the three
 `AWS_*` key variables the daemon inherited is kept out of shells and tool
 output, even an incomplete set that leaves the CLI to sign. Bedrock endpoints must be

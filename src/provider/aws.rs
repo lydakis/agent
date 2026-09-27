@@ -132,39 +132,69 @@ impl std::fmt::Debug for Aws {
 }
 
 impl Aws {
-    /// Resolve credentials once for the Bedrock endpoint at `url`. Fails
-    /// `provider_aws_credentials_unavailable` with the reason, so a daemon
-    /// never starts with a binding it cannot sign for.
-    pub async fn open(url: &reqwest::Url, redaction: Option<Credentials>) -> Result<Self> {
+    /// Credentials for the Bedrock endpoint at `url`, resolved once now. Keys
+    /// the AWS CLI cannot resolve yet (no login, an expired SSO session) do
+    /// not stop the daemon: the binding is returned with the reason, and its
+    /// first call resolves again, so `aws sso login` fixes it in place.
+    pub async fn open(
+        url: &reqwest::Url,
+        redaction: Option<Credentials>,
+    ) -> Result<(Self, Option<Error>)> {
         let (region, service) = endpoint(url).ok_or(Error::new("invalid_provider_url"))?;
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         if let Some(redaction) = &redaction {
             withhold(redaction, var);
         }
-        let (source, keys) = match var(ENVIRONMENT[0]).zip(var(ENVIRONMENT[1])) {
-            Some((access, secret)) => (
-                Source::Environment,
-                Keys::new(access, secret, var(ENVIRONMENT[2])),
-            ),
+        match var(ENVIRONMENT[0]).zip(var(ENVIRONMENT[1])) {
+            Some((access, secret)) => {
+                let aws = Self::unresolved(region, service, Source::Environment, redaction);
+                aws.install(Keys::new(access, secret, var(ENVIRONMENT[2])));
+                Ok((aws, None))
+            }
             None => {
                 let command: Box<[String]> = AWS_CLI.map(str::to_owned).into();
-                let keys = resolve(&command).await?;
-                (Source::Cli(command), keys)
+                Ok(Self::from_cli(region, service, command, redaction).await)
             }
-        };
-        if keys.expired(SystemTime::now()) {
-            return Err(Error::new("provider_aws_credentials_expired"));
         }
-        let aws = Self {
+    }
+
+    async fn from_cli(
+        region: String,
+        service: &'static str,
+        command: Box<[String]>,
+        redaction: Option<Credentials>,
+    ) -> (Self, Option<Error>) {
+        let resolved = resolve(&command).await;
+        let aws = Self::unresolved(region, service, Source::Cli(command), redaction);
+        let unresolved = match resolved {
+            Ok(keys) if !keys.expired(SystemTime::now()) => {
+                aws.install(keys);
+                None
+            }
+            Ok(_) => Some(Error::new("provider_aws_credentials_expired")),
+            Err(error) => Some(error),
+        };
+        (aws, unresolved)
+    }
+
+    /// A signer holding no keys yet: expired placeholders, so the first
+    /// call resolves before it signs.
+    fn unresolved(
+        region: String,
+        service: &'static str,
+        source: Source,
+        redaction: Option<Credentials>,
+    ) -> Self {
+        let mut none = Keys::new(String::new(), String::new(), None);
+        none.expires = Some(UNIX_EPOCH);
+        Self {
             region,
             service,
             source,
-            keys: RwLock::new(Arc::new(Keys::new(String::new(), String::new(), None))),
+            keys: RwLock::new(Arc::new(none)),
             refresh: Arc::default(),
             redaction,
-        };
-        aws.install(keys);
-        Ok(aws)
+        }
     }
 
     #[cfg(test)]
@@ -646,6 +676,29 @@ mod tests {
     /// Whole requests as botocore 1.43 signs them, with payload signing off
     /// and on, with and without a session token. The digest is taken over
     /// the body in chunks, as it streams.
+    #[tokio::test]
+    async fn a_login_missing_at_start_resolves_on_first_use() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("ready");
+        let script = format!(
+            r#"test -e '{}' || {{ echo 'Token has expired' >&2; exit 255; }}
+echo '{{"Version":1,"AccessKeyId":"LATE","SecretAccessKey":"S"}}'"#,
+            ready.display()
+        );
+        let command: Box<[String]> = ["sh".into(), "-c".into(), script].into();
+        let (aws, unresolved) =
+            Aws::from_cli("us-east-1".into(), "bedrock-mantle", command, None).await;
+        assert_eq!(
+            unresolved.unwrap().code,
+            "provider_aws_credentials_unavailable"
+        );
+        let aws = Arc::new(aws);
+        std::fs::write(&ready, "").unwrap();
+        assert_eq!(aws.current().await.unwrap().access, "LATE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn requests_sign_as_botocore_signs_them() {
         let now = at(1_790_296_697);

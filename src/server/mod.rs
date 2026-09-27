@@ -892,10 +892,16 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.sigv4 {
             let url =
                 reqwest::Url::parse(&spec.url).map_err(|_| Error::new("invalid_provider_url"))?;
-            let aws =
+            let (aws, unresolved) =
                 agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone())).await?;
-            auth = Some(json!({"auth":"sigv4","region":aws.region(),
-                "credentials":aws.source()}));
+            let mut signed = json!({"auth":"sigv4","region":aws.region(),
+                "credentials":aws.source()});
+            // Keys the CLI cannot resolve yet leave this binding waiting on a
+            // login, not the daemon: its calls resolve again when they run.
+            if let Some(error) = unresolved {
+                signed["unresolved"] = json!({"error": error.code, "detail": error.detail});
+            }
+            auth = Some(signed);
             provider = provider.with_aws(Arc::new(aws))?;
         }
         if let Some(cap) = config.max_output_tokens {

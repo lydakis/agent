@@ -377,7 +377,11 @@ with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
 its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
 `AWS_PROFILE` or the default profile, SSO and assumed roles included, through
-`aws configure export-credentials`. Temporary keys are re-resolved in the
+`aws configure export-credentials`. Keys the CLI cannot resolve when the
+daemon starts (no login yet, an expired SSO session) do not stop it: the
+binding's `ready.providers` entry carries `unresolved` with the reason, and
+its next call resolves again, so `aws sso login` fixes it without a restart.
+Temporary keys are re-resolved in the
 background five minutes before they expire, at most every ten seconds, and
 once on a 401 or 403, which retries the call as `provider_login_refreshed`;
 Bedrock URLs must be https; the key id, secret and session token are

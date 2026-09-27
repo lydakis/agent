@@ -286,7 +286,10 @@ mod tests {
     fn mantle_offers_each_binding_only_its_own_family() {
         use super::mantle_runs;
         assert!(mantle_runs(Family::Anthropic, "anthropic.claude-sonnet-5"));
-        assert!(mantle_runs(Family::Anthropic, "global.anthropic.claude-sonnet-5"));
+        assert!(mantle_runs(
+            Family::Anthropic,
+            "global.anthropic.claude-sonnet-5"
+        ));
         assert!(!mantle_runs(Family::Anthropic, "openai.gpt-6-luna"));
         assert!(mantle_runs(Family::Responses, "openai.gpt-6-luna"));
         assert!(!mantle_runs(Family::Responses, "anthropic.claude-sonnet-5"));
