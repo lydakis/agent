@@ -26,6 +26,28 @@ def workflow_step(name, workflow="release.yml"):
     return textwrap.dedent(run[1])
 
 
+class TriggerTest(unittest.TestCase):
+    def test_only_the_secretless_request_runs_from_a_tag(self):
+        # A tag push or release runs the workflow file at the tag; only a
+        # workflow_run starts from main's definition.
+        def triggers(name):
+            text = (WORKFLOWS / name).read_text()
+            block = re.search(r"^on:\n((?:^  .*\n)+)", text, re.MULTILINE)
+            return text, re.findall(r"^  (\w+):", block[1], re.MULTILINE)
+        request, on = triggers("release-request.yml")
+        self.assertEqual(on, ["push", "release"])
+        self.assertIn("permissions: {}", request)
+        self.assertNotIn("secrets.", request)
+        self.assertNotIn("uses:", request)
+        for name, event in [("release.yml", "push"), ("publish-homebrew.yml", "release")]:
+            with self.subTest(workflow=name):
+                text, on = triggers(name)
+                self.assertEqual(on, ["workflow_run"])
+                self.assertIn('workflows: ["Release request"]', text)
+                self.assertIn(f"github.event.workflow_run.event == '{event}'", text)
+                self.assertIn("github.event.workflow_run.conclusion == 'success'", text)
+
+
 class ReleaseWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

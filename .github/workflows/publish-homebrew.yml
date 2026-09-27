@@ -1,14 +1,13 @@
 name: Publish Homebrew
 
+# Publishing a release starts release-request.yml, and this runs after it
+# from main's definition, so a tag's own commit never reaches the tap token.
+# Re-run a failed publication from this workflow's run.
+
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Already published stable release tag (for example v0.1.0)
-        required: true
-        type: string
+  workflow_run:
+    workflows: ["Release request"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -19,9 +18,12 @@ concurrency:
 
 jobs:
   publish:
+    # Prereleases (vX.Y.Z-...) stay off the tap; the tap update also checks
+    # the release is published and stable.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (!github.event.release.draft && !github.event.release.prerelease)
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'release' &&
+      !contains(github.event.workflow_run.head_branch, '-')
     runs-on: macos-15
     timeout-minutes: 30
     defaults:
@@ -33,14 +35,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # A release event's own ref is its tag: run main's scripts, not the tag's.
+          # Run main's scripts, never the tag's.
           ref: refs/heads/main
           fetch-depth: 0
           persist-credentials: false
       - name: Resolve approved release
         id: release
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          # A release's run names its tag as its head branch.
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo 'Expected a stable tag such as v0.1.0' >&2

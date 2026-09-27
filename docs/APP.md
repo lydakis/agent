@@ -149,7 +149,11 @@ launch, from a repaired `~/.agent/env`, is picked up on the next attach.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
-[release.yml](../.github/workflows/release.yml) on a macOS runner. It runs
+[release.yml](../.github/workflows/release.yml) on a macOS runner. The tag
+itself only starts [release-request.yml](../.github/workflows/release-request.yml),
+which holds no secrets; release.yml and publish-homebrew.yml run after it from
+`main`'s own definitions, so code at a tag never sees the signing secrets or
+the tap token. A failed run is re-run from its own page. It runs
 the tests, installs the Tauri CLI from
 [app/release/package-lock.json](../app/release/package-lock.json) before any
 signing material exists, builds a universal `agent` and app, and has Tauri sign both with

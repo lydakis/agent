@@ -2,27 +2,27 @@ name: Release
 
 # Builds the signed, notarized desktop app for a version tag and leaves it as
 # a draft release. Publishing the draft is the human step; publish-homebrew.yml
-# then updates the tap.
+# then updates the tap. A tag push starts release-request.yml, and this runs
+# after it from main's definition, so a tag's own commit never reaches the
+# signing secrets. Re-run a failed release from this workflow's run.
 
 on:
-  push:
-    tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing release tag to package without moving it
-        required: true
-        type: string
+  workflow_run:
+    workflows: ["Release request"]
+    types: [completed]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
   resolve:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -34,7 +34,8 @@ jobs:
     steps:
       - name: Validate release tag
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          # A tag push's run names the tag as its head branch.
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo 'Expected a tag such as v0.1.0 or v0.1.0-rc.1' >&2
@@ -49,7 +50,8 @@ jobs:
       - name: Resolve approved release
         id: source
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          # A tag push's run names the tag as its head branch.
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           # Resolve once, before executing any code from the selected tag.
           commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
