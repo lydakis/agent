@@ -22,14 +22,11 @@ const S = {
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(),
-  // What a new side chat may call: 'read' (files and its history) or 'answer' (no tools). Sticky.
-  sideTools: loadSideTools(),
   // Each provider's model family, from the bot records that name both; a turn may run on any
   // provider of its bot's family.
   families: new Map(),
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
-function loadSideTools() { try { return localStorage.getItem('agent:side-tools') === 'answer' ? 'answer' : 'read'; } catch (_) { return 'read'; } }
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
 const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
@@ -188,7 +185,7 @@ function upsert(record) {
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
-  learnFamily(b, record); learnTools(b, record);
+  learnFamily(b, record);
   learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
@@ -213,10 +210,6 @@ function readBranch(b) {
 function learnFamily(b, record) {
   if (typeof record.family === 'string') { b.family = record.family; if (typeof record.provider === 'string') S.families.set(record.provider, record.family); }
   else b.family ??= S.families.get(record.provider) ?? null;
-}
-// What the bot may call: its allowed list when it has one, else all its tools.
-function learnTools(b, record) {
-  if (Array.isArray(record.allowed)) b.callable = record.allowed; else if (Array.isArray(record.tools)) b.callable = record.tools;
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
@@ -656,7 +649,7 @@ function seat(record, session) {
   if (conflict) return;
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
-  learnFamily(b, record); learnTools(b, record);
+  learnFamily(b, record);
   learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   seedHistory(record);
@@ -1235,9 +1228,6 @@ function sendMenuItems(pane) {
     { act: 'set-send', pane, v: 'queue', label: 'Queue after this turn', on: S.send === 'queue' },
     { act: 'set-send', pane, v: 'steer', label: 'Steer into this turn', on: S.send === 'steer' },
     { act: 'set-send', pane, v: 'side', label: 'Ask a side chat', hint: '⑂', on: S.send === 'side' },
-    { sep: true },
-    { act: 'set-side-tools', pane, v: 'read', label: 'Side chats read files', on: S.sideTools === 'read' },
-    { act: 'set-side-tools', pane, v: 'answer', label: 'Side chats only answer', on: S.sideTools === 'answer' },
   ];
 }
 function setSend(mode) { S.send = mode === 'steer' || mode === 'side' ? mode : 'queue'; try { localStorage.setItem('agent:send', S.send); } catch (_) {} }
@@ -1315,21 +1305,14 @@ async function fork(name) {
   await openBeside(copy);
 }
 // A side chat is a fork of a bot, running or not, from its newest finished round, nested under it
-// and opened beside; the source is untouched. It may read files and its history, or answer only.
-// The first message, if any, goes to the side chat.
-const READ_TOOLS = ['read', 'history'];
-function sideAllow(b) {
-  if (S.sideTools === 'answer') return [];
-  return b.callable ? READ_TOOLS.filter((t) => b.callable.includes(t)) : READ_TOOLS;
-}
+// and opened beside; the source is untouched. It has its source's tools and works in its source's
+// folder, beside it. The first message, if any, goes to the side chat.
 async function sideChat(name, text = '') {
   const b = bot(name); if (!b) return;
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   let copy = forkName(name, 1, 'side'); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k, 'side');
   const session = S.session;
-  // A bot announced after attaching has no tool list yet; ask for its record before narrowing it.
-  if (S.sideTools !== 'answer' && !b.callable) { const rec = await Daemon.request('resume', { bot: name }); if (rec?.id === b.id) learnTools(b, rec); }
-  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b) });
+  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   // The first message goes before the pane loads any history, so the turn starts at once.
@@ -1345,7 +1328,6 @@ async function sideChat(name, text = '') {
   if (input && !input.value) { input.value = text; grow(input); }
   throw Object.assign(failed, { kept: true });
 }
-function setSideTools(v) { S.sideTools = v === 'answer' ? 'answer' : 'read'; try { localStorage.setItem('agent:side-tools', S.sideTools); } catch (_) {} }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // A project in a folder: the folder's `.agent/project.toml` names it, or the folder's own name does,
 // and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
@@ -1473,7 +1455,6 @@ async function act(el) {
     case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
     case 'set-model': setModel(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
     case 'set-send': setSend(v); render(); focusInput(pane); return;
-    case 'set-side-tools': setSideTools(v); render(); focusInput(pane); return;
     case 'side-chat': await sideChat(who); return;
     case 'stop': await interrupt(who); return;
     case 'stop-pane': await interrupt(PANE[pane].bot()); return;

@@ -37,7 +37,7 @@ The model chip: models of the bot's family; others need a new agent.
 ![The model chip's menu](app/model-chip.png)
 
 Send on a busy agent: queue after this turn, steer into it, or ask a side
-chat, and what side chats may use.
+chat.
 
 ![Send's choices](app/send.png)
 
@@ -262,10 +262,10 @@ daemon learns nothing about projects; everything here is client work.
   checkpoint, so the daemon copies it at its newest finished round; the
   source is untouched. The copy is named `NAME-side`, nests under its
   source, and opens beside. From the ⋯ menu it opens empty; from Send's
-  side pick, the message is its first. It may read files and its history
-  (`allow: ["read","history"]`, the default) or only answer (`allow: []`),
-  the ▾'s sticky choice. Tools stay shown, so the fork keeps its source's
-  cache; the daemon refuses a call outside the list.
+  side pick, the message is its first. It has its source's tools and works
+  in its source's folder, so it can edit there while the source runs: it
+  is the same agent asked something else at the same time (George,
+  2026-09-27). The fork names no tool list and no folder.
 - **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
   daemon's. A coordinator the app creates gets, after the shared policy, a
   short text of the app's own: a task that changes files, named with the
@@ -280,10 +280,9 @@ daemon learns nothing about projects; everything here is client work.
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
-- **Not built yet.** A side chat with all tools in a new worktree, Keep,
-  which turns a side chat into a task, removing a deleted task's worktree,
-  and the coordinator's role text, approvals and swarms are later steps of
-  item 47.
+- **Not built yet.** Keep, which turns a side chat into a task, removing a
+  deleted task's worktree, profiles with the coordinator's role text,
+  swarms and approvals are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
