@@ -867,29 +867,29 @@ bytes per parked turn versus per live process, on the lifecycle screen.
 45. Approving tool calls. Every allowed call runs without a verdict today,
     and that stays the default. [The design](APPROVALS.md) adds two more
     modes, chosen per bot with `--approval` or `AGENT_APPROVAL`: `auto`,
-    where a client answers from deterministic rules first, then asks Jev a
-    few narrow questions per round, and denies what is dangerous or unclear
-    without asking anyone; and `manual`, where a person or program answers.
+    where a model (Jev first) judges every gated round with a few narrow
+    questions and denies what is dangerous or unclear without asking
+    anyone, with no rules in front of it (George, 2026-09-27); and
+    `manual`, where a person or program answers.
     The daemon only gets an `approve` list of tools whose calls wait for an
     `answer` from any client, and an opaque approver tag: the request rides
     the plan commit, the verdict rides the call's start or its denial, and a
     verdict that has not arrived within a short hold parks the turn like
     `wait`. It has no rules, prompts, or model. It is oversight, not a
-    sandbox. The Harbor tool mix (2026-09-26) sends at least 64 to 76% of
-    rounds to Jev, about 1 to 2% of median trial time, and caps one Jev
-    key at roughly 26 to 31 `auto` rounds a second at most; the count
-    treated four git commands as read-only, which the design no longer
-    does. A labeled Jev run on 341
+    sandbox. With every gated round going to Jev, one key caps an `auto`
+    fleet at about 20 such rounds a second; each waits about 0.26 s at the
+    median and costs about $0.0001. A labeled Jev run on 341
     calls (2026-09-26, $0.07) answered in 0.26 s median with no false
     allows, but at the starting thresholds it refused 23% of benign calls;
     tuned thresholds cut that sharply. Built (2026-09-26): the daemon
     mechanism and `manual` mode with `agent approvals` and `agent answer`.
-    Next, parked on 2026-09-26 behind core work: within-turn compaction,
-    the storage failure, and admission batching have landed (#32, #33),
-    and so has the realistic-budget compaction eval (#37). Then the
-    rules-only `auto` approver with `serve_approvals`, then Jev, and a
-    labeled dangerous set to measure false allows before thresholds are
-    fixed.
+    Built (2026-09-27): `serve_approvals` with its lease and the `denials`
+    counts. Next: the automatic approver, `agent approver` answering the
+    `auto` tag from Jev, with `--approval auto`; then a labeled dangerous
+    set to measure false allows before thresholds are fixed. Later, not a
+    priority (George, 2026-09-27): rules as an option for manual mode, a
+    program answering a `manual` gate from a rule list, starting from the
+    rules the design first proposed.
 46. Done: the model that answered. Every `usage` event keeps
     `served_model`, the model the provider named in its response
     (Responses' `response.model`, Anthropic's `message.model`, and after a

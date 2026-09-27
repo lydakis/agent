@@ -4,8 +4,9 @@ Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
 updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, and at
 `973be14`, the change that built tool approval, for its cost and a store
-lock fix, and at `dd95047` for the per-summary choice between a copy and a
-request of its own. This is the one place that says what is currently known. The documents it links to
+lock fix, at `dd95047` for the per-summary choice between a copy and a
+request of its own, and at `ea82f7a` for serving a gate tag to one
+approver. This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -77,6 +78,10 @@ more turns is not here, because its work changes with its speed; it is under
   a second ungated (main 381), 292 held, 192 parked. Linux x86_64
   container, `973be14` against main at `ddf3f8b`, with within-turn
   compaction, 2026-09-26; an earlier run at `7238c6c` found the same.
+  Serving a tag (`ea82f7a` against `0b295d2`, 2026-09-27, same method and
+  host, three rotated runs): held p50 15.9 against 15.7 ms, the same
+  commits and event and store bytes, and the plan commit's job 0.61
+  against 0.57 ms, inside the run-to-run spread.
   macOS and the automatic approver's own cost are not measured.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
@@ -295,5 +300,6 @@ Reconnects, retention, overload, compaction and recovery.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
 - Tool approval on macOS.
-- Multi-daemon operation, the automatic approver (rules and Jev), and
+- Multi-daemon operation, the automatic approver (Jev on every gated
+  round), and
   concurrent tool calls: designs only.

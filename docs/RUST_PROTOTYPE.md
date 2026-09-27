@@ -836,6 +836,9 @@ own path from the turn. Example requests:
 {"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-5.6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual"}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
 {"id":23,"op":"answer","bot":"Carol","turn":7,"call_id":"call_1","request":1,"decision":"deny","reason":"not on main","by":"cli"}
+{"id":24,"op":"serve_approvals","tag":"auto","lease_ms":5000,"limit":64}
+{"id":25,"op":"renew_approvals","tag":"auto","lease":1790460421345}
+{"id":26,"op":"answer","bot":"Carol","turn":7,"call_id":"call_2","request":1,"tag":"auto","decision":"allow","by":"approver","lease":1790460421345}
 {"id":12,"op":"shutdown"}
 {"id":21,"op":"shutdown","grace_ms":30000}
 ```
@@ -1179,7 +1182,9 @@ so none needs one. Schema 33 adds [tool approval](#tool-approval): the
 leave empty. Schema 34 adds `turns.view_sent`, whether a turn's call or a
 summary or elision changed the bot's view last; turns stored before record
 neither, so a [summary](#compaction) after them never takes their call as
-having sent the view.
+having sent the view. Schema 35 adds `bots.denials`, the [denial
+counts](#tool-approval); none were kept before, so every bot starts from
+none.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1652,10 +1657,14 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `{"calls":[{"call_id","request","announced_ms","gates","name","node"}]}`.
   A round whose calls take more than 256 KiB is announced in several such
   events, in order, so each one pages.
-- **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?}`
+- **Answer.** `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"lease"?}`
   records one gate's verdict on the call's current request; `tag` may be
   left out when the call has one gate, and `reason` goes only with a deny
-  (`invalid_reason` otherwise). The reply lists the gates still
+  (`invalid_reason` otherwise). `lease` is for a session serving `tag`
+  (below): the answer renews the lease, and one under a lease that ended
+  gets `approvals_lost` and changes nothing; a lease without a `tag` is
+  `invalid_lease`. An answer without one is an override, whoever serves
+  the tag. The reply lists the gates still
   `pending`. Errors: `no_pending_approval` (unknown call, request, or tag),
   `approval_superseded` (an earlier request), `approval_already_answered`
   (this gate answered, or the call denied already),
@@ -1721,7 +1730,42 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   one at the end, so a listing that pages on finds it. `stats` reports `approval_requests`, the calls
   announced and not yet started or denied: a count the storage worker
   keeps at each announcement, start, denial, and turn end, as it does
-  `queued_turns`, so `stats` reads no approval row.
+  `queued_turns`, so `stats` reads no approval row. Each listed call also
+  carries `denials`, the bot's counts under each of its open gates (next).
+- **Denial counts.** The daemon counts, per bot and gate tag, the denials
+  that tag gave: `in_row`, ended when a call every gate allowed starts,
+  and `in_turn`, the denials in the turn that gave the last one. They are
+  written in the commit that records the denial, and the start that ends
+  a run writes only when a run was counted, so a bot never denied writes
+  nothing. A lapsed gate's denial is not counted: nobody judged the call.
+  `resume` reports `denials: {tag: {in_row, in_turn, turn}}` once one is
+  counted; a listed or served call carries `{tag: {in_row, in_turn}}` as
+  seen from its own turn, so an approver that restarts or takes over
+  counts on where the last one left off.
+- **Serving a tag.** `{"op":"serve_approvals","tag","lease_ms","limit"?}`
+  hands the session the tag. The reply is the first page of the calls
+  waiting on it, as `approvals {tag}` lists them, with the `lease` number
+  and `lease_ms`; the session pages the rest with `approvals`. From then
+  on it receives, for each round announced for the tag, the
+  `approval_requested` event's envelope with `tag`, `lease`, and
+  `durable: false`, whose `data.calls` are only the calls waiting on the
+  tag, each as a listing shows it, and `failed` when the round is
+  announced again. The listing and the start of delivery are read in
+  one storage job, so a call waiting on the tag is on a page or arrives
+  after; a call on a later page may also arrive pushed, and the request
+  number tells the two apart. One session holds a tag: another gets
+  `approvals_served` while the holder's session is open and its lease
+  runs. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
+  or an answer under the lease, each at least every `lease_ms` (100 to
+  600,000). A holder whose lease ran out keeps the tag until another
+  session serves it, which takes it over under a new lease, or until it
+  renews or answers, which is refused; either way it is sent
+  `{"event":"approvals_lost","tag","lease"}`, and pushes stop. A closed
+  session frees its tags at once. Lease numbers change at every takeover
+  and differ across restarts, and a lease holds only on its own session.
+  `stats` lists the served tags in `approvers`. The stream is for the
+  holder alone: bot followers get the compact event, and a holder that
+  cannot keep up is closed, like a lagging follower.
 - Interrupting a turn cancels its gated calls like any planned call.
   Anything that reaches the socket can answer, a bot's own shell included:
   this is oversight, not containment.
