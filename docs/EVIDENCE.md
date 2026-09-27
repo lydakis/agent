@@ -42,11 +42,19 @@ more turns is not here, because its work changes with its speed; it is under
   under both builds: 26 to 38 turns a second at 10 ms per sync, 95 to 128 at
   2 ms, and no change with no delay. `2d03ac2` against the group build,
   2026-09-26. [Record](DAEMON_MEASUREMENTS.md#group-commit).
-- **macOS durability cost.** A full flush (`F_FULLFSYNC`) costs about 5.4 ms,
-  so an idle shell turn takes about 30 ms longer than with a plain `fsync`;
-  grouping recovers most of it at load (1,280 jobs a second in groups of 8,
-  against 184 one at a time). M1 Max, APFS, 2026-09-26. Accepted on purpose:
-  a commit survives power loss. [Record](DAEMON_MEASUREMENTS.md#group-commit).
+- **macOS durability cost, reversed.** A full flush (`F_FULLFSYNC`) costs
+  about 5.4 ms, so an idle shell turn took about 30 ms longer than with a
+  plain `fsync`; grouping recovers most of it at load (1,280 jobs a second
+  in groups of 8, against 184 one at a time). M1 Max, APFS, 2026-09-26.
+  [Record](DAEMON_MEASUREMENTS.md#group-commit). On the 32-agent socket echo
+  screen the per-commit flush doubled daemon CPU (0.343 to 0.757 s) and
+  added 70 ms to turn p95 in the commit that turned it on, and HEAD with
+  the flush off returned to 0.364 s and 614 ms, so per-commit flushing is
+  off since 2026-09-27. Checkpoints still flush to preserve WAL/database
+  write ordering and consistency, but later acknowledged commits can be
+  lost after an OS crash or power loss. Daemon-crash survival is retained;
+  workspace writes have independent durability. macOS arm64, 2026-09-27.
+  [Record](DAEMON_MEASUREMENTS.md#full-flush-bisect).
 - **No regression from SQLite diagnostics.** 1,152 fixed turns in A/B/B/A
   order: 19.85 and 19.93 s against 19.27 and 19.16 s, CPU and RSS within run
   noise. `7120b48` against the diagnostic build, 2026-09-26.

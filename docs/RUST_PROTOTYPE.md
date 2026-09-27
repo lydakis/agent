@@ -1229,10 +1229,17 @@ racing on `bot_busy`.
 SQLite WAL with `synchronous=FULL`, committed in groups (see Core ownership),
 stores bot metadata and provider binding,
 immutable history nodes, turns, completed checkpoints, tool intents/results,
-retained tool artifacts, and durable event cursors. On macOS a plain fsync
-leaves writes in the drive's cache, so both connections also set `fullfsync`
-and `checkpoint_fullfsync`: every commit and checkpoint is an F_FULLFSYNC and
-survives a power cut. Other platforms ignore both. The writer sets
+retained tool artifacts, and durable event cursors. An answered commit
+survives a daemon crash. On macOS, plain fsync can leave writes in the
+drive's cache, so an OS crash, including a kernel panic, or power loss can
+lose recent acknowledged commits; see [Apple's fsync documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html).
+Per-commit `fullfsync` closed that gap at twice the daemon CPU on light
+load and is off. Both connections set `checkpoint_fullfsync` to preserve
+WAL/database write ordering at checkpoints. This protects database consistency,
+but does not make subsequent commits durable across an OS crash or power loss.
+Workspace writes have their own durability behavior and need not be lost
+together with the corresponding store records. Other platforms ignore both
+full-flush settings. The writer sets
 `temp_store=MEMORY`: a job's savepoint journal (the pages it changed, kept so
 it can roll back alone) stays in memory and is freed when the job ends,
 instead of spilling past 64 KiB to a temporary file. Without it every

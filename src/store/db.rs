@@ -872,9 +872,14 @@ impl Database {
     }
 
     pub fn initialize(conn: Connection) -> Result<Self> {
-        // On macOS a plain fsync leaves writes in the drive's cache, so FULL
-        // survives a power cut only with F_FULLFSYNC, which SQLite sends when
-        // these are on. Elsewhere they change nothing.
+        // FULL syncs the WAL before a commit is answered. An answer survives
+        // a daemon crash, but on macOS plain fsync can leave writes in the
+        // drive's cache: an OS crash or power loss can lose recent commits.
+        // Per-commit F_FULLFSYNC doubled daemon CPU on the light path, so it
+        // is off. Checkpoints retain full flushing to preserve WAL/database
+        // write ordering; this does not make later commits durable across
+        // an OS crash or power loss.
+        // Elsewhere both change nothing.
         //
         // Each job runs in a savepoint inside its group's transaction, and
         // SQLite journals the pages a savepoint changes so it can roll back
@@ -884,7 +889,7 @@ impl Database {
         // when the job ends, bounded by the pages one job changes.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON;
+            PRAGMA fullfsync=OFF; PRAGMA checkpoint_fullfsync=ON;
             PRAGMA foreign_keys=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;",
         )?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;

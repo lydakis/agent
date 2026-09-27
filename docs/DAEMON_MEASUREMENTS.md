@@ -5029,3 +5029,57 @@ tests `catch_up_through_a_turn_larger_than_the_budget_cuts_at_its_rounds`
 and `catch_up_cuts_a_finished_turn_larger_than_the_budget_at_its_rounds`
 and by `test_a_round_that_overflows_before_compaction_is_due_forces_a_summary`,
 which fails on the base with `context_limit`.
+
+## Full-flush bisect
+
+2026-09-27, local macOS arm64, release builds, the 32-agent socket echo screen
+with all five tool schemas. HEAD `1eb4414` against `c585c16`, two alternating
+pairs of three measured runs, showed daemon CPU 0.369 / 0.596 s and 0.343 /
+0.630 s (baseline / HEAD), turn p95 632 / 676 and 617 / 674 ms, peak RSS
+18.9 / 19.7 and 18.7 / 19.6 MiB, ranges not overlapping. One screen of two
+measured runs per commit across the range:
+
+| Build | Daemon CPU s, median (range) | Turn p95 ms | Peak RSS MiB |
+| --- | ---: | ---: | ---: |
+| `2d03ac2`, before group commit | 0.343 (0.341–0.346) | 612.0 | 18.84 |
+| `690dd2f`, group commit and macOS full flush | 0.757 (0.741–0.774) | 682.0 | 18.76 |
+| `7120b48`, batched completions | 0.729 (0.726–0.731) | 675.0 | 18.74 |
+| `095ff68`, admission batching | 0.637 (0.628–0.647) | 670.3 | 18.91 |
+| `ddf3f8b`, within-turn compaction | 0.582 (0.572–0.592) | 675.1 | 19.28 |
+| `fe270dd`, tool approval | 0.604 (0.599–0.608) | 673.4 | 19.42 |
+| HEAD with `fullfsync` and `checkpoint_fullfsync` off | 0.364 (0.360–0.368) | 614.0 | 19.84 |
+
+The step is the one commit that turned on `PRAGMA fullfsync`, and turning the
+flush off at HEAD returns CPU and tail to the pre-group-commit figures, so
+group commit and everything after it are neutral or better on this path and
+the whole regression is `F_FULLFSYNC` on every commit: about 2.8 ms of CPU and
+60 ms of tail per turn at this load, where a group holds one job. The
+evidence page had recorded the flush as an accepted 30 ms per idle turn; the
+CPU was not measured because this screen was not run on that commit.
+
+Resolution: `fullfsync` off, `checkpoint_fullfsync` on. An answered commit
+still survives a daemon crash (`synchronous=FULL`). On macOS, an OS crash,
+including a kernel panic, or power loss can lose acknowledged commits still
+in the drive's cache; see [Apple's fsync documentation](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html).
+Checkpoints retain full flushing to preserve WAL/database write ordering and
+database consistency. They do not provide that durability guarantee for
+subsequent commits. The benchmark measures cost, not OS-crash or power-loss
+recovery.
+
+The same screen with the change, two alternating pairs of three measured
+runs against `1eb4414`, on a noisier host than the bisect (the baseline
+binary itself measured 0.43 to 0.45 s here against 0.60 earlier the same
+day):
+
+| Pair | Daemon CPU s, before / after | Turn p95 ms | Peak RSS MiB |
+| --- | ---: | ---: | ---: |
+| 1 | 0.453 (0.428–0.480) / 0.330 (0.327–0.342) | 640.9 / 602.2 | 19.75 / 20.66 |
+| 2 | 0.428 (0.398–0.431) / 0.446 (0.330–0.471) | 637.6 / 612.8 | 19.61 / 20.52 |
+
+Tail latency fell about 30 ms in both pairs. CPU fell in the first pair and
+split in the second, where two of the three post-change runs were high, so
+the CPU recovery rests on the bisect's cleaner rows above rather than on
+this pair. Peak RSS is about 0.9 MiB higher with the flush off in both
+pairs and in the bisect's last row; not isolated, and small against the
+daemon's 20 MiB. Validation: 121 Rust tests, 366 Python tests with 23
+opt-in skips, strict Clippy and formatting.
