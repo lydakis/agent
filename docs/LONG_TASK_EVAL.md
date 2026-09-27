@@ -170,7 +170,7 @@ any budget and nothing compacted.
 | --- | --- | --- |
 | The setup's four facts | as in the small task | as in the small task |
 | Each close's number | the last line of that close's benchmark; only `tools/.seed` holds the six | the final answer lacks one |
-| Which closes were settled under the old rule | the correction arrives once two settlements have run, when the call that ran the second completes | an `out/` file with truncated entries |
+| Which closes were settled under the old rule | the correction arrives once two closes have been settled, however often each was, when the call that settled the second completes | an `out/` file with truncated entries |
 
 - Each close has 300 fixture batches in whole cents, so its check passes
   under either rounding rule. `make check` without `CLOSE` runs all
@@ -254,7 +254,9 @@ whether its `out/` file holds the right entries, and whether the answer
 carries its number and its benchmark ran. A sustained bot is correct only
 when the hidden tests pass and all six settlements are right, reports its
 numbers only when all six are there, and followed the workflow when it
-ran `tools/env-check` first and every close's steps came in order. It
+ran `tools/env-check` first, every close's steps came in order, and each
+close was first settled after the one before it. Each close's number is
+its own, so one number in an answer credits one close. It
 also counts the step commands that sent their output elsewhere or cut it
 (a pipe, or a redirect other than `2>&1`) and those that ran several
 steps or looped over them. A step counts where a command runs it, not
@@ -827,6 +829,10 @@ closes are settled. Four arms at once, 10 bots each, seed 7,
   submission to its finish as received; the difference is ten local
   submissions and the runner's handling of other events, inferred to be
   well under a second against 300 s or more.
+- Runs 8 and 9 sent the correction after two successful settlements, not
+  two distinct closes, and scored the workflow without comparing the
+  closes' order. Their raw results keep each close's settlement count and
+  every command; they were not rescored for either change.
 
 This is one model, one synthetic task and seed, and 10 bots per arm,
 with a prompt that makes the model read each step whole. Left to choose,

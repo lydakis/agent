@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bench import long_task_eval
-from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_SETTLES, TASK, prompt,
-                                  run_condition, score, settled_cents, step_command_faults, steer_outcome,
-                                  workspace)
+from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_CLOSES, TASK, close_numbers,
+                                  prompt, run_condition, score, settled_closes, settled_cents, step_command_faults,
+                                  steer_outcome, workspace)
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture, is_summary
 
@@ -167,6 +167,25 @@ class LongTaskScoreTests(unittest.TestCase):
                          for rule in (ROUND_DOWN, ROUND_HALF_EVEN) for cents in settled_cents(rows, rule)}
                 self.assertFalse({close['throughput'] for close in facts['closes'].values()} & taken)
         self.assertNotEqual(facts['closes']['2026-05']['throughput'], 669744)
+        # Nor does an earlier close.
+
+        class Draws:
+            def __init__(self, *numbers):
+                self.numbers = list(numbers)
+
+            def randrange(self, start, stop):
+                return self.numbers.pop(0)
+        self.assertEqual(close_numbers(Draws(500_000, 700_000, 500_000, 600_000), {700_000}, 2), [500_000, 600_000])
+
+    def test_the_correction_waits_for_two_closes_however_often_one_was_settled(self):
+        self.setUp()
+        log = self.root / '.steps.log'
+        self.assertEqual(settled_closes(self.root), 0)
+        log.write_text('settle:2026-01 0 a\nsettle:2026-01 0 b\nsettle:2026-02 1 c\ncheck:2026-02 0 d\n')
+        self.assertEqual(settled_closes(self.root), 1)
+        with log.open('a') as out:
+            out.write('settle:2026-02 0 e\n')
+        self.assertEqual(settled_closes(self.root), SUSTAINED_STEER_CLOSES)
 
     @patch.multiple(long_task_eval, MONTHS=MONTHS[:3], CLOSE_BATCHES=20, CLOSE_ROWS=64)
     def test_each_close_counts_only_when_it_was_settled_right_and_its_number_reported(self):
@@ -226,6 +245,11 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertFalse(benched_first['closes'][MONTHS[0]]['benched_after_settle'])
         whole = run(*setup, HALF_EVEN, 'make check', *[step for month in MONTHS for step in close(month)[1:]])
         self.assertTrue(whole['followed_workflow'], whole['closes'])
+        # Every close's own steps in order, but the closes out of it.
+        swapped = run(*setup, HALF_EVEN, *close(MONTHS[1]), *close(MONTHS[0]), *close(MONTHS[2]))
+        self.assertTrue(swapped['correct'] and all(
+            c['checked_before_settle'] and c['benched_after_settle'] for c in swapped['closes'].values()))
+        self.assertFalse(swapped['followed_workflow'])
 
     def test_a_run_that_kept_every_fact_scores_clean(self):
         shell(self.root, 'tools/env-check; make quick; tools/migrate; tools/migrate --status')
@@ -413,7 +437,7 @@ def sustained_script():
     script = ['tools/env-check', 'tools/migrate', 'tools/migrate --status',
               f"cat > ledger/convert.py <<'EOF'\n{TRUNCATING}EOF", 'make check',
               *close(MONTHS[0]), *close(MONTHS[1]), f'make check CLOSE={MONTHS[2]}']
-    assert sum(c.startswith('tools/settle') for c in script) == SUSTAINED_STEER_SETTLES
+    assert sum(c.startswith('tools/settle') for c in script) == SUSTAINED_STEER_CLOSES
     script += [f"cat > ledger/convert.py <<'EOF'\n{HALF_EVEN}EOF", f'tools/settle {MONTHS[0]}',
                f'tools/settle {MONTHS[1]}', f'tools/settle {MONTHS[2]}', f'make bench CLOSE={MONTHS[2]}']
     for month in MONTHS[3:]:

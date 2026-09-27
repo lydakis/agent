@@ -72,11 +72,11 @@ CONDITIONS = {'compact': ('small', 20480, TOOLS), 'full': ('small', 4 << 20, TOO
               'sustained-full': ('sustained', 4 << 20, TOOLS)}
 # The steer arrives once this many tool calls have completed, in every
 # condition of a task, so the correction lands at the same point of it. The
-# sustained task's arrives once this many settlements have run instead,
-# whatever the calls took, so those closes are always settled under the
-# prompt's rule.
+# sustained task's arrives once this many closes have been settled instead,
+# whatever the calls took and however often a close was settled, so that
+# many closes are always settled under the prompt's rule.
 STEER_AFTER = 6
-SUSTAINED_STEER_SETTLES = 2
+SUSTAINED_STEER_CLOSES = 2
 # The sustained task's closes, settled in this order.
 MONTHS = tuple(f'2026-{n:02d}' for n in range(1, 7))
 
@@ -320,12 +320,18 @@ def settled_cents(rows, rule):
             for row in rows if row['currency'] == 'USD']
 
 
-def fresh_number(rng, taken):
-    """A close's six-digit number, drawn again while an entry holds it."""
-    number = rng.randrange(100_000, 1_000_000)
-    while number in taken:
+def close_numbers(rng, taken, count):
+    """Each close's six-digit number, drawn again while a settlement entry
+    or an earlier close holds it, so one number in an answer credits one
+    close."""
+    taken, numbers = set(taken), []
+    for _ in range(count):
         number = rng.randrange(100_000, 1_000_000)
-    return number
+        while number in taken:
+            number = rng.randrange(100_000, 1_000_000)
+        taken.add(number)
+        numbers.append(number)
+    return numbers
 
 
 def close_rows(rng, count):
@@ -494,8 +500,8 @@ def workspace(root, seed, size='small'):
         rows = {month: close_rows(rng, CLOSE_ROWS) for month in MONTHS}
         taken = {abs(cents) for month in MONTHS for rule in (ROUND_DOWN, ROUND_HALF_EVEN)
                  for cents in settled_cents(rows[month], rule)}
-        closes = {month: {'throughput': fresh_number(rng, taken), 'entries': expected(rows[month])}
-                  for month in MONTHS}
+        closes = {month: {'throughput': number, 'entries': expected(rows[month])}
+                  for month, number in zip(MONTHS, close_numbers(rng, taken, len(MONTHS)))}
         files.update({
             'Makefile': MAKEFILE_SUSTAINED,
             'tests/test_fixtures.py': FIXTURE_TESTS_SUSTAINED,
@@ -608,12 +614,14 @@ def workflow(root, initial):
     }
 
 
-def settlements(root):
-    """How many settlements have run and passed, from the step record."""
+def settled_closes(root):
+    """How many closes have been settled, each counted once, from the
+    step record."""
     log = root / '.steps.log'
     if not log.exists():
         return 0
-    return sum(line.startswith('settle:') and line.split()[1] == '0' for line in log.read_text().splitlines())
+    return len({step for step, status, *_ in (line.split() for line in log.read_text().splitlines())
+                if step.startswith('settle:') and status == '0'})
 
 
 # A step command as the sustained task asks for it: one step, its output
@@ -643,9 +651,10 @@ def close_workflow(root, closes):
     """Each close's steps, from the same record: whether a passing check
     of the close, or of every close, came before the settlement that
     stands, whether its benchmark ran after it was first settled, how
-    often it was settled, and whether its settlement file holds the right
-    entries. A close settled again after the correction needs no second
-    benchmark, since its number does not change."""
+    often it was settled and where it first was, and whether its
+    settlement file holds the right entries. A close settled again after
+    the correction needs no second benchmark, since its number does not
+    change."""
     log = root / '.steps.log'
     runs = [line.split()[:2] for line in log.read_text().splitlines()] if log.exists() else []
     out = {}
@@ -657,7 +666,8 @@ def close_workflow(root, closes):
             entries = json.loads((root / 'out' / f'{month}.json').read_text())
         except (OSError, ValueError):
             entries = None
-        out[month] = {'settle_runs': len(settled), 'bench_runs': len(benched),
+        out[month] = {'settle_runs': len(settled), 'first_settled_at': settled[0] if settled else None,
+                      'bench_runs': len(benched),
                       'checked_before_settle': bool(settled) and any(n < settled[-1] for n in checks),
                       'benched_after_settle': bool(settled) and any(n > settled[0] for n in benched),
                       'settled_correctly': entries == facts['entries']}
@@ -688,6 +698,10 @@ def score(root, facts, events, answer):
     for month, close in closes.items():
         close['reported'] = bool(close['bench_runs']) and str(
             facts['closes'][month]['throughput']) in (answer or '').replace(',', '')
+    # The prompt asks for the closes in order: each first settled after
+    # the one before it.
+    firsts = [close['first_settled_at'] for close in closes.values()]
+    in_order = None not in firsts and firsts == sorted(firsts)
     quick = [c for c, command in commands if 'make quick' in command]
     faults = [step_command_faults(command) for _, command in commands]
     repeated = {}
@@ -763,7 +777,7 @@ def score(root, facts, events, answer):
             steps['bench_runs']) and str(facts['throughput']) in (answer or '').replace(',', ''),
         **steps,
         'followed_workflow': steps['env_check_before_edits'] and (
-            all(c['checked_before_settle'] and c['benched_after_settle'] for c in closes.values())
+            in_order and all(c['checked_before_settle'] and c['benched_after_settle'] for c in closes.values())
             if closes else steps['bench_after_check']),
         'closes': closes,
         'closes_settled_correctly': sum(c['settled_correctly'] for c in closes.values()),
@@ -842,7 +856,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 finished[name] = round(message['_received_at'] - submitted[name], 1)
                 continue
             completed[name] += 1
-            due = (settlements(root / name) >= SUSTAINED_STEER_SETTLES if size == 'sustained'
+            due = (settled_closes(root / name) >= SUSTAINED_STEER_CLOSES if size == 'sustained'
                    else completed[name] >= STEER_AFTER)
             if due and name not in steers:
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
