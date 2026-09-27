@@ -7250,10 +7250,18 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         )?;
     }
     if from < 39 {
-        // 38 -> 39: a bot's folder can move. A turn that named none ran in
-        // its bot's folder, fixed until now, so the turn records it.
+        // 38 -> 39: a bot's folder can move. An absorbed steer that named no
+        // folder or model ran with those of the turn it joined; any other
+        // turn that named no folder ran in its bot's, fixed until now.
         conn.execute_batch(
-            "UPDATE turns SET workspace=(SELECT workspace FROM bots WHERE name=turns.bot)
+            "UPDATE turns SET (workspace,model)=(SELECT COALESCE(turns.workspace,t.workspace),
+                    COALESCE(turns.model,t.model)
+                FROM events e JOIN turns t ON t.id=json_extract(e.data,'$.into')
+                WHERE e.turn=turns.id AND e.kind='turn_finished')
+             WHERE status='steered' AND (workspace IS NULL OR model IS NULL)
+                AND EXISTS(SELECT 1 FROM events e JOIN turns t ON t.id=json_extract(e.data,'$.into')
+                    WHERE e.turn=turns.id AND e.kind='turn_finished');
+             UPDATE turns SET workspace=(SELECT workspace FROM bots WHERE name=turns.bot)
              WHERE workspace IS NULL;",
         )?;
     }

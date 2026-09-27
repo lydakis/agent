@@ -1739,18 +1739,56 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
 fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
     let path = std::env::temp_dir().join(format!("agent-folders-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let turn = {
+    let (turn, steer) = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         let turn = gated_turn(&mut db, None);
         db.create("Carol", None, binding()).unwrap();
-        turn
+        db.create("Dan", Some("/synthetic"), binding()).unwrap();
+        let active = TurnOptions {
+            workspace: Some("/synthetic/active".into()),
+            model: Some("openai/active".into()),
+            ..TurnOptions::default()
+        };
+        let first = db
+            .begin("Dan", "first", "work", true, &active, allow_provider)
+            .unwrap()
+            .turn;
+        let steering = TurnOptions {
+            delivery: Delivery::Steer,
+            ..TurnOptions::default()
+        };
+        let steer = db
+            .begin("Dan", "steer", "also", true, &steering, allow_provider)
+            .unwrap()
+            .turn;
+        db.absorb(first, None, 8 << 20, 4096, ContextUsage::default(), false)
+            .unwrap();
+        (turn, steer)
     };
-    // Before 39 a turn that named no folder stored none and read its bot's.
+    // Before 39 a turn's folder never moved its bot, a turn that named no
+    // folder stored none and read its bot's, and an absorbed steer that
+    // named no model stored none either.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("UPDATE turns SET workspace=NULL; PRAGMA user_version=38;")
+        .execute_batch(&format!(
+            "UPDATE bots SET workspace='/synthetic' WHERE name='Dan';
+             UPDATE turns SET workspace=NULL WHERE id IN ({turn},{steer});
+             UPDATE turns SET model=NULL WHERE id={steer}; PRAGMA user_version=38;"
+        ))
         .unwrap();
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    // The steer ran with the folder and model of the turn it joined.
+    let listed = db.turns("Dan", 0, 10).unwrap();
+    let row = listed["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["turn"] == steer)
+        .unwrap();
+    assert_eq!(
+        (&row["workspace"], &row["model"]),
+        (&json!("/synthetic/active"), &json!("openai/active"))
+    );
     let moving = TurnOptions {
         workspace: Some("/synthetic/moved".into()),
         delivery: Delivery::Queue,
