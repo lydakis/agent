@@ -1184,21 +1184,18 @@ fn run(options: &Options) -> Result<i32> {
 }
 
 /// A busy bot's refusal, with the ways past it as flags to copy: callers,
-/// models included, do not act on a description of them. The daemon says
-/// only what is in the way.
+/// models included, do not act on a description of them. The daemon names
+/// the same ways as request fields.
 fn ways_past_busy(bot: &str, error: Error) -> Error {
     if error.code != "bot_busy" {
         return error;
     }
-    // The refusal's own facts, as of the refusing transaction.
-    let fact = |key| {
-        error
-            .facts
-            .as_deref()
-            .and_then(|facts| facts.get(key))
-            .and_then(Value::as_i64)
-    };
-    let running = fact("running_turn");
+    // The refusal's own fact, as of the refusing transaction.
+    let running = error
+        .facts
+        .as_deref()
+        .and_then(|facts| facts.get("running_turn"))
+        .and_then(Value::as_i64);
     let join = match running {
         Some(turn) => format!(
             "resend with --delivery steer --turn {turn} to add this to it, \
@@ -1206,13 +1203,8 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
         ),
         None => "resend with --delivery queue to run this after it".to_owned(),
     };
-    // A turn from before its finished rounds were kept has no fork point
-    // until its next model response.
-    let fork = if running.is_some() && fact("fork_point").is_none() {
-        String::new()
-    } else {
-        format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW")
-    };
+    let fork =
+        format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW");
     // The daemon's own detail names request fields; this says the same in flags.
     let stated = match running {
         Some(turn) => format!("turn {turn} is running"),
@@ -1293,16 +1285,7 @@ fn fork(options: &Options) -> Result<i32> {
     if auto {
         ensure_approver(options, &mut connection, bot_model(&state))?;
     }
-    let result = connection.request("fork", request).map_err(|error| {
-        if error.code != "fork_point_unknown" {
-            return error;
-        }
-        Error::with(
-            "fork_point_unknown",
-            "this turn began before its finished rounds were kept; pass --checkpoint, or fork \
-             after its next model response",
-        )
-    })?;
+    let result = connection.request("fork", request)?;
     print_json(&result, options.pretty)?;
     Ok(0)
 }

@@ -1065,9 +1065,9 @@ source's head is used, and a running or parked turn's newest finished round:
 the last result of its newest fully answered round, a steer absorbed at a
 round boundary, a final answer not yet finished, or the turn's prompt before
 any round finishes. The store keeps that node current as the turn appends, so
-this fork reads no transcript. A turn that began before the store kept it
-(schema 36) refuses a default fork with `fork_point_unknown` until its next
-model response or steer. A fork keeps its source's window start when the fork
+this fork reads no transcript. The upgrade to schema 36, which began keeping
+it, refuses a store with a turn running or parked
+(`store_migration_turn_in_flight`), so every turn has one. A fork keeps its source's window start when the fork
 point is at or after it and carries the source's current compaction, so its
 first request can read the source's cache. `allow` narrows which of the
 source's tools the fork may call: absent keeps the source's list, `[]` allows
@@ -1122,13 +1122,9 @@ the turn's id and handle at once, and `wait`, `turns`, and
   refusal's `running_turn` and `fork_point`, taken in the refusing
   transaction, so it asks nothing more and never names a turn that started
   since. `fork_point` is where a fork without a checkpoint starts, the head
-  of an idle bot or that newest finished round; it is null while a turn that
-  began before such rounds were kept has had no model response since, and
-  then no fork is offered. A model calling `agent run`
+  of an idle bot or that newest finished round. A model calling `agent run`
   does not discover them otherwise, and in benchmark runs it ignored a prose
-  description of them. Likewise `fork_point_unknown` says to fork with a
-  checkpoint or after the next model response, and `agent fork` names
-  `--checkpoint`.
+  description of them.
 - `queue`: the turn is a durable row that starts when the bot is free and a
   slot is open. The response reports `status`: `running` when it started at
   once, `queued` behind the bot's own work, or `ready` when only a slot is
@@ -1292,7 +1288,10 @@ summary or elision changed the bot's view last; turns stored before record
 neither, so a [summary](#compaction) after them never takes their call as
 having sent the view. Schema 35 adds `bots.denials`, the [denial
 counts](#tool-approval); none were kept before, so every bot starts from
-none. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
+none. Schema 36 keeps a running turn's newest finished round; a store with a
+turn running or parked is refused with `store_migration_turn_in_flight`,
+since that round cannot be read back without a transcript scan. End the
+turn with the earlier binary, or use a new store path. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
 prompt; turns stored before record none, so they read as a person's.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may

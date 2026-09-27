@@ -2768,6 +2768,31 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
         .unwrap()
         .turn;
     let prompt = head(&db, "Bob");
+    // A busy submission is told what is in the way and which requests get
+    // past it, with the same facts for programs.
+    let busy = db
+        .begin(
+            "Bob",
+            "r3",
+            "ask",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap_err();
+    assert_eq!(busy.code, "bot_busy");
+    assert_eq!(
+        busy.detail.unwrap(),
+        format!(
+            "turn {turn} is running; submit with delivery \"steer\" and expected_turn {turn} \
+             to add this to it, or delivery \"queue\" to run it afterwards; to ask without \
+             interrupting, fork this bot and submit to the fork"
+        )
+    );
+    assert_eq!(
+        busy.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"running_turn":turn,"fork_point":prompt}))
+    );
     assert_eq!(fork_point(&mut db, "Bob", "f0").unwrap(), prompt);
 
     // Two calls in one round: the round closes only at its last result.
@@ -2981,10 +3006,10 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
 }
 
 #[test]
-fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
+fn schema_36_refuses_a_store_with_a_turn_in_flight() {
     let path = std::env::temp_dir().join(format!("agent-closed-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let turn = {
+    {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
@@ -3006,8 +3031,7 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         db.tool_start(turn, &w).unwrap();
         db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
             .unwrap();
-        turn
-    };
+    }
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -3015,61 +3039,17 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
              ALTER TABLE processes DROP COLUMN delivered; PRAGMA user_version=35;",
         )
         .unwrap();
-    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-    assert_eq!(db.inspect("Bob").unwrap().fork_point, None);
-    assert_eq!(
-        db.fork("Bob", "early", Fork::default()).unwrap_err().code,
-        "fork_point_unknown"
-    );
-    // A busy submission is told what is in the way and what gets past it,
-    // with no fork it cannot start.
-    let busy = db
-        .begin(
-            "Bob",
-            "r3",
-            "ask",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap_err();
-    assert_eq!(busy.code, "bot_busy");
-    assert_eq!(
-        busy.detail.unwrap(),
-        format!(
-            "turn {turn} is running; submit with delivery \"steer\" and expected_turn {turn} \
-             to add this to it, or delivery \"queue\" to run it afterwards"
-        )
-    );
-    // Its facts name the turn and no fork point.
-    assert_eq!(
-        busy.facts.map(|facts| Value::Object(*facts)),
-        Some(json!({"running_turn":turn,"fork_point":null}))
-    );
-    // An explicit point still works, and the next response lifts the refusal.
-    let prompt = head(&db, "Bob") - 1;
-    db.fork(
-        "Bob",
-        "explicit",
-        Fork {
-            checkpoint: Some(prompt),
-            ..Fork::default()
-        },
-    )
-    .unwrap();
-    db.resume(turn).unwrap();
-    db.tool_finish(turn, "w", &result("{}")).unwrap();
-    assert_eq!(
-        db.fork("Bob", "still", Fork::default()).unwrap_err().code,
-        "fork_point_unknown"
-    );
-    let waited = head(&db, "Bob");
-    let (item, a) = call("a");
-    db.append(turn, vec![item], std::slice::from_ref(&a), None)
+    // Its closed node cannot be read back, so the upgrade waits for the
+    // turn to end rather than guessing; the store is left as it was.
+    let refused = Database::initialize(Connection::open(&path).unwrap())
+        .err()
         .unwrap();
-    assert_eq!(db.inspect("Bob").unwrap().fork_point, Some(waited));
-    assert_eq!(fork_point(&mut db, "Bob", "later").unwrap(), waited);
-    drop(db);
+    assert_eq!(refused.code, "store_migration_turn_in_flight");
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 35);
     std::fs::remove_file(path).unwrap();
 }
 

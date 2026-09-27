@@ -146,16 +146,15 @@ turn's prompt.
   forks keep today's validation.
 - **Turns running across the upgrade are refused, not guessed.** The
   migration only adds the two nullable columns. It builds no index and
-  reads or writes no row, so opening an upgraded store costs the same
-  however much history it holds. A waiting or paced turn restored at open
-  has no boundary and no count until its next model response or steer
-  batch writes them. Until then a default fork of it fails with
-  `fork_point_unknown`, for which `agent fork` names `--checkpoint`. Guessing the prompt
-  would repeat the failure seen live, a fork that redoes the task. Finding
-  the real node would take the transcript scan this design avoids. An
-  upgrade test opens a store with thousands of parked turns and many
-  finished ones. It checks that open reads no transcript or `tools` rows,
-  and that the refusal lifts at the turn's next model response.
+  reads no transcript, so opening an upgraded store costs the same however
+  much history it holds. A running or parked turn's boundary cannot be
+  read back without the transcript scan this design avoids, and guessing
+  the prompt would repeat the failure seen live, a fork that redoes the
+  task. So the upgrade refuses a store with such a turn
+  (`store_migration_turn_in_flight`) and leaves it at schema 35: end the
+  turn with the earlier binary, or start a new store. Every turn after it
+  has a boundary from the moment it starts (2026-09-27; until then the
+  runtime tolerated a missing one with `fork_point_unknown`).
 - **The fork keeps its source's window.** Today a fork's `context_start` is
   the carried compaction's cut, or NULL (db.rs:2978). The fork's first call
   then picks a new start at three quarters of the budget, which differs from
@@ -258,9 +257,7 @@ fork on its source's cache.
 - **`bot_busy` from `submit`**: `agent run` offers `fork --source NAME --bot NEW`
   with no checkpoint (the daemon's detail names the same fork in request
   terms, since 2026-09-27). That now means the newest finished round, including on
-  a first turn. It is offered only when the refusal's `fork_point` is set,
-  which a turn running across the schema 36 upgrade lacks until its next
-  model response.
+  a first turn.
 - **The preamble** keeps an executable fork command, `"$AGENT_BIN" fork
   --source NAME --bot NEW`, without the checkpoint, and adds the
   fork-or-fresh sentence above. This is the one opinion kept. It lives in

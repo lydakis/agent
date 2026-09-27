@@ -340,7 +340,7 @@ mod tests {
         reply
             .send(
                 json!({"id":id,"error":"bot_busy","detail":"turn 3 is running",
-                "running_turn":3,"fork_point":null}),
+                "running_turn":3,"fork_point":42}),
             )
             .unwrap();
         let error = request.await.unwrap().unwrap_err();
@@ -350,7 +350,7 @@ mod tests {
         );
         assert_eq!(
             error.facts.map(|facts| Value::Object(*facts)),
-            Some(json!({"running_turn":3,"fork_point":null}))
+            Some(json!({"running_turn":3,"fork_point":42}))
         );
     }
 

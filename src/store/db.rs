@@ -1331,7 +1331,8 @@ impl Database {
                     )
                 })?,
             },
-            // A running turn's newest closed node is kept as it moves.
+            // A running turn's newest closed node is kept as it moves, from
+            // the moment the turn starts.
             fork_point: match r.get::<_, Option<i64>>(4)? {
                 Some(_) => r.get(33)?,
                 None => r.get(1)?,
@@ -3325,22 +3326,17 @@ impl Database {
         if busy && reject {
             // What is in the way, as of this transaction, and the requests
             // that get past it, in this protocol's terms.
-            let mut detail = match bot.running_turn {
+            let fork = "to ask without interrupting, fork this bot and submit to the fork";
+            let detail = match bot.running_turn {
                 Some(turn) => format!(
                     "turn {turn} is running; submit with delivery \"steer\" and expected_turn \
-                     {turn} to add this to it, or delivery \"queue\" to run it afterwards"
+                     {turn} to add this to it, or delivery \"queue\" to run it afterwards; {fork}"
                 ),
-                None => "earlier work is waiting; submit with delivery \"queue\" to run this \
-                         after it"
-                    .to_owned(),
+                None => format!(
+                    "earlier work is waiting; submit with delivery \"queue\" to run this after \
+                     it; {fork}"
+                ),
             };
-            // A turn from before its finished rounds were kept has no fork
-            // point until its next model response.
-            if bot.running_turn.is_none() || bot.fork_point.is_some() {
-                detail.push_str(
-                    "; to ask without interrupting, fork this bot and submit to the fork",
-                );
-            }
             return Err(Error::with("bot_busy", detail)
                 .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
@@ -3969,8 +3965,7 @@ impl Database {
             tx.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
                 .execute(params![head, stub])?;
         }
-        // The round's last result closes it. A turn from before the count
-        // was kept has none, and gets one at its next response.
+        // The round's last result closes it.
         tx.execute(
             "UPDATE bots SET head=?1,open_calls=open_calls-1,
              closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
@@ -5356,16 +5351,7 @@ impl Database {
                 }
                 (Some(node), false)
             }
-            None if parent.running_turn.is_some() => match parent.fork_point {
-                Some(closed) => (Some(closed), true),
-                None => {
-                    return fail_with(
-                        "fork_point_unknown",
-                        "this turn began before its finished rounds were kept; fork with a \
-                         checkpoint, or after its next model response",
-                    );
-                }
-            },
+            None if parent.running_turn.is_some() => (parent.fork_point, true),
             None => (parent.head, false),
         };
         if let Some(node) = checkpoint.filter(|_| !validated) {
@@ -7185,10 +7171,22 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         |r| r.get::<_, bool>(0),
     )? {
         // 35 -> 36: a running turn's newest closed node, and which wait
-        // result delivered a background process. Nothing is read or
-        // guessed: a turn running across the upgrade gets its closed node
-        // at its next model response or steer, and a process finished
-        // before it is readable by the bot that started it alone.
+        // result delivered a background process. A running or parked
+        // turn's closed node cannot be read back without a transcript
+        // scan, so a store with one is refused rather than guessed. A
+        // process finished before it is readable by the bot that started
+        // it alone.
+        if conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bots WHERE running_turn IS NOT NULL)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return fail_with(
+                "store_migration_turn_in_flight",
+                "a turn is running or parked; let it end or interrupt it with the earlier \
+                 binary, or start a new store",
+            );
+        }
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN closed INTEGER;
              ALTER TABLE bots ADD COLUMN open_calls INTEGER;
