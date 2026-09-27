@@ -10,17 +10,29 @@ pub fn linked_branch(dir: &Path) -> Option<String> {
     // The nearest `.git` decides: a file in a linked worktree, a folder in
     // a main checkout.
     let dir = dir.ancestors().find(|d| d.join(".git").exists())?;
-    let pointer = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let pointer = small(&dir.join(".git"))?;
     let gitdir = Path::new(pointer.strip_prefix("gitdir:")?.trim());
     let gitdir = if gitdir.is_absolute() {
         gitdir.to_owned()
     } else {
         dir.join(gitdir)
     };
-    let head = std::fs::read_to_string(gitdir.join("HEAD")).ok()?;
+    let head = small(&gitdir.join("HEAD"))?;
     head.trim()
         .strip_prefix("ref: refs/heads/")
         .map(str::to_owned)
+}
+
+/// A metadata file's text, read no further than a pointer or ref needs.
+fn small(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 #[cfg(test)]

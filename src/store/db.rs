@@ -3695,12 +3695,15 @@ impl Database {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
-                tx.execute("UPDATE turns SET status='steered',finished_ms=?,prompt='',prompt_node=? WHERE id=?",
-                    params![epoch_ms(), id, steer])?;
+                tx.execute("UPDATE turns SET status='steered',finished_ms=?,prompt='',prompt_node=?,
+                    workspace=COALESCE(workspace,(SELECT workspace FROM turns WHERE id=?)) WHERE id=?",
+                    params![epoch_ms(), id, turn, steer])?;
             } else {
+                // A steer that named no folder records the one it ran in.
                 tx.execute(
-                    "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
-                    params![epoch_ms(), steer],
+                    "UPDATE turns SET status='steered',finished_ms=?,
+                        workspace=COALESCE(workspace,(SELECT workspace FROM turns WHERE id=?)) WHERE id=?",
+                    params![epoch_ms(), turn, steer],
                 )?;
             }
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,

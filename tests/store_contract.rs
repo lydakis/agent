@@ -1566,6 +1566,18 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         .turn;
     db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
+    // The steer named no folder, so it records the one its turn ran in,
+    // which a later move does not rewrite.
+    let row = |db: &Database, id: i64| {
+        db.turns("Carol", 0, 10).unwrap()["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["turn"] == id)
+            .unwrap()["workspace"]
+            .clone()
+    };
+    let ran_in = row(&db, turn);
     // One call fails, one is still running.
     let (items, round): (Vec<Bytes>, Vec<ToolCall>) = [("c1", "false"), ("c2", "sleep 5")]
         .iter()
@@ -1678,6 +1690,15 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         db.prompts("Carol", next, 0).unwrap_err().code,
         "invalid_limit"
     );
+    let moving = TurnOptions {
+        workspace: Some("/synthetic/moved".into()),
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    db.begin("Carol", "r-move", "later", true, &moving, allow_provider)
+        .unwrap();
+    assert_eq!(row(&db, steered), ran_in);
+    assert_ne!(ran_in, json!("/synthetic/moved"));
 }
 
 #[test]
