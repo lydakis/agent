@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`turns`, `result`, `rm`, `prune`, `approvals`, `answer`, `stats`, `shutdown`,
+`turns`, `result`, `rm`, `prune`, `approvals`, `answer`, `models`, `stats`, `shutdown`,
 and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -146,6 +146,17 @@ with the CLI's built-in text as the default; the daemon has none. `run
 default `shell,read,write,edit,wait,history`; an existing bot keeps its own,
 so `--tools` while continuing one is a usage error.
 Other client commands require an already running daemon.
+
+`models` prints `~/.agent/models`, the models clients offer, as JSON
+`[{id, note?}]` (`--pretty`: one line each). The file holds one
+`PROVIDER/MODEL` per line, with anything after `#` a note; no file is an
+empty list, and a malformed line fails with `models_invalid` naming it.
+Reading it needs no daemon, and the daemon never reads it: any model runs.
+`models --discover` writes a first file from the listings of the providers
+the daemon runs (starting one like `run`), with each model's name and
+context size as its note and a comment for a provider that listed nothing.
+It refuses with `models_file_exists` once the file exists: after that it is
+the user's to edit. Bots see the same list by running `models`.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon
 directly, with Unix-socket service when `--socket` is

@@ -56,6 +56,8 @@ or `--provider bedrock-openai` for `bedrock-openai/openai.gpt-6-sol`.
 `AGENT_PROVIDER` takes the place of `--provider` for any provider, so
 `export AGENT_PROVIDER=bedrock AGENT_MODEL=bedrock/anthropic.claude-sonnet-5`
 needs no flags.
+`agent models --discover` writes `~/.agent/models` from what your providers
+list; edit it down to the models the app and your agents should offer.
 
 Each bot keeps the model it was created with, so bots on different providers
 can run side by side in one daemon. Other OpenAI Responses-compatible gateways

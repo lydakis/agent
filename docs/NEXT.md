@@ -904,6 +904,25 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     during the parse and is one short string per event. Pricing stays on
     the requested name, which the price table knows and a dated snapshot
     may not ([the contract](COMPARISON_CONTRACT.md#task-comparisons)).
+47. The desktop app's projects design (the "Agent App Concepts" prototype,
+    2026-09-25 to 26). Compared with the daemon, CLI and app on 2026-09-27,
+    nearly all of it is client work; the daemon learns nothing about
+    projects, roles or swarms. Done: the model list. `~/.agent/models` is a
+    config file clients read (the app, and `agent models`, which the preamble
+    names so a bot starting a peer sees the same choices); `agent models
+    --discover` writes a first one from the providers' own listings through
+    the daemon's `provider_models`. Source read 2026-09-27: Codex (9db8162)
+    refreshes its bundled catalog from the Codex backend's `/models`,
+    OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
+    catalogs. The daemon never reads the list. Next, in
+    order: the app shell (projects in the sidebar from coordinator bots and
+    `.agent/project.toml`, a side pane with its own composer, the model chip,
+    Send with queue, steer or side chat, one ⋯ menu, runs folded to one line);
+    tasks in worktrees (`run --new --worktree` with a setup command, in the
+    client); side chats once item 43's fork changes land; approvals in the
+    app (the daemon's manual mode exists); profiles and the coordinator role
+    text in the client policy; swarms last, since that design is not decided.
+    A fork into another provider stays out: history is provider-native.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

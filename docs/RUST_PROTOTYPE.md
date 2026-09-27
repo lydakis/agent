@@ -833,7 +833,8 @@ own path from the turn. Example requests:
 {"id":16,"op":"follow","bot":"*","after":0}
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
-{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-5.6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual"}
+{"id":19,"op":"provider_models"}
+{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual"}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
 {"id":23,"op":"answer","bot":"Carol","turn":7,"call_id":"call_1","request":1,"decision":"deny","reason":"not on main","by":"cli"}
 {"id":12,"op":"shutdown"}
@@ -889,6 +890,17 @@ does not, and each is one op:
   even with peers pending; an error or timeout without a result exits 1.
   `timeout_ms: 0` polls current outcomes and returns unresolved handles as
   pending without a timer, in both the protocol op and the wait tool.
+- `provider_models` asks each provider for its own model listing (`GET
+  .../models` with the provider's credentials, four providers at a time,
+  10 seconds each and 15 for the whole request) and
+  answers `providers.NAME.models` as `{id, name?, context_tokens?,
+  output_tokens?}`, or `providers.NAME.error` for a provider that would not
+  list. It runs off the dispatch path, only when asked, under the same
+  connection admission as a turn, and each provider keeps its answer, a
+  refusal included, five minutes. The reply fits one event: a listing past
+  what is left of it is `provider_models_limit` for that provider. Bedrock
+  Mantle is asked at the host's `/v1/models`. Nothing else reads it: a turn
+  runs whatever model it names. `agent models --discover` uses it once to write `~/.agent/models`.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
