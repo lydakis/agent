@@ -1371,7 +1371,7 @@ impl Database {
         }
         let mut statement = self.conn.prepare(
             "SELECT name,head,workspace,status,running_turn,provider,family,model,reasoning,budget_tokens,tokens_used,tools,
-                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates
+                    input_tokens,cached_input_tokens,id,created_by,created_by_id,gates,allowed
              FROM bots WHERE name > ? ORDER BY name LIMIT ?",
         )?;
         let mut rows = statement.query(params![after.unwrap_or(""), (limit + 1) as i64])?;
@@ -1394,6 +1394,10 @@ impl Database {
                 "gates":r.get::<_, Option<String>>(17)?
                     .map(|gates| serde_json::from_str::<Value>(&gates)).transpose()?
                     .unwrap_or_else(|| json!([]))});
+            let mut bot = bot;
+            if let Some(allowed) = r.get::<_, Option<String>>(18)? {
+                bot["allowed"] = json!(split_tools(&allowed));
+            }
             let size = crate::output::encoded_len(&bot)? + 1;
             if bots.len() == limit || bytes + size > crate::output::MAX_EVENT / 2 {
                 if bots.is_empty() {
@@ -3730,7 +3734,7 @@ impl Database {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
             let mut judged = Vec::new();
-            for call in calls {
+            for call in calls.iter().filter(|call| bot.gated(&call.name)) {
                 let gates: Vec<CallGate> = bot
                     .gates
                     .iter()

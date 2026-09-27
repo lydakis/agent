@@ -326,5 +326,10 @@ live came from the wrong fork point, not from missing framing.
 
 ## Open
 
+- A fork whose list leaves out `read` still sees its source's result stubs,
+  and its own results are still stubbed, since elision follows the tools a
+  bot is shown so the cached prefix holds. It can't expand them. Whether
+  such a fork should stop stubbing, which rebuilds its window, is left for
+  the app's answer-only side chat to measure.
 - How is a bot's allowed list widened, and by whom? Until that exists, a
   side chat kept as a task keeps its list.

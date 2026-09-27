@@ -1298,6 +1298,9 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('fork', source='Answer', bot='Wider', allow=['echo'])['error'],
                          'allow_not_in_source')
         self.assertEqual(client.request('fork', source='Answer', bot='Again')['result']['allowed'], [])
+        # Repeats count once against the daemon's tool count.
+        self.assertEqual(client.request('fork', source='Both', bot='Repeat', allow=['echo'] * 3)['result']['allowed'],
+                         ['echo'])
         # The fork is shown what its source was shown, so its first request
         # repeats the source's last one, and its call is refused at dispatch.
         turn = client.request('submit', bot='Answer', request_id='1', prompt='shell:true')['result']['turn']

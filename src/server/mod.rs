@@ -2345,12 +2345,20 @@ impl Service {
                     Some(None) => {
                         return fail_with("invalid_allow", "allow is a list of tool names");
                     }
-                    Some(Some(tools)) if tools.len() > self.registry.tool_count() => {
+                    // Repeats are allowed; the set stops growing past the bound.
+                    Some(Some(tools))
+                        if tools.len() > self.registry.tool_count() && {
+                            let mut distinct = std::collections::HashSet::new();
+                            tools.iter().any(|tool| {
+                                distinct.insert(tool.as_str());
+                                distinct.len() > self.registry.tool_count()
+                            })
+                        } =>
+                    {
                         return fail_with(
                             "invalid_allow",
                             format!(
-                                "allow names {} tools; the daemon has {}",
-                                tools.len(),
+                                "allow names more tools than the daemon's {}",
                                 self.registry.tool_count()
                             ),
                         );

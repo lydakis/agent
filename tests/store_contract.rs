@@ -8474,7 +8474,7 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
     let tools = ["shell".to_owned(), "read".to_owned()];
     let gate = Gate {
         tag: "manual".into(),
-        tools: vec!["shell".into()],
+        tools: vec!["shell".into(), "read".into()],
         expire_ms: None,
     };
     db.create(
@@ -8530,6 +8530,50 @@ fn a_fork_narrows_what_it_may_call_and_never_widens() {
     let (item, call) = shell_call("fc_1", "s", "true");
     let entries = db.append(turn, vec![item], &[call], None).unwrap();
     assert!(entries.iter().all(|e| e["event"] != "approval_requested"));
+    // In a round with a call it may make, only that one is announced.
+    db.finish(turn, None).unwrap();
+    let turn = db
+        .begin(
+            "Reader",
+            "r2",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (shell, s) = shell_call("fc_2", "s2", "true");
+    let arguments = json!({"path":"x"}).to_string();
+    let read = ToolCall {
+        name: "read".into(),
+        call_id: "r2".into(),
+        arguments: arguments.clone(),
+    };
+    let item = json!({"type":"function_call","id":"fc_3","call_id":"r2","name":"read","arguments":arguments});
+    let entries = db
+        .append(
+            turn,
+            vec![shell, serde_json::to_vec(&item).unwrap().into()],
+            &[s, read],
+            None,
+        )
+        .unwrap();
+    let announced: Vec<&Value> = entries
+        .iter()
+        .filter(|e| e["event"] == "approval_requested")
+        .flat_map(|e| e["data"]["calls"].as_array().unwrap())
+        .collect();
+    assert_eq!(announced.len(), 1);
+    assert_eq!(announced[0]["name"], "read");
+    let listed = db.list(None, 16).unwrap();
+    let reader = listed["bots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "Reader")
+        .unwrap();
+    assert_eq!(reader["allowed"], json!(["read"]));
 }
 
 #[test]
