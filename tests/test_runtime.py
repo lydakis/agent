@@ -1281,6 +1281,41 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('resume', bot='Both')['result']['tools'], ['shell', 'echo'])
         self.assertEqual(client.request('stats')['result']['active_turns'], 0)
 
+    def test_a_fork_calls_only_its_allowed_tools_and_keeps_its_sources_request(self):
+        client = self.client('echo,shell')
+        client.request('create', bot='Both', workspace=str(self.path), tools=['shell', 'echo'])
+        turn = client.request('submit', bot='Both', request_id='1', prompt='shell:true')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.model.requests.get(timeout=3)
+        last = self.model.requests.get(timeout=3)
+        # Absent inherits, [] allows none, null is refused, and a fork never widens.
+        self.assertEqual(client.request('fork', source='Both', bot='Null', allow=None)['error'], 'invalid_allow')
+        self.assertEqual(client.request('fork', source='Both', bot='Wide', allow=['sudo'])['error'],
+                         'allow_not_in_source')
+        plain = client.request('fork', source='Both', bot='Plain')['result']
+        self.assertNotIn('allowed', plain)
+        answer = client.request('fork', source='Both', bot='Answer', workspace=str(self.path), allow=[])['result']
+        self.assertEqual((answer['tools'], answer['allowed']), (['shell', 'echo'], []))
+        self.assertEqual(client.request('fork', source='Answer', bot='Wider', allow=['echo'])['error'],
+                         'allow_not_in_source')
+        self.assertEqual(client.request('fork', source='Answer', bot='Again')['result']['allowed'], [])
+        # Repeats count once against the daemon's tool count.
+        self.assertEqual(client.request('fork', source='Both', bot='Repeat', allow=['echo'] * 3)['result']['allowed'],
+                         ['echo'])
+        # The fork is shown what its source was shown, so its first request
+        # repeats the source's last one, and its call is refused at dispatch.
+        turn = client.request('submit', bot='Answer', request_id='1', prompt='shell:true')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        first = self.model.requests.get(timeout=3)
+        self.assertEqual(json.dumps(first['instructions']), json.dumps(last['instructions']))
+        self.assertEqual(json.dumps(first['tools']), json.dumps(last['tools']))
+        self.assertEqual(json.dumps(first['input'][:len(last['input'])]), json.dumps(last['input']))
+        events = client.request('events', bot='Answer', after=0, limit=64)['result']['events']
+        done = [e for e in events if e['event'] == 'tool_completed'][0]
+        output = client.request('item', bot='Answer', node=done['data']['node'])['result']['output']
+        self.assertEqual(json.loads(output)['error'], 'tool_not_available')
+        self.assertEqual(client.request('resume', bot='Answer')['result']['allowed'], [])
+
     def test_a_bot_is_created_with_what_its_client_states_and_keeps_it(self):
         client = self.client()
         raw = lambda **params: client.request('create', bot='Bob', workspace=str(self.path), **params)
@@ -1371,6 +1406,22 @@ class RuntimeTests(ModelFixture):
         client.process.stdin.flush()
         self.assertEqual(client.receive(lambda m: 'error' in m and m.get('id') is None)['error'], 'invalid_json')
         self.assertEqual(client.request('resume', bot='other')['error'], 'bot_not_found')
+
+    def test_a_running_bot_forks_at_its_newest_finished_round(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='hold', prompt='wait')['result']['turn']
+        self.model.requests.get(timeout=3)
+        busy = client.request('submit', bot='Bob', request_id='more', prompt='hi')
+        self.assertEqual(busy['error'], 'bot_busy')
+        self.assertIn('fork --source Bob --bot NEW', busy['detail'])
+        # No round has finished, so the fork starts at the turn's prompt.
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        prompt = next(e['data']['node'] for e in events if e['event'] == 'accepted' and e['turn'] == turn)
+        forked = client.request('fork', source='Bob', bot='Side', workspace=str(self.path))['result']
+        self.assertEqual(forked['head'], prompt)
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
 
     def test_turn_overrides_workspace_and_model_within_the_family(self):
         client = self.client('echo,shell')
