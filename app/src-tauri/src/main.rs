@@ -94,7 +94,10 @@ fn config() -> Result<Config, String> {
     };
     let workspace = workspace_path(&match workspace {
         Some(dir) => PathBuf::from(dir),
-        None => std::env::current_dir().map_err(|e| e.to_string())?,
+        None => default_workspace(
+            std::env::current_dir().map_err(|e| e.to_string())?,
+            std::env::var_os("HOME").map(PathBuf::from),
+        ),
     })?;
     Ok(Config {
         socket,
@@ -102,6 +105,15 @@ fn config() -> Result<Config, String> {
         model: model.or_else(|| std::env::var("AGENT_MODEL").ok()),
         workspace,
     })
+}
+
+/// The launching directory, except the root a window opened from the Dock or
+/// Finder starts in: that is nobody's project, so home stands in for it.
+fn default_workspace(current: PathBuf, home: Option<PathBuf>) -> PathBuf {
+    match home {
+        Some(home) if current == std::path::Path::new("/") => home,
+        _ => current,
+    }
 }
 
 /// Resolve the default once at startup. The protocol requires an existing
@@ -121,7 +133,22 @@ fn workspace_path(path: &std::path::Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod config_tests {
-    use super::workspace_path;
+    use super::{default_workspace, workspace_path};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_launch_from_the_root_defaults_to_home() {
+        let home = Some(PathBuf::from("/Users/a"));
+        assert_eq!(
+            default_workspace("/".into(), home.clone()),
+            PathBuf::from("/Users/a")
+        );
+        assert_eq!(
+            default_workspace("/tmp/p".into(), home),
+            PathBuf::from("/tmp/p")
+        );
+        assert_eq!(default_workspace("/".into(), None), PathBuf::from("/"));
+    }
 
     #[test]
     fn workspace_defaults_require_an_existing_utf8_directory() {

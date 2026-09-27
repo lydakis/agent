@@ -132,8 +132,8 @@ process that outlives the window. A window opened from the Dock inherits
 launchd's environment rather than a terminal's, so `agent start` runs with
 the environment of the user's login shell (`$SHELL -l -i`), plus
 `~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
-(`export` and quotes allowed, `#` comments), refused unless only its owner
-can read it. That file is the app's; the CLI and the daemon never read it.
+(`export` and quotes allowed, `#` comments), refused unless it is a regular
+file of at most 64 KiB that only its owner can read. That file is the app's; the CLI and the daemon never read it.
 Both are read once per app run, and without `--model` or `AGENT_MODEL` of its
 own the app takes its default model from them too. The
 store and socket themselves are resolved from the app's own arguments and
@@ -179,7 +179,9 @@ AGENT_MODEL=anthropic/claude-sonnet-5 .local/target/release/agent-app \
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
-Arguments and environment are the CLI's: `--socket`, `--store`, `--model`,
+Without `--workspace` the workspace is the launching directory, or home when
+that is `/`, as for a window opened from the Dock. Arguments and environment
+are the CLI's: `--socket`, `--store`, `--model`,
 `--workspace`, `AGENT_SOCKET`, `AGENT_STORE`, `AGENT_MODEL`, and a store's
 socket is resolved the way the CLI and the daemon resolve it (the shared
 client crate's rendezvous), so a deep store path meets the same short socket.

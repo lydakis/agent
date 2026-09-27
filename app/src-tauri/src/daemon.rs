@@ -26,6 +26,8 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 /// stands until this has passed.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MARKER: &str = "__agent_app_environment__";
+/// Keys, not documents: bounds the read that starts every daemon.
+const MAX_ENV_FILE: u64 = 64 * 1024;
 
 static LOGIN: OnceCell<Option<Vec<(OsString, OsString)>>> = OnceCell::const_new();
 
@@ -134,16 +136,32 @@ fn env_file() -> Option<PathBuf> {
 /// in matching quotes. A missing file is empty. One others can read, or a line
 /// that is not an assignment, is refused by path and line, never by value.
 fn read_env_file(path: &Path) -> Result<Vec<(String, String)>, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    use std::{io::Read, os::unix::fs::PermissionsExt};
+    let unreadable =
+        |error: std::io::Error| format!("env_file_unreadable: {}: {error}", path.display());
+    // Checked before opening: opening a FIFO for reading would block.
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("env_file_unreadable: {}: {error}", path.display())),
+        Err(error) => return Err(unreadable(error)),
     };
-    let mode = std::fs::metadata(path)
-        .map_err(|error| format!("env_file_unreadable: {}: {error}", path.display()))?
-        .permissions()
-        .mode();
+    if !metadata.is_file() || metadata.len() > MAX_ENV_FILE {
+        return Err(format!(
+            "env_file_invalid: {} must be a regular file of at most {MAX_ENV_FILE} bytes",
+            path.display()
+        ));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_ENV_FILE + 1).read_to_string(&mut text))
+        .map_err(unreadable)?;
+    if text.len() as u64 > MAX_ENV_FILE {
+        return Err(format!(
+            "env_file_invalid: {} must be a regular file of at most {MAX_ENV_FILE} bytes",
+            path.display()
+        ));
+    }
+    let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
         return Err(format!(
             "env_file_permissions: {} is readable by others; chmod 600 it",
@@ -313,6 +331,20 @@ mod tests {
         assert!(!error.contains("sk-secret"));
         std::fs::write(&file, "1X=1\n").unwrap();
         assert!(read_env_file(&file).is_err());
+        std::fs::write(&file, "X=".repeat(40_000)).unwrap();
+        assert!(
+            read_env_file(&file)
+                .unwrap_err()
+                .starts_with("env_file_invalid: ")
+        );
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(
+            read_env_file(&file)
+                .unwrap_err()
+                .starts_with("env_file_invalid: ")
+        );
+        std::fs::remove_dir(&file).unwrap();
         std::fs::write(&file, "OK=1\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
