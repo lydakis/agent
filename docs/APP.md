@@ -96,7 +96,9 @@ client/          agent-client: the socket protocol and the client policy
   batch of that session's notifications, at most 256, when it asks;
   `request` relays any protocol op; `models` reads `~/.agent/models`, and
   `project` and `write_project` read and write a folder's
-  `.agent/project.toml` ([project.rs](../app/src-tauri/src/project.rs)).
+  `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
+  `policy` composes a folder's client policy, in a profile when named, and
+  falls back to the profiles the app ships for `coordinator`.
   When nothing listens on a store's socket, `attach` starts a daemon first
   ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
   [Installing](#installing).
@@ -223,7 +225,7 @@ The shell follows the "Agent App Concepts" prototype (NEXT item 47). The
 daemon learns nothing about projects; everything here is client work.
 
 - **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
-  and `.agent/project.toml` (name, coordinator, model; mechanics only). The
+  and `.agents/project.toml` (name, coordinator, model; mechanics only). The
   sidebar lists every coordinator in the store as a project, with its tasks
   under it: the coordinator's `created_by` lineage, plus any root bot named
   `<project>.<task>`. Bots in no project follow. A project row opens its
@@ -267,12 +269,16 @@ daemon learns nothing about projects; everything here is client work.
   is the same agent asked something else at the same time (George,
   2026-09-27). The fork names no tool list and no folder.
 - **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
-  daemon's. A coordinator the app creates gets, after the shared policy, a
-  short text of the app's own: a task that changes files, named with the
+  daemon's. A coordinator the app creates is started in the `coordinator`
+  profile: the folder's `.agents/agents/coordinator.md`, the user's, or the
+  one the app ships ([coordinator.md](../app/agents/coordinator.md)), whose
+  model and tools apply when the project names none. The shipped text
+  says: a task that changes files, named with the
   project's prefix so projects do not collide, gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
-  folder's `.agent/setup` run inside it, and `agent run --new --agents
-  --workspace` that worktree, in the project's subfolder of it; the task
+  folder's `.agents/setup` run inside it, and `agent run --new --agents
+  --workspace` (or `--profile ROLE` when a listed role fits) that worktree,
+  in the project's subfolder of it; the task
   keeps that folder for later messages. The text also says the worktree
   starts at the last commit, that a failed setup, or a start that left no
   bot, removes the worktree and branch,
@@ -281,8 +287,7 @@ daemon learns nothing about projects; everything here is client work.
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
-  deleted task's worktree, profiles with the coordinator's role text,
-  swarms and approvals are later steps of item 47.
+  deleted task's worktree, swarms and approvals are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,

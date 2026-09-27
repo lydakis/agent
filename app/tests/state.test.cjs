@@ -857,32 +857,36 @@ test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'
   assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), 'workspace' in q]), [[128, 'aa-fork', false], [128, '-fork-2', false]]);
 });
 
-test('a new project creates its coordinator in the folder, writes its file once, and is not made twice', async () => {
+test('a new project creates its coordinator in the folder, in its role, writes its file once, and is not made twice', async () => {
   const calls = []; let written = false;
   const p = shell({
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: written }),
-    policy: async (dir) => { calls.push(['policy', dir]); return { instructions: 'rules', compaction_instructions: 'summary', note: 'test' }; },
+    policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'rules', compaction_instructions: 'summary', model: 'alpha/role', tools: ['shell', 'wait'], note: 'test' }; },
     writeProject: async (q) => { calls.push(['write', q]); written = true; },
-    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'role', workspace: q.workspace } : { nodes: [], next_from: null }; },
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
-  assert.deepEqual([create.bot, create.workspace, create.model], ['weather.lead', '/synthetic/weather', 'alpha/one']);
-  // The shared policy first, then the app's own coordinator text: tasks that edit get worktrees.
-  assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
-  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /starts with your own name before \.lead/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
-  assert.match(create.instructions, /A task keeps its folder, so later messages to it need no --workspace/);
-  // Tasks get the worktree's own policy, failed starts clean up, and a folder without git keeps tasks in place.
-  assert.match(create.instructions, /run --detach --new --agents --bot NAME/);
-  assert.match(create.instructions, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
-  assert.match(create.instructions, /git worktree remove --force, git branch -D/);
-  assert.match(create.instructions, /when this folder is not a git repository, works in this folder/);
-  assert.equal(calls.find(([op]) => op === 'policy')[1], '/synthetic/weather');
-  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/one' });
+  // The coordinator profile composes the whole text; its model and tools apply when the project names none.
+  assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/synthetic/weather', 'coordinator']);
+  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions, Array.from(create.tools)], ['weather.lead', '/synthetic/weather', 'alpha/role', 'rules', ['shell', 'wait']]);
+  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/role' });
   assert.equal(p.S.selected, 'weather.lead');
   const before = calls.length;
   await p.createProject('/synthetic/weather');
   assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
+});
+
+test('the coordinator the app ships gives editing tasks worktrees and cleans up failed starts', () => {
+  const text = fs.readFileSync(require.resolve('../agents/coordinator.md'), 'utf8');
+  assert.match(text, /^---\nname: coordinator\n/);
+  assert.match(text, /git worktree add -b agent\/NAME/); assert.match(text, /starts with your own name before \.lead/); assert.match(text, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
+  assert.match(text, /A task keeps its folder, so later messages to it need no --workspace/);
+  assert.match(text, /run --detach --new --agents --bot NAME/); assert.match(text, /pass --profile ROLE in place of --agents/);
+  assert.match(text, /If \.agents\/setup exists here/);
+  assert.match(text, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
+  assert.match(text, /git worktree remove --force, git branch -D/);
+  assert.match(text, /when this folder is not a git repository, works in this folder/);
 });
 
 test('a project name taken by another folder\'s coordinator is refused, and a refused model is never written', async () => {

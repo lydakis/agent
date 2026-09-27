@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --profile --approval --approve --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -185,7 +185,11 @@ fn print_flags(flags: &str) {
             "--instructions-file" => ("FILE", "Read the instructions from a file"),
             "--agents" => (
                 "",
-                "Compose instructions: the preamble, AGENTS.md files from the workspace up, and skills",
+                "Compose instructions: the preamble, AGENTS.md files from the workspace up, skills and profiles",
+            ),
+            "--profile" => (
+                "ROLE",
+                "Compose instructions (as --agents) in the role .agents/agents/ROLE.md, with its model and tools",
             ),
             "--reasoning" => ("LEVEL", "low, medium, high, xhigh, or max"),
             "--request-id" => ("ID", "Idempotency key for this submission"),
@@ -429,6 +433,8 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
         ("--instructions", "--instructions-file"),
         ("--agents", "--instructions"),
         ("--agents", "--instructions-file"),
+        ("--profile", "--instructions"),
+        ("--profile", "--instructions-file"),
     ] {
         if has(a) && has(b) {
             return fail_with("usage", format!("{a} conflicts with {b}"));
@@ -448,6 +454,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
             "--instructions",
             "--instructions-file",
             "--agents",
+            "--profile",
             "--reasoning",
             "--budget-tokens",
             "--fallbacks",

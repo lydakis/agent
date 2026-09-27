@@ -128,8 +128,9 @@ the store and an entry in the daemon's registry, not a process.
 
 To give a bot your project's conventions, add `--agents` when you create it.
 Agent then composes its instructions from every `AGENTS.md` from the workspace
-up to the filesystem root, plus `~/.agent/AGENTS.md`, and an index of skills
-in `.agent/skills/`. See [client policy](docs/CLIENT.md).
+up to the filesystem root, plus `~/.agents/AGENTS.md`, and indexes of skills
+in `.agents/skills/` and profiles in `.agents/agents/`. `--profile ROLE`
+starts a bot in one of those roles. See [client policy](docs/CLIENT.md).
 
 ## Fork from an earlier point
 

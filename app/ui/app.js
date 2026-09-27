@@ -227,7 +227,7 @@ const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
 
 // ---------- projects ----------
-// A project is a folder, its coordinator bot `<project>.lead`, and `.agent/project.toml`. The list is
+// A project is a folder, its coordinator bot `<project>.lead`, and `.agents/project.toml`. The list is
 // the coordinator bots in the store, so nothing else can drift from it. A project's tasks are its
 // coordinator's lineage, and any root bot named `<project>.<task>`.
 const LEAD = '.lead';
@@ -1329,23 +1329,13 @@ async function sideChat(name, text = '') {
   throw Object.assign(failed, { kept: true });
 }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
-// A project in a folder: the folder's `.agent/project.toml` names it, or the folder's own name does,
+// A project in a folder: the folder's `.agents/project.toml` names it, or the folder's own name does,
 // and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
 // twice, unless it works in another folder. The file is written only once the daemon has accepted
 // the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
 // the file it lacks, with that coordinator's model, so a failed write retries.
-// The app's own opinion of how a coordinator works, after the shared policy. The daemon and the
-// CLI stay mechanisms: a turn runs in whatever folder it is sent with, so the coordinator names the
-// worktree each time it messages such a task.
-const COORDINATOR = `
-
-## Coordinating this project
-You coordinate the work in this folder. When it is a git repository, give a task that changes files its own worktree, so tasks do not collide. Pick a NAME that "$AGENT_BIN" ls does not list yet and that starts with your own name before .lead and a dot, so tasks in different projects do not collide, and that is also a valid git branch name; from this folder run
-git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
-The worktree starts at the last commit, so uncommitted changes here are not in it. If .agent/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
-"$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK
-so the task works in the same subfolder here. If setup fails, or the start fails and "$AGENT_BIN" ls does not list NAME, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again. A task keeps its folder, so later messages to it need no --workspace. A task that only reads, or any task when this folder is not a git repository, works in this folder. The branch holds a task's work until it is merged.
-`;
+// The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
+// `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
 async function createProject(dir) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
@@ -1354,11 +1344,11 @@ async function createProject(dir) {
     if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model });
     await openOnly(info.coordinator); return;
   }
-  const model = info.model || S.config?.model;
-  if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agent/project.toml');
-  const policy = await Daemon.policy(info.dir);
+  const policy = await Daemon.policy(info.dir, 'coordinator');
+  const model = info.model || policy.model || S.config?.model;
+  if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agents/project.toml');
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions + COORDINATOR, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);

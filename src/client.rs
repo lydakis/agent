@@ -65,6 +65,8 @@ struct Options {
     pretty: bool,
     new: bool,
     agents: bool,
+    /// A new bot's role: `.agents/agents/ROLE.md` in the workspace or home.
+    profile: Option<String>,
     detach: bool,
     no_spawn: bool,
     timeout_ms: Option<u64>,
@@ -126,6 +128,7 @@ fn parse(args: &[String]) -> Result<Options> {
         pretty: false,
         new: false,
         agents: false,
+        profile: None,
         detach: false,
         no_spawn: false,
         timeout_ms: None,
@@ -186,6 +189,7 @@ fn parse(args: &[String]) -> Result<Options> {
                         options.tools_explicit = true;
                     }
                     "--model" => options.model = Some(value),
+                    "--profile" => options.profile = Some(value),
                     "--delivery" => options.delivery = Some(value),
                     "--approval" => options.approval = Some(value),
                     "--approve" => options.approve = Some(value),
@@ -673,23 +677,44 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
 }
 
 /// Explicit text wins; `--agents` composes the shared policy for the
-/// workspace; otherwise the preamble alone.
-fn composed_instructions(options: &Options, workspace: &str) -> Result<String> {
-    if options.agents && options.instructions.is_some() {
+/// workspace, and `--profile` composes it in that role; otherwise the
+/// preamble alone.
+fn composed_instructions(
+    options: &Options,
+    workspace: &str,
+    role: Option<&agent_client::policy::Profile>,
+) -> Result<String> {
+    if (options.agents || role.is_some()) && options.instructions.is_some() {
         return fail_with(
             "usage",
-            "--agents and --instructions are mutually exclusive",
+            "--agents and --profile compose instructions; --instructions sets them",
         );
     }
     if let Some(text) = &options.instructions {
         return Ok(text.clone());
     }
-    if options.agents {
-        return agent_client::policy::instructions(std::path::Path::new(workspace))
+    if options.agents || role.is_some() {
+        return agent_client::policy::instructions(std::path::Path::new(workspace), role)
             .map(|composed| composed.text)
             .map_err(|error| Error::with(error.code(), error.to_string()));
     }
     Ok(DEFAULT_INSTRUCTIONS.to_owned())
+}
+
+/// The role a new bot is started in, which must exist.
+fn role(options: &Options, workspace: &str) -> Result<Option<agent_client::policy::Profile>> {
+    let Some(name) = &options.profile else {
+        return Ok(None);
+    };
+    agent_client::policy::profile(std::path::Path::new(workspace), name)
+        .map_err(|error| Error::with(error.code(), error.to_string()))?
+        .map(Some)
+        .ok_or_else(|| {
+            Error::with(
+                "profile_not_found",
+                format!("no .agents/agents/{name}.md in the workspace or ~/.agents/agents"),
+            )
+        })
 }
 
 /// Inside a bot's shell tool the daemon names the bot; a client run there
@@ -1111,33 +1136,39 @@ fn run(options: &Options) -> Result<i32> {
             "--tools chooses a new bot's tools; an existing bot keeps its own",
         );
     }
-    if !created && (options.instructions.is_some() || options.agents) {
+    if !created && (options.instructions.is_some() || options.agents || options.profile.is_some()) {
         return fail_with(
             "usage",
-            "--instructions and --agents set a new bot's instructions; an existing bot keeps its own",
+            "--instructions, --agents and --profile set a new bot's instructions; an existing bot keeps its own",
         );
     }
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
     if created {
         // The client chooses; the bot retains. Nothing about a bot comes
         // from the daemon or from whichever client connects later.
+        let workspace = workspace.as_deref().expect("a new bot resolves its folder");
+        let role = role(options, workspace)?;
         let model = options
             .model
             .clone()
+            .or_else(|| role.as_ref().and_then(|r| r.model.clone()))
             .or_else(|| std::env::var("AGENT_MODEL").ok())
             .ok_or(Error::with(
                 "usage",
                 "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
             ))?;
-        let workspace = workspace.as_deref().expect("a new bot resolves its folder");
-        let instructions = composed_instructions(options, workspace)?;
+        let instructions = composed_instructions(options, workspace, role.as_ref())?;
         let (created_by, created_by_id) = created_by()?;
-        let tools: Vec<String> = options
-            .tools
-            .split(',')
-            .filter(|t| !t.is_empty())
-            .map(str::to_owned)
-            .collect();
+        // --tools, else the role's, else the default set.
+        let tools: Vec<String> = match role.as_ref().and_then(|r| r.tools.clone()) {
+            Some(tools) if !options.tools_explicit => tools,
+            _ => options
+                .tools
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        };
         let mut create = json!({"bot":bot,"workspace":workspace,"model":model,
             "instructions":instructions,"reasoning":options.reasoning,
             "budget_tokens":options.budget_tokens,"tools":tools,

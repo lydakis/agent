@@ -946,7 +946,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
     catalogs. The daemon never reads the list. Done
     (2026-09-27): the app shell ([APP.md](APP.md#projects-and-panes)):
-    projects in the sidebar from coordinator bots and `.agent/project.toml`,
+    projects in the sidebar from coordinator bots and `.agents/project.toml`,
     a side pane with its own composer, the model chip, Send with queue or
     steer, one ⋯ menu, runs folded to one line. Done (2026-09-27): side
     chats, forks of a running or resting bot opened beside, with their
@@ -967,7 +967,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     are loaded.
     Done (2026-09-27): tasks in worktrees, as the app's opinion. Its
     coordinators are told to give an editing task `git worktree add` on
-    `agent/NAME`, the folder's `.agent/setup`, and `run --new --agents
+    `agent/NAME`, the folder's `.agents/setup`, and `run --new --agents
     --workspace`. A bot now keeps its folder: a message without
     `--workspace` runs where the bot is, one with it moves the bot there,
     and a fork starts where its source is (George, 2026-09-27); the app
@@ -983,12 +983,15 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     Follow-up: a turn without a folder runs in the bot's retained one
     unchecked, as the daemon's fallback always did; a folder deleted since
     shows up as a tool spawn error rather than a refusal at submit.
-    Next, in
-    order (George, 2026-09-27): profiles, role files read from the
-    locations other harnesses already use, with the coordinator's role text
-    as the first; then swarms as the v12 prototype draws them (board,
-    council, streams), measured against simpler setups; Keep. Approvals in
-    the app wait: George runs with full access.
+    Done (2026-09-27): profiles. Everything a client reads is under
+    `.agents` (George: one folder, the one the industry is converging on):
+    skills as `.agents/skills/NAME/SKILL.md`, profiles as
+    `.agents/agents/ROLE.md` with optional `description`, `model` and
+    `tools`, both indexed for every composed bot; `--profile ROLE` starts a
+    bot in one; the app's coordinator text is its shipped `coordinator`
+    profile ([CLIENT.md](CLIENT.md)). Next, in order: swarms as the v12
+    prototype draws them (board, council, streams), measured against simpler
+    setups; Keep. Approvals in the app wait: George runs with full access.
     A fork into another provider stays out: history is provider-native.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
