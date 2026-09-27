@@ -6,6 +6,7 @@ import time
 import unittest
 
 from tests.test_runtime import ModelFixture
+from bench.runtime_client import poll
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -75,7 +76,7 @@ class PacedParkTests(ModelFixture):
                                        prompt=prompt, delivery=delivery)['result']
             self.assertEqual((duplicate['duplicate'], duplicate['turn'], duplicate['status']),
                              (True, turn, 'paced'))
-            self.assertFalse(client.request('result', bot=bot, turn=turn)['result']['finished'])
+            self.assertFalse(poll(client, bot, turn)['result']['finished'])
         self.assertEqual(self.model.requests.qsize(), 2)
         time.sleep(.05)
         for bot, turn in (('Seed', seed), ('Blocked', blocked)):

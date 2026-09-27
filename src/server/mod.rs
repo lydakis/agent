@@ -231,11 +231,6 @@ enum Command {
         after: i64,
         limit: Option<usize>,
     },
-    /// A turn's outcome without waiting: the wait payload, or its live status.
-    Result {
-        bot: String,
-        turn: i64,
-    },
     Submit {
         bot: String,
         /// The identity `bot` had when this request was first made; a retry
@@ -273,10 +268,6 @@ enum Command {
         bot: String,
         nodes: Vec<i64>,
     },
-    Item {
-        bot: String,
-        node: i64,
-    },
     /// A turn's prompts with who wrote each, its started calls, and the
     /// bot's earlier prompts, within `bytes` of text.
     Prompts {
@@ -284,11 +275,12 @@ enum Command {
         turn: i64,
         bytes: Option<usize>,
     },
+    /// One page of a retained tool output stream, by byte offset.
     Artifact {
         bot: String,
         turn: i64,
         call_id: String,
-        stream: Option<String>,
+        stream: String,
         #[serde(default)]
         offset: u64,
         limit: Option<usize>,
@@ -297,9 +289,6 @@ enum Command {
         bot: String,
         #[serde(default)]
         after: i64,
-    },
-    Unfollow {
-        bot: String,
     },
     /// Block this request until the handles resolve; the response carries
     /// the same result shape as the wait tool.
@@ -1023,7 +1012,6 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals","prompts","prompt_authors","provider_models"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -2083,19 +2071,6 @@ impl Service {
                 });
                 Err(Error::new("deferred"))
             }
-            Command::Result { bot, turn } => {
-                store
-                    .op("turn_outcome", move |db| {
-                        match db.turn_outcome(&bot, turn)? {
-                            Some(outcome) => Ok(outcome),
-                            None => {
-                                let status = db.turn_status(&bot, turn)?;
-                                Ok(json!({"turn":turn,"status":status,"finished":false}))
-                            }
-                        }
-                    })
-                    .await
-            }
             Command::Resume { bot } => {
                 store
                     .op("inspect", move |db| {
@@ -2434,7 +2409,6 @@ impl Service {
                     .read("history_items", move |db| db.history_items(&bot, &nodes))
                     .await
             }
-            Command::Item { bot, node } => store.read("item", move |db| db.item(&bot, node)).await,
             Command::Prompts { bot, turn, bytes } => {
                 store
                     .read("prompts", move |db| {
@@ -2451,17 +2425,15 @@ impl Service {
                 limit,
             } => {
                 store
-                    .op("artifact_page", move |db| match stream {
-                        Some(stream) => db.artifact_page(
+                    .op("artifact_page", move |db| {
+                        db.artifact_page(
                             &bot,
                             turn,
                             &call_id,
                             &stream,
                             offset,
                             limit.unwrap_or(64 * 1024),
-                        ),
-                        None if offset == 0 && limit.is_none() => db.artifact(&bot, turn, &call_id),
-                        None => fail("artifact_stream_required"),
+                        )
                     })
                     .await
             }
@@ -2485,10 +2457,6 @@ impl Service {
                 });
                 sub.lock().unwrap().set_replay(task);
                 Ok(json!({"following":bot,"after":after}))
-            }
-            Command::Unfollow { bot } => {
-                self.hub.unsubscribe(&bot, session);
-                Ok(json!({"following":Value::Null}))
             }
             Command::Submit {
                 bot,

@@ -6,7 +6,7 @@ import subprocess
 import time
 import unittest
 
-from bench.runtime_client import serve_args
+from bench.runtime_client import node_item, poll, serve_args
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
 
@@ -42,7 +42,7 @@ class AccountingTests(ModelFixture):
     def tool_output(self, client, bot, call_id):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         node = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]['data']['node']
-        return client.request('item', bot=bot, node=node)['result']['output']
+        return node_item(client, bot, node)['result']['output']
 
     def test_budget_refuses_submissions_and_stops_turns_before_the_next_call(self):
         client = self.client('echo,shell,wait')
@@ -135,20 +135,21 @@ class AccountingTests(ModelFixture):
                                   'output_tokens': 20, 'cache_hit': 0.4})
         self.assertEqual({key: row[key] for key in totals}, totals)
 
-    def test_result_reports_outcomes_and_live_status(self):
+    def test_wait_reports_outcomes_and_turns_report_live_status(self):
         client = self.client('echo')
         client.request('create', bot='Bob', workspace=str(self.path))
-        self.assertEqual(client.request('result', bot='Bob', turn=99)['error'], 'turn_not_found')
+        self.assertEqual(poll(client, 'Bob', 99)['error'], 'turn_not_found')
         turn = client.request('submit', bot='Bob', request_id='w', prompt='wait')['result']['turn']
         self.model.requests.get(timeout=3)
-        live = client.request('result', bot='Bob', turn=turn)['result']
-        self.assertEqual((live['status'], live['finished']), ('running', False))
+        self.assertEqual(poll(client, 'Bob', turn)['result'], {'turn': turn, 'finished': False})
+        live = client.request('turns', bot='Bob', after=turn - 1, limit=1)['result']['turns'][0]
+        self.assertEqual((live['turn'], live['status']), (turn, 'running'))
         client.request('interrupt', bot='Bob', turn=turn)
         client.finished(turn)
-        done = client.request('result', bot='Bob', turn=turn)['result']
+        done = poll(client, 'Bob', turn)['result']
         self.assertEqual((done['status'], done['error']), ('interrupted', 'cancelled'))
         client.request('create', bot='Other', workspace=str(self.path))
-        self.assertEqual(client.request('result', bot='Other', turn=turn)['error'], 'turn_not_found')
+        self.assertEqual(poll(client, 'Other', turn)['error'], 'turn_not_found')
 
     def test_model_reads_its_own_retained_output_through_the_read_tool(self):
         client = self.client('echo,shell,read')
@@ -206,19 +207,18 @@ class AccountingTests(ModelFixture):
         client.finished(later)
         self.assertIn('result', client.request('prune', bot='Bob', keep_turns=1))
         for bot in ('Bob', 'Fork'):
-            self.assertEqual(client.request('artifact', bot=bot, turn=big, call_id='shell-1')['error'], 'artifact_pruned')
             self.assertEqual(client.request('artifact', bot=bot, turn=big, call_id='shell-1', stream='stdout',
                                             offset=0, limit=64)['error'], 'artifact_pruned')
         # Lineage still decides who is told: an unrelated bot and an unanswered call see no turn.
-        self.assertEqual(client.request('artifact', bot='Other', turn=big, call_id='shell-1')['error'], 'turn_not_found')
-        self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-9')['error'], 'turn_not_found')
+        self.assertEqual(client.request('artifact', bot='Other', turn=big, call_id='shell-1', stream='stdout')['error'], 'turn_not_found')
+        self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-9', stream='stdout')['error'], 'turn_not_found')
         read = client.request('submit', bot='Fork', request_id='read',
                               prompt=f'readart:{big}/shell-1/stdout 1,5')['result']['turn']
         self.assertEqual(client.finished(read)['data']['status'], 'completed')
         self.assertEqual(json.loads(self.tool_output(client, 'Fork', 'readart-1'))['error'], 'artifact_pruned')
         # Deleting the producer removes what it owned; the fork's inherited output is still reported as pruned.
         self.assertIn('result', client.request('delete', bot='Bob'))
-        self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-1')['error'], 'artifact_pruned')
+        self.assertEqual(client.request('artifact', bot='Fork', turn=big, call_id='shell-1', stream='stdout')['error'], 'artifact_pruned')
         self.assertEqual(client.request('submit', bot='Bob', request_id='big', prompt='retry')['error'], 'bot_not_found')
 
     def test_unversioned_and_newer_stores_are_refused_with_clear_codes(self):
@@ -258,18 +258,16 @@ class IdleExitTests(ModelFixture):
         # Inspection restarts without submitting any model work. Respect --no-spawn.
         creation = ('--model', '--tools')
         inspect = [flag for i, flag in enumerate(common) if flag not in creation and common[i - 1] not in creation]
-        stopped = subprocess.run([str(self.binary), 'result', *inspect, '--bot', 'Bob', '--turn', '1', '--no-spawn'],
+        stopped = subprocess.run([str(self.binary), 'turns', *inspect, '--bot', 'Bob', '--no-spawn'],
                                  env=clean_env(), capture_output=True, text=True, timeout=10)
         self.assertEqual(stopped.returncode, 1)
         self.assertIn('daemon_unavailable', stopped.stderr)
-        for command in ('result', 'turns'):
-            args = ['--turn', '1'] if command == 'result' else []
-            inspected = subprocess.run([str(self.binary), command, *inspect, '--bot', 'Bob', *args],
-                                       env=clean_env(), capture_output=True, text=True, timeout=10)
-            self.assertEqual(inspected.returncode, 0, inspected.stderr)
-            self.assertTrue(json.loads(inspected.stdout))
-            subprocess.run([str(self.binary), 'shutdown', '--store', str(store)],
-                           env=clean_env(), capture_output=True, timeout=5, check=True)
+        inspected = subprocess.run([str(self.binary), 'turns', *inspect, '--bot', 'Bob'],
+                                   env=clean_env(), capture_output=True, text=True, timeout=10)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        self.assertTrue(json.loads(inspected.stdout))
+        subprocess.run([str(self.binary), 'shutdown', '--store', str(store)],
+                       env=clean_env(), capture_output=True, timeout=5, check=True)
         self.assertEqual(self.model.requests.qsize(), 1)
         # A later command restarts the daemon and continues the same bot.
         again = subprocess.run([str(self.binary), 'run', *inspect, '--bot', 'Bob', 'tool:again'],
@@ -277,8 +275,5 @@ class IdleExitTests(ModelFixture):
         self.assertEqual(again.returncode, 0, again.stderr)
         turns = json.loads(subprocess.run([str(self.binary), 'turns', '--store', str(store), '--bot', 'Bob'],
                                           env=clean_env(), capture_output=True, text=True, timeout=10).stdout)
-        self.assertEqual([t['turn'] for t in turns], [1, 2])
-        outcome = json.loads(subprocess.run([str(self.binary), 'result', '--store', str(store), '--bot', 'Bob', '--turn', '2'],
-                                            env=clean_env(), capture_output=True, text=True, timeout=10).stdout)
-        self.assertEqual(outcome['status'], 'completed')
+        self.assertEqual([(t['turn'], t['status']) for t in turns], [(1, 'completed'), (2, 'completed')])
         subprocess.run([str(self.binary), 'shutdown', '--store', str(store)], env=clean_env(), capture_output=True, timeout=5)

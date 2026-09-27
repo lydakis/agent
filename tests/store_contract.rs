@@ -26,6 +26,11 @@ fn assistant(text: &str) -> Bytes {
 fn db() -> Database {
     Database::initialize(Connection::open_in_memory().unwrap()).unwrap()
 }
+/// One node's item, read the way clients read it: a batch of one.
+fn read_item(db: &Database, bot: &str, node: i64) -> Result<Value> {
+    db.history_items(bot, &[node])
+        .map(|read| read["items"][0]["item"].clone())
+}
 /// The read tool, which a bot needs for its results to get stubs.
 static READ: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| vec!["read".into()]);
 fn binding() -> Binding<'static> {
@@ -171,7 +176,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
             .all(|e| e["cursor"].as_i64().unwrap() > cursor)
     );
     assert!(
-        db.item("Bob", db.inspect("Alternative").unwrap().head.unwrap())
+        db.history_items("Bob", &[db.inspect("Alternative").unwrap().head.unwrap()])
             .is_err()
     );
 }
@@ -1935,12 +1940,15 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     let (_, entry) = db.tool_finish(turn, "c1", &outcome).unwrap();
     assert_eq!(entry["data"]["artifacts"][0], "stdout");
     assert_eq!(
-        db.artifact("Bob", turn, "c1").unwrap()["stdout"],
+        db.artifact_page("Bob", turn, "c1", "stdout", 0, 64)
+            .unwrap()["text"],
         "full output"
     );
-    assert!(db.artifact("Bob", turn, "missing").is_err());
+    assert!(
+        db.artifact_page("Bob", turn, "missing", "stdout", 0, 4)
+            .is_err()
+    );
     db.create("Other", Some("/synthetic"), binding()).unwrap();
-    assert!(db.artifact("Other", turn, "c1").is_err());
     assert!(
         db.artifact_page("Other", turn, "c1", "stdout", 0, 4)
             .is_err()
@@ -1991,9 +1999,9 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         true
     );
     let node = entry["data"]["node"].as_i64().unwrap();
-    assert!(db.item("Bob", node).is_ok());
-    assert!(db.item("Other", node).is_err());
-    assert!(db.item("Bob", node + 1000).is_err());
+    assert!(db.history_items("Bob", &[node]).is_ok());
+    assert!(db.history_items("Other", &[node]).is_err());
+    assert!(db.history_items("Bob", &[node + 1000]).is_err());
     // Retention empties the turn: the owner and a fork holding the output
     // node learn that, an unrelated bot and an unanswered call still do not.
     let checkpoint = db.finish(turn, None).unwrap().last().unwrap()["data"]["checkpoint"]
@@ -2023,10 +2031,6 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
     db.prune("Bob", 1).unwrap();
     for reader in ["Bob", "Fork"] {
         assert_eq!(
-            db.artifact(reader, turn, "c1").unwrap_err().code,
-            "artifact_pruned"
-        );
-        assert_eq!(
             db.artifact_page(reader, turn, "c1", "stdout", 0, 4)
                 .unwrap_err()
                 .code,
@@ -2040,15 +2044,21 @@ fn artifacts_are_scoped_to_the_owning_bot_and_lineage_checks_use_depth() {
         );
     }
     assert_eq!(
-        db.artifact("Other", turn, "c1").unwrap_err().code,
+        db.artifact_page("Other", turn, "c1", "stdout", 0, 4)
+            .unwrap_err()
+            .code,
         "turn_not_found"
     );
     assert_eq!(
-        db.artifact("Fork", turn, "c9").unwrap_err().code,
+        db.artifact_page("Fork", turn, "c9", "stdout", 0, 4)
+            .unwrap_err()
+            .code,
         "turn_not_found"
     );
     assert_eq!(
-        db.artifact("Bob", later, "c1").unwrap_err().code,
+        db.artifact_page("Bob", later, "c1", "stdout", 0, 4)
+            .unwrap_err()
+            .code,
         "artifact_not_found"
     );
 }
@@ -2649,7 +2659,7 @@ fn fork_lineage_pages_are_bounded_and_survive_source_deletion() {
     assert_eq!(second["nodes"][0]["node"], older);
     assert_eq!(second["nodes"][0]["turn"], turn);
     assert!(second["next_from"].is_null());
-    assert_eq!(db.item("branch", older).unwrap()["role"], "user");
+    assert_eq!(read_item(&db, "branch", older).unwrap()["role"], "user");
     db.create("empty", None, binding()).unwrap();
     assert_eq!(
         db.history_nodes("empty", None, 10, None, false).unwrap()["nodes"],
@@ -3968,7 +3978,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
         .unwrap();
         let mut db = Database::initialize(conn).unwrap();
         assert_eq!(
-            db.item("Bob", checkpoint).unwrap()["content"][0]["text"],
+            read_item(&db, "Bob", checkpoint).unwrap()["content"][0]["text"],
             "r1"
         );
         db.delete_bot("Bob").unwrap();
@@ -3979,7 +3989,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
         converse(&mut db, "Bob", 2);
         assert!(db.inspect("Bob").unwrap().head.unwrap() > checkpoint);
         assert_eq!(
-            db.item("Bob", checkpoint).unwrap_err().code,
+            read_item(&db, "Bob", checkpoint).unwrap_err().code,
             "item_not_in_bot_history"
         );
         assert_eq!(
@@ -4012,7 +4022,7 @@ fn checkpoint_identity_survives_migration_deletion_and_restart() {
         converse(&mut db, "Bob", 4);
         assert!(db.inspect("Bob").unwrap().head.unwrap() > removed);
         assert_eq!(
-            db.item("Bob", removed).unwrap_err().code,
+            read_item(&db, "Bob", removed).unwrap_err().code,
             "item_not_in_bot_history"
         );
     }
@@ -5993,7 +6003,7 @@ fn batched_history_items_validate_the_branch_and_bound_payloads() {
     for row in batch["items"].as_array().unwrap() {
         assert_eq!(
             row["item"],
-            db.item("branch", row["node"].as_i64().unwrap()).unwrap()
+            read_item(&db, "branch", row["node"].as_i64().unwrap()).unwrap()
         );
     }
     assert_eq!(batch["items"].as_array().unwrap().len(), ids.len());
@@ -6924,7 +6934,7 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
             let bot = db.inspect("Bob").unwrap();
             id = bot.id;
             head = bot.head.unwrap();
-            item = db.item("Bob", head).unwrap();
+            item = read_item(&db, "Bob", head).unwrap();
         }
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -6959,7 +6969,7 @@ fn merged_schema_preserves_stores_from_both_published_branches() {
             let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
             let bot = db.inspect("Bob").unwrap();
             assert_eq!((bot.id, bot.head), (id, Some(head)));
-            assert_eq!(db.item("Bob", head).unwrap(), item);
+            assert_eq!(read_item(&db, "Bob", head).unwrap(), item);
             if lineage {
                 assert_eq!(bot.created_by.as_deref(), Some("Parent"));
                 assert_eq!(bot.created_by_id, Some(parent_id));
@@ -7037,7 +7047,7 @@ fn oversized_history_items_do_not_hide_the_rest_of_the_batch() {
     for row in rows.iter().filter(|r| r["error"].is_null()) {
         assert_eq!(
             row["item"],
-            db.item("Bob", row["node"].as_i64().unwrap()).unwrap()
+            read_item(&db, "Bob", row["node"].as_i64().unwrap()).unwrap()
         );
     }
     assert!(serde_json::to_vec(&batch).unwrap().len() < 768 * 1024);
@@ -8659,15 +8669,18 @@ fn lineage_checks_reject_a_node_on_another_branch_at_any_depth() {
     // anything on Bob's lineage.
     for (reader, node) in [("Branch", bob), ("Bob", branch)] {
         assert_eq!(
-            db.item(reader, node).unwrap_err().code,
+            read_item(&db, reader, node).unwrap_err().code,
             "item_not_in_bot_history"
         );
     }
     for reader in ["Bob", "Branch"] {
-        assert_eq!(db.item(reader, shared).unwrap()["content"][0]["text"], "r1");
+        assert_eq!(
+            read_item(&db, reader, shared).unwrap()["content"][0]["text"],
+            "r1"
+        );
     }
     assert_eq!(
-        db.item("Branch", branch).unwrap()["content"][0]["text"],
+        read_item(&db, "Branch", branch).unwrap()["content"][0]["text"],
         "r5"
     );
 }

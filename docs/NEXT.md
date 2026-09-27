@@ -881,11 +881,16 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     at a 10 ms sync went from 56 to 131 turns per second; a lone admission
     is unchanged). `stats` reports group sizes and each group's oldest wait,
     the evidence a group work or byte budget would need; none is added.
-    Also done: on macOS the store sets `fullfsync` and
+    Also done, then narrowed: on macOS the store set `fullfsync` and
     `checkpoint_fullfsync`, because a plain fsync there leaves commits in
-    the drive cache. A flush costs about 5.4 ms on an M1 Max, paid once per
-    group, so a Mac should resemble the injected-delay rows above; the
-    window has not been measured there.
+    the drive cache. The per-commit flush doubled daemon CPU on the
+    32-agent echo screen and added 60 ms to its tail, found by bisecting
+    the two days after it landed, so it is off again; `checkpoint_fullfsync`
+    stays to preserve WAL/database write ordering and consistency at
+    checkpoints. An OS crash or power loss can still lose later acknowledged
+    commits; daemon-crash survival is retained. Workspace writes have
+    independent durability. See
+    [the bisect](DAEMON_MEASUREMENTS.md#full-flush-bisect).
 
 45. Approving tool calls. Every allowed call runs without a verdict today,
     and that stays the default. [The design](APPROVALS.md) adds two more

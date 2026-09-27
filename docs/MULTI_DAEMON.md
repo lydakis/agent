@@ -45,8 +45,8 @@ in [`Service::dispatch`](../src/server/mod.rs); storage execution is in
 
 | Read | Current execution path |
 | --- | --- |
-| `bots`, `turns`, `result`, `resume` inspection, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
-| `history_nodes`, `history_items`, `item` | Reader shared with model-context construction |
+| `bots`, `turns`, `resume` inspection, `events`, `artifact`, store counts for `stats` | Storage worker shared with writes |
+| `history_nodes`, `history_items` | Reader shared with model-context construction |
 | `follow` | Bot inspection and replay on the worker; live delivery through the hub |
 | `wait` | Handle registration and settlement against durable outcomes |
 
@@ -309,7 +309,7 @@ bundle, including checkpoints and history-node references. Keep their
 origin identity and provide qualified resolution or a documented refresh
 to target-local references. Resolution of a retained checkpoint must
 survive outcome pruning, through a durable node mapping or checkpoint
-metadata with the same lifetime as the retained history. `result` alone
+metadata with the same lifetime as the retained history. A turn's outcome alone
 is insufficient: its terminal events can be pruned while the checkpoint
 remains valid. Other saved nodes need a mapping or an explicit unsupported
 answer. Never reinterpret a source integer as a target-local id, even if
@@ -406,7 +406,7 @@ The candidate move protocol has these ownership boundaries:
 | Cancel after the cut | Require the destination's durable refusal of that nonce, issued only if it has not imported it. An unreachable destination leaves the source fenced; any operator override must state the duplicate-execution risk. |
 
 Tombstones route supported bot queries and controls with `bot_moved`:
-submissions, `resume`, `follow`, old/new `wait`s, `result`, `interrupt`, and
+submissions, `resume`, `follow`, old/new `wait`s, `interrupt`, and
 fork/history access. The route identifies the destination store and bot;
 operations naming a turn or node use the corresponding target reference
 or the refresh path above. Unsupported operations fail explicitly instead

@@ -429,8 +429,8 @@ async function onEvent(ev) {
 }
 async function loadWaitOrProc(name, node, call) {
   const t = S.transcripts.get(name), session = S.session;
-  let item; try { item = await Daemon.request('item', { bot: name, node }); } catch (_) { return false; }
-  if (S.session !== session || S.transcripts.get(name) !== t) return false;
+  let item; try { item = (await Daemon.request('history_items', { bot: name, nodes: [node] })).items[0]?.item; } catch (_) { return false; }
+  if (!item || S.session !== session || S.transcripts.get(name) !== t) return false;
   return applyWaitOrProc(name, item, call, node);
 }
 // Decode a background start (a proc handle) or a wait result into the cards; also reached by a retried load.
@@ -679,6 +679,9 @@ function attach() {
 async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
+    // The login shell's model, looked up beside the attach so a slow profile never delays it, and
+    // again on each attach while none is known (~/.agent/env may have been repaired meanwhile).
+    if (!S.config.model) Daemon.defaultModel?.().then((m) => { if (m && !S.config.model) S.config.model = m; }, () => {});
     const { session } = await Daemon.attach(S.cursor);
     S.session = session;
     S.deleted = new Set(); S.snapshot = true;

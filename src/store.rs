@@ -1101,13 +1101,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_connections_flush_the_drive_when_they_sync() {
+    async fn commits_sync_plainly_and_checkpoints_flush_the_drive() {
         let store = scratch_store("fullfsync").await;
         let writer = store
             .call(|db| Ok((db.pragma("fullfsync"), db.pragma("checkpoint_fullfsync"))))
             .await
             .unwrap();
-        assert_eq!(writer, (1, 1));
+        assert_eq!(writer, (0, 1));
         let reader = store
             .read("pragma", |db| Ok(db.pragma("checkpoint_fullfsync")))
             .await

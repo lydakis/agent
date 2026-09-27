@@ -111,6 +111,17 @@ test('retries cannot overlap a slow snapshot and a lost attachment retries after
   assert.equal(p.S.attached, true);
 });
 
+test('a slow login-shell model lookup never delays attaching, and a later answer fills the default', async () => {
+  const lookup = deferred(); let lookups = 0, setups = 0;
+  const p = page({ setup: async () => (++setups, {}), defaultModel: () => (++lookups, lookup.promise), attach: async () => ({ session: 1 }), pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
+  await p.attach(); await settle();
+  assert.equal(p.S.attached, true);
+  assert.equal(lookups, 1);
+  lookup.resolve('anthropic/model-x'); await settle();
+  assert.equal(p.S.config.model, 'anthropic/model-x');
+  assert.equal(setups, 1);
+});
+
 test('stream rendering appends only new characters and resets between messages', () => {
   const p = page(); assert.equal(typeof p.renderTail, 'function');
   const t = p.transcript('Bob'); t.streamingTurn = 1;
@@ -939,7 +950,8 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
   const events = [];
   while (!events.some((e) => e.event === 'turn_finished')) events.push(...(await d.pull()).events);
   const nodes = events.filter((e) => e.event === 'message').map((e) => e.data.node);
-  const items = await Promise.all(nodes.map((node) => d.request('item', { node })));
+  const { items: read } = await d.request('history_items', { bot: 'solo', nodes });
+  const items = read.map((entry) => entry.item);
   const user = items.findIndex((i) => i.role === 'user');
   assert.equal(items[user].content[0].text, 'mention the wait op too');
   assert.match(items[user + 1].content[0].text, /^Noted: mention the wait op too\./);

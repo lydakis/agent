@@ -19,7 +19,7 @@ from pathlib import Path
 
 import psutil
 
-from .runtime_client import Client
+from .runtime_client import Client, poll
 from .targets import file_hash
 
 FILLER = 'x' * 200  # ~300 bytes per item once encoded, like short real turns
@@ -108,7 +108,7 @@ def run(binary, out, items, context_bytes, context_items):
                                              workspace=str(out))['result'])
     _, tip_turn_ms = timed(lambda: turn(c, 'tip', 't', 'tip turn ' + FILLER))
     _, history_ms = timed(lambda: turn(c, 'long', 'read', 'history:1'))
-    read = c.request('result', bot='long', turn=turn(c, 'long', 'read2', 'history:1'))['result']['text']
+    read = poll(c, 'long', turn(c, 'long', 'read2', 'history:1'))['result']['text']
     rss_peak = daemon.memory_info().rss
     c.request('shutdown')
     c.close()

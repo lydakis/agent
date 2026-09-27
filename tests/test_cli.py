@@ -136,6 +136,19 @@ class SocketAndCliTests(ModelFixture):
             status, = db.execute('SELECT status FROM turns WHERE id=?', (handle['turn'],)).fetchone()
         self.assertEqual(status, 'completed')
 
+    def test_start_creates_the_store_starts_one_daemon_and_prints_its_ready_line(self):
+        self.assertFalse(self.store.exists())
+        started = json.loads(self.agent('start', *self.common[:4]).stdout)
+        self.assertEqual(started['event'], 'ready')
+        self.assertTrue(self.store.exists())
+        self.assertTrue(self.socket.exists())
+        # A running daemon answers again; nothing new starts.
+        again = json.loads(self.agent('start', '--store', str(self.store)).stdout)
+        self.assertEqual(again['pid'], started['pid'])
+        extra = self.agent('start', '--store', str(self.store), 'now', check=False)
+        self.assertEqual(extra.returncode, 2)
+        self.assertIn('takes no positional arguments', extra.stderr)
+
     def test_stats_and_wait_any_from_the_cli(self):
         self.agent('run', *self.common, '--new', '--bot', 'Bob', 'p0')
         stats = json.loads(self.agent('stats', '--store', str(self.store)).stdout)
@@ -355,7 +368,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
-                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
             with self.subTest(args=args):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
@@ -495,8 +508,8 @@ class SocketAndCliTests(ModelFixture):
             sock.connect(str(self.socket))
             reader = sock.makefile('r')
             reader.readline()
-            sock.sendall((json.dumps({'id': 1, 'op': 'item', 'bot': 'Bob', 'node': node}) + '\n').encode())
-            shell_result = json.loads(json.loads(reader.readline())['result']['output'])
+            sock.sendall((json.dumps({'id': 1, 'op': 'history_items', 'bot': 'Bob', 'nodes': [node]}) + '\n').encode())
+            shell_result = json.loads(json.loads(reader.readline())['result']['items'][0]['item']['output'])
         handle = json.loads(shell_result['stdout'])['handle']
         self.assertTrue(handle.startswith('turn:Alice/'), handle)
         waited = self.agent('run', *with_socket, '--bot', 'Bob', 'wait:' + handle)
@@ -510,8 +523,8 @@ class SocketAndCliTests(ModelFixture):
             sock.connect(str(self.socket))
             reader = sock.makefile('r')
             reader.readline()
-            sock.sendall((json.dumps({'id': 1, 'op': 'item', 'bot': 'Bob', 'node': node}) + '\n').encode())
-            outcome = json.loads(json.loads(reader.readline())['result']['output'])
+            sock.sendall((json.dumps({'id': 1, 'op': 'history_items', 'bot': 'Bob', 'nodes': [node]}) + '\n').encode())
+            outcome = json.loads(json.loads(reader.readline())['result']['items'][0]['item']['output'])
         self.assertEqual(outcome['results'][handle]['text'], 'reply:hello')
         self.assertEqual(outcome['results'][handle]['status'], 'completed')
 
@@ -545,7 +558,6 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(ready['limits']['keep_warm_seconds'], 240)
         self.assertEqual(ready['limits']['cache_ttl'], '5m')
         self.assertEqual(ready['limits']['connections'], -(-ready['limits']['active'] // 64))
-        self.assertIn('wait', ready['capabilities'])
 
     def test_burst_eviction_exits_client_and_replay_recovers_terminal_event(self):
         run = self.agent('run', *self.common, '--new', '--bot', 'Bob', 'burst', check=False, timeout=4)
@@ -704,9 +716,6 @@ class SocketAndCliTests(ModelFixture):
             sock.connect(str(self.socket))
             reader = sock.makefile('r')
             self.assertEqual(json.loads(reader.readline())['event'], 'ready')
-            sock.sendall((json.dumps({'id': 1, 'op': 'artifact', 'bot': 'Bob', 'turn': completed['turn'],
-                                      'call_id': completed['data']['call_id']}) + '\n').encode())
-            self.assertEqual(json.loads(reader.readline())['error'], 'response_size_limit')
             offset, parts = 0, []
             while True:
                 sock.sendall((json.dumps({'id': 3, 'op': 'artifact', 'bot': 'Bob', 'turn': completed['turn'],
@@ -718,8 +727,9 @@ class SocketAndCliTests(ModelFixture):
                 if page['done']:
                     break
             self.assertEqual(''.join(parts), 'y' * 1048576)
-            sock.sendall((json.dumps({'id': 2, 'op': 'item', 'bot': 'Bob', 'node': completed['data']['node']}) + '\n').encode())
-            preview = json.loads(json.loads(reader.readline())['result']['output'])
+            sock.sendall((json.dumps({'id': 2, 'op': 'history_items', 'bot': 'Bob',
+                                      'nodes': [completed['data']['node']]}) + '\n').encode())
+            preview = json.loads(json.loads(reader.readline())['result']['items'][0]['item']['output'])
             self.assertIn('bytes omitted', preview['stdout'])
 
 
