@@ -1019,3 +1019,27 @@ test('a task card leaves the keyboard beside; swapping a folded task in unfolds 
   assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.folded.has('app'), false);
   assert.ok(p.tree().some((n) => n.b?.name === 'app.build'), 'the selected task has a sidebar row');
 });
+
+test('a side chat learns an unknown tool list first, and a failed first message waits in its composer', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => {
+    sent.push([op, q]);
+    if (op === 'resume') return { name: q.bot, id: 1, tools: ['shell', 'history'] };
+    if (op === 'fork') return { name: q.bot, id: 20, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow };
+    if (op === 'submit') throw new Error('daemon_gone');
+    return { nodes: [], next_from: null };
+  } });
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 4, created_by: 'lead', created_by_id: 1 });
+  p.S.selected = 'lead'; await p.openBeside('task');
+  p.S.bots.get('task').callable = ['read'];
+  // Asked from the side pane: the copy replaces its source there, and keeps the unsent message.
+  const side = p.context.document.getElementById('sideinput'), main = p.context.document.getElementById('input');
+  p.setSend('side');
+  side.value = 'what now?'; await p.context.document.getElementById('sideform').listeners.submit({ preventDefault() {} });
+  assert.equal(p.S.ui.side, 'task-side'); assert.equal(side.value, 'what now?'); assert.equal(main.value, '');
+  // A source announced without its tools is asked for them, so the fork asks only for what it has.
+  await p.sideChat('lead');
+  assert.deepEqual(sent.filter(([op]) => op === 'resume').map(([, q]) => q.bot), ['lead']);
+  assert.deepEqual(Array.from(sent.filter(([op]) => op === 'fork').at(-1)[1].allow), ['history']);
+});

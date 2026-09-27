@@ -1306,11 +1306,21 @@ async function sideChat(name, text = '') {
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   let copy = forkName(name, 1, 'side'); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k, 'side');
   const session = S.session;
+  // A bot announced after attaching has no tool list yet; ask for its record before narrowing it.
+  if (S.sideTools !== 'answer' && !b.callable) { const rec = await Daemon.request('resume', { bot: name }); if (rec?.id === b.id) learnTools(b, rec); }
   const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b), ...(b.workspace ? { workspace: b.workspace } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   if (S.ui.side !== copy) await openBeside(copy);
-  if (text) await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace });
+  if (!text) return;
+  try {
+    await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace });
+  } catch (err) {
+    // The side chat exists, so an unsent first message waits in its composer, not its source's.
+    const pane = Object.values(PANE).find((p) => p.bot() === copy), input = pane && $(pane.input);
+    if (input && !input.value) { input.value = text; grow(input); }
+    throw Object.assign(err instanceof Error ? err : new Error(String(err)), { kept: true });
+  }
 }
 function setSideTools(v) { S.sideTools = v === 'answer' ? 'answer' : 'read'; try { localStorage.setItem('agent:side-tools', S.sideTools); } catch (_) {} }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
@@ -1384,7 +1394,7 @@ for (const [pane, ids] of Object.entries(PANE)) {
     e.preventDefault(); const input = $(ids.input); const v = input.value.trim(); if (!v) return; input.value = ''; grow(input);
     // A failed send comes back only to the bot it was for, and never over new typing.
     const who = PANE[pane].bot();
-    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); if (PANE[pane].bot() === who && !input.value) { input.value = v; grow(input); } }
+    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); if (!err?.kept && PANE[pane].bot() === who && !input.value) { input.value = v; grow(input); } }
   });
   $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
   $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });
