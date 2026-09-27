@@ -33,9 +33,8 @@ pub fn path() -> Option<PathBuf> {
 /// The listed models in file order, each once. No file is no list.
 pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
     use std::io::Read;
-    let unreadable = |error: std::io::Error| Error {
-        code: "models_unreadable".into(),
-        detail: Some(format!("{}: {error}", path.display())),
+    let unreadable = |error: std::io::Error| {
+        Error::with("models_unreadable", &format!("{}: {error}", path.display()))
     };
     // Opened without blocking, so a FIFO put in its place is refused below
     // rather than waited on; reads of a regular file are unaffected.
@@ -68,9 +67,11 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
             &format!("{}: larger than 1 MiB", path.display()),
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|error| Error {
-        code: "models_unreadable".into(),
-        detail: Some(format!("{}: {}", path.display(), error.utf8_error())),
+    let text = String::from_utf8(bytes).map_err(|error| {
+        Error::with(
+            "models_unreadable",
+            &format!("{}: {}", path.display(), error.utf8_error()),
+        )
     })?;
     parse(&text).map_err(|(line, reason)| {
         Error::with(

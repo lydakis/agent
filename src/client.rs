@@ -991,7 +991,7 @@ fn models(options: &Options) -> Result<i32> {
     let client_error = |e: agent_client::Error| Error {
         code: e.code,
         detail: e.detail,
-        facts: None,
+        facts: e.facts,
     };
     if options.discover {
         if path.exists() {
