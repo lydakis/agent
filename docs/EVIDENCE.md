@@ -271,7 +271,9 @@ Reconnects, retention, overload, compaction and recovery.
   [Record](LONG_TASK_EVAL.md#live-run-5). With such a steer admitted
   against the whole budget, 20 bots a side: 20 of 20 steers went in and
   20 of 20 bots were correct, against 18 of 20 on main, whose two misses
-  were that steer. `cd1d45f` against `0b295d2`, 2026-09-27.
+  were that steer. `cd1d45f` against `0b295d2`, 2026-09-27; later
+  commits only narrow that admission and send such a steer to the model
+  before any summary, which has not run live.
   [Record](LONG_TASK_EVAL.md#live-run-7).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on

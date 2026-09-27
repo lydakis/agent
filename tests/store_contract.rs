@@ -4758,8 +4758,8 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
 fn absorption_counts_the_separator_of_every_item_the_request_sends() {
     // The request puts a comma between items, so a steer that fits the
     // whole budget by its bytes alone does not fit the request: the turn's
-    // prompt and the steer each take one byte more.
-    for (spare, taken) in [(0, false), (1, false), (2, true)] {
+    // prompt, its reply, and the steer each take one byte more.
+    for (spare, taken) in [(0, false), (2, false), (3, true)] {
         let mut db = db();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         let options = TurnOptions::default();
@@ -4767,6 +4767,9 @@ fn absorption_counts_the_separator_of_every_item_the_request_sends() {
             .begin("Bob", "first", "work", true, &options, allow_provider)
             .unwrap()
             .turn;
+        // A round a summary could take, so the whole budget applies.
+        db.append(first, vec![assistant(&"r".repeat(4000))], &[], None)
+            .unwrap();
         let steer = db
             .begin(
                 "Bob",
@@ -4789,6 +4792,57 @@ fn absorption_counts_the_separator_of_every_item_the_request_sends() {
             .unwrap();
         let ids: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, if taken { vec![steer] } else { vec![] }, "{spare}");
+    }
+}
+
+#[test]
+fn a_steer_goes_past_three_quarters_only_over_what_a_summary_can_take() {
+    // The same budget and steer, and the same bytes in the turn: as a
+    // round, which a summary can take once the model has answered past
+    // it, the steer goes in against the whole budget; as the turn's
+    // prompt, which no summary takes, it would leave the turn no room
+    // after any summary, so it keeps to three quarters and stays queued.
+    for (prompt, round, taken) in [
+        ("work".to_owned(), "r".repeat(4000), true),
+        ("w".repeat(4000), String::new(), false),
+    ] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let first = db
+            .begin(
+                "Bob",
+                "first",
+                &prompt,
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        if !round.is_empty() {
+            db.append(first, vec![assistant(&round)], &[], None)
+                .unwrap();
+        }
+        let steer = db
+            .begin(
+                "Bob",
+                "s",
+                "steer",
+                true,
+                &TurnOptions {
+                    delivery: Delivery::Steer,
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let absorbed = db
+            .absorb(first, None, 4400, 64, ContextUsage::default(), true)
+            .unwrap();
+        let ids: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, if taken { vec![steer] } else { vec![] }, "{taken}");
+        assert_eq!(absorbed.capped, !taken);
     }
 }
 

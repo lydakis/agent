@@ -962,15 +962,25 @@ impl Turn {
         };
         let reference = summarizer(record);
         let (name, model) = split_model(&reference)?;
-        let Some(summarizer) = self.providers.get(name) else {
-            self.hub
-                .live(
-                    &self.bot,
-                    json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
-                        "error":"provider_unavailable","detail":name}),
-                )
-                .await?;
-            return Ok(Compaction::Skipped);
+        // The span goes to the summarizer as stored, so it must speak the
+        // bot's family, as creation checked; a provider name can be bound to
+        // another since.
+        let summarizer = match self.providers.get(name) {
+            Some(provider) if provider.family() == record.family()? => provider,
+            found => {
+                let (error, detail) = match found {
+                    None => ("provider_unavailable", name),
+                    Some(_) => ("provider_family_mismatch", reference.as_str()),
+                };
+                self.hub
+                    .live(
+                        &self.bot,
+                        json!({"event":"compaction_failed","bot":self.bot,"turn":turn,"durable":false,
+                            "error":error,"detail":detail}),
+                    )
+                    .await?;
+                return Ok(Compaction::Skipped);
+            }
         };
         // A turn may run on another model than the bot's, and then the
         // bot's summarizer can neither read that call's cache nor take its
@@ -1511,6 +1521,10 @@ impl Turn {
         let elides = record.tools.iter().any(|tool| tool == "read");
         // How a steer stayed queued for lack of room, while one still is.
         let mut capped = None;
+        // A steer let in against the whole budget goes to the model before
+        // any summary, so no summary spends the round or the budget it went
+        // in for; the boundary after that call summarizes as usual.
+        let mut steer_first = false;
         // The view this task's last call sent, for a summary to copy.
         let mut last: Option<LastCall> = None;
         // Until this task calls or changes the view, the view is taken as
@@ -1525,11 +1539,7 @@ impl Turn {
         while model_rounds < MAX_ROUNDS {
             // A refresh the last call left in flight ends here: the next call
             // reads the cache itself, and the budget counts what it billed.
-            if let Some(refreshed) = settle(&mut accounting.refresh).await
-                && let Some((tokens, _)) = self.account_refresh(refreshed).await?
-            {
-                record.tokens_used = record.tokens_used.saturating_add(tokens);
-            }
+            self.settle_refresh(&mut record, accounting).await?;
             // The budget is checked before each call, so one call may overshoot.
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
                 return Err(error);
@@ -1614,7 +1624,7 @@ impl Turn {
                     last = LastCall::of(&sent, false);
                 }
             }
-            if !resuming {
+            if !resuming && !std::mem::take(&mut steer_first) {
                 match self
                     .compact_if_due(
                         &mut record,
@@ -1642,18 +1652,18 @@ impl Turn {
             // measures it against the whole budget: when the turn's newest
             // round fills it, as one large result can, no summary makes
             // room, and the next round's summary can then take that round
-            // behind the steer.
+            // behind the steer. Such a steer goes to the model next, before
+            // this boundary's steps run again.
             if capped.is_some() && made_room {
                 self.steers.store(true, Relaxed);
             }
             // A summary may have spent the last round or the budget; a steer
             // then stays queued rather than joining a turn that cannot call.
+            let whole = self.summarizes(&record);
             if calls_left(&record, model_rounds)
-                && self
-                    .absorb(&context.prefix, &mut capped, self.summarizes(&record))
-                    .await?
+                && self.absorb(&context.prefix, &mut capped, whole).await?
             {
-                resume_window = resuming;
+                (resume_window, steer_first) = (resuming, whole);
                 continue;
             }
             if let Some(error) = budget_error(record.budget_tokens, record.tokens_used) {
@@ -1750,13 +1760,16 @@ impl Turn {
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
                 // going for one more round rather than ending it unheard,
-                // when the budget and round limit allow one.
+                // when the budget and round limit allow one. A refresh the
+                // reply left in flight is billed first, as the next round
+                // would count it.
+                self.settle_refresh(&mut record, accounting).await?;
+                let whole = self.summarizes(&record);
                 if calls_left(&record, model_rounds)
-                    && self
-                        .absorb(&context.prefix, &mut capped, self.summarizes(&record))
-                        .await?
+                    && self.absorb(&context.prefix, &mut capped, whole).await?
                 {
                     last = LastCall::of(&context, true);
+                    steer_first = whole;
                     continue;
                 }
                 return Ok(Round::Finished);
@@ -1817,11 +1830,28 @@ impl Turn {
     /// when nothing was tried.
     /// Whether a summary could take the rounds behind a steer admitted
     /// against the whole budget: the bot has compaction instructions and
-    /// its summarizer's provider is served here.
+    /// its summarizer is served here in the bot's family.
     fn summarizes(&self, record: &agent_runtime::store::Bot) -> bool {
         record.compaction_instructions.is_some()
-            && split_model(&summarizer(record))
-                .is_ok_and(|(name, _)| self.providers.contains_key(name))
+            && split_model(&summarizer(record)).is_ok_and(|(name, _)| {
+                self.providers
+                    .get(name)
+                    .is_some_and(|provider| record.family().is_ok_and(|f| provider.family() == f))
+            })
+    }
+
+    /// End a refresh left in flight and count what it billed.
+    async fn settle_refresh(
+        &self,
+        record: &mut agent_runtime::store::Bot,
+        accounting: &mut Accounting,
+    ) -> Result<()> {
+        if let Some(refreshed) = settle(&mut accounting.refresh).await
+            && let Some((tokens, _)) = self.account_refresh(refreshed).await?
+        {
+            record.tokens_used = record.tokens_used.saturating_add(tokens);
+        }
+        Ok(())
     }
 
     async fn absorb(

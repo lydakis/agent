@@ -3,6 +3,8 @@ import json
 import queue
 import threading
 import os
+import tempfile
+from pathlib import Path
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from bench.runtime_client import Client
@@ -314,25 +316,36 @@ class ElisionTests(ModelFixture):
         self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
         carried = lambda r: any(i.get('role') == 'user' and i['content'][0]['text'] == correction
                                 for i in r['input'])
-        work = [r for r in drain(self.model) if not is_summary(r)]
-        self.assertTrue(any(carried(r) for r in work))
+        requests = drain(self.model)
+        # The steer goes to the model next, before any summary, so no
+        # summary spends the round or the budget it went in for.
+        self.assertFalse(is_summary(requests[0]))
+        self.assertTrue(carried(requests[0]))
+        work = [r for r in requests if not is_summary(r)]
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
 
     def test_a_steer_keeps_three_quarters_when_the_summarizer_is_not_served(self):
         # The bot's summarizer is on a provider this daemon no longer
-        # serves, so no summary could take the rounds behind a steer let in
+        # serves, or now serves in another family than the bot's stored
+        # items, so no summary could take the rounds behind a steer let in
         # against the whole budget: it keeps the three-quarter share.
         budget = ('--context-bytes', '24576')
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell,read',
-                        extra=('--provider', f'other=responses,{self.url}', *budget))
-        created = client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
-                                 compaction_instructions='Summarize.', compaction_model='other/synthetic-model')
-        client.close()
-        self.assertIn('result', created)
-        client = self.client(tools='shell,read', extra=budget)
-        _, ended, outcome, _ = self.steer_behind_a_large_result(client)
-        self.assertEqual(ended['status'], 'completed', ended)
-        self.assertEqual(outcome.get('error'), 'stale_turn', outcome)
+        for restart in ((), ('--provider', f'other=anthropic,{self.url}')):
+            with self.subTest(restart=restart):
+                store = Path(tempfile.mkdtemp(dir=self.path)) / 'state.sqlite'
+                client = Client(self.binary, store, self.url, 'shell,read',
+                                extra=('--provider', f'other=responses,{self.url}', *budget))
+                created = client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                                         compaction_instructions='Summarize.',
+                                         compaction_model='other/synthetic-model')
+                client.close()
+                self.assertIn('result', created)
+                client = Client(self.binary, store, self.url, 'shell,read', extra=(*restart, *budget))
+                self.addCleanup(client.close)
+                _, ended, outcome, _ = self.steer_behind_a_large_result(client)
+                self.assertEqual(ended['status'], 'completed', ended)
+                self.assertEqual(outcome.get('error'), 'stale_turn', outcome)
+                drain(self.model)
 
     def steer_behind_a_large_result(self, client):
         """Bob's turn asks for a result of about 15 KiB, and a strict steer

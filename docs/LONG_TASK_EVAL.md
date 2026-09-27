@@ -598,8 +598,12 @@ at once, at 128 KiB, same model, plan and host.
 summary condition with the choice, 20 bots per arm, both at once, at
 128 KiB, same model, plan and host; about 185 s per arm. The fixes to
 admission that followed `cd1d45f` (a comma counted per item, a summarizer
-the daemon serves, a call left in the turn) only narrow it, and the three
-steers below that needed the whole budget had at least 7.6 KiB to spare.
+the daemon serves in the bot's family, a call left in the turn once a
+refresh in flight is counted, and three quarters beside the turn's
+prompt) only narrow it, and the three steers below that needed the whole
+budget had at least 7.6 KiB to spare, beside a 694-byte prompt.
+The last of them also sends a steer let in against the whole budget to
+the model before any summary; that order has not run live.
 
 | | summary, choice, steer fix | summary, choice, main |
 | --- | --- | --- |
