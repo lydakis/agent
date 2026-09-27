@@ -4,7 +4,8 @@ Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
 updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, and at
 `973be14`, the change that built tool approval, for its cost and a store
-lock fix. This is the one place that says what is currently known. The documents it links to
+lock fix, and at `dd95047` for the per-summary choice between a copy and a
+request of its own. This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -258,7 +259,15 @@ Reconnects, retention, overload, compaction and recovery.
   more than full context on this task (79,273 input token-equivalents per
   bot with stubs against 73,503, counting cached input at a tenth), since
   full context never passed 38,256 tokens. `6a81bd6`, 2026-09-26.
-  [Record](LONG_TASK_EVAL.md#live-run-4).
+  [Record](LONG_TASK_EVAL.md#live-run-4). With each summary choosing
+  between copying the bot's call and a request of its own by estimated
+  cost, ten bots per arm at 128 KiB: summaries cost 0.093 input
+  token-equivalents per byte summarized, against 0.330 always copying the
+  whole call and 0.337 never copying, and 9 of 10 bots finished correctly
+  in both the choice arm and the arm with no copy. The two misses were
+  a steer left waiting for room, which a scripted task reproduces on the
+  build before the choice. `dd95047` against `d9ecbcf`, 2026-09-26.
+  [Record](LONG_TASK_EVAL.md#live-run-5).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -272,15 +281,14 @@ Reconnects, retention, overload, compaction and recovery.
 - The five-harness screen at the current build.
 - Compaction quality and cost on real coding tasks, beyond one synthetic
   task, and at a realistic budget, where that task seldom compacts.
-- Whether sending summary requests as copies of the bot's call saves
-  anything. At the 20 KiB test budget the copies read cache but sent more
-  uncached summary input than fresh requests (21,111 against 17,606 tokens,
-  over 8 summaries against 11). At 128 KiB the two cost the same per byte
-  summarized, 0.343 and 0.344 token-equivalents counting cached input at a
-  tenth, over 5 copies and 3 fresh requests, and half the copy arm's
-  summaries could not be copies because the view was over the limit
-  (`6a81bd6`). At 256 KiB, one summary per arm: 24,708 token-equivalents
-  for the copy against 54,079 (`e707632`). Both on macOS arm64.
+- Whether choosing between a copy of the bot's call and a request of its
+  own saves anything beyond one task, one model and one budget: run 5's
+  0.093 against 0.337 token-equivalents per byte summarized is 11
+  summaries a side, with the backend's cache reading 9 of the 10 copies
+  (`dd95047`, macOS arm64). Its estimate does not model a cache miss.
+- Whether compacting pays on any task at a realistic budget: on this one,
+  full context cost less than every compacting arm at 128 KiB (runs 4
+  and 5).
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.

@@ -476,18 +476,22 @@ def score(root, facts, events, answer):
     def total(rows, field):
         return sum(row.get(field) or 0 for row in rows)
 
-    # Each summary installed, with the summarizer calls it took and what
-    # it summarized: a catch-up step always sends a request of its own; any
-    # other on the turn's model is a copy unless the copy would not fit.
+    # Each summary installed, with the summarizer calls it took, what it
+    # summarized, and how it was sent: a copy of the bot's call or a request
+    # of its own, with the runtime's estimate of each. A binary from before
+    # the event named its request reports none.
     summaries, spent = [], []
     for event in events:
         data = event['data']
         if event['event'] == 'usage' and data.get('purpose') == 'compaction':
             spent.append(data)
         elif event['event'] == 'compacted':
+            request = data.get('request') or {}
             summaries.append({'catch_up': data.get('catch_up'), 'span_bytes': data.get('bytes'),
                               'view_bytes': (data.get('context_before') or {}).get('bytes'),
                               'limit_bytes': (data.get('input_limit') or {}).get('bytes'),
+                              'form': request.get('form'), 'copied_items': request.get('items'),
+                              'estimate': request.get('estimate'),
                               'calls': len(spent), 'input_tokens': total(spent, 'input_tokens'),
                               'cached_input_tokens': total(spent, 'cached_input_tokens'),
                               'output_tokens': total(spent, 'output_tokens')})

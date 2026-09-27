@@ -1,7 +1,9 @@
 """Compaction budgets, failures, fork isolation, and request-prefix stability."""
 import json
 import os
+import queue
 import sqlite3
+import threading
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from bench.runtime_client import Client
@@ -31,21 +33,87 @@ class AnthropicCompactionTests(ModelFixture):
         summaries = [r for r in requests if is_summary(r)]
         self.assertTrue(summaries)
         first = summaries[0]
-        # The call before it, extended: its system prompt, tools, tool
-        # choice, and messages come first unchanged, so the message cache
-        # covers them, and the request to write comes last.
+        # The call before it through the span, at a turn's prompt: its
+        # system prompt, tools, tool choice, and first messages unchanged,
+        # so the cache covers the tools and instructions, and the request
+        # to write last. A request of its own would send the tools uncached.
         before = requests[requests.index(first) - 1]
         self.assertEqual(first['system'], before['system'])
         self.assertEqual(first['tools'], before['tools'])
         self.assertNotIn('tool_choice', first)
         self.assertEqual(first['thinking'], before['thinking'])
-        self.assertEqual(first['messages'][:len(before['messages'])], before['messages'])
+        copied = first['messages'][:-1]
+        self.assertEqual(copied, before['messages'][:len(copied)])
         self.assertTrue(first['messages'][-1]['content'][-1]['text'].endswith('Summarize.'))
         blocks = [b for m in first['messages'] for b in m['content']]
         self.assertTrue(any(b['type'] == 'tool_use' for b in blocks))
         self.assertTrue(any(b['type'] == 'tool_result' for b in blocks))
         self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
         self.assertFalse(any(m.get('event') == 'compaction_failed' for m in client.saved))
+
+    def test_a_summary_inside_a_turn_copies_the_call_before_it_whole(self):
+        # Anthropic reads a cache where a breakpoint went, and the call put
+        # its own at its end, so a summary inside a turn copies that call
+        # whole, then asks. The result the model answered since stays out.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                        tools='echo,shell', provider='anthropic', family='anthropic',
+                        model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                        extra=('--context-bytes', '32768'))
+        self.addCleanup(client.close)
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               tools=['echo', 'shell'], compaction_instructions='Summarize.',
+                                               reasoning='low'))
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:6')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        indices = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(len(indices), 2)
+        for index in indices:
+            summary, call = requests[index], requests[index - 1]
+            self.assertEqual((summary['system'], summary['tools']), (call['system'], call['tools']))
+            self.assertEqual(summary['messages'][:-1], call['messages'])
+            self.assertTrue(summary['messages'][-1]['content'][-1]['text'].endswith('Summarize.'))
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        requested = [e['data']['request'] for e in events if e['event'] == 'compacted']
+        self.assertEqual([(r['form'], r['items']) for r in requested], [('copy', 5), ('copy', 5)])
+        self.assertTrue(all(r['estimate']['copy'] * 5 < r['estimate']['own'] for r in requested))
+
+    def test_a_paced_copy_inside_a_turn_sends_the_same_call_after_a_restart(self):
+        # Small rounds, so the span ends before the call's window does. The
+        # copy had that window whole; the retry reads the view with the
+        # round since, and sends the call again through the node it ended
+        # at, not through the span or a later node.
+        def start():
+            client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                            tools='echo,shell', provider='anthropic', family='anthropic',
+                            model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                            env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                            extra=('--context-bytes', '8192'))
+            self.addCleanup(client.close)
+            return client
+        client = start()
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               tools=['echo', 'shell'], compaction_instructions='Summarize.',
+                                               reasoning='low'))
+        self.model.compaction_refusals = 1
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x40')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        client.close(kill=True)
+        client = start()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        paced, retry, _ = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(retry, paced + 1)
+        self.assertEqual(requests[retry], requests[paced])
+        self.assertEqual(requests[paced]['messages'][:-1], requests[paced - 1]['messages'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        requested = [e['data']['request'] for e in events if e['event'] == 'compacted']
+        self.assertEqual([(r['form'], r['items']) for r in requested], [('copy', 11), ('copy', 11)])
 
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
@@ -600,8 +668,10 @@ class AnthropicThinkingBindingTests(ModelFixture):
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class SummaryCopyTests(ModelFixture):
-    """A summary request is a copy of the bot's last call with the request
-    to write after it, so the provider reads it from cache."""
+    """A summary request copies the bot's last call through the span it
+    summarizes, with the request to write after it, so the provider reads
+    it from cache, when that is estimated cheaper than a request of its
+    own."""
 
     def start(self, tools='echo', budget=4096, **options):
         client = self.client(tools=tools, extra=('--context-bytes', str(budget), '--compact-at', '50'))
@@ -629,8 +699,9 @@ class SummaryCopyTests(ModelFixture):
         return events
 
     def copies(self, requests):
-        """Each summary extends the call before it: the same instructions,
-        tools, tool choice, cache key, and input, then the request to write."""
+        """Each summary copies the call before it through its span: the same
+        instructions, tools, tool choice, cache key, and the start of its
+        input, which the Responses cache reads, then the request to write."""
         indices = [n for n, r in enumerate(requests) if is_summary(r)]
         self.assertTrue(indices)
         for index in indices:
@@ -640,7 +711,8 @@ class SummaryCopyTests(ModelFixture):
             self.assertEqual(summary['tools'], call['tools'])
             self.assertNotIn('tool_choice', summary)
             self.assertEqual(summary['prompt_cache_key'], call['prompt_cache_key'])
-            self.assertEqual(summary['input'][:len(call['input'])], call['input'])
+            copied = summary['input'][:-1]
+            self.assertEqual(copied, call['input'][:len(copied)])
             self.assertTrue(summary['input'][-1]['content'][0]['text'].endswith('Summarize.'))
         return indices
 
@@ -667,11 +739,12 @@ class SummaryCopyTests(ModelFixture):
         self.turn(client, 'b', 'script')
         requests = self.requests()
         index, = self.copies(requests)
-        # The note went ahead of the view after that call; the copy sends
-        # what the call sent, and the next call carries the note.
+        # The note went ahead of the view after the call that ran before
+        # it; the copy sends what that call sent, and the next call carries
+        # the note.
         pinned = lambda r: [i['content'][0]['text'] for i in r['input']
                             if i.get('role') == 'user' and i['content'][0]['text'].startswith('[carry-forward note')]
-        self.assertEqual(requests[index]['input'][-3]['call_id'], 'script-1')
+        self.assertEqual(requests[index - 1]['input'][-1]['call_id'], 'script-0')
         self.assertEqual(pinned(requests[index]), [])
         self.assertIn(note, pinned(requests[index + 1])[0])
 
@@ -685,11 +758,50 @@ class SummaryCopyTests(ModelFixture):
         indices = self.copies(requests)
         self.assertEqual([e['event'] for e in self.events(client, 'elided', 'compacted')],
                          ['compacted', 'elided', 'compacted'])
-        # The boundary stubbed a result the call before it saw whole, then
-        # summarized: the copy shows that result as the call did.
-        outputs = [i['output'] for i in requests[indices[-1]]['input'] if i.get('type') == 'function_call_output']
-        self.assertEqual(len(outputs), 3)
-        self.assertFalse(any(o.startswith('[tool result elided') for o in outputs))
+        # The boundary stubbed results the call before it saw whole, then
+        # summarized: the copy shows the one in its span as the call did.
+        outputs = lambda r: [i['output'] for i in r['input'] if i.get('type') == 'function_call_output']
+        copied = outputs(requests[indices[-1]])
+        self.assertEqual(len(copied), 1)
+        self.assertFalse(copied[0].startswith('[tool result elided'))
+        self.assertTrue(outputs(requests[indices[-1] + 1])[0].startswith('[tool result elided'))
+
+    def test_a_summary_the_budget_forces_copies_the_call_before_it(self):
+        # The third result cannot fit beside the first two, so the view is
+        # over the budget at that boundary. The forced summary, a catch-up
+        # step, still copies the call that sent the first two.
+        client = self.start(tools='shell', budget=16384)
+        turn = client.request('submit', bot='Bob', request_id='1',
+                              prompt='long:2x100,1x700,1x10')['result']['turn']
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = self.requests()
+        index, = self.copies(requests)
+        self.assertEqual(requests[index]['input'][:-1], requests[index - 1]['input'])
+        compacted, = [e['data'] for e in self.events(client, 'compacted')]
+        self.assertTrue(compacted['catch_up'])
+        self.assertEqual((compacted['request']['form'], compacted['request']['items']), ('copy', 5))
+        self.assertGreater(compacted['request']['estimate']['own'], 4 * compacted['request']['estimate']['copy'])
+
+    def test_a_paced_summary_the_budget_forces_copies_the_same_call_after_a_restart(self):
+        # The view the retry reads is still over the budget; the call it
+        # copies was not, and the retry sends that call again.
+        client = self.start(tools='shell', budget=16384)
+        self.model.compaction_refusals = 1
+        turn = client.request('submit', bot='Bob', request_id='1',
+                              prompt='long:2x100,1x700,1x10')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        client.close(kill=True)
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell',
+                        extra=('--context-bytes', '16384', '--compact-at', '50'))
+        self.addCleanup(client.close)
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = self.requests()
+        paced, retry = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual((self.copies(requests[:retry]), retry), ([paced], paced + 1))
+        self.assertEqual(requests[retry], requests[paced])
+        compacted, = [e['data'] for e in self.events(client, 'compacted')]
+        self.assertTrue(compacted['catch_up'])
+        self.assertEqual((compacted['request']['form'], compacted['request']['items']), ('copy', 5))
 
     def test_a_copy_that_calls_a_tool_is_billed_and_asked_again_on_its_own(self):
         # As Claude Code does: the copy's reply is not installed, and the
@@ -709,8 +821,13 @@ class SummaryCopyTests(ModelFixture):
         failed = [m for m in client.saved if m.get('event') == 'compaction_failed']
         self.assertEqual([(m['error'], m.get('fallback')) for m in failed], [('compaction_tool_call', True)])
         self.assertEqual(self.events(client, 'tool_started'), [])
+        # The event names the request whose summary went in.
+        compacted, = self.events(client, 'compacted')
+        self.assertEqual((compacted['data']['request']['form'], compacted['data']['request']['items']),
+                         ('own', None))
 
     def test_a_turn_on_another_model_than_the_summarizer_gets_a_request_of_its_own(self):
+        self.model.bodies = []
         self.model.models = ('synthetic-model', 'synthetic-large')
         self.model.routes = []
         client = self.start()
@@ -729,8 +846,91 @@ class SummaryCopyTests(ModelFixture):
         self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
         self.assertIsNone(self.model.routes[index])
         self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+
+    def test_a_turn_back_on_the_summarizer_does_not_copy_a_call_another_model_sent(self):
+        self.model.bodies = []
+        # The history this turn starts from was sent by the previous turn's
+        # model, which the summarizer's cache never saw.
+        self.model.models = ('synthetic-model', 'synthetic-large')
+        client = self.start()
+        for n in range(3):
+            model = {'model': 'openai/synthetic-large'} if n < 2 else {}
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 500,
+                                  **model)['result']['turn']
+            self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        summary = requests[index]
+        self.assertEqual(requests[index - 1]['model'], 'synthetic-large')
+        self.assertEqual((summary['model'], summary['instructions'], summary['tools']),
+                         ('synthetic-model', 'Summarize.', []))
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+
+    def test_a_turn_after_one_that_failed_before_a_call_does_not_copy_it(self):
+        self.model.bodies = []
+        # The previous turn's prompt is stored, but its only request was
+        # refused with no usage, so no call sent the history it ends.
+        self.model.refused_prompts = {'1' * 600}
+        client = self.start()
+        for n in range(3):
+            turn = client.request('submit', bot='Bob', request_id=str(n), prompt=str(n) * 600)['result']['turn']
+            ended = client.finished(turn)['data']
+            self.assertEqual(ended['status'], 'failed' if n == 1 else 'completed', ended)
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(requests[index - 1]['input'][-1]['content'][0]['text'], '1' * 600)
+        summary = requests[index]
+        self.assertEqual((summary['instructions'], summary['tools']), ('Summarize.', []))
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
+
+    def test_a_turn_after_one_that_summarized_and_failed_before_a_call_does_not_copy_it(self):
+        self.model.bodies = []
+        # The previous turn summarized, took a steer, and its only ordinary
+        # request was refused: no call sent the view its summary left.
+        self.model.refused_prompts = {'1' * 1200}
+        client = self.start()
+        self.turn(client, '0', '0' * 1200)
+        self.requests()
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='1' * 1200)['result']['turn']
+        self.assertTrue(is_summary(self.model.requests.get(timeout=5)))
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:go',
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'failed')
+        self.assertEqual(client.finished(steer)['data'].get('into'), turn)
+        self.turn(client, '2', '2' * 1200)
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(requests[index - 1]['input'][-1]['content'][0]['text'], 'steer:go')
+        summary = requests[index]
+        self.assertEqual((summary['instructions'], summary['tools']), ('Summarize.', []))
+        self.assertEqual(self.request_of_its_own(client, 1), self.own_bytes(summary))
+
+    def request_of_its_own(self, client, index=None):
+        """The one summary's `request`, or the one `index` names: a request
+        of its own, priced."""
+        compacted = self.events(client, 'compacted')
+        compacted, = compacted if index is None else [compacted[index]]
+        request = compacted['data']['request']
+        self.assertEqual((request['form'], request['items'], request['estimate']['copy']), ('own', None, None))
+        return request['estimate']['own']
+
+    def own_bytes(self, summary):
+        """What a Responses request of its own sends, as the summary is
+        priced: its instructions, its empty tool list, and its input's
+        items as they went, read from the request's body."""
+        body, = [b for b in self.model.bodies if json.loads(b) == summary]
+        text = body.decode()
+        start = text.index('"input":') + len('"input":')
+        _, end = json.JSONDecoder().raw_decode(text, start)
+        return len(summary['instructions']) + len(json.dumps(summary['tools'])) + len(text[start:end].encode()) - 2
 
     def test_a_summary_by_another_model_is_a_request_of_its_own(self):
+        self.model.bodies = []
         self.model.models = ('synthetic-model', 'synthetic-small')
         client = self.start(compaction_model='openai/synthetic-small')
         for n in range(3):
@@ -740,3 +940,4 @@ class SummaryCopyTests(ModelFixture):
                          ('synthetic-small', 'Summarize.', []))
         self.assertTrue(summary['prompt_cache_key'].endswith('-summary'))
         self.assertIsNotNone(client.request('resume', bot='Bob')['result']['compaction'])
+        self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))

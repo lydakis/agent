@@ -1176,7 +1176,10 @@ starts with no elision floor. Schema 30 adds the prompt a [cut inside a
 turn](#cuts-inside-a-turn) keeps; earlier cuts are all at a turn's prompt,
 so none needs one. Schema 33 adds [tool approval](#tool-approval): the
 `approvals` table and its tag index, and `bots.gates`, which existing bots
-leave empty.
+leave empty. Schema 34 adds `turns.view_sent`, whether a turn's call or a
+summary or elision changed the bot's view last; turns stored before record
+neither, so a [summary](#compaction) after them never takes their call as
+having sent the view.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1836,30 +1839,58 @@ bot's own model or the `compaction_model` the client named at creation (same
 family; another family's items cannot be replayed to it).
 
 When the summarizer is the model the bot's last call ran on (the bot's, or
-the turn's override), and the view as that call sent it holds the whole
-span, the request is a copy of that call, as Claude Code and Codex
-send theirs: the bot's instructions, tools, tool choice, reasoning, cache
-key, and routing token, the prefix and window that call sent, read under
-its elision floor and thinking strip, and the items since, then one user
-item, the compaction request, carrying the client's compaction
-instructions and the maximum summary size. All but the newest items read
-from the provider cache. The copy takes what the last call sent ahead of
-its window, so a note written since does not show, and the window from
-before any stubs this boundary made. A summary that parks on a rate limit
+the turn's override), and a view a call sent holds the whole span, the
+request may be a copy of that call, as Claude Code and Codex send theirs:
+the bot's instructions, tools, tool choice, reasoning, cache key, and
+routing token, the prefix and window that call sent, read under its elision
+floor and thinking strip, then one user item, the compaction request,
+carrying the client's compaction instructions and the maximum summary size.
+The view is the last call's in this task, or, before the task's first call,
+the view as the bot's call before the new prompt or wait sent it through its
+newest boundary. That holds only when a call on the same model sent the view
+last, with no summary or elision rewriting it since: this turn's own, or,
+before this turn's first, the previous turn's, when that turn left more than
+its prompt. After a turn that failed before a call, no call sent that
+history. The copy takes what the call sent ahead of its window, so a
+note written since does not show, and the window from before any stubs this
+boundary made.
+
+Each summary goes the cheapest of three ways, estimated from the byte sizes
+the store keeps, a byte the provider's cache should hold counted at a tenth
+(what Anthropic's cache reads and OpenAI's GPT-5 family bill): a copy of the
+window through the span's end, a copy of the whole window, or a request of
+its own. The Responses cache reads any prefix of a call it holds, so there a
+copy ends at the span and reads all but the request from cache. Anthropic
+reads a cache only at a breakpoint, and the call put its own where it ended,
+so there a copy through the span reads only the tools and instructions,
+while a copy of the call's whole window reads all but the request; the
+result the model answered since stays out. A whole copy over the input
+limit is trimmed to the span rather than dropped, and a catch-up step's copy
+ends at its span. The estimate takes the call to be in cache; it does not
+model a cache that expired while a tool ran or the bot sat idle. The
+`compacted` event's `request` says which way went (`form`, `copy` or `own`,
+and `items`, the window items copied) with both estimates, `null` where a
+way could not be sent. A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
-starts, and that prefix when the view no longer sends it, so its retry,
-after a restart too, copies the same call. It does not set `tool_choice`, which on
+starts, where it ends when the copy had the call's window whole, and that
+prefix when the view no longer sends it, so its retry, after a restart
+too, sends the same request, though the view since holds another round. A summary
+the budget forced keeps that prefix, and its retry reads the window from
+the saved start the call's window was read from, past the budget, since
+the view it summarizes holds one round more than the call it copied. The copy does not set `tool_choice`, which on
 Anthropic would invalidate the message cache, so the request asks for text
 and a reply that calls a tool (`compaction_tool_call`) or has no text
 (`empty_summary`) is billed and not installed. As Claude Code does, the
 summary is then asked for at once in a request of its own, below, if the
 bot's budget and round limit allow another call; the `compaction_failed`
-event for the copy says `"fallback": true`. The summary covers everything the copy shows,
-the verbatim tail included. Otherwise (a step through a backlog larger than
-the budget, below; a copy that would exceed the input limit; or another
-summarizer, which cannot read that call's cache, as when a turn
-overrides the bot's model and the bot's summarizer summarizes it) the
-request is one of its own: the compaction instructions as its instructions, the previous summary
+event for the copy says `"fallback": true`. The summary covers everything
+the copy shows, the part of the verbatim tail a whole copy sends included.
+Otherwise (no view a call sent holds the span, a copy that cannot fit the
+input limit, or another summarizer, which cannot read that call's cache, as
+when a turn overrides the bot's model and the bot's summarizer summarizes
+it, or the next turn inherits the view that model sent), or when it is
+estimated cheaper, the request is one of its own: the
+compaction instructions as its instructions, the previous summary
 first, if any, so the summarizer merges rather than restarts, then the
 span's items as stored, then a request to write. Anthropic requests of this
 form retain the bot's tool definitions because the span may contain native

@@ -159,8 +159,8 @@ verbatim tail takes the large task's view far below the 75% trigger, so
 `tests/test_long_task_eval.py` elides once and summarizes never. A bot
 without `read` stores no stubs, so in `large-summary` summaries make all
 the room (twice in the scripted run). That is the condition the summary
-copy is measured on, against a build that sends fresh requests; see
-[running it](#running-it).
+requests are measured on, against the build before them and one that sends
+only requests of their own; see [running it](#running-it).
 
 Scores come from the workspace and the event log, not the model's account
 of itself: hidden tests passed, every file under `vendor/` unchanged with
@@ -175,9 +175,10 @@ compactions, elisions, the view each model call was made under (its
 summary version and cut, and its elision floor), input, cached input, and output tokens for the model and the
 summarizer separately, summarizer latency from its send to the send of
 the model call it held back, and for each installed summary whether it was
-a catch-up step (always a request of its own, never a copy), the bytes it
-summarized and the view they came from, and its summarizer calls and
-tokens. Failed summaries are live-only events, so the
+a catch-up step, the bytes it summarized and the view they came from, how
+it was sent (a copy of the bot's call, with the window items copied, or a
+request of its own) with the runtime's estimate of each way, and its
+summarizer calls and tokens. Failed summaries are live-only events, so the
 runner collects them as they arrive. The workspace's own tools record
 each run of `tools/env-check`, `make check`, and the benchmark with its
 exit status and a digest of the workspace's files, dotfiles and bytecode
@@ -202,32 +203,39 @@ under `.local/long-task-eval/run/`, which git ignores. Each condition
 prints a one-line summary; the JSON file keeps every bot's scores and
 answer.
 
-The realistic-budget comparison runs four arms at once, so every arm sees
-the backend at the same time, five bots each. The runtime has one
-behavior, so the arm with fresh summary requests is a measurement build,
-never committed: the same commit with the copy's selection in `compact()`
-turned off, which sends every summary as the request of its own that a
-separate summarizer model and a catch-up step already use.
+The realistic-budget comparison runs its arms at once, so every arm sees
+the backend at the same time. The runtime has one behavior, so an arm with
+another way of sending summaries is a measurement build, never committed:
+the commit before the per-summary choice (`d9ecbcf`, which copies the
+bot's call whenever it fits), and the same commit as the other arms with
+the copy turned off in `compact()`, which sends every summary as a request
+of its own.
 
 ```sh
 git worktree add .local/copy-off HEAD
-perl -0pi -e 's/sent\.filter\(\|sent\| sent\.model == reference && !plan\.catch_up\)/sent.filter(|_| false)/' \
+perl -0pi -e 's/sent\.filter\(\|sent\| sent\.model == reference\)/sent.filter(|_| false)/' \
     .local/copy-off/src/server/turn.rs
 git -C .local/copy-off diff --stat    # 1 file changed, 1 insertion(+), 1 deletion(-)
 cargo build --release --bin agent --manifest-path .local/copy-off/Cargo.toml \
     --target-dir .local/copy-off/target
+git worktree add .local/always-copy d9ecbcf
+cargo build --release --bin agent --manifest-path .local/always-copy/Cargo.toml \
+    --target-dir .local/always-copy/target
 
-run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 5 "$@"; }
+run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 10 \
+    --context-bytes 131072 "$@"; }
 run --conditions large-compact --out .local/long-task-eval/large-compact.json &
-run --conditions large-full --out .local/long-task-eval/large-full.json &
-run --conditions large-summary --out .local/long-task-eval/large-summary-copy.json &
+run --conditions large-full --context-bytes 4194304 --out .local/long-task-eval/large-full.json &
+run --conditions large-summary --out .local/long-task-eval/large-summary-choice.json &
+run --conditions large-summary --binary .local/always-copy/target/release/agent \
+    --out .local/long-task-eval/large-summary-copy.json &
 run --conditions large-summary --binary .local/copy-off/target/release/agent \
-    --out .local/long-task-eval/large-summary-fresh.json &
+    --out .local/long-task-eval/large-summary-own.json &
 wait
 ```
 
-Each JSON file records its binary's digest, which tells the two
-`large-summary` arms apart. `--context-bytes N` gives every condition the
+Each JSON file records its binary's digest, which tells the `large-summary`
+arms apart. `--context-bytes N` gives every condition the
 run names the budget N instead of its own, for example to run the
 `large-` arms at 128 KiB beside a `large-full` run without it.
 
@@ -494,6 +502,72 @@ more at 20 KiB (runs 1 and 2, different commits), the same per byte at
 128 KiB, and 54% less at 256 KiB (one summary each). It pays when the span
 is large beside what is new since the last call.
 
+## Live run 5
+
+2026-09-26, 22:03 to 22:08 UTC, the per-summary choice at commit
+`dd95047` (binary `8a88f4b0…`, also used for `large-compact` and
+`large-full`), against the commit before it, which copies whenever the
+copy fits (`d9ecbcf`, `663831db…`), and `dd95047` with the copy turned off
+(`eecdf4a3…`). Same model, plan, seed and host as runs 3 and 4; ten bots
+per arm, all five arms at once, at 128 KiB except `large-full`.
+
+| | large-compact | summary, choice | summary, always copy | summary, own | large-full |
+| --- | --- | --- | --- | --- | --- |
+| Completed, vendor intact, migrated once | 10/10 each | 10/10 each | 10/10 each | 10/10 each | 10/10 each |
+| Correct and steered | 10/10 | 9/10 | 10/10 | 9/10 | 10/10 |
+| Number reported | 10/10 | 9/10 | 10/10 | 10/10 | 10/10 |
+| Bots that ran `make quick` (none twice) | 3 | 1 | 0 | 1 | 0 |
+| Bots that stubbed / summarized | 7 / 2 | 0 / 6 | 0 / 6 | 0 / 5 | 0 / 0 |
+| Summaries (catch-up steps) | 2 (0) | 11 (3) | 17 (6) | 11 (6) | none |
+| Peak input tokens per bot | 21,384 to 34,510 | 21,249 to 36,002 | 21,267 to 34,742 | 21,596 to 35,362 | 25,059 to 83,673 |
+| Model calls | 137 | 135 | 144 | 135 | 145 |
+| Model input / cached / output tokens | 2,693,866 / 1,998,848 / 15,378 | 2,994,329 / 2,432,768 / 13,607 | 3,217,943 / 2,478,080 / 14,608 | 2,939,962 / 2,331,776 / 14,283 | 4,300,903 / 3,860,224 / 16,056 |
+| Model input served from cache | 74% | 81% | 77% | 79% | 90% |
+| Summarizer input / cached / output tokens | 2,674 / 0 / 918 | 238,176 / 193,024 / 7,263 | 482,520 / 129,536 / 13,012 | 251,401 / 0 / 7,600 | none |
+| Summarizer token-equivalents per byte summarized | 0.229 | 0.093 | 0.330 | 0.337 | none |
+| Input token-equivalents per bot, cached at a tenth | 89,758 | 86,929 | 135,361 | 109,276 | 82,670 |
+| Summary time holding the model back | 60.7 s | 450.0 s | 701.6 s | 381.0 s | none |
+| Condition wall time | 201.3 s | 220.5 s | 250.1 s | 232.7 s | 217.0 s |
+
+- The choice sent 10 of its 11 summaries as copies, catch-up steps
+  included, each of the call through the span's end. Nine read 97.8% to
+  99.2% of their input from cache: about 2,400 token-equivalents for a
+  62 KB span, where a request of its own for a span that size cost about
+  21,000 in the arm with no copy. One copy read no cache and cost 21,420,
+  about what a request of its own costs, since the copy stops at the
+  span's end.
+- The estimates tracked the bill. The copies the cache read came to 3.0
+  to 3.3 estimated bytes per token-equivalent. The choice's own estimates
+  for 62 KB spans, about 64,000, came to about 3.05 per token of the other
+  arm's requests of their own for spans that size. So the estimated ratio
+  of copy to own held within about 10%. The estimate does not model a
+  cache miss.
+- The eleventh summary was a catch-up step whose first request was paced.
+  Its retry rebuilt the view it had copied under the budget, which that
+  view was over, so it went as a request of its own with no estimate. That
+  is fixed after this run, and a scripted test paces the same step and
+  checks that the retry sends the paced copy again; not measured live.
+- The commit before copied the whole call rather than through the span,
+  and sent every catch-up step as a request of its own. Its summaries read
+  27% of their input from cache and cost as much per byte as requests of
+  their own. It also ran more summaries (17 in 6 bots, against 11 in 6),
+  which depends on what each model trajectory printed (inferred from the
+  views).
+- Two bots lost the steered correction: one in the choice arm and one in
+  the arm with no copy, each after a catch-up step left one large result
+  filling most of the budget. The steer waited for room that no summary
+  could make, since the result was part of the newest boundary, and failed
+  with `stale_turn` when the task ended (hidden tests 5/9; the cause is
+  inferred from their views). A scripted task reproduces it on `d9ecbcf`
+  as well, so the choice did not cause it.
+- Summaries held the model back about 41 s each in the choice arm, against
+  35 s for requests of their own; fifty bots ran at once, and a summary of
+  908 uncached tokens took 51.6 s, so the time here is the backend's
+  queue, not the request's size (inferred).
+- Compacting still did not pay on this task: full context cost 82,670
+  token-equivalents per bot against 86,929 with the choice, the cheapest
+  of the compacting arms.
+
 ## Not covered yet
 
 The rest of item 36: branching every condition from identical
@@ -502,8 +576,6 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 1,000 tokens with the tools), a task long enough that summaries run
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
-compactions and retrievals. From runs 3 and 4: choosing per summary
-between the copy and a request of its own from the byte sizes the store
-already keeps, trimming the copy rather than dropping it when the view is
-over the limit, and a task whose context grows well past the budget,
-where compacting could pay.
+compactions and retrievals. From runs 3 to 5: a task whose context grows
+well past the budget, where compacting could pay, and a steer that waits
+while one result fills the room it needs.

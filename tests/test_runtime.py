@@ -38,8 +38,11 @@ class Model(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            body = self.rfile.read(int(self.headers['Content-Length']))
+            request = json.loads(body)
             self.server.requests.put(request)
+            if hasattr(self.server, 'bodies'):
+                self.server.bodies.append(body)
             if hasattr(self.server, 'request_gates'):
                 try:
                     gate = self.server.request_gates.get_nowait()
@@ -77,6 +80,15 @@ class Model(http.server.BaseHTTPRequestHandler):
             texts = [i['content'][0]['text'] for i in request['input'] if i.get('role') == 'user']
             # A `steer:` message joins the running task, which its prompt drives.
             user = next((t for t in reversed(texts) if not t.startswith('steer:')), texts[-1])
+            if user in getattr(self.server, 'refused_prompts', ()):
+                # A refusal with no usage: the turn fails without a model round.
+                body = b'{"error":{"message":"synthetic refusal"}}'
+                self.send_response(400)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             attempts = getattr(self.server, 'attempts', {})
             attempt = attempts[user] = attempts.get(user, 0) + 1
             self.server.attempts = attempts
@@ -468,6 +480,17 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'
+            if summary and getattr(self.server, 'compaction_refusals', 0):
+                # As on Responses: a rate limit whose last wait parks the turn.
+                self.server.compaction_refusals -= 1
+                body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+                self.send_response(429)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if warm and getattr(self.server, 'refuse_warm', False):
                 body = b'{"type":"error","error":{"type":"invalid_request_error","message":"no"}}'
                 self.send_response(400)
@@ -516,9 +539,14 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 calls = max((int(b['id'][11:]) + 1 for m in request['messages'][start:]
                              for b in m['content'] if b['type'] == 'tool_use'
                              and b['id'].startswith('toolu_long_')), default=0)
-                if calls < int(prompt[5:]):
+                # `long:COUNTxLINES,...` sets each round's lines, as on Responses.
+                spec = prompt[5:]
+                sizes = ([600] * int(spec) if 'x' not in spec else
+                         [int(lines) for part in spec.split(',')
+                          for count, lines in [part.split('x')] for _ in range(int(count))])
+                if calls < len(sizes):
                     blocks.append({'type': 'tool_use', 'id': f'toolu_long_{calls}', 'name': 'shell',
-                                   'input': {'command': f"seq -f 'round {calls} line %g' 1 600"}})
+                                   'input': {'command': f"seq -f 'round {calls} line %g' 1 {sizes[calls]}"}})
                     stop = 'tool_use'
                 else:
                     blocks.append({'type': 'text', 'text': f'done after {calls} rounds'})

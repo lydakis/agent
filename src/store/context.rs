@@ -31,6 +31,21 @@ pub struct ContextPrefix {
 }
 
 impl Window {
+    /// Keep the first `len` items: a call's window read back with the items
+    /// written since it.
+    pub fn truncate(&mut self, len: usize) {
+        let dropped: i64 = self
+            .sizes
+            .iter()
+            .skip(len)
+            .map(|&size| i64::from(size))
+            .sum();
+        self.item_bytes -= dropped;
+        self.ids.truncate(len);
+        self.sizes.truncate(len);
+        self.thinking.truncate(len);
+    }
+
     pub fn prefix(&self, listed: &[(i64, String)], prefix_budget: usize) -> Result<ContextPrefix> {
         context_prefix(
             self.family,
