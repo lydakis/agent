@@ -1789,8 +1789,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   every takeover, start from a random point each run, and stay below
   2^53; a lease holds only on its own session.
   `stats` lists the served tags in `approvers`. The stream is for the
-  holder alone: bot followers get the compact event, and a holder that
-  cannot keep up is closed, like a lagging follower.
+  holder alone: bot followers get the compact event. Pushes to a holder
+  wait in order for room in its output, so a group commit's burst does not
+  drop a holder that is reading; one with 128 pushes waiting has stopped
+  reading and is closed, like a lagging follower.
 - Interrupting a turn cancels its gated calls like any planned call.
   Anything that reaches the socket can answer, a bot's own shell included:
   this is oversight, not containment.

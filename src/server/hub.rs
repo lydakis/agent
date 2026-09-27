@@ -7,10 +7,13 @@ use agent_runtime::{Result, fail, output::Output, store::Store};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 pub struct Subscription {
     session: u64,
@@ -54,6 +57,7 @@ pub const ALL: &str = "*";
 pub struct Approver {
     session: u64,
     output: Output,
+    feed: Feed,
     lease: u64,
     lease_ms: u64,
     deadline: Instant,
@@ -74,6 +78,39 @@ impl Approver {
     }
 }
 pub type Serving = Arc<Mutex<Approver>>;
+/// How many pushes may wait for one holder. A group commit can publish many
+/// parts at once, each up to 256 KiB of calls; they wait here for room in
+/// the session's output rather than closing it. A holder this far behind
+/// has stopped reading.
+const FEED_PARTS: usize = 128;
+/// The pushes to one holder, in order: its calls and the notice that it
+/// lost the tag.
+struct Feed {
+    sender: mpsc::UnboundedSender<Value>,
+    queued: Arc<AtomicUsize>,
+}
+impl Feed {
+    fn new(output: Output) -> Self {
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Value>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let counted = queued.clone();
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                let sent = output.send(message).await;
+                counted.fetch_sub(1, Ordering::Relaxed);
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+        Self { sender, queued }
+    }
+    /// False when the holder has stopped reading.
+    fn push(&self, message: Value) -> bool {
+        self.queued.fetch_add(1, Ordering::Relaxed) < FEED_PARTS
+            && self.sender.send(message).is_ok()
+    }
+}
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
@@ -144,7 +181,7 @@ impl HubInner {
             };
             let mut held = serving.lock().unwrap();
             if held.live && held.deadline <= now {
-                let _ = held.output.try_send(lost(&tag, lease));
+                held.feed.push(lost(&tag, lease));
                 drop(held);
                 self.approvers.remove(&tag);
             } else {
@@ -191,7 +228,7 @@ impl Hub {
                 drop(held);
                 return Some(serving);
             }
-            let _ = held.output.try_send(lost(tag, held.lease));
+            held.feed.push(lost(tag, held.lease));
             None
         });
         // Leases that ran out go now, whichever tag they held, so tags
@@ -201,6 +238,7 @@ impl Hub {
         let lease = inner.next_lease;
         let approver = Arc::new(Mutex::new(Approver {
             session,
+            feed: Feed::new(output.clone()),
             output,
             lease,
             lease_ms,
@@ -242,7 +280,7 @@ impl Hub {
         }
         let now = Instant::now();
         if held.deadline <= now {
-            let _ = held.output.try_send(lost(tag, lease));
+            held.feed.push(lost(tag, lease));
             drop(held);
             inner.remove(tag);
             return fail("approvals_lost");
@@ -268,7 +306,7 @@ impl Hub {
     }
     /// Deliver a part of an announcement to the session serving its gate
     /// tag. A holder whose lease ran out is told it lost the tag instead;
-    /// one that cannot keep up is closed, like a lagging follower.
+    /// one that has stopped reading is closed, like a lagging follower.
     pub fn approval(&self, message: &Value) {
         let Some(tag) = message["tag"].as_str() else {
             return;
@@ -277,7 +315,7 @@ impl Hub {
         let Some(held) = self.inner.lock().unwrap().approvers.get(tag).cloned() else {
             return;
         };
-        let (session, output, sent) = {
+        let (session, output) = {
             let held = held.lock().unwrap();
             if !held.live || cursor <= held.cursor {
                 return;
@@ -291,12 +329,13 @@ impl Hub {
             let mut sent = message.clone();
             sent["lease"] = json!(held.lease);
             sent["durable"] = json!(false);
-            (held.session, held.output.clone(), sent)
+            if held.feed.push(sent) {
+                return;
+            }
+            (held.session, held.output.clone())
         };
-        if output.try_send(sent).is_err() {
-            self.close_session(session);
-            output.close();
-        }
+        self.close_session(session);
+        output.close();
     }
     /// End a lease that ran out, if it still holds its tag, and tell its
     /// holder.
@@ -307,7 +346,7 @@ impl Hub {
         };
         let held = held.lock().unwrap();
         if held.session == session && held.lease == lease {
-            let _ = held.output.try_send(lost(tag, lease));
+            held.feed.push(lost(tag, lease));
             drop(held);
             inner.remove(tag);
         }
@@ -625,5 +664,51 @@ mod tests {
         let inner = hub.inner.lock().unwrap();
         assert_eq!(inner.approvers.keys().collect::<Vec<_>>(), ["other"]);
         assert_eq!(inner.expiries.len(), 1);
+    }
+
+    fn part(cursor: i64, bytes: usize) -> Value {
+        json!({"event":"approval_requested","tag":"auto","cursor":cursor,"data":{"calls":"x".repeat(bytes)}})
+    }
+
+    #[tokio::test]
+    async fn a_burst_larger_than_the_output_waits_for_a_reading_holder() {
+        use tokio::io::AsyncBufReadExt;
+        let hub = Hub::default();
+        let (writer, reader) = tokio::io::duplex(1 << 16);
+        let output = Output::writer(writer);
+        let (_, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
+        serving.lock().unwrap().go_live(0);
+        // 24 parts of 200 KiB, more than twice the session's 2 MiB queue,
+        // published at once as one group commit would.
+        for cursor in 1..=24 {
+            hub.approval(&part(cursor, 200 * 1024));
+        }
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        for cursor in 1..=24 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let pushed: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(pushed["cursor"], cursor);
+        }
+        assert!(!*output.subscribe_closed().borrow());
+        assert_eq!(hub.served(), ["auto"]);
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_stopped_reading_is_closed() {
+        let hub = Hub::default();
+        let (writer, _unread) = tokio::io::duplex(1024);
+        let output = Output::writer(writer);
+        let (_, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
+        serving.lock().unwrap().go_live(0);
+        for cursor in 1..=400 {
+            hub.approval(&part(cursor, 16));
+            tokio::task::yield_now().await;
+        }
+        assert!(*output.subscribe_closed().borrow());
+        assert!(hub.served().is_empty());
     }
 }
