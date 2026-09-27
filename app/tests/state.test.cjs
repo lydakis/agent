@@ -26,7 +26,7 @@ function page(daemon = {}, storage = null) {
   }};
   const context = vm.createContext({
     Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
-    document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, addEventListener() {},
+    document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; },
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
     window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
@@ -876,6 +876,21 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
   assert.match(items[user + 1].content[0].text, /^Noted: mention the wait op too\./);
   assert.equal(events.filter((e) => e.event === 'turn_finished').length, 1, 'the steer joined the running turn');
   d.close();
+});
+
+test('Escape in the finder never stops a turn, and a deleted bot takes its draft with it', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
+  p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.tree(); p.S.selected = 'app.lead';
+  const doc = p.context.document;
+  doc.getElementById('pickerq').value = '';
+  await doc.listeners.keydown({ key: 'Escape', target: { id: 'pickerq' }, preventDefault() {} });
+  assert.deepEqual(sent.filter((op) => op === 'interrupt'), []);
+  p.S.selected = 'app.task'; doc.getElementById('input').value = 'for task';
+  await p.onEvent({ event: 'deleted', bot: 'app.task' });
+  assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, '');
 });
 
 test('the demo daemon ends a stopped turn quietly when its bot is deleted before the script wakes', async () => {

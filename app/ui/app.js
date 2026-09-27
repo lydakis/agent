@@ -203,7 +203,10 @@ function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
-  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name); if (S.ui.side === name) S.ui.side = null;
+  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
+  // A draft belongs to its bot, so it goes with it.
+  if (S.ui.side === name) { S.ui.side = null; $('sideinput').value = ''; }
+  if (S.selected === name) $('input').value = '';
 }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
@@ -1356,7 +1359,8 @@ $('pickerlist').addEventListener('click', async (e) => { const r = e.target.clos
 const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
-  if (S.ui.picker || e.target.id === 'projdir') return;
+  // The finder and the folder field handle their own keys; Escape there must not stop a turn.
+  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
