@@ -1002,8 +1002,8 @@ Where it differs from the design above:
   leases. Either way the holder is sent `approvals_lost`. The lease period
   starts when the serve reply is queued, and pushes follow the reply. An
   accepted leased answer holds the lease through storage and restarts its
-  period on completion, including a failed answer. Calls waiting for output
-  room are discarded when their lease ends; already queued output may arrive.
+  period when its reply is queued, including a failed answer. Calls waiting
+  for output room are discarded when their lease ends; already queued output may arrive.
 - A lapsed gate's denial is not counted in `denials`: nobody judged the
   call.
 

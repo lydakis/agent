@@ -323,6 +323,13 @@ shared listing budget, refused credentials, and the bounded shared AWS
 startup lookup. These are synthetic checks, not fresh paid-provider
 validation or a catalog performance comparison.
 
+The later `e0f5067` approval follow-up was checked against this
+consolidation. Its reply-boundary refinement is retained without
+reintroducing lease replacement: a valid answer holds its lease through
+reply queueing, and only its owning session can release that hold. The
+62 server tests and 24 release-binary approval integration tests passed;
+the 10 focused hub tests, Clippy, formatting, and diff checks also passed.
+
 ## Not established
 
 - Any Terminal-Bench score: five tasks are a screen.

@@ -1817,9 +1817,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   600,000), counted from when its serve reply is queued; pushes follow
   the reply, so neither the rest of a storage group nor a burst of pushes
   uses up the lease or the reply's room. An accepted leased answer holds
-  the tag through its storage job and restarts the period on completion,
-  including an error. A holder whose lease ran out keeps
-  the tag until any session next serves a tag, which ends the lease (and
+  the tag through storage and reply backpressure, restarting the period
+  when its reply is queued, including an error. A holder whose lease ran
+  out keeps the tag until any session next serves a tag, which ends the lease (and
   another may take the tag over under a new one), or until it renews or
   answers, which is refused; either way it is sent
   `{"event":"approvals_lost","tag","lease"}`, and pushes stop. A closed
