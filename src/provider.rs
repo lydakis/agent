@@ -815,6 +815,7 @@ impl Provider {
                     format!("provider_http_{status}")
                 },
                 detail: body.detail,
+                facts: None,
             });
         }
         reservation.learn(response.headers(), self.family);
@@ -1057,6 +1058,7 @@ impl Provider {
             return Err(Error {
                 code,
                 detail: body.detail,
+                facts: None,
             });
         }
         reservation.learn(response.headers(), self.family);
@@ -1459,10 +1461,7 @@ async fn create(prefix: &[u8], previous: Option<&str>, items: Items) -> Result<S
     text.extend_from_slice(&prefix[1..]);
     let mut stream = items.stream();
     while let Some(chunk) = stream.next().await {
-        text.extend_from_slice(&chunk.map_err(|error| Error {
-            code: error.to_string(),
-            detail: None,
-        })?);
+        text.extend_from_slice(&chunk.map_err(|error| Error::new(&error.to_string()))?);
     }
     text.extend_from_slice(b"]}");
     String::from_utf8(text).map_err(|_| Error::new("invalid_item_encoding"))

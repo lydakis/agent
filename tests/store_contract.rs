@@ -2916,6 +2916,31 @@ fn a_running_turn_forks_at_its_newest_finished_round() {
         .unwrap()
         .turn;
     let prompt = head(&db, "Bob");
+    // A busy submission is told what is in the way and which requests get
+    // past it, with the same facts for programs.
+    let busy = db
+        .begin(
+            "Bob",
+            "r3",
+            "ask",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap_err();
+    assert_eq!(busy.code, "bot_busy");
+    assert_eq!(
+        busy.detail.unwrap(),
+        format!(
+            "turn {turn} is running; submit with delivery \"steer\" and expected_turn {turn} \
+             to add this to it, or delivery \"queue\" to run it afterwards; to ask without \
+             interrupting, fork this bot and submit to the fork"
+        )
+    );
+    assert_eq!(
+        busy.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"running_turn":turn,"fork_point":prompt}))
+    );
     assert_eq!(fork_point(&mut db, "Bob", "f0").unwrap(), prompt);
 
     // Two calls in one round: the round closes only at its last result.
@@ -3129,10 +3154,10 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
 }
 
 #[test]
-fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
+fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
     let path = std::env::temp_dir().join(format!("agent-closed-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let turn = {
+    let (turn, kept) = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
@@ -3154,7 +3179,7 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         db.tool_start(turn, &w).unwrap();
         db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
             .unwrap();
-        turn
+        (turn, stored(&mut db, "Bob"))
     };
     Connection::open(&path)
         .unwrap()
@@ -3163,46 +3188,23 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
              ALTER TABLE processes DROP COLUMN delivered; PRAGMA user_version=35;",
         )
         .unwrap();
+    // Its closed node cannot be read back, so the upgrade ends the turn
+    // rather than guessing, and the bot keeps its whole history.
     let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.turn_status("Bob", turn).unwrap(), "interrupted");
+    let bot = db.inspect("Bob").unwrap();
     assert_eq!(
-        db.fork("Bob", "early", Fork::default()).unwrap_err().code,
-        "fork_point_unknown"
+        (bot.status.as_str(), bot.running_turn),
+        ("interrupted", None)
     );
-    // So a busy submission is not pointed at that fork.
-    let busy = db
-        .begin(
-            "Bob",
-            "r3",
-            "ask",
-            true,
-            &TurnOptions::default(),
-            allow_provider,
-        )
-        .unwrap_err();
-    assert_eq!(busy.code, "bot_busy");
-    assert!(!busy.detail.unwrap().contains("fork"));
-    // An explicit point still works, and the next response lifts the refusal.
-    let prompt = head(&db, "Bob") - 1;
-    db.fork(
-        "Bob",
-        "explicit",
-        Fork {
-            checkpoint: Some(prompt),
-            ..Fork::default()
-        },
-    )
-    .unwrap();
-    db.resume(turn).unwrap();
-    db.tool_finish(turn, "w", &result("{}")).unwrap();
+    let history = stored(&mut db, "Bob");
+    assert_eq!(history[..kept.len()], kept[..]);
+    // The parked call is answered, so a default fork starts at the head.
+    assert_eq!(history.len(), kept.len() + 1);
     assert_eq!(
-        db.fork("Bob", "still", Fork::default()).unwrap_err().code,
-        "fork_point_unknown"
+        fork_point(&mut db, "Bob", "after").unwrap(),
+        head(&db, "Bob")
     );
-    let waited = head(&db, "Bob");
-    let (item, a) = call("a");
-    db.append(turn, vec![item], std::slice::from_ref(&a), None)
-        .unwrap();
-    assert_eq!(fork_point(&mut db, "Bob", "later").unwrap(), waited);
     drop(db);
     std::fs::remove_file(path).unwrap();
 }

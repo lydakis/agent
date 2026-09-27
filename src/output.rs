@@ -124,7 +124,11 @@ impl Output {
         match result {
             Ok(result) => serde_json::json!({"id":id.clone(),"result":result}),
             Err(error) => {
-                serde_json::json!({"id":id.clone(),"error":error.code,"detail":error.detail})
+                let mut response = error.facts.map(|facts| *facts).unwrap_or_default();
+                response.insert("id".into(), id);
+                response.insert("error".into(), error.code.into());
+                response.insert("detail".into(), error.detail.into());
+                Value::Object(response)
             }
         }
     }
