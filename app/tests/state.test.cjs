@@ -986,3 +986,21 @@ test('swap carries each draft with its bot; a long wait list stays short in the 
   b.waitingOn = Array.from({ length: 5000 }, (_, i) => `turn:app.t${i}/1`);
   assert.equal(p.waitSummary(b), 'app.t0/1, app.t1/1, app.t2/1 +4997');
 });
+
+test('the demo daemon answers as a side chat only for a fork given its own tools, whatever the name', async () => {
+  const context = vm.createContext({ window: {}, setTimeout, clearTimeout, Math, JSON, Promise, Error, String, Set, Map, Infinity });
+  vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
+  const d = context.window.Daemon;
+  const texts = async (bot) => {
+    await d.request('submit', { bot, prompt: 'run the tests', delivery: 'reject' });
+    const events = [];
+    while (!events.some((e) => e.event === 'turn_finished' && e.bot === bot)) events.push(...(await d.pull()).events);
+    return events.filter((e) => e.bot === bot && e.event === 'tool_started').map((e) => e.data.name);
+  };
+  try {
+    await d.request('create', { bot: 'client-side', model: 'alpha/one' });
+    assert.deepEqual(await texts('client-side'), ['shell'], 'a bot merely named -side runs its prompt');
+    await d.request('fork', { source: 'client-side', bot: 'peek', allow: ['read', 'history'] });
+    assert.deepEqual(await texts('peek'), ['read'], 'a fork with its own tools answers from history');
+  } finally { d.close(); }
+});

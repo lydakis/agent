@@ -24,7 +24,7 @@ window.Daemon = (() => {
   }
 
   // ---------- demo daemon ----------
-  const S = { bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set() };
+  const S = { bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set() };
   // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
@@ -111,8 +111,9 @@ window.Daemon = (() => {
     if (turn === null) return;
     await wait(250);
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
-    // A side chat answers from the history it was forked with.
-    if (/-side(-\d+)?$/.test(name)) {
+    // A fork given its own tool list stands in for a side chat, which
+    // answers from the history it was forked with.
+    if (S.sides.has(name)) {
       await tool(name, turn, 'read', { path: 'PLAN.md' }, '1.2 KiB · three steps', 400);
       await stream(name, turn, 'Waiting on three peers: plan is done, build is waiting on its reviewer, and test is running. The release build is still going in the background.');
       if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
@@ -258,8 +259,8 @@ window.Daemon = (() => {
           const turn = S.nextTurn; reply(params.bot, params.prompt); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         // A running source forks too, as the daemon's does from its newest finished round.
-        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace, Array.isArray(params.allow) ? params.allow : src.allowed ?? null); return { ...S.bots.get(params.bot) }; }
-        case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); b.interrupted = true; S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
+        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace, Array.isArray(params.allow) ? params.allow : src.allowed ?? null); if (Array.isArray(params.allow)) S.sides.add(params.bot); return { ...S.bots.get(params.bot) }; }
+        case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); b.interrupted = true; S.bots.delete(params.bot); S.lineages.delete(params.bot); S.sides.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
         default: throw new Error(`unsupported_in_demo:${op}`);
       }
     },
