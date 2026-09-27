@@ -1414,7 +1414,7 @@ class RuntimeTests(ModelFixture):
         self.model.requests.get(timeout=3)
         busy = client.request('submit', bot='Bob', request_id='more', prompt='hi')
         self.assertEqual(busy['error'], 'bot_busy')
-        self.assertIn('fork --source Bob --bot NEW', busy['detail'])
+        self.assertEqual(busy['detail'], f'turn {turn} is running')
         # No round has finished, so the fork starts at the turn's prompt.
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         prompt = next(e['data']['node'] for e in events if e['event'] == 'accepted' and e['turn'] == turn)

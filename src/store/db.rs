@@ -3312,34 +3312,13 @@ impl Database {
         }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
-            // Name the ways past a busy bot as flags to copy; callers, models
-            // included, do not act on a description of them.
-            let wait = match bot.running_turn {
-                Some(turn) => format!(
-                    "turn {turn} is running; resend with --delivery steer --turn {turn} \
-                     to add this to it, or --delivery queue to run it afterwards"
-                ),
-                None => "earlier work is waiting; resend with --delivery queue to run \
-                         this after it"
-                    .to_owned(),
-            };
-            // A fork without a checkpoint starts at the running turn's
-            // newest finished round, or at the head of an idle bot. A turn
-            // from before that round was kept has none to offer yet.
-            let forkable = bot.running_turn.is_none()
-                || self
-                    .conn
-                    .prepare_cached("SELECT closed IS NOT NULL FROM bots WHERE name=?")?
-                    .query_row([name], |r| r.get::<_, bool>(0))?;
-            if !forkable {
-                return fail_with("bot_busy", wait);
-            }
+            // What is in the way; the ways past it are the client's to offer.
             return fail_with(
                 "bot_busy",
-                format!(
-                    "{wait}; to ask without interrupting, fork --source {name} --bot NEW \
-                     and send it to NEW"
-                ),
+                match bot.running_turn {
+                    Some(turn) => format!("turn {turn} is running"),
+                    None => "earlier work is waiting".to_owned(),
+                },
             );
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
@@ -5365,8 +5344,7 @@ impl Database {
                     None => {
                         return fail_with(
                             "fork_point_unknown",
-                            "this turn began before its finished rounds were kept; \
-                             pass --checkpoint, or fork after its next model response",
+                            "this turn began before its finished rounds were kept",
                         );
                     }
                 }

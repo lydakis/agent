@@ -17,6 +17,12 @@ pub const EARLIER_TOKENS: usize = 16_000;
 /// SDK default for Jev, longer for a general model, which is slower.
 pub const DEADLINE_MS: u64 = 10_000;
 pub const MODEL_DEADLINE_MS: u64 = 30_000;
+/// How long an `auto` call may wait for its verdict before it is denied and
+/// the turn ends: the approver's own deadline, plus margin.
+pub const AUTO_EXPIRE_MS: u64 = MODEL_DEADLINE_MS + 15_000;
+/// Tools the approval modes never gate: they touch only the bot's own
+/// store records.
+pub const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
 /// Denials that trip the breaker: in a row, or in one turn.
 pub const IN_ROW: u64 = 3;
 pub const IN_TURN: u64 = 20;

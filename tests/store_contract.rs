@@ -3020,7 +3020,7 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         db.fork("Bob", "early", Fork::default()).unwrap_err().code,
         "fork_point_unknown"
     );
-    // So a busy submission is not pointed at that fork.
+    // A busy submission is told only what is in the way.
     let busy = db
         .begin(
             "Bob",
@@ -3032,7 +3032,7 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         )
         .unwrap_err();
     assert_eq!(busy.code, "bot_busy");
-    assert!(!busy.detail.unwrap().contains("fork"));
+    assert_eq!(busy.detail.unwrap(), format!("turn {turn} is running"));
     // An explicit point still works, and the next response lifts the refusal.
     let prompt = head(&db, "Bob") - 1;
     db.fork(

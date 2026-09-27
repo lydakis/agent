@@ -14,6 +14,7 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
+use agent_client::approver::{AUTO_EXPIRE_MS, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 /// What a new bot is told when the caller gives no instructions: the
 /// harness preamble every client shares. `--agents` layers AGENTS.md files
@@ -724,11 +725,6 @@ fn author() -> Result<Value> {
     }
 }
 
-/// How long an `auto` call may wait for its verdict before it is denied and
-/// the turn ends: the approver's own deadline (30 s for a general model),
-/// plus margin.
-const AUTO_EXPIRE_MS: u64 = 45_000;
-
 /// Whether a bot record has a gate the `auto` approver answers.
 fn answered_by_auto(bot: &Value) -> bool {
     bot["gates"]
@@ -852,10 +848,6 @@ fn ensure_approver(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
-/// Tools the approval modes never gate: they touch only the bot's own
-/// store records.
-const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
 
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
 /// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
@@ -1152,13 +1144,15 @@ fn run(options: &Options) -> Result<i32> {
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     // Existing bots keep their model unless --model explicitly overrides it.
     // AGENT_MODEL is only a creation default, including inside a peer's shell.
-    let submitted = connection.request(
-        "submit",
-        json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
-            "workspace":workspace,
-            "model":if created { Value::Null } else { json!(options.model) },
-            "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
-    )?;
+    let submitted = connection
+        .request(
+            "submit",
+            json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
+                "workspace":workspace,
+                "model":if created { Value::Null } else { json!(options.model) },
+                "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
+        )
+        .map_err(|error| ways_past_busy(&mut connection, &bot, error))?;
     if options.detach {
         print_json(&submitted, options.pretty)?;
         return Ok(0);
@@ -1181,6 +1175,34 @@ fn run(options: &Options) -> Result<i32> {
             return Ok(code);
         }
     }
+}
+
+/// A busy bot's refusal, with the ways past it as flags to copy: callers,
+/// models included, do not act on a description of them. The daemon says
+/// only what is in the way.
+fn ways_past_busy(connection: &mut Connection, bot: &str, error: Error) -> Error {
+    if error.code != "bot_busy" {
+        return error;
+    }
+    let running = connection
+        .request("resume", json!({"bot":bot}))
+        .ok()
+        .and_then(|record| record["running_turn"].as_i64());
+    let join = match running {
+        Some(turn) => format!(
+            "resend with --delivery steer --turn {turn} to add this to it, \
+             or --delivery queue to run it afterwards"
+        ),
+        None => "resend with --delivery queue to run this after it".to_owned(),
+    };
+    let fact = error.detail.map(|d| d + "; ").unwrap_or_default();
+    Error::with(
+        "bot_busy",
+        format!(
+            "{fact}{join}; to ask without interrupting, fork --source {bot} --bot NEW \
+             and send it to NEW"
+        ),
+    )
 }
 
 fn follow(options: &Options) -> Result<i32> {
@@ -1255,7 +1277,16 @@ fn fork(options: &Options) -> Result<i32> {
     if auto {
         ensure_approver(options, &mut connection, bot_model(&state))?;
     }
-    let result = connection.request("fork", request)?;
+    let result = connection.request("fork", request).map_err(|error| {
+        if error.code != "fork_point_unknown" {
+            return error;
+        }
+        let fact = error.detail.map(|d| d + "; ").unwrap_or_default();
+        Error::with(
+            "fork_point_unknown",
+            format!("{fact}pass --checkpoint, or fork after its next model response"),
+        )
+    })?;
     print_json(&result, options.pretty)?;
     Ok(0)
 }

@@ -1109,13 +1109,14 @@ the turn's id and handle at once, and `wait`, `turns`, and
 
 - `reject` (default): `bot_busy` while a turn runs or is parked,
   `active_agent_limit` when no slot is free. Nothing is written. The
-  `bot_busy` detail names the running turn and the ways past it as flags
-  to copy (`--delivery steer --turn N`, `--delivery queue`, or
+  `bot_busy` detail says only what is in the way: `turn N is running`, or
+  `earlier work is waiting`. `agent run` adds the ways past it as flags to
+  copy (`--delivery steer --turn N`, `--delivery queue`, or
   `fork --source NAME --bot NEW` to ask without interrupting, which starts
-  at the running turn's newest finished round; a turn from before schema 36
-  has none until its next response or steer, so no fork is offered). A model
-  calling `agent run` does not discover them otherwise, and in benchmark runs
-  it ignored a prose description of them.
+  at the running turn's newest finished round). A model calling `agent run`
+  does not discover them otherwise, and in benchmark runs it ignored a prose
+  description of them. Likewise `fork_point_unknown` states the fact and
+  `agent fork` adds `--checkpoint`.
 - `queue`: the turn is a durable row that starts when the bot is free and a
   slot is open. The response reports `status`: `running` when it started at
   once, `queued` behind the bot's own work, or `ready` when only a slot is

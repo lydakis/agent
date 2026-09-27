@@ -159,6 +159,14 @@ class SocketAndCliTests(ModelFixture):
         self.agent('fork', '--store', str(self.store), *fork.group(1).split(), '--bot', 'Side')
         side = self.agent('run', '--store', str(self.store), '--bot', 'Side', 'aside')
         self.assertEqual(side.returncode, 0)
+        # With no known fork point (a turn running across the schema 36
+        # upgrade), the daemon states the fact and `agent fork` adds the way past it.
+        with sqlite3.connect(self.store) as db:
+            db.execute("UPDATE bots SET closed=NULL WHERE name='Bob'")
+        unknown = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Lost', check=False)
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn('fork_point_unknown: this turn began before its finished rounds were kept; '
+                      'pass --checkpoint, or fork after its next model response', unknown.stderr)
         queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'queue', 'second').stdout)
         self.assertEqual(queued['status'], 'queued')

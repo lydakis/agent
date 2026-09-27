@@ -150,7 +150,7 @@ turn's prompt.
   however much history it holds. A waiting or paced turn restored at open
   has no boundary and no count until its next model response or steer
   batch writes them. Until then a default fork of it fails with
-  `fork_point_unknown`, which names `--checkpoint`. Guessing the prompt
+  `fork_point_unknown`, for which `agent fork` names `--checkpoint`. Guessing the prompt
   would repeat the failure seen live, a fork that redoes the task. Finding
   the real node would take the transcript scan this design avoids. An
   upgrade test opens a store with thousands of parked turns and many
@@ -255,9 +255,10 @@ fork on its source's cache.
 
 ### 3. Hints and preamble
 
-- **`bot_busy` from `submit`** offers `fork --source NAME --bot NEW` with no
-  checkpoint. That now means the newest finished round, including on a first
-  turn.
+- **`bot_busy` from `submit`**: `agent run` offers `fork --source NAME --bot NEW`
+  with no checkpoint (the daemon's detail states only the running turn,
+  since 2026-09-27). That now means the newest finished round, including on
+  a first turn.
 - **The preamble** keeps an executable fork command, `"$AGENT_BIN" fork
   --source NAME --bot NEW`, without the checkpoint, and adds the
   fork-or-fresh sentence above. This is the one opinion kept. It lives in
