@@ -130,12 +130,21 @@ pub fn write(dir: &Path, name: &str, model: &str) -> Result<(), String> {
         }
         _ => format!("project_unwritable: {}: {e}", path.display()),
     };
-    std::fs::create_dir_all(dir.join(".agent")).map_err(failed)?;
+    let agent = dir.join(".agent");
+    let created = !agent.is_dir();
+    std::fs::create_dir_all(&agent).map_err(failed)?;
     place_new(&path, |file| {
         std::io::Write::write_all(file, text.as_bytes())?;
         file.sync_all()
     })
-    .map_err(failed)
+    .map_err(failed)?;
+    // The new entries are durable only once their directories are synced.
+    let sync = |d: &Path| std::fs::File::open(d).and_then(|f| f.sync_all());
+    sync(&agent).map_err(failed)?;
+    if created {
+        sync(dir).map_err(failed)?;
+    }
+    Ok(())
 }
 
 /// Fill a temporary file beside `path`, then link it into place. The link

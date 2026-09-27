@@ -953,7 +953,7 @@ for (const [id, who] of PANES) {
 
 // ---------- heads and composers ----------
 function headHTML(b, pane) {
-  const waiting = b.waitingOn.length ? ` on ${esc(b.waitingOn.map((h) => h.replace(/^turn:/, '')).join(', '))}` : '';
+  const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
   if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
   const lead = b.project ? bot(b.project + LEAD) : null;
@@ -961,9 +961,16 @@ function headHTML(b, pane) {
     : `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(b.project)}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`;
   return `<div class="crumbs">${crumbs}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
+// A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
+const WAIT_SHOWN = 3;
+function waitSummary(b) {
+  const shown = b.waitingOn.slice(0, WAIT_SHOWN).map((h) => h.replace(/^turn:/, '')).join(', ');
+  const more = b.waitingOn.length - WAIT_SHOWN;
+  return more > 0 ? `${shown} +${more}` : shown;
+}
 // Heads change with their bot's status, not with time, so they are written only when that changes.
 function renderHead(el, b, pane) {
-  const key = b ? `${b.name}|${b.status}|${b.waitingOn.join(' ')}|${b.project}` : '-';
+  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}` : '-';
   if (el.dataset.k === key) return; el.dataset.k = key;
   el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME creates one</span></div>' : '';
 }
@@ -1291,7 +1298,13 @@ async function openBeside(name) {
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side ? 'side' : 'main');
 }
-function swap() { if (!S.ui.side) return; [S.selected, S.ui.side] = [S.ui.side, S.selected]; render(); save(); focusInput('main'); }
+// Drafts travel with their bots.
+function swap() {
+  if (!S.ui.side) return;
+  [S.selected, S.ui.side] = [S.ui.side, S.selected];
+  [$('input').value, $('sideinput').value] = [$('sideinput').value, $('input').value];
+  render(); save(); focusInput('main');
+}
 function closeSide() { if (!S.ui.side) return; S.ui.side = null; $('sideinput').value = ''; render(); save(); focusInput('main'); }
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
 function showNewProject(on) {
@@ -1345,7 +1358,7 @@ async function act(el) {
     case 'more': showMenu(botMenuItems(who), { rect }, who); return;
     case 'model': await modelMenu(pane, { rect, up: true }); return;
     case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
-    case 'set-model': setModel(who, v); render(); return;
+    case 'set-model': setModel(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
     case 'set-send': setSend(v); render(); focusInput(pane); return;
     case 'stop': await interrupt(who); return;
     case 'stop-pane': await interrupt(PANE[pane].bot()); return;

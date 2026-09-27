@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -884,4 +884,18 @@ test('a folded run names a timeout or a failed call; the finder reaches folded t
   await p.openBeside('app.build'); draft.value = 'for build only';
   await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside starts empty');
   draft.value = 'for test only'; p.closeSide(); assert.equal(draft.value, '');
+});
+
+test('swap carries each draft with its bot; a long wait list stays short in the head', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.tree(); p.S.selected = 'app.lead';
+  const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
+  await p.openBeside('app.build'); main.value = 'to lead'; side.value = 'to build';
+  p.swap();
+  assert.equal(p.S.selected, 'app.build'); assert.equal(main.value, 'to build');
+  assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'to lead');
+  const b = p.S.bots.get('app.lead'); b.status = 'waiting';
+  b.waitingOn = Array.from({ length: 5000 }, (_, i) => `turn:app.t${i}/1`);
+  assert.equal(p.waitSummary(b), 'app.t0/1, app.t1/1, app.t2/1 +4997');
 });
