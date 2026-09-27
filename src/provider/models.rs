@@ -111,7 +111,8 @@ impl Provider {
 
 /// The shapes providers answer with: `data` (OpenAI, Anthropic, OpenRouter,
 /// Bedrock Mantle) or `models` (the ChatGPT Codex backend, whose `hide` and
-/// `none` entries its own picker leaves out too).
+/// `none` entries its own picker leaves out too). Newest first where the
+/// provider dates them, since OpenAI's order is arbitrary.
 fn parse(listed: &Value) -> Result<Vec<Value>> {
     let number = |entry: &Value, keys: &[&str]| {
         keys.iter()
@@ -122,8 +123,10 @@ fn parse(listed: &Value) -> Result<Vec<Value>> {
         (None, Some(models)) => models,
         _ => return Err(Error::with("invalid_provider_response", "model listing")),
     };
+    let mut entries: Vec<&Value> = entries.iter().collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry["created"].as_i64().unwrap_or(i64::MIN)));
     Ok(entries
-        .iter()
+        .into_iter()
         .filter(|entry| entry["visibility"].as_str().is_none_or(|v| v == "list"))
         .filter_map(|entry| {
             let id = entry["id"].as_str().or(entry["slug"].as_str())?;
@@ -164,9 +167,13 @@ mod tests {
             [json!({"id":"claude-sonnet-5","name":"Claude Sonnet 5",
                 "context_tokens":1000000,"output_tokens":128000})]
         );
-        let openai = json!({"object":"list","data":[{"id":"gpt-6-luna","object":"model",
-            "created":1,"owned_by":"openai"}]});
-        assert_eq!(parse(&openai).unwrap(), [json!({"id":"gpt-6-luna"})]);
+        let openai = json!({"object":"list","data":[
+            {"id":"gpt-5.6-luna","object":"model","created":1,"owned_by":"openai"},
+            {"id":"gpt-6-luna","object":"model","created":2,"owned_by":"openai"}]});
+        assert_eq!(
+            parse(&openai).unwrap(),
+            [json!({"id":"gpt-6-luna"}), json!({"id":"gpt-5.6-luna"})]
+        );
         let openrouter = json!({"data":[{"id":"vendor/model","name":"Vendor: Model",
             "context_length":200000,"top_provider":{"max_completion_tokens":64000}}]});
         assert_eq!(
