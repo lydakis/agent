@@ -1346,6 +1346,18 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // twice, unless it works in another folder. The file is written only once the daemon has accepted
 // the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
 // the file it lacks, with that coordinator's model, so a failed write retries.
+// The app's own opinion of how a coordinator works, after the shared policy. The daemon and the
+// CLI stay mechanisms: a turn runs in whatever folder it is sent with, so the coordinator names the
+// worktree each time it messages such a task.
+const COORDINATOR = `
+
+## Coordinating this project
+You coordinate the work in this folder. Give a task that changes files its own git worktree, so tasks do not collide: from this folder run
+git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
+then, if .agent/setup exists here, run it inside that worktree with AGENT_SOURCE set to this folder, and start the task with
+"$AGENT_BIN" run --detach --new --bot NAME --workspace "$HOME/.agent/worktrees/NAME" -- TASK
+A turn runs in the folder it is sent with, so pass the same --workspace whenever you message that task again. A task that only reads works in this folder. The branch holds a task's work until it is merged.
+`;
 async function createProject(dir) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
@@ -1358,7 +1370,7 @@ async function createProject(dir) {
   if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agent/project.toml');
   const policy = await Daemon.policy(info.dir);
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions + COORDINATOR, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);

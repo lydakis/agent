@@ -146,9 +146,11 @@ window.Daemon = (() => {
     const handles = [];
     for (const n of Object.keys(tasks)) {
       if (m.interrupted) return;
-      // The task that edits code gets its own worktree; the others read the project folder.
+      // The task that edits code gets its own worktree, as the app tells its coordinators; the others read the project folder.
       const tree = n === 'demo.build';
-      const cmd = `"$AGENT_BIN" run --new --bot ${n}${tree ? ' --worktree' : ''} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
+      const at = `"$HOME/.agent/worktrees/${n}"`;
+      const cmd = tree ? `git worktree add -b agent/${n} ${at} HEAD && "$AGENT_BIN" run --new --bot ${n} --workspace ${at} --model "$AGENT_MODEL" --detach '${tasks[n]}'`
+        : `"$AGENT_BIN" run --new --bot ${n} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
@@ -214,7 +216,7 @@ window.Daemon = (() => {
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
-    // A task made with --worktree works in `worktrees/NAME` on branch agent/NAME.
+    // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {

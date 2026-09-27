@@ -193,12 +193,16 @@ daemon learns nothing about projects; everything here is client work.
   (`allow: ["read","history"]`, the default) or only answer (`allow: []`),
   the ▾'s sticky choice. Tools stay shown, so the fork keeps its source's
   cache; the daemon refuses a call outside the list.
-- **Tasks in worktrees.** A bot asked to delegate is told it may add
-  `--worktree` ([CLIENT.md](CLIENT.md)); that task then works on its own
-  branch, `agent/NAME`, in a git worktree set up by the repository's
-  `.agent/setup` ([CLI.md](CLI.md)). A bot in a linked worktree shows its
-  branch after its name in the head, read once from the worktree's files
-  when the head is first drawn.
+- **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
+  daemon's. A coordinator the app creates gets, after the shared policy, a
+  short text of the app's own: a task that changes files gets
+  `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
+  folder's `.agent/setup` run inside it, and `agent run --new --workspace`
+  that worktree, and the same `--workspace` whenever it messages that task
+  again. To the CLI and the daemon it is only a turn sent with another
+  folder; a bot runs wherever it is sent. A bot in a
+  linked worktree shows its branch after its name in the head, read once
+  from the worktree's files when the head is first drawn.
 - **Not built yet.** A side chat with all tools in a new worktree, Keep,
   which turns a side chat into a task, removing a deleted task's worktree,
   and the coordinator's role text, approvals and swarms are later steps of

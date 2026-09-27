@@ -63,7 +63,6 @@ struct Options {
     after: i64,
     pretty: bool,
     new: bool,
-    worktree: bool,
     agents: bool,
     detach: bool,
     no_spawn: bool,
@@ -125,7 +124,6 @@ fn parse(args: &[String]) -> Result<Options> {
         after: 0,
         pretty: false,
         new: false,
-        worktree: false,
         agents: false,
         detach: false,
         no_spawn: false,
@@ -162,7 +160,6 @@ fn parse(args: &[String]) -> Result<Options> {
             "--pretty" => options.pretty = true,
             "--no-spawn" => options.no_spawn = true,
             "--new" => options.new = true,
-            "--worktree" => options.worktree = true,
             "--agents" => options.agents = true,
             "--no-compaction" => options.compaction_instructions = None,
             "--fallbacks" => options.fallbacks = true,
@@ -1084,15 +1081,6 @@ fn workspace(options: &Options) -> Result<String> {
         .to_owned())
 }
 
-struct Undo<'a>(Option<&'a agent_client::worktree::Worktree>);
-impl Drop for Undo<'_> {
-    fn drop(&mut self) {
-        if let Some(made) = self.0 {
-            made.remove();
-        }
-    }
-}
-
 fn run(options: &Options) -> Result<i32> {
     let mut prompt = options.positional.join(" ");
     if prompt == "-" || (prompt.is_empty() && !std::io::stdin().is_terminal()) {
@@ -1104,7 +1092,7 @@ fn run(options: &Options) -> Result<i32> {
     }
     let from = author()?;
     let mut connection = ensure_daemon(options)?;
-    let mut workspace = workspace(options)?;
+    let workspace = workspace(options)?;
     // A named bot is continued, never silently replaced: an unknown name is an
     // error unless --new asks for creation. No name means a fresh identity.
     let created = options.new || options.bot.is_none();
@@ -1132,30 +1120,6 @@ fn run(options: &Options) -> Result<i32> {
                 "usage",
                 "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
             ))?;
-        // The worktree is the bot's folder from the start, so its
-        // instructions come from there too.
-        let worktree = if options.worktree {
-            let root = agent_client::worktree::root(&options.store);
-            use std::os::fd::AsFd;
-            let output = std::io::stderr().as_fd().try_clone_to_owned()?;
-            let made = agent_client::worktree::create(
-                &root,
-                Path::new(&workspace),
-                &bot,
-                Stdio::from(output),
-            )
-            .map_err(|e| Error::with(&e.code, e.detail.as_deref().unwrap_or("")))?;
-            workspace = made
-                .path
-                .to_str()
-                .ok_or(Error::new("workspace_not_utf8"))?
-                .to_owned();
-            Some(made)
-        } else {
-            None
-        };
-        // Until the bot exists, any failure takes the worktree back: it holds nothing yet.
-        let mut undo = Undo(worktree.as_ref());
         let instructions = composed_instructions(options, &workspace)?;
         let (created_by, created_by_id) = created_by()?;
         let tools: Vec<String> = options
@@ -1178,17 +1142,12 @@ fn run(options: &Options) -> Result<i32> {
             create.as_object_mut().expect("object").extend(gate);
         }
         connection.request("create", create)?;
-        undo.0 = None;
     } else {
         // Gates are the bot's own, set when it was made: a bot gated for
         // `auto` gets its approver back, as after a daemon restart.
         let record = connection.request("resume", json!({"bot":bot}))?;
         if answered_by_auto(&record) {
             ensure_approver(options, &mut connection, bot_model(&record))?;
-        }
-        // A bot works in its own folder; --workspace moves one turn elsewhere.
-        if options.workspace.is_none() {
-            workspace = record["workspace"].as_str().unwrap_or("-").to_owned();
         }
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
@@ -1197,9 +1156,7 @@ fn run(options: &Options) -> Result<i32> {
     let submitted = connection.request(
         "submit",
         json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
-            // A created bot's folder is its own; a continued one names a
-            // folder only when --workspace moves this turn.
-            "workspace":if !created && options.workspace.is_some() { json!(workspace) } else { Value::Null },
+            "workspace":workspace,
             "model":if created { Value::Null } else { json!(options.model) },
             "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
     )?;
@@ -1274,8 +1231,7 @@ fn fork(options: &Options) -> Result<i32> {
     };
     let checkpoint = options.checkpoint;
     let mut connection = Connection::connect(&options.socket)?;
-    // A fork works in its source's folder unless --workspace names another,
-    // as a bot continues in its own.
+    // A fork inherits only the conversation; its turns name their own workspace.
     let (created_by, created_by_id) = created_by()?;
     let mut request = json!({"source":source,"checkpoint":checkpoint,"bot":bot,
         "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
@@ -1288,9 +1244,6 @@ fn fork(options: &Options) -> Result<i32> {
     // A fork keeps its source's tools and gates; its own gate adds to them.
     // Its approver starts first, so a missing judge leaves no fork behind.
     let state = connection.request("resume", json!({"bot":source}))?;
-    if options.workspace.is_none() {
-        request["workspace"] = state["workspace"].clone();
-    }
     let mut auto = answered_by_auto(&state);
     if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
         let tools: Vec<String> = serde_json::from_value(state["tools"].clone())

@@ -18,7 +18,6 @@ pub const MAX_INSTRUCTIONS: usize = 60 * 1024;
 pub const PREAMBLE: &str = "To delegate a subtask to another agent with its own conversation, run \
 \"$AGENT_BIN\" run --detach --new --bot NAME -- TASK from the shell; it prints a turn handle immediately. \
 Add --model PROVIDER/MODEL to give it one of the models \"$AGENT_BIN\" models lists; without it, it gets yours. \
-Add --worktree when it will change files while other agents work in the same folder: it then works on its own branch, agent/NAME, in its own git worktree. \
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \
 Blocking run/follow inside a shell tool is rejected. \

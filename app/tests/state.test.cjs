@@ -842,7 +842,11 @@ test('a new project creates its coordinator in the folder, writes its file once,
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
-  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions], ['weather.lead', '/synthetic/weather', 'alpha/one', 'rules']);
+  assert.deepEqual([create.bot, create.workspace, create.model], ['weather.lead', '/synthetic/weather', 'alpha/one']);
+  // The shared policy first, then the app's own coordinator text: tasks that edit get worktrees.
+  assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
+  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME"/);
+  assert.match(create.instructions, /pass the same --workspace whenever you message that task again/);
   assert.equal(calls.find(([op]) => op === 'policy')[1], '/synthetic/weather');
   assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/one' });
   assert.equal(p.S.selected, 'weather.lead');

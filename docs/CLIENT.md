@@ -13,8 +13,7 @@ Implemented 2026-09-19.
 1. **The harness preamble.** How to delegate through this runtime: `agent
    run --detach --new --bot NAME` from the shell tool, with `--model` one of
    those `agent models` lists (named as a command, so the text stays one
-   cached prefix whatever the list holds), `--worktree` for a delegate that
-   changes files while others work in the same folder, collect with `wait`,
+   cached prefix whatever the list holds), collect with `wait`,
    and that `AGENT_BOT`/`AGENT_BOT_ID` identify the bot itself
    and `AGENT_PARENT`/`AGENT_PARENT_ID` its creator. Calls to that creator use
    `--bot-id` so a reused name cannot receive the work, and are for questions, not
@@ -29,11 +28,6 @@ Implemented 2026-09-19.
    (the workspace's winning on a name clash) become an index: name, first
    line, path. The bot opens a skill with its `read` tool when the subject
    comes up; nothing else is sent, so an unused skill costs one line.
-
-The crate also makes those worktrees (`worktree.rs`): git checks out the
-folder's `HEAD` on `agent/NAME`, the repository's `.agent/setup` runs in it,
-and a failure removes both. The app reads a bot's branch from the worktree's
-files to show it, with no git process.
 
 The text is a stable prefix on purpose: after the first turn it rides the
 provider's prompt cache, and it changes only when a file changes. The whole
