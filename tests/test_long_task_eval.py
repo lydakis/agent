@@ -537,7 +537,17 @@ class LongTaskScoreTests(unittest.TestCase):
         plain = ['make check CLOSE=2026-01', 'tools/settle 2026-01 2>&1', 'make bench CLOSE=2026-01']
         odd = ['cat tools/settle', '(make check CLOSE=2026-01) >log', 'make -s bench CLOSE=2026-01']
         events = [started(n, command) for n, command in enumerate(plain + odd + ['ls'], 1)]
-        self.assertEqual(score(self.root, facts, events, '', 0)['step_commands_to_review'], odd)
+        before = score(self.root, facts, events, '', 0)
+        self.assertEqual(before['step_commands_to_review'], odd)
+        # A call longer than its event's 2,048-character preview is listed
+        # whatever it holds, and left out of the counters.
+        long = json.dumps({'command': 'make check CLOSE=2026-01 && ' + 'x' * 3000})
+        cut = {'cursor': 9, 'event': 'tool_started',
+               'data': {'call_id': 'c9', 'name': 'shell', 'arguments': long[:2048], 'arguments_truncated': True}}
+        scored = score(self.root, facts, [*events, cut], '', 0)
+        self.assertEqual(scored['step_commands_to_review'], [*odd, '[cut] ' + long[:160]])
+        for counter in ('filtered_step_commands', 'combined_step_commands'):
+            self.assertEqual(scored[counter], before[counter])
 
     def test_a_step_run_in_the_background_goes_unread(self):
         # A background or detached call returns a handle, not the step's

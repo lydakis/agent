@@ -283,9 +283,11 @@ an interpreter's `-c` too, not where it reads the step's source. Since
 no parser follows every shell form, every command that names `make` or
 `tools/settle` in any form but the plain one (`make check
 CLOSE=<month>`, `tools/settle <month>` or `make bench CLOSE=<month>`,
-with `2>&1` at most) is also listed for a person to read. In the
-scripted run at 128 KiB, the default tools stub old results nine times
-and summarize never; without `read`, seven summaries make the room.
+with `2>&1` at most) is also listed for a person to read, as is every
+call longer than the 2,048 characters its `tool_started` event holds;
+the counters above skip those calls. In the scripted run at 128 KiB,
+the default tools stub old results nine times and summarize never;
+without `read`, seven summaries make the room.
 
 Every condition also records each bot's shell commands (the first 160
 characters each), its time from submission to its task's end, and the

@@ -813,12 +813,19 @@ def score(root, facts, events, answer, corrected_at=None):
         if event['event'] == 'tool_started':
             calls[data['call_id']] = data
             if data['name'] == 'shell':
+                # The event previews the arguments to 2,048 characters. A
+                # longer call is kept as its preview, which the counters
+                # cannot read, and listed for review.
+                preview = data.get('arguments') or '{}'
                 try:
-                    arguments = json.loads(data.get('arguments') or '{}')
+                    arguments = json.loads(preview)
                 except ValueError:
-                    arguments = {}
-                commands.append((event['cursor'], arguments.get('command', ''),
-                                 bool(arguments.get('background') or arguments.get('detach'))))
+                    arguments = None
+                if not isinstance(arguments, dict) or data.get('arguments_truncated'):
+                    commands.append((event['cursor'], preview, False, True))
+                else:
+                    commands.append((event['cursor'], arguments.get('command', ''),
+                                     bool(arguments.get('background') or arguments.get('detach')), False))
     steps = workflow(root, facts['state'])
     closes = close_workflow(root, facts['closes'], corrected_at)
     # Each close's number counts when its benchmark printed it and the
@@ -830,11 +837,11 @@ def score(root, facts, events, answer, corrected_at=None):
     # the one before it.
     firsts = [close['first_settled_at'] for close in closes.values()]
     in_order = None not in firsts and firsts == sorted(firsts)
-    quick = [c for c, command, _ in commands if 'make quick' in command]
-    faults = [step_command_faults(command, unread) for _, command, unread in commands]
+    quick = [c for c, command, *_ in commands if 'make quick' in command]
+    faults = [step_command_faults(command, unread) for _, command, unread, cut in commands if not cut]
     repeated = {}
     seen = set()
-    for cursor, command, _ in commands:
+    for cursor, command, *_ in commands:
         if command in seen and first_cut is not None and cursor > first_cut:
             repeated[command] = repeated.get(command, 0) + 1
         seen.add(command)
@@ -913,15 +920,17 @@ def score(root, facts, events, answer, corrected_at=None):
         'closes': closes,
         'closes_settled_correctly': sum(c['settled_correctly'] for c in closes.values()),
         'closes_reported': sum(c['reported'] for c in closes.values()),
-        'commands': [command[:160] for _, command, _ in commands],
+        'commands': [command[:160] for _, command, *_ in commands],
         # Step commands against the sustained prompt: output filtered, or
         # several steps in one command.
         'filtered_step_commands': sum(filtered for filtered, _ in faults),
         'combined_step_commands': sum(combined for _, combined in faults),
         # The parser cannot follow every shell form, so a command that names
-        # a step in any form but the plain one is listed for a person.
-        'step_commands_to_review': [command[:160] for _, command, _ in commands
-                                    if closes and NAMES_STEP.search(command) and not PLAIN_STEP.match(command)],
+        # a step in any form but the plain one is listed for a person, as is
+        # every call too long for its event to hold.
+        'step_commands_to_review': [('[cut] ' if cut else '') + command[:160] for _, command, _, cut in commands
+                                    if closes and (cut or NAMES_STEP.search(command)
+                                                   and not PLAIN_STEP.match(command))],
         'compactions': len(compactions),
         'elisions': sum(e['event'] == 'elided' for e in events),
         'repeated_commands_after_first_compaction': repeated,
