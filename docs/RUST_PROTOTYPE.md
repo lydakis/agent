@@ -1793,7 +1793,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   holder alone: bot followers get the compact event. Pushes to a holder
   wait in order for room in its output, so a group commit's burst does not
   drop a holder that is reading; one with 128 pushes waiting has stopped
-  reading and is closed, like a lagging follower. A session that serves
+  reading and is closed, like a lagging follower. A lease that ends drops
+  the pushes still waiting for it, one already waiting for room in the
+  output included, and sends only `approvals_lost`. A session that serves
   its tag again gets no more of its old lease's waiting pushes: they are
   held while the new listing is read, then dropped, since the listing has
   them, or sent if it fails. Each round is held once, however many tags

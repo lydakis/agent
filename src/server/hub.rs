@@ -113,19 +113,7 @@ impl Feed {
         let (flow, mut state) = watch::channel(Flow::Open);
         tokio::spawn(async move {
             while let Some((message, notice)) = receiver.recv().await {
-                let flow = loop {
-                    let flow = *state.borrow_and_update();
-                    if flow != Flow::Paused {
-                        break flow;
-                    }
-                    if state.changed().await.is_err() {
-                        break Flow::Ended;
-                    }
-                };
-                let sent = match flow == Flow::Ended && !notice {
-                    true => Ok(()),
-                    false => output.send(message).await,
-                };
+                let sent = Self::deliver(&output, &mut state, &message, notice).await;
                 counted.fetch_sub(1, Ordering::Relaxed);
                 if sent.is_err() {
                     break;
@@ -136,6 +124,36 @@ impl Feed {
             sender,
             queued,
             flow,
+        }
+    }
+    /// Send one push as the flow allows. A pause or an end also stops a
+    /// send still waiting for room in the output, so no call goes out
+    /// under a lease that ended while it waited.
+    async fn deliver(
+        output: &Output,
+        state: &mut watch::Receiver<Flow>,
+        message: &Value,
+        notice: bool,
+    ) -> Result<()> {
+        loop {
+            let flow = *state.borrow_and_update();
+            if flow == Flow::Ended && !notice {
+                return Ok(());
+            }
+            if flow == Flow::Paused {
+                // Gone while paused: nobody holds the lease any more.
+                if state.changed().await.is_err() {
+                    return Ok(());
+                }
+                continue;
+            }
+            tokio::select! {
+                sent = output.send_ref(message) => return sent,
+                changed = state.changed() => if changed.is_err() {
+                    // The flow can no longer change.
+                    return output.send_ref(message).await;
+                },
+            }
         }
     }
     /// Queue a call. False when the holder has stopped reading.
@@ -839,6 +857,38 @@ mod tests {
         assert_eq!(pushed.last(), Some(&(new, 25)));
         let stale = pushed.iter().filter(|(lease, _)| *lease == old).count();
         assert!(stale < 24, "{pushed:?}");
+    }
+
+    #[tokio::test]
+    async fn an_ended_lease_stops_a_push_still_waiting_for_room() {
+        let hub = Hub::default();
+        let (writer, reader) = tokio::io::duplex(1 << 16);
+        let output = Output::writer(writer);
+        let (_, serving, _) = hub.serve("auto", 1, output.clone(), 60_000).unwrap();
+        serving.lock().unwrap().go_live(0);
+        // Two parts of 900 KiB fill the session's 2 MiB output; the third
+        // waits for room.
+        for cursor in 1..=3 {
+            hub.approval(&part(cursor, 900 * 1024));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (new, serving, before) = hub.serve("auto", 1, output, 60_000).unwrap();
+        serving.lock().unwrap().go_live(3);
+        hub.replaced(before);
+        hub.approval(&part(4, 16));
+        let cursors: Vec<i64> = read(reader, 4).await.into_iter().map(|(_, c)| c).collect();
+        assert_eq!(
+            cursors,
+            [1, 2, 4],
+            "the waiting part was on the new listing"
+        );
+        assert_eq!(
+            hub.inner.lock().unwrap().approvers["auto"]
+                .lock()
+                .unwrap()
+                .lease,
+            new
+        );
     }
 
     #[tokio::test]
