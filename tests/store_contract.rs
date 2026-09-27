@@ -3021,7 +3021,8 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         db.fork("Bob", "early", Fork::default()).unwrap_err().code,
         "fork_point_unknown"
     );
-    // A busy submission is told only what is in the way.
+    // A busy submission is told what is in the way and what gets past it,
+    // with no fork it cannot start.
     let busy = db
         .begin(
             "Bob",
@@ -3033,7 +3034,13 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         )
         .unwrap_err();
     assert_eq!(busy.code, "bot_busy");
-    assert_eq!(busy.detail.unwrap(), format!("turn {turn} is running"));
+    assert_eq!(
+        busy.detail.unwrap(),
+        format!(
+            "turn {turn} is running; submit with delivery \"steer\" and expected_turn {turn} \
+             to add this to it, or delivery \"queue\" to run it afterwards"
+        )
+    );
     // Its facts name the turn and no fork point.
     assert_eq!(
         busy.facts.map(|facts| Value::Object(*facts)),

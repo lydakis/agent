@@ -3323,12 +3323,24 @@ impl Database {
         }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
-            // What is in the way, as of this transaction; the ways past it
-            // are the client's to offer.
-            let detail = match bot.running_turn {
-                Some(turn) => format!("turn {turn} is running"),
-                None => "earlier work is waiting".to_owned(),
+            // What is in the way, as of this transaction, and the requests
+            // that get past it, in this protocol's terms.
+            let mut detail = match bot.running_turn {
+                Some(turn) => format!(
+                    "turn {turn} is running; submit with delivery \"steer\" and expected_turn \
+                     {turn} to add this to it, or delivery \"queue\" to run it afterwards"
+                ),
+                None => "earlier work is waiting; submit with delivery \"queue\" to run this \
+                         after it"
+                    .to_owned(),
             };
+            // A turn from before its finished rounds were kept has no fork
+            // point until its next model response.
+            if bot.running_turn.is_none() || bot.fork_point.is_some() {
+                detail.push_str(
+                    "; to ask without interrupting, fork this bot and submit to the fork",
+                );
+            }
             return Err(Error::with("bot_busy", detail)
                 .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
@@ -5349,7 +5361,8 @@ impl Database {
                 None => {
                     return fail_with(
                         "fork_point_unknown",
-                        "this turn began before its finished rounds were kept",
+                        "this turn began before its finished rounds were kept; fork with a \
+                         checkpoint, or after its next model response",
                     );
                 }
             },

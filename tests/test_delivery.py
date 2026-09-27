@@ -257,9 +257,12 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(first['status'], 'running')
         refused = client.request('submit', bot='Bob', request_id='x', prompt='never')
         self.assertEqual(refused['error'], 'bot_busy')
-        # The refusal says what is in the way; the ways past it are the
-        # client's to offer.
-        self.assertEqual(refused['detail'], f"turn {first['turn']} is running")
+        # The refusal says what is in the way and which requests get past it.
+        self.assertEqual(refused['detail'],
+                         f"turn {first['turn']} is running; submit with delivery \"steer\" and "
+                         f"expected_turn {first['turn']} to add this to it, or delivery \"queue\" "
+                         "to run it afterwards; to ask without interrupting, fork this bot and "
+                         "submit to the fork")
         # The same facts for programs, as of the refusal.
         self.assertEqual(refused['running_turn'], first['turn'])
         self.assertIsInstance(refused['fork_point'], int)

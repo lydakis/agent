@@ -154,13 +154,14 @@ class SocketAndCliTests(ModelFixture):
         # fork it offers works while the turn runs.
         for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue'):
             self.assertIn(flags, refused.stderr + refused.stdout)
+        self.assertNotIn('expected_turn', refused.stderr + refused.stdout)
         fork = re.search(r'fork (--source Bob) --bot NEW', refused.stderr + refused.stdout)
         self.assertIsNotNone(fork, refused.stderr + refused.stdout)
         self.agent('fork', '--store', str(self.store), *fork.group(1).split(), '--bot', 'Side')
         side = self.agent('run', '--store', str(self.store), '--bot', 'Side', 'aside')
         self.assertEqual(side.returncode, 0)
         # With no known fork point (a turn running across the schema 36
-        # upgrade), the daemon states the fact and `agent fork` adds the way past it.
+        # upgrade), `agent fork` names the flag that gets past it.
         with sqlite3.connect(self.store) as db:
             db.execute("UPDATE bots SET closed=NULL WHERE name='Bob'")
         # A refusal then offers no fork it cannot start.

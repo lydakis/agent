@@ -1213,8 +1213,12 @@ fn ways_past_busy(bot: &str, error: Error) -> Error {
     } else {
         format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW")
     };
-    let stated = error.detail.map(|d| d + "; ").unwrap_or_default();
-    Error::with("bot_busy", format!("{stated}{join}{fork}"))
+    // The daemon's own detail names request fields; this says the same in flags.
+    let stated = match running {
+        Some(turn) => format!("turn {turn} is running"),
+        None => "earlier work is waiting".to_owned(),
+    };
+    Error::with("bot_busy", format!("{stated}; {join}{fork}"))
 }
 
 fn follow(options: &Options) -> Result<i32> {
@@ -1293,10 +1297,10 @@ fn fork(options: &Options) -> Result<i32> {
         if error.code != "fork_point_unknown" {
             return error;
         }
-        let fact = error.detail.map(|d| d + "; ").unwrap_or_default();
         Error::with(
             "fork_point_unknown",
-            format!("{fact}pass --checkpoint, or fork after its next model response"),
+            "this turn began before its finished rounds were kept; pass --checkpoint, or fork \
+             after its next model response",
         )
     })?;
     print_json(&result, options.pretty)?;
