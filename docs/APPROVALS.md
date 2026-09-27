@@ -981,11 +981,13 @@ Where it differs from the design above:
   or the verdict comes, and no call starts once a later one lapsed.
 
 - A served call is the whole listing entry (arguments, open gates,
-  expiry, and counts), and a round's calls are pushed in messages of up to
-  256 KiB of calls, as the events are split.
-- A holder whose lease ran out keeps its tag until another session serves
-  it or the holder next renews or answers; the daemon keeps no timer for
-  leases. Either way the holder is sent `approvals_lost`.
+  expiry, and counts). Each tag's holder gets only the calls waiting on its
+  tag, in messages of up to 256 KiB of calls numbered `part` of `parts`,
+  so it judges a whole round in one request.
+- A holder whose lease ran out keeps its tag until any session next serves
+  a tag or the holder renews or answers; the daemon keeps no timer for
+  leases. Either way the holder is sent `approvals_lost`. The lease period
+  starts when the listing is read, not when the request arrives.
 - A lapsed gate's denial is not counted in `denials`: nobody judged the
   call.
 

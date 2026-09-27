@@ -1770,19 +1770,24 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `approval_requested` event's envelope with `tag`, `lease`, and
   `durable: false`, whose `data.calls` are only the calls waiting on the
   tag, each as a listing shows it, and `failed` when the round is
-  announced again. The listing and the start of delivery are read in
+  announced again. A round whose calls take more than 256 KiB comes in
+  several such messages, numbered by `data.part` of `data.parts`, so the
+  holder knows when it has the whole round. The listing and the start of delivery are read in
   one storage job, so a call waiting on the tag is on a page or arrives
   after; a call on a later page may also arrive pushed, and the request
   number tells the two apart. One session holds a tag: another gets
   `approvals_served` while the holder's session is open and its lease
   runs. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
-  600,000). A holder whose lease ran out keeps the tag until another
-  session serves it, which takes it over under a new lease, or until it
-  renews or answers, which is refused; either way it is sent
+  600,000), counted from when the listing is read. A holder whose lease ran out keeps
+  the tag until any session next serves a tag, which ends the lease (and
+  another may take the tag over under a new one), or until it renews or
+  answers, which is refused; either way it is sent
   `{"event":"approvals_lost","tag","lease"}`, and pushes stop. A closed
-  session frees its tags at once. Lease numbers change at every takeover
-  and differ across restarts, and a lease holds only on its own session.
+  session frees its tags at once. A session that serves a tag again with
+  a bad `limit` (1 to 256) keeps the lease it had. Lease numbers change at
+  every takeover, start from a random point each run, and stay below
+  2^53; a lease holds only on its own session.
   `stats` lists the served tags in `approvers`. The stream is for the
   holder alone: bot followers get the compact event, and a holder that
   cannot keep up is closed, like a lagging follower.
