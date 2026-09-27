@@ -126,7 +126,8 @@ impl Bot {
 /// What a fork may choose for itself; everything else comes from the source.
 #[derive(Default, Clone, Copy)]
 pub struct Fork<'a> {
-    /// A node id from the source's history; `None` is its current head.
+    /// A node id from the source's history; `None` is its head when it is
+    /// idle, or its running turn's newest finished round.
     pub checkpoint: Option<i64>,
     pub workspace: Option<&'a str>,
     pub budget_tokens: Option<u64>,
@@ -333,6 +334,12 @@ pub fn merge_gates<'a>(gates: impl IntoIterator<Item = &'a Gate>, tools: &[Strin
     }
     merged.retain(|g| !g.tools.is_empty());
     merged
+}
+/// An item's top-level `type`, read without the rest of it.
+#[derive(serde::Deserialize)]
+struct Kind {
+    #[serde(rename = "type", default)]
+    kind: String,
 }
 /// One gate's answer to one announcement of a call.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -814,7 +821,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 35;
+    pub const SCHEMA: i32 = 36;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -938,7 +945,8 @@ impl Database {
                 elision INTEGER REFERENCES elisions(node),
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
-                thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT);
+                thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
+                closed INTEGER, open_calls INTEGER);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -983,7 +991,7 @@ impl Database {
                 tag TEXT NOT NULL, turn INTEGER NOT NULL, PRIMARY KEY(approval,tag)) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS approval_tags_tag ON approval_tags(tag,approval,turn);
             CREATE TABLE IF NOT EXISTS processes(id INTEGER PRIMARY KEY AUTOINCREMENT, turn INTEGER NOT NULL REFERENCES turns(id),
-                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT);
+                call_id TEXT NOT NULL, status TEXT NOT NULL, result TEXT, delivered INTEGER);
             CREATE INDEX IF NOT EXISTS processes_turn ON processes(turn);
             CREATE TABLE IF NOT EXISTS artifacts(turn INTEGER NOT NULL REFERENCES turns(id), call_id TEXT NOT NULL,
                 stream TEXT NOT NULL, data BLOB NOT NULL, raw_bytes INTEGER NOT NULL DEFAULT 0,
@@ -3273,28 +3281,14 @@ impl Database {
                          this after it"
                     .to_owned(),
             };
-            // A fork needs a settled point: during a turn, the head the turn
-            // started from. A first turn has none, so no fork is offered.
-            let checkpoint = match bot.running_turn {
-                Some(turn) => self
-                    .conn
-                    .query_row("SELECT parent FROM nodes WHERE turn=?", [turn], |row| {
-                        row.get::<_, Option<i64>>(0)
-                    })
-                    .optional()?
-                    .flatten()
-                    .map(|node| format!(" --checkpoint {node}")),
-                None => Some(String::new()),
-            };
+            // A fork without a checkpoint starts at the running turn's
+            // newest finished round, or at the head of an idle bot.
             return fail_with(
                 "bot_busy",
-                match checkpoint {
-                    Some(checkpoint) => format!(
-                        "{wait}; to ask without interrupting, fork --source {name}{checkpoint} \
-                         --bot NEW and send it to NEW"
-                    ),
-                    None => wait,
-                },
+                format!(
+                    "{wait}; to ask without interrupting, fork --source {name} --bot NEW \
+                     and send it to NEW"
+                ),
             );
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
@@ -3649,8 +3643,9 @@ impl Database {
                 .push(entry(cursor, &bot.name, Some(turn), "steered", data));
             steered.push((steer, size));
         }
+        // Steers go in only at a round boundary and hold no calls.
         tx.execute(
-            "UPDATE bots SET head=? WHERE name=?",
+            "UPDATE bots SET head=?1,closed=?1,open_calls=0 WHERE name=?2",
             params![head, bot.name],
         )?;
         tx.commit()?;
@@ -3678,6 +3673,9 @@ impl Database {
         // A gated round notes which item plans each call.
         let gated = calls.iter().any(|call| bot.gated(&call.name));
         let mut planned = HashMap::new();
+        let last_reasoning = items.last().is_some_and(|item| {
+            serde_json::from_slice::<Kind>(item).is_ok_and(|k| k.kind == "reasoning")
+        });
         for item in items {
             let id = node(&tx, head, &item)?;
             head = Some(id);
@@ -3779,9 +3777,23 @@ impl Database {
             }
             served = Some(Served::new(&bot.name, turn, last, judged, None));
         }
+        // The newest closed node: a response with calls leaves it where the
+        // request that produced it began, since that request answered every
+        // earlier call; one without calls closes at its last item, unless
+        // that item is reasoning, which a fork cannot split off.
+        let closed = match (calls.len(), last_reasoning) {
+            (0, false) => head,
+            _ => bot.head,
+        };
         tx.execute(
-            "UPDATE bots SET head=? WHERE name=?",
-            params![head, bot.name],
+            "UPDATE bots SET head=?,closed=CASE WHEN ?3 THEN closed ELSE ?2 END,open_calls=?4 WHERE name=?5",
+            params![
+                head,
+                closed,
+                calls.is_empty() && last_reasoning,
+                calls.len() as i64,
+                bot.name
+            ],
         )?;
         // A successful response consumes a round in the same durable commit
         // as its messages and tool plans. Failed requests end the turn.
@@ -3898,8 +3910,11 @@ impl Database {
             tx.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
                 .execute(params![head, stub])?;
         }
+        // The round's last result closes it. A turn from before the count
+        // was kept has none, and gets one at its next response.
         tx.execute(
-            "UPDATE bots SET head=? WHERE name=?",
+            "UPDATE bots SET head=?1,open_calls=open_calls-1,
+             closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
             params![head, bot.name],
         )?;
         if let Some(text) = &outcome.note {
@@ -4589,7 +4604,7 @@ impl Database {
             params![status, epoch_ms(), turn],
         )?;
         tx.execute(
-            "UPDATE bots SET head=?,running_turn=NULL,status=? WHERE name=?",
+            "UPDATE bots SET head=?,running_turn=NULL,status=?,closed=NULL,open_calls=NULL WHERE name=?",
             params![head, status, bot.name],
         )?;
         promote(&tx, &bot.name)?;
@@ -4962,6 +4977,33 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+    /// Of these background commands, the ones another bot started. A bot
+    /// waits only on its own: a fork's history can hold its source's
+    /// `proc:N`, and resolving it would hand the fork its source's result.
+    pub fn foreign_processes(&self, bot: &str, ids: &[i64]) -> Result<Vec<i64>> {
+        let mut owner = self.conn.prepare_cached(
+            "SELECT t.bot FROM processes p JOIN turns t ON t.id=p.turn WHERE p.id=?",
+        )?;
+        let mut foreign = Vec::new();
+        for id in ids {
+            let started: Option<String> = owner.query_row([id], |r| r.get(0)).optional()?;
+            if started.is_some_and(|started| started != bot) {
+                foreign.push(*id);
+            }
+        }
+        Ok(foreign)
+    }
+    /// The wait result at `node` delivered these finished commands; a fork
+    /// may read their stored output only if its history holds that node.
+    pub fn delivered(&mut self, node: i64, ids: &[i64]) -> Result<()> {
+        let mut update = self.conn.prepare_cached(
+            "UPDATE processes SET delivered=? WHERE id=? AND delivered IS NULL AND status<>'running'",
+        )?;
+        for id in ids {
+            update.execute(params![node, id])?;
+        }
+        Ok(())
+    }
     pub fn running_processes(&self) -> Result<i64> {
         Ok(self.conn.query_row(
             "SELECT count(*) FROM processes WHERE status='running'",
@@ -5044,9 +5086,9 @@ impl Database {
         Ok(())
     }
     /// Branch a new bot from any message in the source's history. Without a
-    /// node, the source's current head is used and the source must be idle,
-    /// since a live head is still moving. The point must leave no tool call
-    /// unanswered; the source itself is never changed. The fork copies the
+    /// node, an idle source's head is used, or a running turn's newest
+    /// finished round. The point must leave no tool call unanswered; the
+    /// source itself is never changed. The fork copies the
     /// source's binding, instructions, and tools as they are, so its first
     /// call repeats the source's prefix and can read the source's cache.
     pub fn fork(&mut self, source: &str, name: &str, fork: Fork<'_>) -> Result<(Bot, Value)> {
@@ -5064,21 +5106,35 @@ impl Database {
         {
             return fail("approve_not_in_tools");
         }
-        let checkpoint = match node {
+        // A running or parked turn's newest closed node is kept as it
+        // moves, so forking there reads no transcript and needs no check.
+        let (checkpoint, validated) = match node {
             Some(node) => {
                 if !self.in_lineage(parent.head, node)? {
                     return fail("node_not_in_source_history");
                 }
-                Some(node)
+                (Some(node), false)
             }
-            None => {
-                if parent.running_turn.is_some() {
-                    return fail("bot_busy");
+            None if parent.running_turn.is_some() => {
+                let closed: Option<i64> =
+                    self.conn
+                        .query_row("SELECT closed FROM bots WHERE name=?", [source], |r| {
+                            r.get(0)
+                        })?;
+                match closed {
+                    Some(closed) => (Some(closed), true),
+                    None => {
+                        return fail_with(
+                            "fork_point_unknown",
+                            "this turn began before its finished rounds were kept; \
+                             pass --checkpoint, or fork after its next model response",
+                        );
+                    }
                 }
-                parent.head
             }
+            None => (parent.head, false),
         };
-        if let Some(node) = checkpoint {
+        if let Some(node) = checkpoint.filter(|_| !validated) {
             self.validate_fork_point(node)?;
         }
         if self.exists(name)? {
@@ -5097,6 +5153,22 @@ impl Database {
             )
         } else {
             (None, Strip::default(), 0)
+        };
+        // Carrying the source's current compaction, the fork keeps the
+        // source's window start when the fork point is at or after it, so
+        // its first request begins where the source's last one did and
+        // reads its cache. Both are on the source's lineage, where ids
+        // grow, so a start at or before the point is one of its ancestors.
+        let start = match checkpoint {
+            Some(node) if parent.compaction.is_none_or(|c| c <= node) => self
+                .conn
+                .query_row(
+                    "SELECT context_start FROM bots WHERE name=?",
+                    [source],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?
+                .filter(|start| *start <= node),
+            _ => None,
         };
         let tx = self.conn.savepoint()?;
         let id = identity(&tx)?;
@@ -5164,8 +5236,8 @@ impl Database {
                 )?;
             }
             tx.execute(
-                "UPDATE bots SET compaction=?1,context_start=(SELECT cut FROM compactions WHERE node=?1) WHERE name=?2",
-                params![version, name],
+                "UPDATE bots SET compaction=?1,context_start=COALESCE(?3,(SELECT cut FROM compactions WHERE node=?1)) WHERE name=?2",
+                params![version, name, start],
             )?;
             // The elision floor the source had at the checkpoint.
             let mut version = parent.elision;
@@ -5809,6 +5881,22 @@ impl Database {
             .conn
             .query_row("SELECT head FROM bots WHERE name=?", [name], |r| r.get(0))
             .optional()?;
+        // A background command's output is stored under the call that
+        // started it, whose own result is only its handle: another branch
+        // reads it only through the wait result that delivered it.
+        let process: Option<Option<i64>> = self
+            .conn
+            .prepare_cached("SELECT delivered FROM processes WHERE turn=? AND call_id=?")?
+            .query_row(params![turn, call_id], |r| r.get(0))
+            .optional()?;
+        if let Some(delivered) = process {
+            if let (Some(Some(head)), Some(delivered)) = (head, delivered)
+                && self.in_lineage(Some(head), delivered)?
+            {
+                return Ok(());
+            }
+            return fail("turn_not_found");
+        }
         let node: Option<i64> = self.conn.query_row(
             "SELECT json_extract(data,'$.node') FROM events WHERE turn=? AND kind='tool_completed'
              AND json_extract(data,'$.call_id')=? ORDER BY id DESC LIMIT 1",
@@ -6400,8 +6488,9 @@ fn start_locked(tx: &Connection, bot: &Bot, turn: i64, prompt: &str) -> Result<O
             params![epoch_ms(), turn],
         )?;
     }
+    // `finish` answers every call, so a turn starts on a closed head.
     tx.execute(
-        "UPDATE bots SET head=?,status='running',running_turn=? WHERE name=?",
+        "UPDATE bots SET head=?1,status='running',running_turn=?2,closed=?1,open_calls=0 WHERE name=?3",
         params![head, turn, bot.name],
     )?;
     Ok(Some(head))
@@ -6883,6 +6972,22 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 34 -> 35: denial counts per gate tag. None was kept before, so
         // every bot starts from none.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN denials TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='closed')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 35 -> 36: a running turn's newest closed node, and which wait
+        // result delivered a background process. Nothing is read or
+        // guessed: a turn running across the upgrade gets its closed node
+        // at its next model response or steer, and a process finished
+        // before it is readable by the bot that started it alone.
+        conn.execute_batch(
+            "ALTER TABLE bots ADD COLUMN closed INTEGER;
+             ALTER TABLE bots ADD COLUMN open_calls INTEGER;
+             ALTER TABLE processes ADD COLUMN delivered INTEGER;",
+        )?;
     }
     Ok(())
 }

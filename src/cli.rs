@@ -150,7 +150,10 @@ fn print_flags(flags: &str) {
             "--socket" => ("PATH", "Select the daemon socket"),
             "--bot" => ("NAME", "Select a bot; for fork, name the destination"),
             "--source" => ("NAME", "Select the bot to fork"),
-            "--checkpoint" => ("NODE", "Fork at this history node; default: current head"),
+            "--checkpoint" => (
+                "NODE",
+                "Fork at this history node; default: an idle source's head, or a running turn's newest finished round",
+            ),
             "--after" => ("ID", "Start after this event cursor or turn ID"),
             "--turn" => (
                 "ID",

@@ -2438,13 +2438,11 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
         .code,
         "fork_point_has_open_tool_calls"
     );
-    // While the turn runs, forking the moving head is refused; an explicit answered node is fine.
-    assert_eq!(
-        db.fork("Bob", "live", Fork { ..Fork::default() })
-            .unwrap_err()
-            .code,
-        "bot_busy"
-    );
+    // While the turn runs, a default fork starts at its newest finished
+    // round: before any round finishes, the turn's prompt.
+    let (live, forked) = db.fork("Bob", "live", Fork { ..Fork::default() }).unwrap();
+    assert_eq!(live.head, Some(mid - 2));
+    assert_eq!(forked["data"]["node"], mid - 2);
     db.tool_start(turn, &call).unwrap();
     let (_, entry) = db.tool_finish(turn, "c1", &result("hi")).unwrap();
     let answered = entry["data"]["node"].as_i64().unwrap();
@@ -2514,6 +2512,316 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
         db.history_read("Bob", i64::MAX, 0, 65536).unwrap_err().code,
         "turn_not_in_history"
     );
+}
+
+fn call(call_id: &str) -> (Bytes, ToolCall) {
+    let item = serde_json::to_vec(&json!({"type":"function_call","name":"echo",
+        "call_id":call_id,"arguments":"{}"}))
+    .unwrap()
+    .into();
+    let call = ToolCall {
+        name: "echo".into(),
+        call_id: call_id.into(),
+        arguments: "{}".into(),
+    };
+    (item, call)
+}
+fn head(db: &Database, bot: &str) -> i64 {
+    db.inspect(bot).unwrap().head.unwrap()
+}
+/// The node a default fork of a running bot starts at, read from the fork.
+fn fork_point(db: &mut Database, source: &str, name: &str) -> Result<i64> {
+    let (fork, _) = db.fork(source, name, Fork::default())?;
+    Ok(fork.head.unwrap())
+}
+
+#[test]
+fn a_running_turn_forks_at_its_newest_finished_round() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    converse(&mut db, "Bob", 1);
+    let turn = db
+        .begin(
+            "Bob",
+            "r2",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let prompt = head(&db, "Bob");
+    assert_eq!(fork_point(&mut db, "Bob", "f0").unwrap(), prompt);
+
+    // Two calls in one round: the round closes only at its last result.
+    let ((a_item, a), (b_item, b)) = (call("a"), call("b"));
+    db.append(turn, vec![a_item, b_item], &[a.clone(), b.clone()], None)
+        .unwrap();
+    assert_eq!(fork_point(&mut db, "Bob", "f1").unwrap(), prompt);
+    db.tool_start(turn, &a).unwrap();
+    db.tool_finish(turn, "a", &result("one")).unwrap();
+    assert_eq!(fork_point(&mut db, "Bob", "f2").unwrap(), prompt);
+    db.tool_start(turn, &b).unwrap();
+    db.tool_finish(turn, "b", &result("two")).unwrap();
+    let round = head(&db, "Bob");
+    assert_eq!(fork_point(&mut db, "Bob", "f3").unwrap(), round);
+    // The fork holds the whole round and can run on its own.
+    assert_eq!(stored(&mut db, "f3").len(), stored(&mut db, "Bob").len());
+
+    // The next model call is in flight: nothing new is closed yet.
+    let (c_item, c) = call("c");
+    db.append(
+        turn,
+        vec![assistant("again"), c_item],
+        std::slice::from_ref(&c),
+        None,
+    )
+    .unwrap();
+    assert_eq!(fork_point(&mut db, "Bob", "f4").unwrap(), round);
+
+    // Parked on a wait, the turn keeps its closed node.
+    db.tool_start(turn, &c).unwrap();
+    db.tool_finish(turn, "c", &result("three")).unwrap();
+    let answered = head(&db, "Bob");
+    let (w_item, w) = call("w");
+    db.append(turn, vec![w_item], std::slice::from_ref(&w), None)
+        .unwrap();
+    db.tool_start(turn, &w).unwrap();
+    db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
+        .unwrap();
+    assert_eq!(fork_point(&mut db, "Bob", "f5").unwrap(), answered);
+
+    // A forking bot's own fork: the round before the running one.
+    db.fork("f5", "f5-self", Fork::default()).unwrap();
+    assert_eq!(head(&db, "f5-self"), answered);
+
+    // A final answer closes at once; a reasoning item left last does not.
+    db.resume(turn).unwrap();
+    db.tool_finish(turn, "w", &result("{}")).unwrap();
+    let waited = head(&db, "Bob");
+    let reasoning: Bytes = serde_json::to_vec(&json!({"type":"reasoning","id":"rs1",
+        "encrypted_content":"synthetic","summary":[]}))
+    .unwrap()
+    .into();
+    db.append(turn, vec![reasoning], &[], None).unwrap();
+    assert_eq!(fork_point(&mut db, "Bob", "f6").unwrap(), waited);
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    let done = head(&db, "Bob");
+    assert_eq!(fork_point(&mut db, "Bob", "f7").unwrap(), done);
+    db.finish(turn, None).unwrap();
+    // Idle again, a default fork takes the head as before.
+    assert_eq!(fork_point(&mut db, "Bob", "f8").unwrap(), done);
+}
+
+#[test]
+fn a_steer_closes_the_round_it_joins() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, a) = call("a");
+    db.append(turn, vec![item], std::slice::from_ref(&a), None)
+        .unwrap();
+    db.tool_start(turn, &a).unwrap();
+    db.tool_finish(turn, "a", &result("one")).unwrap();
+    for n in 0..2 {
+        db.begin(
+            "Bob",
+            &format!("s{n}"),
+            &format!("steer {n}"),
+            true,
+            &TurnOptions {
+                delivery: Delivery::Steer,
+                ..TurnOptions::default()
+            },
+            allow_provider,
+        )
+        .unwrap();
+    }
+    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+        .unwrap();
+    let steered = head(&db, "Bob");
+    assert_eq!(fork_point(&mut db, "Bob", "fork").unwrap(), steered);
+    let text = serde_json::to_string(&stored(&mut db, "fork")).unwrap();
+    assert!(
+        text.contains("steer 0") && text.contains("steer 1"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_fork_keeps_its_sources_window_start() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    for n in 1..=12 {
+        converse(&mut db, "Bob", n);
+    }
+    // A budget the history has outgrown, so the source's start has moved.
+    let window = db.window("Bob", i64::MAX, 12).unwrap().unwrap();
+    assert!(window.ids.len() <= 9);
+    // It grows again past three quarters, where a fresh start would differ.
+    converse(&mut db, "Bob", 13);
+    assert!(db.window("Bob", i64::MAX, 12).unwrap().unwrap().ids.len() > 9);
+    let turn = db
+        .begin(
+            "Bob",
+            "r14",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let source = db.window("Bob", i64::MAX, 12).unwrap().unwrap();
+    db.fork("Bob", "fork", Fork::default()).unwrap();
+    let fork = db.window("fork", i64::MAX, 12).unwrap().unwrap();
+    assert_eq!(
+        fork.ids, source.ids,
+        "the fork's request begins where the source's does"
+    );
+    db.append(turn, vec![assistant("done")], &[], None).unwrap();
+    db.finish(turn, None).unwrap();
+}
+
+#[test]
+fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
+    let mut db = db();
+    db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    let turn = db
+        .begin(
+            "Bob",
+            "r1",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, bg) = call("bg");
+    db.append(turn, vec![item], std::slice::from_ref(&bg), None)
+        .unwrap();
+    db.tool_start(turn, &bg).unwrap();
+    let process = db.process_start(turn, "bg").unwrap();
+    db.tool_finish(turn, "bg", &result(&format!("proc:{process}")))
+        .unwrap();
+    // The fork's history holds the handle, but the command is Bob's.
+    db.fork("Bob", "early", Fork::default()).unwrap();
+    assert_eq!(
+        db.foreign_processes("early", &[process]).unwrap(),
+        [process]
+    );
+    assert!(db.foreign_processes("Bob", &[process]).unwrap().is_empty());
+    db.process_finish(
+        process,
+        &json!({"stdout":"large"}),
+        &[("stdout", b"synthetic output".to_vec())],
+    )
+    .unwrap();
+    // Its stored output is Bob's, and a branch's only once delivered there.
+    assert!(db.artifact_page("Bob", turn, "bg", "stdout", 0, 64).is_ok());
+    assert_eq!(
+        db.artifact_page("early", turn, "bg", "stdout", 0, 64)
+            .unwrap_err()
+            .code,
+        "turn_not_found"
+    );
+    let (item, w) = call("w");
+    db.append(turn, vec![item], std::slice::from_ref(&w), None)
+        .unwrap();
+    db.tool_start(turn, &w).unwrap();
+    let (_, entry) = db.tool_finish(turn, "w", &result("{}")).unwrap();
+    let delivered = entry["data"]["node"].as_i64().unwrap();
+    db.delivered(delivered, &[process]).unwrap();
+    db.fork("Bob", "late", Fork::default()).unwrap();
+    assert_eq!(head(&db, "late"), delivered);
+    assert!(
+        db.artifact_page("late", turn, "bg", "stdout", 0, 64)
+            .is_ok()
+    );
+    assert_eq!(
+        db.artifact_page("early", turn, "bg", "stdout", 0, 64)
+            .unwrap_err()
+            .code,
+        "turn_not_found"
+    );
+}
+
+#[test]
+fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
+    let path = std::env::temp_dir().join(format!("agent-closed-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        converse(&mut db, "Bob", 1);
+        let turn = db
+            .begin(
+                "Bob",
+                "r2",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        // Parked, so the turn is still there when the store opens again.
+        let (item, w) = call("w");
+        db.append(turn, vec![item], std::slice::from_ref(&w), None)
+            .unwrap();
+        db.tool_start(turn, &w).unwrap();
+        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
+            .unwrap();
+        turn
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN closed; ALTER TABLE bots DROP COLUMN open_calls;
+             ALTER TABLE processes DROP COLUMN delivered; PRAGMA user_version=35;",
+        )
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.fork("Bob", "early", Fork::default()).unwrap_err().code,
+        "fork_point_unknown"
+    );
+    // An explicit point still works, and the next response lifts the refusal.
+    let prompt = head(&db, "Bob") - 1;
+    db.fork(
+        "Bob",
+        "explicit",
+        Fork {
+            checkpoint: Some(prompt),
+            ..Fork::default()
+        },
+    )
+    .unwrap();
+    db.resume(turn).unwrap();
+    db.tool_finish(turn, "w", &result("{}")).unwrap();
+    assert_eq!(
+        db.fork("Bob", "still", Fork::default()).unwrap_err().code,
+        "fork_point_unknown"
+    );
+    let waited = head(&db, "Bob");
+    let (item, a) = call("a");
+    db.append(turn, vec![item], std::slice::from_ref(&a), None)
+        .unwrap();
+    assert_eq!(fork_point(&mut db, "Bob", "later").unwrap(), waited);
+    drop(db);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

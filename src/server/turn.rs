@@ -1489,10 +1489,27 @@ impl Turn {
                         .handles
                         .take_settled(&self.store, turn, &waiting.handles)
                         .await;
+                    // Background commands whose results this wait hands over.
+                    let delivered: Vec<i64> = results
+                        .iter()
+                        .filter(|(_, result)| result["pending"] != true)
+                        .filter_map(|(handle, _)| match Handle::parse(handle) {
+                            Ok(Handle::Process(id)) => Some(id),
+                            _ => None,
+                        })
+                        .collect();
                     let outcome = Outcome::text(wait_result(results).to_string());
                     let id = waiting.call_id.clone();
                     self.store
-                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .op("tool_finish", move |db| {
+                            let (item, entry) = db.tool_finish(turn, &id, &outcome)?;
+                            if let Some(node) = entry["data"]["node"].as_i64()
+                                && !delivered.is_empty()
+                            {
+                                db.delivered(node, &delivered)?;
+                            }
+                            Ok((item, entry))
+                        })
                         .await?;
                 }
                 // Calls that followed in the same model response.
@@ -2765,6 +2782,7 @@ impl Turn {
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
     ) -> Result<ControlFlow<Stop, Outcome>> {
+        let mut processes = Vec::new();
         for text in &handles {
             match Handle::parse(text) {
                 Err(error) => return Ok(ControlFlow::Continue(failure(error))),
@@ -2774,7 +2792,25 @@ impl Turn {
                         "a turn cannot wait on itself",
                     ))));
                 }
+                Ok(Handle::Process(id)) => processes.push(id),
                 Ok(_) => {}
+            }
+        }
+        // A bot waits only on commands it started; one its history
+        // inherited from a fork's source is not its to collect.
+        if !processes.is_empty() {
+            let bot = self.bot.clone();
+            let foreign = self
+                .store
+                .op("foreign_processes", move |db| {
+                    db.foreign_processes(&bot, &processes)
+                })
+                .await?;
+            if let Some(id) = foreign.first() {
+                return Ok(ControlFlow::Continue(failure(Error::with(
+                    "handle_unavailable",
+                    format!("proc:{id} was started by another agent"),
+                ))));
             }
         }
         // Only move the remaining calls once this wait can actually park.

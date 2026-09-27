@@ -190,7 +190,8 @@ enum Command {
     },
     Fork {
         source: String,
-        /// A node id from the source's history; defaults to its current head.
+        /// A node id from the source's history; defaults to its head when it
+        /// is idle, or to its running turn's newest finished round.
         checkpoint: Option<i64>,
         bot: String,
         workspace: Option<String>,

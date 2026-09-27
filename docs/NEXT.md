@@ -825,11 +825,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     allowed-tools list checked at dispatch, which a fork inherits and can
     only narrow, so a fork keeps its source's tool definitions and prompt
     cache. The daemon and CLI add no text for the fork, and a fork takes
-    no instructions of its own: done, it is an exact copy. Next, the store
-    change with contract tests, including process handles and their stored
-    output scoped to the bot that started them (item 39), then the list,
-    then measurement of the cache and of the fork-or-fresh rule in the
-    preamble.
+    no instructions of its own: done, it is an exact copy. Done: a fork
+    with no checkpoint starts at a running or parked turn's newest finished
+    round, kept current in `bots.closed` so it reads no transcript, and
+    keeps its source's window start; a bot waits only on background
+    commands it started, and reads another branch's stored process output
+    only through the wait result that delivered it (schema 36). Next, the
+    allowed-tools list, then measurement of the cache and of the
+    fork-or-fresh rule, which is not in the preamble yet.
 
 44. Storage commits on a slow disk. Done: the worker commits in groups,
     one sync for the jobs that queued together, and callers are answered

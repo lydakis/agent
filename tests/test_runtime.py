@@ -1371,6 +1371,22 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.receive(lambda m: 'error' in m and m.get('id') is None)['error'], 'invalid_json')
         self.assertEqual(client.request('resume', bot='other')['error'], 'bot_not_found')
 
+    def test_a_running_bot_forks_at_its_newest_finished_round(self):
+        client = self.client()
+        client.request('create', bot='Bob', workspace=str(self.path))
+        turn = client.request('submit', bot='Bob', request_id='hold', prompt='wait')['result']['turn']
+        self.model.requests.get(timeout=3)
+        busy = client.request('submit', bot='Bob', request_id='more', prompt='hi')
+        self.assertEqual(busy['error'], 'bot_busy')
+        self.assertIn('fork --source Bob --bot NEW', busy['detail'])
+        # No round has finished, so the fork starts at the turn's prompt.
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        prompt = next(e['data']['node'] for e in events if e['event'] == 'accepted' and e['turn'] == turn)
+        forked = client.request('fork', source='Bob', bot='Side', workspace=str(self.path))['result']
+        self.assertEqual(forked['head'], prompt)
+        client.request('interrupt', bot='Bob', turn=turn)
+        self.assertEqual(client.finished(turn)['data']['status'], 'interrupted')
+
     def test_turn_overrides_workspace_and_model_within_the_family(self):
         client = self.client('echo,shell')
         client.request('create', bot='Bob', workspace=str(self.path))

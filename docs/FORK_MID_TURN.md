@@ -1,7 +1,14 @@
 # Forking a running bot, and fork versus a fresh bot
 
-Status: design note, 2026-09-25. Nothing here is built except that a fork is
-now an exact copy, with no instructions of its own (same pull request). Other
+Status: design note, 2026-09-25. Built: a fork is an exact copy, with no
+instructions of its own; and section 1 (2026-09-27, schema 36), with the
+open-call count kept on `bots.open_calls` beside `bots.closed` rather than on
+`turns`, since every write that moves one updates the bot row already. The
+bot's `wait` tool refuses another bot's `proc:N` with `handle_unavailable`
+rather than answering it inside a wait result. Not built yet: the
+allowed-tools list (section 2) and the fork-or-fresh sentence in the
+preamble, which waits on George and the measurement below; the preamble
+names the checkpoint-free fork. Other
 code facts are from lydakis/agent at 02e79eb. Anthropic cache behavior is
 from its
 [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)

@@ -1033,7 +1033,7 @@ fn fork(options: &Options) -> Result<i32> {
     let (Some(source), Some(bot)) = (&options.source, &options.bot) else {
         return fail_with(
             "usage",
-            "fork needs --source and --bot; --checkpoint N picks a message, default is the current head",
+            "fork needs --source and --bot; --checkpoint N picks a message, default is an idle source's head or a running turn's newest finished round",
         );
     };
     let checkpoint = options.checkpoint;
