@@ -983,7 +983,7 @@ as one.
    allows, false denials, unclear), latency from announcement to verdict
    (p50 and p99), tokens, and cost.
 
-   The approver's own path is measured (2026-09-27, `4f83aae`) with
+   The approver's own path is measured (2026-09-27, `74f726b`) with
    judges that answer at once, in three arms of
    [`bench.approval_overhead`](../bench/approval_overhead.py) over a Unix
    socket: `socket`, the screen answering as in item 3; `jev`, `agent
@@ -993,24 +993,27 @@ as one.
 
    | | socket | jev | judge |
    |---|---:|---:|---:|
-   | Turn latency p50 / p99, ms | 16.0 / 27.1 | 18.8 / 32.3 | 26.6 / 42.1 |
-   | Daemon CPU per turn, ms | 11.1 | 12.1 | 18.7 |
+   | Turn latency p50 / p99, ms | 14.8 / 27.1 | 17.5 / 30.8 | 26.3 / 40.6 |
+   | Daemon CPU per turn, ms | 9.8 | 10.9 | 18.3 |
    | Approver CPU per turn, ms | | 1.1 | 1.3 |
    | Judge time the approver reports, p50, ms | | 1 | 8 |
-   | Store commits per turn | 12.0 | 12.0 | 23.0 |
-   | Storage worker time per turn, ms | 10.0 | 10.7 | 17.9 |
+   | Store commits per turn | 12.0 | 12.0 | 23.2 |
+   | Storage worker time per turn, ms | 8.9 | 9.7 | 17.7 |
 
-   - With Jev the approver adds 2.8 ms a round and no commit: the
-     `prompts` read (0.7 ms of storage time), building and redacting the
+   - With Jev the approver adds 2.7 ms a round and no commit: the
+     `prompts` read (0.8 ms of storage time), building and redacting the
      state, and the HTTP round trip.
-   - A general model through the daemon adds 10.6 ms, 7.6 ms of daemon
+   - A general model through the daemon adds 11.5 ms, 8.6 ms of daemon
      CPU, and 11 commits a round: the fork, the judge's turn (its accept,
      window, response, and finish), reading its tokens, and the deletion,
      which runs in three bounded pieces. Against a short model turn (1.9 s
      at the median in the live fleet check) this is small; at 100 such
-     rounds a second it is about three
-     quarters of a core, so a lighter path (a judge turn that leaves no
-     bot behind) is worth building if general judges run at that rate.
+     rounds a second it is most of a core, so a lighter path (a judge turn
+     that leaves no bot behind) is worth building if general judges run at
+     that rate.
+   - The same arms before the rebase onto the landed lease changes gave
+     16.0, 18.8, and 26.6 ms at the median: the same differences within
+     the run-to-run spread.
 
 ## Built so far
 

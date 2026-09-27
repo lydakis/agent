@@ -7,7 +7,7 @@ updated at `095ff68` for admission batching and disk-full containment, at
 lock fix, at `dd95047` for the per-summary choice between a copy and a
 request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
-serving a gate tag to one approver, and at `4f83aae` for the automatic
+serving a gate tag to one approver, and at `74f726b` for the automatic
 approver's own cost. This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
@@ -85,13 +85,13 @@ more turns is not here, because its work changes with its speed; it is under
   host, three rotated runs): held p50 15.9 against 15.7 ms, the same
   commits and event and store bytes, and the plan commit's job 0.61
   against 0.57 ms, inside the run-to-run spread.
-  The automatic approver's own cost (`4f83aae`, 2026-09-27, same host and
+  The automatic approver's own cost (`74f726b`, 2026-09-27, same host and
   workload over a Unix socket, three rotated runs, judges that answer at
-  once): against a client that answers directly (p50 16.0 ms, 11.1 ms of
+  once): against a client that answers directly (p50 14.8 ms, 9.8 ms of
   daemon CPU and 12 commits a turn), `agent approver` with a stand-in for
-  Jev adds 2.8 ms at the median (18.8 ms), 1.0 ms of daemon CPU for the
+  Jev adds 2.7 ms at the median (17.5 ms), 1.1 ms of daemon CPU for the
   `prompts` read, and 1.1 ms of its own CPU, with no added commit; a
-  general model through the daemon adds 10.6 ms (26.6 ms), 7.6 ms of daemon
+  general model through the daemon adds 11.5 ms (26.3 ms), 8.6 ms of daemon
   CPU, and 11 commits a round for the fork, its turn, and its deletion.
   Neither includes the judge's own time: Jev answered in 0.26 s at the
   median in the labeled run, and a general model takes longer.
