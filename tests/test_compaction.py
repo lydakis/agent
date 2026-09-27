@@ -144,9 +144,9 @@ class CompactionTests(ModelFixture):
     def test_output_cap_advances_compaction_without_reducing_the_input_envelope(self):
         for cap in (None, 2048):
             with self.subTest(cap=cap):
-                extra = ('--max-output-tokens', str(cap)) if cap is not None else ()
-                client = Client(self.binary, self.path / f'cap-{cap}.sqlite', self.url, extra=extra,
-                                settings={'context_bytes': 8192, 'compact_at': 95})
+                capped = {'max_output_tokens': cap} if cap is not None else {}
+                client = Client(self.binary, self.path / f'cap-{cap}.sqlite', self.url,
+                                settings={'context_bytes': 8192, 'compact_at': 95, **capped})
                 self.addCleanup(client.close)
                 self.create(client)
                 for n in range(7):

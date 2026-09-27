@@ -322,24 +322,26 @@ bound; the operating system is then the only limit.
 | `--max-pending` | Submissions waiting to start: queued behind a bot's own work or ready for a slot, daemon-wide. A submission that would wait past the bound answers `pending_limit` and writes nothing; one that starts at once is never refused by it. | none |
 | `--max-pending-bytes` | UTF-8 prompt bytes of those waiting submissions. | none |
 | `--max-connecting` | Provider requests awaiting response headers, a Bedrock Runtime call's body digest included. Established streams are not capped. Both providers hold headers until the first token, so a permit is held for the whole time to first token; a bound of N caps throughput at N calls per first-token latency. | none |
-| `--max-output-tokens` | Generated tokens per model call, including reasoning. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
 | `--stall-timeout` | Seconds an established provider stream may go without a content frame before the attempt fails as `provider_stream_stalled` and is retried. Keepalives do not count. 1 to 86,400. | 120 |
-| `--keep-warm` | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 disables. | 240 |
-| `--cache-ttl` | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
 
 ### Bot settings
 
-A bot's context, compaction, retention and approval hold are its own:
+A bot's context, compaction, retention, approval hold and model-call
+settings are its own:
 `create` takes them as a `settings` object, the bot keeps them, a fork
 copies its source's, and `resume` reports every one as it applies, defaults
 included. A setting left out takes the default below; a value out of range
 answers `invalid_setting` naming it, and nothing is created. `agent run`
 sets them on a new bot with the flags shown; an existing bot keeps its own.
 Each bot can choose differently, so one daemon serves bots on models with
-different context windows. These were daemon flags before schema 40; a bot
-from before then takes the defaults.
+different context windows or output limits. These were daemon flags before
+schema 40; a bot from before then takes the defaults. A value its provider's
+family refuses, such as an Anthropic output bound below 2,048, is refused at
+`create` with that provider's error. A turn calls through the shared provider,
+or through a copy shaped by the bot's own output bound, cache lifetime and
+keep-warm when it sets any of them.
 
 | Setting (flag) | Meaning | Default |
 | --- | --- | --- |
@@ -350,6 +352,9 @@ from before then takes the defaults.
 | `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
 | `retain_turns` (`--retain-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
 | `approval_hold_ms` (`--approval-hold-ms`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
+| `max_output_tokens` (`--max-output-tokens`) | Generated tokens per model call, including reasoning, summaries included. Anthropic calls use the model's full output limit (read inside Bedrock ids) unless this is set; set, it is sent as `max_tokens`, at least 2,048 so a legacy thinking budget of 1,024 or more fits beside the answer. Bedrock deducts input plus this bound from quota when a call starts, so a bound near real output buys throughput there. | none |
+| `keep_warm` (`--keep-warm`) | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 never refreshes. | 240 |
+| `cache_ttl` (`--cache-ttl`) | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -554,8 +559,8 @@ from cache; the 6.8k-token conversation was written again at 1.25 times the
 input rate. The one-hour cache read all 9.0k, but it bills every write at
 twice the input rate, idle or not. The daemon keeps the five-minute cache and
 refreshes it instead. While a turn's call streams its reply or a tool runs,
-once that call's cache has gone `--keep-warm` seconds unread (240 by
-default), it sends that call's request again with `max_tokens: 0` and
+once that call's cache has gone the bot's `keep_warm` seconds unread (240
+by default), it sends that call's request again with `max_tokens: 0` and
 `stream: false`. That request generates nothing, bills a cache read, and
 restarts the cache's lifetime. It repeats until the reply and then the tool
 finish. The lifetime is counted from when the call, or the last refresh, was
@@ -591,8 +596,8 @@ model call is certain, so each refresh costs a 0.1-times read of the
 conversation where expiry costs a 1.25-times rewrite; a ten-minute tool takes
 at most two. Whether it also
 beats the one-hour cache, which covers parked waits and gaps between turns
-but bills every write at twice the input rate, is not measured; `--cache-ttl
-1h` selects it for that comparison. Its writes are recorded apart, from
+but bills every write at twice the input rate, is not measured; a bot's
+`cache_ttl` of `1h` (`--cache-ttl 1h`) selects it for that comparison. Its writes are recorded apart, from
 Anthropic's per-lifetime split or, when a report has none, as the request
 asked. The guidance
 also lists the requests `max_tokens: 0` rejects: streaming, budgeted thinking
@@ -658,7 +663,7 @@ read 2026-09-25). The 128,000 and 64,000 values for current models come from the
 [models overview](https://platform.claude.com/docs/en/about-claude/models/overview),
 read 2026-09-25; the older values are Anthropic's published figures for those
 models, not re-read on that date. Bedrock ids are read for the Claude model
-they name, and `--max-output-tokens` replaces the limit when set. Known legacy Claude ids (Haiku 4.5, 4.5 and
+they name, and a bot's `max_output_tokens` replaces the limit when set. Known legacy Claude ids (Haiku 4.5, 4.5 and
 older) instead get the budget form with 2,048, 8,192, or 16,384 tokens, kept
 below `max_tokens`, since current models reject budgets and older ones require
 them. Reasoning summaries and thinking stream as

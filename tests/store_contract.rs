@@ -3,8 +3,8 @@ use agent_runtime::{
     codec::Family,
     provider::{ToolCall, Usage},
     store::{
-        Answered, Binding, Bot, CompactionPlan, ContextUsage, Database, Decision, Delivery, Fork,
-        Gate, Gated, Planning, Settings, Strip, TurnOptions, Wake,
+        Answered, Binding, Bot, CacheTtl, CompactionPlan, ContextUsage, Database, Decision,
+        Delivery, Fork, Gate, Gated, Planning, Settings, Strip, TurnOptions, Wake,
     },
     tools::Outcome,
 };
@@ -1843,6 +1843,8 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     let settings = Settings {
         context_bytes: Some(4096),
         retain_turns: Some(1),
+        keep_warm: Some(0),
+        cache_ttl: Some(CacheTtl::Hour),
         ..Settings::default()
     };
     let (bob, _) = db
@@ -1860,7 +1862,8 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
     assert_eq!(
         serde_json::to_value(&bob).unwrap()["settings"],
         json!({"context_bytes":4096,"context_items":4096,"note_turns":48,"compact_at":75,
-            "compact_keep":25,"retain_turns":1,"approval_hold_ms":2000})
+            "compact_keep":25,"retain_turns":1,"approval_hold_ms":2000,"max_output_tokens":null,
+            "keep_warm":0,"cache_ttl":"1h"})
     );
     // Retention follows the bot's own setting.
     for n in 1..=3 {
@@ -1914,6 +1917,14 @@ fn a_bot_keeps_its_settings_and_a_fork_copies_them() {
         },
         Settings {
             approval_hold_ms: Some(3_600_001),
+            ..Settings::default()
+        },
+        Settings {
+            max_output_tokens: Some(0),
+            ..Settings::default()
+        },
+        Settings {
+            keep_warm: Some(300),
             ..Settings::default()
         },
     ] {

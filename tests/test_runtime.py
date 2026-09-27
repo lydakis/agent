@@ -643,7 +643,7 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class AnthropicRuntimeTests(unittest.TestCase):
-    def start(self, extra=()):
+    def start(self, extra=(), settings=None):
         root = Path(__file__).resolve().parent.parent
         temp = tempfile.TemporaryDirectory(dir=root / '.local')
         self.addCleanup(temp.cleanup)
@@ -658,12 +658,12 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client = Client(root / '.local/target/release/agent', path / 'state.sqlite',
                         f'http://127.0.0.1:{model.server_port}/v1', 'echo,shell', model='synthetic-claude',
                         key_env='ANTHROPIC_TEST_KEY', env=env, provider='anthropic', family='anthropic',
-                        extra=extra)
+                        extra=extra, settings=settings)
         self.addCleanup(client.close)
         return client, model, path
 
     def test_a_long_tool_call_keeps_the_prompt_cache_warm(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -689,7 +689,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(sent[2] - sent[1], 900)
 
     def test_a_long_reply_keeps_its_own_prompt_cache_warm(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 2.5
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='g1', prompt='long')['result']['turn']
@@ -707,7 +707,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u.get('purpose') for u in usage], ['keep_warm', 'keep_warm', None])
 
     def test_a_refresh_in_flight_when_the_reply_ends_carries_into_the_tool(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
@@ -724,7 +724,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
     def test_the_last_replys_refresh_counts_before_a_steer_joins_the_turn(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.generate_delay = 1.5
         model.warm_delay = 1
         # The call bills 14 tokens (5 + 2 cached in, 7 out) and its refresh 9.
@@ -745,7 +745,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
     def test_a_call_waiting_to_be_sent_is_refreshed_only_from_its_send(self):
         # One request may start at a time and Ann's waits for its headers,
         # so Bob's call waits to be sent; its cache exists only from then.
-        client, model, path = self.start(extra=('--keep-warm', '1', '--max-connecting', '1'))
+        client, model, path = self.start(extra=('--max-connecting', '1'), settings={'keep_warm': 1})
         model.hold_delay = 2.5
         model.generate_delay = 1.5
         model.arrivals = []
@@ -764,7 +764,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(warms[0][0] - sent, 0.9)
 
     def test_a_refused_refresh_ends_the_refreshes_but_not_the_turn(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.refuse_warm = True
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 2.5')['result']['turn']
@@ -777,7 +777,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(len(warms), 1)
 
     def test_a_refresh_sent_before_the_tool_ends_is_still_recorded(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.warm_delay = 1
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='w1', prompt='shell:sleep 1.5')['result']['turn']
@@ -786,7 +786,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
     def test_an_interrupt_still_records_a_refresh_already_sent(self):
-        client, model, path = self.start(extra=('--keep-warm', '1'))
+        client, model, path = self.start(settings={'keep_warm': 1})
         model.warm_delay = 1.5
         client.request('create', bot='Bob', workspace=str(path), reasoning='low')
         turn = client.request('submit', bot='Bob', request_id='i1', prompt='shell:sleep 10')['result']['turn']
@@ -799,7 +799,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         self.assertEqual(call['max_tokens'] > 0, True)
 
     def test_an_hour_long_cache_is_marked_priced_apart_and_not_refreshed(self):
-        client, model, path = self.start(extra=('--keep-warm', '1', '--cache-ttl', '1h'))
+        client, model, path = self.start(settings={'keep_warm': 1, 'cache_ttl': '1h'})
         model.cache_control = {'type': 'ephemeral', 'ttl': '1h'}
         # A report without the per-lifetime split: every write is an hour's.
         model.start_usage = {'cache_creation_input_tokens': 3}

@@ -194,7 +194,7 @@ enum Command {
         /// Its context, history and approval settings; each one left out
         /// takes the default. Forks keep their source's.
         #[serde(default)]
-        settings: Settings,
+        settings: Box<Settings>,
     },
     Resume {
         bot: String,
@@ -527,18 +527,9 @@ pub struct Configuration {
     /// unbounded by default, since waiting work is durable rows.
     pub max_pending: Option<usize>,
     pub max_pending_bytes: Option<usize>,
-    /// Generated tokens per Responses call, including reasoning; none by default.
-    pub max_output_tokens: Option<u32>,
     /// Seconds an established provider stream may go without a content
     /// frame before the attempt fails and is retried; default 120.
     pub stall_timeout: Option<u64>,
-    /// Seconds an Anthropic prompt cache may sit unread while a tool runs
-    /// before it is refreshed; default 240, 0 disables.
-    pub keep_warm: Option<u64>,
-    /// Anthropic prompt caches last an hour instead of five minutes; their
-    /// writes bill twice the input rate instead of 1.25 times, and no
-    /// refresh is sent. Responses providers are unaffected.
-    pub cache_hour: bool,
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
@@ -854,11 +845,6 @@ pub async fn run(config: Configuration) -> Result<()> {
     let stall_timeout = config
         .stall_timeout
         .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
-    let keep_warm = match config.keep_warm {
-        Some(0) => None,
-        Some(seconds) => Some(Duration::from_secs(seconds)),
-        None => Some(agent_runtime::provider::KEEP_WARM),
-    };
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let aws_start = agent_runtime::provider::aws::Start::new();
@@ -916,16 +902,10 @@ pub async fn run(config: Configuration) -> Result<()> {
             auth = Some(signed);
             provider = provider.with_aws(Arc::new(aws))?;
         }
-        if let Some(cap) = config.max_output_tokens {
-            provider = provider.with_max_output_tokens(cap)?;
-        }
         if spec.socket {
             provider = provider.with_socket()?;
         }
-        let provider = provider
-            .with_stall_timeout(stall_timeout)?
-            .with_keep_warm(keep_warm)?
-            .with_cache_hour(config.cache_hour);
+        let provider = provider.with_stall_timeout(stall_timeout)?;
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
@@ -981,10 +961,8 @@ pub async fn run(config: Configuration) -> Result<()> {
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
-            "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
-            "stall_timeout_seconds":stall_timeout.as_secs(),
-            "keep_warm_seconds":keep_warm.map_or(0, |after| after.as_secs()),
-            "cache_ttl":if config.cache_hour { "1h" } else { "5m" }},
+            "idle_exit_seconds":config.idle_exit,
+            "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "durability":"sqlite_full","partial_text_durable":false});
@@ -1848,11 +1826,15 @@ impl Service {
                 // says what it runs and what it is told, and the bot keeps both.
                 let reference = model.ok_or(Error::new("model_required"))?;
                 let (provider, model) = split_model(&reference)?;
-                let family = self
+                let served = self
                     .providers
                     .get(provider)
-                    .ok_or(Error::with("provider_unavailable", provider))?
-                    .family();
+                    .ok_or(Error::with("provider_unavailable", provider))?;
+                let family = served.family();
+                // What its family refuses, such as an Anthropic output bound
+                // with no room for thinking, is refused before the bot exists.
+                settings.validate()?;
+                turn::shaped(served, &settings)?;
                 if let Some(level) = &reasoning
                     && !matches!(level.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
                 {
@@ -1903,7 +1885,7 @@ impl Service {
                                 compaction_model: compaction_model.as_deref(),
                                 fallbacks,
                                 gate: gate.as_ref(),
-                                settings,
+                                settings: *settings,
                             },
                         )?;
                         Ok((serde_json::to_value(created)?, event["cursor"].as_i64()))
@@ -4037,7 +4019,7 @@ mod tests {
             approve: None,
             approver: None,
             approve_expire_ms: None,
-            settings: Settings::default(),
+            settings: Box::default(),
         }
     }
     fn scratch(name: &str) -> std::path::PathBuf {

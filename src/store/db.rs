@@ -154,6 +154,24 @@ pub struct Settings {
     /// parks; zero parks at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_hold_ms: Option<u64>,
+    /// Generated tokens per model call, reasoning included; none takes the
+    /// model's own limit on Anthropic and sends no bound on Responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Seconds an Anthropic prompt cache may sit unread during a tool call
+    /// before it is refreshed; zero never refreshes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_warm: Option<u64>,
+    /// Anthropic prompt-cache lifetime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    Minutes,
+    #[serde(rename = "1h")]
+    Hour,
 }
 const MIN_CONTEXT_BYTES: usize = 1024;
 const MIN_CONTEXT_ITEMS: usize = 2;
@@ -175,6 +193,17 @@ impl Settings {
     }
     pub fn approval_hold_ms(&self) -> u64 {
         self.approval_hold_ms.unwrap_or(2000)
+    }
+    /// How long a cache may sit unread before a refresh; `None` never.
+    pub fn keep_warm(&self) -> Option<std::time::Duration> {
+        match self.keep_warm {
+            Some(0) => None,
+            Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+            None => Some(crate::provider::KEEP_WARM),
+        }
+    }
+    pub fn cache_hour(&self) -> bool {
+        self.cache_ttl == Some(CacheTtl::Hour)
     }
     /// Refuses a value outside its range, naming the setting and the range.
     pub fn validate(&self) -> Result<()> {
@@ -201,6 +230,15 @@ impl Settings {
         if self.approval_hold_ms.is_some_and(|n| n > 3_600_000) {
             return refuse("approval_hold_ms is at most 3600000; 0 parks at once");
         }
+        if self.max_output_tokens == Some(0) {
+            return refuse("max_output_tokens is at least 1");
+        }
+        if self
+            .keep_warm
+            .is_some_and(|n| n >= crate::provider::CACHE_LIFETIME.as_secs())
+        {
+            return refuse("keep_warm is below 300 seconds; 0 never refreshes");
+        }
         Ok(())
     }
     /// Every setting as it applies, defaults included, for clients.
@@ -208,7 +246,9 @@ impl Settings {
         json!({"context_bytes":self.context_bytes(),"context_items":self.context_items(),
             "note_turns":self.note_turns(),"compact_at":self.compact_at(),
             "compact_keep":self.compact_keep(),"retain_turns":self.retain_turns,
-            "approval_hold_ms":self.approval_hold_ms()})
+            "approval_hold_ms":self.approval_hold_ms(),"max_output_tokens":self.max_output_tokens,
+            "keep_warm":self.keep_warm().map_or(0, |after| after.as_secs()),
+            "cache_ttl":self.cache_ttl.unwrap_or(CacheTtl::Minutes)})
     }
     fn stored(&self) -> Result<Option<String>> {
         Ok((*self != Self::default())

@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit";
+const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms --max-output-tokens --keep-warm --cache-ttl --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -217,18 +217,21 @@ fn print_flags(flags: &str) {
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
-            "--max-output-tokens" => ("N", "Output token cap per model call"),
+            "--max-output-tokens" => (
+                "N",
+                "A new bot's output token cap per model call; default the model's limit",
+            ),
             "--stall-timeout" => (
                 "SECONDS",
                 "Retry a provider stream with no content this long; default 120",
             ),
             "--keep-warm" => (
                 "SECONDS",
-                "Refresh an idle Anthropic prompt cache during a tool call after this long; default 240, 0 disables",
+                "A new bot refreshes its idle Anthropic prompt cache during a tool call after this long; default 240, 0 disables",
             ),
             "--cache-ttl" => (
                 "5m|1h",
-                "Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
+                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
             ),
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
             "--context-bytes" => ("N", "A new bot's model context bytes; default 8 MiB"),

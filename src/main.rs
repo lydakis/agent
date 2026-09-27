@@ -85,11 +85,8 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut max_connecting = None;
     let mut max_pending = None;
     let mut max_pending_bytes = None;
-    let mut max_output_tokens = None;
     let mut idle_exit = None;
     let mut stall_timeout = None;
-    let mut keep_warm = None;
-    let mut cache_hour = false;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -117,11 +114,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     _ => max_connecting = Some(parsed),
                 }
             }
-            "--max-output-tokens" => {
-                max_output_tokens = Some(value.parse::<u32>().ok().filter(|n| *n > 0).ok_or(
-                    Error::with("usage", "--max-output-tokens needs a positive integer"),
-                )?)
-            }
             "--stall-timeout" => {
                 stall_timeout = Some(
                     value
@@ -133,18 +125,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                             "--stall-timeout needs seconds from 1 to 86400",
                         ))?,
                 )
-            }
-            "--cache-ttl" => {
-                cache_hour = match value.as_str() {
-                    "5m" => false,
-                    "1h" => true,
-                    _ => return fail_with("usage", "--cache-ttl needs 5m or 1h"),
-                }
-            }
-            "--keep-warm" => {
-                keep_warm = Some(value.parse::<u64>().ok().filter(|n| *n < 300).ok_or(
-                    Error::with("usage", "--keep-warm needs seconds below 300 (0 disables)"),
-                )?)
             }
             "--idle-exit" => {
                 let seconds: u64 = value
@@ -168,10 +148,7 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         max_connecting,
         max_pending,
         max_pending_bytes,
-        max_output_tokens,
         stall_timeout,
-        keep_warm,
-        cache_hour,
         idle_exit,
     })
 }

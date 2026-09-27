@@ -101,8 +101,9 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   `--approval-hold-ms` is milliseconds: how long a new bot's gated calls
   wait live for a verdict before the turn parks (default 2,000; 0 parks at once).
 - `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
-  `--note-turns`, `--compact-at`, `--compact-keep`, `--retain-turns`, and
-  `--approval-hold-ms`; they are not daemon options, and an existing bot
+  `--note-turns`, `--compact-at`, `--compact-keep`, `--retain-turns`,
+  `--approval-hold-ms`, `--max-output-tokens`, `--keep-warm`, and
+  `--cache-ttl`; they are not daemon options, and an existing bot
   keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope

@@ -342,6 +342,19 @@ impl Finished {
     }
 }
 
+/// The provider as a bot's settings shape its calls: its output bound,
+/// cache lifetime and keep-warm. The bot's defaults borrow it unchanged.
+pub fn shaped<'p>(
+    provider: &'p Provider,
+    settings: &Settings,
+) -> Result<std::borrow::Cow<'p, Provider>> {
+    provider.shaped(
+        settings.max_output_tokens,
+        settings.keep_warm(),
+        settings.cache_hour(),
+    )
+}
+
 impl Turn {
     pub async fn execute(&self, mut cancelled: watch::Receiver<Option<&'static str>>) -> Exit {
         // Only an explicit interrupt or shutdown cancels, naming its error. A
@@ -973,7 +986,9 @@ impl Turn {
         // bot's family, as creation checked; a provider name can be bound to
         // another since.
         let summarizer = match self.providers.get(name) {
-            Some(provider) if provider.family() == record.family()? => provider,
+            Some(provider) if provider.family() == record.family()? => {
+                shaped(provider, self.settings())?
+            }
             found => {
                 let (error, detail) = match found {
                     None => ("provider_unavailable", name),
@@ -1085,7 +1100,7 @@ impl Turn {
             };
             let completion = match self
                 .call_with(
-                    summarizer,
+                    &summarizer,
                     model,
                     &instructions,
                     summary_tools,
@@ -1464,6 +1479,8 @@ impl Turn {
                 context.model.as_str(),
             ));
         }
+        let shaped = shaped(provider, self.settings())?;
+        let provider: &Provider = &shaped;
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's children inherit: the CLI a bot runs to delegate
         // needs a model for the peer (its own by default), the bot's own name

@@ -94,7 +94,7 @@ it bounds the sends, and a fleet cannot start every pre-read at once.
 | Responses over WebSocket | yes | **documented** unsupported on either endpoint | refused for Bedrock URLs |
 | Rate-limit headers for pacing | yes | **documented** absent | escalating refusal backoff instead |
 | Legacy thinking budgets by model name | yes | ids are vendor- and profile-prefixed | carried: `us.anthropic.claude-haiku-4-5…` reads as `claude-haiku-4-5` |
-| Output cap | the model's full limit for Anthropic | quota deducted up front on runtime | per-model limit read inside Bedrock ids; `--max-output-tokens` overrides it |
+| Output cap | the model's full limit for Anthropic | quota deducted up front on runtime | per-model limit read inside Bedrock ids; a bot's `max_output_tokens` (`--max-output-tokens`) overrides it |
 
 ## The gaps from the first survey, on current main
 
@@ -112,7 +112,7 @@ it bounds the sends, and a fleet cannot start every pre-read at once.
    global profiles are separate quotas.
 3. **The fixed 32k `max_tokens`.** Main now asks for each model's full output
    limit (PR #15), read inside Bedrock ids, so Haiku 4.5 on Bedrock gets 64,000
-   rather than the 128,000 default. `--max-output-tokens` overrides it, with a
+   rather than the 128,000 default. A bot's `--max-output-tokens` overrides it, with a
    legacy thinking budget clamped to leave 1,024 tokens for the answer. On
    Bedrock runtime `input + max_tokens` is deducted from quota when a call
    starts (**documented**), so the full limit reserves up to 128,000 tokens
