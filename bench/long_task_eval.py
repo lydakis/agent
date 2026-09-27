@@ -646,7 +646,9 @@ def step_command_faults(command, unread=False):
     it runs more than one step or loops over them. A call run in the
     background or detached returns a handle, not the output, so a step in
     it goes unread."""
-    segments = re.split(r'&&|\|\||;|\n', command)
+    # List separators, a lone `&` included; `2>&1`, `&>` and `|&` are
+    # redirects and pipes, not separators.
+    segments = re.split(r'&&|\|\||;|\n|(?<![>&|])&(?![&>])', command)
     runs = [bool(STEP_RUN.match(segment)) for segment in segments]
     steps = [segment for segment, run in zip(segments, runs) if run]
 

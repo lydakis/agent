@@ -440,7 +440,12 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('make check CLOSE=2026-01 || echo failed', (False, False)),
                 ('{ make check CLOSE=2026-01; } 2>&1 | tail -5', (True, False)),
                 ('for m in 2026-01 2026-02; do make bench CLOSE=$m; done | tail -2', (True, True)),
-                ('for f in tests/*.py; do wc -l $f; done | sort; make check CLOSE=2026-06', (False, False))):
+                ('for f in tests/*.py; do wc -l $f; done | sort; make check CLOSE=2026-06', (False, False)),
+                # Joined by a lone `&`, beside redirects that also use it.
+                ('make check CLOSE=2026-01 & tools/settle 2026-01', (False, True)),
+                ('make check CLOSE=2026-01 & wait', (False, False)),
+                ('make check CLOSE=2026-01 &> log', (True, False)),
+                ('make check CLOSE=2026-01 |& tail -5', (True, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 

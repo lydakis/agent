@@ -264,7 +264,8 @@ its own, so one number in an answer credits one close. It
 also counts the step commands that sent their output elsewhere or cut it
 (a pipe, or a redirect other than `2>&1`), or ran them in the
 background or detached, where the call returns a handle rather than the
-output, and those that ran several steps or looped over them. A step counts where a command runs it,
+output, and those that ran several steps, joined by any list separator
+(`&` included), or looped over them. A step counts where a command runs it,
 inside a conditional or a loop too, not where it reads the step's
 source. In the scripted run at 128 KiB, the default
 tools stub old results nine times and summarize never; without `read`,
