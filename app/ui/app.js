@@ -199,6 +199,8 @@ function learnWorkspace(b, record) {
   const ws = record.workspace ?? null;
   if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; }
 }
+// A bot keeps its folder, so the app names one only for a bot that has none.
+const home = (b) => (b.workspace ? {} : { workspace: S.config.workspace });
 // A bot in a linked git worktree shows the branch it works on; read once, when its head is first drawn.
 function readBranch(b) {
   if (b.branch !== undefined) return;
@@ -339,7 +341,7 @@ async function onEvent(ev) {
       break;
     }
     case 'accepted': {
-      const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; }
+      const b = bot(name); if (b) { b.status = 'running'; b.runningTurn = turn; b.waitingOn = []; b.turnStarted = S.live ? Date.now() : 0; b.elapsed = 0; if (typeof data.workspace === 'string') learnWorkspace(b, data); }
       if (typeof data.node === 'number') pushNode(transcript(name), { kind: 'node', node: data.node, turn });
       break;
     }
@@ -1273,8 +1275,9 @@ async function submit(text, pane = 'main') {
   if (mode === 'side') { await sideChat(b.name, text); return; }
   // A steer joins the running turn only on that turn's model and folder, so it names neither.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
-  // rather than the message landing in whatever turn runs next.
-  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { workspace: b.workspace ?? S.config.workspace, ...(model && model !== b.model ? { model } : {}) };
+  // rather than the message landing in whatever turn runs next. A bot keeps its folder, so a
+  // message names one only for a bot that has none.
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
@@ -1303,7 +1306,7 @@ async function fork(name) {
   // A root bot's fork is a root too.
   const lead = b.project ? bot(b.project + LEAD) : null;
   const parent = creatorOf(b) ?? (lead && lead !== b && lead.id != null ? lead : null), session = S.session;
-  const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}), ...(b.workspace ? { workspace: b.workspace } : {}) });
+  const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   await openBeside(copy);
@@ -1323,13 +1326,13 @@ async function sideChat(name, text = '') {
   const session = S.session;
   // A bot announced after attaching has no tool list yet; ask for its record before narrowing it.
   if (S.sideTools !== 'answer' && !b.callable) { const rec = await Daemon.request('resume', { bot: name }); if (rec?.id === b.id) learnTools(b, rec); }
-  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b), ...(b.workspace ? { workspace: b.workspace } : {}) });
+  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   // The first message goes before the pane loads any history, so the turn starts at once.
   let failed = null;
   if (text) {
-    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace }); }
+    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
   if (S.ui.side !== copy) await openBeside(copy);
@@ -1356,7 +1359,7 @@ You coordinate the work in this folder. When it is a git repository, give a task
 git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
 The worktree starts at the last commit, so uncommitted changes here are not in it. If .agent/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
 "$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME" -- TASK
-If setup or the start fails, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again. A turn runs in the folder it is sent with, so pass the same --workspace whenever you message that task again. A task that only reads, or any task when this folder is not a git repository, works in this folder. The branch holds a task's work until it is merged.
+If setup or the start fails, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again. A task keeps its folder, so later messages to it need no --workspace. A task that only reads, or any task when this folder is not a git repository, works in this folder. The branch holds a task's work until it is merged.
 `;
 async function createProject(dir) {
   const info = await Daemon.project(dir);

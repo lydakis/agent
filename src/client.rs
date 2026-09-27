@@ -1092,6 +1092,8 @@ fn run(options: &Options) -> Result<i32> {
     }
     let from = author()?;
     let mut connection = ensure_daemon(options)?;
+    // A new bot starts here or in --workspace; a bot keeps its folder
+    // unless --workspace moves it.
     let workspace = workspace(options)?;
     // A named bot is continued, never silently replaced: an unknown name is an
     // error unless --new asks for creation. No name means a fresh identity.
@@ -1156,7 +1158,7 @@ fn run(options: &Options) -> Result<i32> {
     let submitted = connection.request(
         "submit",
         json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
-            "workspace":workspace,
+            "workspace":options.workspace.as_ref().map(|_| &workspace),
             "model":if created { Value::Null } else { json!(options.model) },
             "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
     )?;
@@ -1172,8 +1174,13 @@ fn run(options: &Options) -> Result<i32> {
     let mut renderer = Renderer::new(options.pretty, Some(turn), &options.target);
     if options.pretty {
         eprintln!(
-            "agent: {bot} turn {turn}{} in {workspace}",
-            if created { " (new bot)" } else { "" }
+            "agent: {bot} turn {turn}{}{}",
+            if created { " (new bot)" } else { "" },
+            if created || options.workspace.is_some() {
+                format!(" in {workspace}")
+            } else {
+                String::new()
+            }
         );
     }
     loop {

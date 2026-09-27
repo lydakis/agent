@@ -264,6 +264,7 @@ window.Daemon = (() => {
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
           if (b.status !== 'idle' && params.delivery === 'steer') { (b.steers ??= []).push(params.prompt); emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
+          if (params.workspace) b.workspace = params.workspace; // a message that names a folder moves the bot there
           const turn = S.nextTurn; reply(params.bot, params.prompt); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         // A running source forks too, as the daemon's does from its newest finished round.

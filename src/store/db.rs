@@ -3246,7 +3246,16 @@ impl Database {
                     "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
                 )?.query_row([node], |r| r.get(0))?;
             }
-            if saved != prompt || saved_options != *options {
+            // A turn records the folder it runs in; a retry that names none
+            // means wherever the first attempt went.
+            let same = TurnOptions {
+                workspace: options
+                    .workspace
+                    .clone()
+                    .or(saved_options.workspace.clone()),
+                ..options.clone()
+            };
+            if saved != prompt || saved_options != same {
                 return fail("idempotency_conflict");
             }
             return Ok(Started {
@@ -3340,12 +3349,14 @@ impl Database {
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
         }
+        // A bot keeps its folder; a turn that names one moves it there.
         let workspace = options
             .workspace
             .as_deref()
             .or(bot.workspace.as_deref())
             .ok_or(Error::new("workspace_required"))?
             .to_owned();
+        let moved = options.workspace.is_some() && bot.workspace.as_deref() != Some(&workspace);
         // Only the head of a bot's line is ready; the rest wait behind it.
         let status = if busy {
             "queued"
@@ -3387,10 +3398,17 @@ impl Database {
             "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn)
              VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
-            params![turn, name, request_id, prompt, status, options.workspace, options.model,
-                options.delivery.name(), options.expected_turn,
+            // Queued work keeps the folder it was sent to even if the bot
+            // moves before it starts; a steer without one joins any turn.
+            params![turn, name, request_id, prompt, status,
+                if options.delivery == Delivery::Steer { options.workspace.as_deref() } else { Some(workspace.as_str()) },
+                options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1)],
         )?;
+        if moved {
+            tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
+                .execute(params![workspace, name])?;
+        }
         tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
             .execute(params![turn, name])?;
         let model = options
@@ -5316,6 +5334,8 @@ impl Database {
             allow,
         } = fork;
         let parent = self.inspect(source)?;
+        // A fork starts where its source is unless told otherwise.
+        let workspace = workspace.or(parent.workspace.as_deref());
         if let Some(gate) = gate
             && gate.tools.iter().any(|t| !parent.tools.contains(t))
         {

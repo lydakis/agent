@@ -710,7 +710,8 @@ test('a steer joins the running turn: it names no model and no workspace', async
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task', status: 'running', running_turn: 3 });
   p.S.selected = 'task'; p.setModel('task', 'alpha/two');
   p.setSend('queue'); await p.submit('later');
-  assert.equal(sent.at(-1).workspace, '/synthetic/task'); assert.equal(sent.at(-1).model, 'alpha/two');
+  // A bot keeps its folder, so a message names none; a turn run elsewhere moves the head's folder.
+  assert.equal('workspace' in sent.at(-1), false); assert.equal(sent.at(-1).model, 'alpha/two');
   p.setSend('steer'); await p.submit('now');
   assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('workspace' in sent.at(-1), false); assert.equal('model' in sent.at(-1), false);
   assert.equal(sent.at(-1).expected_turn, 3, 'a steer is for the turn on screen');
@@ -719,6 +720,17 @@ test('a steer joins the running turn: it names no model and no workspace', async
   await p.onEvent({ event: 'queued', bot: 'task', turn: 4, data: { status: 'ready' } });
   await p.submit('soon');
   assert.equal(sent.at(-1).delivery, 'queue'); assert.equal('expected_turn' in sent.at(-1), false);
+});
+
+test('a bot keeps its folder: only a bot without one is sent the app\'s, and a turn elsewhere moves it', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(q); } });
+  p.upsert({ name: 'loose', id: 3, provider: 'alpha', model: 'one' });
+  p.S.selected = 'loose'; await p.submit('here');
+  assert.equal(sent.at(-1).workspace, '/synthetic');
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task' });
+  await p.onEvent({ event: 'accepted', bot: 'task', turn: 5, data: { workspace: '/synthetic/moved' } });
+  assert.equal(p.S.bots.get('task').workspace, '/synthetic/moved');
 });
 
 test('a steer whose turn ended meanwhile is refused as stale, with a short message, and never queued', async () => {
@@ -747,7 +759,7 @@ test('a side chat forks a running bot under it, beside, with read tools or none,
   p.S.selected = 'app.lead';
   await p.sideChat('app.lead');
   const forks = () => sent.filter(([op]) => op === 'fork').map(([, q]) => q);
-  assert.deepEqual(forks().map((q) => [q.source, q.bot, q.created_by, q.created_by_id, Array.from(q.allow), q.workspace, 'checkpoint' in q]), [['app.lead', 'app.lead-side', 'app.lead', 1, ['read', 'history'], '/synthetic', false]]);
+  assert.deepEqual(forks().map((q) => [q.source, q.bot, q.created_by, q.created_by_id, Array.from(q.allow), 'workspace' in q, 'checkpoint' in q]), [['app.lead', 'app.lead-side', 'app.lead', 1, ['read', 'history'], false, false]]);
   assert.equal(p.S.ui.side, 'app.lead-side'); assert.equal(p.S.bots.get('app.lead-side').parent, 'app.lead');
   // Send's side pick asks a new side chat with this message; the running source gets nothing.
   p.setSend('side'); p.setSideTools('answer');
@@ -829,7 +841,8 @@ test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'
   p.S.selected = long;
   await p.fork(long); await p.fork(long);
   const forks = sent.filter(([op]) => op === 'fork').map(([, q]) => q);
-  assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), q.workspace]), [[128, 'aa-fork', '/synthetic/elsewhere'], [128, '-fork-2', '/synthetic/elsewhere']]);
+  // The daemon starts a fork where its source is, so the app names no folder.
+  assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), 'workspace' in q]), [[128, 'aa-fork', false], [128, '-fork-2', false]]);
 });
 
 test('a new project creates its coordinator in the folder, writes its file once, and is not made twice', async () => {
@@ -846,7 +859,7 @@ test('a new project creates its coordinator in the folder, writes its file once,
   // The shared policy first, then the app's own coordinator text: tasks that edit get worktrees.
   assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
   assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME"/);
-  assert.match(create.instructions, /pass the same --workspace whenever you message that task again/);
+  assert.match(create.instructions, /A task keeps its folder, so later messages to it need no --workspace/);
   // Tasks get the worktree's own policy, failed starts clean up, and a folder without git keeps tasks in place.
   assert.match(create.instructions, /run --detach --new --agents --bot NAME/);
   assert.match(create.instructions, /git worktree remove --force, git branch -D/);

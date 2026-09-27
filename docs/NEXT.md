@@ -960,10 +960,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     are loaded.
     Done (2026-09-27): tasks in worktrees, as the app's opinion. Its
     coordinators are told to give an editing task `git worktree add` on
-    `agent/NAME`, the folder's `.agent/setup`, and `run --workspace` on
-    every message to that task; the CLI and daemon are unchanged, since a
-    bot runs wherever it is sent (George, 2026-09-27); the app shows a
-    worktree bot's branch
+    `agent/NAME`, the folder's `.agent/setup`, and `run --new --agents
+    --workspace`. A bot now keeps its folder: a message without
+    `--workspace` runs where the bot is, one with it moves the bot there,
+    and a fork starts where its source is (George, 2026-09-27); the app
+    shows a worktree bot's branch
     ([APP.md](APP.md#projects-and-panes)). Follow-up: deleting a bot leaves
     its worktree and branch, which hold its work; the app should offer to
     remove them.

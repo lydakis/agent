@@ -174,7 +174,10 @@ fn print_flags(flags: &str) {
             "--all" => ("", "Follow every bot on one connection"),
             "--any" => ("", "Return when the first handle resolves"),
             "--timeout-ms" => ("N", "Wait at most N milliseconds; 0 polls immediately"),
-            "--workspace" => ("DIR", "Select the working directory"),
+            "--workspace" => (
+                "DIR",
+                "A new bot's folder (default: here); moves an existing bot there",
+            ),
             "--instructions" => (
                 "TEXT",
                 "A new bot's instructions (default: the built-in text)",

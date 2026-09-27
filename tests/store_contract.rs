@@ -138,19 +138,10 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         )
         .is_err()
     );
-    // The fork carries no default directory; each of its turns names one.
+    // The fork starts in its source's folder; a turn that names another moves it.
     assert_eq!(
-        db.begin(
-            "Alternative",
-            "r1",
-            "different",
-            true,
-            &TurnOptions::default(),
-            allow_provider
-        )
-        .unwrap_err()
-        .code,
-        "workspace_required"
+        db.inspect("Alternative").unwrap().workspace.as_deref(),
+        Some("/synthetic/bob")
     );
     let branch = TurnOptions {
         workspace: Some("/synthetic/alternative".into()),
@@ -1991,6 +1982,16 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
             .unwrap()
             .fresh
     );
+    // A retry that names no folder means wherever the first attempt went.
+    let unnamed = TurnOptions {
+        workspace: None,
+        ..options.clone()
+    };
+    assert!(
+        !db.begin("Bob", "r1", "work", true, &unnamed, allow_provider)
+            .unwrap()
+            .fresh
+    );
     assert_eq!(
         db.begin(
             "Bob",
@@ -2015,11 +2016,43 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
             allow_provider,
         )
         .unwrap();
+    // The earlier turn moved Bob; a turn that names no folder runs where Bob is.
     let context = db.context(plain.turn).unwrap();
     assert_eq!(
         (context.workspace.as_str(), context.model.as_str()),
-        ("/synthetic/default", "openai/synthetic-model")
+        ("/synthetic/elsewhere", "openai/synthetic-model")
     );
+    // Work queued before a move runs where the bot was; work after it runs
+    // where the bot went.
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let before = db
+        .begin("Bob", "r3", "before", true, &queue, allow_provider)
+        .unwrap();
+    let moving = TurnOptions {
+        workspace: Some("/synthetic/third".into()),
+        ..queue.clone()
+    };
+    let mover = db
+        .begin("Bob", "r4", "move", true, &moving, allow_provider)
+        .unwrap();
+    let after = db
+        .begin("Bob", "r5", "after", true, &queue, allow_provider)
+        .unwrap();
+    for (turn, folder) in [
+        (plain.turn, None),
+        (before.turn, Some("/synthetic/elsewhere")),
+        (mover.turn, Some("/synthetic/third")),
+        (after.turn, Some("/synthetic/third")),
+    ] {
+        if let Some(folder) = folder {
+            db.start(turn, allow_provider).unwrap();
+            assert_eq!(db.context(turn).unwrap().workspace, folder);
+        }
+        db.finish(turn, None).unwrap();
+    }
 }
 
 #[test]
@@ -2517,7 +2550,11 @@ fn fork_lineage_pages_are_bounded_and_survive_source_deletion() {
 fn fork_events_publish_the_persisted_workspace() {
     let mut db = db();
     db.create("source", Some("/source"), binding()).unwrap();
-    for (name, workspace) in [("default", None), ("explicit", Some("/branch"))] {
+    // A fork without a folder of its own starts in its source's.
+    for (name, workspace, kept) in [
+        ("default", None, "/source"),
+        ("explicit", Some("/branch"), "/branch"),
+    ] {
         let (fork, event) = db
             .fork(
                 "source",
@@ -2528,10 +2565,10 @@ fn fork_events_publish_the_persisted_workspace() {
                 },
             )
             .unwrap();
-        assert_eq!(fork.workspace.as_deref(), workspace);
-        assert_eq!(event["data"]["workspace"], json!(workspace));
+        assert_eq!(fork.workspace.as_deref(), Some(kept));
+        assert_eq!(event["data"]["workspace"], json!(kept));
         let replay = db.events(name, 0, 10).unwrap();
-        assert_eq!(replay["events"][0]["data"]["workspace"], json!(workspace));
+        assert_eq!(replay["events"][0]["data"]["workspace"], json!(kept));
     }
 }
 

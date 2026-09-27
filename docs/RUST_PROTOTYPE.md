@@ -137,12 +137,14 @@ address; the identity is a store-wide integer `id` that `create`, `fork`,
 `resume`, `bots`, and every `submit` answer report, and that is never reused
 after a delete. A fork is a new identity with an empty request namespace.
 
-A bot is not bound to a directory. Each turn runs in the directory `run` was
-invoked from (or `--workspace`), so the same conversation can continue in a new
-checkout, worktree, or snapshot, and consecutive turns may use different
-directories. `create` and `fork` accept an optional workspace that serves only
-as the default for submissions that name none; a bot without one rejects such a
-submission with `workspace_required`. The conversation does not know about
+A bot keeps its folder but is not bound to it. A new bot starts in the
+directory `run` was invoked from (or `--workspace`), and later turns run there
+wherever `run` is invoked. A submission that names a workspace runs there and
+moves the bot, so the same conversation can continue in a new checkout,
+worktree, or snapshot. Work already queued keeps the folder it was sent to; a
+steer that names none joins the running turn wherever it runs. A fork starts in
+its source's folder unless `fork` names another. A bot without a folder rejects
+a submission that names none with `workspace_required`. The conversation does not know about
 filesystem state; the caller is responsible for the workspace matching what the
 history assumes, exactly as with forks.
 
