@@ -5,7 +5,8 @@ updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, at
 `973be14`, the change that built tool approval, for its cost and a store
 lock fix, at `dd95047` for the per-summary choice between a copy and a
-request of its own, and at `cd1d45f` for the fix to run 5's lost steers.
+request of its own, at `cd1d45f` for the fix to run 5's lost steers, and
+at `7061fab` for the sustained task's first run.
 This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -274,7 +275,13 @@ Reconnects, retention, overload, compaction and recovery.
   were that steer. `cd1d45f` against `0b295d2`, 2026-09-27; later
   commits only narrow that admission and send such a steer to the model
   before any summary, which has not run live.
-  [Record](LONG_TASK_EVAL.md#live-run-7).
+  [Record](LONG_TASK_EVAL.md#live-run-7). On a sustained task that settles
+  six closes in one turn, about 508 KB of required output, 40 bots in
+  four arms at once: none compacted, since the model sent long outputs to
+  files and read their tails (peak 29,638 tokens, 11% of a 272k window),
+  and 25 of 40 finished before the correction was sent, which alone
+  decided who was correct. `7061fab`, 2026-09-27.
+  [Record](LONG_TASK_EVAL.md#live-run-8).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -295,7 +302,8 @@ Reconnects, retention, overload, compaction and recovery.
   (`dd95047`, macOS arm64). Its estimate does not model a cache miss.
 - Whether compacting pays on any task at a realistic budget: on this one,
   full context cost less than every compacting arm at 128 KiB (runs 4
-  and 5).
+  and 5), and on the sustained task the model never let its context
+  reach the budget (run 8).
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.

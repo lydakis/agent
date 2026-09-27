@@ -635,7 +635,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     six closes in one turn, about 508 KB of required output, so the
     context outgrows 128 KiB about four times over; it scores each
     close's settlement and number, the whole task's cost, and each bot's
-    time to finish, and has run only against the scripted provider.
+    time to finish. Its first live run
+    ([run 8](LONG_TASK_EVAL.md#live-run-8)) never compacted: the model sent
+    long outputs to files and read their tails, and 25 of 40 bots finished
+    before the correction was sent. The task now asks for each step read
+    whole and sends the correction once two closes are settled; that
+    version has run only against the scripted provider.
     Still open: stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts

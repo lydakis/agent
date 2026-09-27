@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bench import long_task_eval
-from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_AFTER, TASK, prompt,
-                                  run_condition, score, steer_outcome, workspace)
+from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_SETTLES, TASK, prompt,
+                                  run_condition, score, step_command_faults, steer_outcome, workspace)
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture, is_summary
 
@@ -150,6 +150,7 @@ class LongTaskScoreTests(unittest.TestCase):
         # sustained budget several times over.
         self.assertGreater(printed, long_task_eval.CONDITIONS['sustained-compact'][1] * 3)
         self.assertIn(f'closes {MONTHS[0]} through {MONTHS[-1]}', prompt('sustained'))
+        self.assertIn('do not redirect, pipe, filter or truncate it', prompt('sustained'))
         self.assertTrue(prompt('sustained').startswith(TASK[:TASK.index(' When `make check` passes')] + '\n\n'))
 
     @patch.multiple(long_task_eval, MONTHS=MONTHS[:3], CLOSE_BATCHES=20, CLOSE_ROWS=64)
@@ -335,7 +336,23 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(steer_outcome({'turn': 9}, {'status': 'failed', 'error': 'stale_turn'}),
                          'failed: stale_turn')
         self.assertEqual(steer_outcome({'error': 'stale_turn'}, None), 'refused: stale_turn')
-        self.assertEqual(steer_outcome(None, None), 'not sent: fewer tool calls')
+        self.assertEqual(steer_outcome(None, None), 'not sent: the task ended before its steer point')
+
+    def test_a_step_command_that_filters_or_combines_steps_is_counted(self):
+        # As run 8's bots ran them: output to a file and its tail read, or
+        # every close in one loop.
+        for command, faults in (
+                ('make check CLOSE=2026-01', (False, False)),
+                ('make check CLOSE=2026-01 2>&1', (False, False)),
+                ('cd work && tools/settle 2026-02', (False, False)),
+                ('make bench CLOSE=2026-01 > /tmp/bench.log 2>&1; tail -3 /tmp/bench.log', (True, False)),
+                ('make check CLOSE=2026-01 2>&1 | tail -5', (True, False)),
+                ('for m in 2026-01 2026-02; do tools/settle $m; done', (False, True)),
+                ('make check CLOSE=2026-03 && tools/settle 2026-03', (False, True)),
+                ("cat > ledger/convert.py <<'EOF'\nx = 1\nEOF", (False, False)),
+                ('grep -n rows/s tools/.seed', (False, False))):
+            with self.subTest(command=command):
+                self.assertEqual(step_command_faults(command), faults)
 
 
 # A scripted agent that does the task right.
@@ -348,14 +365,15 @@ def sustained_script():
     """A scripted agent that does the sustained task right: it settles two
     closes under the prompt's rule, takes up the correction once it
     arrives, settles those two again, finishes the closes, and prints
-    every close's number for its answer."""
+    every close's number for its answer, the one command that filters and
+    loops."""
     def close(month):
         return [f'make check CLOSE={month}', f'tools/settle {month}', f'make bench CLOSE={month}']
 
     script = ['tools/env-check', 'tools/migrate', 'tools/migrate --status',
               f"cat > ledger/convert.py <<'EOF'\n{TRUNCATING}EOF", 'make check',
               *close(MONTHS[0]), *close(MONTHS[1]), f'make check CLOSE={MONTHS[2]}']
-    assert len(script) == SUSTAINED_STEER_AFTER
+    assert sum(c.startswith('tools/settle') for c in script) == SUSTAINED_STEER_SETTLES
     script += [f"cat > ledger/convert.py <<'EOF'\n{HALF_EVEN}EOF", f'tools/settle {MONTHS[0]}',
                f'tools/settle {MONTHS[1]}', f'tools/settle {MONTHS[2]}', f'make bench CLOSE={MONTHS[2]}']
     for month in MONTHS[3:]:
@@ -444,8 +462,8 @@ class LongTaskRunnerTests(ModelFixture):
     def test_the_sustained_task_compacts_again_and_again_and_scores_every_close(self):
         # At 128 KiB the closes outgrow the budget several times: stubs make
         # the room with the default tools, summaries without `read`. The
-        # correction arrives at the task's own steer point, after two
-        # closes were settled under the prompt's rule.
+        # correction arrives at the task's own steer point, once two closes
+        # were settled under the prompt's rule.
         spec = ('openai', 'responses', self.url, None)
         for condition in ('sustained-compact', 'sustained-summary'):
             with self.subTest(condition=condition):
@@ -474,6 +492,7 @@ class LongTaskRunnerTests(ModelFixture):
                     self.assertEqual(result['summarizer_calls'], result['compactions'])
                 self.assertEqual(result['model_calls'], len(self.model.task_script) + 1)
                 self.assertEqual(result['commands'], [c[:160] for c in self.model.task_script])
+                self.assertEqual((result['filtered_step_commands'], result['combined_step_commands']), (1, 1))
                 self.assertGreater(result['input_token_equivalents'], 0)
                 self.assertGreater(result['wall_s'], 0)
                 requests = []
@@ -484,7 +503,10 @@ class LongTaskRunnerTests(ModelFixture):
                                         for i in r['input']) for r in work))
                 steered = [n for n, r in enumerate(work) if any(
                     i.get('role') == 'user' and i['content'][0]['text'] == CORRECTION for i in r['input'])]
-                self.assertIn(steered[0], (SUSTAINED_STEER_AFTER, SUSTAINED_STEER_AFTER + 1))
+                # Sent when the second settlement's call completed, taken at
+                # that round or the next.
+                point = self.model.task_script.index(f'tools/settle {MONTHS[1]}') + 1
+                self.assertIn(steered[0], (point, point + 1))
                 summary = long_task_eval.summarize(block)
                 self.assertEqual(summary['closes_settled_correctly'], [len(MONTHS)])
                 self.assertEqual(summary['bot_wall_s'], [result['wall_s']])

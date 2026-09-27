@@ -17,8 +17,10 @@ without `read`, so summaries rather than stubs make the room, and
 setup and then settle six monthly closes in the same turn, each with a
 check, a settlement and a benchmark that print long outputs, so the context
 outgrows the budget again and again and the final answer needs a number
-from every close. The correction arrives after two closes can have been
-settled, so a close settled under the old rule has to be settled again.
+from every close. The prompt asks for each step as its own command, read
+whole, since a model that sends a step's output to a file and reads its tail
+never lets the context grow. The correction arrives once two closes are
+settled, so those closes have to be settled again.
 Scores come from the workspace and the event log, not from the model's
 account of itself: hidden tests, the vendor checksum, each close's
 settlement file, how often `make quick` ran and the migration was applied,
@@ -69,10 +71,11 @@ CONDITIONS = {'compact': ('small', 20480, TOOLS), 'full': ('small', 4 << 20, TOO
               'sustained-full': ('sustained', 4 << 20, TOOLS)}
 # The steer arrives once this many tool calls have completed, in every
 # condition of a task, so the correction lands at the same point of it. The
-# sustained task's setup takes about five calls and each close three, so
-# its correction comes after up to two closes are settled.
+# sustained task's arrives once this many settlements have run instead,
+# whatever the calls took, so those closes are always settled under the
+# prompt's rule.
 STEER_AFTER = 6
-SUSTAINED_STEER_AFTER = 12
+SUSTAINED_STEER_SETTLES = 2
 # The sustained task's closes, settled in this order.
 MONTHS = tuple(f'2026-{n:02d}' for n in range(1, 7))
 
@@ -96,8 +99,9 @@ def prompt(size):
     return (TASK[:-len(LAST_STEP)]
             + f'\n\nThen settle the monthly closes {MONTHS[0]} through {MONTHS[-1]}, in order. For each close, '
             'run `make check CLOSE=<month>`; when it passes, run `tools/settle <month>`, which writes '
-            'out/<month>.json with your convert, then `make bench CLOSE=<month>`. Finish with a short report '
-            "that lists the throughput each close's benchmark printed.")
+            'out/<month>.json with your convert, then `make bench CLOSE=<month>`. Run each of these steps as '
+            'its own command and read its whole output: do not redirect, pipe, filter or truncate it. Finish '
+            "with a short report that lists the throughput each close's benchmark printed.")
 
 LEGACY = {f'L-{n:03d}': f'A-{n:03d}' for n in range(100, 140)}
 LEGACY_LARGE = {**LEGACY, **{f'L-{n}': f'A-{n}' for n in range(1000, 1900)}}
@@ -586,6 +590,30 @@ def workflow(root, initial):
     }
 
 
+def settlements(root):
+    """How many settlements have run and passed, from the step record."""
+    log = root / '.steps.log'
+    if not log.exists():
+        return 0
+    return sum(line.startswith('settle:') and line.split()[1] == '0' for line in log.read_text().splitlines())
+
+
+# A step command as the sustained task asks for it: one step, its output
+# neither sent elsewhere nor cut. Merging stderr into it is fine.
+STEP_NAMES = ('make check', 'tools/settle', 'make bench')
+
+
+def step_command_faults(command):
+    """Whether a command that runs a step filters its output, and whether
+    it runs more than one step or loops over them."""
+    names = sum(command.count(name) for name in STEP_NAMES)
+    if not names:
+        return False, False
+    plain = command.replace('2>&1', '')
+    return '|' in plain or '>' in plain, names > 1 or any(
+        f'{word} ' in command for word in ('for', 'while', 'xargs'))
+
+
 def close_workflow(root, closes):
     """Each close's steps, from the same record: whether a passing check
     of the close, or of every close, came before the settlement that
@@ -636,6 +664,7 @@ def score(root, facts, events, answer):
         close['reported'] = bool(close['bench_runs']) and str(
             facts['closes'][month]['throughput']) in (answer or '').replace(',', '')
     quick = [c for c, command in commands if 'make quick' in command]
+    faults = [step_command_faults(command) for _, command in commands]
     repeated = {}
     seen = set()
     for cursor, command in commands:
@@ -715,6 +744,10 @@ def score(root, facts, events, answer):
         'closes_settled_correctly': sum(c['settled_correctly'] for c in closes.values()),
         'closes_reported': sum(c['reported'] for c in closes.values()),
         'commands': [command[:160] for _, command in commands],
+        # Step commands against the sustained prompt: output filtered, or
+        # several steps in one command.
+        'filtered_step_commands': sum(filtered for filtered, _ in faults),
+        'combined_step_commands': sum(combined for _, combined in faults),
         'compactions': len(compactions),
         'elisions': sum(e['event'] == 'elided' for e in events),
         'repeated_commands_after_first_compaction': repeated,
@@ -757,13 +790,14 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
             facts[name] = workspace(work, seed + n, size)
             client.request('create', bot=name, workspace=str(work), instructions=INSTRUCTIONS,
                            tools=tools.split(','), compaction_instructions=COMPACTION)
-        task, steer_after = prompt(size), SUSTAINED_STEER_AFTER if size == 'sustained' else STEER_AFTER
+        task = prompt(size)
         started = time.monotonic()
         for name in names:
             turns[name] = client.request('submit', bot=name, request_id='task', prompt=task)['result']['turn']
         # Live events: count completed tools per bot, steer once each passes
         # the task's steer point, and collect the terminal events of tasks
-        # and steers, with each task's time to finish.
+        # and steers, with each task's time to finish. The sustained task's
+        # point is in its step record, written before the tool completes.
         done, steers, ends, completed, finished = {}, {}, {}, {name: 0 for name in names}, {}
         while len(done) < len(names):
             message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
@@ -781,7 +815,9 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 finished[name] = round(time.monotonic() - started, 1)
                 continue
             completed[name] += 1
-            if completed[name] == steer_after and name not in steers:
+            due = (settlements(root / name) >= SUSTAINED_STEER_SETTLES if size == 'sustained'
+                   else completed[name] >= STEER_AFTER)
+            if due and name not in steers:
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
                                        delivery='steer', expected_turn=turns[name])
                 steers[name] = reply.get('result') or {'error': reply.get('error')}
@@ -816,7 +852,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
 def steer_outcome(steer, end):
     """Whether the correction reached the task: its turn's final status."""
     if steer is None:
-        return 'not sent: fewer tool calls'
+        return 'not sent: the task ended before its steer point'
     if 'turn' not in steer:
         return f"refused: {steer['error']}"
     return end['status'] if end['status'] == 'steered' else f"{end['status']}: {end.get('error')}"
@@ -852,7 +888,9 @@ def summarize(block):
             'bot_wall_s': sorted(b['wall_s'] for b in bots),
             **({'closes_settled_correctly': [b['closes_settled_correctly'] for b in bots],
                 'closes_reported': [b['closes_reported'] for b in bots],
-                'settle_runs': [sum(c['settle_runs'] for c in b['closes'].values()) for b in bots]}
+                'settle_runs': [sum(c['settle_runs'] for c in b['closes'].values()) for b in bots],
+                'filtered_step_commands': [b['filtered_step_commands'] for b in bots],
+                'combined_step_commands': [b['combined_step_commands'] for b in bots]}
                if block['task'] == 'sustained' else {}),
             'wall_s': block['wall_s']}
 
