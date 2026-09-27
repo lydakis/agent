@@ -827,6 +827,26 @@ fn models(options: &Options) -> Result<i32> {
         }
         let mut connection = ensure_daemon(options)?;
         let listing = connection.request("provider_models", json!({}))?;
+        // A list of refusals alone is not written: once a login works,
+        // discovery can still run.
+        let providers = listing["providers"].as_object();
+        if !providers.is_some_and(|providers| {
+            providers
+                .values()
+                .any(|listed| listed["models"].as_array().is_some_and(|m| !m.is_empty()))
+        }) {
+            let refused: Vec<String> = providers
+                .into_iter()
+                .flatten()
+                .map(|(name, listed)| {
+                    format!(
+                        "{name}: {}",
+                        listed["error"].as_str().unwrap_or("no models")
+                    )
+                })
+                .collect();
+            return fail_with("models_none_listed", refused.join(", "));
+        }
         let text = agent_client::models::render(&listing);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

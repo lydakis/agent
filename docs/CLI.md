@@ -155,8 +155,10 @@ Reading it needs no daemon, and the daemon never reads it: any model runs.
 `models --discover` writes a first file from the listings of the providers
 the daemon runs (starting one like `run`), with each model's name and
 context size as its note and a comment for a provider that listed nothing.
-It refuses with `models_file_exists` once the file exists: after that it is
-the user's to edit. Bots see the same list by running `models`.
+When no provider lists a model it writes nothing and fails with
+`models_none_listed`, naming each refusal, so it can run again after a
+login. It refuses with `models_file_exists` once the file exists: after
+that it is the user's to edit. Bots see the same list by running `models`.
 
 `serve` requires explicit `--store` and `--provider` options. It runs the daemon
 directly, with Unix-socket service when `--socket` is

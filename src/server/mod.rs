@@ -859,6 +859,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let approval_hold = Duration::from_millis(config.approval_hold_ms.unwrap_or(2000));
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
+    let aws_start = agent_runtime::provider::aws::Start::new();
     let credentials = agent_runtime::tools::Credentials::default();
     let mut bindings = serde_json::Map::new();
     for spec in &config.providers {
@@ -892,13 +893,22 @@ pub async fn run(config: Configuration) -> Result<()> {
         if spec.sigv4 {
             let url =
                 reqwest::Url::parse(&spec.url).map_err(|_| Error::new("invalid_provider_url"))?;
-            let (aws, unresolved) =
-                agent_runtime::provider::aws::Aws::open(&url, Some(credentials.clone())).await?;
+            let (aws, unresolved) = agent_runtime::provider::aws::Aws::open(
+                &url,
+                Some(credentials.clone()),
+                &aws_start,
+            )
+            .await?;
             let mut signed = json!({"auth":"sigv4","region":aws.region(),
                 "credentials":aws.source()});
             // Keys the CLI cannot resolve yet leave this binding waiting on a
             // login, not the daemon: its calls resolve again when they run.
-            if let Some(error) = unresolved {
+            // Its detail is clipped: every SigV4 binding carries the same
+            // one, and `ready` is one event however many there are.
+            if let Some(mut error) = unresolved {
+                if let Some(detail) = &mut error.detail {
+                    detail.truncate(detail.floor_char_boundary(200));
+                }
                 signed["unresolved"] = json!({"error": error.code, "detail": error.detail});
             }
             auth = Some(signed);

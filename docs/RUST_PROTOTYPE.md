@@ -377,10 +377,12 @@ with `global.anthropic.claude-opus-5` model ids. Keys come from the AWS chain in
 its own order: `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (with
 `AWS_SESSION_TOKEN`) when set, otherwise whatever the AWS CLI resolves for
 `AWS_PROFILE` or the default profile, SSO and assumed roles included, through
-`aws configure export-credentials`. Keys the CLI cannot resolve when the
-daemon starts (no login yet, an expired SSO session) do not stop it: the
-binding's `ready.providers` entry carries `unresolved` with the reason, and
-its next call resolves again, so `aws sso login` fixes it without a restart.
+`aws configure export-credentials`, asked once at start for every SigV4
+binding and waited on at most three seconds. Keys the CLI cannot resolve
+by then (no login yet, an expired SSO session, a stalled CLI) do not stop
+the daemon: the binding's `ready.providers` entry carries `unresolved` with
+the reason (its detail clipped to 200 bytes), and its next call resolves
+again, so `aws sso login` fixes it without a restart.
 A call with no usable keys fails before it is paced, admitted or its body
 read.
 Temporary keys are re-resolved in the

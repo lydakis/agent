@@ -28,6 +28,14 @@ const REFRESH_AHEAD: Duration = Duration::from_secs(300);
 /// Bound on one `aws` credential resolution; an SSO login that needs a
 /// browser fails here with the CLI's own message instead of hanging a turn.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long startup waits on the AWS CLI; a client starting the daemon
+/// gives it 10 s in all. Keys it has not given by then are resolved on the
+/// binding's first call.
+const START: Duration = Duration::from_secs(3);
+
+/// What the AWS CLI gave when the daemon started, asked once for every
+/// SigV4 binding: they all read the same profile.
+pub type Start = tokio::sync::OnceCell<Result<Keys>>;
 /// Re-resolution runs at most this often, so neither a CLI outage nor a
 /// fleet refused for another reason (a model not enabled, a missing
 /// permission) can spawn the CLI once per request.
@@ -139,6 +147,7 @@ impl Aws {
     pub async fn open(
         url: &reqwest::Url,
         redaction: Option<Credentials>,
+        start: &Start,
     ) -> Result<(Self, Option<Error>)> {
         let (region, service) = endpoint(url).ok_or(Error::new("invalid_provider_url"))?;
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
@@ -153,7 +162,7 @@ impl Aws {
             }
             None => {
                 let command: Box<[String]> = AWS_CLI.map(str::to_owned).into();
-                Ok(Self::from_cli(region, service, command, redaction).await)
+                Ok(Self::from_cli(region, service, command, redaction, start).await)
             }
         }
     }
@@ -163,8 +172,21 @@ impl Aws {
         service: &'static str,
         command: Box<[String]>,
         redaction: Option<Credentials>,
+        start: &Start,
     ) -> (Self, Option<Error>) {
-        let resolved = resolve(&command).await;
+        let resolved = start
+            .get_or_init(|| async {
+                tokio::time::timeout(START, resolve(&command))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::with(
+                            "provider_aws_credentials_unavailable",
+                            format!("the AWS CLI gave no keys within {START:?} of start"),
+                        ))
+                    })
+            })
+            .await
+            .clone();
         let aws = Self::unresolved(region, service, Source::Cli(command), redaction);
         let unresolved = match resolved {
             Ok(keys) if !keys.expired(SystemTime::now()) => {
@@ -687,8 +709,14 @@ echo '{{"Version":1,"AccessKeyId":"LATE","SecretAccessKey":"S"}}'"#,
             ready.display()
         );
         let command: Box<[String]> = ["sh".into(), "-c".into(), script].into();
-        let (aws, unresolved) =
-            Aws::from_cli("us-east-1".into(), "bedrock-mantle", command, None).await;
+        let (aws, unresolved) = Aws::from_cli(
+            "us-east-1".into(),
+            "bedrock-mantle",
+            command,
+            None,
+            &Start::new(),
+        )
+        .await;
         assert_eq!(
             unresolved.unwrap().code,
             "provider_aws_credentials_unavailable"
@@ -696,6 +724,28 @@ echo '{{"Version":1,"AccessKeyId":"LATE","SecretAccessKey":"S"}}'"#,
         let aws = Arc::new(aws);
         std::fs::write(&ready, "").unwrap();
         assert_eq!(aws.current().await.unwrap().access, "LATE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stalled CLI holds startup for `START` once, not per binding.
+    #[tokio::test]
+    async fn a_stalled_login_holds_startup_once_and_briefly() {
+        let dir = std::env::temp_dir().join(format!("agent-aws-stall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asked = dir.join("asked");
+        let script = format!("echo . >> '{}'; sleep 20", asked.display());
+        let command = || -> Box<[String]> { ["sh".into(), "-c".into(), script.clone()].into() };
+        let (start, began) = (Start::new(), Instant::now());
+        for service in ["bedrock-mantle", "bedrock"] {
+            let (_, unresolved) =
+                Aws::from_cli("us-east-1".into(), service, command(), None, &start).await;
+            assert_eq!(
+                unresolved.unwrap().code,
+                "provider_aws_credentials_unavailable"
+            );
+        }
+        assert!(began.elapsed() < START + Duration::from_secs(2));
+        assert_eq!(std::fs::read_to_string(&asked).unwrap(), ".\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

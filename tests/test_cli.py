@@ -1008,6 +1008,14 @@ class ModelListTests(ModelFixture):
         # Two listings fill what the daemon keeps; the third is asked again.
         self.assertEqual(len(self.model.paths), 4)
 
+    def test_discover_writes_nothing_when_no_provider_lists(self):
+        refused = self.agent('models', '--discover', *self.store,
+                             '--provider', 'gone=responses,http://127.0.0.1:1/v1', check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn('models_none_listed', refused.stderr)
+        self.assertIn('gone: provider_', refused.stderr)
+        self.assertFalse(self.list.exists(), 'a list of refusals is not installed')
+
     def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
         self.assertEqual(json.loads(self.agent('models').stdout), [])
         self.assertIn('agent models --discover', self.agent('models', '--pretty').stderr)
