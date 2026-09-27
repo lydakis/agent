@@ -2032,10 +2032,16 @@ impl Service {
                 tokio::spawn(async move {
                     let mut names: Vec<String> = providers.keys().cloned().collect();
                     names.sort();
-                    // A few at a time, so bodies being read stay a few limits' worth.
+                    // A few at a time, so bodies being read stay a few limits'
+                    // worth, and all within one deadline however many there are.
+                    let by = tokio::time::Instant::now() + Duration::from_secs(15);
                     let asks = names.clone().into_iter().map(|name| {
                         let providers = providers.clone();
-                        async move { providers[&name].models().await }
+                        async move {
+                            tokio::time::timeout_at(by, providers[&name].models())
+                                .await
+                                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
+                        }
                     });
                     let listed: Vec<_> = futures_util::StreamExt::collect(
                         futures_util::StreamExt::buffered(futures_util::stream::iter(asks), 4),

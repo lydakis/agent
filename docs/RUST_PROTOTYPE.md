@@ -891,7 +891,8 @@ does not, and each is one op:
   `timeout_ms: 0` polls current outcomes and returns unresolved handles as
   pending without a timer, in both the protocol op and the wait tool.
 - `provider_models` asks each provider for its own model listing (`GET
-  .../models` with the provider's credentials, 10 seconds at most) and
+  .../models` with the provider's credentials, four providers at a time,
+  10 seconds each and 15 for the whole request) and
   answers `providers.NAME.models` as `{id, name?, context_tokens?,
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
   list. It runs off the dispatch path, only when asked, under the same

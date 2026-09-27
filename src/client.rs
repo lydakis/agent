@@ -851,6 +851,10 @@ fn models(options: &Options) -> Result<i32> {
             }
             _ => error.into(),
         })?;
+        // The new name is durable only once its directory is.
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
         eprintln!("wrote {}", path.display());
     }
     let models = agent_client::models::read(&path).map_err(client_error)?;
