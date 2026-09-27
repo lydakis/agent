@@ -257,6 +257,7 @@ impl Sockets {
                             format!("provider_http_{status}")
                         },
                         detail: None,
+                        facts: None,
                     },
                     dead: true,
                     refused: true,

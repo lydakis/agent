@@ -381,10 +381,7 @@ pub async fn payload(body: impl Stream<Item = std::io::Result<Bytes>>) -> Result
     let mut body = std::pin::pin!(body);
     let mut context = digest::Context::new(&digest::SHA256);
     while let Some(chunk) = body.next().await {
-        context.update(&chunk.map_err(|error| Error {
-            code: error.to_string(),
-            detail: None,
-        })?);
+        context.update(&chunk.map_err(|error| Error::new(&error.to_string()))?);
     }
     Ok(hex(context.finish().as_ref()))
 }

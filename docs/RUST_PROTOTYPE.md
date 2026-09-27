@@ -815,6 +815,8 @@ remain available through replay if the drain deadline is reached.
 
 Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
+A refusal a program acts on also carries its facts as fields beside them:
+`bot_busy` from `submit` reports `running_turn` and `fork_point`.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 `data`, in exactly the shape `events` replays them. Durable events reach
 followers in commit order: the storage worker itself hands each group's
@@ -1113,11 +1115,13 @@ the turn's id and handle at once, and `wait`, `turns`, and
   `earlier work is waiting`. `agent run` adds the ways past it as flags to
   copy (`--delivery steer --turn N`, `--delivery queue`, or
   `fork --source NAME --bot NEW` to ask without interrupting, which starts
-  at the running turn's newest finished round). It offers the fork only when
-  `resume` reports a `fork_point`: where a fork without a checkpoint starts,
-  the head of an idle bot or that newest finished round, absent while a turn
-  that began before such rounds were kept has had no model response since.
-  A model calling `agent run`
+  at the running turn's newest finished round). It reads these from the
+  refusal's `running_turn` and `fork_point`, taken in the refusing
+  transaction, so it asks nothing more and never names a turn that started
+  since. `fork_point` is where a fork without a checkpoint starts, the head
+  of an idle bot or that newest finished round; it is null while a turn that
+  began before such rounds were kept has had no model response since, and
+  then no fork is offered. A model calling `agent run`
   does not discover them otherwise, and in benchmark runs it ignored a prose
   description of them. Likewise `fork_point_unknown` states the fact and
   `agent fork` adds `--checkpoint`.

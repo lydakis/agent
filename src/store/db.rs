@@ -100,8 +100,9 @@ pub struct Bot {
     pub denials: BTreeMap<String, Denials>,
     /// Where a fork without a checkpoint starts: an idle bot's head, or its
     /// running turn's newest finished round. `None` when there is none yet:
-    /// no history, or a turn that began before that round was kept.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// no history, or a turn that began before that round was kept. A busy
+    /// refusal reports it.
+    #[serde(skip)]
     pub fork_point: Option<i64>,
 }
 /// A bot's denials under one gate tag: how many in a row, reset when a call
@@ -3322,14 +3323,14 @@ impl Database {
         }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
-            // What is in the way; the ways past it are the client's to offer.
-            return fail_with(
-                "bot_busy",
-                match bot.running_turn {
-                    Some(turn) => format!("turn {turn} is running"),
-                    None => "earlier work is waiting".to_owned(),
-                },
-            );
+            // What is in the way, as of this transaction; the ways past it
+            // are the client's to offer.
+            let detail = match bot.running_turn {
+                Some(turn) => format!("turn {turn} is running"),
+                None => "earlier work is waiting".to_owned(),
+            };
+            return Err(Error::with("bot_busy", detail)
+                .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");

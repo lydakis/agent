@@ -3034,6 +3034,11 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         .unwrap_err();
     assert_eq!(busy.code, "bot_busy");
     assert_eq!(busy.detail.unwrap(), format!("turn {turn} is running"));
+    // Its facts name the turn and no fork point.
+    assert_eq!(
+        busy.facts.map(|facts| Value::Object(*facts)),
+        Some(json!({"running_turn":turn,"fork_point":null}))
+    );
     // An explicit point still works, and the next response lifts the refusal.
     let prompt = head(&db, "Bob") - 1;
     db.fork(

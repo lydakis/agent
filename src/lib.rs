@@ -13,19 +13,31 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Error {
     pub code: String,
     pub detail: Option<String>,
+    /// Facts a program acts on, sent beside `detail` in a response, so a
+    /// client need not parse the detail or ask again.
+    pub facts: Option<Box<serde_json::Map<String, serde_json::Value>>>,
 }
 impl Error {
     pub fn new(code: &str) -> Self {
         Self {
             code: code.into(),
             detail: None,
+            facts: None,
         }
     }
     pub fn with(code: &str, detail: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             detail: Some(detail.into()),
+            facts: None,
         }
+    }
+    /// This error with `facts`, an object whose fields join the response.
+    pub fn facts(mut self, facts: serde_json::Value) -> Self {
+        if let serde_json::Value::Object(facts) = facts {
+            self.facts = Some(Box::new(facts));
+        }
+        self
     }
 }
 impl std::fmt::Display for Error {

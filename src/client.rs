@@ -448,13 +448,18 @@ impl Connection {
         loop {
             let message = self.read_line()?;
             if message.get("id").is_some_and(|id| *id == json!(self.next)) {
-                return match message.get("error").and_then(Value::as_str) {
-                    Some(code) => Err(Error {
-                        code: code.to_owned(),
-                        detail: message["detail"].as_str().map(str::to_owned),
-                    }),
-                    None => Ok(message["result"].clone()),
+                let Some(code) = message.get("error").and_then(Value::as_str) else {
+                    return Ok(message["result"].clone());
                 };
+                let mut error = Error::new(code);
+                error.detail = message["detail"].as_str().map(str::to_owned);
+                if let Value::Object(mut facts) = message {
+                    for key in ["id", "error", "detail"] {
+                        facts.remove(key);
+                    }
+                    error.facts = (!facts.is_empty()).then(|| Box::new(facts));
+                }
+                return Err(error);
             }
             if message.get("id").is_none() {
                 self.pending.push_back(message);
@@ -986,6 +991,7 @@ fn models(options: &Options) -> Result<i32> {
     let client_error = |e: agent_client::Error| Error {
         code: e.code,
         detail: e.detail,
+        facts: None,
     };
     if options.discover {
         if path.exists() {
@@ -1152,7 +1158,7 @@ fn run(options: &Options) -> Result<i32> {
                 "model":if created { Value::Null } else { json!(options.model) },
                 "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
         )
-        .map_err(|error| ways_past_busy(&mut connection, &bot, error))?;
+        .map_err(|error| ways_past_busy(&bot, error))?;
     if options.detach {
         print_json(&submitted, options.pretty)?;
         return Ok(0);
@@ -1180,14 +1186,19 @@ fn run(options: &Options) -> Result<i32> {
 /// A busy bot's refusal, with the ways past it as flags to copy: callers,
 /// models included, do not act on a description of them. The daemon says
 /// only what is in the way.
-fn ways_past_busy(connection: &mut Connection, bot: &str, error: Error) -> Error {
+fn ways_past_busy(bot: &str, error: Error) -> Error {
     if error.code != "bot_busy" {
         return error;
     }
-    let record = connection.request("resume", json!({"bot":bot})).ok();
-    let running = record
-        .as_ref()
-        .and_then(|record| record["running_turn"].as_i64());
+    // The refusal's own facts, as of the refusing transaction.
+    let fact = |key| {
+        error
+            .facts
+            .as_deref()
+            .and_then(|facts| facts.get(key))
+            .and_then(Value::as_i64)
+    };
+    let running = fact("running_turn");
     let join = match running {
         Some(turn) => format!(
             "resend with --delivery steer --turn {turn} to add this to it, \
@@ -1197,13 +1208,13 @@ fn ways_past_busy(connection: &mut Connection, bot: &str, error: Error) -> Error
     };
     // A turn from before its finished rounds were kept has no fork point
     // until its next model response.
-    let fork = if running.is_some() && record.is_some_and(|record| record["fork_point"].is_null()) {
+    let fork = if running.is_some() && fact("fork_point").is_none() {
         String::new()
     } else {
         format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW")
     };
-    let fact = error.detail.map(|d| d + "; ").unwrap_or_default();
-    Error::with("bot_busy", format!("{fact}{join}{fork}"))
+    let stated = error.detail.map(|d| d + "; ").unwrap_or_default();
+    Error::with("bot_busy", format!("{stated}{join}{fork}"))
 }
 
 fn follow(options: &Options) -> Result<i32> {
