@@ -1394,8 +1394,12 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
     };
     assert_eq!(message["cursor"], announced["cursor"]);
     assert_eq!(
-        (&message["bot"], &message["turn"]),
-        (&json!("Bob"), &json!(turn))
+        (&message["bot"], &message["turn"], &message["tag"]),
+        (&json!("Bob"), &json!(turn), &json!("manual"))
+    );
+    assert_eq!(
+        (&message["data"]["part"], &message["data"]["parts"]),
+        (&json!(1), &json!(1))
     );
     let calls = message["data"]["calls"].as_array().unwrap();
     assert_eq!(calls.len(), 2);

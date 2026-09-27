@@ -2168,13 +2168,20 @@ impl Service {
                 if !(100..=600_000).contains(&lease_ms) {
                     return fail_with("invalid_lease", "lease_ms from 100 to 600000");
                 }
-                let (lease, serving) = self.hub.serve(&tag, session, output.clone(), lease_ms)?;
+                // Checked before the tag changes hands, so a bad page keeps
+                // the lease this session may already hold.
+                let limit = limit.unwrap_or(64);
+                if !(1..=256).contains(&limit) {
+                    return fail("invalid_approval_page");
+                }
+                let (lease, serving, before) =
+                    self.hub.serve(&tag, session, output.clone(), lease_ms)?;
                 // The listing and the start of delivery share one job, so
                 // every waiting call is on a page or announced after it.
                 let listed = tag.clone();
                 let page = store
                     .op("serve_approvals", move |db| {
-                        let (cursor, page) = db.serve_approvals(&listed, limit.unwrap_or(64))?;
+                        let (cursor, page) = db.serve_approvals(&listed, limit)?;
                         serving.lock().unwrap().go_live(cursor);
                         Ok(page)
                     })
@@ -2187,7 +2194,7 @@ impl Service {
                         Ok(page)
                     }
                     Err(error) => {
-                        self.hub.unserve(&tag, lease);
+                        self.hub.unserve(&tag, lease, before);
                         Err(error)
                     }
                 }

@@ -6244,7 +6244,9 @@ fn pending_call(
 }
 /// A round's announcement as serving approvers get it, after the commit
 /// that makes it: the announcing event's cursor, and each call whole, as
-/// `approvals` lists it, in messages of up to 256 KiB of calls.
+/// `approvals` lists it. Each gate tag gets the calls waiting on it, in
+/// messages of up to 256 KiB of calls numbered `part` of `parts`, so its
+/// approver knows when it holds the whole round.
 fn serving(
     bot: &str,
     turn: i64,
@@ -6252,16 +6254,48 @@ fn serving(
     calls: Vec<Value>,
     failed: Option<&str>,
 ) -> Result<Vec<Value>> {
-    Ok(announcements(calls)?
-        .into_iter()
-        .map(|calls| {
-            let mut data = json!({"calls":calls});
+    let mut tags: Vec<&str> = calls
+        .iter()
+        .flat_map(|call| call["gates"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    let tags: Vec<String> = tags.into_iter().map(str::to_owned).collect();
+    // One tag is the usual round: its calls move rather than copy.
+    let rounds: Vec<(String, Vec<Value>)> = match &tags[..] {
+        [tag] => vec![(tag.clone(), calls)],
+        _ => tags
+            .into_iter()
+            .map(|tag| {
+                let waiting = calls
+                    .iter()
+                    .filter(|call| {
+                        call["gates"]
+                            .as_array()
+                            .is_some_and(|gates| gates.iter().any(|g| *g == tag.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                (tag, waiting)
+            })
+            .collect(),
+    };
+    let mut served = Vec::new();
+    for (tag, calls) in rounds {
+        let parts = announcements(calls)?;
+        let count = parts.len();
+        for (index, calls) in parts.into_iter().enumerate() {
+            let mut data = json!({"calls":calls,"part":index + 1,"parts":count});
             if let Some(failed) = failed {
                 data["failed"] = json!(failed);
             }
-            entry(cursor, bot, Some(turn), "approval_requested", data)
-        })
-        .collect())
+            let mut message = entry(cursor, bot, Some(turn), "approval_requested", data);
+            message["tag"] = json!(tag);
+            served.push(message);
+        }
+    }
+    Ok(served)
 }
 /// A round's announced calls in events small enough to page: up to 256 KiB
 /// each, well under the half-event page bound, since one call is at most its
@@ -7110,6 +7144,58 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_round_is_served_per_tag_in_numbered_parts() {
+        let call = |id: usize, gates: &[&str], bytes: usize| json!({"call_id":format!("c{id}"),"gates":gates,"arguments":{"command":"x".repeat(bytes)}});
+        // One tag: every call in one part, moved rather than copied.
+        let served = serving("Bob", 3, 9, vec![call(1, &["auto"], 8)], None).unwrap();
+        let [one] = &served[..] else {
+            panic!("{served:?}")
+        };
+        assert_eq!(
+            (&one["tag"], &one["cursor"], &one["turn"]),
+            (&json!("auto"), &json!(9), &json!(3))
+        );
+        assert_eq!(
+            (&one["data"]["part"], &one["data"]["parts"]),
+            (&json!(1), &json!(1))
+        );
+        // Two tags: each gets only the calls waiting on it, numbered apart;
+        // a round past 256 KiB comes in parts.
+        let calls = vec![
+            call(1, &["auto", "manual"], 200 * 1024),
+            call(2, &["manual"], 200 * 1024),
+            call(3, &["auto"], 10),
+        ];
+        let served = serving("Bob", 3, 9, calls, Some("c0")).unwrap();
+        let shape: Vec<(String, u64, u64, Vec<String>)> = served
+            .iter()
+            .map(|m| {
+                let ids = m["data"]["calls"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c["call_id"].as_str().unwrap().to_owned())
+                    .collect();
+                (
+                    m["tag"].as_str().unwrap().to_owned(),
+                    m["data"]["part"].as_u64().unwrap(),
+                    m["data"]["parts"].as_u64().unwrap(),
+                    ids,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("auto".into(), 1, 1, vec!["c1".into(), "c3".into()]),
+                ("manual".into(), 1, 2, vec!["c1".into()]),
+                ("manual".into(), 2, 2, vec!["c2".into()]),
+            ]
+        );
+        assert!(served.iter().all(|m| m["data"]["failed"] == "c0"));
+    }
 
     #[test]
     fn string_prefixes_decode_only_what_they_keep() {

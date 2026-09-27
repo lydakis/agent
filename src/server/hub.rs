@@ -62,10 +62,12 @@ pub struct Approver {
 }
 impl Approver {
     /// Start delivery after the listing the serving job read: only calls
-    /// announced past `cursor` are new to the approver.
+    /// announced past `cursor` are new to the approver. The lease period
+    /// starts here, so time queued behind storage does not use it up.
     pub fn go_live(&mut self, cursor: i64) {
         self.cursor = cursor;
         self.live = true;
+        self.deadline = Instant::now() + Duration::from_millis(self.lease_ms);
     }
 }
 pub type Serving = Arc<Mutex<Approver>>;
@@ -77,11 +79,15 @@ pub struct Hub {
 }
 impl Default for Hub {
     fn default() -> Self {
-        // Leases differ across restarts, so a number from before one never
-        // matches the lease its tag has after.
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
+        // Leases start from a random point each run, so a number from
+        // before a restart matches the lease its tag has after only by a
+        // 2^-52 chance, whatever the clock does. Below 2^53, so a client
+        // reading JSON numbers as doubles keeps them exact.
+        use std::hash::{BuildHasher, Hasher};
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+            >> 12;
         Self {
             inner: Arc::new(Mutex::new(HubInner {
                 next_lease: seed,
@@ -107,14 +113,15 @@ impl Hub {
     /// Hand `tag` to `session` under a new lease, not yet live: the job
     /// that lists the tag's waiting calls makes it live. A tag another
     /// session holds is refused until that session closes or lets its
-    /// lease run out; the one it had is then told so.
+    /// lease run out; the one it had is then told so. Returns the lease the
+    /// session itself held before, which `unserve` puts back.
     pub fn serve(
         &self,
         tag: &str,
         session: u64,
         output: Output,
         lease_ms: u64,
-    ) -> Result<(u64, Serving)> {
+    ) -> Result<(u64, Serving, Option<Serving>)> {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
         if let Some(held) = inner.approvers.get(tag) {
@@ -122,10 +129,17 @@ impl Hub {
             if held.session != session && held.deadline > now {
                 return fail("approvals_served");
             }
-            if held.session != session {
-                let _ = held.output.try_send(lost(tag, held.lease));
-            }
         }
+        // Leases that ran out go now, whichever tag they held, so tags
+        // served once and let go do not accumulate.
+        inner.approvers.retain(|held_tag, held| {
+            let held = held.lock().unwrap();
+            let keep = held.deadline > now || (held.session == session && held_tag == tag);
+            if !keep {
+                let _ = held.output.try_send(lost(held_tag, held.lease));
+            }
+            keep
+        });
         inner.next_lease += 1;
         let lease = inner.next_lease;
         let approver = Arc::new(Mutex::new(Approver {
@@ -137,18 +151,22 @@ impl Hub {
             cursor: i64::MAX,
             live: false,
         }));
-        inner.approvers.insert(tag.to_owned(), approver.clone());
-        Ok((lease, approver))
+        let before = inner.approvers.insert(tag.to_owned(), approver.clone());
+        Ok((lease, approver, before))
     }
-    /// Give up `tag` if `lease` still holds it, as when serving it failed.
-    pub fn unserve(&self, tag: &str, lease: u64) {
+    /// Give up `tag` if `lease` still holds it, as when serving it failed,
+    /// and put back the lease the session held `before`.
+    pub fn unserve(&self, tag: &str, lease: u64, before: Option<Serving>) {
         let mut inner = self.inner.lock().unwrap();
         if inner
             .approvers
             .get(tag)
             .is_some_and(|held| held.lock().unwrap().lease == lease)
         {
-            inner.approvers.remove(tag);
+            match before {
+                Some(before) => inner.approvers.insert(tag.to_owned(), before),
+                None => inner.approvers.remove(tag),
+            };
         }
     }
     /// Keep `tag` for `session` under `lease` for another lease period.
@@ -190,54 +208,36 @@ impl Hub {
         tags.sort();
         tags
     }
-    /// Deliver an announcement to the session serving each gate tag its
-    /// calls name, each receiving only the calls that wait on its tag. A
-    /// holder whose lease ran out is told it lost the tag instead; one that
-    /// cannot keep up is closed, like a lagging follower.
+    /// Deliver a part of an announcement to the session serving its gate
+    /// tag. A holder whose lease ran out is told it lost the tag instead;
+    /// one that cannot keep up is closed, like a lagging follower.
     pub fn approval(&self, message: &Value) {
-        let calls = message["data"]["calls"].as_array();
-        let mut tags: Vec<&str> = calls
-            .into_iter()
-            .flatten()
-            .flat_map(|call| call["gates"].as_array().into_iter().flatten())
-            .filter_map(Value::as_str)
-            .collect();
-        tags.sort_unstable();
-        tags.dedup();
+        let Some(tag) = message["tag"].as_str() else {
+            return;
+        };
         let cursor = message["cursor"].as_i64().unwrap_or(0);
-        let now = Instant::now();
-        for tag in tags {
-            let Some(held) = self.inner.lock().unwrap().approvers.get(tag).cloned() else {
-                continue;
-            };
-            let (session, output, sent) = {
-                let held = held.lock().unwrap();
-                if !held.live || cursor <= held.cursor {
-                    continue;
-                }
-                if held.deadline <= now {
-                    let (session, lease) = (held.session, held.lease);
-                    drop(held);
-                    self.expire(tag, session, lease);
-                    continue;
-                }
-                let mut sent = message.clone();
-                if let Some(Value::Array(calls)) = sent["data"].get_mut("calls") {
-                    calls.retain(|call| {
-                        call["gates"]
-                            .as_array()
-                            .is_some_and(|gates| gates.iter().any(|g| g == tag))
-                    });
-                }
-                sent["tag"] = json!(tag);
-                sent["lease"] = json!(held.lease);
-                sent["durable"] = json!(false);
-                (held.session, held.output.clone(), sent)
-            };
-            if output.try_send(sent).is_err() {
-                self.close_session(session);
-                output.close();
+        let Some(held) = self.inner.lock().unwrap().approvers.get(tag).cloned() else {
+            return;
+        };
+        let (session, output, sent) = {
+            let held = held.lock().unwrap();
+            if !held.live || cursor <= held.cursor {
+                return;
             }
+            if held.deadline <= Instant::now() {
+                let (session, lease) = (held.session, held.lease);
+                drop(held);
+                self.expire(tag, session, lease);
+                return;
+            }
+            let mut sent = message.clone();
+            sent["lease"] = json!(held.lease);
+            sent["durable"] = json!(false);
+            (held.session, held.output.clone(), sent)
+        };
+        if output.try_send(sent).is_err() {
+            self.close_session(session);
+            output.close();
         }
     }
     /// End a lease that ran out, if it still holds its tag, and tell its

@@ -455,6 +455,7 @@ class ServedApprovalTests(ModelFixture):
         second = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two')['result']['turn']
         pushed = self.pushed(approver, second)
         self.assertEqual((pushed['tag'], pushed['lease'], pushed['durable']), ('auto', lease, False))
+        self.assertEqual((pushed['data']['part'], pushed['data']['parts']), (1, 1))
         [call] = pushed['data']['calls']
         self.assertEqual((call['call_id'], call['request'], call['arguments']['command']),
                          ('shell-1', 1, 'printf two'))
@@ -523,6 +524,13 @@ class ServedApprovalTests(ModelFixture):
                                      ('auto', 600_001, 'invalid_lease')):
             self.assertEqual(session.request('serve_approvals', tag=tag, lease_ms=lease_ms)['error'], error)
         self.assertEqual(daemon.request('stats')['result']['approvers'], [])
+        # A holder asking again with a bad page keeps the lease it has.
+        lease = session.request('serve_approvals', tag='auto', lease_ms=5000)['result']['lease']
+        for limit in (0, 257):
+            self.assertEqual(session.request('serve_approvals', tag='auto', lease_ms=5000, limit=limit)['error'],
+                             'invalid_approval_page')
+        self.assertEqual(session.request('renew_approvals', tag='auto', lease=lease)['result']['lease'], lease)
+        self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
