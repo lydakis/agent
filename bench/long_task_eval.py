@@ -46,7 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -306,11 +306,26 @@ def batch(rng):
 # CLOSE=<month>` runs, whose verbose listing is its long output; rows to
 # settle, whose amounts have four places, so the rounding rule decides
 # about half their entries; a settlement that prints its journal; and a
-# benchmark with its own number, six digits where every entry's cents have
-# at most five, so no other output holds it.
+# benchmark with its own number, six digits that no settlement entry holds
+# under either rule (their cents reach seven digits), so no other output
+# holds it.
 CLOSE_BATCHES = 300
 CLOSE_ROWS = 640
 BENCH_LINES = 300
+
+
+def settled_cents(rows, rule):
+    """The cents a settlement under a rounding rule prints."""
+    return [int((Decimal(row['amount']) * 100).to_integral_value(rounding=rule))
+            for row in rows if row['currency'] == 'USD']
+
+
+def fresh_number(rng, taken):
+    """A close's six-digit number, drawn again while an entry holds it."""
+    number = rng.randrange(100_000, 1_000_000)
+    while number in taken:
+        number = rng.randrange(100_000, 1_000_000)
+    return number
 
 
 def close_rows(rng, count):
@@ -477,7 +492,9 @@ def workspace(root, seed, size='small'):
         suite = [{'close': month, 'batch': n + 1, 'rows': rows, 'entries': expected(rows)}
                  for month in MONTHS for n, rows in enumerate(batch(rng) for _ in range(CLOSE_BATCHES))]
         rows = {month: close_rows(rng, CLOSE_ROWS) for month in MONTHS}
-        closes = {month: {'throughput': rng.randrange(100_000, 1_000_000), 'entries': expected(rows[month])}
+        taken = {abs(cents) for month in MONTHS for rule in (ROUND_DOWN, ROUND_HALF_EVEN)
+                 for cents in settled_cents(rows[month], rule)}
+        closes = {month: {'throughput': fresh_number(rng, taken), 'entries': expected(rows[month])}
                   for month in MONTHS}
         files.update({
             'Makefile': MAKEFILE_SUSTAINED,
@@ -602,8 +619,15 @@ def settlements(root):
 # A step command as the sustained task asks for it: one step, its output
 # neither sent elsewhere nor cut. Merging stderr into it is fine. A step
 # runs where a command begins, in a segment between `;`, `&&`, `||` and
-# newlines, so reading `tools/settle` does not count as running it.
-STEP_RUN = re.compile(r"""^[\s('"]*(?:(?:do|then)\s+)?(?:python3?\s+)?(?:\./)?(?:make (?:check|bench)\b|tools/settle\b)""")
+# newlines, after any variable assignments, a wrapper such as `env` or
+# `time`, or an interpreter, so reading `tools/settle` does not count as
+# running it; `make` may take options and variables before its target.
+STEP_RUN = re.compile(
+    r"""^[\s('"]*(?:(?:do|then)\s+)?"""
+    r"""(?:(?:(?:env|command|exec|time|nice|nohup|stdbuf)(?:\s+-\S+)*|timeout(?:\s+-\S+)*\s+\S+"""
+    r"""|\w+=\S*)\s+)*"""
+    r"""(?:(?:python3?|bash|sh)\s+)?"""
+    r"""(?:make(?:\s+(?:-C\s+\S+|-\S+|\w+=\S*))*\s+(?:check|bench)\b|(?:[\w.~/-]*/)?tools/settle\b)""")
 
 
 def step_command_faults(command):
@@ -792,13 +816,15 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
             client.request('create', bot=name, workspace=str(work), instructions=INSTRUCTIONS,
                            tools=tools.split(','), compaction_instructions=COMPACTION)
         task = prompt(size)
-        started = time.monotonic()
+        started, submitted = time.monotonic(), {}
         for name in names:
+            submitted[name] = time.monotonic()
             turns[name] = client.request('submit', bot=name, request_id='task', prompt=task)['result']['turn']
         # Live events: count completed tools per bot, steer once each passes
         # the task's steer point, and collect the terminal events of tasks
-        # and steers, with each task's time to finish. The sustained task's
-        # point is in its step record, written before the tool completes.
+        # and steers, with each task's time from its submission to its end
+        # as the reader received it. The sustained task's point is in its
+        # step record, written before the tool completes.
         done, steers, ends, completed, finished = {}, {}, {}, {name: 0 for name in names}, {}
         while len(done) < len(names):
             message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
@@ -813,7 +839,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 continue
             if message['event'] == 'turn_finished':
                 done[name] = message
-                finished[name] = round(time.monotonic() - started, 1)
+                finished[name] = round(message['_received_at'] - submitted[name], 1)
                 continue
             completed[name] += 1
             due = (settlements(root / name) >= SUSTAINED_STEER_SETTLES if size == 'sustained'
@@ -822,7 +848,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
                                        delivery='steer', expected_turn=turns[name])
                 steers[name] = reply.get('result') or {'error': reply.get('error')}
-        wall = round(time.monotonic() - started, 1)
+        wall = round(max(m['_received_at'] for m in done.values()) - started, 1)
         # A steer still queued when its task ends fails then, as it names
         # that task's turn.
         for name, steer in steers.items():
@@ -883,9 +909,11 @@ def summarize(block):
                                          sum(b['summarizer_cached_input_tokens'] for b in bots),
                                          sum(b['summarizer_output_tokens'] for b in bots)],
             'summarizer_ms': sum(b['summarizer_ms'] for b in bots),
-            # What a correct task cost and how long a bot took to finish.
+            # What a correct task cost, none when no task was correct, and
+            # how long a bot took to finish.
             'input_token_equivalents_per_correct_task': round(
-                sum(b['input_token_equivalents'] for b in bots) / max(1, sum(b['correct'] for b in bots))),
+                sum(b['input_token_equivalents'] for b in bots) / correct) if (
+                    correct := sum(b['correct'] for b in bots)) else None,
             'bot_wall_s': sorted(b['wall_s'] for b in bots),
             **({'closes_settled_correctly': [b['closes_settled_correctly'] for b in bots],
                 'closes_reported': [b['closes_reported'] for b in bots],

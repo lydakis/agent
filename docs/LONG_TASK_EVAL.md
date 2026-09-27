@@ -9,7 +9,9 @@ The acceptance cases pass. The evaluation has run twice live on the small
 task, recorded [below](#live-run-1), and twice on the large task at
 realistic budgets ([live runs 3 and 4](#live-run-3)). The
 [sustained task](#the-sustained-task), which outgrows a realistic budget
-several times in one turn, has run only against the scripted provider.
+several times in one turn, has run live twice, on one model and one seed
+per bot: with each step read whole ([run 9](#live-run-9)), compacting took
+39 to 45% less input per correct task than full context.
 
 ## Acceptance cases
 
@@ -178,8 +180,10 @@ any budget and nothing compacted.
   1,907 for seed 7), so a close settled before the correction is wrong
   until it is settled again.
 - The settlement prints one journal line per entry; the benchmark prints
-  300 warmup lines. Each number to report has six digits, where no entry's
-  cents have more than five.
+  300 warmup lines. Each number to report has six digits that no
+  settlement entry holds under either rule. Entries' cents reach seven
+  digits, so a number an entry holds is drawn again; no number was for
+  seeds 7 to 16, the ones runs 8 and 9 used.
 
 Measured on the seed-7 workspace, each close's steps print 83,905 to
 86,438 bytes (check about 33.5 KB, settlement 28 to 30 KB, benchmark
@@ -818,6 +822,11 @@ closes are settled. Four arms at once, 10 bots each, seed 7,
 - The plan paced every bot about six times, and every pause resumed.
   There were no errors, failed turns, refused steers or compaction
   failures, and setup facts held and the workflow was followed in 40 of 40.
+- Times in runs 8 and 9 run from the arm's first submission to when the
+  runner handled each finish. Each bot is now timed from its own
+  submission to its finish as received; the difference is ten local
+  submissions and the runner's handling of other events, inferred to be
+  well under a second against 300 s or more.
 
 This is one model, one synthetic task and seed, and 10 bots per arm,
 with a prompt that makes the model read each step whole. Left to choose,

@@ -5,12 +5,14 @@ import os
 import subprocess
 import tempfile
 import unittest
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN
 from pathlib import Path
 from unittest.mock import patch
 
 from bench import long_task_eval
 from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_SETTLES, TASK, prompt,
-                                  run_condition, score, step_command_faults, steer_outcome, workspace)
+                                  run_condition, score, settled_cents, step_command_faults, steer_outcome,
+                                  workspace)
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture, is_summary
 
@@ -152,6 +154,19 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertIn(f'closes {MONTHS[0]} through {MONTHS[-1]}', prompt('sustained'))
         self.assertIn('do not redirect, pipe, filter or truncate it', prompt('sustained'))
         self.assertTrue(prompt('sustained').startswith(TASK[:TASK.index(' When `make check` passes')] + '\n\n'))
+
+    def test_no_settlement_entry_holds_a_close_number(self):
+        # Entries' cents reach seven digits, so a number an entry holds
+        # under either rule is drawn again, as seed 930's 2026-05 one was.
+        for seed in (7, 930):
+            with self.subTest(seed=seed):
+                self.setUp()
+                facts = workspace(self.root, seed, 'sustained')
+                taken = {abs(cents) for month in MONTHS
+                         for rows in [json.loads((self.root / f'data/closes/{month}.json').read_text())]
+                         for rule in (ROUND_DOWN, ROUND_HALF_EVEN) for cents in settled_cents(rows, rule)}
+                self.assertFalse({close['throughput'] for close in facts['closes'].values()} & taken)
+        self.assertNotEqual(facts['closes']['2026-05']['throughput'], 669744)
 
     @patch.multiple(long_task_eval, MONTHS=MONTHS[:3], CLOSE_BATCHES=20, CLOSE_ROWS=64)
     def test_each_close_counts_only_when_it_was_settled_right_and_its_number_reported(self):
@@ -338,6 +353,14 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(steer_outcome({'error': 'stale_turn'}, None), 'refused: stale_turn')
         self.assertEqual(steer_outcome(None, None), 'not sent: the task ended before its steer point')
 
+    def test_a_condition_with_no_correct_task_has_no_cost_per_correct_task(self):
+        self.setUp()
+        facts = workspace(self.root, 7)
+        bot = {'status': 'completed', 'steer': 'steered', 'wall_s': 1.0, **score(self.root, facts, [], '')}
+        self.assertFalse(bot['correct'])
+        block = {'condition': 'compact', 'task': 'small', 'context_bytes': 20480, 'wall_s': 1.0, 'bots': {'b': bot}}
+        self.assertIsNone(long_task_eval.summarize(block)['input_token_equivalents_per_correct_task'])
+
     def test_a_step_command_that_filters_or_combines_steps_is_counted(self):
         # As run 8's bots ran them: output to a file and its tail read, or
         # every close in one loop. Reading a step's source, as run 9's bots
@@ -359,7 +382,15 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('make bench CLOSE=2026-05 2>&1; cat tools/settle | head', (False, False)),
                 ('for f in tests/*.py; do wc -l $f; done; make check CLOSE=2026-06', (False, False)),
                 ('while read m; do make bench CLOSE=$m; done < months', (False, True)),
-                ('printf "2026-01 2026-02" | xargs -n1 tools/settle', (False, True))):
+                ('printf "2026-01 2026-02" | xargs -n1 tools/settle', (False, True)),
+                # Behind assignments, wrappers and make's options.
+                ('CLOSE=2026-01 make check >log', (True, False)),
+                ('make -s bench CLOSE=2026-01 | tail', (True, False)),
+                ('env X=1 tools/settle 2026-01 >log', (True, False)),
+                ('time make -C . check CLOSE=2026-02', (False, False)),
+                ('timeout 600 ./tools/settle 2026-03 | tail -3', (True, False)),
+                ('bash /work/tools/settle 2026-04 2>&1', (False, False)),
+                ('less tools/settle', (False, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 
