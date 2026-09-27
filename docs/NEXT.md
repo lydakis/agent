@@ -561,9 +561,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     the forced elision, and catch-up steps cut at rounds inside a turn too
     large for one step. A steer the turn had no room for is tried again at
     the boundary where elision or a summary makes some, rather than only
-    after the turn ends. Catch-up steps and forced moves at one head extend
-    the version made there until the view fits, unless a fork taken
-    between them already sees it. Still open: steers absorbed before an in-turn cut are
+    after the turn ends, and, for a bot with a summarizer, against the
+    whole budget once neither can. Catch-up steps and forced moves at one
+    head extend the version made there until the view fits, unless a fork
+    taken between them already sees it. Still open: steers absorbed before an in-turn cut are
     summarized, not kept verbatim like the prompt; and every window and
     planning walk traverses the item
     overflow pages because the metadata columns sit after `item`, where a
@@ -625,9 +626,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     In [run 5](LONG_TASK_EVAL.md#live-run-5) the choice sent 10 of 11
     summaries as copies, catch-up steps included, at 0.093
     token-equivalents per byte summarized against 0.330 copying the whole
-    call and 0.337 for requests of their own. Still open: a steer that
-    waits while one result in the newest boundary fills the room it needs
-    (two of 50 bots in run 5; a scripted task shows it on main too); stub
+    call and 0.337 for requests of their own. Two of its 50 bots lost a
+    steer that waited while one result in the newest boundary filled the
+    room it needed; such a steer now goes in against the whole budget
+    ([run 7](LONG_TASK_EVAL.md#live-run-7): 20 of 20 steers went in,
+    against 18 of 20 on main). Still open: stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts
     conditions, a realistic preamble, a task long enough that summaries

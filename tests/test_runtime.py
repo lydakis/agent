@@ -719,7 +719,7 @@ class AnthropicRuntimeTests(unittest.TestCase):
         usage = [m['data'] for m in client.saved if m.get('event') == 'usage']
         self.assertEqual([u.get('purpose') for u in usage], [None, 'keep_warm', None])
 
-    def test_a_steered_round_counts_the_last_replys_refresh_toward_the_budget(self):
+    def test_the_last_replys_refresh_counts_before_a_steer_joins_the_turn(self):
         client, model, path = self.start(extra=('--keep-warm', '1'))
         model.generate_delay = 1.5
         model.warm_delay = 1
@@ -727,10 +727,13 @@ class AnthropicRuntimeTests(unittest.TestCase):
         client.request('create', bot='Bob', workspace=str(path), reasoning='low', budget_tokens=20)
         turn = client.request('submit', bot='Bob', request_id='s1', prompt='long')['result']['turn']
         model.requests.get(timeout=5)
-        client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
+        steer = client.request('submit', bot='Bob', request_id='s2', prompt='more', delivery='steer')
         # The refresh still in flight when the reply ends is answered and
-        # counted before the steer's round, which the budget then refuses.
-        self.assertEqual(client.finished(turn)['data']['error'], 'budget_exhausted')
+        # counted before the steer could join, and leaves the budget no
+        # call for it: the turn completes without it, rather than failing
+        # with it unheard, and the steer, run on its own, is refused.
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.finished(steer['result']['turn'])['data']['error'], 'budget_exhausted')
         self.assertEqual(model.requests.get(timeout=1)['max_tokens'], 0)
         self.assertTrue(model.requests.empty())
         self.assertEqual(client.request('resume', bot='Bob')['result']['tokens_used'], 23)
