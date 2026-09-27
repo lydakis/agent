@@ -4,6 +4,7 @@
 //! events, and relays requests. Nothing else lives here.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod project;
 mod session;
 
 use agent_client::Client;
@@ -145,11 +146,36 @@ fn setup(state: State<'_, Shared>) -> Value {
     })
 }
 
-/// The shared client policy for this workspace, composed now so an edited
-/// AGENTS.md reaches the next bot: preamble, AGENTS.md files, skills.
+/// The shared client policy for a workspace (the app's own by default),
+/// composed now so an edited AGENTS.md reaches the next bot: preamble,
+/// AGENTS.md files, skills.
 #[tauri::command]
-fn policy(state: State<'_, Shared>) -> Result<Value, String> {
-    compose(std::path::Path::new(&state.config.workspace))
+fn policy(state: State<'_, Shared>, workspace: Option<String>) -> Result<Value, String> {
+    match workspace {
+        Some(dir) => compose(std::path::Path::new(&workspace_path(
+            std::path::Path::new(&dir),
+        )?)),
+        None => compose(std::path::Path::new(&state.config.workspace)),
+    }
+}
+
+/// The project in a folder: its `.agent/project.toml`, or the defaults a
+/// new project there would take.
+#[tauri::command]
+fn project(dir: String) -> Result<Value, String> {
+    project::read(std::path::Path::new(&workspace_path(
+        std::path::Path::new(&dir),
+    )?))
+}
+
+/// Write a new project's `.agent/project.toml`; an existing one is kept.
+#[tauri::command]
+fn write_project(dir: String, name: String, model: String) -> Result<(), String> {
+    project::write(
+        std::path::Path::new(&workspace_path(std::path::Path::new(&dir))?),
+        &name,
+        &model,
+    )
 }
 
 /// The models to offer, read from `~/.agent/models` each time, so an edit
@@ -290,7 +316,15 @@ fn main() {
             events: Mutex::new(SessionSlot::default()),
         })
         .invoke_handler(tauri::generate_handler![
-            setup, policy, models, attach, pull, request, log
+            setup,
+            policy,
+            models,
+            project,
+            write_project,
+            attach,
+            pull,
+            request,
+            log
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");
