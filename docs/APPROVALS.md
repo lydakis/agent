@@ -1019,6 +1019,11 @@ as one.
    - The same arms before the rebase onto the landed lease changes gave
      16.0, 18.8, and 26.6 ms at the median: the same differences within
      the run-to-run spread.
+   - After the review fixes (`aed1669`, 2026-09-27), interleaved with
+     `74f726b`, two runs of each and six rounds per arm: socket 13.5 and
+     13.9 ms, Jev 15.8 and 16.3 ms, general model 22.3 and 23.6 ms, the
+     same commits. The fixes (the slot taken before reads, the queued judge
+     turn, per-bot dedupe) cost nothing measurable.
 
 ## Built so far
 

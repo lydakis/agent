@@ -7,8 +7,8 @@ updated at `095ff68` for admission batching and disk-full containment, at
 lock fix, at `dd95047` for the per-summary choice between a copy and a
 request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
-serving a gate tag to one approver, and at `74f726b` for the automatic
-approver's own cost. This is the one place that says what is currently
+serving a gate tag to one approver, and at `74f726b` and `aed1669` for
+the automatic approver's own cost. This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -93,6 +93,10 @@ more turns is not here, because its work changes with its speed; it is under
   `prompts` read, and 1.1 ms of its own CPU, with no added commit; a
   general model through the daemon adds 11.5 ms (26.3 ms), 8.6 ms of daemon
   CPU, and 11 commits a round for the fork, its turn, and its deletion.
+  Rechecked after the review fixes (`aed1669` against `74f726b`, two
+  interleaved runs of each, six rounds per arm): Jev adds 2.2 against
+  2.3 ms and a general model 8.8 against 9.7 ms over the direct client,
+  with the same commits, so the fixes cost nothing measurable.
   Neither includes the judge's own time: Jev answered in 0.26 s at the
   median in the labeled run, and a general model takes longer.
   macOS is not measured.
