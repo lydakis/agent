@@ -85,6 +85,12 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "approver",
+        usage: "approver [--tag TAG] [--judge PROVIDER/MODEL] [--reasoning LEVEL] [--note FILE] [--judge-url URL]",
+        flags: "--tag --judge --reasoning --note --judge-url",
+        startup: false,
+    },
+    Command {
         name: "models",
         usage: "models [--discover]",
         flags: "--discover --pretty --no-spawn",
@@ -267,7 +273,19 @@ fn print_flags(flags: &str) {
             "--request" => ("N", "The request number the call was announced with"),
             "--tag" => (
                 "TAG",
-                "The gate to list or answer; default: the call's only gate",
+                "The gate to list, answer, or serve; default: the call's only gate, or auto",
+            ),
+            "--note" => (
+                "FILE",
+                "Text the judge always sees: trusted remotes, hosts, limits; default AGENT_APPROVER_NOTE",
+            ),
+            "--judge" => (
+                "PROVIDER/MODEL",
+                "Who judges: typesafe/jev-latest or any model the daemon serves; default AGENT_APPROVER_JUDGE, Jev when TYPESAFE_API_KEY is set, else AGENT_MODEL",
+            ),
+            "--judge-url" => (
+                "URL",
+                "Jev's base URL; default TYPESAFE_BASE_URL or https://api.typesafe.ai",
             ),
             "--reason" => ("TEXT", "Why, shown to the model with a denial"),
             "--approval-hold-ms" => (

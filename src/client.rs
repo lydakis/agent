@@ -86,6 +86,10 @@ struct Options {
     request: Option<i64>,
     tag: Option<String>,
     reason: Option<String>,
+    /// `approver`: the environment note file, the judge, and Jev's URL.
+    note: Option<PathBuf>,
+    judge: Option<String>,
+    judge_url: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
     positional: Vec<String>,
@@ -139,6 +143,11 @@ fn parse(args: &[String]) -> Result<Options> {
         request: None,
         tag: None,
         reason: None,
+        note: std::env::var_os("AGENT_APPROVER_NOTE").map(PathBuf::from),
+        judge: std::env::var("AGENT_APPROVER_JUDGE")
+            .ok()
+            .filter(|judge| !judge.is_empty()),
+        judge_url: None,
         daemon_flags: Vec::new(),
         positional: Vec::new(),
         target: String::new(),
@@ -190,6 +199,9 @@ fn parse(args: &[String]) -> Result<Options> {
                     }
                     "--tag" => options.tag = Some(value),
                     "--reason" => options.reason = Some(value),
+                    "--note" => options.note = Some(PathBuf::from(value)),
+                    "--judge-url" => options.judge_url = Some(value),
+                    "--judge" => options.judge = Some(value),
                     "--instructions" => options.instructions = Some(value),
                     "--instructions-file" => {
                         options.instructions =
@@ -613,6 +625,15 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    // The judge's key is the approver's alone, unless a provider the daemon
+    // runs names it as its key variable.
+    let provider_key = options.providers.iter().any(|spec| {
+        crate::server::ProviderSpec::parse(spec)
+            .is_ok_and(|spec| spec.key_env.as_deref() == Some(JUDGE_KEY))
+    });
+    if !provider_key {
+        command.env_remove(JUDGE_KEY);
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
@@ -684,6 +705,154 @@ fn created_by() -> Result<(Option<String>, Option<i64>)> {
     }
 }
 
+/// Inside a bot's shell tool the daemon also names the turn; a prompt a
+/// client submits from there is that turn's model's words, not a person's.
+fn author() -> Result<Value> {
+    let bot = std::env::var("AGENT_BOT").ok().filter(|b| !b.is_empty());
+    let turn = std::env::var("AGENT_TURN").ok();
+    match (bot, turn) {
+        (None, None) => Ok(Value::Null),
+        (Some(bot), Some(turn)) => {
+            let turn = turn
+                .parse::<i64>()
+                .ok()
+                .filter(|turn| *turn > 0)
+                .ok_or(Error::new("author_turn_required"))?;
+            Ok(json!({"bot":bot,"turn":turn}))
+        }
+        _ => fail("author_turn_required"),
+    }
+}
+
+/// How long an `auto` call may wait for its verdict before it is denied and
+/// the turn ends: the approver's own deadline (30 s for a general model),
+/// plus margin.
+const AUTO_EXPIRE_MS: u64 = 45_000;
+
+/// Whether a bot record has a gate the `auto` approver answers.
+fn answered_by_auto(bot: &Value) -> bool {
+    bot["gates"]
+        .as_array()
+        .is_some_and(|gates| gates.iter().any(|gate| gate["tag"] == "auto"))
+}
+
+/// A bot record's model, as `provider/model`.
+fn bot_model(bot: &Value) -> Option<String> {
+    Some(format!(
+        "{}/{}",
+        bot["provider"].as_str()?,
+        bot["model"].as_str()?
+    ))
+}
+
+fn judge_key() -> Option<String> {
+    std::env::var(JUDGE_KEY).ok().filter(|key| !key.is_empty())
+}
+
+/// Who judges for an approver: `--judge` or AGENT_APPROVER_JUDGE, then Jev
+/// when its key is set, then `model`.
+fn judge(options: &Options, model: Option<String>) -> Result<String> {
+    options
+        .judge
+        .clone()
+        .or_else(|| judge_key().map(|_| "typesafe/jev-latest".into()))
+        .or(model)
+        .ok_or_else(|| {
+            Error::with(
+                "judge_required",
+                format!(
+                    "auto needs a judge: pass --judge PROVIDER/MODEL, or set AGENT_APPROVER_JUDGE, {JUDGE_KEY}, or AGENT_MODEL"
+                ),
+            )
+        })
+}
+
+/// Whether the approver `pid` logged that it serves, after byte `start`.
+fn serving(log: &std::ffi::OsStr, start: u64, pid: u32) -> Result<bool> {
+    use std::io::{BufRead, Seek};
+    let mut file = std::fs::File::open(log)?;
+    file.seek(std::io::SeekFrom::Start(start))?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = serde_json::from_str::<Value>(&line?) else {
+            continue;
+        };
+        if line["event"] == "serving" && line["pid"] == pid {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// An `auto` bot needs an approver serving `auto`. If none is, start one:
+/// detached, logging its verdicts next to the store, judged by the model
+/// `judge` picks, with the bot's own as the last choice.
+fn ensure_approver(
+    options: &Options,
+    connection: &mut Connection,
+    model: Option<String>,
+) -> Result<()> {
+    let served = |connection: &mut Connection| -> Result<bool> {
+        let stats = connection.request("stats", json!({}))?;
+        Ok(stats["approvers"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "auto")))
+    };
+    if served(connection)? {
+        return Ok(());
+    }
+    let judge = judge(options, model)?;
+    let mut log = options.store.clone().into_os_string();
+    log.push(".approver.log");
+    let path = log;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    // Where this approver's lines start: it is ready once it says so there.
+    let start = log.metadata()?.len();
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("approver")
+        .arg("--store")
+        .arg(&options.store)
+        .arg("--socket")
+        .arg(&options.socket)
+        .arg("--judge")
+        .arg(&judge);
+    if let Some(note) = &options.note {
+        command.arg("--note").arg(note);
+    }
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        // The tag is served as soon as the lease is held, before the judge
+        // is ready, so wait for the approver's own word.
+        if serving(&path, start, child.id())? {
+            return Ok(());
+        }
+        // Another approver won the tag first: that one serves it.
+        if let Some(status) = child.try_wait()? {
+            if served(connection)? {
+                return Ok(());
+            }
+            return fail_with(
+                "approver_start_failed",
+                format!("approver exited with {status}"),
+            );
+        }
+        startup_remaining(deadline)?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Tools the approval modes never gate: they touch only the bot's own
 /// store records.
 const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
@@ -693,37 +862,44 @@ const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
 /// `manual` gates --approve, or every tool the bot has but the four that
 /// touch only its own records, for a person or a program to answer.
 fn requested_gate(options: &Options, tools: &[String]) -> Result<Value> {
+    // The tools gated: --approve, or every tool but the ungated four.
+    let approve = || -> Result<Vec<String>> {
+        let approve: Vec<String> = match &options.approve {
+            Some(list) => list
+                .split(',')
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            None => tools
+                .iter()
+                .filter(|t| !UNGATED.contains(&t.as_str()))
+                .cloned()
+                .collect(),
+        };
+        // Asked to gate nothing: refused rather than run ungated.
+        if approve.is_empty() && options.approve.is_some() {
+            return fail_with("usage", "--approve names no tools");
+        }
+        Ok(approve)
+    };
     match options.approval.as_deref().unwrap_or("full") {
         "full" if options.approve.is_some() => fail_with(
             "usage",
-            "--approve names tools for an approver; use --approval manual",
+            "--approve names tools for an approver; use --approval manual or auto",
         ),
         "full" => Ok(json!({})),
-        "manual" => {
-            let approve: Vec<String> = match &options.approve {
-                Some(list) => list
-                    .split(',')
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                None => tools
-                    .iter()
-                    .filter(|t| !UNGATED.contains(&t.as_str()))
-                    .cloned()
-                    .collect(),
-            };
-            match approve.is_empty() {
-                // Asked to gate nothing: refused rather than run ungated.
-                true if options.approve.is_some() => fail_with("usage", "--approve names no tools"),
-                // A bot with only ungated tools has nothing to wait for.
-                true => Ok(json!({})),
-                false => Ok(json!({"approve":approve,"approver":"manual"})),
-            }
-        }
-        "auto" => fail_with(
-            "approval_mode_unsupported",
-            "auto needs the automatic approver, which is not built yet; use manual or full",
-        ),
+        // A bot with only ungated tools has nothing to wait for.
+        "manual" => Ok(match approve()? {
+            approve if approve.is_empty() => json!({}),
+            approve => json!({"approve":approve,"approver":"manual"}),
+        }),
+        // The same tools, answered by the approver serving `auto`, which
+        // has until the expiry before the call is denied and the turn ends.
+        "auto" => Ok(match approve()? {
+            approve if approve.is_empty() => json!({}),
+            approve => json!({"approve":approve,"approver":"auto",
+                "approve_expire_ms":AUTO_EXPIRE_MS}),
+        }),
         mode => fail_with(
             "usage",
             format!("unknown approval mode {mode}; use full, manual, or auto"),
@@ -763,6 +939,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "prune" => prune(&options),
         "approvals" => approvals(&options),
         "answer" => answer(&options),
+        "approver" => approver(&options),
         "models" => models(&options),
         "stats" => {
             let mut connection = ensure_existing_daemon(&options)?;
@@ -913,6 +1090,7 @@ fn run(options: &Options) -> Result<i32> {
     if prompt.trim().is_empty() {
         return fail_with("usage", "run needs a prompt");
     }
+    let from = author()?;
     let mut connection = ensure_daemon(options)?;
     let workspace = workspace(options)?;
     // A named bot is continued, never silently replaced: an unknown name is an
@@ -957,9 +1135,20 @@ fn run(options: &Options) -> Result<i32> {
             "compaction_instructions":options.compaction_instructions,
             "compaction_model":options.compaction_model,"fallbacks":options.fallbacks});
         if let Value::Object(gate) = requested_gate(options, &tools)? {
+            // Its approver first, so a missing judge leaves no bot behind.
+            if gate.get("approver").is_some_and(|tag| tag == "auto") {
+                ensure_approver(options, &mut connection, Some(model.clone()))?;
+            }
             create.as_object_mut().expect("object").extend(gate);
         }
         connection.request("create", create)?;
+    } else {
+        // Gates are the bot's own, set when it was made: a bot gated for
+        // `auto` gets its approver back, as after a daemon restart.
+        let record = connection.request("resume", json!({"bot":bot}))?;
+        if answered_by_auto(&record) {
+            ensure_approver(options, &mut connection, bot_model(&record))?;
+        }
     }
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     // Existing bots keep their model unless --model explicitly overrides it.
@@ -969,7 +1158,7 @@ fn run(options: &Options) -> Result<i32> {
         json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
             "workspace":workspace,
             "model":if created { Value::Null } else { json!(options.model) },
-            "delivery":options.delivery,"expected_turn":options.turn}),
+            "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
     )?;
     if options.detach {
         print_json(&submitted, options.pretty)?;
@@ -1053,13 +1242,19 @@ fn fork(options: &Options) -> Result<i32> {
         request["allow"] = json!(allow);
     }
     // A fork keeps its source's tools and gates; its own gate adds to them.
+    // Its approver starts first, so a missing judge leaves no fork behind.
+    let state = connection.request("resume", json!({"bot":source}))?;
+    let mut auto = answered_by_auto(&state);
     if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
-        let state = connection.request("resume", json!({"bot":source}))?;
         let tools: Vec<String> = serde_json::from_value(state["tools"].clone())
             .map_err(|_| Error::new("daemon_protocol_mismatch"))?;
         if let Value::Object(gate) = requested_gate(options, &tools)? {
+            auto |= gate.get("approver").is_some_and(|tag| tag == "auto");
             request.as_object_mut().expect("object").extend(gate);
         }
+    }
+    if auto {
+        ensure_approver(options, &mut connection, bot_model(&state))?;
     }
     let result = connection.request("fork", request)?;
     print_json(&result, options.pretty)?;
@@ -1187,6 +1382,75 @@ fn approvals(options: &Options) -> Result<i32> {
 /// Allow or deny one gated call. The request number is required, so a
 /// decision made on what a person saw cannot land on a call announced
 /// again since.
+/// The judge's key, which only the approver holds.
+const JUDGE_KEY: &str = agent_runtime::tools::JUDGE_KEY;
+
+/// The approver's note: a regular file no larger than a judge's whole
+/// state, opened without blocking so a FIFO cannot hold startup.
+fn note(path: &Path) -> Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let unreadable = || Error::with("usage", format!("cannot read {}", path.display()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| unreadable())?;
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Err(unreadable());
+    }
+    let limit = agent_client::approver::STATE_TOKENS * 3;
+    let mut note = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut note)
+        .map_err(|_| unreadable())?;
+    if note.len() > limit {
+        return fail_with(
+            "usage",
+            format!(
+                "{} is over {limit} bytes, more than a judge sees",
+                path.display()
+            ),
+        );
+    }
+    String::from_utf8(note).map_err(|_| unreadable())
+}
+
+/// Serve a gate tag, `auto` by default, with a judge model deciding every
+/// call; runs until the daemon goes away or another session takes the tag.
+fn approver(options: &Options) -> Result<i32> {
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let judge = judge(options, env("AGENT_MODEL"))?;
+    let note = options.note.as_deref().map(note).transpose()?;
+    // Jev is `typesafe/jev-*`; any other name, a daemon provider called
+    // `typesafe` included, runs through the daemon.
+    let judge = match judge
+        .strip_prefix("typesafe/")
+        .filter(|model| model.starts_with("jev-"))
+    {
+        Some(model) => crate::approver::JudgeSpec::Jev {
+            url: options
+                .judge_url
+                .clone()
+                .or_else(|| env("TYPESAFE_BASE_URL"))
+                .unwrap_or_else(|| "https://api.typesafe.ai".into()),
+            model: model.to_owned(),
+            key: judge_key().ok_or_else(|| {
+                Error::with("judge_key_required", format!("set {JUDGE_KEY} for Jev"))
+            })?,
+        },
+        None => crate::approver::JudgeSpec::Model {
+            model: judge,
+            reasoning: options.reasoning.clone(),
+        },
+    };
+    crate::approver::main(crate::approver::Settings {
+        socket: options.socket.clone(),
+        tag: options.tag.clone().unwrap_or_else(|| "auto".into()),
+        judge,
+        note,
+    })
+}
+
 fn answer(options: &Options) -> Result<i32> {
     // The same kind of guard as the creator identity: it stops a bot's own
     // shell from answering by accident, not a determined command.

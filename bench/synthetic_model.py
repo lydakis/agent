@@ -5,7 +5,8 @@ server's `release` event is set, which lets a screen park many bots on one
 anchor turn. `shell:` prompts return one shell tool call and then a reply; `wait:` prompts
 return one wait tool call on the given handles and then a reply; `delay:N`
 prompts reply after N milliseconds so many turns overlap; `limited:` prompts
-are refused with 429 and a one-second Retry-After every time.
+are refused with 429 and a one-second Retry-After every time. A judge's
+round from `agent approver` gets every question answered 0.05.
 No history validation: the daemon's request bodies are counted, not checked.
 """
 import http.server
@@ -77,6 +78,10 @@ class Model(http.server.BaseHTTPRequestHandler):
         elif user.startswith('wait:') and last.get('type') != 'function_call_output':
             text, output = '', [{'type': 'function_call', 'name': 'wait', 'call_id': 'w-1',
                                  'arguments': json.dumps({'handles': user[5:].split(',')})}]
+        elif user.startswith('{"questions"'):
+            # A judge's round from `agent approver`: every risk judged low.
+            text = json.dumps({id: 0.05 for id in json.loads(user)['questions']})
+            output = [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]
         else:
             # `text:N` replies with N bytes, so histories grow from both sides.
             text = 'x' * int(user[5:].split()[0]) if user.startswith('text:') else 'done'

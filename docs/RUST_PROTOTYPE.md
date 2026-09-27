@@ -854,6 +854,8 @@ own path from the turn. Example requests:
 {"id":24,"op":"serve_approvals","tag":"auto","lease_ms":5000,"limit":64}
 {"id":25,"op":"renew_approvals","tag":"auto","lease":1790460421345}
 {"id":26,"op":"answer","bot":"Carol","turn":7,"call_id":"call_2","request":1,"tag":"auto","decision":"allow","by":"approver","lease":1790460421345}
+{"id":27,"op":"submit","bot":"Dave","request_id":"child-1","prompt":"Summarize the build log","from":{"bot":"Carol","turn":7}}
+{"id":28,"op":"prompts","bot":"Carol","turn":7,"bytes":65536}
 {"id":12,"op":"shutdown"}
 {"id":21,"op":"shutdown","grace_ms":30000}
 ```
@@ -1003,8 +1005,9 @@ delivered only to live followers and carry `durable:false`, as do the `pruned`
 and `deleted` retention notices. Durable event kinds
 are `created`, `forked`, `queued` (a submission waiting its turn), `accepted`
 (a turn starting, with its prompt's node), `message`, `usage`, `tool_started`
-(with a 2 KiB argument preview, and `approvals` for a gated call),
-`tool_completed` (with retained artifact names; `denied` for a denied call),
+(with a 2 KiB argument preview, and `approvals` and the planning `node`
+for a gated call), `tool_completed` (with retained artifact names; `failed`
+for a call that failed, `denied` for a denied one),
 `approval_requested` (a round's gated calls, see [tool approval](#tool-approval)),
 `turn_waiting` and `turn_resumed` (a parked turn's handles, or the call whose
 verdict it waits for, and its wake-up), `turn_paced` (a turn parked at its model-call boundary because its
@@ -1032,13 +1035,31 @@ from `AGENT_BOT` and `AGENT_BOT_ID`, exported in every shell tool environment.
 The store validates the pair in the child creation transaction and rejects a
 missing, deleted, deleting, or replaced creator, so a surviving shell cannot
 attribute a new child to a replacement bot after restart. The daemon also sets
-`AGENT_PARENT` and `AGENT_PARENT_ID` to the running bot's recorded creator.
+`AGENT_PARENT` and `AGENT_PARENT_ID` to the running bot's recorded creator,
+and `AGENT_TURN` to the turn the shell runs in.
 The client preamble uses both with `run --bot NAME --bot-id ID`, preventing
 stale child-to-parent submissions after name reuse. The record, the `created` and `forked` events, and `bots` pages
 carry both; the two events also carry the record's list fields (`id`,
 `provider`, `model`, `workspace`, `status`, `running_turn`), so a follower
 seats a new bot without a request per creation. Bots remain peers: the field is lineage for people and
-clients, never authority. A fork keeps the source's binding, instructions,
+clients, never authority.
+
+`from: {bot, turn}` on `submit` says a bot's model wrote the prompt, in
+that turn; a prompt without it is a person's. The CLI sends it from
+`AGENT_BOT` and `AGENT_TURN`, and refuses a shell environment that has one
+without the other (`author_turn_required`). The store checks that the turn
+is the bot's (`invalid_from`), keeps it on the new turn's row, a steer's
+included, counts it in the request's idempotency, and reports it on
+`accepted` and `queued`. Like the creator, it is declared, not verified.
+`{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
+as an approver judges them, within `bytes` of text (default 64 KiB, at most
+256 KiB): the turn's prompt and each steer it absorbed, in order, with
+`from`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
+`done`, `failed` when it failed, and `node`, with `calls_more` when some
+were left out; and the bot's earlier prompts, newest first, with `more`
+when some were left out. Text that does not fit is cut and marked
+`truncated`, and each steer, call, and earlier prompt also counts 64
+bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
@@ -1257,7 +1278,8 @@ summary or elision changed the bot's view last; turns stored before record
 neither, so a [summary](#compaction) after them never takes their call as
 having sent the view. Schema 35 adds `bots.denials`, the [denial
 counts](#tool-approval); none were kept before, so every bot starts from
-none.
+none. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
+prompt; turns stored before record none, so they read as a person's.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1843,8 +1865,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   another may take the tag over under a new one), or until it renews or
   answers, which is refused; either way it is sent
   `{"event":"approvals_lost","tag","lease"}`, and pushes stop. A closed
-  session frees its tags at once. A session that serves a tag again with
-  a bad `limit` (1 to 256) keeps the lease it had. Lease numbers change at
+  session frees its tags at once. A `limit` outside 1 to 256 is refused
+  before any lease is made. Lease numbers change at
   every takeover, start from a random point each run, and stay below
   2^53; a lease holds only on its own session.
   `stats` lists the served tags in `approvers`. The stream is for the
@@ -1853,10 +1875,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   drop a holder that is reading; one with 128 pushes waiting has stopped
   reading and is closed, like a lagging follower. A lease that ends drops
   the pushes still waiting for it, one already waiting for room in the
-  output included, and sends only `approvals_lost`. A session that serves
-  its tag again gets no more of its old lease's waiting pushes: they are
-  held while the new listing is read, then dropped, since the listing has
-  them, or sent if it fails. Each round is held once, however many tags
+  output included, and sends only `approvals_lost`. Each round is held
+  once, however many tags
   its calls wait on, and a tag's messages are built only when a session
   serves it.
 - Interrupting a turn cancels its gated calls like any planned call.
@@ -1867,8 +1887,15 @@ The CLI turns a mode into a gate. `run --new --approval manual`, or
 `AGENT_APPROVAL=manual`, gates every tool of the new bot but `history`,
 `wait`, `note`, and `echo`, tagged `manual`; `--approve LIST` picks the
 tools instead, and `fork` takes both. `full`, the default, gates nothing.
-`auto` is refused with `approval_mode_unsupported` until the automatic
-approver exists. `agent approvals [--bot NAME] [--tag TAG]` lists pending
+`auto` gates the same tools, tagged `auto`, with a 45 s expiry, and
+starts `agent approver` detached if no session serves `auto`, logging to
+`STORE.approver.log`; its judge is `AGENT_APPROVER_JUDGE`, else Jev when
+`TYPESAFE_API_KEY` is set, else the bot's own model, and a judge that
+cannot start fails the command before any bot is made
+(`approver_start_failed`). `agent approver [--tag TAG] [--judge
+PROVIDER/MODEL] [--reasoning LEVEL] [--note FILE] [--judge-url URL]` serves
+a tag and has a judge decide every call waiting on it, printing one JSON
+line per round ([APPROVALS.md](APPROVALS.md#automatic-mode)). `agent approvals [--bot NAME] [--tag TAG]` lists pending
 calls, `agent answer --bot NAME --turn N --call ID --request R allow|deny
 [--tag T] [--reason TEXT]` decides one and refuses to run inside a bot's
 tool shell, and `run --pretty` prints each pending call with the commands

@@ -333,7 +333,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                 output = [{'type': 'function_call', 'name': 'echo', 'call_id': 'c' * 65536,
                            'arguments': json.dumps({'text': 'ok'})}]
             else:
-                text = getattr(self.server, 'reply_text', 'reply:' + user)
+                reply_for = getattr(self.server, 'reply_for', None)
+                text = (reply_for and reply_for(request, user)) or getattr(self.server, 'reply_text', 'reply:' + user)
                 output = [{'id': 'msg_text', 'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': text}]}]
             if is_summary(request):
