@@ -1607,7 +1607,10 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         (&read["workspace"], &read["earlier"], &read["more"]),
         (&json!("/synthetic"), &json!([]), &json!(false))
     );
-    assert_eq!(read["calls_more"], false);
+    assert_eq!(
+        (&read["prompts_more"], &read["calls_more"]),
+        (&json!(false), &json!(false))
+    );
     // The author's own turn is a person's words.
     let bob = db.prompts("Bob", person, 1024).unwrap();
     assert_eq!(bob["prompts"], json!([{"turn":person,"text":"work"}]));
@@ -1627,17 +1630,22 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
     assert_eq!(cut["calls"][0]["arguments_truncated"], true);
     assert!(cut["calls"][0]["node"].is_i64(), "{cut}");
     assert!(listed["approvals"].as_array().unwrap().is_empty());
-    // Text past the budget is cut and marked, and calls past it are left out.
+    // Text past the budget is cut and marked; steers and calls past it are
+    // left out.
     let cut = db.prompts("Carol", turn, 5).unwrap();
     assert_eq!(cut["prompts"][0]["text"], "deleg");
     assert_eq!(cut["prompts"][0]["truncated"], true);
-    assert_eq!(cut["prompts"][1]["text"], "");
+    assert_eq!(cut["prompts"].as_array().unwrap().len(), 1);
+    assert_eq!(cut["prompts_more"], true);
     assert_eq!(
         (&cut["calls"], &cut["calls_more"]),
         (&json!([]), &json!(true))
     );
+    let cut = db.prompts("Carol", turn, 14 + entry + 3).unwrap();
+    assert_eq!(cut["prompts"][1]["text"], "als");
+    assert_eq!(cut["prompts_more"], false);
     // Each call counts against the budget, so a long turn stays within it.
-    let cut = db.prompts("Carol", turn, 33 + entry + 3).unwrap();
+    let cut = db.prompts("Carol", turn, 33 + 2 * entry + 3).unwrap();
     assert_eq!(cut["calls"].as_array().unwrap().len(), 1);
     assert_eq!(cut["calls"][0]["arguments"], "{\"c");
     assert_eq!(cut["calls"][0]["arguments_truncated"], true);

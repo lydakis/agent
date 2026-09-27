@@ -1048,12 +1048,12 @@ included, counts it in the request's idempotency, and reports it on
 `{"op":"prompts","bot","turn","bytes"?}` reads a turn's words and calls
 as an approver judges them, within `bytes` of text (default 64 KiB, at most
 256 KiB): the turn's prompt and each steer it absorbed, in order, with
-`from`; the calls it started, each with its argument preview,
+`from`, and `prompts_more` when steers were left out; the calls it started, each with its argument preview,
 `done`, `failed` when it failed, and `node`, with `calls_more` when some
 were left out; and the bot's earlier prompts, newest first, with `more`
 when some were left out. Text that does not fit is cut and marked
-`truncated`, and each call and earlier prompt also counts 64 bytes, so
-many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
+`truncated`, and each steer, call, and earlier prompt also counts 64
+bytes, so many short entries stay within `bytes` too. A fork keeps the source's binding, instructions,
 and tools, and takes no text of its own; the source is never changed. Workspaces, wherever given, must already exist and be absolute. Use the actual returned checkpoint
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts

@@ -61,6 +61,10 @@ const REPLY_BYTES: usize = 64 * 1024;
 /// First wait after a 429 or 529 without Retry-After, doubled each time.
 const BACKOFF: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(4);
+/// The longest Retry-After honored, past any round's deadline anyway.
+const RETRY_MAX_SECS: f64 = 60.0;
+/// A judge fork is `approver.TAG.PID.N`, and every bot name fits 128 bytes.
+const JUDGE_NAME_ROOM: usize = 128 - "approver.".len() - ".4294967295.18446744073709551615".len();
 
 fn daemon(error: agent_client::Error) -> Error {
     match error.detail {
@@ -183,7 +187,8 @@ impl Jev {
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|value| value.to_str().ok()?.parse::<f64>().ok())
-                    .map(Duration::from_secs_f64);
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                    .map(|seconds| Duration::from_secs_f64(seconds.min(RETRY_MAX_SECS)));
                 let mut backoff = self.backoff.lock().unwrap();
                 let wait = retry.unwrap_or(backoff.1);
                 backoff.1 = (backoff.1 * 2).min(BACKOFF_MAX);
@@ -479,8 +484,14 @@ struct Shared {
 }
 
 async fn serve(settings: Settings) -> Result<i32> {
-    let (client, mut events) = Client::connect(&settings.socket).await.map_err(daemon)?;
     let tag = settings.tag.clone();
+    if matches!(settings.judge, JudgeSpec::Model { .. }) && tag.len() > JUDGE_NAME_ROOM {
+        return Err(Error::with(
+            "invalid_tag",
+            format!("a model judge's tag is at most {JUDGE_NAME_ROOM} bytes, to name its forks"),
+        ));
+    }
+    let (client, mut events) = Client::connect(&settings.socket).await.map_err(daemon)?;
     let served = client
         .request(
             "serve_approvals",
@@ -820,6 +831,28 @@ async fn judge(
     }
 }
 
+/// Every string in a call's arguments, one per line, as a command sees them.
+fn strings(value: &Value, out: &mut String) {
+    match value {
+        Value::String(text) => {
+            out.push_str(text);
+            out.push('\n');
+        }
+        Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+        Value::Object(fields) => fields.values().for_each(|item| strings(item, out)),
+        _ => {}
+    }
+}
+
+/// Whether `text` names `path` as a whole: not as part of a longer name,
+/// so a file `config` is not named by `./configure`.
+fn mentions(text: &str, path: &str) -> bool {
+    let part = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    text.match_indices(path).any(|(at, _)| {
+        !part(text[..at].chars().next_back()) && !part(text[at + path.len()..].chars().next())
+    })
+}
+
 /// A file the turn wrote, as a judged call that names it would run it:
 /// only a regular file, opened without waiting on a FIFO or device, and
 /// read no further than `FILE_BYTES`, whatever size it reported.
@@ -878,6 +911,10 @@ async fn intent(
             json!({"bot":bot,"turn":turn,"bytes":PROMPT_BYTES}),
         )
         .await?;
+    // Steers left out may hold the person's latest word.
+    if read["prompts_more"] == true {
+        return Err(Unjudged::TooLong);
+    }
     let mut request = Vec::new();
     let mut visited = HashSet::from([(bot.to_owned(), turn)]);
     for prompt in read["prompts"].as_array().into_iter().flatten() {
@@ -922,13 +959,23 @@ async fn intent(
         });
     }
     let mut allowed = Vec::new();
+    let mut allowed_cut = read["calls_more"] == true;
     let mut written = Vec::new();
+    // Arguments read whole for calls whose preview was cut; past the text
+    // limit only a write's or edit's path is still read, and kept small.
+    let mut expanded = 0;
     for call in read["calls"].as_array().into_iter().flatten() {
         let tool = call["name"].as_str().unwrap_or_default().to_owned();
         let preview = call["arguments"].as_str().unwrap_or_default();
-        let mut arguments = match call["arguments_truncated"] == true {
+        let writes = matches!(tool.as_str(), "write" | "edit");
+        let cut = call["arguments_truncated"] == true;
+        let mut arguments = match cut {
             false => serde_json::from_str(preview).unwrap_or_else(|_| json!(preview)),
             true => match call["node"].as_i64() {
+                Some(_) if expanded >= PROMPT_BYTES && !writes => {
+                    allowed_cut = true;
+                    json!(preview)
+                }
                 Some(node) => {
                     let item = client
                         .request("item", json!({"bot":bot,"node":node}))
@@ -940,9 +987,7 @@ async fn intent(
             },
         };
         // A file's content is not what consent is about: its path and size.
-        if matches!(tool.as_str(), "write" | "edit")
-            && let Value::Object(fields) = &arguments
-        {
+        if writes && let Value::Object(fields) = &arguments {
             if let Some(path) = fields.get("path").and_then(Value::as_str) {
                 written.push(path.to_owned());
             }
@@ -952,6 +997,9 @@ async fn intent(
                 .map(|(_, value)| value.as_str().map_or(0, str::len))
                 .sum();
             arguments = json!({"path":fields.get("path"),"bytes":bytes});
+        }
+        if cut {
+            expanded += arguments.to_string().len();
         }
         allowed.push(Allowed {
             tool,
@@ -970,13 +1018,14 @@ async fn intent(
     let workspace = read["workspace"].as_str().map(PathBuf::from);
     let mut changing: Vec<(String, String)> = Vec::new();
     for call in &mut planned {
-        let text = call.arguments.to_string();
+        let mut text = String::new();
+        strings(&call.arguments, &mut text);
         let names = |path: &str| {
             let name = std::path::Path::new(path)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or(path);
-            text.contains(path) || (name.len() >= 3 && text.contains(name))
+            mentions(&text, path) || (name.len() >= 3 && mentions(&text, name))
         };
         for (path, id) in &changing {
             if names(path) {
@@ -993,7 +1042,9 @@ async fn intent(
             let file = workspace
                 .as_deref()
                 .map_or_else(|| PathBuf::from(path), |w| w.join(path));
-            if let Some(content) = written_file(&file)? {
+            // Off the runtime thread: a slow mount must not hold up renewal.
+            let read = tokio::task::spawn_blocking(move || written_file(&file));
+            if let Some(content) = read.await.map_err(|_| Unjudged::Failed)?? {
                 call.files
                     .push((path.clone(), String::from_utf8_lossy(&content).into_owned()));
             }
@@ -1022,7 +1073,7 @@ async fn intent(
         request,
         planned,
         allowed,
-        allowed_cut: read["calls_more"] == true,
+        allowed_cut,
         earlier,
     })
 }
@@ -1125,6 +1176,20 @@ mod tests {
                 ("Bob", 4, vec!["d"])
             ]
         );
+    }
+
+    #[test]
+    fn a_file_is_named_only_as_a_whole_word() {
+        let mut text = String::new();
+        strings(
+            &json!({"command":"./configure && sh ./run.sh\ncat notes/config.bak","env":["x"]}),
+            &mut text,
+        );
+        assert!(mentions(&text, "run.sh"));
+        assert!(!mentions(&text, "config"));
+        assert!(!mentions(&text, "notes/config"));
+        assert!(mentions(&text, "notes/config.bak"));
+        assert!(mentions(&text, "x"));
     }
 
     #[test]

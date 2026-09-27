@@ -1121,18 +1121,27 @@ Where the approver differs from the design above:
   approver reads authors with `prompts` rather than from
   `approval_requested`.
 - A file the turn wrote is shown whole with a call that names it, by its
-  path or its file name, up to 48 KiB counted as it is read; a larger one
+  path or its file name as a whole word in one of the call's strings, up
+  to 48 KiB counted as it is read, read off the approver's runtime thread; a larger one
   is refused as "not reviewed: it runs a file too large to show", and one
   that is no longer a regular file is not read. A write or edit planned
   earlier in the same round is named in its place, since it runs first.
 - A general model is asked the same questions as text, each with what
   makes it yes or no, and answers them as one JSON object.
+- A turn whose steers do not all fit the `prompts` read is denied as
+  "intent too long", since the person's latest word may be the one left
+  out. A model judge's tag is at most 87 bytes, so its forks' names fit.
 
 Not built yet: the app's cards and the app's own approver, and the judge
 comparison (item 4 of Measure). Follow-ups from review (2026-09-27): a
 fork's inherited turns in `earlier` (they belong to the source bot, so a
-fork's first checks see none of that history), and rotation for the
-CLI-started approver's log, which grows one line a round. Dropped with the rules on 2026-09-27:
+fork's first checks see none of that history); rotation for the
+CLI-started approver's log, which grows one line a round; a CLI that finds
+the tag already served waiting for that approver's `serving` line too;
+judging a later call against consent an earlier call in the same round may
+use up; counting the questions (eleven a call) in a round's request limit;
+and writing the verdict lines so a stalled reader of stdout cannot hold up
+the approver. Dropped with the rules on 2026-09-27:
 `until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions

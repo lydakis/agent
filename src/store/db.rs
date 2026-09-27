@@ -4487,10 +4487,10 @@ impl Database {
     /// turn that wrote each (none for a person's words); the calls it
     /// started, with argument previews and whether each failed; then the
     /// bot's earlier prompts, newest first. Text counts against `bytes` in
-    /// that order, and each call and earlier prompt also counts
+    /// that order, and each steer, call, and earlier prompt also counts
     /// `PROMPTS_ENTRY`; text that does not fit is cut and marked
-    /// `truncated`, `calls_more` says calls were left out, and `more` says
-    /// earlier prompts were.
+    /// `truncated`, and `prompts_more`, `calls_more`, and `more` say steers,
+    /// calls, and earlier prompts were left out.
     pub fn prompts(&self, name: &str, turn: i64, bytes: usize) -> Result<Value> {
         if !(1..=Self::PROMPTS_BYTES).contains(&bytes) {
             return fail_with(
@@ -4523,6 +4523,7 @@ impl Database {
         };
         let mut left = bytes;
         let mut prompts = vec![prompt_entry(turn, text, from, from_turn, &mut left)];
+        let mut prompts_more = false;
         let mut steers = self.conn.prepare_cached(
             "SELECT json_extract(data,'$.from') FROM events WHERE turn=? AND kind='steered' ORDER BY id",
         )?;
@@ -4540,6 +4541,11 @@ impl Database {
                     r.get::<_, Option<i64>>(2)?,
                 ))
             })?;
+            if left < Self::PROMPTS_ENTRY {
+                prompts_more = true;
+                break;
+            }
+            left -= Self::PROMPTS_ENTRY;
             let mut entry = prompt_entry(id, text, from, from_turn, &mut left);
             entry["steer"] = json!(true);
             prompts.push(entry);
@@ -4611,7 +4617,7 @@ impl Database {
         }
         Ok(
             json!({"bot":name,"turn":turn,"status":turn_status_name(&status),"workspace":workspace,
-            "prompts":prompts,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
+            "prompts":prompts,"prompts_more":prompts_more,"calls":calls,"calls_more":calls_more,"earlier":earlier,"more":more}),
         )
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
