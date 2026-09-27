@@ -33,6 +33,8 @@ def render_cask(version: str, archive: Path) -> str:
     strategy :github_latest
   end
 
+  depends_on :macos
+
   app "Agent.app"
 
   zap trash: [

@@ -108,11 +108,14 @@ jobs:
           cargo test --locked --workspace
       - name: Build the daemon for both architectures
         run: |
+          # Tauri bundles externalBin binaries/agent as Contents/MacOS/agent.
+          # A universal build checks each architecture's sidecar, then
+          # bundles the universal one.
+          mkdir -p app/src-tauri/binaries
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             cargo build --release --locked --bin agent --target "$target"
+            cp ".local/target/$target/release/agent" "app/src-tauri/binaries/agent-$target"
           done
-          # Tauri bundles externalBin binaries/agent as Contents/MacOS/agent.
-          mkdir -p app/src-tauri/binaries
           lipo -create -output app/src-tauri/binaries/agent-universal-apple-darwin \
             .local/target/aarch64-apple-darwin/release/agent \
             .local/target/x86_64-apple-darwin/release/agent
