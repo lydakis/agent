@@ -4,6 +4,7 @@
 //! events, and relays requests. Nothing else lives here.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod daemon;
 mod project;
 mod session;
 
@@ -16,6 +17,9 @@ use tokio::sync::Mutex;
 
 struct Config {
     socket: PathBuf,
+    /// The store the socket was derived from; a daemon is started only for
+    /// a store, never behind an explicit socket.
+    store: Option<PathBuf>,
     model: Option<String>,
     workspace: String,
 }
@@ -23,6 +27,9 @@ struct Config {
 struct Shared {
     config: Config,
     client: Mutex<Option<Arc<Client>>>,
+    /// The `agent` packaged beside the app, which starts a missing daemon.
+    agent: Option<PathBuf>,
+    starts: Mutex<daemon::Starts>,
     /// Counts attachments; a pull names the session it reads for, so a
     /// batch from a session the page has left is never mistaken for new.
     session: std::sync::atomic::AtomicU64,
@@ -67,10 +74,10 @@ fn config() -> Result<Config, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    let socket = match socket {
-        Some(socket) => socket,
+    let (socket, store) = match socket {
+        Some(socket) => (socket, None),
         None => match (store, std::env::var_os("AGENT_SOCKET")) {
-            (None, Some(env)) => PathBuf::from(env),
+            (None, Some(env)) => (PathBuf::from(env), None),
             (store, _) => {
                 let store = store
                     .or_else(|| std::env::var_os("AGENT_STORE").map(PathBuf::from))
@@ -79,7 +86,9 @@ fn config() -> Result<Config, String> {
                             .map(|home| PathBuf::from(home).join(".agent/state.sqlite"))
                     })
                     .ok_or("no store path; pass --socket or --store")?;
-                agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?
+                let socket =
+                    agent_client::socket::default_socket(&store).map_err(|e| e.to_string())?;
+                (socket, Some(store))
             }
         },
     };
@@ -89,6 +98,7 @@ fn config() -> Result<Config, String> {
     })?;
     Ok(Config {
         socket,
+        store,
         model: model.or_else(|| std::env::var("AGENT_MODEL").ok()),
         workspace,
     })
@@ -242,9 +252,20 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
     if let Some(old) = state.client.lock().await.take() {
         old.close().await;
     }
-    let (client, events) = Client::connect(&state.config.socket)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (client, events) = match Client::connect(&state.config.socket).await {
+        Ok(connected) => connected,
+        // Nothing listens: start the daemon for the store, then connect.
+        Err(error) if error.code == "daemon_unavailable" => {
+            let (Some(agent), Some(store)) = (&state.agent, &state.config.store) else {
+                return Err(error.to_string());
+            };
+            state.starts.lock().await.start(agent, store).await?;
+            Client::connect(&state.config.socket)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let session = state
         .session
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -312,6 +333,8 @@ fn main() {
         .manage(Shared {
             config,
             client: Mutex::new(None),
+            agent: daemon::bundled(),
+            starts: Mutex::new(daemon::Starts::default()),
             session: std::sync::atomic::AtomicU64::new(0),
             events: Mutex::new(SessionSlot::default()),
         })

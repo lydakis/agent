@@ -93,6 +93,9 @@ client/          agent-client: the socket protocol and the client policy
   `request` relays any protocol op; `models` reads `~/.agent/models`, and
   `project` and `write_project` read and write a folder's
   `.agent/project.toml` ([project.rs](../app/src-tauri/src/project.rs)).
+  When nothing listens on a store's socket, `attach` starts a daemon first
+  ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
+  [Installing](#installing).
   State and protocol logic live in the
   page, exactly as they did in the prototype, so the design and the
   mechanics iterate in one place.
@@ -111,6 +114,51 @@ client/          agent-client: the socket protocol and the client policy
   in the background, spawns its tasks plan, build and test, build spawns
   review, and the coordinator waits on all of it. Serve `app/ui` with any
   static server to work on the design without a daemon.
+
+## Installing
+
+The app is published as a Homebrew cask for macOS (Apple silicon and Intel):
+
+```sh
+brew install --cask lydakis/agent/agent
+```
+
+The bundle carries the `agent` runtime as `Agent.app/Contents/MacOS/agent`;
+the cask does not put it on `PATH`. When the app finds no daemon on its
+store's socket, it runs that binary as `agent start --store STORE`, which
+starts the daemon exactly as a CLI command would: providers from
+`AGENT_PROVIDER` or the keys that are set, the log beside the store, a
+process that outlives the window. A window opened from the Dock inherits
+launchd's environment rather than a terminal's, so `agent start` runs with
+the environment of the user's login shell (`$SHELL -l -i`), where provider
+keys are usually exported; the store and socket themselves are resolved from
+the app's own arguments and environment. A failed start shows the CLI's
+reason on the page and is not retried for 30 seconds. An explicit `--socket`
+or `AGENT_SOCKET` never starts anything.
+
+Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
+`Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
+[release.yml](../.github/workflows/release.yml) on a macOS runner. It runs
+the tests, builds a universal `agent` and app, and has Tauri sign both with
+the Developer ID and hardened runtime, notarize and staple the bundle
+([tauri.release.conf.json](../app/src-tauri/tauri.release.conf.json)); it
+then verifies the signature, Gatekeeper assessment, staple, architectures and
+versions, and leaves `Agent_X.Y.Z_universal.zip`, the generated cask and
+`checksums.txt` on a draft release. Publishing the draft (not a prerelease)
+runs [publish-homebrew.yml](../.github/workflows/publish-homebrew.yml): it
+checks the assets against their checksums and the tag's cask generator,
+installs and audits the cask, and writes `Casks/agent.rb` to
+[lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
+downgrades the tap or replaces a different cask of the same version. The
+helpers and their tests are in [app/release](../app/release)
+(`python3 -m unittest discover -s app/release`).
+
+Secrets: the six Apple signing and notary secrets Errand uses
+(`APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`,
+`APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD`, `APPLE_DEVELOPER_ID_APPLICATION`,
+`APP_STORE_CONNECT_API_KEY_P8`, `APP_STORE_CONNECT_KEY_ID`,
+`APP_STORE_CONNECT_ISSUER_ID`), and `HOMEBREW_TAP_GITHUB_TOKEN` with Contents
+write access to the tap.
 
 ## Running it
 
@@ -280,8 +328,7 @@ page cannot subscribe to window events and never attaches. Page errors are
 forwarded to the app's stderr through a `log` command.
 
 Not verified: the live window's rendering by eye (the debug binary is not a
-bundle, so it could not be screenshotted here), a real provider, and macOS
-packaging, which needs `bundle.active` and real icons.
+bundle, so it could not be screenshotted here) and a real provider.
 
 The tree uses the daemon's `created_by` (bots created from a shell tool since
 schema 22, with the creator's identity since 23) or the `created` event; a bot
@@ -304,7 +351,7 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
-2. Packaging: a real icon set, `bundle.active`, a signed build.
+2. The first release: create the tap, set the secrets, tag `v0.1.0`.
 3. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
 
