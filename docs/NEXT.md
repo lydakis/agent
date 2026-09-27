@@ -936,7 +936,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     steer, one ⋯ menu, runs folded to one line. Side chat shows disabled
     until item 43. Follow-up: `delete` and `fork` take only a name, so a
     delete or fork the app started can land on a bot recreated under that
-    name meanwhile; both should take the bot's id, as `submit` does. Next, in
+    name meanwhile; both should take the bot's id, as `submit` does. The
+    same holds for a model menu left open across such a recreation. And a
+    `project.toml` another window writes between the app reading the folder
+    and creating the coordinator is refused only after the coordinator
+    exists; creation should re-check the file or remove that coordinator.
+    Next, in
     order: tasks in worktrees (`run --new --worktree` with a setup command, in the
     client); side chats once item 43's fork changes land; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role

@@ -1128,13 +1128,15 @@ function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $
 // ---------- menus ----------
 // One menu at a time: an agent's ⋯ (from its head, its sidebar row, its card, or a right-click), the
 // model chip, and Send's ▾.
-let menuAnchor = null, menuFor = null, menuKey = '';
+let menuAnchor = null, menuFor = null, menuKey = '', menuPane = 'main';
 const menuSig = (items) => items.map((i) => `${i.act}:${!!i.disabled}:${!!i.on}:${i.hint ?? ''}`).join('|');
 function menuHTML(items) {
   return items.map((i) => i.sep ? '<hr>' : i.head ? `<div class="lab">${esc(i.head)}</div>` :
     `<button type="button" role="menuitem"${i.disabled ? ' disabled' : ''}${i.danger ? ' class="danger"' : ''} data-act="${i.act}"${i.who != null ? ` data-who="${esc(i.who)}"` : ''}${i.v != null ? ` data-v="${esc(i.v)}"` : ''}${i.pane ? ` data-pane="${i.pane}"` : ''}><span><span class="ck">${i.on ? '✓' : ''}</span>${esc(i.label)}</span><span class="mh">${esc(i.hint ?? '')}</span></button>`).join('');
 }
 function showMenu(items, anchor, who = null) {
+  // Focus goes back to the pane the menu came from, so typing after it reaches the same bot.
+  if (!S.ui.menu) menuPane = document.activeElement?.closest?.('.pane.side') ? 'side' : 'main';
   const m = $('menu'); m.innerHTML = menuHTML(items); m.classList.add('on'); S.ui.menu = true; menuAnchor = anchor; menuFor = who; menuKey = menuSig(items);
   const w = m.offsetWidth, h = m.offsetHeight, W = window.innerWidth, H = window.innerHeight;
   let x = anchor.x, y = anchor.y;
@@ -1142,7 +1144,11 @@ function showMenu(items, anchor, who = null) {
   m.style.left = `${Math.max(4, Math.min(x, W - w - 4))}px`; m.style.top = `${Math.max(4, Math.min(y, H - h - 4))}px`;
   m.querySelector('button:not([disabled])')?.focus({ preventScroll: true });
 }
-function closeMenu() { if (!S.ui.menu) return; S.ui.menu = false; menuFor = null; $('menu').classList.remove('on'); }
+function closeMenu() {
+  if (!S.ui.menu) return; S.ui.menu = false; menuFor = null;
+  const m = $('menu'), had = m.contains?.(document.activeElement); m.classList.remove('on');
+  if (had) focusInput(menuPane);
+}
 // An open agent menu follows its bot: a status change rebuilds it in place, a deletion closes it.
 function refreshMenu() {
   if (!S.ui.menu || menuFor == null) return;
@@ -1200,6 +1206,8 @@ async function modelMenu(pane, anchor) {
   // Read now, so an edited ~/.agent/models shows without a restart.
   let list = [], error = null;
   try { list = await Daemon.models(); if (!list.length) error = 'agent models --discover lists more'; } catch (e) { error = String(e?.message ?? e); }
+  // The pane may show another bot, or this name another identity, by the time the list is read.
+  if (PANE[pane].bot() !== b.name || bot(b.name) !== b) return;
   showMenu(modelMenuItems(b, list, error), anchor);
 }
 
@@ -1250,7 +1258,9 @@ async function fork(name) {
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   if (isActive(b.status)) throw new Error('bot_busy: a running bot forks once its turn ends');
   let copy = forkName(name, 1); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k);
-  const parent = creatorOf(b) ?? b, session = S.session;
+  // A task known only by its project prefix sits under the coordinator, and so does its fork.
+  const lead = b.project ? bot(b.project + LEAD) : null;
+  const parent = creatorOf(b) ?? (lead && lead !== b && lead.id != null ? lead : b), session = S.session;
   const record = await Daemon.request('fork', { source: name, bot: copy, created_by: parent.name, created_by_id: parent.id, ...(b.workspace ? { workspace: b.workspace } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;

@@ -767,6 +767,12 @@ test('fork copies a bot at rest next to it and opens the copy beside', async () 
   assert.equal(p.S.ui.side, 'app.task-fork-2');
   await assert.rejects(p.fork('app.busy'), /bot_busy/);
   assert.equal(sent.filter(([op]) => op === 'fork').length, 2);
+  // A task known only by its prefix forks under the coordinator, beside itself.
+  p.upsert({ name: 'app.solo', id: 4, provider: 'alpha', model: 'one' }); p.tree();
+  assert.equal(p.S.bots.get('app.solo').project, 'app');
+  await p.fork('app.solo');
+  const solo = sent.filter(([op]) => op === 'fork').at(-1)[1];
+  assert.deepEqual([solo.created_by, solo.created_by_id], ['app.lead', 1]);
 });
 
 test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'s folder', async () => {
