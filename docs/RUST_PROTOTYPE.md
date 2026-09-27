@@ -894,9 +894,12 @@ does not, and each is one op:
   .../models` with the provider's credentials, 10 seconds at most) and
   answers `providers.NAME.models` as `{id, name?, context_tokens?,
   output_tokens?}`, or `providers.NAME.error` for a provider that would not
-  list. It runs off the dispatch path, only when asked, and each provider keeps
-  its answer five minutes. Nothing else reads it: a turn runs whatever model it
-  names. `agent models --discover` uses it once to write `~/.agent/models`.
+  list. It runs off the dispatch path, only when asked, under the same
+  connection admission as a turn, and each provider keeps its answer, a
+  refusal included, five minutes. The reply fits one event: a listing past
+  what is left of it is `provider_models_limit` for that provider. Bedrock
+  Mantle is asked at the host's `/v1/models`. Nothing else reads it: a turn
+  runs whatever model it names. `agent models --discover` uses it once to write `~/.agent/models`.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
   running processes against the process bound and how many of them are
