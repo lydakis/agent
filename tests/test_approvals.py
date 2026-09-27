@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 
+from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_elision import drain, encoded
 from tests.test_runtime import ODD_CALL_ID, ModelFixture, is_summary
@@ -55,6 +56,8 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(client.request('approvals')['result'], {'approvals': [], 'next_after': None})
         self.assertEqual(client.request('stats')['result']['approval_requests'], 0)
         self.assertIn('approvals', client.ready['capabilities'])
+        self.assertIn('serve_approvals', client.ready['capabilities'])
+        self.assertEqual(client.request('stats')['result']['approvers'], [])
         self.assertEqual(client.ready['limits']['approval_hold_ms'], 2000)
 
     def test_an_allowed_call_runs_and_records_who_allowed_it(self):
@@ -393,6 +396,146 @@ class ApprovalTests(ModelFixture):
         self.assertTrue(compacted[0]['pinned'])
         calls = [i['call_id'] for i in requests[-1]['input'] if i.get('type') == 'function_call']
         self.assertEqual(calls, ['long-4'])
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class ServedApprovalTests(ModelFixture):
+    """One session serves a gate tag: it holds the tag under a lease, gets
+    the calls waiting on it, then each call announced for it."""
+
+    def daemon(self, extra=()):
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait', extra=extra)
+        self.addCleanup(daemon.close)
+        created = daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'],
+                                 approver='auto')['result']
+        self.assertEqual(created['gates'], [{'tag': 'auto', 'tools': ['shell']}])
+        return daemon
+
+    def session(self, daemon):
+        session = Connection(daemon.socket_path)
+        self.addCleanup(session.close)
+        return session
+
+    def pushed(self, session, turn, event='approval_requested'):
+        return session.receive(lambda m: m.get('event') == event and m.get('turn') == turn)
+
+    def answer(self, session, turn, call_id, request=1, decision='allow', **extra):
+        return session.request('answer', bot='Bob', turn=turn, call_id=call_id, request=request,
+                               decision=decision, by='test', **extra)
+
+    def test_a_served_tag_gets_its_waiting_calls_then_each_new_one(self):
+        daemon = self.daemon(extra=('--approval-hold-ms', '60000'))
+        first = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
+        deadline = time.monotonic() + 5
+        while not daemon.request('approvals', tag='auto')['result']['approvals']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        approver = self.session(daemon)
+        served = approver.request('serve_approvals', tag='auto', lease_ms=5000)['result']
+        lease = served['lease']
+        self.assertEqual((served['tag'], served['lease_ms'], served['next_after']), ('auto', 5000, None))
+        # Later pages end where serving began.
+        self.assertEqual(daemon.request('approvals', tag='auto', through=served['through'])['result']['approvals'],
+                         served['approvals'])
+        # The waiting call comes with the listing, whole, with the counts.
+        [waiting] = served['approvals']
+        self.assertEqual((waiting['turn'], waiting['call_id'], waiting['request']), (first, 'shell-1', 1))
+        self.assertEqual(waiting['arguments']['command'], 'printf one')
+        self.assertEqual(waiting['denials'], {'auto': {'in_row': 0, 'in_turn': 0}})
+        self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
+        # Another session cannot serve a held tag, and an answer under a
+        # lease names its tag and holds only on the session that has it.
+        other = self.session(daemon)
+        self.assertEqual(other.request('serve_approvals', tag='auto', lease_ms=5000)['error'], 'approvals_served')
+        self.assertEqual(self.answer(approver, first, 'shell-1', lease=lease)['error'], 'invalid_lease')
+        self.assertEqual(self.answer(other, first, 'shell-1', tag='auto', lease=lease)['error'], 'approvals_lost')
+        self.assertEqual(approver.request('renew_approvals', tag='auto', lease=lease + 1)['error'], 'approvals_lost')
+        self.assertEqual(approver.request('renew_approvals', tag='auto', lease=lease)['result'],
+                         {'tag': 'auto', 'lease': lease, 'lease_ms': 5000})
+        self.assertEqual(self.answer(approver, first, 'shell-1', tag='auto', lease=lease)['result']['pending'], [])
+        self.assertEqual(daemon.finished(first)['data']['status'], 'completed')
+        # A call announced after serving began is pushed to the holder only.
+        second = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf two')['result']['turn']
+        pushed = self.pushed(approver, second)
+        self.assertEqual((pushed['tag'], pushed['lease'], pushed['durable']), ('auto', lease, False))
+        self.assertEqual((pushed['data']['part'], pushed['data']['parts']), (1, 1))
+        [call] = pushed['data']['calls']
+        self.assertEqual((call['call_id'], call['request'], call['arguments']['command']),
+                         ('shell-1', 1, 'printf two'))
+        self.assertEqual(self.answer(approver, second, 'shell-1', tag='auto', lease=lease,
+                                     decision='deny', reason='not now')['result']['decision'], 'deny')
+        self.assertEqual(daemon.finished(second)['data']['status'], 'completed')
+        # The daemon counts the denial on the bot, and the next call carries it.
+        self.assertEqual(daemon.request('resume', bot='Bob')['result']['denials'],
+                         {'auto': {'in_row': 1, 'in_turn': 1, 'turn': second}})
+        third = daemon.request('submit', bot='Bob', request_id='c', prompt='shell:printf three')['result']['turn']
+        [call] = self.pushed(approver, third)['data']['calls']
+        self.assertEqual(call['denials'], {'auto': {'in_row': 1, 'in_turn': 0}})
+        # Closing the session frees the tag at once: the next server takes
+        # over under a new lease, and gets the call still waiting.
+        approver.close()
+        deadline = time.monotonic() + 5
+        while (taken := other.request('serve_approvals', tag='auto', lease_ms=5000)).get('error') == 'approvals_served':
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        taken = taken['result']
+        self.assertNotEqual(taken['lease'], lease)
+        self.assertEqual([c['turn'] for c in taken['approvals']], [third])
+        self.answer(other, third, 'shell-1', tag='auto', lease=taken['lease'])
+        self.assertEqual(daemon.finished(third)['data']['status'], 'completed')
+        self.assertEqual(daemon.request('resume', bot='Bob')['result']['denials'],
+                         {'auto': {'in_row': 0, 'in_turn': 1, 'turn': second}})
+
+    def test_a_quiet_holder_loses_its_tag_to_the_next_server(self):
+        daemon = self.daemon(extra=('--approval-hold-ms', '60000'))
+        quiet, next_ = self.session(daemon), self.session(daemon)
+        old = quiet.request('serve_approvals', tag='auto', lease_ms=100)['result']['lease']
+        self.assertEqual(next_.request('serve_approvals', tag='auto', lease_ms=5000)['error'], 'approvals_served')
+        time.sleep(.2)
+        # Past its lease the holder still has the tag until another takes it.
+        new = next_.request('serve_approvals', tag='auto', lease_ms=5000)['result']['lease']
+        lost = quiet.receive(lambda m: m.get('event') == 'approvals_lost')
+        self.assertEqual((lost['tag'], lost['lease']), ('auto', old))
+        turn = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf hi')['result']['turn']
+        self.pushed(next_, turn)
+        # A woken holder's answer under its old lease changes nothing.
+        self.assertEqual(self.answer(quiet, turn, 'shell-1', tag='auto', lease=old)['error'], 'approvals_lost')
+        self.assertEqual(quiet.request('renew_approvals', tag='auto', lease=old)['error'], 'approvals_lost')
+        self.assertEqual(daemon.request('approvals', tag='auto')['result']['approvals'][0]['call_id'], 'shell-1')
+        self.answer(next_, turn, 'shell-1', tag='auto', lease=new)
+        self.assertEqual(daemon.finished(turn)['data']['status'], 'completed')
+        # A lease that runs out with no one to take over is ended when its
+        # holder next renews.
+        short = quiet.request('serve_approvals', tag='short', lease_ms=100)['result']['lease']
+        time.sleep(.2)
+        self.assertEqual(quiet.request('renew_approvals', tag='short', lease=short)['error'], 'approvals_lost')
+        self.assertEqual(quiet.receive(lambda m: m.get('event') == 'approvals_lost')['lease'], short)
+        self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
+        # An answer without a lease overrides whoever serves the tag.
+        override = daemon.request('submit', bot='Bob', request_id='b', prompt='shell:printf over')['result']['turn']
+        deadline = time.monotonic() + 5
+        while not daemon.request('approvals', tag='auto')['result']['approvals']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+        self.assertEqual(self.answer(daemon.control, override, 'shell-1')['result']['pending'], [])
+        self.assertEqual(daemon.finished(override)['data']['status'], 'completed')
+
+    def test_serving_is_refused_for_a_bad_tag_or_lease(self):
+        daemon = self.daemon()
+        session = self.session(daemon)
+        for tag, lease_ms, error in (('', 5000, 'invalid_approver'), ('auto', 99, 'invalid_lease'),
+                                     ('auto', 600_001, 'invalid_lease')):
+            self.assertEqual(session.request('serve_approvals', tag=tag, lease_ms=lease_ms)['error'], error)
+        self.assertEqual(daemon.request('stats')['result']['approvers'], [])
+        # Duplicate registration and a bad page both preserve the lease.
+        lease = session.request('serve_approvals', tag='auto', lease_ms=5000)['result']['lease']
+        self.assertEqual(session.request('serve_approvals', tag='auto', lease_ms=5000)['error'],
+                         'approvals_served')
+        for limit in (0, 257):
+            self.assertEqual(session.request('serve_approvals', tag='auto', lease_ms=5000, limit=limit)['error'],
+                             'invalid_approval_page')
+        self.assertEqual(session.request('renew_approvals', tag='auto', lease=lease)['result']['lease'], lease)
+        self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')

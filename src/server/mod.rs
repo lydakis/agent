@@ -301,6 +301,9 @@ enum Command {
         reason: Option<String>,
         /// A label for audit, the client's choice; not verified.
         by: Option<String>,
+        /// The lease of the session serving `tag`: an answer under a lease
+        /// that ended is refused. Without one, the answer is an override.
+        lease: Option<u64>,
     },
     /// Planned calls waiting on a gate, in announcement order.
     Approvals {
@@ -308,7 +311,20 @@ enum Command {
         tag: Option<String>,
         #[serde(default)]
         after: i64,
+        through: Option<i64>,
         limit: Option<usize>,
+    },
+    /// Serve one gate tag: the calls waiting on it now, then each call
+    /// announced for it after, for as long as the session renews its lease.
+    ServeApprovals {
+        tag: String,
+        lease_ms: u64,
+        limit: Option<usize>,
+    },
+    /// Keep a served tag for another lease period.
+    RenewApprovals {
+        tag: String,
+        lease: u64,
     },
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
@@ -838,6 +854,7 @@ pub(crate) async fn publish(
                 let _ = hub.durable(&bot, entry).await;
             }
             Publication::Through(cursor) => hub.published_to(cursor),
+            Publication::Approval(message) => hub.approval(&message),
             Publication::Finished { bot, turn, outcome } => {
                 handles.turn_finished(&bot, turn, outcome);
             }
@@ -958,7 +975,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","provider_models"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals","provider_models"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -1211,13 +1228,14 @@ pub async fn run(config: Configuration) -> Result<()> {
                                 service.hub.published_through(cursor).await;
                                 if *output.subscribe_closed().borrow() { continue; }
                             }
-                            let (request_id, result, shutdown) = match request {
+                            let (request_id, result, shutdown, serving) = match request {
                                 Ok(request) => {
                                     let shutdown = match request.command {
                                         Command::Shutdown { grace_ms } => Some(grace_ms),
                                         _ => None,
                                     };
                                     let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
+                                    let serves = matches!(request.command, Command::ServeApprovals { .. });
                                     let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
@@ -1225,12 +1243,19 @@ pub async fn run(config: Configuration) -> Result<()> {
                                         service.admissions.push_back(Admission { session: id, output, id: request.id, bound, pending: Pending::Settled(result) });
                                         continue;
                                     }
-                                    (request.id, result, shutdown)
+                                    let serving = result.as_ref().ok().filter(|_| serves).and_then(|page| {
+                                        Some((page["tag"].as_str()?.to_owned(), page["lease"].as_u64()?))
+                                    });
+                                    (request.id, result, shutdown, serving)
                                 }
-                                Err(error) => (Value::Null, Err(error), None),
+                                Err(error) => (Value::Null, Err(error), None, None),
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
+                            // A served tag's lease and pushes start behind its reply.
+                            if let Some((tag, lease)) = serving {
+                                service.hub.start(&tag, lease);
+                            }
                             if let Some(grace_ms) = shutdown {
                                 // A later shutdown can only bring the deadline closer.
                                 let until = tokio::time::Instant::now() + Duration::from_millis(grace_ms);
@@ -2080,6 +2105,7 @@ impl Service {
                     "waiting_turns": waiting,
                     "paced_turns": paced,
                     "approval_requests": approvals,
+                    "approvers": self.hub.served(),
                     "queued_turns": queued,
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
@@ -2104,6 +2130,7 @@ impl Service {
                 decision,
                 reason,
                 by,
+                lease,
             } => {
                 let allow = match decision.as_str() {
                     "allow" => true,
@@ -2126,6 +2153,16 @@ impl Service {
                 if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
                     return fail("invalid_by");
                 }
+                // A served answer renews its lease, and one under a lease
+                // that ended changes nothing: the tag's new holder decides.
+                let _answer_lease = if let Some(lease) = lease {
+                    let Some(tag) = &tag else {
+                        return fail_with("invalid_lease", "a lease answers for its tag");
+                    };
+                    Some(self.hub.answering(tag, session, lease)?)
+                } else {
+                    None
+                };
                 let name = bot.clone();
                 let answered = store
                     .op("answer", move |db| {
@@ -2155,13 +2192,63 @@ impl Service {
                 bot,
                 tag,
                 after,
+                through,
                 limit,
             } => {
                 store
                     .op("approvals", move |db| {
-                        db.approvals(bot.as_deref(), tag.as_deref(), after, limit.unwrap_or(64))
+                        db.approvals(
+                            bot.as_deref(),
+                            tag.as_deref(),
+                            after,
+                            through,
+                            limit.unwrap_or(64),
+                        )
                     })
                     .await
+            }
+            Command::ServeApprovals {
+                tag,
+                lease_ms,
+                limit,
+            } => {
+                name(&tag).map_err(|_| Error::new("invalid_approver"))?;
+                if !(100..=600_000).contains(&lease_ms) {
+                    return fail_with("invalid_lease", "lease_ms from 100 to 600000");
+                }
+                // Checked before the tag changes hands, so a bad page keeps
+                // the lease this session may already hold.
+                let limit = limit.unwrap_or(64);
+                if !(1..=256).contains(&limit) {
+                    return fail("invalid_approval_page");
+                }
+                let (lease, serving) = self.hub.serve(&tag, session, output.clone(), lease_ms)?;
+                // The listing and the start of delivery share one job, so
+                // every waiting call is on a page or announced after it.
+                let listed = tag.clone();
+                let page = store
+                    .op("serve_approvals", move |db| {
+                        let (cursor, page) = db.serve_approvals(&listed, limit)?;
+                        serving.lock().unwrap().go_live(cursor);
+                        Ok(page)
+                    })
+                    .await;
+                match page {
+                    Ok(mut page) => {
+                        page["tag"] = json!(tag);
+                        page["lease"] = json!(lease);
+                        page["lease_ms"] = json!(lease_ms);
+                        Ok(page)
+                    }
+                    Err(error) => {
+                        self.hub.unserve(&tag, lease);
+                        Err(error)
+                    }
+                }
+            }
+            Command::RenewApprovals { tag, lease } => {
+                let lease_ms = self.hub.renew(&tag, session, lease)?;
+                Ok(json!({"tag":tag,"lease":lease,"lease_ms":lease_ms}))
             }
             Command::Wait {
                 handles,
@@ -4802,7 +4889,7 @@ mod tests {
             .call(move |db| {
                 Ok((
                     db.turn_status("Bob", turn)?,
-                    db.approvals(None, None, 0, 64)?,
+                    db.approvals(None, None, 0, None, 64)?,
                 ))
             })
             .await

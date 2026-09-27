@@ -5,9 +5,10 @@ updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, at
 `973be14`, the change that built tool approval, for its cost and a store
 lock fix, at `dd95047` for the per-summary choice between a copy and a
-request of its own, at `cd1d45f` for the fix to run 5's lost steers, and
-at `7061fab` and `7c1904d` for the sustained task's runs.
-This is the one place that says what is currently known. The documents it links to
+request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
+`7061fab` and `7c1904d` for the sustained task's runs, and at `ea82f7a` for
+serving a gate tag to one approver. This is the one place that says what is
+currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -79,6 +80,10 @@ more turns is not here, because its work changes with its speed; it is under
   a second ungated (main 381), 292 held, 192 parked. Linux x86_64
   container, `973be14` against main at `ddf3f8b`, with within-turn
   compaction, 2026-09-26; an earlier run at `7238c6c` found the same.
+  Serving a tag (`ea82f7a` against `0b295d2`, 2026-09-27, same method and
+  host, three rotated runs): held p50 15.9 against 15.7 ms, the same
+  commits and event and store bytes, and the plan commit's job 0.61
+  against 0.57 ms, inside the run-to-run spread.
   macOS and the automatic approver's own cost are not measured.
   [Record](APPROVALS.md#measure-before-building).
 - **Five harnesses, same synthetic work.** 32 agents, three turns each adding
@@ -298,6 +303,15 @@ Reconnects, retention, overload, compaction and recovery.
   [plan](WEBSOCKET.md#measurement-plan) includes a synchronized loss of every
   connection.
 
+Approval consolidation validation (2026-09-27, based on `3d725b4`):
+308 Rust runtime/client tests passed; the full release-binary Python suite
+ran 363 tests with 23 optional tests skipped. Clippy with warnings denied,
+formatting, and diff checks passed. Lease regressions cover duplicate
+registration, publication preservation, cancellation with simultaneously
+ready output, storage waits, failed listing cleanup, and reply ordering.
+The bounded macOS comparison is recorded in APPROVALS.md; it is a small
+non-regression screen, not an efficiency ranking.
+
 ## Not established
 
 - Any Terminal-Bench score: five tasks are a screen.
@@ -319,6 +333,7 @@ Reconnects, retention, overload, compaction and recovery.
   it per operation, but no run has recorded it.
 - Whether the WebSocket transport pays for itself, and a fleet-wide bound on
   its full-send memory.
-- Tool approval on macOS.
-- Multi-daemon operation, the automatic approver (rules and Jev), and
+- Tool approval at fleet scale on macOS.
+- Multi-daemon operation, the automatic approver (Jev on every gated
+  round), and
   concurrent tool calls: designs only.

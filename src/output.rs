@@ -149,7 +149,13 @@ impl Output {
     }
 
     pub async fn send(&self, event: Value) -> Result<()> {
-        let bytes = Self::encode(&event)?;
+        self.send_ref(&event).await
+    }
+
+    /// `send` for an event the caller keeps: cancelled while it waits for
+    /// room, it has queued nothing, and the event can be sent again.
+    pub async fn send_ref(&self, event: &Value) -> Result<()> {
+        let bytes = Self::encode(event)?;
         let permit = self
             .budget
             .clone()
