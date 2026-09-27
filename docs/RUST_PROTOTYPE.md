@@ -804,7 +804,10 @@ event without subscribing (the benchmark and lifecycle tools use it). With
 `--socket PATH` it is a daemon: it prints `ready` once on stdout, accepts any
 number of Unix-socket sessions, and runs until `shutdown`, SIGTERM, or SIGINT.
 Each socket session begins with a `ready` line and must `follow` the bots it
-wants to observe.
+wants to observe. `ready` carries the protocol version, and the CLI, the app
+and `agent_client` refuse a daemon of any other with
+`daemon_protocol_mismatch`: the daemon and its clients ship together, and
+none keeps an earlier protocol working.
 
 `agent shutdown` returns once the daemon process has exited, so a caller may
 copy or reopen the store: the daemon answers the request first, then cancels

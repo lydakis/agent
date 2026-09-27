@@ -956,7 +956,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let hub = Hub::default();
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
-    let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
+    let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,

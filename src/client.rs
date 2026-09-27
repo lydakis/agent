@@ -406,7 +406,9 @@ impl Connection {
             ready: Value::Null,
         };
         connection.ready = connection.read_ready(deadline)?;
-        if connection.ready["event"] != "ready" {
+        if connection.ready["event"] != "ready"
+            || connection.ready["protocol"].as_u64() != Some(agent_client::PROTOCOL)
+        {
             return fail("daemon_protocol_mismatch");
         }
         Ok(connection)

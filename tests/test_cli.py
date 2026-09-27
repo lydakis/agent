@@ -920,6 +920,25 @@ class CliTests(ModelFixture):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(lambda args: check(*args), [('run', False), ('ls', True)]))
 
+    def test_cli_refuses_a_daemon_of_another_protocol(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            path = Path(directory)/'daemon.sock'
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(path))
+                listener.listen(1)
+                listener.settimeout(3)
+                process = subprocess.Popen([str(self.binary), 'ls', '--store', str(Path(directory)/'state.db'),
+                                            '--socket', str(path)],
+                                           env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    with listener.accept()[0] as peer:
+                        peer.sendall(b'{"event":"ready","protocol":2}\n')
+                        _, stderr = process.communicate(timeout=5)
+                    self.assertEqual(process.returncode, 1)
+                    self.assertIn(b'daemon_protocol_mismatch', stderr)
+                finally:
+                    self.stop_process(process)
+
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')
         self.addCleanup(client.close)

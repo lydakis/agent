@@ -111,9 +111,9 @@ async fn readiness_rejects_missing_or_mismatched_protocol_versions() {
     let listener = UnixListener::bind(&path).unwrap();
     for protocol in [
         serde_json::Value::Null,
-        serde_json::json!(2),
-        serde_json::json!(4),
-        serde_json::json!("3"),
+        serde_json::json!(agent_client::PROTOCOL - 1),
+        serde_json::json!(agent_client::PROTOCOL + 1),
+        serde_json::json!(agent_client::PROTOCOL.to_string()),
     ] {
         let connecting = tokio::spawn({
             let path = path.clone();
