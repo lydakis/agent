@@ -2,11 +2,12 @@
 
 Snapshot, 2026-09-26, at `afdd633` plus the change that added this page,
 updated at `095ff68` for admission batching and disk-full containment, at
-`e707632` and `6a81bd6` for the realistic-budget long-task runs, and at
+`e707632` and `6a81bd6` for the realistic-budget long-task runs, at
 `973be14`, the change that built tool approval, for its cost and a store
 lock fix, at `dd95047` for the per-summary choice between a copy and a
-request of its own, and at `ea82f7a` for serving a gate tag to one
-approver. This is the one place that says what is currently known. The documents it links to
+request of its own, at `cd1d45f` for the fix to run 5's lost steers, and at
+`ea82f7a` for serving a gate tag to one approver. This is the one place that
+says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -272,7 +273,13 @@ Reconnects, retention, overload, compaction and recovery.
   in both the choice arm and the arm with no copy. The two misses were
   a steer left waiting for room, which a scripted task reproduces on the
   build before the choice. `dd95047` against `d9ecbcf`, 2026-09-26.
-  [Record](LONG_TASK_EVAL.md#live-run-5).
+  [Record](LONG_TASK_EVAL.md#live-run-5). With such a steer admitted
+  against the whole budget, 20 bots a side: 20 of 20 steers went in and
+  20 of 20 bots were correct, against 18 of 20 on main, whose two misses
+  were that steer. `cd1d45f` against `0b295d2`, 2026-09-27; later
+  commits only narrow that admission and send such a steer to the model
+  before any summary, which has not run live.
+  [Record](LONG_TASK_EVAL.md#live-run-7).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket

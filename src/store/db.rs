@@ -3522,6 +3522,7 @@ impl Database {
         context_bytes: usize,
         context_items: usize,
         reserved: super::ContextUsage,
+        whole: bool,
     ) -> Result<Absorbed> {
         let bot = self.active(turn)?;
         let through = match through {
@@ -3538,10 +3539,38 @@ impl Database {
         // the window keeps, less what the turn already holds and what the
         // view sends ahead of it (`reserved`: its summary, pinned context,
         // and notes); what does not fit stays queued and starts as its own
-        // turn when the line moves.
+        // turn when the line moves. `whole` measures against the whole
+        // budget instead, for a steer no elision or summary made room for,
+        // but only past what a summary can take: beside the turn's prompt
+        // and `reserved` alone, which no summary takes, it keeps to three
+        // quarters, so once the rounds behind it are summarized the turn
+        // has the room the share leaves. A request separates its items with
+        // a comma each, so every item held and absorbed is counted a byte
+        // wider.
         let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
-        let mut room_bytes = (context_bytes / 4 * 3).saturating_sub(used_bytes + reserved.bytes);
-        let mut room_items = (context_items / 4 * 3).saturating_sub(used_items + reserved.items);
+        let (share_bytes, share_items) = (context_bytes / 4 * 3, context_items / 4 * 3);
+        let (mut room_bytes, mut room_items) = if whole {
+            let prompt = self
+                .conn
+                .prepare_cached(
+                    "SELECT s.total_bytes-COALESCE(p.total_bytes,0) FROM nodes s
+                     LEFT JOIN nodes p ON p.id=s.parent WHERE s.turn=?",
+                )?
+                .query_row([turn], |r| r.get::<_, i64>(0))? as usize;
+            (
+                context_bytes
+                    .saturating_sub(used_bytes + used_items + reserved.bytes)
+                    .min(share_bytes.saturating_sub(prompt + 1 + reserved.bytes)),
+                context_items
+                    .saturating_sub(used_items + reserved.items)
+                    .min(share_items.saturating_sub(1 + reserved.items)),
+            )
+        } else {
+            (
+                share_bytes.saturating_sub(used_bytes + used_items + reserved.bytes),
+                share_items.saturating_sub(used_items + reserved.items),
+            )
+        };
         let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
         let mut more = false;
         let mut capped = false;
@@ -3573,11 +3602,11 @@ impl Database {
                 }
                 bytes += size;
                 let item = family.user_item(&row.get::<_, String>(1)?)?;
-                if item.len() > room_bytes || room_items == 0 {
+                if item.len() + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
                 }
-                room_bytes -= item.len();
+                room_bytes -= item.len() + 1;
                 room_items -= 1;
                 steers.push((row.get(0)?, item, size));
             }

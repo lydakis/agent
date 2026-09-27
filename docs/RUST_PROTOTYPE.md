@@ -1094,9 +1094,29 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   not overtake it. Once elision or a summary makes room in the running
   turn, the same boundary tries it again, and so does a later boundary
   whose view sends less ahead of the turn, a note cleared or shrunk, so a
-  correction reaches a long task that compacts; one still queued when the turn ends starts as its
-  own turn when the line moves (a strict steer, which names that turn,
-  fails with `stale_turn`).
+  correction reaches a long task that compacts. For a bot with
+  compaction instructions and a summarizer the daemon serves in the bot's
+  family, a steer still queued after a boundary's elision and compaction
+  steps, or after a final reply, is measured against the whole
+  `--context-bytes` and `--context-items` instead: when
+  one large result in the newest round fills the turn, no stub or summary
+  can take it, and the steer would otherwise wait out the task. Beside
+  what no summary takes, the view's prefix and the turn's prompt, it
+  still keeps to three quarters, so only rounds a summary can take go
+  past them. Such a steer goes to the model in the next call, before any
+  summary, so no summary spends the round or the budget it went in for.
+  What it adds may put the view past the compaction threshold, and the
+  boundary after that call summarizes the rounds behind it, as it does
+  for any view that size. A bot without such a summarizer keeps three
+  quarters, since nothing could take those rounds and its next round
+  would fail with `context_limit`; the summarizer itself refuses a
+  provider now bound to another family, with `provider_family_mismatch`.
+  Admission counts the comma the request puts before each item. A steer
+  joins only a turn that can call again: after a summary or a final
+  reply that spent the budget or the last round, counting a cache
+  refresh the reply left in flight, it stays queued. One still queued
+  when the turn ends starts as its own turn when the line moves (a
+  strict steer, which names that turn, fails with `stale_turn`).
   Usage comes from cumulative byte and depth totals at the head and the parent
   of the turn's first node, found through a partial `nodes(turn)` index. This
   takes a fixed number of indexed lookups regardless of current-turn length;
@@ -1988,7 +2008,10 @@ fixed until the next compaction; rewriting a carry-forward note or moving the
 window can still invalidate the later suffix. A summarizer failure leaves the
 context view unchanged, preserves any billable usage, is reported as a live
 `compaction_failed` notification, and the turn continues with the window
-as it is; the window's own overflow handling still bounds stored items.
+as it is; the window's own overflow handling still bounds stored items. A
+summarizer the daemon no longer serves (`provider_unavailable`), or serves
+in another family than the bot's stored items (`provider_family_mismatch`),
+is reported the same way without a request.
 Planning runs on the reader connection: nodes are immutable and only the
 running turn moves its bot's head, so the reader's snapshot plans what the
 worker would. Indexed byte/item accounting sizes the unsummarized span first,
