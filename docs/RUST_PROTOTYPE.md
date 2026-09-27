@@ -52,7 +52,7 @@ agent run --new --model anthropic/claude-sonnet-5 --bot Bob -- "Add a failing te
 agent run --bot Bob -- "Now run the full suite"          # same bot, next turn, same conversation
 agent run --bot Bob --model anthropic/claude-opus-5-5 -- "Review the diff"   # this turn only
 agent follow --bot Bob --after 0                         # replay, then live events
-agent fork --source Bob --checkpoint 12 --bot Bob-alt      # workspace comes with each later run
+agent fork --source Bob --checkpoint 12 --bot Bob-alt      # starts in Bob's folder
 agent interrupt --bot Bob
 agent ls
 agent shutdown

@@ -970,6 +970,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     remove them. Follow-up: the coordinator text continues a task by name,
     so a task deleted and recreated under the same name gets its messages;
     pinning continuations with `--bot-id` would refuse the replacement.
+    Follow-up: the app learns a bot's folder from its record, so a move by
+    another client shows after the app reattaches; and a project name with
+    `..` cannot prefix a valid branch name, so project names should refuse it.
+    Follow-up: a turn without a folder runs in the bot's retained one
+    unchecked, as the daemon's fallback always did; a folder deleted since
+    shows up as a tool spawn error rather than a refusal at submit.
     Next, in
     order: side chats with all tools in a new worktree, and Keep; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
