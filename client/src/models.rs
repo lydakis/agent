@@ -58,6 +58,7 @@ pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
 
 fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
     let mut models: Vec<Model> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (index, line) in text.lines().enumerate() {
         let (entry, note) = match line.split_once('#') {
             Some((entry, note)) => (entry.trim(), Some(note.trim())),
@@ -77,7 +78,7 @@ fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
         if !valid {
             return Err((index + 1, "expected PROVIDER/MODEL"));
         }
-        if models.iter().any(|known| known.id == entry) {
+        if !seen.insert(entry) {
             continue;
         }
         models.push(Model {
@@ -114,6 +115,7 @@ pub fn render(listing: &Value) -> String {
             text.push_str(&format!("# {}\n", said.join(" ")));
             continue;
         };
+        let listed = text.len();
         for model in models {
             let Some(id) = model["id"].as_str() else {
                 continue;
@@ -139,6 +141,10 @@ pub fn render(listing: &Value) -> String {
                 true => text.push_str(&format!("{id}\n")),
                 false => text.push_str(&format!("{id}  # {note}\n")),
             }
+        }
+        // A provider that answered but gave nothing usable says so by name.
+        if text.len() == listed {
+            text.push_str(&format!("# {name}: no models listed\n"));
         }
     }
     text
@@ -178,12 +184,14 @@ mod tests {
             "anthropic":{"models":[{"id":"claude-sonnet-5","name":"Claude Sonnet 5",
                 "context_tokens":1000000,"output_tokens":128000}]},
             "bedrock":{"error":"provider_http_404","detail":"not found"},
-            "gone":{"error":"provider_http_500","detail":"down\nother/model\r\nx"}}}));
+            "gone":{"error":"provider_http_500","detail":"down\nother/model\r\nx"},
+            "quiet":{"models":[{"id":"bad id"}]}}}));
         assert!(text.contains(
             "anthropic/claude-sonnet-5  # Claude Sonnet 5, 1000000 context, 128000 output\n"
         ));
         assert!(text.contains("# bedrock: provider_http_404: not found\n"));
         assert!(text.contains("# gone: provider_http_500: down other/model x\n"));
+        assert!(text.contains("# quiet: no models listed\n"));
         let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["anthropic/claude-sonnet-5", "openai/gpt-6-luna"]);
     }
