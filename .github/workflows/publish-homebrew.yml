@@ -69,7 +69,7 @@ jobs:
         run: |
           gh api "repos/lydakis/agent/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
           gh release download "$RELEASE_TAG" --repo lydakis/agent \
-            --pattern agent.rb --pattern checksums.txt \
+            --pattern agent.rb --pattern checksums.txt --pattern source-commit.txt \
             --pattern "Agent_${RELEASE_TAG#v}_universal.zip" --dir "$RUNNER_TEMP/release"
       - name: Check out tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,10 +82,12 @@ jobs:
         id: prepare
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
         run: |
           python3 app/release/prepare_homebrew_update.py "$RELEASE_TAG" \
             "$RUNNER_TEMP/release.json" "$RUNNER_TEMP/release" \
             tap/Casks/agent.rb "$RUNNER_TEMP/tap-update.json" \
+            --commit "$RELEASE_COMMIT" \
             --generator release-source/app/release/homebrew_cask.py
           if [ -f "$RUNNER_TEMP/tap-update.json" ]; then
             echo 'changed=true' >> "$GITHUB_OUTPUT"

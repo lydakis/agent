@@ -156,11 +156,13 @@ signing material exists, builds a universal `agent` and app, and has Tauri sign 
 the Developer ID and hardened runtime, notarize and staple the bundle
 ([tauri.release.conf.json](../app/src-tauri/tauri.release.conf.json)); it
 then verifies the signature, Gatekeeper assessment, staple, architectures and
-versions, and leaves `Agent_X.Y.Z_universal.zip`, the generated cask and
-`checksums.txt` on a draft release. Publishing the draft (not a prerelease)
-runs [publish-homebrew.yml](../.github/workflows/publish-homebrew.yml): it
-checks the assets against their checksums and the tag's cask generator,
+versions, and leaves `Agent_X.Y.Z_universal.zip`, the generated cask,
+`source-commit.txt` (the commit it built) and `checksums.txt` on a draft
+release. Publishing the draft (not a prerelease) runs
+[publish-homebrew.yml](../.github/workflows/publish-homebrew.yml): it
 resolves the tag to a commit on `main` before running any of its code,
+refuses assets built from any other commit (a draft's tag can move), checks
+them against their checksums and the tag's cask generator,
 installs and audits the cask, and writes `Casks/agent.rb` to
 [lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
 downgrades the tap or replaces a different cask of the same version. The

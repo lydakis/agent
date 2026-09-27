@@ -198,6 +198,7 @@ jobs:
       - name: Package the app and cask, and verify them
         env:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
           version="${RELEASE_TAG#v}"
           app=.local/target/universal-apple-darwin/release/bundle/macos/Agent.app
@@ -215,8 +216,10 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$app" "$archive"
           python3 app/release/homebrew_cask.py "$version" "$archive" dist/agent.rb
           ruby -c dist/agent.rb
+          # Publishing checks the tag still resolves to the commit built here.
+          printf '%s\n' "$RELEASE_COMMIT" > dist/source-commit.txt
           cd dist
-          shasum -a 256 "Agent_${version}_universal.zip" agent.rb > checksums.txt
+          shasum -a 256 "Agent_${version}_universal.zip" agent.rb source-commit.txt > checksums.txt
           shasum -a 256 --check checksums.txt
           mkdir smoke
           ditto -x -k "Agent_${version}_universal.zip" smoke
@@ -245,7 +248,7 @@ jobs:
           if [[ "$RELEASE_TAG" == *-* ]]; then
             options+=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" dist/*.zip dist/checksums.txt dist/agent.rb \
+          gh release create "$RELEASE_TAG" dist/*.zip dist/checksums.txt dist/agent.rb dist/source-commit.txt \
             --verify-tag --draft --title "$RELEASE_TAG" --generate-notes "${options[@]}"
       - name: Remove temporary signing credentials
         if: always()

@@ -26,17 +26,21 @@ class HomebrewUpdateTest(unittest.TestCase):
         self.archive.write_bytes(b"signed app")
         self.cask = render_cask("0.2.0", self.archive).encode()
         (self.assets / "agent.rb").write_bytes(self.cask)
+        self.commit = "a" * 40
+        (self.assets / "source-commit.txt").write_text(self.commit + "\n")
         self.write_checksums()
 
     def write_checksums(self):
         (self.assets / "checksums.txt").write_text("".join(
             f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-            for path in [self.archive, self.assets / "agent.rb"]
+            for path in [self.archive, self.assets / "agent.rb",
+                         self.assets / "source-commit.txt"]
         ))
 
     def prepare(self, tag="v0.2.0"):
         self.metadata.write_text(json.dumps(self.release))
-        return prepare_update(tag, self.metadata, self.assets, self.current)
+        return prepare_update(tag, self.metadata, self.assets, self.current,
+                              commit=self.commit)
 
     def test_first_publication_and_upgrade_request(self):
         request = self.prepare()
@@ -80,16 +84,17 @@ class HomebrewUpdateTest(unittest.TestCase):
             f"pathlib.Path(sys.argv[3]).write_bytes({tagged!r})\n"
         )
         request = prepare_update("v0.2.0", self.metadata, self.assets, self.current,
-                                 generator=generator)
+                                 commit=self.commit, generator=generator)
         self.assertEqual(base64.b64decode(request["content"]), self.cask)
         self.assertEqual((self.assets / "agent.rb").read_bytes(), tagged)
         self.assertIsNone(prepare_update("v0.2.0", self.metadata, self.assets,
-                                        self.current, generator=generator))
+                                        self.current, commit=self.commit,
+                                        generator=generator))
         (self.assets / "agent.rb").write_bytes(tagged + b"# unexpected\n")
         self.write_checksums()
         with self.assertRaisesRegex(ValueError, "generated cask"):
             prepare_update("v0.2.0", self.metadata, self.assets, self.current,
-                           generator=generator)
+                           commit=self.commit, generator=generator)
 
     def test_requires_matching_published_stable_release(self):
         for field, value in [
@@ -108,7 +113,8 @@ class HomebrewUpdateTest(unittest.TestCase):
         self.assertFalse(self.current.exists())
 
     def test_checks_both_assets_and_exact_cask(self):
-        for path in [self.archive, self.assets / "agent.rb"]:
+        for path in [self.archive, self.assets / "agent.rb",
+                     self.assets / "source-commit.txt"]:
             with self.subTest(path=path.name):
                 original = path.read_bytes()
                 path.write_bytes(original + b"changed")
@@ -118,6 +124,19 @@ class HomebrewUpdateTest(unittest.TestCase):
         (self.assets / "agent.rb").write_bytes(self.cask + b"# unexpected\n")
         self.write_checksums()
         with self.assertRaisesRegex(ValueError, "generated cask"):
+            self.prepare()
+        self.assertFalse(self.current.exists())
+
+    def test_assets_must_come_from_the_tags_current_commit(self):
+        built = self.commit
+        for commit in ["b" * 40, built[:7], "", built.upper()]:
+            with self.subTest(commit=commit), self.assertRaisesRegex(ValueError, "built from"):
+                self.commit = commit
+                self.prepare()
+        self.commit = built
+        (self.assets / "source-commit.txt").write_text("b" * 40 + "\n")
+        self.write_checksums()
+        with self.assertRaisesRegex(ValueError, "built from"):
             self.prepare()
         self.assertFalse(self.current.exists())
 

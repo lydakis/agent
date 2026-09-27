@@ -17,7 +17,7 @@ STABLE_VERSION = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 
 
 def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
-                   *, generator: Path | None = None):
+                   *, commit: str, generator: Path | None = None):
     match = re.fullmatch("v" + STABLE_VERSION, tag)
     if not match:
         raise ValueError("expected a stable tag such as v0.1.0")
@@ -35,9 +35,14 @@ def prepare_update(tag: str, metadata: Path, assets: Path, current: Path,
         checksums[entry[2]] = entry[1]
     archive = assets / archive_name(version)
     cask_path = assets / "agent.rb"
-    for path in [archive, cask_path]:
+    source = assets / "source-commit.txt"
+    for path in [archive, cask_path, source]:
         if checksums.get(path.name) != hashlib.sha256(path.read_bytes()).hexdigest():
             raise ValueError(f"checksum mismatch or missing checksum for {path.name}")
+    # A draft's tag can move after its assets were built: publish only what
+    # the tag's current commit built.
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or source.read_text() != commit + "\n":
+        raise ValueError("release assets were not built from the tag's commit")
     cask = render_cask(version, archive).encode()
     expected_release_cask = cask
     if generator is not None:
@@ -82,13 +87,15 @@ def main():
     parser.add_argument("assets", type=Path)
     parser.add_argument("current", type=Path)
     parser.add_argument("request", type=Path)
+    parser.add_argument("--commit", required=True,
+                        help="the commit the release tag resolves to now")
     parser.add_argument("--generator", type=Path,
                         help="release tag's generator, used to verify immutable assets")
     args = parser.parse_args()
     args.request.unlink(missing_ok=True)
     try:
         request = prepare_update(args.tag, args.metadata, args.assets, args.current,
-                                 generator=args.generator)
+                                 commit=args.commit, generator=args.generator)
         if request is not None:
             args.request.write_text(json.dumps(request))
         else:
