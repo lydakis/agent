@@ -21,7 +21,7 @@ Add --model PROVIDER/MODEL to give it one of the models \"$AGENT_BIN\" models li
 Continue an existing agent with \"$AGENT_BIN\" run --detach --bot NAME -- TASK. \
 Collect results with the wait tool on that handle; it returns the peer's status and final text. \
 Blocking run/follow inside a shell tool is rejected. \
-Use \"$AGENT_BIN\" fork --source NAME --checkpoint N --bot NEW to branch an agent from an earlier point in its history. \
+Use \"$AGENT_BIN\" fork --source NAME --bot NEW to branch an agent from where it is now, mid-turn included; --checkpoint N branches from an earlier point in its history. \
 $AGENT_BOT and $AGENT_BOT_ID identify you; $AGENT_PARENT and $AGENT_PARENT_ID, when set, identify the agent that created you. \
 To contact that creator, run \
 \"$AGENT_BIN\" run --detach --bot \"$AGENT_PARENT\" --bot-id \"$AGENT_PARENT_ID\" -- TASK; \

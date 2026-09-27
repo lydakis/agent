@@ -208,7 +208,13 @@ closes stdout, even if the client keeps stdin open or stops reading output.
 Background commands are rows in a `processes` table with store-wide ids, so a
 `proc:` handle is unique for the store's lifetime, its result is durable and
 can be waited on more than once, and daemon memory holds only in-flight
-commands. Completion commits the result and its overflow artifacts in one
+commands. A bot's `wait` tool resolves only the commands that bot started:
+another bot's `proc:N`, such as one a fork inherited in its history, fails
+with `handle_unavailable`. A command's stored output is readable by the bot
+that started it, and by another branch only when its history holds the wait
+result that delivered it. The `wait` protocol op and `agent wait` still
+resolve any handle: their caller is a program holding the handle it was given.
+This is not a sandbox. Completion commits the result and its overflow artifacts in one
 transaction before waking waiters. A persistence failure stops the daemon with
 an error and disconnects clients. After storage is repaired, restart marks an
 unrecorded completion as `process_lost`. The code means supervision ended: the
@@ -1037,9 +1043,23 @@ and tools, and takes no text of its own; the source is never changed. Workspaces
 and turn IDs, not the illustrative numbers. Names are immutable bot identities
 within one store; rename/alias operations are not implemented. A fork starts
 from any message in the source's history: `checkpoint` names a node id (every
-`message` and `tool_completed` event carries one), and without it the source's
-current head is used, which requires the source to be idle since a live head
-is still moving. The point must leave no tool call unanswered, or the fork
+`message` and `tool_completed` event carries one). Without it, an idle
+source's head is used, and a running or parked turn's newest finished round:
+the last result of its newest fully answered round, a steer absorbed at a
+round boundary, a final answer not yet finished, or the turn's prompt before
+any round finishes. The store keeps that node current as the turn appends, so
+this fork reads no transcript. A turn that began before the store kept it
+(schema 36) refuses a default fork with `fork_point_unknown` until its next
+model response or steer. A fork keeps its source's window start when the fork
+point is at or after it and carries the source's current compaction, so its
+first request can read the source's cache. `allow` narrows which of the
+source's tools the fork may call: absent keeps the source's list, `[]` allows
+none, and `null` fails with `invalid_allow`. A tool outside the source's list
+fails with `allow_not_in_source`, so a fork never widens. The fork is still
+shown every tool, since changing the definitions would rebuild the provider
+cache; a call outside the list is refused at dispatch with
+`tool_not_available` and never waits for an approver. `resume` and `forked`
+report `allowed` when a bot has one (schema 37). The point must leave no tool call unanswered, or the fork
 fails with `fork_point_has_open_tool_calls`; a node outside the source's
 lineage fails with `node_not_in_source_history`. A Responses reasoning node
 cannot be separated from its following output item; selecting it fails with
@@ -1076,9 +1096,9 @@ the turn's id and handle at once, and `wait`, `result`, `turns`, and
   `active_agent_limit` when no slot is free. Nothing is written. The
   `bot_busy` detail names the running turn and the ways past it as flags
   to copy (`--delivery steer --turn N`, `--delivery queue`, or
-  `fork --source NAME --checkpoint C --bot NEW` to ask without interrupting,
-  where `C` is the head the running turn started from; a first turn has no
-  such point, so no fork is offered). A model
+  `fork --source NAME --bot NEW` to ask without interrupting, which starts
+  at the running turn's newest finished round; a turn from before schema 36
+  has none until its next response or steer, so no fork is offered). A model
   calling `agent run` does not discover them otherwise, and in benchmark runs
   it ignored a prose description of them.
 - `queue`: the turn is a durable row that starts when the bot is free and a
