@@ -8,8 +8,9 @@ lock fix, at `dd95047` for the per-summary choice between a copy and a
 request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
 `7061fab` and `7c1904d` for the sustained task's runs, at `ea82f7a` for
 serving a gate tag to one approver, at `74f726b` and `aed1669` for
-the automatic approver's own cost, and at `81458d2` for the judges
-compared. This is the one place that says what is currently
+the automatic approver's own cost, at `81458d2` for the judges
+compared, and at the change that made these limits per bot for its finish
+cost. This is the one place that says what is currently
 known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -264,7 +265,11 @@ Reconnects, retention, overload, compaction and recovery.
   error without strace.
 - **Retention.** A race that could lose a completion event under
   `--retain-turns 1` (2 of 10 runs) is fixed (0 of 10). Retention halves
-  per-turn store growth (1.4 against 2.8 KB).
+  per-turn store growth (1.4 against 2.8 KB). Reading each bot's own
+  retention and context settings inside its finishing commit, instead of
+  daemon flags, left 32 turns finishing together unchanged within noise:
+  median p99 12.70 against 12.40 ms, ranges 10.1–19.2 and 10.3–18.3 ms,
+  15 runs a build. Linux x86_64 container, 2026-09-27.
   [Race](DAEMON_MEASUREMENTS.md#retention-publication-boundary),
   [growth](LIVE_FLEET.md).
 - **Overload.** Paced turns release their slots, so a healthy provider's work
