@@ -1004,3 +1004,18 @@ test('the demo daemon answers as a side chat only for a fork given its own tools
     assert.deepEqual(await texts('peek'), ['read'], 'a fork with its own tools answers from history');
   } finally { d.close(); }
 });
+
+test('a task card leaves the keyboard beside; swapping a folded task in unfolds its project', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.tree(); p.S.selected = 'app.lead';
+  const doc = p.context.document, focused = [];
+  for (const id of ['input', 'sideinput']) doc.getElementById(id).focus = () => focused.push(id);
+  const card = { dataset: { task: 'app.build' } };
+  await doc.listeners.click({ target: { closest: (sel) => (sel === '[data-task]' ? card : sel === '.pane.main' ? {} : null) } });
+  await p.tick();
+  assert.equal(p.S.ui.side, 'app.build'); assert.equal(focused.at(-1), 'sideinput');
+  p.S.ui.folded.add('app'); p.swap();
+  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.folded.has('app'), false);
+  assert.ok(p.tree().some((n) => n.b?.name === 'app.build'), 'the selected task has a sidebar row');
+});

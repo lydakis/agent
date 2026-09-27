@@ -1366,6 +1366,7 @@ async function nextBeside() {
 function swap() {
   if (!S.ui.side) return;
   [S.selected, S.ui.side] = [S.ui.side, S.selected];
+  const p = bot(S.selected).project; if (p && S.ui.folded.delete(p)) S.shapeGen += 1;
   [$('input').value, $('sideinput').value] = [$('sideinput').value, $('input').value];
   render(); save(); focusInput('main');
 }
@@ -1390,7 +1391,7 @@ for (const [pane, ids] of Object.entries(PANE)) {
 }
 $('projform').addEventListener('submit', async (e) => {
   e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
-  try { await createProject(dir); showNewProject(false); } catch (err) { toast(String(err?.message ?? err), 5000); }
+  try { await createProject(dir); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
 });
 $('projdir').addEventListener('keydown', (e) => { if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
@@ -1452,7 +1453,8 @@ document.addEventListener('click', async (e) => {
   if (e.target.closest('#menu')) return;
   const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]');
   if (step) toggleStep(step);
-  else if (task) await openBeside(task.dataset.task);
+  // Opening a task beside puts the keyboard where openBeside chose.
+  else if (task) { await openBeside(task.dataset.task); return; }
   else if (row) await openOnly(row.dataset.bot);
   // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
   if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
