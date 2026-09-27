@@ -3006,10 +3006,10 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
 }
 
 #[test]
-fn schema_36_refuses_a_store_with_a_turn_in_flight() {
+fn schema_36_ends_a_turn_in_flight_and_keeps_its_history() {
     let path = std::env::temp_dir().join(format!("agent-closed-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    {
+    let (turn, kept) = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
         converse(&mut db, "Bob", 1);
@@ -3031,7 +3031,8 @@ fn schema_36_refuses_a_store_with_a_turn_in_flight() {
         db.tool_start(turn, &w).unwrap();
         db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
             .unwrap();
-    }
+        (turn, stored(&mut db, "Bob"))
+    };
     Connection::open(&path)
         .unwrap()
         .execute_batch(
@@ -3039,17 +3040,24 @@ fn schema_36_refuses_a_store_with_a_turn_in_flight() {
              ALTER TABLE processes DROP COLUMN delivered; PRAGMA user_version=35;",
         )
         .unwrap();
-    // Its closed node cannot be read back, so the upgrade waits for the
-    // turn to end rather than guessing; the store is left as it was.
-    let refused = Database::initialize(Connection::open(&path).unwrap())
-        .err()
-        .unwrap();
-    assert_eq!(refused.code, "store_migration_turn_in_flight");
-    let version: i32 = Connection::open(&path)
-        .unwrap()
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, 35);
+    // Its closed node cannot be read back, so the upgrade ends the turn
+    // rather than guessing, and the bot keeps its whole history.
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(db.turn_status("Bob", turn).unwrap(), "interrupted");
+    let bot = db.inspect("Bob").unwrap();
+    assert_eq!(
+        (bot.status.as_str(), bot.running_turn),
+        ("interrupted", None)
+    );
+    let history = stored(&mut db, "Bob");
+    assert_eq!(history[..kept.len()], kept[..]);
+    // The parked call is answered, so a default fork starts at the head.
+    assert_eq!(history.len(), kept.len() + 1);
+    assert_eq!(
+        fork_point(&mut db, "Bob", "after").unwrap(),
+        head(&db, "Bob")
+    );
+    drop(db);
     std::fs::remove_file(path).unwrap();
 }
 

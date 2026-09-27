@@ -7171,26 +7171,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         |r| r.get::<_, bool>(0),
     )? {
         // 35 -> 36: a running turn's newest closed node, and which wait
-        // result delivered a background process. A running or parked
-        // turn's closed node cannot be read back without a transcript
-        // scan, so a store with one is refused rather than guessed. A
-        // process finished before it is readable by the bot that started
-        // it alone.
-        if conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bots WHERE running_turn IS NOT NULL)",
-            [],
-            |r| r.get::<_, bool>(0),
-        )? {
-            return fail_with(
-                "store_migration_turn_in_flight",
-                "a turn is running or parked; let it end or interrupt it with the earlier \
-                 binary, or start a new store",
-            );
-        }
+        // result delivered a background process. A parked turn's closed
+        // node cannot be read back without a transcript scan, so the
+        // upgrade ends it rather than guess: it joins the running turns
+        // that every open interrupts, and its history is kept. A process
+        // finished before it is readable by the bot that started it alone.
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN closed INTEGER;
              ALTER TABLE bots ADD COLUMN open_calls INTEGER;
-             ALTER TABLE processes ADD COLUMN delivered INTEGER;",
+             ALTER TABLE processes ADD COLUMN delivered INTEGER;
+             UPDATE turns SET status='running' WHERE status IN ('waiting','paced');",
         )?;
     }
     if !conn.query_row(

@@ -150,11 +150,10 @@ turn's prompt.
   much history it holds. A running or parked turn's boundary cannot be
   read back without the transcript scan this design avoids, and guessing
   the prompt would repeat the failure seen live, a fork that redoes the
-  task. So the upgrade refuses a store with such a turn
-  (`store_migration_turn_in_flight`) and leaves it at schema 35: end the
-  turn with the earlier binary, or start a new store. Every turn after it
-  has a boundary from the moment it starts (2026-09-27; until then the
-  runtime tolerated a missing one with `fork_point_unknown`).
+  task. So the upgrade ends such a turn as interrupted, the way every open
+  ends a turn left running, and keeps its history. Every turn after it has
+  a boundary from the moment it starts (2026-09-27; until then the runtime
+  tolerated a missing one with `fork_point_unknown`).
 - **The fork keeps its source's window.** Today a fork's `context_start` is
   the carried compaction's cut, or NULL (db.rs:2978). The fork's first call
   then picks a new start at three quarters of the budget, which differs from

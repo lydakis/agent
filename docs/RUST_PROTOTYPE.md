@@ -1066,8 +1066,8 @@ the last result of its newest fully answered round, a steer absorbed at a
 round boundary, a final answer not yet finished, or the turn's prompt before
 any round finishes. The store keeps that node current as the turn appends, so
 this fork reads no transcript. The upgrade to schema 36, which began keeping
-it, refuses a store with a turn running or parked
-(`store_migration_turn_in_flight`), so every turn has one. A fork keeps its source's window start when the fork
+it, ends a turn left running or parked as interrupted, so every turn has
+one. A fork keeps its source's window start when the fork
 point is at or after it and carries the source's current compaction, so its
 first request can read the source's cache. `allow` narrows which of the
 source's tools the fork may call: absent keeps the source's list, `[]` allows
@@ -1288,10 +1288,10 @@ summary or elision changed the bot's view last; turns stored before record
 neither, so a [summary](#compaction) after them never takes their call as
 having sent the view. Schema 35 adds `bots.denials`, the [denial
 counts](#tool-approval); none were kept before, so every bot starts from
-none. Schema 36 keeps a running turn's newest finished round; a store with a
-turn running or parked is refused with `store_migration_turn_in_flight`,
-since that round cannot be read back without a transcript scan. End the
-turn with the earlier binary, or use a new store path. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
+none. Schema 36 keeps a running turn's newest finished round. That round
+cannot be read back without a transcript scan, so the upgrade ends a turn
+left parked the way every open ends a running one: interrupted, its calls
+answered, its history kept. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
 prompt; turns stored before record none, so they read as a person's.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
