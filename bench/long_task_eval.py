@@ -581,11 +581,17 @@ def hidden_tests(root):
         return 0, len(HIDDEN), 'convert did not run'
     passed, failure = 0, None
     for rows, answer in zip(HIDDEN, got):
-        if answer == expected(rows):
+        if exact(answer, expected(rows)):
             passed += 1
         elif failure is None:
             failure = {'rows': rows, 'got': answer, 'expected': expected(rows)}
     return passed, len(HIDDEN), failure
+
+
+def exact(got, want):
+    """Equal in value and in JSON type: 100.0 cents or True are not 100
+    or 1."""
+    return json.dumps(got, sort_keys=True) == json.dumps(want, sort_keys=True)
 
 
 def count_lines(path):
@@ -647,19 +653,19 @@ def step_command_faults(command, unread=False):
     background or detached returns a handle, not the output, so a step in
     it goes unread; so does a step in a command substitution, whose output
     goes to the command around it."""
-    # List separators, a lone `&` included, and the openings of command
-    # and process substitutions; `2>&1`, `&>` and `|&` are redirects and
-    # pipes, not separators.
-    parts = re.split(r'(&&|\|\||;|\n|(?<![>&|])&(?![&>])|\$\(|<\(|`)', command)
-    segments, openers = parts[0::2], [''] + parts[1::2]
+    # List separators, a lone `&` included, pipeline stages, and the
+    # openings of command and process substitutions; `2>&1` and `&>` are
+    # redirects, not separators.
+    parts = re.split(r'(&&|\|\||\|&?|;|\n|(?<![>&|])&(?![&>])|\$\(|<\(|`)', command)
+    segments, openers, closers = parts[0::2], [''] + parts[1::2], parts[1::2] + ['']
     runs = [bool(STEP_RUN.match(segment)) for segment in segments]
     steps = [segment for segment, run in zip(segments, runs) if run]
     substituted = any(run and opener in ('$(', '<(', '`') for run, opener in zip(runs, openers))
 
-    def sends(segment):
-        return '|' in segment or '>' in segment.replace('2>&1', '')
-    filtered = (unread or substituted) and bool(steps) or any(sends(step) for step in steps) or any(
-        GROUP_END.match(segment) and sends(segment) and any(runs[:n]) for n, segment in enumerate(segments))
+    def sends(n):
+        return closers[n] in ('|', '|&') or '>' in segments[n].replace('2>&1', '')
+    filtered = (unread or substituted) and bool(steps) or any(sends(n) for n, run in enumerate(runs) if run) or any(
+        GROUP_END.match(segment) and sends(n) and any(runs[:n]) for n, segment in enumerate(segments))
     looped = any(re.match(r'[\s({]*do\s', step) for step in steps) or bool(
         re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
     return filtered, len(steps) > 1 or looped
@@ -667,12 +673,11 @@ def step_command_faults(command, unread=False):
 
 def close_workflow(root, closes):
     """Each close's steps, from the same record: whether a passing check
-    of the close, or of every close, came before the settlement that
-    stands, whether its benchmark ran after it was first settled, how
-    often it was settled and where it first was, and whether its
-    settlement file holds the right entries. A close settled again after
-    the correction needs no second benchmark, since its number does not
-    change."""
+    of the close, or of every close, came before it was first settled and
+    its benchmark after, how often it was settled and where it first was,
+    and whether its settlement file holds the right entries. A close
+    settled again after the correction needs no second check or
+    benchmark, since its number does not change."""
     log = root / '.steps.log'
     runs = [line.split()[:2] for line in log.read_text().splitlines()] if log.exists() else []
     out = {}
@@ -686,9 +691,9 @@ def close_workflow(root, closes):
             entries = None
         out[month] = {'settle_runs': len(settled), 'first_settled_at': settled[0] if settled else None,
                       'bench_runs': len(benched),
-                      'checked_before_settle': bool(settled) and any(n < settled[-1] for n in checks),
+                      'checked_before_settle': bool(settled) and any(n < settled[0] for n in checks),
                       'benched_after_settle': bool(settled) and any(n > settled[0] for n in benched),
-                      'settled_correctly': entries == facts['entries']}
+                      'settled_correctly': exact(entries, facts['entries'])}
     return out
 
 
@@ -717,44 +722,33 @@ def close_labels(text, months):
     return sorted(labels)
 
 
-def column_label(header, line, position, months):
-    """The close a number heads under when the labels above it run across
-    a line: the label in its table cell, or with no table, the label in
-    its place when the line has one number for each."""
-    if '|' in header and '|' in line:
-        cells = header.split('|')
-        cell = line[:position].count('|')
-        labels = close_labels(cells[cell], months) if cell < len(cells) else []
-        return labels[0][1] if len(labels) == 1 else None
-    labels = [month for _, month in close_labels(header, months)]
-    values = [found.start() for found in re.finditer(r'(?<![\d.])\d+(?!\.?\d)', line)]
-    return labels[values.index(position)] if len(values) == len(labels) and position in values else None
-
-
 def reported_closes(answer, numbers):
     """The closes an answer gives its own number for: the number whole, as
-    `reports` finds it, under that close's label. A number's label is the
-    last close label before it on its line, else the first after it on its
-    line. With none on its line, it is the label its column heads when the
-    last labelled line above holds several, as a table's heading row does,
-    else that line's last label."""
-    reported, above, header = set(), None, None
+    `reports` finds it, under that close's label. A line that names as
+    many closes as it gives close numbers pairs them in order, as in
+    `2026-01: n, 2026-02: m` or `January and February: n and m`;
+    otherwise a number's label is the last before it on its line, else the
+    first after it. A line with numbers and no labels pairs them in order
+    with the last labelled line above when that names as many, as under a
+    table's heading row, else takes its label when it names one."""
+    reported, above = set(), []
     for line in (answer or '').replace(',', '').splitlines():
         labels = close_labels(line, numbers)
-        for month, number in numbers.items():
-            for found in whole(number).finditer(line):
-                before = [label for start, label in labels if start < found.start()]
-                after = [label for start, label in labels if start > found.start()]
-                if labels:
-                    label = (before[-1:] or after[:1])[0]
-                elif header is not None:
-                    label = column_label(header, line, found.start(), numbers)
-                else:
-                    label = above
-                if label == month:
-                    reported.add(month)
-        if labels:
-            above, header = labels[-1][1], line if len(labels) > 1 else None
+        found = sorted((hit.start(), month) for month, number in numbers.items()
+                       for hit in whole(number).finditer(line))
+        names = [label for _, label in labels]
+        if found and len(names) == len(found):
+            pairs = zip(names, found)
+        elif labels:
+            pairs = [(([label for start, label in labels if start < at][-1:]
+                       or [label for start, label in labels if start > at][:1])[0], (at, month))
+                     for at, month in found]
+        elif len(above) == len(found):
+            pairs = zip(above, found)
+        else:
+            pairs = [(above[0], hit) for hit in found] if len(above) == 1 else []
+        reported |= {month for label, (_, month) in pairs if label == month}
+        above = names or above
     return reported
 
 

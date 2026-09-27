@@ -237,9 +237,10 @@ class LongTaskScoreTests(unittest.TestCase):
                      answer=' '.join(f'{m}: 1{numbers[m]}' if m == MONTHS[0] else f'{m}: {numbers[m]:,}.'
                                      for m in MONTHS))
         self.assertEqual(longer['closes_reported'], 2)
-        # Each number counts under its own close's label: before it on its
-        # line, else after it on its line, else on a line above. A label is
-        # the month or its name.
+        # Each number counts under its own close's label: in order when a
+        # line names as many closes as it gives numbers, else the nearest
+        # before it on its line, else after it, else on a line above. A
+        # label is the month or its name.
         for answer, reported in (
                 (' '.join(f'{m}: {numbers[m]}' for m in MONTHS), 3),
                 (f'{MONTHS[1]}: {numbers[MONTHS[0]]}, {MONTHS[0]}: {numbers[MONTHS[1]]}, '
@@ -249,6 +250,9 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('\n'.join(f'{name}:\n- throughput {numbers[m]}'
                            for name, m in zip(('January', 'Feb', 'March'), MONTHS)), 3),
                 (' '.join(str(numbers[m]) for m in MONTHS), 0),
+                (f'January and February: {numbers[MONTHS[0]]} and {numbers[MONTHS[1]]} rows/s, respectively; '
+                 f'March: {numbers[MONTHS[2]]}', 3),
+                (', '.join(f'{numbers[m]} ({m})' for m in MONTHS), 3),
                 # Across a line, as a table's heading row or a plain one.
                 ('| Close | ' + ' | '.join(MONTHS) + ' |\n|---|---|---|---|\n| Throughput | '
                  + ' | '.join(str(numbers[m]) for m in MONTHS) + ' |', 3),
@@ -270,6 +274,22 @@ class LongTaskScoreTests(unittest.TestCase):
         benched_first = run(*setup, HALF_EVEN, f'make check CLOSE={MONTHS[0]}', f'make bench CLOSE={MONTHS[0]}',
                             f'tools/settle {MONTHS[0]}', *[step for month in MONTHS[1:] for step in close(month)])
         self.assertFalse(benched_first['closes'][MONTHS[0]]['benched_after_settle'])
+        # The check, first settlement and benchmark are one attempt, not
+        # pieces of several.
+        pieces = run(*setup, HALF_EVEN, f'tools/settle {MONTHS[0]}', f'make bench CLOSE={MONTHS[0]}',
+                     f'make check CLOSE={MONTHS[0]}', f'tools/settle {MONTHS[0]}',
+                     *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertTrue(pieces['correct'])
+        self.assertFalse(pieces['closes'][MONTHS[0]]['checked_before_settle'] or pieces['followed_workflow'])
+        # Cents must be integers, in the settlement and from convert.
+        floats = run(*setup, HALF_EVEN, *closed, "python3 -c \"import json; p = 'out/" + MONTHS[0] + ".json'; "
+                     "e = json.load(open(p)); [x.update(cents=float(x['cents'])) for x in e]; "
+                     "json.dump(e, open(p, 'w'))\"")
+        self.assertEqual(floats['closes_settled_correctly'], 2)
+        self.assertFalse(floats['correct'])
+        float_convert = run(*setup, HALF_EVEN.replace('cents=int(', 'cents=float('), *closed)
+        self.assertFalse(float_convert['correct'])
+        self.assertTrue(float_convert['hidden_tests'].startswith('0/'), float_convert['hidden_tests'])
         whole = run(*setup, HALF_EVEN, 'make check', *[step for month in MONTHS for step in close(month)[1:]])
         self.assertTrue(whole['followed_workflow'], whole['closes'])
         # Every close's own steps in order, but the closes out of it.
@@ -458,7 +478,11 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('out=$(make check CLOSE=2026-01); printf %s "$out" | tail -1', (True, False)),
                 ('n=`make bench CLOSE=2026-01`', (True, False)),
                 ('diff <(tools/settle 2026-01) expected', (True, False)),
-                ('d=$(date); make check CLOSE=2026-01', (False, False))):
+                ('d=$(date); make check CLOSE=2026-01', (False, False)),
+                # A later stage of a pipeline is a step too.
+                ('printf x | make check CLOSE=2026-01 >log', (True, False)),
+                ('printf x | tools/settle 2026-01', (False, False)),
+                ('echo y | tools/settle 2026-01 | tail -3', (True, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 
