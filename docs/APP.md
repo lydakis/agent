@@ -368,7 +368,9 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
 2. The first release: create the tap, set the secrets, tag `v0.1.0`.
-3. The rest of the projects design (the "Agent App Concepts" prototype), in
+3. Refuse a `~/.agent/env` that a macOS ACL makes readable by other
+   accounts; today only its POSIX mode is checked.
+4. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
 
 ## Regression checks
