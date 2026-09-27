@@ -2801,20 +2801,18 @@ impl Turn {
             }
         }
         // A bot waits only on commands it started; one its history
-        // inherited from a fork's source is not its to collect.
+        // inherited from a fork's source is not its to collect. An owned
+        // command stays owned, so checking before the wait parks is enough.
         if !processes.is_empty() {
             let bot = self.bot.clone();
-            let foreign = self
+            let refused = self
                 .store
-                .op("foreign_processes", move |db| {
-                    db.foreign_processes(&bot, &processes)
+                .op("unowned_process", move |db| {
+                    db.unowned_process(&bot, &processes)
                 })
                 .await?;
-            if let Some(id) = foreign.first() {
-                return Ok(ControlFlow::Continue(failure(Error::with(
-                    "handle_unavailable",
-                    format!("proc:{id} was started by another agent"),
-                ))));
+            if let Some(error) = refused {
+                return Ok(ControlFlow::Continue(failure(error)));
             }
         }
         // Only move the remaining calls once this wait can actually park.

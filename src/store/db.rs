@@ -3298,7 +3298,16 @@ impl Database {
                     .to_owned(),
             };
             // A fork without a checkpoint starts at the running turn's
-            // newest finished round, or at the head of an idle bot.
+            // newest finished round, or at the head of an idle bot. A turn
+            // from before that round was kept has none to offer yet.
+            let forkable = bot.running_turn.is_none()
+                || self
+                    .conn
+                    .prepare_cached("SELECT closed IS NOT NULL FROM bots WHERE name=?")?
+                    .query_row([name], |r| r.get::<_, bool>(0))?;
+            if !forkable {
+                return fail_with("bot_busy", wait);
+            }
             return fail_with(
                 "bot_busy",
                 format!(
@@ -4993,21 +5002,34 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
-    /// Of these background commands, the ones another bot started. A bot
-    /// waits only on its own: a fork's history can hold its source's
-    /// `proc:N`, and resolving it would hand the fork its source's result.
-    pub fn foreign_processes(&self, bot: &str, ids: &[i64]) -> Result<Vec<i64>> {
+    /// Why a bot may not wait on one of these background commands, if it
+    /// may not. A bot waits only on its own: a fork's history can hold its
+    /// source's `proc:N`, and resolving it would hand the fork its source's
+    /// result. An id with no command yet is refused too, since another bot
+    /// could start it before the wait attaches.
+    pub fn unowned_process(&self, bot: &str, ids: &[i64]) -> Result<Option<Error>> {
         let mut owner = self.conn.prepare_cached(
             "SELECT t.bot FROM processes p JOIN turns t ON t.id=p.turn WHERE p.id=?",
         )?;
-        let mut foreign = Vec::new();
         for id in ids {
             let started: Option<String> = owner.query_row([id], |r| r.get(0)).optional()?;
-            if started.is_some_and(|started| started != bot) {
-                foreign.push(*id);
+            match started {
+                None => {
+                    return Ok(Some(Error::with(
+                        "unknown_handle",
+                        format!("proc:{id} does not exist"),
+                    )));
+                }
+                Some(started) if started != bot => {
+                    return Ok(Some(Error::with(
+                        "handle_unavailable",
+                        format!("proc:{id} was started by another agent"),
+                    )));
+                }
+                Some(_) => {}
             }
         }
-        Ok(foreign)
+        Ok(None)
     }
     /// The wait result at `node` delivered these finished commands; a fork
     /// may read their stored output only if its history holds that node.
@@ -6192,8 +6214,10 @@ fn deny(
         return fail("invalid_tool_state");
     }
     let head = node(tx, bot.head, &item)?;
+    // A denial answers its call like a result does, and can close the round.
     tx.execute(
-        "UPDATE bots SET head=? WHERE name=?",
+        "UPDATE bots SET head=?1,open_calls=open_calls-1,
+         closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
         params![head, bot.name],
     )?;
     let mut data = json!({"call_id":call_id,"node":head,"artifacts":[],"denied":true,

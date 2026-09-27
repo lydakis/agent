@@ -2718,11 +2718,17 @@ fn a_fork_waits_on_its_own_commands_and_reads_only_delivered_output() {
         .unwrap();
     // The fork's history holds the handle, but the command is Bob's.
     db.fork("Bob", "early", Fork::default()).unwrap();
+    let refused = |db: &Database, bot, id| db.unowned_process(bot, &[id]).unwrap().map(|e| e.code);
     assert_eq!(
-        db.foreign_processes("early", &[process]).unwrap(),
-        [process]
+        refused(&db, "early", process),
+        Some("handle_unavailable".into())
     );
-    assert!(db.foreign_processes("Bob", &[process]).unwrap().is_empty());
+    assert_eq!(refused(&db, "Bob", process), None);
+    // A command not started yet could be started by anyone before the wait attaches.
+    assert_eq!(
+        refused(&db, "Bob", process + 1),
+        Some("unknown_handle".into())
+    );
     db.process_finish(
         process,
         &json!({"stdout":"large"}),
@@ -2798,6 +2804,19 @@ fn schema_36_refuses_a_default_fork_of_a_turn_from_before_it() {
         db.fork("Bob", "early", Fork::default()).unwrap_err().code,
         "fork_point_unknown"
     );
+    // So a busy submission is not pointed at that fork.
+    let busy = db
+        .begin(
+            "Bob",
+            "r3",
+            "ask",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap_err();
+    assert_eq!(busy.code, "bot_busy");
+    assert!(!busy.detail.unwrap().contains("fork"));
     // An explicit point still works, and the next response lifts the refusal.
     let prompt = head(&db, "Bob") - 1;
     db.fork(
@@ -8530,4 +8549,30 @@ fn schema_37_keeps_every_bot_its_tools() {
     assert_eq!((bob.allowed.as_deref(), bob.callable()), (None, &READ[..]));
     drop(db);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_denied_call_closes_its_round() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (item, call) = shell_call("fc_1", "s1", "true");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason: Some("no"),
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &call, 0).unwrap(),
+        Gated::Denied
+    ));
+    let denied = head(&db, "Bob");
+    assert_eq!(fork_point(&mut db, "Bob", "after").unwrap(), denied);
 }

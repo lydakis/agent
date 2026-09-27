@@ -182,7 +182,7 @@ class WaitTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results'][handle]['exit_code'], 3)
         unknown = client.request('submit', bot='Bob', request_id='w3', prompt='wait:proc:999')['result']['turn']
         self.assertEqual(client.finished(unknown)['data']['status'], 'completed')
-        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results']['proc:999']['error'], 'unknown_handle')
+        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['error'], 'unknown_handle')
 
     def test_a_fork_cannot_collect_its_sources_background_command(self):
         client = self.client('echo,shell,wait')
