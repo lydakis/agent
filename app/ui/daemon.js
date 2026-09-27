@@ -250,7 +250,6 @@ window.Daemon = (() => {
           for(const node of params.nodes) {const item=S.nodes.get(node),size=JSON.stringify(item).length*2;if(items.length && bytes+size>768*1024)break;items.push({node,item});bytes+=size;}
           return {items};
         }
-        case 'item': { const item = S.nodes.get(params.node); if (!item) throw new Error('item_not_in_bot_history'); return item; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');

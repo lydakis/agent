@@ -269,7 +269,7 @@ pinned the same day (Gemini CLI `2fe7c2d`, goose `04ed836`, OpenHands SDK
   `approvals` lists, adds an `arguments` preview to 2,048 characters with
   `arguments_truncated`, as `tool_started` already does, taken from the
   node the worker has just written; an approver reads a longer one (a
-  large `write`) with `item` on that call's node. Bot followers get the
+  large `write`) with `history_items` on that call's node. Bot followers get the
   compact event. One event per round, not per call, and no extra commit.
 - **`answer` decides one request.**
   `{"op":"answer","bot","turn","call_id","request","tag"?,"decision":"allow"|"deny","reason"?,"by"?,"lease"?}`.
@@ -659,7 +659,7 @@ order: the environment note, the root person's prompt for this turn, the
 current turn's prompt and its steers, each marked as a person's or a
 model's words, the calls being judged, the calls already allowed, and
 then earlier prompts newest first until a 16k-token budget is spent. The
-calls being judged are sent whole, read with `item` when their preview
+calls being judged are sent whole, read with `history_items` when their preview
 was cut, and so is any file written this turn that one of them runs. So
 are the already allowed shell and caller-registered calls, since a
 one-time request is used up by a call that did it and a deploy past a
@@ -1118,7 +1118,7 @@ Where it differs from the design above:
 Built on 2026-09-27, the automatic approver:
 
 - `agent approver`: serves a tag, groups each round's calls, reads what
-  the judge is shown with `prompts` and `item`, follows delegations up to
+  the judge is shown with `prompts` and `history_items`, follows delegations up to
   8 turns to the person's words (a deeper chain, more than 64 delegating
   turns, or more prompt text across them than one 128 KiB read holds, is
   judged too long), redacts, and asks one judge request per

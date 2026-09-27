@@ -933,6 +933,22 @@ impl From<agent_client::Error> for Unjudged {
     }
 }
 
+/// The item a planned call's node holds. One too large to read whole is too
+/// long to judge.
+async fn node_item(
+    client: &Client,
+    bot: &str,
+    node: &Value,
+) -> std::result::Result<Value, Unjudged> {
+    let read = client
+        .request("history_items", json!({"bot":bot,"nodes":[node]}))
+        .await?;
+    match &read["items"][0] {
+        entry if entry["error"] == "item_too_large" => Err(Unjudged::TooLong),
+        entry => Ok(entry["item"].clone()),
+    }
+}
+
 /// What the judge is shown for a round, read from the daemon: the words the
 /// turn answers to, followed up delegations to the person's own; the calls
 /// being judged, whole; the calls the turn already ran; earlier prompts.
@@ -986,9 +1002,7 @@ async fn intent(
         let arguments = match whole {
             true => call["arguments"].clone(),
             false => {
-                let item = client
-                    .request("item", json!({"bot":bot,"node":call["node"]}))
-                    .await?;
+                let item = node_item(client, bot, &call["node"]).await?;
                 policy::call_arguments(&item, call["call_id"].as_str().unwrap_or_default())
                     .ok_or(Unjudged::Failed)?
             }
@@ -1026,9 +1040,7 @@ async fn intent(
                     json!(preview)
                 }
                 Some(node) => {
-                    let item = client
-                        .request("item", json!({"bot":bot,"node":node}))
-                        .await?;
+                    let item = node_item(client, bot, &json!(node)).await?;
                     policy::call_arguments(&item, call["call_id"].as_str().unwrap_or_default())
                         .ok_or(Unjudged::Failed)?
                 }

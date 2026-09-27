@@ -288,12 +288,11 @@ checks use the turn's running total without an extra database read per round.
 
 `turns` (protocol) and `agent turns --bot NAME` list a bot's turns with status,
 effective workspace and model, tokens, rounds, timing, and a prompt preview,
-paged by `after`. `result` and `agent result --bot NAME --turn N` return a
-finished turn's outcome in the same shape a `wait` produces, or its live status
-without blocking; the command exits 0 only for a completed turn. Both query
-commands restart an idle daemon using the supplied provider/tool configuration
-(or provider environment defaults), honor `--no-spawn`, and refuse missing stores.
-They do not submit new model work; existing parked work may resume on startup.
+paged by `after`. A finished turn's outcome comes from `wait` on its handle;
+`timeout_ms: 0` answers at once, pending while the turn runs. `agent turns`
+restarts an idle daemon using the supplied provider/tool configuration (or
+provider environment defaults), honors `--no-spawn`, and refuses missing stores.
+It does not submit new model work; existing parked work may resume on startup.
 
 A truncated shell result names its retained streams as `artifacts`, for
 example `["12/call_abc/stdout"]`, and the model can page through one with
@@ -834,13 +833,11 @@ own path from the turn. Example requests:
 {"id":3,"op":"follow","bot":"Bob","after":0}
 {"id":4,"op":"resume","bot":"Bob"}
 {"id":5,"op":"events","bot":"Bob","after":0,"limit":100}
-{"id":6,"op":"item","bot":"Bob","node":2}
 {"id":20,"op":"history_nodes","bot":"Alternative","from":2,"limit":400}
-{"id":7,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1"}
+{"id":6,"op":"history_items","bot":"Bob","nodes":[2]}
 {"id":13,"op":"artifact","bot":"Bob","turn":1,"call_id":"call_1","stream":"stdout","offset":0,"limit":65536}
 {"id":8,"op":"fork","source":"Bob","checkpoint":2,"bot":"Alternative"}
 {"id":9,"op":"interrupt","bot":"Bob","turn":1}
-{"id":10,"op":"unfollow","bot":"Bob"}
 {"id":11,"op":"bots","after":null,"limit":64}
 {"id":14,"op":"prune","bot":"Bob","keep_turns":8}
 {"id":15,"op":"delete","bot":"Bob"}
@@ -864,13 +861,13 @@ own path from the turn. Example requests:
 including inherited fork history. `from` is an inclusive node ID and defaults to
 the current head. The response contains `nodes: [{node: ID, turn: TURN_ID}, ...]` and
 `next_from`, the next older node or null at the root. `limit` defaults to 400
-and must be 1 through 400. Bodies are fetched through `item`; pagination does
+and must be 1 through 400. Bodies are fetched through `history_items`; pagination does
 not copy bodies. `min_node` optionally bounds the oldest included ID.
 `oldest_first: true` selects the oldest page within that range while still
 returning its nodes newest first; `next_newer` is the inclusive minimum ID for
 the next forward page, or null. This lets clients retain only range endpoints.
 Turn IDs are inherited from each node's nearest turn-start ancestor.
-Membership validation walks the lineage, as `item` does. Both operations run
+Membership validation walks the lineage, as `history_items` does. Both operations run
 on the read worker in a consistent snapshot, avoiding the serialized writer.
 The fork can read its shared prefix after its source is deleted.
 
@@ -988,7 +985,7 @@ creations before an already-consumed cursor require restarting the listing.
 `agent ls` reads pages incrementally while preserving its JSON-array output.
 
 Replay tasks are owned by their subscriptions and tracked by the service.
-`unfollow`, replacing a follow on the same bot/session, and session closure
+Replacing a follow on the same bot/session and session closure
 cancel the old replay. Notifications already queued can precede the operation's
 reply, but no old replay events follow its acknowledgment. Shutdown cancels and
 drains remaining replay tasks before joining the stdout worker. Socket paths have independent ownership locks. Live sockets,
@@ -1018,16 +1015,13 @@ the running turn), and
 turn's carries `into` and `node`). A `submit` response includes the turn's
 `handle`, `turn:BOT/N`, and its `status`.
 
-For bounded artifact retrieval, specify a `stream` from `tool_completed`, a
-UTF-8 byte `offset` (default 0), and a byte `limit` (4 through 65,536, default
-65,536). The response contains `text`, `next_offset`, `total_bytes`, and `done`.
-Continue at the returned offset until done. Pages never split a UTF-8 character;
-an offset inside a character is rejected. Only the selected page is returned
-from SQLite to Rust for the response.
-The original operation without `stream` returns all streams for small artifacts;
-it may return `response_size_limit`, in which case use pages. Offset and limit
-require a stream. This keeps even escaped, multi-stream artifacts retrievable
-within the 1 MiB response bound.
+`artifact` reads one retained stream a page at a time: a `stream` from
+`tool_completed` (required), a UTF-8 byte `offset` (default 0), and a byte
+`limit` (4 through 65,536, default 65,536). The response contains `text`,
+`next_offset`, `total_bytes`, and `done`. Continue at the returned offset until
+done. Pages never split a UTF-8 character; an offset inside a character is
+rejected. Only the selected page is returned from SQLite to Rust for the
+response, so any artifact stays retrievable within the 1 MiB response bound.
 
 `created_by` and `created_by_id` on `create` and `fork` declare the bot
 on whose behalf the client acts. Supply both or neither. The CLI captures them
@@ -1110,7 +1104,7 @@ A missing bot never creates a replacement implicitly.
 
 `delivery` on `submit` says what happens when the bot is busy or the daemon
 is at `--max-active`. It is one field with three values; every mode returns
-the turn's id and handle at once, and `wait`, `result`, `turns`, and
+the turn's id and handle at once, and `wait`, `turns`, and
 `interrupt` work on the turn unchanged.
 
 - `reject` (default): `bot_busy` while a turn runs or is parked,
@@ -1331,9 +1325,9 @@ automatically continue an interrupted network request. A new submission is an
 explicit new turn. Partial streaming text is marked `durable:false` and can be
 lost on crash. Completed messages survive. Paged `events` replay returns durable
 records; message/tool-result records reference stored nodes retrievable through
-`item`, avoiding another transcript copy in the event table. Cursors are store-wide
+`history_items`, avoiding another transcript copy in the event table. Cursors are store-wide
 monotonic IDs, and queries are filtered to the requested bot. History loads and
-lineage checks use recursive queries, so `item` and `fork` cost one query each
+lineage checks use recursive queries, so `history_items` and `fork` cost one query each
 instead of a walk per node. Retention is explicit; see [Retention](#retention).
 
 Event pages stop at either the requested count or a 512 KiB encoded-entry budget.
@@ -1499,7 +1493,7 @@ continues its source's. The `history` tool returns one turn's prompt, replies,
 tool calls, and results as provider JSONL with only the top-level
 `encrypted_content` field removed from reasoning items. Reasoning records and
 readable summaries remain, as do Anthropic thinking and signatures. Stored
-items, raw `item` reads, forks, and provider replay remain unchanged. The reading
+items, raw `history_items` reads, forks, and provider replay remain unchanged. The reading
 view removes insignificant JSON whitespace from multiline provider items so
 each occupies one JSONL record. Single-line items need no whitespace rewrite;
 whitespace inside text strings remains intact. Pages
@@ -1612,11 +1606,11 @@ needs, and one optional policy composes them:
   Running process rows survive so their results can commit; a later prune
   removes those results after completion. The
   transcript and the turn rows themselves stay, so the context window, the
-  `history` tool, `item`, forks, and accounting are unaffected; what shrinks
-  is replay and artifact retrieval. `result` and new `wait` calls for an expired
+  `history` tool, `history_items`, forks, and accounting are unaffected; what shrinks
+  is replay and artifact retrieval. New `wait` calls for an expired
   turn outcome return `turn_result_pruned`; they never report an empty success.
   On a pruning notice, `agent run` and `agent follow` reconcile their selected
-  turn through `result`, so retries of expired turns exit with that error
+  turn through a zero-timeout `wait`, so retries of expired turns exit with that error
   instead of waiting for a terminal event that no longer exists.
   Existing waiters can still receive the completion captured before pruning.
   The bot remembers the highest pruned
@@ -1943,7 +1937,7 @@ cumulative savings through its floor. A node's bytes as sent are then its
 byte total less the smaller of the two, so the window, turn admission, and
 compaction accounting stay constant-time lookups and read no item. A
 request reads the stub in place of the result's row. The stored transcript
-is never rewritten: `item`, `history`, and forks see every result whole,
+is never rewritten: `history_items`, `history`, and forks see every result whole,
 and `read` with `result/NODE` returns one on the bot's own lineage. A
 shell result is one JSON line, often longer than a `read` page, so that
 read splits lines longer than 4 KiB into numbered pieces and pages them.
@@ -2208,7 +2202,7 @@ families, stale interruption, cancellation, rejection of a second storage owner,
 missing provider completion, the socket daemon started by `run`, delegation from
 a shell tool through `$AGENT_BIN`, follow replay then live delivery, and
 artifact retention. Additional regressions cover slow RPC readers, cancellation
-of replay on unfollow/replacement, explicit store selection despite an inherited
+of replay on follow replacement, explicit store selection despite an inherited
 socket, and startup/reconnection with deeply nested store paths. Rust tests cover shared prefix allocation, history bounds,
 slow-consumer queue pressure, transactional tool outcomes, replay pagination,
 both stream parsers, file tools, and provider spec parsing.

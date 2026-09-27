@@ -15,7 +15,7 @@ import time
 import unittest
 
 from bench.targets import clean_env
-from bench.runtime_client import Client, serve_args
+from bench.runtime_client import Client, node_item, poll, serve_args
 
 # Longer than 256 bytes, with text a shell would run if pasted unquoted.
 ODD_CALL_ID = "odd $(touch pwned) 'x'\n" + 'L' * 300
@@ -942,7 +942,7 @@ class RuntimeTests(ModelFixture):
             self.assertEqual(client.finished(turn)['data']['status'], 'completed')
             events = client.request('events', bot='Bob', after=0, limit=64)['result']['events']
             completed = next(e for e in events if e['turn'] == turn and e['event'] == 'tool_completed')
-            output = client.request('item', bot='Bob', node=completed['data']['node'])['result']['output']
+            output = node_item(client, 'Bob', completed['data']['node'])['result']['output']
             return json.loads(output)
 
         first = result('detach:exec sleep 30', 'first')
@@ -1091,7 +1091,7 @@ class RuntimeTests(ModelFixture):
         self.assertGreaterEqual(time.monotonic() - started, .25)
         self.assertEqual(client.process.wait(timeout=3), 0)
         restarted = self.client()
-        result = restarted.request('result', bot='Bob', turn=turn)['result']
+        result = poll(restarted, 'Bob', turn)['result']
         self.assertEqual((result['status'], result['error']), ('interrupted', 'daemon_shutdown'))
 
     def held_admissions(self, client, count):
@@ -1266,7 +1266,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual([t['name'] for t in first['tools']], ['echo'])
         events = client.request('events', bot='Echo', after=0, limit=64)['result']['events']
         done = [e for e in events if e['event'] == 'tool_completed'][0]
-        output = client.request('item', bot='Echo', node=done['data']['node'])['result']['output']
+        output = node_item(client, 'Echo', done['data']['node'])['result']['output']
         self.assertEqual(json.loads(output)['error'], 'tool_not_available')
         turn = client.request('submit', bot='Both', request_id='1', prompt='shell:true')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
@@ -1312,7 +1312,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(json.dumps(first['input'][:len(last['input'])]), json.dumps(last['input']))
         events = client.request('events', bot='Answer', after=0, limit=64)['result']['events']
         done = [e for e in events if e['event'] == 'tool_completed'][0]
-        output = client.request('item', bot='Answer', node=done['data']['node'])['result']['output']
+        output = node_item(client, 'Answer', done['data']['node'])['result']['output']
         self.assertEqual(json.loads(output)['error'], 'tool_not_available')
         self.assertEqual(client.request('resume', bot='Answer')['result']['allowed'], [])
 
@@ -1373,7 +1373,7 @@ class RuntimeTests(ModelFixture):
         client = self.client()
         later = client.request('submit', bot='Bob', request_id='2', prompt='back')['result']['turn']
         self.assertEqual(client.finished(later)['data']['status'], 'completed')
-        self.assertEqual(client.request('result', bot='Bob', turn=later)['result']['text'], 'reply:back')
+        self.assertEqual(poll(client, 'Bob', later)['result']['text'], 'reply:back')
 
     def test_fork_from_a_mid_turn_message_and_from_the_head(self):
         client = self.client('echo,shell')
@@ -1499,7 +1499,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual((self.path / 'artifact').read_text(), 'created')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         node = next(e['data']['node'] for e in events if e['event'] == 'tool_completed')
-        result = json.loads(client.request('item', bot='Bob', node=node)['result']['output'])
+        result = json.loads(node_item(client, 'Bob', node)['result']['output'])
         self.assertEqual((result['stdout'], result['stderr'], result['exit_code']), ('stdout', 'stderr', 0))
         turn = client.request('submit', bot='Bob', request_id='cancel',
                               prompt='shell:sleep 30 & echo $! > child.pid; wait')['result']['turn']
@@ -1524,7 +1524,7 @@ class RuntimeTests(ModelFixture):
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         killed = [e for e in events if e['event'] == 'tool_completed' and e['turn'] == turn]
         self.assertEqual(len(killed), 1)
-        output = json.loads(client.request('item', bot='Bob', node=killed[0]['data']['node'])['result']['output'])
+        output = json.loads(node_item(client, 'Bob', killed[0]['data']['node'])['result']['output'])
         self.assertEqual(output['error'], 'tool_outcome_unknown')
         self.assertIn('may still be running', output['detail'])
         again = client.request('submit', bot='Bob', request_id='retry', prompt='hi')['result']['turn']
@@ -1625,7 +1625,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         node = next(e['data']['node'] for e in events if e['event'] == 'tool_completed')
-        output = client.request('item', bot='Bob', node=node)['result']['output']
+        output = node_item(client, 'Bob', node)['result']['output']
         # Assert booleans so even a failed test never prints the credential value.
         self.assertTrue(json.loads(output)['stdout'] == 'unset:preserved')
         self.assertFalse(sentinel in output)
@@ -1638,7 +1638,7 @@ class RuntimeTests(ModelFixture):
         events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         for event in events:
             if 'node' in event['data']:
-                item = client.request('item', bot='Bob', node=event['data']['node'])['result']
+                item = node_item(client, 'Bob', event['data']['node'])['result']
                 self.assertFalse(sentinel in json.dumps(item))
         self.assertEqual(len(self.model.auth_checks), 4)
         self.assertTrue(all(self.model.auth_checks))
@@ -1718,7 +1718,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(len(client.request('events', bot='Bob', after=0, limit=256)['result']['events']), 5 * 4 + 1)
         turn = client.request('submit', bot='Bob', request_id='h', prompt='history:1')['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
-        final = client.request('result', bot='Bob', turn=turn)['result']['text']
+        final = poll(client, 'Bob', turn)['result']['text']
         self.assertTrue(final.startswith('echo:'))
         read = json.loads(final[5:])
         self.assertEqual(read['turn'], 1)
@@ -1727,12 +1727,12 @@ class RuntimeTests(ModelFixture):
         self.assertNotIn('p2', read['text'])
         turn = client.request('submit', bot='Bob', request_id='h9', prompt='history:9')['result']['turn']
         client.finished(turn)
-        self.assertIn('turn_not_in_history', client.request('result', bot='Bob', turn=turn)['result']['text'])
+        self.assertIn('turn_not_in_history', poll(client, 'Bob', turn)['result']['text'])
         # A fork sees the same lineage and computes its own window over it.
         client.request('fork', source='Bob', bot='branch', workspace=str(self.path))
         turn = client.request('submit', bot='branch', request_id='b', prompt='history:2')['result']['turn']
         client.finished(turn)
-        self.assertIn('reply:p2', client.request('result', bot='branch', turn=turn)['result']['text'])
+        self.assertIn('reply:p2', poll(client, 'branch', turn)['result']['text'])
         while not self.model.requests.empty():
             requests.append(self.model.requests.get())
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
@@ -1754,7 +1754,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('prune', bot='Bob', keep_turns=1)['result']['events'], 4)
         self.assertEqual(client.request('prune', bot='Bob', keep_turns=0)['error'], 'invalid_retention')
         first = [e for e in page['events'] if e['event'] == 'message'][0]['data']['node']
-        self.assertEqual(client.request('item', bot='Bob', node=first)['result']['content'][0]['text'], 'reply:p2')
+        self.assertEqual(node_item(client, 'Bob', first)['result']['content'][0]['text'], 'reply:p2')
         # A follower asking for pruned history is told so before the rest.
         client.request('follow', bot='Bob', after=0)
         self.assertEqual(client.receive(lambda m: m.get('event') == 'pruned')['bot'], 'Bob')
@@ -1777,12 +1777,12 @@ class RuntimeTests(ModelFixture):
         old = client.request('submit', bot='Bob', request_id='bg',
                              prompt='bg:while [ ! -f release ]; do sleep .01; done; printf done')['result']['turn']
         client.finished(old)
-        text = client.request('result', bot='Bob', turn=old)['result']['text']
+        text = poll(client, 'Bob', old)['result']['text']
         handle = json.loads(text.removeprefix('echo:'))['handle']
         self.assertEqual(client.request('delete', bot='Bob')['error'], 'bot_busy')
         later = client.request('submit', bot='Bob', request_id='next', prompt='next')['result']['turn']
         client.finished(later)
-        self.assertEqual(client.request('result', bot='Bob', turn=old)['error'], 'turn_result_pruned')
+        self.assertEqual(poll(client, 'Bob', old)['error'], 'turn_result_pruned')
         waited = client.request('wait', handles=[f'turn:Bob/{old}'], timeout_ms=100)['result']['results']
         self.assertEqual(waited[f'turn:Bob/{old}']['error'], 'turn_result_pruned')
         (self.path / 'release').touch()

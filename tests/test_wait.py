@@ -9,7 +9,7 @@ import threading
 import time
 import unittest
 
-from bench.runtime_client import Client, serve_args
+from bench.runtime_client import Client, node_item, poll, serve_args
 from bench.socket_client import SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
@@ -49,7 +49,7 @@ class WaitTests(ModelFixture):
         page = client.request('events', bot='Bob', after=0, limit=256)['result']
         self.assertEqual([e['turn'] for e in page['events'] if e['event'] == 'turn_finished'], [turn])
         self.assertIn('pruned_before', page)
-        self.assertEqual(client.request('result', bot='Bob', turn=turn)['result']['error'], 'cancelled')
+        self.assertEqual(poll(client, 'Bob', turn)['result']['error'], 'cancelled')
         client.request('interrupt', bot='Alice', turn=alice)
 
     def test_slow_stdio_wait_reader_gets_disconnect_without_stdin_eof(self):
@@ -124,7 +124,7 @@ class WaitTests(ModelFixture):
     def tool_output(self, client, bot, call_id):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         node = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]['data']['node']
-        output = client.request('item', bot=bot, node=node)['result']['output']
+        output = node_item(client, bot, node)['result']['output']
         try:
             return json.loads(output)
         except ValueError:
