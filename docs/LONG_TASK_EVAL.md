@@ -7,7 +7,11 @@ against scripted providers, and an evaluation of a real model on one
 synthetic repository task (roadmap [item 36](NEXT.md)). Written 2026-09-26.
 The acceptance cases pass. The evaluation has run twice live on the small
 task, recorded [below](#live-run-1), and twice on the large task at
-realistic budgets ([live runs 3 and 4](#live-run-3)).
+realistic budgets ([live runs 3 and 4](#live-run-3)). The
+[sustained task](#the-sustained-task), which outgrows a realistic budget
+several times in one turn, has run live twice, on one model and one seed
+per bot: with each step read whole ([run 9](#live-run-9)), compacting took
+39 to 45% less input per correct task than full context.
 
 ## Acceptance cases
 
@@ -145,6 +149,50 @@ a passing check 60,954 before and again after the correction, and the
 benchmark 59,380: about 357 KB before any read the model chooses, against
 a 256 KiB budget, about 64k tokens.
 
+### The sustained task
+
+Runs 3 to 5 did not show whether compacting pays: the large task's context
+never grew far past the budget, and full context was the cheaper arm. The
+sustained task keeps going. It has the small task's setup (the same
+restriction, removed `make quick`, migration with an unknown outcome, and
+hidden tests), then settles six monthly closes, 2026-01 to 2026-06, in
+the same turn. For each close the prompt asks for `make check
+CLOSE=<month>`, then `tools/settle <month>`, which runs the bot's
+`convert` on that close's rows and writes `out/<month>.json`, then `make
+bench CLOSE=<month>`, and the final report must list every close's
+throughput. It asks for each of those steps as its own command, read
+whole, without redirecting, piping, filtering or truncating its output:
+left to choose in [run 8](#live-run-8), gpt-6-sol sent the long outputs
+to files and read their tails, so no bot's context passed 30k tokens at
+any budget and nothing compacted.
+
+| Fact | Where it appears | What losing it looks like |
+| --- | --- | --- |
+| The setup's four facts | as in the small task | as in the small task |
+| Each close's number | the last line of that close's benchmark; only `tools/.seed` holds the six | the final answer lacks one |
+| Which closes were settled under the old rule | the correction arrives once two closes have been settled, however often each was, when the call that settled the second completes | an `out/` file with truncated entries |
+
+- Each close has 300 fixture batches in whole cents, so its check passes
+  under either rounding rule. `make check` without `CLOSE` runs all
+  1,800, and a `CLOSE` that names no close fails.
+- Each close has 640 rows to settle with amounts to four places. About half
+  their USD entries differ between truncation and half to even (937 of
+  1,907 for seed 7), so a close settled before the correction is wrong
+  until it is settled again.
+- The settlement prints one journal line per entry; the benchmark prints
+  300 warmup lines. Each number to report has six digits that no
+  settlement entry holds under either rule. Entries' cents reach seven
+  digits, so a number an entry holds is drawn again; no number was for
+  seeds 7 to 16, the ones runs 8 and 9 used.
+
+Measured on the seed-7 workspace, each close's steps print 83,905 to
+86,438 bytes (check about 33.5 KB, settlement 28 to 30 KB, benchmark
+22.7 KB), each under the 64 KiB preview: 507,868 bytes over the six
+closes before any read the model chooses, about 3.9 times a 128 KiB
+budget. Read whole, that is about 124k tokens at the 4 bytes a token
+this page takes for budgets (an estimate, not a count). The setup's own
+steps print under 3 KB.
+
 ## Conditions and scores
 
 Each condition runs from fresh starts in its own daemon, with `--trials`
@@ -158,6 +206,9 @@ instructions, as the context evaluation does.
 | `large-compact` | large | 256 KiB | the same | stubs |
 | `large-summary` | large | 256 KiB | the same without `read` | summaries only |
 | `large-full` | large | 4 MiB | the same as `large-compact` | nothing needed |
+| `sustained-compact` | sustained | 128 KiB | the default tools | stubs, then summaries |
+| `sustained-summary` | sustained | 128 KiB | without `read` | summaries only |
+| `sustained-full` | sustained | 4 MiB | the default tools | nothing needed, within the model's window |
 
 At 256 KiB, stubbing everything the model has answered below the 64 KiB
 verbatim tail takes the large task's view far below the 75% trigger, so
@@ -193,6 +244,47 @@ from command text: a command that only names a step, or a step that
 fails, does not count. The hidden tests import the code the
 model wrote, so they run in a child process that keeps only `PATH`,
 `TMPDIR`, and the locale from the runner's environment, and no credentials.
+
+The sustained task is scored per close from the same record: whether a
+passing check of the close (`make check CLOSE=<month>`; one of every
+close counts for none) came before its first settlement and its
+benchmark after it, as one attempt (a close settled again after the
+correction needs no second check or benchmark, since its number does not
+change), how often it was settled, whether a close first settled before
+the turn took in the correction was settled again after it, whether its
+`out/` file holds the right entries, in integer cents, and whether the
+answer carries its number under its own close, whole rather than inside
+a longer one, and its benchmark ran. A line that names as many closes as
+it gives close numbers pairs them in order (`2026-01: n, 2026-02: m`, or
+`January and February: n and m`); otherwise a number's close is the last
+label before it on its line, else the first after it. A line with
+numbers and no label pairs them in order with the last labelled line
+above when that names as many, as under a table's heading row, else
+takes its label when it names one. A label is the month (`2026-01`) or
+its name (`January` or `Jan`) in any case, except the lowercase verb
+"may". The hidden tests also require integer cents. A sustained bot is
+correct only when the hidden tests pass, all six settlements are right,
+and each close settled before the correction was settled again after it,
+reports its numbers only when all six are there, and followed the
+workflow when it ran `tools/env-check` first, every close's steps came
+in order, and each close was first settled after the one before it. Each
+close's number is its own, so one number in an answer credits one close.
+It also counts the step commands that sent their output elsewhere or cut
+it (a pipe, or a redirect other than `2>&1`, at any stage of a
+pipeline), ran them inside a command substitution, or ran them in the
+background or detached, where the call returns a handle rather than the
+output, and those that ran several steps, joined by any list separator
+(`&` included), or looped over them. A step counts where a command runs
+it, inside a conditional, a loop or an interpreter's `-c` too, not where
+it reads the step's source. In the scripted run at 128 KiB, the default
+tools stub old results nine times and summarize never; without `read`,
+seven summaries make the room.
+
+Every condition also records each bot's shell commands (the first 160
+characters each), its time from submission to its task's end, and the
+whole task's input in token-equivalents, model and summarizer, with
+cached input at a tenth; the condition's summary line gives those per
+correct task.
 
 ## Running it
 
@@ -244,6 +336,22 @@ Each JSON file records its binary's digest, which tells the `large-summary`
 arms apart. `--context-bytes N` gives every condition the
 run names the budget N instead of its own, for example to run the
 `large-` arms at 128 KiB beside a `large-full` run without it.
+
+The sustained comparison runs one build, with its arms at once:
+
+```sh
+run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 10 "$@"; }
+run --conditions sustained-compact --out .local/long-task-eval/sustained-compact-128.json &
+run --conditions sustained-compact --context-bytes 262144 \
+    --out .local/long-task-eval/sustained-compact-256.json &
+run --conditions sustained-summary --out .local/long-task-eval/sustained-summary-128.json &
+run --conditions sustained-full --out .local/long-task-eval/sustained-full.json &
+wait
+```
+
+`sustained-full` holds everything the model reads, so it needs a model
+whose window holds the task: check the model's context window before the
+run.
 
 ## Live run 1
 
@@ -634,6 +742,131 @@ the model before any summary; that order has not run live.
 - Both arms otherwise match: workflow followed, vendor intact and the
   migration applied once in 20 of 20, and no retrievals.
 
+## Live run 8
+
+2026-09-27, 03:27 to 03:35 UTC, the sustained task's first live run at
+`7061fab`, before the rule to read each step whole and with the
+correction sent after the twelfth completed tool call: four arms at once,
+10 bots each, seed 7, `chatgpt/gpt-6-sol` on the ChatGPT plan with
+Codex's login, macOS arm64. Codex 0.157.1's bundled model list gives
+`gpt-6-sol` a 272,000-token window (read 2026-09-27, not measured).
+
+| | stubs and summaries, 128 KiB | the same, 256 KiB | summaries only, 128 KiB | full, 4 MiB |
+| --- | --- | --- | --- | --- |
+| Correct | 4/10 | 4/10 | 5/10 | 2/10 |
+| Steers that went in / never sent | 4 / 6 | 4 / 6 | 5 / 5 | 2 / 8 |
+| Stubs, summaries, retrievals | 0 | 0 | 0 | 0 |
+| Peak input tokens per bot, highest | 29.6k | 23.1k | 29.3k | 21.4k |
+| Work input served from cache | 87.3% | 85.2% | 88.1% | 81.6% |
+| Bot time to finish, p50 / max | 133 / 466 s | 91 / 410 s | 124 / 211 s | 89 / 176 s |
+
+- Nothing compacted. The bots ran long steps with their output sent to a
+  log file and read its tail, and 31 of 40 settled several closes in one
+  shell loop, so the largest context any bot sent was 29,638 tokens, 11%
+  of the window, where the steps print about 124k tokens read whole.
+- The correction was the only difference in outcome. 25 of 40 bots
+  finished within 7 to 12 model calls, before their twelfth tool call
+  completed, so it was never sent; each settled all six closes truncating
+  and passed 5 of 9 hidden tests. All 15 steered bots were correct. The
+  arms' correct counts show which bots reached the steer point, not what
+  the budget did, and so does cost per correct task (122.0k, 80.0k,
+  107.2k and 160.9k input token-equivalents), since a steered bot settles
+  again (7 to 12 settlements against 6).
+- Every bot wrote its logs under fixed names in the shared `/tmp`, such as
+  `ledger-bench-<month>.log`, so bots read each other's: two reported
+  another workspace's numbers (5 of 6 in one, 1 in the other). Scores come
+  from each workspace's own step record, so only those answers were
+  affected. A workspace is not a sandbox; many agents on one host share
+  such paths unless their tools keep to the workspace.
+- The plan paced every bot in all four daemons at the same two moments
+  (`turn_paced`, then `turn_resumed`, at 03:28:09 and 03:29:09), shared by
+  every arm. The slowest bots, all steered, waited up to about 86 s between
+  model calls.
+- 612 model calls, all served by `gpt-6-sol`, with no errors, failed
+  turns, `stale_turn` or compaction failures. Setup facts held and the
+  workflow was followed in 40 of 40.
+
+The task now asks for each step as its own command, read whole, and sends
+the correction after two successful settlements, and the scores count
+step commands against that rule. [Run 9](#live-run-9) ran that version.
+The correction now waits for two distinct closes.
+
+## Live run 9
+
+2026-09-27, 03:45 to 03:56 UTC, the sustained task at `7c1904d`: each
+step its own command, read whole, and the correction sent after two
+successful settlements, which settling one close twice would also have
+met. Four arms at once, 10 bots each, seeds 7 to 16 (one per bot),
+`chatgpt/gpt-6-sol` on the ChatGPT plan with Codex's login, macOS arm64.
+
+| | stubs and summaries, 128 KiB | the same, 256 KiB | summaries only, 128 KiB | full, 4 MiB |
+| --- | --- | --- | --- | --- |
+| Correct | 9/10 | 10/10 | 10/10 | 9/10 |
+| Stub passes per bot | 14 to 20 | 5 to 7 | 0 | 0 |
+| Summaries, all copies | 1 | 0 | 94, 8 to 11 per bot | 0 |
+| Retrievals | 5 | 3 | 0 | 0 |
+| Peak input tokens per bot, highest | 36.1k | 67.0k | 37.5k | 294.8k |
+| Work input served from cache | 46.9% | 69.9% | 58.0% | 93.2% |
+| Input token-equivalents per bot, median | 391k | 447k | 435k | 702k |
+| Input token-equivalents per correct task | 416k | 457k | 438k | 754k |
+| Output tokens, work + summarizer | 20.3k + 1.1k | 18.7k | 20.1k + 113.3k | 18.9k |
+| Bot time to finish, p50 / max | 347 / 530 s | 381 / 534 s | 541 / 604 s | 374 / 383 s |
+
+- Compacting paid on this task. Per correct task, the budgeted arms took
+  39 to 45% less input than full context, counting cached input at a
+  tenth and every summary; full context's bots reached 224k to 295k
+  tokens. Stubs at 128 KiB cost least and matched full context on
+  correctness and median time (347 against 374 s), but not on the tail:
+  their slowest bot took 530 s against full context's 383 s, and the
+  256 KiB arm's 534 s. Summaries only cost about the same and got 10 of
+  10, but their bots took 45% longer at the median. Output is not in the
+  token-equivalents: the summaries-only arm's summarizer wrote 113k
+  output tokens, about 11k per bot, beside about 2k of the bot's own.
+- Summaries cost time more than input: 6.8% of the summaries-only arm's
+  input went to them, all 94 sent as copies with 98.9% of their input
+  from cache. They held the bots' calls 3,490 s in all, about 37 s each,
+  a span that includes any plan pacing in between.
+- Stubs break the cache: 46.9% of the stub arm's work input came from
+  cache at 128 KiB and 69.9% at 256 KiB, against 93.2% with full context.
+  The smaller context still made 128 KiB the cheapest.
+- Every steer went in (40 of 40). The two wrong bots, one with stubs at
+  128 KiB and one with full context, made the same mistake: after the
+  correction they looked at `tests/fixtures.json`, found only two-place
+  amounts, decided the rounding rule changed nothing, and never settled
+  2026-01 and 2026-02 again (4 of 6 closes right). The closes' rows have
+  four places. Nothing in either bot's events points at its context.
+- No bot redirected, piped, filtered or truncated a step's output, or
+  read another bot's files. The counters as run flagged 10 commands, all
+  reads of `tools/settle`'s source such as `cat tools/settle | head -90`;
+  they now count only commands that run a step.
+- The provider served inputs up to 294,809 tokens, past the 272,000 in
+  Codex's model list.
+- The plan paced every bot about six times, and every pause resumed.
+  There were no errors, failed turns, refused steers or compaction
+  failures, and setup facts held and the workflow was followed in 40 of 40.
+- Times in runs 8 and 9 run from the arm's first submission to when the
+  runner handled each finish. Each bot is now timed from its own
+  submission to its finish as received; the difference is ten local
+  submissions and the runner's handling of other events, inferred to be
+  well under a second against 300 s or more.
+- Run 8 sent the correction after the twelfth completed tool call, and
+  run 9 after two successful settlements, not two distinct closes. Both
+  scored the workflow without comparing the closes' order or binding
+  each close's check, first settlement and benchmark into one attempt or
+  requiring a close settled before the correction to be settled again,
+  credited one `make check` of every close as each close's check,
+  matched each number anywhere in the answer, even inside a longer one or
+  under another close, compared cents by value rather than as integers,
+  and did not count background, detached, substituted or later-pipeline
+  steps as unread. Their raw results keep each close's settlement count,
+  every command and each answer; they were not rescored for these
+  changes.
+
+This is one model, one synthetic task with seeds 7 to 16 (one per bot,
+the same in every arm), and 10 bots per arm, with a prompt that makes the
+model read each step whole. Left to choose, the same model kept its
+context small by itself (run 8).
+
 ## Not covered yet
 
 The rest of item 36: branching every condition from identical
@@ -643,4 +876,8 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
 compactions and retrievals. From runs 3 to 5: a task whose context grows
-well past the budget, where compacting could pay.
+well past the budget, where compacting could pay. The sustained task,
+read whole, is that task: in run 9 compacting cost 39 to 45% less input
+per correct task than full context. Still open: a task whose output the
+model has to read without being told to, other models, and pricing the
+summarizer's output.

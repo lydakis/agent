@@ -630,7 +630,22 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     steer that waited while one result in the newest boundary filled the
     room it needed; such a steer now goes in against the whole budget
     ([run 7](LONG_TASK_EVAL.md#live-run-7): 20 of 20 steers went in,
-    against 18 of 20 on main). Still open: stub
+    against 18 of 20 on main). Next (Astra's order): a
+    [sustained task](LONG_TASK_EVAL.md#the-sustained-task) that settles
+    six closes in one turn, about 508 KB of required output, so the
+    context outgrows 128 KiB about four times over; it scores each
+    close's settlement and number, the whole task's cost, and each bot's
+    time to finish. Its first live run
+    ([run 8](LONG_TASK_EVAL.md#live-run-8)) never compacted: the model sent
+    long outputs to files and read their tails, and 25 of 40 bots finished
+    before the correction was sent. With each step read whole and the
+    correction sent after two successful settlements
+    ([run 9](LONG_TASK_EVAL.md#live-run-9)), 38 of 40 were correct and
+    compacting took 39 to 45% less input per correct task than full
+    context; stubs matched full context's median time but not its tail
+    (530 against 383 s), and summaries only took 45% longer at the
+    median.
+    Still open: stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts
     conditions, a realistic preamble, a task long enough that summaries
