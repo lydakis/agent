@@ -37,6 +37,15 @@ def render_cask(version: str, archive: Path) -> str:
 
   app "Agent.app"
 
+  # The app starts a daemon from its bundle that outlives the window. Stop it
+  # (letting running turns finish) before the bundle goes, as on an upgrade.
+  uninstall quit:   "me.lydakis.agent",
+            script: {{
+              executable:   "#{{appdir}}/Agent.app/Contents/MacOS/agent",
+              args:         ["shutdown", "--grace", "30"],
+              must_succeed: false,
+            }}
+
   zap trash: [
     "~/Library/Caches/me.lydakis.agent",
     "~/Library/Saved Application State/me.lydakis.agent.savedState",

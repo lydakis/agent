@@ -33,29 +33,44 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # A release event's own ref is its tag: run main's scripts, not the tag's.
+          ref: refs/heads/main
+          fetch-depth: 0
           persist-credentials: false
-      - name: Check out release validator
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Validate with the same generator that built the release assets.
-          ref: refs/tags/${{ inputs.tag || github.event.release.tag_name }}
-          path: release-source
-          persist-credentials: false
-      - name: Download published release assets
+      - name: Resolve approved release
         id: release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         run: |
           if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo 'Expected a stable tag such as v0.1.0' >&2
             exit 1
           fi
+          # Resolve once, before executing any code from the selected tag. A
+          # draft's tag can be moved before it is published.
+          commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          approved_main=$(git rev-parse --verify "refs/remotes/origin/main^{commit}")
+          if ! git merge-base --is-ancestor "$commit" "$approved_main"; then
+            echo 'Release tag must point to a commit on main' >&2
+            exit 1
+          fi
+          printf 'tag=%s\ncommit=%s\n' "$RELEASE_TAG" "$commit" >> "$GITHUB_OUTPUT"
+      - name: Check out release validator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Validate with the same generator that built the release assets.
+          ref: ${{ steps.release.outputs.commit }}
+          path: release-source
+          persist-credentials: false
+      - name: Download published release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
           gh api "repos/lydakis/agent/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
           gh release download "$RELEASE_TAG" --repo lydakis/agent \
             --pattern agent.rb --pattern checksums.txt \
             --pattern "Agent_${RELEASE_TAG#v}_universal.zip" --dir "$RUNNER_TEMP/release"
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
       - name: Check out tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

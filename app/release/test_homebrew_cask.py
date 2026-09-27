@@ -16,6 +16,9 @@ class CaskTest(unittest.TestCase):
         self.assertIn('  version "0.1.0"', cask)
         self.assertIn("/releases/download/v#{version}/Agent_#{version}_universal.zip", cask)
         self.assertIn('  app "Agent.app"', cask)
+        # The bundled daemon is stopped before its binary goes.
+        self.assertIn('Agent.app/Contents/MacOS/agent",', cask)
+        self.assertIn('args:         ["shutdown", "--grace", "30"]', cask)
         # brew style (Homebrew/OSDependsOn) requires it of a macOS-only cask.
         self.assertIn("  depends_on :macos\n", cask)
         # The store is shared with the CLI and is the user's data, not the app's.

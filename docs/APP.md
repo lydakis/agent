@@ -133,16 +133,23 @@ launchd's environment rather than a terminal's, so `agent start` runs with
 the environment of the user's login shell (`$SHELL -l -i`), plus
 `~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
 (`export` and quotes allowed, `#` comments), refused unless only its owner
-can read it. That file is the app's; the CLI and the daemon never read it. The
+can read it. That file is the app's; the CLI and the daemon never read it.
+Both are read once per app run, and without `--model` or `AGENT_MODEL` of its
+own the app takes its default model from them too. The
 store and socket themselves are resolved from the app's own arguments and
 environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
-or `AGENT_SOCKET` never starts anything.
+or `AGENT_SOCKET` never starts anything. Uninstalling or upgrading the cask
+quits the app and runs the bundled `agent shutdown --grace 30`, so the default
+store's daemon, whoever started it, lets running turns finish and exits before
+its binary is replaced.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
 [release.yml](../.github/workflows/release.yml) on a macOS runner. It runs
-the tests, builds a universal `agent` and app, and has Tauri sign both with
+the tests, installs the Tauri CLI from
+[app/release/package-lock.json](../app/release/package-lock.json) before any
+signing material exists, builds a universal `agent` and app, and has Tauri sign both with
 the Developer ID and hardened runtime, notarize and staple the bundle
 ([tauri.release.conf.json](../app/src-tauri/tauri.release.conf.json)); it
 then verifies the signature, Gatekeeper assessment, staple, architectures and
@@ -150,6 +157,7 @@ versions, and leaves `Agent_X.Y.Z_universal.zip`, the generated cask and
 `checksums.txt` on a draft release. Publishing the draft (not a prerelease)
 runs [publish-homebrew.yml](../.github/workflows/publish-homebrew.yml): it
 checks the assets against their checksums and the tag's cask generator,
+resolves the tag to a commit on `main` before running any of its code,
 installs and audits the cask, and writes `Casks/agent.rb` to
 [lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
 downgrades the tap or replaces a different cask of the same version. The

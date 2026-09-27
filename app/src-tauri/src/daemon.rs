@@ -6,17 +6,18 @@
 //! A window opened from the Dock or Finder inherits launchd's environment,
 //! not the user's shell, so provider keys exported in a shell profile would be
 //! missing. `agent start` therefore runs with the environment of the user's
-//! login shell, read once per start; if that cannot be read it runs with the
+//! login shell, read once per app run; if that cannot be read it runs with the
 //! app's own. Keys kept out of shell profiles go in `~/.agent/env`, `KEY=VALUE`
 //! lines readable only by their owner, which the app adds on top: the file is
-//! the app's, and neither the CLI nor the daemon reads it.
+//! the app's, and neither the CLI nor the daemon reads it. The app's default
+//! model comes from the same place when its own environment has none.
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::process::Command;
+use tokio::{process::Command, sync::OnceCell};
 
 /// The CLI bounds its own startup at 10 s; the shell gets the rest.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,6 +26,36 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 /// stands until this has passed.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MARKER: &str = "__agent_app_environment__";
+
+static LOGIN: OnceCell<Option<Vec<(OsString, OsString)>>> = OnceCell::const_new();
+
+async fn login() -> Option<&'static [(OsString, OsString)]> {
+    LOGIN.get_or_init(login_environment).await.as_deref()
+}
+
+/// `AGENT_MODEL` as a daemon this app starts would see it: `~/.agent/env`
+/// over the login shell.
+pub async fn model() -> Option<String> {
+    let file = env_file().and_then(|file| read_env_file(&file).ok());
+    pick_model(file.as_deref(), login().await)
+}
+
+fn pick_model(
+    file: Option<&[(String, String)]>,
+    login: Option<&[(OsString, OsString)]>,
+) -> Option<String> {
+    let model =
+        match file.and_then(|pairs| pairs.iter().rev().find(|(key, _)| key == "AGENT_MODEL")) {
+            Some((_, value)) => value.clone(),
+            None => login?
+                .iter()
+                .find(|(key, _)| key == "AGENT_MODEL")?
+                .1
+                .to_str()?
+                .to_owned(),
+        };
+    (!model.is_empty()).then_some(model)
+}
 
 /// The `agent` shipped beside this executable, if there is one.
 pub fn bundled() -> Option<PathBuf> {
@@ -54,8 +85,8 @@ impl Starts {
 
 async fn start(agent: &Path, store: &Path) -> Result<(), String> {
     let mut command = Command::new(agent);
-    if let Some(environment) = login_environment().await {
-        command.env_clear().envs(environment);
+    if let Some(environment) = login().await {
+        command.env_clear().envs(environment.iter().cloned());
     }
     if let Some(file) = env_file() {
         command.envs(read_env_file(&file)?);
@@ -221,6 +252,26 @@ mod tests {
         );
         assert!(parse_environment(b"no marker\0HOME=/h\0").is_none());
         assert!(parse_environment(format!("{MARKER}\n").as_bytes()).is_none());
+    }
+
+    #[test]
+    fn the_model_is_the_env_files_then_the_login_shells() {
+        let file = |model: &str| vec![("AGENT_MODEL".to_owned(), model.to_owned())];
+        let login = vec![(
+            OsString::from("AGENT_MODEL"),
+            OsString::from("openai/login"),
+        )];
+        assert_eq!(
+            pick_model(Some(&file("anthropic/file")), Some(&login)).as_deref(),
+            Some("anthropic/file")
+        );
+        assert_eq!(
+            pick_model(Some(&[]), Some(&login)).as_deref(),
+            Some("openai/login")
+        );
+        assert_eq!(pick_model(None, None), None);
+        // An empty assignment in the file means no model, as it would for the daemon.
+        assert_eq!(pick_model(Some(&file("")), Some(&login)), None);
     }
 
     #[test]

@@ -106,6 +106,9 @@ jobs:
           python3 -m unittest discover -s app/release
           node --test app/tests/state.test.cjs
           cargo test --locked --workspace
+      - name: Install the Tauri CLI
+        # From the committed lockfile, before any signing material exists.
+        run: npm ci --ignore-scripts --prefix app/release
       - name: Build the daemon for both architectures
         run: |
           # Tauri bundles externalBin binaries/agent as Contents/MacOS/agent.
@@ -190,7 +193,7 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           APPLE_API_KEY_PATH: ${{ env.AGENT_NOTARY_KEY }}
         run: |
-          npx --yes @tauri-apps/cli@2.11.5 build --ci --target universal-apple-darwin \
+          ../release/node_modules/.bin/tauri build --ci --target universal-apple-darwin \
             --bundles app --config tauri.release.conf.json
       - name: Package the app and cask, and verify them
         env:

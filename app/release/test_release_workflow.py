@@ -10,9 +10,9 @@ import unittest
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 
 
-def workflow_step(name):
+def workflow_step(name, workflow="release.yml"):
     """Run the actual workflow's shell gate without invoking release tooling."""
-    workflow = (WORKFLOWS / "release.yml").read_text()
+    workflow = (WORKFLOWS / workflow).read_text()
     match = re.search(
         rf"^      - name: {re.escape(name)}\n(.*?)(?=^      - |\Z)",
         workflow, re.MULTILINE | re.DOTALL,
@@ -78,6 +78,25 @@ class ReleaseWorkflowTest(unittest.TestCase):
             ["bash", "-e", "-u", "-o", "pipefail", "-c", script],
             cwd=self.root, env=env, capture_output=True, text=True,
         )
+
+    def publish_gate(self, tag):
+        env = {**os.environ, "RELEASE_TAG": tag, "GITHUB_OUTPUT": str(self.output)}
+        script = workflow_step("Resolve approved release", "publish-homebrew.yml")
+        return subprocess.run(
+            ["bash", "-e", "-u", "-o", "pipefail", "-c", script],
+            cwd=self.root, env=env, capture_output=True, text=True,
+        )
+
+    def test_publishing_resolves_a_stable_tag_on_main_before_running_its_code(self):
+        result = self.publish_gate("v1.0.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.output.read_text(), f"tag=v1.0.0\ncommit={self.approved}\n")
+        for tag in ["v2.0.0", "v1.0.0-rc.1", "v9.9.9", "main", "v1.0.0;touch injected"]:
+            with self.subTest(tag=tag):
+                self.output.unlink(missing_ok=True)
+                self.assertNotEqual(self.publish_gate(tag).returncode, 0)
+                self.assertFalse(self.output.exists())
+                self.assertFalse((self.root / "injected").exists())
 
     def test_approved_lightweight_annotated_and_older_tags(self):
         for tag, commit in [("v1.0.0", self.approved),

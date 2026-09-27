@@ -146,14 +146,20 @@ mod config_tests {
 }
 
 /// What the page needs to create bots and to say where it is.
+/// A window opened from the Dock has no `AGENT_MODEL` of its own; the model
+/// is then the one a daemon the app starts would be given.
 #[tauri::command]
-fn setup(state: State<'_, Shared>) -> Value {
-    json!({
+async fn setup(state: State<'_, Shared>) -> Result<Value, String> {
+    let model = match &state.config.model {
+        Some(model) => Some(model.clone()),
+        None => daemon::model().await,
+    };
+    Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
-        "model": state.config.model,
+        "model": model,
         "workspace": state.config.workspace,
         "tools": ["shell", "read", "write", "edit", "wait", "history"],
-    })
+    }))
 }
 
 /// The shared client policy for a workspace (the app's own by default),
