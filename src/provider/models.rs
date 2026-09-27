@@ -40,8 +40,9 @@ pub type Listed = Result<Arc<str>>;
 impl Provider {
     /// `{id, name?, context_tokens?, output_tokens?}` per model, ids without
     /// the provider prefix. Callers asking at once share one request.
-    /// Refused credentials are not kept: a login made meanwhile (`aws sso
-    /// login`, Codex signing in) is used on the next ask.
+    /// Refused credentials are not kept, the provider's own 401 or 403
+    /// included: a login made meanwhile (`aws sso login`, Codex signing in)
+    /// is used on the next ask.
     pub async fn models(&self) -> Listed {
         let mut kept = self.listing.0.lock().await;
         if let Some((at, listed, _)) = kept.as_ref()
@@ -70,6 +71,7 @@ impl Provider {
             ["provider_aws_credentials_", "provider_login_"]
                 .iter()
                 .any(|refused| error.code.starts_with(refused))
+                || ["provider_http_401", "provider_http_403"].contains(&error.code.as_str())
         }) {
             return listed;
         }
@@ -282,8 +284,13 @@ fn openai_text(id: &str) -> bool {
 /// Whether a Mantle model id is one of the family its binding speaks:
 /// Anthropic's models (`anthropic.`, perhaps under a routing prefix such as
 /// `global.`) on the Messages route, everything else on Responses.
+///
+/// gpt-oss is listed but refused on the Responses route ("does not support
+/// the '/openai/v1/responses' API", docs/BEDROCK.md), so it is offered on
+/// neither.
 fn mantle_runs(family: Family, id: &str) -> bool {
-    id.split('.').any(|part| part == "anthropic") == (family == Family::Anthropic)
+    !id.contains("gpt-oss")
+        && id.split('.').any(|part| part == "anthropic") == (family == Family::Anthropic)
 }
 
 /// The shapes providers answer with: `data` (OpenAI, Anthropic, OpenRouter,
@@ -380,6 +387,29 @@ mod tests {
         assert_eq!(transport.listed.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn a_rejected_key_is_asked_again_not_kept() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = socket.read(&mut [0; 4096]).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let transport = Transport::new(64, 1).unwrap();
+        let provider =
+            Provider::new(transport.clone(), Family::Responses, &url, Some("k".into())).unwrap();
+        let refused = provider.models().await.unwrap_err();
+        assert_eq!(refused.code, "provider_http_401");
+        assert!(provider.listing.0.lock().await.is_none());
+        assert_eq!(transport.listed.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn openai_offers_only_models_a_turn_can_run() {
         use super::openai_text;
@@ -424,6 +454,8 @@ mod tests {
         assert!(!mantle_runs(Family::Anthropic, "openai.gpt-6-luna"));
         assert!(mantle_runs(Family::Responses, "openai.gpt-6-luna"));
         assert!(!mantle_runs(Family::Responses, "anthropic.claude-sonnet-5"));
+        assert!(!mantle_runs(Family::Responses, "openai.gpt-oss-20b"));
+        assert!(!mantle_runs(Family::Anthropic, "openai.gpt-oss-120b"));
     }
 
     #[test]

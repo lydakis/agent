@@ -905,13 +905,14 @@ does not, and each is one op:
   connection admission as a turn, and each provider keeps its answer, a
   refusal included, five minutes, while the listings (kept as their JSON
   text) and refusals kept across all providers stay within 2 MiB (past that
-  an answer is given, not kept). A refusal for missing or expired
-  credentials is not kept, so a login made meanwhile lists on the next ask.
+  an answer is given, not kept). A refusal for missing, expired or rejected
+  credentials (a 401 or 403 included) is not kept, so a login made meanwhile
+  lists on the next ask.
   The reply fits one event: a listing past
   what is left of it is `provider_models_limit` for that provider. Bedrock
   Mantle is asked at the host's `/v1/models`, and each binding offers only
   its own family (`anthropic.` models on the Messages route, the rest on
-  Responses). OpenAI's own listing leaves out speech, embedding, image,
+  Responses, except gpt-oss, which Mantle lists but refuses on Responses). OpenAI's own listing leaves out speech, embedding, image,
   moderation and search models by base model name (a fine-tune by the model
   it was tuned from), and a ChatGPT login asks the Codex
   backend with `client_version` (the Codex release this repository measures
