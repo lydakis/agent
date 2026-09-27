@@ -963,9 +963,26 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     until the app reattaches. After a reattach, task cards inside the side
     pane show no latest line until opened, since only the main pane's peers
     are loaded.
+    Done (2026-09-27): tasks in worktrees, as the app's opinion. Its
+    coordinators are told to give an editing task `git worktree add` on
+    `agent/NAME`, the folder's `.agent/setup`, and `run --new --agents
+    --workspace`. A bot now keeps its folder: a message without
+    `--workspace` runs where the bot is, one with it moves the bot there,
+    and a fork starts where its source is (George, 2026-09-27); the app
+    shows a worktree bot's branch
+    ([APP.md](APP.md#projects-and-panes)). Follow-up: deleting a bot leaves
+    its worktree and branch, which hold its work; the app should offer to
+    remove them. Follow-up: the coordinator text continues a task by name,
+    so a task deleted and recreated under the same name gets its messages;
+    pinning continuations with `--bot-id` would refuse the replacement.
+    Follow-up: the app learns a bot's folder from its record, so a move by
+    another client shows after the app reattaches; and a project name with
+    `..` cannot prefix a valid branch name, so project names should refuse it.
+    Follow-up: a turn without a folder runs in the bot's retained one
+    unchecked, as the daemon's fallback always did; a folder deleted since
+    shows up as a tool spawn error rather than a refusal at submit.
     Next, in
-    order: tasks in worktrees (`run --new --worktree` with a setup command, in the
-    client), then side chats with all tools in a new worktree, and Keep; approvals in the
+    order: side chats with all tools in a new worktree, and Keep; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
     text in the client policy; swarms last, since that design is not decided.
     A fork into another provider stays out: history is provider-native.

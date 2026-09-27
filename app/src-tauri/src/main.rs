@@ -7,6 +7,7 @@
 mod daemon;
 mod project;
 mod session;
+mod worktree;
 
 use agent_client::Client;
 use serde_json::{Value, json};
@@ -228,6 +229,13 @@ async fn default_model() -> Option<String> {
 
 /// The models to offer, read from `~/.agent/models` each time, so an edit
 /// shows without a restart. The daemon has no list.
+/// The branch a bot's folder has checked out when it is a linked git
+/// worktree; read from files, no git run.
+#[tauri::command]
+fn branch(dir: String) -> Option<String> {
+    worktree::linked_branch(std::path::Path::new(&dir))
+}
+
 #[tauri::command]
 fn models() -> Result<Value, String> {
     let path = agent_client::models::path().ok_or("no HOME for ~/.agent/models")?;
@@ -380,6 +388,7 @@ fn main() {
             setup,
             default_model,
             policy,
+            branch,
             models,
             project,
             write_project,

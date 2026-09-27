@@ -189,10 +189,25 @@ function upsert(record) {
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnFamily(b, record); learnTools(b, record);
-  b.workspace = record.workspace ?? null;
+  learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
   seedHistory(record);
+}
+// A new folder means its branch is read again, when the bot is next shown.
+function learnWorkspace(b, record) {
+  const ws = record.workspace ?? null;
+  if (b.workspace !== ws) { b.workspace = ws; b.branch = undefined; }
+}
+// A bot keeps its folder, so the app names one only for a bot that has none.
+const home = (b) => (b.workspace ? {} : { workspace: S.config.workspace });
+// A bot in a linked git worktree shows the branch it works on; read once, when its head is first drawn.
+function readBranch(b) {
+  if (b.branch !== undefined) return;
+  b.branch = null;
+  const ws = b.workspace;
+  if (!ws || !Daemon.branch) return;
+  Daemon.branch(ws).then((branch) => { if (branch && b.workspace === ws && bot(b.name) === b) { b.branch = branch; render(); } }, () => {});
 }
 // Records carry the family; creation events do not, so a bot seated from one takes its provider's.
 function learnFamily(b, record) {
@@ -642,7 +657,7 @@ function seat(record, session) {
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
   learnFamily(b, record); learnTools(b, record);
-  b.workspace = record.workspace ?? null;
+  learnWorkspace(b, record);
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   seedHistory(record);
 }
@@ -970,12 +985,13 @@ for (const [id, who] of PANES) {
 function headHTML(b, pane) {
   const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
-  if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
   const lead = b.project ? bot(b.project + LEAD) : null;
   const crumbs = !lead ? `<b>${esc(b.name)}</b>` : lead === b ? `<b>${esc(b.project)}</b>`
     : `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(b.project)}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`;
-  return `<div class="crumbs">${crumbs}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
+  return `<div class="crumbs">${crumbs}${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
 }
+const branchHTML = (b) => (b.branch ? `<span class="branch" title="${esc(b.workspace)}">⎇ ${esc(b.branch)}</span>` : '');
 // A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
 const WAIT_SHOWN = 3;
 function waitSummary(b) {
@@ -985,7 +1001,8 @@ function waitSummary(b) {
 }
 // Heads change with their bot's status, not with time, so they are written only when that changes.
 function renderHead(el, b, pane) {
-  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}` : '-';
+  if (b) readBranch(b);
+  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}|${b.branch ?? ''}` : '-';
   if (el.dataset.k === key) return; el.dataset.k = key;
   el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME creates one</span></div>' : '';
 }
@@ -1261,8 +1278,9 @@ async function submit(text, pane = 'main') {
   if (mode === 'side') { await sideChat(b.name, text); return; }
   // A steer joins the running turn only on that turn's model and folder, so it names neither.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
-  // rather than the message landing in whatever turn runs next.
-  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { workspace: b.workspace ?? S.config.workspace, ...(model && model !== b.model ? { model } : {}) };
+  // rather than the message landing in whatever turn runs next. A bot keeps its folder, so a
+  // message names one only for a bot that has none.
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { ...home(b), ...(model && model !== b.model ? { model } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
   try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
   catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
@@ -1291,7 +1309,7 @@ async function fork(name) {
   // A root bot's fork is a root too.
   const lead = b.project ? bot(b.project + LEAD) : null;
   const parent = creatorOf(b) ?? (lead && lead !== b && lead.id != null ? lead : null), session = S.session;
-  const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}), ...(b.workspace ? { workspace: b.workspace } : {}) });
+  const record = await Daemon.request('fork', { source: name, bot: copy, ...(parent ? { created_by: parent.name, created_by_id: parent.id } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   await openBeside(copy);
@@ -1311,13 +1329,13 @@ async function sideChat(name, text = '') {
   const session = S.session;
   // A bot announced after attaching has no tool list yet; ask for its record before narrowing it.
   if (S.sideTools !== 'answer' && !b.callable) { const rec = await Daemon.request('resume', { bot: name }); if (rec?.id === b.id) learnTools(b, rec); }
-  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b), ...(b.workspace ? { workspace: b.workspace } : {}) });
+  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   // The first message goes before the pane loads any history, so the turn starts at once.
   let failed = null;
   if (text) {
-    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace }); }
+    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', ...home(record) }); }
     catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
   if (S.ui.side !== copy) await openBeside(copy);
@@ -1334,6 +1352,18 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // twice, unless it works in another folder. The file is written only once the daemon has accepted
 // the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
 // the file it lacks, with that coordinator's model, so a failed write retries.
+// The app's own opinion of how a coordinator works, after the shared policy. The daemon and the
+// CLI stay mechanisms: a turn runs in whatever folder it is sent with, so the coordinator names the
+// worktree each time it messages such a task.
+const COORDINATOR = `
+
+## Coordinating this project
+You coordinate the work in this folder. When it is a git repository, give a task that changes files its own worktree, so tasks do not collide. Pick a NAME that "$AGENT_BIN" ls does not list yet and that starts with your own name before .lead and a dot, so tasks in different projects do not collide, and that is also a valid git branch name; from this folder run
+git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
+The worktree starts at the last commit, so uncommitted changes here are not in it. If .agent/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
+"$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME/$(git rev-parse --show-prefix)" -- TASK
+so the task works in the same subfolder here. If setup fails, or the start fails and "$AGENT_BIN" ls does not list NAME, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again. A task keeps its folder, so later messages to it need no --workspace. A task that only reads, or any task when this folder is not a git repository, works in this folder. The branch holds a task's work until it is merged.
+`;
 async function createProject(dir) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
@@ -1346,7 +1376,7 @@ async function createProject(dir) {
   if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agent/project.toml');
   const policy = await Daemon.policy(info.dir);
   const session = S.session;
-  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions + COORDINATOR, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);

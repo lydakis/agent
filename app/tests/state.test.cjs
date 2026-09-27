@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, setSideTools };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, setSideTools, renderHead };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -403,7 +403,9 @@ test('committed thinking and answer nodes match live, replay, and reconnect tran
     await p.onEvent({event:'turn_finished',bot:'Bob',turn:1,data:{status:'completed'}});
     assert.match(p.itemsHTML(p.transcript('Bob')), /durable answer/);
   }
-  assert.equal(live.itemsHTML(live.transcript('Bob')),replay.itemsHTML(replay.transcript('Bob')));
+  // Live keeps how long it watched the thought, which replay cannot know; the rest must match.
+  const untimed=(html)=>html.replace(/▸ thought [^<]*/,'▸ thought');
+  assert.equal(untimed(live.itemsHTML(live.transcript('Bob'))),replay.itemsHTML(replay.transcript('Bob')));
   await live.onEvent({event:'text_delta',bot:'Bob',turn:2,text:'not committed'});
   live.lost('disconnected');
   assert.equal(live.transcript('Bob').text,'');
@@ -719,7 +721,8 @@ test('a steer joins the running turn: it names no model and no workspace', async
   p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task', status: 'running', running_turn: 3 });
   p.S.selected = 'task'; p.setModel('task', 'alpha/two');
   p.setSend('queue'); await p.submit('later');
-  assert.equal(sent.at(-1).workspace, '/synthetic/task'); assert.equal(sent.at(-1).model, 'alpha/two');
+  // A bot keeps its folder, so a message names none; a turn run elsewhere moves the head's folder.
+  assert.equal('workspace' in sent.at(-1), false); assert.equal(sent.at(-1).model, 'alpha/two');
   p.setSend('steer'); await p.submit('now');
   assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('workspace' in sent.at(-1), false); assert.equal('model' in sent.at(-1), false);
   assert.equal(sent.at(-1).expected_turn, 3, 'a steer is for the turn on screen');
@@ -728,6 +731,18 @@ test('a steer joins the running turn: it names no model and no workspace', async
   await p.onEvent({ event: 'queued', bot: 'task', turn: 4, data: { status: 'ready' } });
   await p.submit('soon');
   assert.equal(sent.at(-1).delivery, 'queue'); assert.equal('expected_turn' in sent.at(-1), false);
+});
+
+test('a bot keeps its folder: only a bot without one is sent the app\'s', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(q); } });
+  p.upsert({ name: 'loose', id: 3, provider: 'alpha', model: 'one' });
+  p.S.selected = 'loose'; await p.submit('here');
+  assert.equal(sent.at(-1).workspace, '/synthetic');
+  // A turn's folder is not the bot's: a steer run elsewhere leaves the bot where it was.
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task' });
+  await p.onEvent({ event: 'accepted', bot: 'task', turn: 5, data: { workspace: '/synthetic/steer' } });
+  assert.equal(p.S.bots.get('task').workspace, '/synthetic/task');
 });
 
 test('a steer whose turn ended meanwhile is refused as stale, with a short message, and never queued', async () => {
@@ -756,7 +771,7 @@ test('a side chat forks a running bot under it, beside, with read tools or none,
   p.S.selected = 'app.lead';
   await p.sideChat('app.lead');
   const forks = () => sent.filter(([op]) => op === 'fork').map(([, q]) => q);
-  assert.deepEqual(forks().map((q) => [q.source, q.bot, q.created_by, q.created_by_id, Array.from(q.allow), q.workspace, 'checkpoint' in q]), [['app.lead', 'app.lead-side', 'app.lead', 1, ['read', 'history'], '/synthetic', false]]);
+  assert.deepEqual(forks().map((q) => [q.source, q.bot, q.created_by, q.created_by_id, Array.from(q.allow), 'workspace' in q, 'checkpoint' in q]), [['app.lead', 'app.lead-side', 'app.lead', 1, ['read', 'history'], false, false]]);
   assert.equal(p.S.ui.side, 'app.lead-side'); assert.equal(p.S.bots.get('app.lead-side').parent, 'app.lead');
   // Send's side pick asks a new side chat with this message; the running source gets nothing.
   p.setSend('side'); p.setSideTools('answer');
@@ -838,7 +853,8 @@ test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'
   p.S.selected = long;
   await p.fork(long); await p.fork(long);
   const forks = sent.filter(([op]) => op === 'fork').map(([, q]) => q);
-  assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), q.workspace]), [[128, 'aa-fork', '/synthetic/elsewhere'], [128, '-fork-2', '/synthetic/elsewhere']]);
+  // The daemon starts a fork where its source is, so the app names no folder.
+  assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), 'workspace' in q]), [[128, 'aa-fork', false], [128, '-fork-2', false]]);
 });
 
 test('a new project creates its coordinator in the folder, writes its file once, and is not made twice', async () => {
@@ -851,7 +867,16 @@ test('a new project creates its coordinator in the folder, writes its file once,
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
-  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions], ['weather.lead', '/synthetic/weather', 'alpha/one', 'rules']);
+  assert.deepEqual([create.bot, create.workspace, create.model], ['weather.lead', '/synthetic/weather', 'alpha/one']);
+  // The shared policy first, then the app's own coordinator text: tasks that edit get worktrees.
+  assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
+  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /starts with your own name before \.lead/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
+  assert.match(create.instructions, /A task keeps its folder, so later messages to it need no --workspace/);
+  // Tasks get the worktree's own policy, failed starts clean up, and a folder without git keeps tasks in place.
+  assert.match(create.instructions, /run --detach --new --agents --bot NAME/);
+  assert.match(create.instructions, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
+  assert.match(create.instructions, /git worktree remove --force, git branch -D/);
+  assert.match(create.instructions, /when this folder is not a git repository, works in this folder/);
   assert.equal(calls.find(([op]) => op === 'policy')[1], '/synthetic/weather');
   assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/one' });
   assert.equal(p.S.selected, 'weather.lead');
@@ -1055,4 +1080,23 @@ test('a side chat learns an unknown tool list first, and a failed first message 
   await p.sideChat('lead');
   assert.deepEqual(sent.filter(([op]) => op === 'resume').map(([, q]) => q.bot), ['lead']);
   assert.deepEqual(Array.from(sent.filter(([op]) => op === 'fork').at(-1)[1].allow), ['history']);
+});
+
+test('a bot in a linked worktree shows its branch in its head, read once per folder', async () => {
+  const asked = [];
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }), branch: async (dir) => { asked.push(dir); return dir.endsWith('/worktrees/app.build') ? 'agent/app.build' : null; } });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/home/u/.agent/worktrees/app.build', created_by: 'app.lead', created_by_id: 1 });
+  p.tree();
+  const head = p.context.document.getElementById('title'), b = p.S.bots.get('app.build');
+  p.renderHead(head, b, 'main'); await new Promise((r) => setImmediate(r));
+  p.renderHead(head, b, 'main');
+  assert.match(head.innerHTML, /⎇ agent\/app\.build/);
+  p.renderHead(head, p.S.bots.get('app.lead'), 'main'); await new Promise((r) => setImmediate(r));
+  assert.doesNotMatch(head.innerHTML, /⎇/, 'a main checkout shows no branch');
+  p.renderHead(head, b, 'side');
+  assert.deepEqual(asked, ['/home/u/.agent/worktrees/app.build', '/synthetic'], 'each folder is read once');
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic', created_by: 'app.lead', created_by_id: 1 });
+  p.renderHead(head, b, 'main'); await new Promise((r) => setImmediate(r));
+  assert.doesNotMatch(head.innerHTML, /⎇/, 'a new folder is read again');
 });

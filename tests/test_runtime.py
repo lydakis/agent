@@ -1439,12 +1439,14 @@ class RuntimeTests(ModelFixture):
                                         model='anthropic/claude')['error'], 'provider_unavailable')
         self.assertEqual(client.request('submit', bot='Bob', request_id='m', prompt='hi',
                                         workspace='relative/path')['error'], 'workspace_must_exist_and_be_absolute')
-        self.assertEqual(client.request('resume', bot='Bob')['result']['workspace'], str(self.path.resolve()))
-        # A bot created without a workspace must be given one per submission.
+        # The turn that named a folder moved Bob there.
+        self.assertEqual(client.request('resume', bot='Bob')['result']['workspace'], str(other.resolve()))
+        # A bot created without a workspace needs one named until a turn gives it one.
         self.assertIsNone(client.request('create', bot='Nomad')['result']['workspace'])
         self.assertEqual(client.request('submit', bot='Nomad', request_id='n', prompt='hi')['error'], 'workspace_required')
         turn = client.request('submit', bot='Nomad', request_id='n2', prompt='hi', workspace=str(other))['result']['turn']
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        self.assertEqual(client.request('resume', bot='Nomad')['result']['workspace'], str(other.resolve()))
 
     def test_interrupt_and_crash_recovery_are_explicit(self):
         client = self.client()

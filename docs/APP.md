@@ -41,6 +41,10 @@ chat, and what side chats may use.
 
 ![Send's choices](app/send.png)
 
+build works in its own worktree: its branch follows its name in the head.
+
+![build on its own branch, beside the lead](app/worktree.png)
+
 A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
@@ -262,9 +266,24 @@ daemon learns nothing about projects; everything here is client work.
   (`allow: ["read","history"]`, the default) or only answer (`allow: []`),
   the ▾'s sticky choice. Tools stay shown, so the fork keeps its source's
   cache; the daemon refuses a call outside the list.
-- **Not built yet.** A side chat with all tools in a new worktree waits on
-  tasks in worktrees. Keep, which turns a side chat into a task, and the
-  coordinator's role text, approvals and swarms are later steps of item 47.
+- **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
+  daemon's. A coordinator the app creates gets, after the shared policy, a
+  short text of the app's own: a task that changes files, named with the
+  project's prefix so projects do not collide, gets
+  `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
+  folder's `.agent/setup` run inside it, and `agent run --new --agents
+  --workspace` that worktree, in the project's subfolder of it; the task
+  keeps that folder for later messages. The text also says the worktree
+  starts at the last commit, that a failed setup, or a start that left no
+  bot, removes the worktree and branch,
+  and that without git every task works in the project folder. The daemon only runs a
+  turn where the bot is, or where a message moves it. A bot in a
+  linked worktree shows its branch after its name in the head, read once
+  from the worktree's files when the head is first drawn.
+- **Not built yet.** A side chat with all tools in a new worktree, Keep,
+  which turns a side chat into a task, removing a deleted task's worktree,
+  and the coordinator's role text, approvals and swarms are later steps of
+  item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -398,7 +417,8 @@ coordinators and lineage, folding, opening alone or beside and swapping,
 per-pane sends with the sticky queue or steer pick, model choices within a
 provider, the agent menu's enabled items and its refresh on a status change,
 fork naming and placement, side chats (a running source, the allowed list,
-the first message going to the copy), project creation (no file for a refused model),
+the first message going to the copy), a worktree bot's branch in its head,
+project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, and runs folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving

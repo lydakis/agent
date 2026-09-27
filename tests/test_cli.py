@@ -70,18 +70,35 @@ class SocketAndCliTests(ModelFixture):
         duplicate = self.agent('run', *self.common, '--new', '--bot', 'Bob', 'hello', check=False)
         self.assertEqual(duplicate.returncode, 1)
         self.assertIn('bot_exists', duplicate.stderr)
-        # A turn runs where it is invoked, not where the bot was created.
+        # A bot keeps its folder wherever it is invoked from; --workspace moves it.
         elsewhere = self.path / 'elsewhere'
         elsewhere.mkdir()
-        moved = subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob',
-                                'shell:printf here > marker'], env=clean_env(), capture_output=True,
-                               text=True, timeout=30, cwd=elsewhere)
-        self.assertEqual(moved.returncode, 0, moved.stderr)
-        self.assertEqual((elsewhere / 'marker').read_text(), 'here')
-        self.assertFalse((self.path / 'marker').exists())
-        accepted = next(json.loads(l) for l in moved.stdout.splitlines() if json.loads(l).get('event') == 'accepted')
-        self.assertEqual(accepted['data']['workspace'], str(elsewhere.resolve()))
-        self.assertEqual(accepted['data']['model'], 'openai/synthetic-model')
+        def run_from(cwd, command, *flags):
+            done = subprocess.run([*self.base, 'run', '--store', str(self.store), '--bot', 'Bob', *flags,
+                                   command], env=clean_env(), capture_output=True, text=True, timeout=30, cwd=cwd)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return next(json.loads(l) for l in done.stdout.splitlines() if json.loads(l).get('event') == 'accepted')
+        kept = run_from(elsewhere, 'shell:printf kept > marker')
+        self.assertEqual((self.path / 'marker').read_text(), 'kept')
+        self.assertFalse((elsewhere / 'marker').exists())
+        self.assertEqual(kept['data']['workspace'], str(self.path.resolve()))
+        moved = run_from(self.path, 'shell:printf moved > marker', '--workspace', str(elsewhere))
+        self.assertEqual((elsewhere / 'marker').read_text(), 'moved')
+        self.assertEqual(moved['data']['workspace'], str(elsewhere.resolve()))
+        self.assertEqual(moved['data']['model'], 'openai/synthetic-model')
+        stays = run_from(self.path, 'shell:printf stays > marker')
+        self.assertEqual((elsewhere / 'marker').read_text(), 'stays')
+        self.assertEqual(stays['data']['workspace'], str(elsewhere.resolve()))
+        listed = {b['name']: b['workspace'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+        self.assertEqual(listed['Bob'], str(elsewhere.resolve()))
+        # Continuing a bot never reads the caller's folder, so a deleted one does not matter.
+        gone = self.path / 'gone'
+        gone.mkdir()
+        from_gone = subprocess.run(['sh', '-c', 'cd "$0" && rmdir "$0" && exec "$@"', str(gone), *self.base,
+                                    'run', '--store', str(self.store), '--bot', 'Bob', 'shell:printf gone > marker'],
+                                   env=clean_env(), capture_output=True, text=True, timeout=30)
+        self.assertEqual(from_gone.returncode, 0, from_gone.stderr)
+        self.assertEqual((elsewhere / 'marker').read_text(), 'gone')
         failing = self.agent('run', '--store', str(self.store), '--bot', 'Bob', 'truncate', check=False)
         self.assertEqual(failing.returncode, 1)
         last = json.loads(failing.stdout.splitlines()[-1])
@@ -175,10 +192,18 @@ class SocketAndCliTests(ModelFixture):
         queued = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'queue', 'second').stdout)
         self.assertEqual(queued['status'], 'queued')
+        # Queued work keeps the folder it was sent to when a later message moves the bot.
+        other = self.path / 'other'
+        other.mkdir()
+        moving = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', '--delivery', 'queue',
+                                       '--workspace', str(other), 'third').stdout)
         steered = self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--delivery=steer', '--pretty', 'late')
         self.assertRegex(steered.stderr, r'steered into turn|completed')
         done = json.loads(self.agent('wait', '--store', str(self.store), queued['handle']).stdout)
         self.assertEqual(done['results'][queued['handle']]['text'], 'reply:second')
+        self.agent('wait', '--store', str(self.store), moving['handle'])
+        turns = {t['turn']: t['workspace'] for t in json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)}
+        self.assertEqual((turns[queued['turn']], turns[moving['turn']]), (str(self.path.resolve()), str(other.resolve())))
         busy = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach', 'slow').stdout)
         strict = json.loads(self.agent('run', '--store', str(self.store), '--bot', 'Bob', '--detach',
                                        '--delivery', 'steer', '--turn', str(busy['turn']), 'now').stdout)
@@ -382,6 +407,8 @@ class SocketAndCliTests(ModelFixture):
         pretty = self.agent('fork', '--store='+str(self.store), '--source=Bob', '--bot=Pretty', '--pretty')
         self.assertGreater(len(pretty.stdout.splitlines()), 1)
         self.assertEqual(json.loads(first.stdout)['head'], json.loads(pretty.stdout)['head'])
+        # A fork starts where its source is.
+        self.assertEqual(json.loads(first.stdout)['workspace'], str(self.path.resolve()))
         # --allow narrows: no flag inherits, an empty value allows none.
         self.assertNotIn('allowed', json.loads(first.stdout))
         none = self.agent('fork', '--store='+str(self.store), '--source=Bob', '--bot=Answer', '--allow=')

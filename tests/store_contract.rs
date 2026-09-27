@@ -143,19 +143,10 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         )
         .is_err()
     );
-    // The fork carries no default directory; each of its turns names one.
+    // The fork starts in its source's folder; a turn that names another moves it.
     assert_eq!(
-        db.begin(
-            "Alternative",
-            "r1",
-            "different",
-            true,
-            &TurnOptions::default(),
-            allow_provider
-        )
-        .unwrap_err()
-        .code,
-        "workspace_required"
+        db.inspect("Alternative").unwrap().workspace.as_deref(),
+        Some("/synthetic/bob")
     );
     let branch = TurnOptions {
         workspace: Some("/synthetic/alternative".into()),
@@ -1580,6 +1571,18 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         .turn;
     db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
         .unwrap();
+    // The steer named no folder, so it records the one its turn ran in,
+    // which a later move does not rewrite.
+    let row = |db: &Database, id: i64| {
+        db.turns("Carol", 0, 10).unwrap()["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["turn"] == id)
+            .unwrap()["workspace"]
+            .clone()
+    };
+    let ran_in = row(&db, turn);
     // One call fails, one is still running.
     let (items, round): (Vec<Bytes>, Vec<ToolCall>) = [("c1", "false"), ("c2", "sleep 5")]
         .iter()
@@ -1692,6 +1695,15 @@ fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
         db.prompts("Carol", next, 0).unwrap_err().code,
         "invalid_limit"
     );
+    let moving = TurnOptions {
+        workspace: Some("/synthetic/moved".into()),
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    db.begin("Carol", "r-move", "later", true, &moving, allow_provider)
+        .unwrap();
+    assert_eq!(row(&db, steered), ran_in);
+    assert_ne!(ran_in, json!("/synthetic/moved"));
 }
 
 #[test]
@@ -1714,6 +1726,46 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
         db.prompts("Bob", turn, 1024).unwrap()["prompts"],
         json!([{"turn":turn,"text":"work"}])
     );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
+    let path = std::env::temp_dir().join(format!("agent-folders-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let turn = gated_turn(&mut db, None);
+        db.create("Carol", None, binding()).unwrap();
+        turn
+    };
+    // Before 39 a turn that named no folder stored none and read its bot's.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("UPDATE turns SET workspace=NULL; PRAGMA user_version=38;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let moving = TurnOptions {
+        workspace: Some("/synthetic/moved".into()),
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "r-move", "later", true, &moving, allow_provider)
+        .unwrap();
+    let listed = db.turns("Bob", 0, 10).unwrap();
+    let row = listed["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["turn"] == turn)
+        .unwrap();
+    assert_eq!(row["workspace"], "/synthetic");
     drop(db);
     let version: i32 = Connection::open(&path)
         .unwrap()
@@ -2001,6 +2053,16 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
             .unwrap()
             .fresh
     );
+    // A retry that names no folder means wherever the first attempt went.
+    let unnamed = TurnOptions {
+        workspace: None,
+        ..options.clone()
+    };
+    assert!(
+        !db.begin("Bob", "r1", "work", true, &unnamed, allow_provider)
+            .unwrap()
+            .fresh
+    );
     assert_eq!(
         db.begin(
             "Bob",
@@ -2025,11 +2087,55 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
             allow_provider,
         )
         .unwrap();
+    // The earlier turn moved Bob; a turn that names no folder runs where Bob is.
     let context = db.context(plain.turn).unwrap();
     assert_eq!(
         (context.workspace.as_str(), context.model.as_str()),
-        ("/synthetic/default", "openai/synthetic-model")
+        ("/synthetic/elsewhere", "openai/synthetic-model")
     );
+    // Work queued before a move runs where the bot was; work after it runs
+    // where the bot went.
+    let queue = TurnOptions {
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    let before = db
+        .begin("Bob", "r3", "before", true, &queue, allow_provider)
+        .unwrap();
+    let moving = TurnOptions {
+        workspace: Some("/synthetic/third".into()),
+        ..queue.clone()
+    };
+    let mover = db
+        .begin("Bob", "r4", "move", true, &moving, allow_provider)
+        .unwrap();
+    let after = db
+        .begin("Bob", "r5", "after", true, &queue, allow_provider)
+        .unwrap();
+    // A steer's folder never moves the bot, whether or not the steer runs.
+    let steer = TurnOptions {
+        workspace: Some("/synthetic/steer".into()),
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "r6", "aside", true, &steer, allow_provider)
+        .unwrap();
+    assert_eq!(
+        db.inspect("Bob").unwrap().workspace.as_deref(),
+        Some("/synthetic/third")
+    );
+    for (turn, folder) in [
+        (plain.turn, None),
+        (before.turn, Some("/synthetic/elsewhere")),
+        (mover.turn, Some("/synthetic/third")),
+        (after.turn, Some("/synthetic/third")),
+    ] {
+        if let Some(folder) = folder {
+            db.start(turn, allow_provider).unwrap();
+            assert_eq!(db.context(turn).unwrap().workspace, folder);
+        }
+        db.finish(turn, None).unwrap();
+    }
 }
 
 #[test]
@@ -2527,7 +2633,11 @@ fn fork_lineage_pages_are_bounded_and_survive_source_deletion() {
 fn fork_events_publish_the_persisted_workspace() {
     let mut db = db();
     db.create("source", Some("/source"), binding()).unwrap();
-    for (name, workspace) in [("default", None), ("explicit", Some("/branch"))] {
+    // A fork without a folder of its own starts in its source's.
+    for (name, workspace, kept) in [
+        ("default", None, "/source"),
+        ("explicit", Some("/branch"), "/branch"),
+    ] {
         let (fork, event) = db
             .fork(
                 "source",
@@ -2538,10 +2648,10 @@ fn fork_events_publish_the_persisted_workspace() {
                 },
             )
             .unwrap();
-        assert_eq!(fork.workspace.as_deref(), workspace);
-        assert_eq!(event["data"]["workspace"], json!(workspace));
+        assert_eq!(fork.workspace.as_deref(), Some(kept));
+        assert_eq!(event["data"]["workspace"], json!(kept));
         let replay = db.events(name, 0, 10).unwrap();
-        assert_eq!(replay["events"][0]["data"]["workspace"], json!(workspace));
+        assert_eq!(replay["events"][0]["data"]["workspace"], json!(kept));
     }
 }
 
@@ -4497,6 +4607,18 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
             .outcomes[0]
             .0,
         inherited
+    );
+    // The steer named neither, so it records the model and folder it ran with.
+    let listed = db.turns("Bob", 0, 10).unwrap();
+    let row = listed["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["turn"] == inherited)
+        .unwrap();
+    assert_eq!(
+        (&row["model"], &row["workspace"]),
+        (&json!("openai/other"), &json!("/active"))
     );
     assert!(!db.steers_waiting("Bob").unwrap());
 }

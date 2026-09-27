@@ -837,7 +837,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 38;
+    pub const SCHEMA: i32 = 39;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -3251,7 +3251,16 @@ impl Database {
                     "SELECT json_extract(CAST(item AS TEXT),'$.content[0].text') FROM nodes WHERE id=?"
                 )?.query_row([node], |r| r.get(0))?;
             }
-            if saved != prompt || saved_options != *options {
+            // A turn records the folder it runs in; a retry that names none
+            // means wherever the first attempt went.
+            let same = TurnOptions {
+                workspace: options
+                    .workspace
+                    .clone()
+                    .or(saved_options.workspace.clone()),
+                ..options.clone()
+            };
+            if saved != prompt || saved_options != same {
                 return fail("idempotency_conflict");
             }
             return Ok(Started {
@@ -3345,12 +3354,17 @@ impl Database {
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
         }
+        // A bot keeps its folder; a turn that names one moves it there.
         let workspace = options
             .workspace
             .as_deref()
             .or(bot.workspace.as_deref())
             .ok_or(Error::new("workspace_required"))?
             .to_owned();
+        // A steer's folder is for that message alone: it may never run.
+        let moved = options.workspace.is_some()
+            && options.delivery != Delivery::Steer
+            && bot.workspace.as_deref() != Some(&workspace);
         // Only the head of a bot's line is ready; the rest wait behind it.
         let status = if busy {
             "queued"
@@ -3392,10 +3406,17 @@ impl Database {
             "INSERT INTO turns(id,bot,request_id,prompt,status,workspace,model,delivery,expected_turn,from_bot,from_turn)
              VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         )?.execute(
-            params![turn, name, request_id, prompt, status, options.workspace, options.model,
-                options.delivery.name(), options.expected_turn,
+            // Queued work keeps the folder it was sent to even if the bot
+            // moves before it starts; a steer without one joins any turn.
+            params![turn, name, request_id, prompt, status,
+                if options.delivery == Delivery::Steer { options.workspace.as_deref() } else { Some(workspace.as_str()) },
+                options.model, options.delivery.name(), options.expected_turn,
                 options.from.as_ref().map(|f| &f.0), options.from.as_ref().map(|f| f.1)],
         )?;
+        if moved {
+            tx.prepare_cached("UPDATE bots SET workspace=? WHERE name=?")?
+                .execute(params![workspace, name])?;
+        }
         tx.prepare_cached("INSERT INTO retained_turns(turn,bot) VALUES (?,?)")?
             .execute(params![turn, name])?;
         let model = options
@@ -3679,12 +3700,17 @@ impl Database {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
-                tx.execute("UPDATE turns SET status='steered',finished_ms=?,prompt='',prompt_node=? WHERE id=?",
-                    params![epoch_ms(), id, steer])?;
+                tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
+                    (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                        FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
+                    params![epoch_ms(), id, turn, steer])?;
             } else {
+                // A steer that named no folder or model records the ones it ran with.
                 tx.execute(
-                    "UPDATE turns SET status='steered',finished_ms=? WHERE id=?",
-                    params![epoch_ms(), steer],
+                    "UPDATE turns SET status='steered',finished_ms=?1,
+                        (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                            FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
+                    params![epoch_ms(), turn, steer],
                 )?;
             }
             let data = json!({"status":"steered","into":turn,"node":id,"checkpoint":Value::Null,
@@ -5321,6 +5347,8 @@ impl Database {
             allow,
         } = fork;
         let parent = self.inspect(source)?;
+        // A fork starts where its source is unless told otherwise.
+        let workspace = workspace.or(parent.workspace.as_deref());
         if let Some(gate) = gate
             && gate.tools.iter().any(|t| !parent.tools.contains(t))
         {
@@ -7219,6 +7247,14 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE turns ADD COLUMN from_bot TEXT;
              ALTER TABLE turns ADD COLUMN from_turn INTEGER;",
+        )?;
+    }
+    if from < 39 {
+        // 38 -> 39: a bot's folder can move. A turn that named none ran in
+        // its bot's folder, fixed until now, so the turn records it.
+        conn.execute_batch(
+            "UPDATE turns SET workspace=(SELECT workspace FROM bots WHERE name=turns.bot)
+             WHERE workspace IS NULL;",
         )?;
     }
     Ok(())
