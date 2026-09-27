@@ -202,6 +202,10 @@ enum Command {
         approve: Option<Vec<String>>,
         approver: Option<String>,
         approve_expire_ms: Option<u64>,
+        /// The tools the fork may call, within its source's. Absent keeps
+        /// the source's list, `[]` allows none, and `null` is refused.
+        #[serde(default, deserialize_with = "present")]
+        allow: Option<Option<Vec<String>>>,
     },
     /// Remove an idle bot and everything only it owns.
     Delete {
@@ -620,6 +624,15 @@ fn workspace(path: &str) -> Result<String> {
         .to_str()
         .ok_or(Error::new("workspace_not_utf8"))?
         .into())
+}
+/// A field given as `null` deserializes to `Some(None)`, apart from one
+/// left out, which `default` makes `None`.
+fn present<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 /// A client's own gate: tools whose calls wait for a verdict, and the tag
 /// of the approver that answers. Both or neither; the daemon never reads
@@ -2322,10 +2335,28 @@ impl Service {
                 approve,
                 approver,
                 approve_expire_ms,
+                allow,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
                 }
+                let allow = match allow {
+                    None => None,
+                    Some(None) => {
+                        return fail_with("invalid_allow", "allow is a list of tool names");
+                    }
+                    Some(Some(tools)) if tools.len() > self.registry.tool_count() => {
+                        return fail_with(
+                            "invalid_allow",
+                            format!(
+                                "allow names {} tools; the daemon has {}",
+                                tools.len(),
+                                self.registry.tool_count()
+                            ),
+                        );
+                    }
+                    Some(Some(tools)) => Some(tools),
+                };
                 let gate = gate(
                     approve,
                     approver,
@@ -2349,6 +2380,7 @@ impl Service {
                                 created_by: created_by.as_deref(),
                                 created_by_id,
                                 gate: gate.as_ref(),
+                                allow: allow.as_deref(),
                             },
                         )
                     })

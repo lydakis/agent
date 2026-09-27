@@ -8448,3 +8448,86 @@ fn a_version_a_fork_sees_is_not_extended_under_it() {
     assert_eq!(after.elided, floor.through);
     assert_eq!(after.compaction.unwrap().summary, "summary 0");
 }
+
+#[test]
+fn a_fork_narrows_what_it_may_call_and_never_widens() {
+    let mut db = db();
+    let tools = ["shell".to_owned(), "read".to_owned()];
+    let gate = Gate {
+        tag: "manual".into(),
+        tools: vec!["shell".into()],
+        expire_ms: None,
+    };
+    db.create(
+        "Bob",
+        Some("/synthetic"),
+        Binding {
+            tools: &tools,
+            gate: Some(&gate),
+            ..binding()
+        },
+    )
+    .unwrap();
+    converse(&mut db, "Bob", 1);
+    let read = ["read".to_owned()];
+    let fork = |allow| Fork {
+        allow,
+        workspace: Some("/synthetic"),
+        ..Fork::default()
+    };
+    let (reader, forked) = db.fork("Bob", "Reader", fork(Some(&read))).unwrap();
+    // Still shown every tool, so its requests keep its source's prefix.
+    assert_eq!(
+        (reader.tools.as_slice(), reader.callable()),
+        (&tools[..], &read[..])
+    );
+    assert_eq!(forked["data"]["allowed"], json!(["read"]));
+    // A call it may not make waits for no verdict: it is refused.
+    assert!(db.inspect("Bob").unwrap().gated("shell"));
+    assert!(!reader.gated("shell"));
+    let (plain, _) = db.fork("Reader", "Plain", Fork::default()).unwrap();
+    assert_eq!(plain.allowed.as_deref(), Some(&read[..]));
+    assert_eq!(
+        db.fork("Reader", "Wide", fork(Some(&tools)))
+            .unwrap_err()
+            .code,
+        "allow_not_in_source"
+    );
+    let (none, _) = db.fork("Reader", "None", fork(Some(&[]))).unwrap();
+    assert_eq!(none.callable(), &[] as &[String]);
+    let (all, _) = db.fork("Bob", "All", Fork::default()).unwrap();
+    assert_eq!((all.allowed.as_deref(), all.callable()), (None, &tools[..]));
+    let turn = db
+        .begin(
+            "Reader",
+            "r",
+            "work",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let (item, call) = shell_call("fc_1", "s", "true");
+    let entries = db.append(turn, vec![item], &[call], None).unwrap();
+    assert!(entries.iter().all(|e| e["event"] != "approval_requested"));
+}
+
+#[test]
+fn schema_37_keeps_every_bot_its_tools() {
+    let path = std::env::temp_dir().join(format!("agent-allowed-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN allowed; PRAGMA user_version=36;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let bob = db.inspect("Bob").unwrap();
+    assert_eq!((bob.allowed.as_deref(), bob.callable()), (None, &READ[..]));
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}

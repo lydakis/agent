@@ -1052,7 +1052,14 @@ this fork reads no transcript. A turn that began before the store kept it
 (schema 36) refuses a default fork with `fork_point_unknown` until its next
 model response or steer. A fork keeps its source's window start when the fork
 point is at or after it and carries the source's current compaction, so its
-first request can read the source's cache. The point must leave no tool call unanswered, or the fork
+first request can read the source's cache. `allow` narrows which of the
+source's tools the fork may call: absent keeps the source's list, `[]` allows
+none, and `null` fails with `invalid_allow`. A tool outside the source's list
+fails with `allow_not_in_source`, so a fork never widens. The fork is still
+shown every tool, since changing the definitions would rebuild the provider
+cache; a call outside the list is refused at dispatch with
+`tool_not_available` and never waits for an approver. `resume` and `forked`
+report `allowed` when a bot has one (schema 37). The point must leave no tool call unanswered, or the fork
 fails with `fork_point_has_open_tool_calls`; a node outside the source's
 lineage fails with `node_not_in_source_history`. A Responses reasoning node
 cannot be separated from its following output item; selecting it fails with

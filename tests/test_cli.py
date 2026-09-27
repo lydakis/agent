@@ -369,6 +369,16 @@ class SocketAndCliTests(ModelFixture):
         pretty = self.agent('fork', '--store='+str(self.store), '--source=Bob', '--bot=Pretty', '--pretty')
         self.assertGreater(len(pretty.stdout.splitlines()), 1)
         self.assertEqual(json.loads(first.stdout)['head'], json.loads(pretty.stdout)['head'])
+        # --allow narrows: no flag inherits, an empty value allows none.
+        self.assertNotIn('allowed', json.loads(first.stdout))
+        none = self.agent('fork', '--store='+str(self.store), '--source=Bob', '--bot=Answer', '--allow=')
+        self.assertEqual(json.loads(none.stdout)['allowed'], [])
+        some = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Echo', '--allow', 'echo,echo')
+        self.assertEqual(json.loads(some.stdout)['allowed'], ['echo'])
+        wider = self.agent('fork', '--store', str(self.store), '--source', 'Answer', '--bot', 'Wide', '--allow', 'echo',
+                           check=False)
+        self.assertEqual(wider.returncode, 1)
+        self.assertIn('allow_not_in_source', wider.stderr)
         detached = self.agent('run', '--store='+str(self.store), '--bot=Bob', '--detach', '--pretty', 'hi')
         self.assertGreater(len(detached.stdout.splitlines()), 1)
         self.agent('wait', '--store='+str(self.store), json.loads(detached.stdout)['handle'])

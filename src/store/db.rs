@@ -48,8 +48,13 @@ pub struct Bot {
     pub model: String,
     pub instructions: String,
     pub reasoning: Option<String>,
-    /// The tools this bot may call, chosen at creation and kept with it.
+    /// The tools this bot is shown, chosen at creation and kept with it.
     pub tools: Vec<String>,
+    /// The subset of `tools` it may call, when narrower; `None` is all of
+    /// them. A fork narrows it without changing what the model is shown,
+    /// so the fork's requests keep its source's cached prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<Vec<String>>,
     /// The bot whose client created or forked this one, as that client
     /// declared it (the CLI takes it from `AGENT_BOT`). Bots are peers;
     /// this is lineage for people, not authority.
@@ -111,9 +116,14 @@ impl Denials {
     }
 }
 impl Bot {
-    /// Whether a call of this tool waits for a verdict.
+    /// Whether a call of this tool waits for a verdict. A call the bot may
+    /// not make is refused, never announced.
     pub fn gated(&self, tool: &str) -> bool {
-        gated(&self.gates, tool)
+        gated(&self.gates, tool) && self.callable().iter().any(|t| t == tool)
+    }
+    /// The tools this bot may call: its allowed list, else its tools.
+    pub fn callable(&self) -> &[String] {
+        self.allowed.as_deref().unwrap_or(&self.tools)
     }
     /// The bot id that keys this bot's provider prompt cache.
     pub fn cache_bot(&self) -> i64 {
@@ -135,6 +145,9 @@ pub struct Fork<'a> {
     pub created_by_id: Option<i64>,
     /// A gate the fork adds to the ones it inherits.
     pub gate: Option<&'a Gate>,
+    /// The tools the fork may call, within its source's; `None` keeps the
+    /// source's list.
+    pub allow: Option<&'a [String]>,
 }
 /// Provider binding chosen at creation; immutable for the bot's lifetime.
 pub struct Binding<'a> {
@@ -821,7 +834,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 36;
+    pub const SCHEMA: i32 = 37;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -946,7 +959,7 @@ impl Database {
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
                 thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT,
-                closed INTEGER, open_calls INTEGER);
+                closed INTEGER, open_calls INTEGER, allowed TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -1260,6 +1273,9 @@ impl Database {
             instructions: r.get(8)?,
             reasoning: r.get(9)?,
             tools: split_tools(&r.get::<_, String>(12)?),
+            allowed: r
+                .get::<_, Option<String>>(32)?
+                .map(|joined| split_tools(&joined)),
             input_tokens: r.get::<_, i64>(13)?.max(0) as u64,
             cached_input_tokens: r.get::<_, i64>(14)?.max(0) as u64,
             cache_hit: cache_hit(r.get::<_, i64>(14)?, r.get::<_, i64>(13)?),
@@ -1302,7 +1318,7 @@ impl Database {
             },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -5099,6 +5115,7 @@ impl Database {
             created_by,
             created_by_id,
             gate,
+            allow,
         } = fork;
         let parent = self.inspect(source)?;
         if let Some(gate) = gate
@@ -5106,6 +5123,25 @@ impl Database {
         {
             return fail("approve_not_in_tools");
         }
+        // A fork never widens what its source may call.
+        let allowed = match allow {
+            None => parent.allowed.clone(),
+            Some(allow) => {
+                let mut allowed: Vec<String> = Vec::with_capacity(allow.len());
+                for tool in allow {
+                    if !parent.callable().contains(tool) {
+                        return fail_with(
+                            "allow_not_in_source",
+                            format!("{source} may not call {tool}"),
+                        );
+                    }
+                    if !allowed.contains(tool) {
+                        allowed.push(tool.clone());
+                    }
+                }
+                Some(allowed)
+            }
+        };
         // A running or parked turn's newest closed node is kept as it
         // moves, so forking there reads no transcript and needs no check.
         let (checkpoint, validated) = match node {
@@ -5180,7 +5216,7 @@ impl Database {
             &parent.tools,
         ))?;
         tx.execute(
-            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO bots(name,id,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,context_start,pruned_cursor,tools,created_by,created_by_id,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,thinking_from,thinking_to,thinking_elided,gates,allowed) VALUES (?,?,?,?,'idle',NULL,?,?,?,?,?,?,0,NULL,0,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 name,
                 id,
@@ -5209,7 +5245,8 @@ impl Database {
                 thinking.1.from,
                 thinking.1.to,
                 thinking.2,
-                gates
+                gates,
+                allowed.as_ref().map(|allowed| allowed.join(","))
             ],
         )?;
         if let Some(node) = checkpoint {
@@ -5259,6 +5296,9 @@ impl Database {
             "created_by":created_by,"created_by_id":created_by_id});
         if let Some(gates) = &gates {
             data["gates"] = serde_json::from_str(gates)?;
+        }
+        if let Some(allowed) = &allowed {
+            data["allowed"] = json!(allowed);
         }
         let cursor = event(&tx, name, None, "forked", data.clone())?;
         tx.commit()?;
@@ -6988,6 +7028,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
              ALTER TABLE bots ADD COLUMN open_calls INTEGER;
              ALTER TABLE processes ADD COLUMN delivered INTEGER;",
         )?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='allowed')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 36 -> 37: a bot's allowed tools. NULL is its whole tools set, so
+        // every existing bot keeps the access it had.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN allowed TEXT;")?;
     }
     Ok(())
 }

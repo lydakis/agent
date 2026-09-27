@@ -26,8 +26,8 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "fork",
-        usage: "fork --source NAME --bot NAME [--checkpoint NODE]",
-        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --pretty",
+        usage: "fork --source NAME --bot NAME [--checkpoint NODE] [--allow LIST]",
+        flags: "--source --bot --checkpoint --workspace --budget-tokens --approval --approve --allow --pretty",
         startup: false,
     },
     Command {
@@ -197,6 +197,10 @@ fn print_flags(flags: &str) {
             "--tools" => (
                 "LIST",
                 "A new bot's tools; default shell,read,write,edit,wait,history",
+            ),
+            "--allow" => (
+                "LIST",
+                "The tools a fork may call, within its source's; '' allows none; default: the source's",
             ),
             "--max-processes" => ("N", "Concurrent process limit; 0 is unbounded"),
             "--max-detached" => ("N", "Detached commands still running; 0 is unbounded"),

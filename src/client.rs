@@ -43,6 +43,8 @@ struct Options {
     providers_explicit: bool,
     tools_explicit: bool,
     tools: String,
+    /// A fork's allowed tools, comma-separated; empty allows none.
+    allow: Option<String>,
     model: Option<String>,
     instructions: Option<String>,
     reasoning: Option<String>,
@@ -101,6 +103,7 @@ fn parse(args: &[String]) -> Result<Options> {
         providers_explicit: false,
         tools_explicit: false,
         tools: DEFAULT_TOOLS.into(),
+        allow: None,
         model: None,
         instructions: None,
         reasoning: None,
@@ -176,6 +179,7 @@ fn parse(args: &[String]) -> Result<Options> {
                     "--delivery" => options.delivery = Some(value),
                     "--approval" => options.approval = Some(value),
                     "--approve" => options.approve = Some(value),
+                    "--allow" => options.allow = Some(value),
                     "--call" => options.call = Some(value),
                     "--request" => {
                         options.request = Some(
@@ -1044,6 +1048,10 @@ fn fork(options: &Options) -> Result<i32> {
         "workspace":options.workspace.as_ref().map(|_| workspace(options)).transpose()?,
         "budget_tokens":options.budget_tokens,
         "created_by":created_by,"created_by_id":created_by_id});
+    if let Some(allow) = &options.allow {
+        let allow: Vec<&str> = allow.split(',').filter(|t| !t.is_empty()).collect();
+        request["allow"] = json!(allow);
+    }
     // A fork keeps its source's tools and gates; its own gate adds to them.
     if options.approval.as_deref().unwrap_or("full") != "full" || options.approve.is_some() {
         let state = connection.request("resume", json!({"bot":source}))?;

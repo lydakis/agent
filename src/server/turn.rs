@@ -2422,7 +2422,7 @@ impl Turn {
         mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
     ) -> Result<Option<Stop>> {
-        let (turn, allowed) = (self.turn, &record.tools);
+        let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             if record.gated(&call.name) {
@@ -2592,7 +2592,11 @@ impl Turn {
             let expire_ms = record
                 .gates
                 .iter()
-                .filter(|gate| round.clone().any(|c| gate.tools.contains(&c.name)))
+                .filter(|gate| {
+                    round
+                        .clone()
+                        .any(|c| record.gated(&c.name) && gate.tools.contains(&c.name))
+                })
                 .filter_map(|gate| gate.expire_ms)
                 .min();
             (notify, expire_ms.map(|ms| at + Duration::from_millis(ms)))

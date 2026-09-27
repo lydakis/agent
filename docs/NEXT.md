@@ -830,9 +830,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     round, kept current in `bots.closed` so it reads no transcript, and
     keeps its source's window start; a bot waits only on background
     commands it started, and reads another branch's stored process output
-    only through the wait result that delivered it (schema 36). Next, the
-    allowed-tools list, then measurement of the cache and of the
-    fork-or-fresh rule, which is not in the preamble yet.
+    only through the wait result that delivered it (schema 36). Done: the
+    allowed-tools list, `fork --allow`, which a fork inherits and can only
+    narrow; a call outside it is refused at dispatch (schema 37). Next,
+    measurement of the cache and of the fork-or-fresh rule, which is not
+    in the preamble yet, then the app's side chat.
 
 44. Storage commits on a slow disk. Done: the worker commits in groups,
     one sync for the jobs that queued together, and callers are answered
