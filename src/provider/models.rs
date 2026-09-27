@@ -6,7 +6,7 @@ use super::{Provider, aws, connection_error, error_body, sanitize_error};
 use crate::{Error, Result, codec::Family, fail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(300);
@@ -18,10 +18,15 @@ const LIMIT: usize = 8 * 1024 * 1024;
 /// SHA-256 of an empty body, for a signer that signs the payload.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Listings kept across all providers, about two replies' worth; past it
+/// a listing is answered but not kept.
+const KEPT: usize = 2 * crate::output::MAX_EVENT;
+
 /// The last answer, a refusal included, so a client asking again within
-/// `KEEP` waits on neither the network nor a provider that is down.
+/// `KEEP` waits on neither the network nor a provider that is down, with
+/// the bytes it holds of the transport's shared `KEPT`.
 #[derive(Default)]
-pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed)>>);
+pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed, usize)>>);
 
 type Listed = Result<Arc<Vec<Value>>>;
 
@@ -30,17 +35,21 @@ impl Provider {
     /// the provider prefix. Callers asking at once share one request.
     pub async fn models(&self) -> Listed {
         let mut kept = self.listing.0.lock().await;
-        if let Some((at, listed)) = kept.as_ref()
+        if let Some((at, listed, _)) = kept.as_ref()
             && at.elapsed() < KEEP
         {
             return listed.clone();
         }
+        if let Some((_, _, held)) = kept.take() {
+            self.transport.listed.fetch_sub(held, Ordering::Relaxed);
+        }
+        let mut size = 0;
         let listed = tokio::time::timeout(DEADLINE, self.list_models())
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
             .and_then(|models| {
-                // Kept only if one reply could carry it.
-                let size = serde_json::to_vec(&models).map_or(usize::MAX, |bytes| bytes.len());
+                // Answered only if one reply could carry it.
+                size = serde_json::to_vec(&models).map_or(usize::MAX, |bytes| bytes.len());
                 match size <= crate::output::MAX_EVENT {
                     true => Ok(Arc::new(models)),
                     false => Err(Error::with(
@@ -49,7 +58,16 @@ impl Provider {
                     )),
                 }
             });
-        *kept = Some((Instant::now(), listed.clone()));
+        let held = if listed.is_ok() { size } else { 0 };
+        let room =
+            self.transport
+                .listed
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |kept| {
+                    (kept + held <= KEPT).then_some(kept + held)
+                });
+        if room.is_ok() {
+            *kept = Some((Instant::now(), listed.clone(), held));
+        }
         listed
     }
 
@@ -115,7 +133,17 @@ impl Provider {
                 entries.extend(listed);
             }
             if page["has_more"] != true {
-                return parse(&json!({"data": entries}));
+                let mut models = parse(&json!({"data": entries}))?;
+                // Mantle lists every family at one address; offer only those
+                // this binding's wire format runs.
+                if matches!(aws::endpoint(&self.url), Some((_, "bedrock-mantle"))) {
+                    models.retain(|model| {
+                        model["id"]
+                            .as_str()
+                            .is_some_and(|id| mantle_runs(self.family, id))
+                    });
+                }
+                return Ok(models);
             }
             match page["last_id"].as_str() {
                 Some(last) if after.as_deref() != Some(last) => after = Some(last.to_owned()),
@@ -195,6 +223,13 @@ impl Provider {
     }
 }
 
+/// Whether a Mantle model id is one of the family its binding speaks:
+/// Anthropic's models (`anthropic.`, perhaps under a routing prefix such as
+/// `global.`) on the Messages route, everything else on Responses.
+fn mantle_runs(family: Family, id: &str) -> bool {
+    id.split('.').any(|part| part == "anthropic") == (family == Family::Anthropic)
+}
+
 /// The shapes providers answer with: `data` (OpenAI, Anthropic, OpenRouter,
 /// Bedrock Mantle) or `models` (the ChatGPT Codex backend, whose `hide` and
 /// `none` entries its own picker leaves out too). Newest first where the
@@ -246,6 +281,16 @@ mod tests {
         provider::{Provider, Transport},
     };
     use serde_json::json;
+
+    #[test]
+    fn mantle_offers_each_binding_only_its_own_family() {
+        use super::mantle_runs;
+        assert!(mantle_runs(Family::Anthropic, "anthropic.claude-sonnet-5"));
+        assert!(mantle_runs(Family::Anthropic, "global.anthropic.claude-sonnet-5"));
+        assert!(!mantle_runs(Family::Anthropic, "openai.gpt-6-luna"));
+        assert!(mantle_runs(Family::Responses, "openai.gpt-6-luna"));
+        assert!(!mantle_runs(Family::Responses, "anthropic.claude-sonnet-5"));
+    }
 
     #[test]
     fn each_listing_sits_where_its_provider_serves_it() {

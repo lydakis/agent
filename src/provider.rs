@@ -117,6 +117,8 @@ const BEDROCK_BETAS: &str = "thinking-binding-controls-2026-08-01";
 pub struct Transport {
     shards: Vec<Shard>,
     starting: Semaphore,
+    /// Bytes of model listings kept across every provider on it.
+    listed: AtomicUsize,
 }
 struct Shard {
     client: reqwest::Client,
@@ -156,6 +158,7 @@ impl Transport {
             .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(Self {
             shards,
+            listed: AtomicUsize::new(0),
             starting: Semaphore::new(if max_connecting == 0 {
                 Semaphore::MAX_PERMITS
             } else {
