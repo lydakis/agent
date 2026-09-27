@@ -929,11 +929,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     the daemon's `provider_models`. Source read 2026-09-27: Codex (9db8162)
     refreshes its bundled catalog from the Codex backend's `/models`,
     OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
-    catalogs. The daemon never reads the list. Next, in
-    order: the app shell (projects in the sidebar from coordinator bots and
-    `.agent/project.toml`, a side pane with its own composer, the model chip,
-    Send with queue, steer or side chat, one ⋯ menu, runs folded to one line);
-    tasks in worktrees (`run --new --worktree` with a setup command, in the
+    catalogs. The daemon never reads the list. Done
+    (2026-09-27): the app shell ([APP.md](APP.md#projects-and-panes)):
+    projects in the sidebar from coordinator bots and `.agent/project.toml`,
+    a side pane with its own composer, the model chip, Send with queue or
+    steer, one ⋯ menu, runs folded to one line. Side chat shows disabled
+    until item 43. Next, in order: tasks in worktrees (`run --new --worktree` with a setup command, in the
     client); side chats once item 43's fork changes land; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
     text in the client policy; swarms last, since that design is not decided.

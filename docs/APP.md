@@ -41,7 +41,7 @@ nothing polled.
 
 ```
 app/
-  src-tauri/     Rust core: six commands, no events
+  src-tauri/     Rust core: a transport, plus the project file
   ui/            the page: index.html, app.css, app.js, daemon.js
   playground.py  an offline daemon with a synthetic model, for mechanics
 client/          agent-client: the socket protocol and the client policy
@@ -52,7 +52,10 @@ client/          agent-client: the socket protocol and the client policy
   `policy` composes the client policy for the workspace; `attach` connects
   and follows `*` from the page's cursor; `pull` hands the page the next
   batch of that session's notifications, at most 256, when it asks;
-  `request` relays any protocol op. State and protocol logic live in the
+  `request` relays any protocol op; `models` reads `~/.agent/models`, and
+  `project` and `write_project` read and write a folder's
+  `.agent/project.toml` ([project.rs](../app/src-tauri/src/project.rs)).
+  State and protocol logic live in the
   page, exactly as they did in the prototype, so the design and the
   mechanics iterate in one place.
 - **The page** is the prototype's HTML and CSS with the fake daemon swapped
@@ -63,10 +66,11 @@ client/          agent-client: the socket protocol and the client policy
   mutation queue, so a pending read cannot splice over a newer snapshot.
 - **Demo mode.** In a plain browser there is no Rust core, so `daemon.js`
   becomes a simulated daemon that emits the same protocol shapes and answers
-  `item`, `submit`, `create`, `interrupt`. The scenario plays on load: main
-  thinks, starts a release build in the background, spawns plan, build and
-  test, build spawns review, and main waits on all of it. Serve `app/ui` with
-  any static server to work on the design without a daemon.
+  `item`, `submit`, `create`, `fork`, `delete`, `interrupt`. The scenario
+  plays on load in two projects: `demo.lead` thinks, starts a release build
+  in the background, spawns its tasks plan, build and test, build spawns
+  review, and the coordinator waits on all of it. Serve `app/ui` with any
+  static server to work on the design without a daemon.
 
 ## Running it
 
@@ -82,17 +86,53 @@ socket is resolved the way the CLI and the daemon resolve it (the shared
 client crate's rendezvous), so a deep store path meets the same short socket.
 The page draws with the machine's own monospace face and fetches nothing.
 Closing the window is detaching; the daemon and its bots continue. The page
-remembers the bot on screen, the open peek, the rail and the folds per socket
-and workspace in the webview's local storage, and restores them on the next
-start. If the daemon is unreachable or closes the session, the page shows why
+remembers the thread on screen, the one beside it, the sidebar, folded
+projects, model picks and the steps fold per socket and workspace in the
+webview's local storage, and restores them on the next start. Send's queue or
+steer pick is remembered for every window. If the daemon is unreachable or closes the session, the page shows why
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
 
-Keys are the concept's: `^k` switch, `^b` rail, `^p` peek, `^t` thoughts,
-`^o` output, `Esc` close then interrupt, `↑` `↓` on an empty prompt to move
-between bots, `^d` close the window, `/new NAME [PROVIDER/MODEL]` to create a
-bot, `?` on an empty prompt for the list and the models in `~/.agent/models`,
-read each time. `⌘` works where `^` does.
+Keys: `^k` find a bot, `^b` sidebar, `^p` next task beside, `^o` every
+run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
+empty message to move between bots, `^d` close the window, Enter to send and
+Shift-Enter for a new line, `/new NAME [PROVIDER/MODEL]` to create a bot, `?`
+on an empty message for the list and the models in `~/.agent/models`, read
+each time. `⌘` works where `^` does.
+
+## Projects and panes
+
+The shell follows the "Agent App Concepts" prototype (NEXT item 47). The
+daemon learns nothing about projects; everything here is client work.
+
+- **Projects.** A project is a folder, its coordinator bot `<project>.lead`,
+  and `.agent/project.toml` (name, coordinator, model; mechanics only). The
+  sidebar lists every coordinator in the store as a project, with its tasks
+  under it: the coordinator's `created_by` lineage, plus any root bot named
+  `<project>.<task>`. Bots in no project follow. A project row opens its
+  coordinator; its chevron folds the tasks. **＋ New project** takes a
+  folder, reads its `project.toml` or names the project after the folder,
+  creates the coordinator there with the folder's own client policy, and
+  writes the file if there was none. An existing coordinator is opened.
+- **Panes.** A sidebar row opens that thread alone. A task card opens its
+  bot in a side pane with its own composer; ⤢ swaps it into full view, ✕ or
+  `Esc` closes it.
+- **Composer.** The model chip lists `~/.agent/models`, read on each open.
+  Models of the bot's provider switch the next turns (sent as `submit`'s
+  `model`); other providers show disabled as "new agent", since a bot keeps
+  its provider. Send starts a turn on a bot at rest; on a working bot it
+  queues or steers, as picked last from its ▾.
+- **One menu per agent**, from the head's ⋯, a sidebar row's or card's ⋯ on
+  hover, or a right-click: stop, fork (an exact copy of a bot at rest, next
+  to it in the tree, opened beside), delete (confirmed), and every run's
+  thoughts and output.
+- **Runs.** Thinking, tool calls and their output between two messages fold
+  to one line: the call in progress with its clock, or the tools used, and
+  any failure. A click opens a run or unfolds one long output.
+- **Not built yet.** Side chat shows disabled in the menu and in Send's ▾:
+  it forks a running bot, which needs NEXT item 43. Keep, which turns a side
+  chat into a task, waits with it. Tasks in worktrees, the coordinator's role
+  text, approvals and swarms are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -196,13 +236,18 @@ instructions as the CLI, so app-created bots can summarize older context.
 Completed thoughts retain locally observed thinking time; historical thoughts
 without a recorded duration show no invented time.
 
+On 2026-09-27 the shell was driven in demo mode in headless Chromium:
+projects and tasks in the sidebar, a card opened beside and swapped, the three
+menus, fork, confirmed delete, folding and a new project, with no page errors.
+A task's runs rendered while it worked matched a full redraw of the same pane.
+
 ## Next
 
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
 2. Packaging: a real icon set, `bundle.active`, a signed build.
-3. The projects design (the "Agent App Concepts" prototype), in the order
-   [NEXT item 47](NEXT.md) gives.
+3. The rest of the projects design (the "Agent App Concepts" prototype), in
+   the order [NEXT item 47](NEXT.md) gives.
 
 ## Regression checks
 
@@ -213,7 +258,11 @@ windowing, CSS control-character escaping, creation-event validation, concurrent
 submission IDs, fork-history paging, snapshot/history ordering, history paging
 past activity summaries, pinned submission identities, oversized-item isolation,
 compaction policy propagation, creation refusal when the workspace policy
-cannot compose, and completed thought timing.
+cannot compose, completed thought timing, and the shell: projects from
+coordinators and lineage, folding, opening alone or beside and swapping,
+per-pane sends with the sticky queue or steer pick, model choices within a
+provider, the agent menu's enabled items, fork naming and placement, project
+creation, and runs folded with failures on their line.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.
