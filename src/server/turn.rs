@@ -1489,10 +1489,27 @@ impl Turn {
                         .handles
                         .take_settled(&self.store, turn, &waiting.handles)
                         .await;
+                    // Background commands whose results this wait hands over.
+                    let delivered: Vec<i64> = results
+                        .iter()
+                        .filter(|(_, result)| result["pending"] != true)
+                        .filter_map(|(handle, _)| match Handle::parse(handle) {
+                            Ok(Handle::Process(id)) => Some(id),
+                            _ => None,
+                        })
+                        .collect();
                     let outcome = Outcome::text(wait_result(results).to_string());
                     let id = waiting.call_id.clone();
                     self.store
-                        .op("tool_finish", move |db| db.tool_finish(turn, &id, &outcome))
+                        .op("tool_finish", move |db| {
+                            let (item, entry) = db.tool_finish(turn, &id, &outcome)?;
+                            if let Some(node) = entry["data"]["node"].as_i64()
+                                && !delivered.is_empty()
+                            {
+                                db.delivered(node, &delivered)?;
+                            }
+                            Ok((item, entry))
+                        })
                         .await?;
                 }
                 // Calls that followed in the same model response.
@@ -2405,7 +2422,7 @@ impl Turn {
         mut warm: Option<&mut Warm<'_>>,
         route: Option<&str>,
     ) -> Result<Option<Stop>> {
-        let (turn, allowed) = (self.turn, &record.tools);
+        let (turn, allowed) = (self.turn, record.callable());
         let mut calls = calls.into_iter();
         while let Some(call) = calls.next() {
             if record.gated(&call.name) {
@@ -2575,7 +2592,11 @@ impl Turn {
             let expire_ms = record
                 .gates
                 .iter()
-                .filter(|gate| round.clone().any(|c| gate.tools.contains(&c.name)))
+                .filter(|gate| {
+                    round
+                        .clone()
+                        .any(|c| record.gated(&c.name) && gate.tools.contains(&c.name))
+                })
                 .filter_map(|gate| gate.expire_ms)
                 .min();
             (notify, expire_ms.map(|ms| at + Duration::from_millis(ms)))
@@ -2765,6 +2786,7 @@ impl Turn {
         calls: &mut std::vec::IntoIter<ToolCall>,
         route: Option<&str>,
     ) -> Result<ControlFlow<Stop, Outcome>> {
+        let mut processes = Vec::new();
         for text in &handles {
             match Handle::parse(text) {
                 Err(error) => return Ok(ControlFlow::Continue(failure(error))),
@@ -2774,7 +2796,23 @@ impl Turn {
                         "a turn cannot wait on itself",
                     ))));
                 }
+                Ok(Handle::Process(id)) => processes.push(id),
                 Ok(_) => {}
+            }
+        }
+        // A bot waits only on commands it started; one its history
+        // inherited from a fork's source is not its to collect. An owned
+        // command stays owned, so checking before the wait parks is enough.
+        if !processes.is_empty() {
+            let bot = self.bot.clone();
+            let refused = self
+                .store
+                .op("unowned_process", move |db| {
+                    db.unowned_process(&bot, &processes)
+                })
+                .await?;
+            if let Some(error) = refused {
+                return Ok(ControlFlow::Continue(failure(error)));
             }
         }
         // Only move the remaining calls once this wait can actually park.

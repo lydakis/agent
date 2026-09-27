@@ -182,7 +182,24 @@ class WaitTests(ModelFixture):
         self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results'][handle]['exit_code'], 3)
         unknown = client.request('submit', bot='Bob', request_id='w3', prompt='wait:proc:999')['result']['turn']
         self.assertEqual(client.finished(unknown)['data']['status'], 'completed')
-        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results']['proc:999']['error'], 'unknown_handle')
+        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['error'], 'unknown_handle')
+
+    def test_a_fork_cannot_collect_its_sources_background_command(self):
+        client = self.client('echo,shell,wait')
+        client.request('create', bot='Bob', workspace=str(self.path))
+        started = client.request('submit', bot='Bob', request_id='bg', prompt='bg:printf out')['result']['turn']
+        self.assertEqual(client.finished(started)['data']['status'], 'completed')
+        handle = self.tool_output(client, 'Bob', 'bg-1')['handle']
+        client.request('fork', source='Bob', bot='Twin', workspace=str(self.path))
+        # The handle is in Twin's history, but the command is Bob's.
+        waited = client.request('submit', bot='Twin', request_id='w', prompt='wait:' + handle)['result']['turn']
+        self.assertEqual(client.finished(waited)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Twin', 'wait-1')['error'], 'handle_unavailable')
+        mine = client.request('submit', bot='Bob', request_id='w', prompt='wait:' + handle)['result']['turn']
+        self.assertEqual(client.finished(mine)['data']['status'], 'completed')
+        self.assertEqual(self.tool_output(client, 'Bob', 'wait-1')['results'][handle]['stdout'], 'out')
+        # A program holding the handle still resolves it.
+        self.assertEqual(client.request('wait', handles=[handle])['result']['results'][handle]['stdout'], 'out')
 
     def test_peer_turn_handles_resolve_with_status_and_text(self):
         client = self.client('echo,shell,wait')
