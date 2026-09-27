@@ -99,6 +99,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
         return Err(invalid(&format!("coordinator must be {coordinator}")));
     }
     let model = field("model")?;
+    if model.as_deref() == Some("") {
+        return Err(invalid("model must not be empty"));
+    }
     Ok(json!({
         "dir": dir, "name": name, "coordinator": coordinator, "model": model, "file": true,
     }))
@@ -238,6 +241,8 @@ mod tests {
         let error = read(&dir).unwrap_err();
         assert!(error.starts_with("project_invalid: "), "{error}");
         assert!(error.ends_with("unknown key role"), "{error}");
+        std::fs::write(dir.join(FILE), "name = \"demo\"\nmodel = \"\"\n").unwrap();
+        assert!(read(&dir).unwrap_err().ends_with("model must not be empty"));
         std::fs::write(
             dir.join(FILE),
             "name = \"demo\"\ncoordinator = \"demo.lead\"\nmodel = \"alpha/one\"\n",

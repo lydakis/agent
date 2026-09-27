@@ -972,7 +972,9 @@ const PANE = {
 };
 const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer' };
 // Send starts a turn on a bot at rest; on a working bot it does what the menu last picked.
-const sendMode = (b) => b && isActive(b.status) ? S.send : 'send';
+// Only a turn that has started can take a steer; one waiting for a slot takes a queue.
+const RUNNING = new Set(['running', 'waiting', 'paced']);
+const sendMode = (b) => !b || !isActive(b.status) ? 'send' : S.send === 'steer' && !RUNNING.has(b.status) ? 'queue' : S.send;
 const providerOf = (model) => String(model ?? '').split('/')[0];
 // A turn may run on the bot's own provider, or on another the fleet's records show in its family.
 function runsOn(b, model) {
@@ -1211,7 +1213,7 @@ async function submit(text, pane = 'main') {
   const b = bot(PANE[pane].bot()); if (!b) throw new Error('no bot selected; /new NAME creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
-  const model = S.override.get(b.name), delivery = isActive(b.status) ? S.send : 'reject';
+  const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
   // A steer joins the running turn only on that turn's model and folder, so it names neither.
   // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
   // rather than the message landing in whatever turn runs next.

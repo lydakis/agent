@@ -712,6 +712,11 @@ test('a steer joins the running turn: it names no model and no workspace', async
   p.setSend('steer'); await p.submit('now');
   assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('workspace' in sent.at(-1), false); assert.equal('model' in sent.at(-1), false);
   assert.equal(sent.at(-1).expected_turn, 3, 'a steer is for the turn on screen');
+  // A turn still waiting for a slot has not started, so it takes a queue, not a steer.
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task', status: 'ready', running_turn: null });
+  await p.onEvent({ event: 'queued', bot: 'task', turn: 4, data: { status: 'ready' } });
+  await p.submit('soon');
+  assert.equal(sent.at(-1).delivery, 'queue'); assert.equal('expected_turn' in sent.at(-1), false);
 });
 
 test('a steer whose turn ended meanwhile is refused as stale, with a short message, and never queued', async () => {

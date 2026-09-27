@@ -934,7 +934,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     projects in the sidebar from coordinator bots and `.agent/project.toml`,
     a side pane with its own composer, the model chip, Send with queue or
     steer, one ⋯ menu, runs folded to one line. Side chat shows disabled
-    until item 43. Next, in order: tasks in worktrees (`run --new --worktree` with a setup command, in the
+    until item 43. Follow-up: `delete` takes only a name, so a delete the app
+    confirmed can land on a bot recreated under that name meanwhile; the
+    daemon's `delete` should take `bot_id` like `submit` does. Next, in
+    order: tasks in worktrees (`run --new --worktree` with a setup command, in the
     client); side chats once item 43's fork changes land; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
     text in the client policy; swarms last, since that design is not decided.
