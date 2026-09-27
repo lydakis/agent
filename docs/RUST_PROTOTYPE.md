@@ -1777,7 +1777,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   after; a call on a later page may also arrive pushed, and the request
   number tells the two apart. One session holds a tag: another gets
   `approvals_served` while the holder's session is open and its lease
-  runs. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
+  runs or its listing is still being read. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
   600,000), counted from when the listing is read. A holder whose lease ran out keeps
   the tag until any session next serves a tag, which ends the lease (and

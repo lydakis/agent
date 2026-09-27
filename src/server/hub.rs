@@ -6,7 +6,7 @@
 use agent_runtime::{Result, fail, output::Output, store::Store};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -57,6 +57,9 @@ pub struct Approver {
     lease: u64,
     lease_ms: u64,
     deadline: Instant,
+    /// Its key in the hub's `expiries`: no later than `deadline`, which
+    /// only moves later.
+    indexed: Instant,
     cursor: i64,
     live: bool,
 }
@@ -102,7 +105,57 @@ struct HubInner {
     firehose: Vec<(u64, Output)>,
     subs: HashMap<String, Vec<(u64, Sub)>>,
     approvers: HashMap<String, Serving>,
+    /// Every entry of `approvers` once, by lease and a deadline no later
+    /// than its own, so leases that ran out are found without visiting the
+    /// rest. Renewals move only the deadline; the key catches up when it
+    /// comes due.
+    expiries: BTreeMap<(Instant, u64), String>,
     next_lease: u64,
+}
+impl HubInner {
+    fn insert(&mut self, tag: &str, serving: Serving) {
+        let key = {
+            let mut held = serving.lock().unwrap();
+            held.indexed = held.deadline;
+            (held.indexed, held.lease)
+        };
+        self.expiries.insert(key, tag.to_owned());
+        self.approvers.insert(tag.to_owned(), serving);
+    }
+    fn remove(&mut self, tag: &str) -> Option<Serving> {
+        let serving = self.approvers.remove(tag)?;
+        let key = {
+            let held = serving.lock().unwrap();
+            (held.indexed, held.lease)
+        };
+        self.expiries.remove(&key);
+        Some(serving)
+    }
+    /// End the leases that ran out and tell their holders. A lease not yet
+    /// live has not started, so it is kept for another period.
+    fn expire_due(&mut self, now: Instant) {
+        while let Some(entry) = self.expiries.first_entry() {
+            if entry.key().0 > now {
+                break;
+            }
+            let ((_, lease), tag) = entry.remove_entry();
+            let Some(serving) = self.approvers.get(&tag).cloned() else {
+                continue;
+            };
+            let mut held = serving.lock().unwrap();
+            if held.live && held.deadline <= now {
+                let _ = held.output.try_send(lost(&tag, lease));
+                drop(held);
+                self.approvers.remove(&tag);
+            } else {
+                if !held.live {
+                    held.deadline = now + Duration::from_millis(held.lease_ms);
+                }
+                held.indexed = held.deadline;
+                self.expiries.insert((held.indexed, lease), tag);
+            }
+        }
+    }
 }
 /// What a serving session is told when its tag passes to another holder,
 /// its lease runs out, or it answers with a lease that ended.
@@ -126,20 +179,24 @@ impl Hub {
         let now = Instant::now();
         if let Some(held) = inner.approvers.get(tag) {
             let held = held.lock().unwrap();
-            if held.session != session && held.deadline > now {
+            if held.session != session && (!held.live || held.deadline > now) {
                 return fail("approvals_served");
             }
         }
+        // The session's own lease on the tag is replaced without a word;
+        // another session's ran out, so it is told.
+        let before = inner.remove(tag).and_then(|serving| {
+            let held = serving.lock().unwrap();
+            if held.session == session {
+                drop(held);
+                return Some(serving);
+            }
+            let _ = held.output.try_send(lost(tag, held.lease));
+            None
+        });
         // Leases that ran out go now, whichever tag they held, so tags
         // served once and let go do not accumulate.
-        inner.approvers.retain(|held_tag, held| {
-            let held = held.lock().unwrap();
-            let keep = held.deadline > now || (held.session == session && held_tag == tag);
-            if !keep {
-                let _ = held.output.try_send(lost(held_tag, held.lease));
-            }
-            keep
-        });
+        inner.expire_due(now);
         inner.next_lease += 1;
         let lease = inner.next_lease;
         let approver = Arc::new(Mutex::new(Approver {
@@ -148,10 +205,11 @@ impl Hub {
             lease,
             lease_ms,
             deadline: now + Duration::from_millis(lease_ms),
+            indexed: now,
             cursor: i64::MAX,
             live: false,
         }));
-        let before = inner.approvers.insert(tag.to_owned(), approver.clone());
+        inner.insert(tag, approver.clone());
         Ok((lease, approver, before))
     }
     /// Give up `tag` if `lease` still holds it, as when serving it failed,
@@ -163,10 +221,10 @@ impl Hub {
             .get(tag)
             .is_some_and(|held| held.lock().unwrap().lease == lease)
         {
-            match before {
-                Some(before) => inner.approvers.insert(tag.to_owned(), before),
-                None => inner.approvers.remove(tag),
-            };
+            inner.remove(tag);
+            if let Some(before) = before {
+                inner.insert(tag, before);
+            }
         }
     }
     /// Keep `tag` for `session` under `lease` for another lease period.
@@ -186,7 +244,7 @@ impl Hub {
         if held.deadline <= now {
             let _ = held.output.try_send(lost(tag, lease));
             drop(held);
-            inner.approvers.remove(tag);
+            inner.remove(tag);
             return fail("approvals_lost");
         }
         held.deadline = now + Duration::from_millis(held.lease_ms);
@@ -251,7 +309,7 @@ impl Hub {
         if held.session == session && held.lease == lease {
             let _ = held.output.try_send(lost(tag, lease));
             drop(held);
-            inner.approvers.remove(tag);
+            inner.remove(tag);
         }
     }
     pub fn add_firehose(&self, session: u64, output: Output) {
@@ -289,9 +347,18 @@ impl Hub {
             !subs.is_empty()
         });
         // A closed session's tags are free at once; nobody is left to tell.
-        inner
-            .approvers
-            .retain(|_, held| held.lock().unwrap().session != session);
+        let HubInner {
+            approvers,
+            expiries,
+            ..
+        } = &mut *inner;
+        approvers.retain(|_, serving| {
+            let held = serving.lock().unwrap();
+            if held.session == session {
+                expiries.remove(&(held.indexed, held.lease));
+            }
+            held.session != session
+        });
     }
     /// How many copies of one of `bot`'s events `session` receives: once
     /// for the firehose, once following `*`, and once following the bot.
@@ -499,5 +566,64 @@ mod tests {
         release.send(()).unwrap();
         replaying.join().unwrap();
         assert_eq!(deliveries, Ok((1, 0)));
+    }
+
+    #[tokio::test]
+    async fn serving_ends_only_the_leases_that_ran_out() {
+        use tokio::io::AsyncBufReadExt;
+        let hub = Hub::default();
+        let (writer, reader) = tokio::io::duplex(1 << 16);
+        let told = Output::writer(writer);
+        let quiet = || Output::writer(tokio::io::sink());
+        let (ran_out, serving, _) = hub.serve("ran-out", 1, told.clone(), 1).unwrap();
+        serving.lock().unwrap().go_live(0);
+        // Renewed: its deadline moved past the key it was indexed under.
+        let (_, renewed, _) = hub.serve("renewed", 1, quiet(), 1).unwrap();
+        renewed.lock().unwrap().go_live(0);
+        renewed.lock().unwrap().deadline = Instant::now() + Duration::from_secs(3600);
+        // Still being listed, so its lease has not started.
+        let (listing, _, _) = hub.serve("listing", 1, quiet(), 1).unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let (_, _, before) = hub.serve("other", 2, quiet(), 60_000).unwrap();
+        assert!(before.is_none());
+        let mut line = String::new();
+        let mut reader = tokio::io::BufReader::new(reader);
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let lost: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            (lost["event"].as_str(), lost["lease"].as_u64()),
+            (Some("approvals_lost"), Some(ran_out))
+        );
+        {
+            let inner = hub.inner.lock().unwrap();
+            let mut tags: Vec<&str> = inner.approvers.keys().map(String::as_str).collect();
+            tags.sort();
+            assert_eq!(tags, ["listing", "other", "renewed"]);
+            // One key a lease, no later than its deadline.
+            assert_eq!(inner.expiries.len(), inner.approvers.len());
+            for (key, tag) in &inner.expiries {
+                let held = inner.approvers[tag].lock().unwrap();
+                assert_eq!(*key, (held.indexed, held.lease));
+                assert!(held.indexed <= held.deadline);
+            }
+        }
+        // Another session cannot take a tag still being listed.
+        assert!(hub.serve("listing", 3, quiet(), 1).is_err());
+        // Serving a tag again replaces the session's own lease silently,
+        // and a failed serve puts it back under its old key.
+        let (again, _, before) = hub.serve("listing", 1, quiet(), 1).unwrap();
+        assert_eq!(
+            before.as_ref().map(|b| b.lock().unwrap().lease),
+            Some(listing)
+        );
+        hub.unserve("listing", again, before);
+        hub.close_session(1);
+        let inner = hub.inner.lock().unwrap();
+        assert_eq!(inner.approvers.keys().collect::<Vec<_>>(), ["other"]);
+        assert_eq!(inner.expiries.len(), 1);
     }
 }
