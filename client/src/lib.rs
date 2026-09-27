@@ -2,6 +2,7 @@
 //! JSONL requests correlated by `id`, notifications forwarded on a channel.
 //! Shared by the terminal client and the desktop app; nothing here depends
 //! on the runtime crate.
+pub mod models;
 pub mod policy;
 pub mod socket;
 

@@ -329,6 +329,9 @@ enum Command {
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
     Stats,
+    /// Each provider's own model listing, for a client writing its model
+    /// list. Asked when requested and kept five minutes; nothing runs on it.
+    ProviderModels,
     Bots {
         after: Option<String>,
         limit: Option<usize>,
@@ -972,7 +975,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals","provider_models"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -2048,6 +2051,33 @@ impl Service {
                     })
                     .await
             }
+            Command::ProviderModels => {
+                // Off the dispatch path: a listing waits on the network.
+                let (providers, output) = (self.providers.clone(), output.clone());
+                tokio::spawn(async move {
+                    let mut names: Vec<String> = providers.keys().cloned().collect();
+                    names.sort();
+                    // A few at a time, so bodies being read stay a few limits'
+                    // worth, and all within one deadline however many there are.
+                    let by = tokio::time::Instant::now() + Duration::from_secs(15);
+                    let asks = names.clone().into_iter().map(|name| {
+                        let providers = providers.clone();
+                        async move {
+                            tokio::time::timeout_at(by, providers[&name].models())
+                                .await
+                                .unwrap_or_else(|_| Err(Error::new("provider_models_deadline")))
+                        }
+                    });
+                    let listed: Vec<_> = futures_util::StreamExt::collect(
+                        futures_util::StreamExt::buffered(futures_util::stream::iter(asks), 4),
+                    )
+                    .await;
+                    let answer = fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
+                        .map(|answer| json!({"providers": answer}));
+                    retention_reply(session, &output, id, answer).await;
+                });
+                Err(Error::new("deferred"))
+            }
             Command::Stats => {
                 let (waiting, running, queued, paced, pending_bytes, approvals) = store
                     .op("counts", |db| {
@@ -2647,8 +2677,68 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
     }
 }
 
+/// One `provider_models` reply carries every listing, so it must fit one
+/// event of `limit` bytes: a listing past what is left is refused by name
+/// rather than failing the whole answer. Room for each refusal is held back
+/// first, so refusals always fit; more providers than even refusals fit
+/// for fail the request as a whole.
+fn fit_listings(
+    listed: impl ExactSizeIterator<Item = (String, Result<Arc<Vec<Value>>>)>,
+    limit: usize,
+) -> Result<serde_json::Map<String, Value>> {
+    const REFUSAL: usize = 160;
+    let listed: Vec<_> = listed.collect();
+    let held: usize = listed.iter().map(|(name, _)| name.len() + REFUSAL).sum();
+    let Some(mut room) = limit.saturating_sub(4096).checked_sub(held) else {
+        return Err(Error::with(
+            "provider_models_limit",
+            format!("{} providers are more than one reply holds", listed.len()),
+        ));
+    };
+    let mut answer = serde_json::Map::new();
+    for (name, result) in listed {
+        let mut entry = match result {
+            Ok(models) => json!({"models": models.as_slice()}),
+            Err(error) => json!({"error": error.code, "detail": error.detail}),
+        };
+        let size = entry.to_string().len() + name.len() + 8;
+        match room.checked_sub(size) {
+            Some(left) => room = left,
+            None => {
+                entry = json!({
+                    "error": "provider_models_limit",
+                    "detail": format!("listing is {size} bytes, {room} left in the reply"),
+                });
+            }
+        }
+        answer.insert(name, entry);
+    }
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_listings_always_fit_one_reply() {
+        let model = json!({"id": "m".repeat(100)});
+        let limit = 256 * 1024;
+        let big = Arc::new(vec![model.clone(); 1700]);
+        let mut listed = vec![("a-near".to_owned(), Ok(big))];
+        for i in 0..300 {
+            listed.push((format!("b-{i:03}"), Ok(Arc::new(vec![model.clone(); 20]))));
+        }
+        let answer = fit_listings(listed.into_iter(), limit).unwrap();
+        assert!(json!({"providers": answer}).to_string().len() <= limit - 4096);
+        assert!(answer["a-near"]["models"].is_array());
+        assert_eq!(answer["b-299"]["error"], "provider_models_limit");
+        assert_eq!(answer.len(), 301);
+        let many = (0..2000).map(|i| (format!("p-{i}"), Ok(Arc::new(Vec::new()))));
+        assert_eq!(
+            fit_listings(many, limit).unwrap_err().code,
+            "provider_models_limit"
+        );
+    }
+
     use super::*;
 
     #[test]

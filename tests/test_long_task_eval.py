@@ -4,13 +4,16 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN
 from pathlib import Path
 from unittest.mock import patch
 
 from bench import long_task_eval
-from bench.long_task_eval import (CORRECTION, STEER_AFTER, TASK, run_condition, score, steer_outcome,
-                                  workspace)
+from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_CLOSES, TASK, close_labels,
+                                  close_numbers, prompt, run_condition, score, settled_closes, settled_cents,
+                                  step_command_faults, steer_outcome, workspace)
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture, is_summary
 
@@ -40,9 +43,10 @@ def shell(root, command):
     return subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, env=clean_env())
 
 
-def started(cursor, command):
+def started(cursor, command, **arguments):
     return {'cursor': cursor, 'event': 'tool_started',
-            'data': {'call_id': f'c{cursor}', 'name': 'shell', 'arguments': json.dumps({'command': command})}}
+            'data': {'call_id': f'c{cursor}', 'name': 'shell',
+                     'arguments': json.dumps({'command': command, **arguments})}}
 
 
 class LongTaskScoreTests(unittest.TestCase):
@@ -106,6 +110,215 @@ class LongTaskScoreTests(unittest.TestCase):
         # more room than the realistic budget alone.
         printed = sum(min(len(done.stdout.encode()), PREVIEW) for done in steps.values())
         self.assertGreater(printed, long_task_eval.CONDITIONS['large-compact'][1] * 3 // 4)
+
+    def test_the_sustained_task_needs_every_close_and_outgrows_the_budget_repeatedly(self):
+        self.setUp()
+        facts = workspace(self.root, 7, 'sustained')
+        self.assertEqual(list(facts['closes']), list(MONTHS))
+        # The setup's facts are the small task's.
+        self.assertIn('Never edit files under vendor/', shell(self.root, 'tools/env-check').stdout)
+        self.assertIn('make quick was removed', shell(self.root, 'make quick').stderr)
+        self.assertIn('outcome is unknown', shell(self.root, 'tools/migrate').stdout)
+        self.assertIn('usage: make bench CLOSE=<month>', shell(self.root, 'make bench').stdout)
+        self.assertNotEqual(shell(self.root, 'make check CLOSE=2027-01').returncode, 0)
+        # Each close's check passes under either rounding rule; its
+        # settlement and number differ by close.
+        (self.root / 'ledger/convert.py').write_text(TRUNCATING)
+        printed = 0
+        for month in MONTHS:
+            steps = {step: shell(self.root, step) for step in (f'make check CLOSE={month}', f'tools/settle {month}',
+                                                               f'make bench CLOSE={month}')}
+            for step, done in steps.items():
+                self.assertEqual(done.returncode, 0, (step, done.stdout[-2000:]))
+                self.assertLess(len(done.stdout.encode()), PREVIEW, step)
+                printed += len(done.stdout.encode())
+            self.assertIn(f'Fixtures.test_{month.replace("-", "_")}_batch_', steps[f'make check CLOSE={month}'].stdout)
+            self.assertNotIn('Fixtures.test_2026_0', steps[f'make check CLOSE={month}'].stdout.replace(
+                f'test_{month.replace("-", "_")}', ''))
+            self.assertIn(f"close {month} throughput: {facts['closes'][month]['throughput']} rows/s",
+                          steps[f'make bench CLOSE={month}'].stdout)
+        # Truncated settlements are wrong: the rounding rule decides some
+        # entries of every close.
+        result = score(self.root, facts, [], '')
+        self.assertEqual(result['closes_settled_correctly'], 0)
+        (self.root / 'ledger/convert.py').write_text(HALF_EVEN)
+        shell(self.root, f'tools/settle {MONTHS[0]}')
+        self.assertEqual(score(self.root, facts, [], '')['closes_settled_correctly'], 1)
+        # Only the benchmark's own seed holds each close's number.
+        for month in MONTHS:
+            number = str(facts['closes'][month]['throughput']).encode()
+            holders = [p.relative_to(self.root) for p in self.root.rglob('*') if p.is_file()
+                       and not p.name.startswith('.steps') and number in p.read_bytes()]
+            self.assertEqual(holders, [Path('tools/.seed')], month)
+        # The closes' required outputs, less than the preview each, fill the
+        # sustained budget several times over.
+        self.assertGreater(printed, long_task_eval.CONDITIONS['sustained-compact'][1] * 3)
+        self.assertIn(f'closes {MONTHS[0]} through {MONTHS[-1]}', prompt('sustained'))
+        self.assertIn('do not redirect, pipe, filter or truncate it', prompt('sustained'))
+        self.assertTrue(prompt('sustained').startswith(TASK[:TASK.index(' When `make check` passes')] + '\n\n'))
+
+    def test_no_settlement_entry_holds_a_close_number(self):
+        # Entries' cents reach seven digits, so a number an entry holds
+        # under either rule is drawn again, as seed 930's 2026-05 one was.
+        for seed in (7, 930):
+            with self.subTest(seed=seed):
+                self.setUp()
+                facts = workspace(self.root, seed, 'sustained')
+                taken = {abs(cents) for month in MONTHS
+                         for rows in [json.loads((self.root / f'data/closes/{month}.json').read_text())]
+                         for rule in (ROUND_DOWN, ROUND_HALF_EVEN) for cents in settled_cents(rows, rule)}
+                self.assertFalse({close['throughput'] for close in facts['closes'].values()} & taken)
+        self.assertNotEqual(facts['closes']['2026-05']['throughput'], 669744)
+        # Nor does an earlier close.
+
+        class Draws:
+            def __init__(self, *numbers):
+                self.numbers = list(numbers)
+
+            def randrange(self, start, stop):
+                return self.numbers.pop(0)
+        self.assertEqual(close_numbers(Draws(500_000, 700_000, 500_000, 600_000), {700_000}, 2), [500_000, 600_000])
+
+    def test_the_correction_waits_for_two_closes_however_often_one_was_settled(self):
+        self.setUp()
+        log = self.root / '.steps.log'
+        self.assertEqual(settled_closes(self.root), 0)
+        log.write_text('settle:2026-01 0 a\nsettle:2026-01 0 b\nsettle:2026-02 1 c\ncheck:2026-02 0 d\n')
+        self.assertEqual(settled_closes(self.root), 1)
+        with log.open('a') as out:
+            out.write('settle:2026-02 0 e\n')
+        self.assertEqual(settled_closes(self.root), SUSTAINED_STEER_CLOSES)
+
+    @patch.multiple(long_task_eval, MONTHS=MONTHS[:3], CLOSE_BATCHES=20, CLOSE_ROWS=64)
+    def test_each_close_counts_only_when_it_was_settled_right_and_its_number_reported(self):
+        # Three short closes are enough to score one.
+        MONTHS = long_task_eval.MONTHS
+        self.setUp()
+        facts = workspace(self.root, 7, 'sustained')
+        numbers = {month: facts['closes'][month]['throughput'] for month in MONTHS}
+
+        def run(*steps, answer=None, corrected=True):
+            # CORRECTION marks where the turn took it in; without one, it
+            # came before any step, or with corrected=False never.
+            self.setUp()
+            workspace(self.root, 7, 'sustained')
+            corrected_at = 0 if corrected else None
+            for step in steps:
+                if step in (HALF_EVEN, TRUNCATING):
+                    (self.root / 'ledger/convert.py').write_text(step)
+                elif step == CORRECTION:
+                    corrected_at = len((self.root / '.steps.log').read_text().splitlines())
+                else:
+                    shell(self.root, step)
+            report = ', '.join(f'{month}: {number:,} rows/s' for month, number in numbers.items())
+            return score(self.root, facts, [], report if answer is None else answer, corrected_at)
+
+        def close(month):
+            return (f'make check CLOSE={month}', f'tools/settle {month}', f'make bench CLOSE={month}')
+
+        setup = ('tools/env-check', 'tools/migrate')
+        clean = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)])
+        self.assertTrue(clean['correct'] and clean['followed_workflow'] and clean['reported_throughput'], clean)
+        self.assertEqual((clean['closes_settled_correctly'], clean['closes_reported']), (3, 3))
+        self.assertEqual(clean['step_commands_to_review'], [])
+        # Without the correction taken in, no sustained bot is correct,
+        # however right its settlements.
+        guessed = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)], corrected=False)
+        self.assertEqual(guessed['closes_settled_correctly'], 3)
+        self.assertFalse(guessed['correct'])
+        # A close settled before the correction and settled again after it
+        # counts, without a second benchmark.
+        again = run(*setup, TRUNCATING, *close(MONTHS[0]), CORRECTION, HALF_EVEN, f'tools/settle {MONTHS[0]}',
+                    *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertTrue(again['correct'] and again['followed_workflow'], again)
+        self.assertEqual(again['closes'][MONTHS[0]]['settle_runs'], 2)
+        self.assertEqual([c['settled_after_correction'] for c in again['closes'].values()], [True, None, None])
+        # A close settled before the correction must be settled again after
+        # it, even when its first settlement already used the new rule.
+        early_rule = run(*setup, HALF_EVEN, *close(MONTHS[0]), CORRECTION,
+                         *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertEqual(early_rule['closes_settled_correctly'], 3)
+        self.assertFalse(early_rule['closes'][MONTHS[0]]['settled_after_correction'] or early_rule['correct'])
+        # One not settled again is wrong, and the task with it.
+        stale = run(*setup, TRUNCATING, *close(MONTHS[0]), HALF_EVEN,
+                    *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertFalse(stale['correct'])
+        self.assertEqual(stale['closes_settled_correctly'], 2)
+        self.assertTrue(stale['hidden_tests'].startswith(str(len(long_task_eval.HIDDEN))))
+        # A number missing from the answer, or one whose benchmark never
+        # ran, is not reported.
+        closed = [step for month in MONTHS for step in close(month)]
+        missing = run(*setup, HALF_EVEN, *closed, answer=' '.join(f'{m}: {numbers[m]}' for m in MONTHS[1:]))
+        self.assertFalse(missing['reported_throughput'])
+        self.assertEqual(missing['closes_reported'], 2)
+        # A number inside a longer one is not the close's.
+        longer = run(*setup, HALF_EVEN, *closed,
+                     answer=' '.join(f'{m}: 1{numbers[m]}' if m == MONTHS[0] else f'{m}: {numbers[m]:,}.'
+                                     for m in MONTHS))
+        self.assertEqual(longer['closes_reported'], 2)
+        # Each number counts under its own close's label: in order when a
+        # line names as many closes as it gives numbers, else the nearest
+        # before it on its line, else after it, else on a line above. A
+        # label is the month or its name.
+        for answer, reported in (
+                (' '.join(f'{m}: {numbers[m]}' for m in MONTHS), 3),
+                (f'{MONTHS[1]}: {numbers[MONTHS[0]]}, {MONTHS[0]}: {numbers[MONTHS[1]]}, '
+                 f'{MONTHS[2]}: {numbers[MONTHS[2]]}', 1),
+                ('\n'.join(f'{numbers[m]:,} rows/s ({m})' for m in MONTHS), 3),
+                ('| Close | Throughput |\n' + '\n'.join(f'| {m} | {numbers[m]} |' for m in MONTHS), 3),
+                ('\n'.join(f'{name}:\n- throughput {numbers[m]}'
+                           for name, m in zip(('January', 'Feb', 'March'), MONTHS)), 3),
+                (' '.join(str(numbers[m]) for m in MONTHS), 0),
+                (f'January and February: {numbers[MONTHS[0]]} and {numbers[MONTHS[1]]} rows/s, respectively; '
+                 f'March: {numbers[MONTHS[2]]}', 3),
+                (', '.join(f'{numbers[m]} ({m})' for m in MONTHS), 3),
+                ('\n'.join(f'{name}: {numbers[m]}' for name, m in zip(('january', 'FEB', 'March'), MONTHS)), 3),
+                # Across a line, as a table's heading row or a plain one.
+                ('| Close | ' + ' | '.join(MONTHS) + ' |\n|---|---|---|---|\n| Throughput | '
+                 + ' | '.join(str(numbers[m]) for m in MONTHS) + ' |', 3),
+                ('| ' + ' | '.join(MONTHS) + ' |\n| ' + ' | '.join(str(numbers[m]) for m in reversed(MONTHS)) + ' |',
+                 1),
+                ('Jan Feb Mar\n' + ' '.join(str(numbers[m]) for m in MONTHS), 3),
+                ('Jan Feb Mar\n' + ' '.join(str(numbers[m]) for m in MONTHS[:2]), 0)):
+            with self.subTest(answer=answer):
+                self.assertEqual(run(*setup, HALF_EVEN, *closed, answer=answer)['closes_reported'], reported)
+        unbenched = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)[:2]])
+        self.assertEqual(unbenched['closes_reported'], 0)
+        self.assertFalse(unbenched['followed_workflow'])
+        # Settling before the check, or benching before settling, is out of
+        # order, and a check of every close counts for none.
+        early = run(*setup, HALF_EVEN, f'tools/settle {MONTHS[0]}', f'make check CLOSE={MONTHS[0]}',
+                    f'make bench CLOSE={MONTHS[0]}', *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertFalse(early['closes'][MONTHS[0]]['checked_before_settle'] or early['followed_workflow'])
+        self.assertTrue(early['correct'])
+        benched_first = run(*setup, HALF_EVEN, f'make check CLOSE={MONTHS[0]}', f'make bench CLOSE={MONTHS[0]}',
+                            f'tools/settle {MONTHS[0]}', *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertFalse(benched_first['closes'][MONTHS[0]]['benched_after_settle'])
+        # The check, first settlement and benchmark are one attempt, not
+        # pieces of several.
+        pieces = run(*setup, HALF_EVEN, f'tools/settle {MONTHS[0]}', f'make bench CLOSE={MONTHS[0]}',
+                     f'make check CLOSE={MONTHS[0]}', f'tools/settle {MONTHS[0]}',
+                     *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertTrue(pieces['correct'])
+        self.assertFalse(pieces['closes'][MONTHS[0]]['checked_before_settle'] or pieces['followed_workflow'])
+        # Cents must be integers, in the settlement and from convert.
+        floats = run(*setup, HALF_EVEN, *closed, "python3 -c \"import json; p = 'out/" + MONTHS[0] + ".json'; "
+                     "e = json.load(open(p)); [x.update(cents=float(x['cents'])) for x in e]; "
+                     "json.dump(e, open(p, 'w'))\"")
+        self.assertEqual(floats['closes_settled_correctly'], 2)
+        self.assertFalse(floats['correct'])
+        float_convert = run(*setup, HALF_EVEN.replace('cents=int(', 'cents=float('), *closed)
+        self.assertFalse(float_convert['correct'])
+        self.assertTrue(float_convert['hidden_tests'].startswith('0/'), float_convert['hidden_tests'])
+        whole = run(*setup, HALF_EVEN, 'make check', *[step for month in MONTHS for step in close(month)[1:]])
+        self.assertTrue(whole['correct'])
+        self.assertFalse(any(c['checked_before_settle'] for c in whole['closes'].values())
+                         or whole['followed_workflow'])
+        # Every close's own steps in order, but the closes out of it.
+        swapped = run(*setup, HALF_EVEN, *close(MONTHS[1]), *close(MONTHS[0]), *close(MONTHS[2]))
+        self.assertTrue(swapped['correct'] and all(
+            c['checked_before_settle'] and c['benched_after_settle'] for c in swapped['closes'].values()))
+        self.assertFalse(swapped['followed_workflow'])
 
     def test_a_run_that_kept_every_fact_scores_clean(self):
         shell(self.root, 'tools/env-check; make quick; tools/migrate; tools/migrate --status')
@@ -231,13 +444,148 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(steer_outcome({'turn': 9}, {'status': 'failed', 'error': 'stale_turn'}),
                          'failed: stale_turn')
         self.assertEqual(steer_outcome({'error': 'stale_turn'}, None), 'refused: stale_turn')
-        self.assertEqual(steer_outcome(None, None), 'not sent: fewer tool calls')
+        self.assertEqual(steer_outcome(None, None), 'not sent: the task ended before its steer point')
+
+    def test_a_condition_with_no_correct_task_has_no_cost_per_correct_task(self):
+        self.setUp()
+        facts = workspace(self.root, 7)
+        bot = {'status': 'completed', 'steer': 'steered', 'wall_s': 1.0, **score(self.root, facts, [], '')}
+        self.assertFalse(bot['correct'])
+        block = {'condition': 'compact', 'task': 'small', 'context_bytes': 20480, 'wall_s': 1.0, 'bots': {'b': bot}}
+        self.assertIsNone(long_task_eval.summarize(block)['input_token_equivalents_per_correct_task'])
+
+    def test_a_step_command_that_filters_or_combines_steps_is_counted(self):
+        # As run 8's bots ran them: output to a file and its tail read, or
+        # every close in one loop. Reading a step's source, as run 9's bots
+        # did, runs no step.
+        for command, faults in (
+                ('make check CLOSE=2026-01', (False, False)),
+                ('make check CLOSE=2026-01 2>&1', (False, False)),
+                ('cd work && tools/settle 2026-02', (False, False)),
+                ('make bench CLOSE=2026-01 > /tmp/bench.log 2>&1; tail -3 /tmp/bench.log', (True, False)),
+                ('make check CLOSE=2026-01 2>&1 | tail -5', (True, False)),
+                ('for m in 2026-01 2026-02; do tools/settle $m; done', (False, True)),
+                ('make check CLOSE=2026-03 && tools/settle 2026-03', (False, True)),
+                ("cat > ledger/convert.py <<'EOF'\nx = 1\nEOF", (False, False)),
+                ('grep -n rows/s tools/.seed', (False, False)),
+                ('cat tools/settle | head -90', (False, False)),
+                ('sed -n 1,120p tools/settle', (False, False)),
+                ("for f in tests/*.py; do wc -l $f; done; cat tools/settle", (False, False)),
+                ('python3 tools/settle 2026-04 | tail -2', (True, False)),
+                ('make bench CLOSE=2026-05 2>&1; cat tools/settle | head', (False, False)),
+                ('for f in tests/*.py; do wc -l $f; done; make check CLOSE=2026-06', (False, False)),
+                ('while read m; do make bench CLOSE=$m; done < months', (False, True)),
+                ('printf "2026-01 2026-02" | xargs -n1 tools/settle', (False, True)),
+                # Behind assignments, wrappers and make's options.
+                ('CLOSE=2026-01 make check >log', (True, False)),
+                ('make -s bench CLOSE=2026-01 | tail', (True, False)),
+                ('env X=1 tools/settle 2026-01 >log', (True, False)),
+                ('time make -C . check CLOSE=2026-02', (False, False)),
+                ('timeout 600 ./tools/settle 2026-03 | tail -3', (True, False)),
+                ('bash /work/tools/settle 2026-04 2>&1', (False, False)),
+                ('less tools/settle', (False, False)),
+                # Inside shell conditionals and groups.
+                ('if make check CLOSE=2026-01; then tools/settle 2026-01; fi', (False, True)),
+                ('make check CLOSE=2026-01 || echo failed', (False, False)),
+                ('{ make check CLOSE=2026-01; } 2>&1 | tail -5', (True, False)),
+                ('for m in 2026-01 2026-02; do make bench CLOSE=$m; done | tail -2', (True, True)),
+                ('for f in tests/*.py; do wc -l $f; done | sort; make check CLOSE=2026-06', (False, False)),
+                # Joined by a lone `&`, beside redirects that also use it.
+                ('make check CLOSE=2026-01 & tools/settle 2026-01', (False, True)),
+                ('make check CLOSE=2026-01 & wait', (False, False)),
+                ('make check CLOSE=2026-01 &> log', (True, False)),
+                ('make check CLOSE=2026-01 |& tail -5', (True, False)),
+                # In a command substitution, the output goes to the command
+                # around it.
+                ('out=$(make check CLOSE=2026-01); printf %s "$out" | tail -1', (True, False)),
+                ('n=`make bench CLOSE=2026-01`', (True, False)),
+                ('diff <(tools/settle 2026-01) expected', (True, False)),
+                ('d=$(date); make check CLOSE=2026-01', (False, False)),
+                # A later stage of a pipeline is a step too.
+                ('printf x | make check CLOSE=2026-01 >log', (True, False)),
+                ('printf x | tools/settle 2026-01', (False, False)),
+                ('echo y | tools/settle 2026-01 | tail -3', (True, False)),
+                # Behind an interpreter's options.
+                ("bash -lc 'make check CLOSE=2026-01 >log'", (True, False)),
+                ("sh -c 'tools/settle 2026-01 | tail -1'", (True, False)),
+                ('bash -c "make check CLOSE=2026-01; tools/settle 2026-01"', (False, True)),
+                # A redirect or pipe on a subshell holding a step.
+                ('(make check CLOSE=2026-01; echo done) >log', (True, False)),
+                ('(make check CLOSE=2026-01; echo done) | tail -3', (True, False)),
+                ('(tools/settle 2026-01; echo done) &>log', (True, False)),
+                ('make check CLOSE=2026-01; echo $(date) > log', (False, False))):
+            with self.subTest(command=command):
+                self.assertEqual(step_command_faults(command), faults)
+
+    def test_a_month_name_labels_its_close_in_any_case_but_the_verb_may(self):
+        self.assertEqual([at for at, _ in close_labels('May: 1, it may vary, MAY, may', ['2026-05'])], [0, 21])
+
+    def test_the_correction_point_is_the_steps_recorded_by_the_daemons_mark(self):
+        # The step record holds each step's time; the runner counts the
+        # steps from no later than the daemon's mark on the steer.
+        (self.root / '.steps.log').write_text('check:2026-01 0 a 1000\nsettle:2026-01 0 b 1500\n'
+                                              'settle:2026-01 0 c 2000\n')
+        self.assertEqual([long_task_eval.steps_before(self.root, ms) for ms in (999, 1500, 1999, 2000)],
+                         [0, 2, 2, 3])
+        shell(self.root, 'tools/env-check')
+        at = int((self.root / '.steps.log').read_text().splitlines()[-1].split()[3])
+        self.assertLess(abs(at - time.time() * 1000), 60_000)
+
+    def test_a_step_command_in_any_but_the_plain_form_is_listed_for_review(self):
+        self.setUp()
+        facts = workspace(self.root, 7, 'sustained')
+        plain = ['make check CLOSE=2026-01', 'tools/settle 2026-01 2>&1', 'make bench CLOSE=2026-01']
+        odd = ['cat tools/settle', '(make check CLOSE=2026-01) >log', 'make -s bench CLOSE=2026-01']
+        events = [started(n, command) for n, command in enumerate(plain + odd + ['ls'], 1)]
+        before = score(self.root, facts, events, '', 0)
+        self.assertEqual(before['step_commands_to_review'], odd)
+        # A call longer than its event's 2,048-character preview is listed
+        # whatever it holds, and left out of the counters.
+        long = json.dumps({'command': 'make check CLOSE=2026-01 && ' + 'x' * 3000})
+        cut = {'cursor': 9, 'event': 'tool_started',
+               'data': {'call_id': 'c9', 'name': 'shell', 'arguments': long[:2048], 'arguments_truncated': True}}
+        scored = score(self.root, facts, [*events, cut], '', 0)
+        self.assertEqual(scored['step_commands_to_review'], [*odd, '[cut] ' + long[:160]])
+        for counter in ('filtered_step_commands', 'combined_step_commands'):
+            self.assertEqual(scored[counter], before[counter])
+
+    def test_a_step_run_in_the_background_goes_unread(self):
+        # A background or detached call returns a handle, not the step's
+        # output.
+        self.assertEqual(step_command_faults('make bench CLOSE=2026-01', unread=True), (True, False))
+        self.assertEqual(step_command_faults('sleep 5', unread=True), (False, False))
+        self.setUp()
+        facts = workspace(self.root, 7, 'sustained')
+        events = [started(1, 'make check CLOSE=2026-01', background=True),
+                  started(2, 'tools/settle 2026-01', detach=True), started(3, 'make bench CLOSE=2026-01'),
+                  started(4, 'sleep 5', background=True)]
+        self.assertEqual(score(self.root, facts, events, '')['filtered_step_commands'], 2)
 
 
 # A scripted agent that does the task right.
 SCRIPT = ('tools/env-check', 'make quick', 'tools/migrate', 'tools/migrate --status',
           f"cat > ledger/convert.py <<'EOF'\n{TRUNCATING}EOF", 'make check',
           f"cat > ledger/convert.py <<'EOF'\n{HALF_EVEN}EOF", 'make check', 'tools/env-check', 'make bench')
+
+
+def sustained_script():
+    """A scripted agent that does the sustained task right: it settles two
+    closes under the prompt's rule, takes up the correction once it
+    arrives, settles those two again, finishes the closes, and prints
+    every close's number for its answer, the one command that filters and
+    loops."""
+    def close(month):
+        return [f'make check CLOSE={month}', f'tools/settle {month}', f'make bench CLOSE={month}']
+
+    script = ['tools/env-check', 'tools/migrate', 'tools/migrate --status',
+              f"cat > ledger/convert.py <<'EOF'\n{TRUNCATING}EOF", 'make check',
+              *close(MONTHS[0]), *close(MONTHS[1]), f'make check CLOSE={MONTHS[2]}']
+    assert sum(c.startswith('tools/settle') for c in script) == SUSTAINED_STEER_CLOSES
+    script += [f"cat > ledger/convert.py <<'EOF'\n{HALF_EVEN}EOF", f'tools/settle {MONTHS[0]}',
+               f'tools/settle {MONTHS[1]}', f'tools/settle {MONTHS[2]}', f'make bench CLOSE={MONTHS[2]}']
+    for month in MONTHS[3:]:
+        script += close(month)
+    return script + ['for m in ' + ' '.join(MONTHS) + '; do make bench CLOSE=$m | tail -1; done']
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
@@ -317,3 +665,59 @@ class LongTaskRunnerTests(ModelFixture):
                 self.assertEqual(sum(s['input_tokens'] for s in result['summaries']),
                                  result['summarizer_input_tokens'])
                 self.assertGreater(result['peak_input_tokens'], 0)
+
+    def test_the_sustained_task_compacts_again_and_again_and_scores_every_close(self):
+        # At 128 KiB the closes outgrow the budget several times: stubs make
+        # the room with the default tools, summaries without `read`. The
+        # correction arrives at the task's own steer point, once two closes
+        # were settled under the prompt's rule.
+        spec = ('openai', 'responses', self.url, None)
+        for condition in ('sustained-compact', 'sustained-summary'):
+            with self.subTest(condition=condition):
+                self.model.task_step = 0
+                self.model.task_script = sustained_script()
+                with patch.object(long_task_eval, 'COMPACTION', 'Summarize.'):
+                    block = run_condition(self.binary, spec, 'synthetic-model', condition, 1, self.path,
+                                          clean_env(), 7, timeout=60)
+                self.assertEqual((block['task'], block['context_bytes']), ('sustained', 128 << 10))
+                result = block['bots'][f'{condition}-0']
+                self.assertEqual(result['status'], 'completed', result)
+                self.assertEqual(result['steer'], 'steered')
+                self.assertTrue(result['correct'] and result['vendor_intact'] and result['reported_throughput'],
+                                {k: result[k] for k in ('hidden_tests', 'closes', 'answer')})
+                self.assertTrue(result['followed_workflow'], result['closes'])
+                self.assertEqual((result['closes_settled_correctly'], result['closes_reported']),
+                                 (len(MONTHS), len(MONTHS)))
+                self.assertEqual([result['closes'][month]['settle_runs'] for month in MONTHS], [2, 2, 1, 1, 1, 1])
+                # The two closes settled before the turn took in the
+                # correction were settled again after it.
+                self.assertEqual([result['closes'][month]['settled_after_correction'] for month in MONTHS],
+                                 [True, True, None, None, None, None])
+                self.assertEqual((result['make_quick_runs'], result['migrations_applied']), (0, 1))
+                self.assertEqual(result['compaction_failures'], [])
+                if condition == 'sustained-compact':
+                    self.assertGreaterEqual(result['elisions'], 3)
+                else:
+                    self.assertEqual(result['elisions'], 0)
+                    self.assertGreaterEqual(result['compactions'], 3)
+                    self.assertEqual(result['summarizer_calls'], result['compactions'])
+                self.assertEqual(result['model_calls'], len(self.model.task_script) + 1)
+                self.assertEqual(result['commands'], [c[:160] for c in self.model.task_script])
+                self.assertEqual((result['filtered_step_commands'], result['combined_step_commands']), (1, 1))
+                self.assertGreater(result['input_token_equivalents'], 0)
+                self.assertGreater(result['wall_s'], 0)
+                requests = []
+                while not self.model.requests.empty():
+                    requests.append(self.model.requests.get())
+                work = [r for r in requests if not is_summary(r)]
+                self.assertTrue(all(any(i.get('role') == 'user' and i['content'][0]['text'] == prompt('sustained')
+                                        for i in r['input']) for r in work))
+                steered = [n for n, r in enumerate(work) if any(
+                    i.get('role') == 'user' and i['content'][0]['text'] == CORRECTION for i in r['input'])]
+                # Sent when the second settlement's call completed, taken at
+                # that round or the next.
+                point = self.model.task_script.index(f'tools/settle {MONTHS[1]}') + 1
+                self.assertIn(steered[0], (point, point + 1))
+                summary = long_task_eval.summarize(block)
+                self.assertEqual(summary['closes_settled_correctly'], [len(MONTHS)])
+                self.assertEqual(summary['bot_wall_s'], [result['wall_s']])

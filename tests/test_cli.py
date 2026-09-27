@@ -16,7 +16,7 @@ import unittest
 from bench.runtime_client import Client
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
-from tests.test_runtime import ModelFixture
+from tests.test_runtime import Model, ModelFixture
 
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
@@ -330,7 +330,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
-                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'stats', 'shutdown', 'serve')]:
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
             with self.subTest(args=args):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
@@ -928,3 +928,117 @@ class CliTests(ModelFixture):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('blocking_tool_client', result.stderr)
         self.assertEqual(client.control.request('resume', bot='blocked')['error'], 'bot_not_found')
+
+
+class ListingModel(Model):
+    """The synthetic model, also answering the provider's model listing."""
+
+    def do_GET(self):
+        self.server.listings = getattr(self.server, 'listings', 0) + 1
+        if self.path == '/huge/v1/models':
+            # Parses under the listing limit but alone overflows one reply.
+            data = [{'id': f'model-{i:04d}-' + 'x' * 120} for i in range(9000)]
+        elif self.path.startswith('/paged/v1/models?'):
+            # Anthropic's paging: has_more with last_id, answered by after_id.
+            if 'after_id=first-model' in self.path:
+                data, more = [{'id': 'second-model'}], {'has_more': False}
+            else:
+                data, more = [{'id': 'first-model'}], {'has_more': True, 'last_id': 'first-model'}
+            body = json.dumps({'data': data, **more}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        elif self.path == '/v1/models':
+            data = [{'id': 'synthetic-model', 'display_name': 'Synthetic', 'max_input_tokens': 4096},
+                    {'id': 'other-model'}]
+        else:
+            self.send_error(404)
+            return
+        body = json.dumps({'object': 'list', 'data': data}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
+class ModelListTests(ModelFixture):
+    """~/.agent/models: what clients offer, written once by --discover, never read by the daemon."""
+    handler = ListingModel
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.path / 'home'
+        self.home.mkdir()
+        self.list = self.home / '.agent' / 'models'
+        self.store = ['--store', str(self.path / 'state.sqlite')]
+        self.providers = ['--provider', f'openai=responses,{self.url}',
+                          '--provider', 'gone=responses,http://127.0.0.1:1/v1',
+                          '--provider', f'huge=responses,{self.url.removesuffix("/v1")}/huge/v1',
+                          '--provider', f'paged=anthropic,{self.url.removesuffix("/v1")}/paged/v1']
+        self.addCleanup(lambda: self.agent('shutdown', *self.store, check=False))
+
+    def agent(self, *args, check=True):
+        result = subprocess.run([str(self.binary), *args], env=dict(clean_env(), HOME=str(self.home)),
+                                capture_output=True, text=True, timeout=30, cwd=self.path)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        return result
+
+    def test_discover_writes_a_first_list_that_clients_and_bots_read(self):
+        self.assertEqual(json.loads(self.agent('models').stdout), [])
+        self.assertIn('agent models --discover', self.agent('models', '--pretty').stderr)
+        self.assertFalse((self.path / 'state.sqlite').exists(), 'reading the list starts no daemon')
+
+        self.agent('models', '--discover', *self.store, *self.providers)
+        text = self.list.read_text()
+        self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n', text)
+        self.assertRegex(text, r'# gone: provider_\w+')
+        # A listing too large for the reply is refused by name; the rest still arrive.
+        self.assertIn('# huge: provider_models_limit: ', text)
+        self.assertIn('paged/first-model\npaged/second-model\n', text)
+        listed = json.loads(self.agent('models').stdout)
+        self.assertEqual(listed, [{'id': 'openai/synthetic-model', 'note': 'Synthetic, 4096 context'},
+                                  {'id': 'openai/other-model'}, {'id': 'paged/first-model'},
+                                  {'id': 'paged/second-model'}])
+        # It is the user's file from here on: discovery never replaces it.
+        again = self.agent('models', '--discover', *self.store, check=False)
+        self.assertEqual(again.returncode, 1)
+        self.assertIn('models_file_exists', again.stderr)
+
+        # The daemon asked each provider once and keeps the answers, the refused one too.
+        with socket.socket(socket.AF_UNIX) as s:
+            s.connect(str(self.path / 'state.sqlite.sock'))
+            lines = s.makefile('rw')
+            lines.readline()
+            lines.write(json.dumps({'id': 1, 'op': 'provider_models'}) + '\n')
+            lines.flush()
+            answer = next(m for m in map(json.loads, lines) if m.get('id') == 1)
+        self.assertEqual([m['id'] for m in answer['result']['providers']['openai']['models']],
+                         ['synthetic-model', 'other-model'])
+        self.assertEqual(self.model.listings, 4)
+
+        # A bot reads the same list, and a model nobody listed still runs.
+        self.model.models = ('synthetic-model', 'unlisted')
+        self.agent('run', *self.store, '--model', 'openai/unlisted', '--new', '--bot', 'Bob',
+                   'shell:"$AGENT_BIN" models > seen')
+        self.assertEqual(json.loads((self.path / 'seen').read_text()), listed)
+
+        # A terminal is shown what a note says, not what it would do.
+        self.list.write_text('openai/synthetic-model  # \x1b[2Jcleared\n')
+        self.assertIn('\\u{1b}[2Jcleared', self.agent('models', '--pretty').stdout)
+        self.list.unlink()
+        os.mkfifo(self.list)
+        fifo = self.agent('models', check=False)
+        self.assertIn('not a regular file', fifo.stderr)
+        self.list.unlink()
+
+        self.list.write_text('openai/synthetic-model\nnot a model\n')
+        broken = self.agent('models', check=False)
+        self.assertEqual(broken.returncode, 1)
+        self.assertIn('models_invalid', broken.stderr)
+        self.assertIn('models:2', broken.stderr)

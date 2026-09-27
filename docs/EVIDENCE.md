@@ -5,9 +5,10 @@ updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, at
 `973be14`, the change that built tool approval, for its cost and a store
 lock fix, at `dd95047` for the per-summary choice between a copy and a
-request of its own, at `cd1d45f` for the fix to run 5's lost steers, and at
-`ea82f7a` for serving a gate tag to one approver. This is the one place that
-says what is currently known. The documents it links to
+request of its own, at `cd1d45f` for the fix to run 5's lost steers, at
+`7061fab` and `7c1904d` for the sustained task's runs, and at `ea82f7a` for
+serving a gate tag to one approver. This is the one place that says what is
+currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
 measurement updates this page with it.
@@ -279,7 +280,22 @@ Reconnects, retention, overload, compaction and recovery.
   were that steer. `cd1d45f` against `0b295d2`, 2026-09-27; later
   commits only narrow that admission and send such a steer to the model
   before any summary, which has not run live.
-  [Record](LONG_TASK_EVAL.md#live-run-7).
+  [Record](LONG_TASK_EVAL.md#live-run-7). On a sustained task that settles
+  six closes in one turn, about 508 KB of required output, 40 bots in
+  four arms at once: none compacted, since the model sent long outputs to
+  files and read their tails (peak 29,638 tokens, 11% of a 272k window),
+  and 25 of 40 finished before the correction was sent, which alone
+  decided who was correct. `7061fab`, 2026-09-27.
+  [Record](LONG_TASK_EVAL.md#live-run-8). With each step read whole and
+  the correction sent after two successful settlements, 38 of 40 were
+  correct, and compacting took 39 to 45% less input per correct task than
+  full context (416k input token-equivalents with stubs at 128 KiB, 438k
+  with summaries only, 457k with stubs at 256 KiB, against 754k). Bots
+  with stubs matched full context's median time (p50 347 against 374 s)
+  but not its tail (max 530 against 383 s); bots with summaries only
+  took 541 s at the median, and their summarizer wrote 113k
+  output tokens that the token-equivalents leave out. `7c1904d`,
+  2026-09-27. [Record](LONG_TASK_EVAL.md#live-run-9).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -291,16 +307,18 @@ Reconnects, retention, overload, compaction and recovery.
 
 - Any Terminal-Bench score: five tasks are a screen.
 - The five-harness screen at the current build.
-- Compaction quality and cost on real coding tasks, beyond one synthetic
-  task, and at a realistic budget, where that task seldom compacts.
+- Compaction quality and cost on real coding tasks, beyond two synthetic
+  ones.
 - Whether choosing between a copy of the bot's call and a request of its
   own saves anything beyond one task, one model and one budget: run 5's
   0.093 against 0.337 token-equivalents per byte summarized is 11
   summaries a side, with the backend's cache reading 9 of the 10 copies
   (`dd95047`, macOS arm64). Its estimate does not model a cache miss.
-- Whether compacting pays on any task at a realistic budget: on this one,
-  full context cost less than every compacting arm at 128 KiB (runs 4
-  and 5).
+- Whether compacting pays beyond one synthetic task and one model: it
+  did on the sustained task read whole (run 9), but full context cost
+  less on the shorter task (runs 4 and 5), and when the prompt let it,
+  the model kept its own context under the budget (run 8). Neither
+  prices the summarizer's output.
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.
