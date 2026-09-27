@@ -107,7 +107,7 @@ client/          agent-client: the socket protocol and the client policy
   mutation queue, so a pending read cannot splice over a newer snapshot.
 - **Demo mode.** In a plain browser there is no Rust core, so `daemon.js`
   becomes a simulated daemon that emits the same protocol shapes and answers
-  `item`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer joins
+  `history_items`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer joins
   the running turn at its next round boundary as a user message, and the
   scripted reply acknowledges it. The scenario
   plays on load in two projects: `demo.lead` thinks, starts a release build

@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 
-from bench.runtime_client import Client
+from bench.runtime_client import Client, node_item
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_elision import drain, encoded
@@ -40,7 +40,7 @@ class ApprovalTests(ModelFixture):
     def tool_output(self, client, call_id, bot='Bob'):
         events = client.request('events', bot=bot, after=0, limit=256)['result']['events']
         completed = [e for e in events if e['event'] == 'tool_completed' and e['data']['call_id'] == call_id][-1]
-        output = client.request('item', bot=bot, node=completed['data']['node'])['result']['output']
+        output = node_item(client, bot, completed['data']['node'])['result']['output']
         return completed['data'], json.loads(output)
 
     def events(self, client, turn, kind, bot='Bob'):
@@ -57,8 +57,6 @@ class ApprovalTests(ModelFixture):
         self.assertNotIn('approvals', self.events(client, turn, 'tool_started')[0])
         self.assertEqual(client.request('approvals')['result'], {'approvals': [], 'next_after': None})
         self.assertEqual(client.request('stats')['result']['approval_requests'], 0)
-        self.assertIn('approvals', client.ready['capabilities'])
-        self.assertIn('serve_approvals', client.ready['capabilities'])
         self.assertEqual(client.request('stats')['result']['approvers'], [])
         self.assertEqual(client.ready['limits']['approval_hold_ms'], 2000)
 
@@ -354,7 +352,7 @@ class ApprovalTests(ModelFixture):
         client = self.park_and_allow(client, turn, calls, rounds // 2, extra, 'shell,read')
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
-        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
         self.assertIn(f'done after {rounds} rounds', json.dumps(answer))
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
@@ -387,7 +385,7 @@ class ApprovalTests(ModelFixture):
         client = self.park_and_allow(client, turn, [f'long-{n}' for n in range(5)], 4, extra, 'shell')
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
-        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
         self.assertIn('done after 5 rounds', json.dumps(answer))
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
@@ -774,15 +772,15 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(daemon.request('stats')['result']['approvers'], ['auto'])
         return process, lines
 
-    def outcome(self, daemon, turn, call_id='shell-1'):
+    def poll(self, daemon, turn, call_id='shell-1'):
         events = daemon.request('events', bot='Bob', after=0, limit=256)['result']['events']
         return next(e['data'] for e in events if e['turn'] == turn and e['event'] == 'tool_completed'
                     and e['data']['call_id'] == call_id)
 
     def denial(self, daemon, turn, call_id='shell-1'):
-        completed = self.outcome(daemon, turn, call_id)
+        completed = self.poll(daemon, turn, call_id)
         self.assertTrue(completed.get('denied'), completed)
-        output = daemon.request('item', bot='Bob', node=completed['node'])['result']['output']
+        output = node_item(daemon, 'Bob', completed['node'])['result']['output']
         return json.loads(output)['detail']
 
     def test_every_call_is_judged_once_a_round_and_risky_ones_are_denied(self):

@@ -51,7 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bench.context_eval import COMPACTION, INSTRUCTIONS, page_rows  # noqa: E402
-from bench.runtime_client import Client  # noqa: E402
+from bench.runtime_client import Client, node_item  # noqa: E402
 from bench.targets import clean_env, file_hash  # noqa: E402
 
 ENDPOINTS = {'chatgpt': ('responses', 'https://chatgpt.com/backend-api/codex', None),
@@ -1028,7 +1028,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
             checkpoint = done[name]['data'].get('checkpoint')
             answer = ''
             if checkpoint:
-                item = client.request('item', bot=name, node=checkpoint)['result']
+                item = node_item(client, name, checkpoint)['result']
                 answer = ''.join(c.get('text', '') for c in item.get('content', []) if isinstance(c, dict))
             results[name] = {'status': done[name]['data']['status'], 'error': done[name]['data'].get('error'),
                              'wall_s': finished[name],

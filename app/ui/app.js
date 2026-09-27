@@ -414,8 +414,8 @@ async function onEvent(ev) {
 }
 async function loadWaitOrProc(name, node, call) {
   const t = S.transcripts.get(name), session = S.session;
-  let item; try { item = await Daemon.request('item', { bot: name, node }); } catch (_) { return false; }
-  if (S.session !== session || S.transcripts.get(name) !== t) return false;
+  let item; try { item = (await Daemon.request('history_items', { bot: name, nodes: [node] })).items[0]?.item; } catch (_) { return false; }
+  if (!item || S.session !== session || S.transcripts.get(name) !== t) return false;
   return applyWaitOrProc(name, item, call, node);
 }
 // Decode a background start (a proc handle) or a wait result into the cards; also reached by a retried load.

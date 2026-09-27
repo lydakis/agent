@@ -5,7 +5,7 @@ import os
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from tests.test_elision import drain, encoded
-from bench.runtime_client import Client
+from bench.runtime_client import Client, node_item
 from bench.targets import clean_env
 
 
@@ -30,7 +30,7 @@ class TurnCompactionTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40')['result']['turn']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
-        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
         self.assertIn('done after 40 rounds', json.dumps(answer))
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
@@ -69,7 +69,7 @@ class TurnCompactionTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
-        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
         self.assertIn('done after 5 rounds', json.dumps(answer))
         requests = drain(self.model)
         self.assertTrue(all(encoded(r['input']) <= 24576 for r in requests))
@@ -140,7 +140,7 @@ class AnthropicTurnCompactionTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:30')['result']['turn']
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
-        answer = client.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
         self.assertIn('done after 30 rounds', json.dumps(answer))
         self.assertEqual(self.model.binding_errors, [])
         requests = drain(self.model)

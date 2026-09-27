@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 
-from bench.runtime_client import Client, serve_args
+from bench.runtime_client import Client, node_item, serve_args
 from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture
@@ -66,7 +66,7 @@ class DaemonTests(ModelFixture):
                 completed = [event for event in events if event['event'] == 'tool_completed']
                 self.assertEqual(len(completed), len(calls))
                 for event in completed:
-                    item = client.request('item', bot='Bob', node=event['data']['node'])['result']
+                    item = node_item(client, 'Bob', event['data']['node'])['result']
                     self.assertEqual(json.loads(item['output'])['error'], 'file_not_regular')
                 self.assertTrue((root/'alias').is_symlink())
                 self.assertIn('result', client.request('shutdown'))
@@ -271,7 +271,7 @@ class DaemonTests(ModelFixture):
                 while reader.readline():
                     pass
 
-    def test_unfollow_and_replacement_stop_old_replay(self):
+    def test_replacement_follow_stops_old_replay(self):
         path = self.path/'state.db'
         bootstrap = Client(self.binary, path, self.url)
         bootstrap.request('create', bot='Bob')
@@ -282,29 +282,27 @@ class DaemonTests(ModelFixture):
             last = db.execute('SELECT MAX(id) FROM events').fetchone()[0]
         client = SocketClient(self.binary, path, self.url, 'echo')
         self.addCleanup(client.close)
-        for replacement in (dict(op='unfollow', bot='Bob'), dict(op='follow', bot='Bob', after=last)):
-            with socket.socket(socket.AF_UNIX) as peer:
-                peer.settimeout(3); peer.connect(str(client.socket_path))
-                with peer.makefile('rb') as reader:
-                    json.loads(reader.readline())
-                    requests = [dict(id=1, op='follow', bot='Bob', after=0), dict(id=2, **replacement), dict(id=3, op='resume', bot='Bob')]
-                    peer.sendall(b''.join((json.dumps(r)+'\n').encode() for r in requests))
-                    acknowledged = False
-                    while True:
-                        event = json.loads(reader.readline())
-                        if event.get('id') == 2: acknowledged = True
-                        elif acknowledged:
-                            self.assertNotEqual(event.get('event'), 'fixture')
-                        if event.get('id') == 3: break
-                    # Drain any scheduled replay, then establish a second response barrier.
-                    time.sleep(.1)
-                    peer.sendall(b'{"id":4,"op":"resume","bot":"Bob"}\n')
-                    while True:
-                        event = json.loads(reader.readline())
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.settimeout(3); peer.connect(str(client.socket_path))
+            with peer.makefile('rb') as reader:
+                json.loads(reader.readline())
+                requests = [dict(id=1, op='follow', bot='Bob', after=0), dict(id=2, op='follow', bot='Bob', after=last),
+                            dict(id=3, op='resume', bot='Bob')]
+                peer.sendall(b''.join((json.dumps(r)+'\n').encode() for r in requests))
+                acknowledged = False
+                while True:
+                    event = json.loads(reader.readline())
+                    if event.get('id') == 2: acknowledged = True
+                    elif acknowledged:
                         self.assertNotEqual(event.get('event'), 'fixture')
-                        if replacement['op'] == 'unfollow':
-                            self.assertNotEqual(event.get('event'), 'follow_live')
-                        if event.get('id') == 4: break
+                    if event.get('id') == 3: break
+                # Drain any scheduled replay, then establish a second response barrier.
+                time.sleep(.1)
+                peer.sendall(b'{"id":4,"op":"resume","bot":"Bob"}\n')
+                while True:
+                    event = json.loads(reader.readline())
+                    self.assertNotEqual(event.get('event'), 'fixture')
+                    if event.get('id') == 4: break
 
     def test_stdio_shutdown_releases_an_active_replay(self):
         path = self.path/'state.db'

@@ -7,7 +7,7 @@ import json
 import os
 import time
 from unittest import skipUnless
-from bench.runtime_client import Client
+from bench.runtime_client import Client, node_item
 from bench.socket_client import Connection, SocketClient
 from tests.test_elision import drain, encoded
 from tests.test_runtime import ModelFixture, is_summary
@@ -84,7 +84,7 @@ class TurnCompactionAcceptanceTests(ModelFixture):
         completed = [e['data']['call_id'] for e in stored if e['event'] == 'tool_completed']
         self.assertEqual(completed[:40], [f'long-{n}' for n in range(40)])
         self.assertEqual(rounds(self.path), [str(n) for n in range(40)])
-        answer = control.request('item', bot='Bob', node=ended['data']['checkpoint'])['result']
+        answer = node_item(control, 'Bob', ended['data']['checkpoint'])['result']
         self.assertIn('done after 40 rounds', json.dumps(answer))
         compacted = [e['data'] for e in stored if e['event'] == 'compacted']
         self.assertTrue(all(c['pinned'] and c['covered_turns'] == [1, 1] for c in compacted))

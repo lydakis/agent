@@ -1,7 +1,7 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`turns`, `result`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
+`turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
 `shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
@@ -139,8 +139,9 @@ wins; otherwise `AGENT_SOCKET` applies unless `--store` was explicit. Without a
 socket override, the socket is derived from the selected store.
 
 `run` may start the daemon. `start` starts it if none is running, with the
-same startup as `run`, and prints the running daemon's ready line. `stats`, `turns`, `result`, `rm`, `prune`,
-`approvals`, and `answer` may restart it only for an existing store. These commands accept the startup
+same startup as `run`, and prints the running daemon's ready line. `stats`,
+`turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
+existing store. These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match
