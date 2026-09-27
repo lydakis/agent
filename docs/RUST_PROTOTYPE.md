@@ -1176,7 +1176,10 @@ starts with no elision floor. Schema 30 adds the prompt a [cut inside a
 turn](#cuts-inside-a-turn) keeps; earlier cuts are all at a turn's prompt,
 so none needs one. Schema 33 adds [tool approval](#tool-approval): the
 `approvals` table and its tag index, and `bots.gates`, which existing bots
-leave empty.
+leave empty. Schema 34 adds `turns.view_sent`, whether a turn's call or a
+summary or elision changed the bot's view last; turns stored before record
+neither, so a [summary](#compaction) after them never takes their call as
+having sent the view.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset
@@ -1844,9 +1847,11 @@ floor and thinking strip, then one user item, the compaction request,
 carrying the client's compaction instructions and the maximum summary size.
 The view is the last call's in this task, or, before the task's first call,
 the view as the bot's call before the new prompt or wait sent it through its
-newest boundary. That holds only when the bot's previous turn called the
-same model, made a model round, and left more than its prompt; after a turn
-that failed before a call, no call sent that history. The copy takes what the call sent ahead of its window, so a
+newest boundary. That holds only when a call on the same model sent the view
+last, with no summary or elision rewriting it since: this turn's own, or,
+before this turn's first, the previous turn's, when that turn left more than
+its prompt. After a turn that failed before a call, no call sent that
+history. The copy takes what the call sent ahead of its window, so a
 note written since does not show, and the window from before any stubs this
 boundary made.
 

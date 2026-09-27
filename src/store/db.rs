@@ -701,6 +701,10 @@ impl CatchUp {
 /// Where and with which model a turn runs.
 pub struct TurnContext {
     pub model_rounds: usize,
+    /// Whether this turn's last change to the bot's view was a call that
+    /// sent it, rather than a summary or elision that rewrote it; `None`
+    /// until the turn makes either.
+    pub view_sent: Option<bool>,
     pub bot: String,
     pub bot_id: i64,
     pub created_by: Option<String>,
@@ -708,9 +712,10 @@ pub struct TurnContext {
     pub workspace: String,
     pub model: String,
     /// The model of the bot's latest earlier turn that started, when its
-    /// calls sent the history this turn starts from: it made a model round
-    /// and something follows its prompt. `None` otherwise, as when it
-    /// failed before a call, or on a fork's first turn.
+    /// calls sent the history this turn starts from: a call sent its view
+    /// last, and something follows its prompt. `None` otherwise, as when
+    /// it failed before a call or after a summary, or on a fork's first
+    /// turn.
     pub previous_model: Option<String>,
 }
 pub struct Database {
@@ -778,7 +783,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 33;
+    pub const SCHEMA: i32 = 34;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -918,7 +923,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS turns(id INTEGER PRIMARY KEY, bot TEXT NOT NULL REFERENCES bots(name),
                 request_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
                 prompt_node INTEGER REFERENCES nodes(id),
-                workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0,
+                workspace TEXT, model TEXT, waiting TEXT, model_rounds INTEGER NOT NULL DEFAULT 0, view_sent INTEGER,
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 started_ms INTEGER, finished_ms INTEGER,
                 retries INTEGER NOT NULL DEFAULT 0, paced_ms INTEGER NOT NULL DEFAULT 0,
@@ -1843,6 +1848,9 @@ impl Database {
             )?;
             bot.elision
         };
+        if let Some(turn) = bot.running_turn {
+            tx.execute("UPDATE turns SET view_sent=0 WHERE id=?", [turn])?;
+        }
         let data = json!({"version":head,"previous":previous,"through":plan.through,
             "results":plan.results,"saved_bytes":plan.saved_bytes});
         let cursor = event(&tx, name, bot.running_turn, "elided", data.clone())?;
@@ -2600,7 +2608,7 @@ impl Database {
                 record_usage_for(&tx, name, turn, usage, Some("compaction"))?;
             }
             tx.execute(
-                "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
+                "UPDATE turns SET model_rounds=model_rounds+1,view_sent=0 WHERE id=?",
                 [turn],
             )?;
         }
@@ -3673,7 +3681,7 @@ impl Database {
         // A successful response consumes a round in the same durable commit
         // as its messages and tool plans. Failed requests end the turn.
         tx.execute(
-            "UPDATE turns SET model_rounds=model_rounds+1 WHERE id=?",
+            "UPDATE turns SET model_rounds=model_rounds+1,view_sent=1 WHERE id=?",
             [turn],
         )?;
         tx.commit()?;
@@ -4295,23 +4303,34 @@ impl Database {
     }
     /// The workspace and model reference a running turn must use.
     pub fn context(&self, turn: i64) -> Result<TurnContext> {
-        let (workspace, model, model_rounds): (Option<String>, Option<String>, usize) =
-            self.conn.query_row(
-                "SELECT workspace,model,model_rounds FROM turns WHERE id=?",
-                [turn],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, u32>(2)? as usize)),
-            )?;
+        let (workspace, model, model_rounds, view_sent): (
+            Option<String>,
+            Option<String>,
+            usize,
+            Option<bool>,
+        ) = self.conn.query_row(
+            "SELECT workspace,model,model_rounds,view_sent FROM turns WHERE id=?",
+            [turn],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, u32>(2)? as usize,
+                    r.get(3)?,
+                ))
+            },
+        )?;
         let bot = self.active(turn)?;
         let default = format!("{}/{}", bot.provider, bot.model);
         // A turn that started stored its prompt node then; steers absorbed
         // elsewhere and refusals never start, and the partial index skips
         // them in one probe. One that stored its prompt and failed before a
-        // call made no model round, or left its prompt, a prompt node,
-        // right before this one.
+        // call recorded no call, or left its prompt, a prompt node, right
+        // before this one.
         let previous_model = self
             .conn
             .prepare_cached(
-                "SELECT COALESCE(t.model,?3),t.model_rounds>0 AND p.turn IS NULL
+                "SELECT COALESCE(t.model,?3),t.view_sent IS 1 AND p.turn IS NULL
                    FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
                   WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
                   ORDER BY t.id DESC LIMIT 1",
@@ -4323,6 +4342,7 @@ impl Database {
             .flatten();
         Ok(TurnContext {
             model_rounds,
+            view_sent,
             workspace: workspace
                 .or(bot.workspace)
                 .ok_or(Error::new("workspace_required"))?,
@@ -6527,6 +6547,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 32 -> 33: tool approval. Existing bots have no gates; the
         // approvals table is created with the rest of the schema.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN gates TEXT;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('turns') WHERE name='view_sent')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 33 -> 34: whether a turn's call sent the bot's view last. Turns
+        // stored before record neither, so none is taken as having sent it.
+        conn.execute_batch("ALTER TABLE turns ADD COLUMN view_sent INTEGER;")?;
     }
     Ok(())
 }

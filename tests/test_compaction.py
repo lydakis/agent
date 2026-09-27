@@ -1,7 +1,9 @@
 """Compaction budgets, failures, fork isolation, and request-prefix stability."""
 import json
 import os
+import queue
 import sqlite3
+import threading
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
 from bench.runtime_client import Client
@@ -882,9 +884,37 @@ class SummaryCopyTests(ModelFixture):
         self.assertEqual((summary['instructions'], summary['tools']), ('Summarize.', []))
         self.assertEqual(self.request_of_its_own(client), self.own_bytes(summary))
 
-    def request_of_its_own(self, client):
-        """The one summary's `request`: a request of its own, priced."""
-        compacted, = self.events(client, 'compacted')
+    def test_a_turn_after_one_that_summarized_and_failed_before_a_call_does_not_copy_it(self):
+        self.model.bodies = []
+        # The previous turn summarized, took a steer, and its only ordinary
+        # request was refused: no call sent the view its summary left.
+        self.model.refused_prompts = {'1' * 1200}
+        client = self.start()
+        self.turn(client, '0', '0' * 1200)
+        self.requests()
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='1' * 1200)['result']['turn']
+        self.assertTrue(is_summary(self.model.requests.get(timeout=5)))
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:go',
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        self.assertEqual(client.finished(turn)['data']['status'], 'failed')
+        self.assertEqual(client.finished(steer)['data'].get('into'), turn)
+        self.turn(client, '2', '2' * 1200)
+        requests = self.requests()
+        index, = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(requests[index - 1]['input'][-1]['content'][0]['text'], 'steer:go')
+        summary = requests[index]
+        self.assertEqual((summary['instructions'], summary['tools']), ('Summarize.', []))
+        self.assertEqual(self.request_of_its_own(client, 1), self.own_bytes(summary))
+
+    def request_of_its_own(self, client, index=None):
+        """The one summary's `request`, or the one `index` names: a request
+        of its own, priced."""
+        compacted = self.events(client, 'compacted')
+        compacted, = compacted if index is None else [compacted[index]]
         request = compacted['data']['request']
         self.assertEqual((request['form'], request['items'], request['estimate']['copy']), ('own', None, None))
         return request['estimate']['own']

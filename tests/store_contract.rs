@@ -7468,7 +7468,77 @@ fn schema_33_adds_approvals_with_no_gates_on_existing_bots() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 33);
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
+    let path = std::env::temp_dir().join(format!("agent-sent-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        for n in 1..=6 {
+            converse(&mut db, "Bob", n);
+        }
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE turns DROP COLUMN view_sent; PRAGMA user_version=33;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let begin = |db: &mut Database, n: usize| {
+        db.begin(
+            "Bob",
+            &format!("r{n}"),
+            &format!("p{n}"),
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn
+    };
+    // A turn stored before records neither, so none is taken as having
+    // sent the view the next turn starts from.
+    let turn = begin(&mut db, 7);
+    let context = db.context(turn).unwrap();
+    assert_eq!((context.view_sent, context.previous_model), (None, None));
+    // A call sends the view; a summary after it rewrites the view.
+    db.append(turn, vec![assistant("r7")], &[], None).unwrap();
+    assert_eq!(db.context(turn).unwrap().view_sent, Some(true));
+    let plan = compaction_plan(&db, "Bob", 1, i64::MAX, i64::MAX)
+        .unwrap()
+        .unwrap();
+    db.compact(
+        "Bob",
+        &plan,
+        "summary",
+        None,
+        0,
+        ContextUsage {
+            bytes: 4096,
+            items: 256,
+        },
+        Value::Null,
+    )
+    .unwrap();
+    assert_eq!(db.context(turn).unwrap().view_sent, Some(false));
+    db.finish(turn, None).unwrap();
+    let next = begin(&mut db, 8);
+    assert_eq!(db.context(next).unwrap().previous_model, None);
+    db.append(next, vec![assistant("r8")], &[], None).unwrap();
+    db.finish(next, None).unwrap();
+    let after = begin(&mut db, 9);
+    let context = db.context(after).unwrap();
+    assert_eq!(context.previous_model, Some(context.model));
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 34);
     std::fs::remove_file(path).unwrap();
 }
 
