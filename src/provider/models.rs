@@ -10,6 +10,11 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 const KEEP: Duration = Duration::from_secs(300);
+/// The Codex release whose model list a ChatGPT login is offered: Codex
+/// sends its own version as `client_version` (openai/codex 9db8162, read
+/// 2026-09-27), and the backend answers 400 without it. 0.157.1 is the
+/// release the rest of this repository measures against.
+const CODEX_CLIENT_VERSION: &str = "0.157.1";
 const DEADLINE: Duration = Duration::from_secs(10);
 /// Anthropic's pages hold 1,000 models; nobody lists fifty thousand.
 const PAGES: usize = 50;
@@ -109,6 +114,12 @@ impl Provider {
         if self.family == Family::Anthropic && self.aws.is_none() {
             url.set_query(Some("limit=1000"));
         }
+        if self.login.is_some() {
+            // The Codex backend lists models for a Codex version and refuses
+            // a request without one.
+            url.query_pairs_mut()
+                .append_pair("client_version", CODEX_CLIENT_VERSION);
+        }
         url
     }
 
@@ -136,6 +147,9 @@ impl Provider {
                 let mut models = parse(&json!({"data": entries}))?;
                 // Mantle lists every family at one address; offer only those
                 // this binding's wire format runs.
+                if self.url.host_str() == Some("api.openai.com") {
+                    models.retain(|model| model["id"].as_str().is_some_and(openai_text));
+                }
                 if matches!(aws::endpoint(&self.url), Some((_, "bedrock-mantle"))) {
                     models.retain(|model| {
                         model["id"]
@@ -223,6 +237,30 @@ impl Provider {
     }
 }
 
+/// OpenAI's listing names every model on the account, speech, embedding,
+/// image and moderation ones included, with nothing to tell them apart but
+/// the name. Leave out those families, which a Responses turn cannot run.
+/// The families are read from OpenAI's model names (inferred from the
+/// listing seen 2026-09-27, not from a published capability field).
+fn openai_text(id: &str) -> bool {
+    const NOT_TEXT: [&str; 13] = [
+        "embedding",
+        "tts",
+        "whisper",
+        "transcribe",
+        "realtime",
+        "audio",
+        "dall-e",
+        "image",
+        "moderation",
+        "davinci",
+        "babbage",
+        "sora",
+        "search",
+    ];
+    !NOT_TEXT.iter().any(|family| id.contains(family))
+}
+
 /// Whether a Mantle model id is one of the family its binding speaks:
 /// Anthropic's models (`anthropic.`, perhaps under a routing prefix such as
 /// `global.`) on the Messages route, everything else on Responses.
@@ -283,6 +321,37 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn openai_offers_only_models_a_turn_can_run() {
+        use super::openai_text;
+        for id in [
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "o5-mini",
+            "gpt-5.6-luna",
+            "codex-mini-latest",
+        ] {
+            assert!(openai_text(id), "{id}");
+        }
+        for id in [
+            "text-embedding-3-large",
+            "tts-1-hd",
+            "whisper-1",
+            "gpt-4o-transcribe",
+            "gpt-realtime",
+            "gpt-audio",
+            "dall-e-3",
+            "gpt-image-1",
+            "omni-moderation-latest",
+            "davinci-002",
+            "babbage-002",
+            "sora-2",
+            "gpt-4o-search-preview",
+        ] {
+            assert!(!openai_text(id), "{id}");
+        }
+    }
+
+    #[test]
     fn mantle_offers_each_binding_only_its_own_family() {
         use super::mantle_runs;
         assert!(mantle_runs(Family::Anthropic, "anthropic.claude-sonnet-5"));
@@ -298,6 +367,29 @@ mod tests {
     #[test]
     fn each_listing_sits_where_its_provider_serves_it() {
         let transport = Transport::new(64, 1).unwrap();
+        let dir = std::env::temp_dir().join(format!("agent-models-login-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join("auth.json");
+        std::fs::write(
+            &auth,
+            r#"{"tokens":{"access_token":"synthetic-token","account_id":"synthetic-account"}}"#,
+        )
+        .unwrap();
+        let login = std::sync::Arc::new(crate::provider::login::Login::open(&auth, None).unwrap());
+        let chatgpt = Provider::new(
+            transport.clone(),
+            Family::Responses,
+            "https://chatgpt.com/backend-api/codex",
+            None,
+        )
+        .unwrap()
+        .with_login(login)
+        .unwrap();
+        assert_eq!(
+            chatgpt.models_url().as_str(),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.157.1"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
         let url = |family, base: &str| {
             Provider::new(transport.clone(), family, base, None)
                 .unwrap()

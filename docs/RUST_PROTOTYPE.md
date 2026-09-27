@@ -906,7 +906,10 @@ does not, and each is one op:
   what is left of it is `provider_models_limit` for that provider. Bedrock
   Mantle is asked at the host's `/v1/models`, and each binding offers only
   its own family (`anthropic.` models on the Messages route, the rest on
-  Responses). Nothing else reads it: a turn runs whatever model it names.
+  Responses). OpenAI's own listing leaves out speech, embedding, image,
+  moderation and search models by name, and a ChatGPT login asks the Codex
+  backend with `client_version` (the Codex release this repository measures
+  against). Nothing else reads it: a turn runs whatever model it names.
   `agent models --discover` uses it once to write `~/.agent/models`.
 - `stats` returns the daemon's live state without sampling its process from
   outside: open sessions, active turns against the bound, parked turns,
