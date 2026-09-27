@@ -329,13 +329,16 @@ class SocketAndCliTests(ModelFixture):
                              (('--provider', f'openai=responses-ws,{self.url}'), 'over websocket but daemon has'),
                              (('--max-processes', '3'), '--max-processes'),
                              (('--max-detached', '2'), '--max-detached'),
-                             (('--max-pending', '5'), '--max-pending'),
-                             (('--note-turns', '5'), '--note-turns'),
-                             (('--retain-turns', '2'), '--retain-turns')):
+                             (('--max-pending', '5'), '--max-pending')):
             refused = attempt(*flags)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
             self.assertIn('daemon_configuration_mismatch', refused.stderr)
             self.assertIn(named, refused.stderr)
+        # A bot's settings are its own, chosen when it is made.
+        kept = attempt('--note-turns', '5', '--retain-turns', '2')
+        self.assertEqual(kept.returncode, 2, kept.stdout + kept.stderr)
+        self.assertIn("--note-turns, --retain-turns set a new bot's settings; an existing bot keeps its own",
+                      kept.stderr)
         # The daemon has no model of its own: --model belongs to run alone.
         stats = self.agent('stats', '--store', str(self.store), '--model', 'openai/other', check=False)
         self.assertEqual(stats.returncode, 2)
@@ -351,13 +354,21 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(json.loads(self.agent('turns', '--store', str(self.store), '--bot', 'Bob').stdout)[0]['status'],
                          'completed')
 
-    def test_normalized_daemon_limits_match_on_startup_and_attach(self):
-        flags = ['--idle-exit', '0', '--context-bytes', '512', '--context-items', '1', '--stall-timeout', '30',
-                 '--keep-warm', '0', '--cache-ttl', '1h']
-        self.agent('run', *self.common, *flags, '--new', '--bot', 'Bob', 'hi')
+    def test_daemon_limits_match_on_startup_and_attach_and_bots_keep_their_settings(self):
+        flags = ['--idle-exit', '0', '--stall-timeout', '30', '--keep-warm', '0', '--cache-ttl', '1h']
+        self.agent('run', *self.common, *flags, '--context-bytes', '1024', '--context-items', '2',
+                   '--new', '--bot', 'Bob', 'hi')
         self.agent('run', *self.again, *flags, '--bot', 'Bob', 'again')
-        self.agent('run', *self.again, '--context-bytes', '1024', '--context-items', '2',
-                   '--bot', 'Bob', 'effective')
+        control = Connection(self.socket)
+        self.addCleanup(control.close)
+        settings = control.request('resume', bot='Bob')['result']['settings']
+        self.assertEqual((settings['context_bytes'], settings['context_items'], settings['compact_at']),
+                         (1024, 2, 75))
+        # The daemon checks each setting's range and creates nothing it refuses.
+        small = self.agent('run', *self.common, '--context-bytes', '512', '--new', '--bot', 'Small', 'hi', check=False)
+        self.assertEqual(small.returncode, 1)
+        self.assertIn('invalid_setting: context_bytes is at least 1024', small.stderr)
+        self.assertEqual(control.request('resume', bot='Small')['error'], 'bot_not_found')
         refused = self.agent('stats', '--store', str(self.store), '--idle-exit', '1', check=False)
         self.assertIn('daemon_configuration_mismatch', refused.stderr)
         refused = self.agent('stats', '--store', str(self.store), '--stall-timeout', '120', check=False)
@@ -387,7 +398,7 @@ class SocketAndCliTests(ModelFixture):
             ('run', '--stall-timeout', '86401', 'hi'),
             ('run', '--keep-warm', '300', 'hi'),
             ('run', '--cache-ttl', '2h', 'hi'),
-            ('serve', '--context-items', '0'),
+            ('run', '--new', '--context-items', '0', 'hi'),
             ('follow', '--after=-1', '--all'),
         ]
         for args in invalid:

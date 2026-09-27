@@ -20,8 +20,8 @@ from tests.test_turn_compaction import all_events
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class ApprovalTests(ModelFixture):
-    def gated(self, extra=(), bot='Bob', **gate):
-        client = self.client('echo,shell,wait', extra=extra)
+    def gated(self, extra=(), settings=None, bot='Bob', **gate):
+        client = self.client('echo,shell,wait', extra=extra, settings=settings)
         gate = {'approve': ['shell'], 'approver': 'manual', **gate}
         created = client.request('create', bot=bot, workspace=str(self.path), **gate)['result']
         self.assertEqual(created['gates'], [{'tag': gate['approver'], 'tools': gate['approve'],
@@ -58,7 +58,7 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(client.request('approvals')['result'], {'approvals': [], 'next_after': None})
         self.assertEqual(client.request('stats')['result']['approval_requests'], 0)
         self.assertEqual(client.request('stats')['result']['approvers'], [])
-        self.assertEqual(client.ready['limits']['approval_hold_ms'], 2000)
+        self.assertEqual(created['settings']['approval_hold_ms'], 2000)
 
     def test_an_allowed_call_runs_and_records_who_allowed_it(self):
         client = self.gated()
@@ -106,7 +106,7 @@ class ApprovalTests(ModelFixture):
         self.assertFalse((self.path / 'ran').exists())
 
     def test_a_slow_verdict_parks_the_turn_and_resumes_it(self):
-        client = self.gated(extra=('--approval-hold-ms', '100'))
+        client = self.gated(settings={'approval_hold_ms': 100})
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf late')['result']['turn']
         waiting = client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn)
         self.assertEqual(waiting['data'], {'call_id': 'shell-1', 'approval': True, 'deadline_ms': None})
@@ -121,10 +121,10 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(len(self.events(client, turn, 'turn_resumed')), 1)
 
     def test_an_expired_gate_denies_the_call_and_ends_the_turn(self):
-        for hold in ('2000', '50'):
+        for hold in (2000, 50):
             with self.subTest(hold=hold):
                 self.setUp()
-                client = self.gated(extra=('--approval-hold-ms', hold), approve_expire_ms=300)
+                client = self.gated(settings={'approval_hold_ms': hold}, approve_expire_ms=300)
                 turn = client.request('submit', bot='Bob', request_id='t',
                                       prompt='multi:touch first|touch second')['result']['turn']
                 calls = self.announced(client, turn)
@@ -140,7 +140,7 @@ class ApprovalTests(ModelFixture):
                 self.assertFalse((self.path / 'first').exists() or (self.path / 'second').exists())
                 self.assertEqual(client.request('approvals')['result']['approvals'], [])
                 parked = self.events(client, turn, 'turn_waiting')
-                self.assertEqual(len(parked), 1 if hold == '50' else 0)
+                self.assertEqual(len(parked), 1 if hold == 50 else 0)
                 client.close()
 
     def test_a_failed_call_voids_verdicts_for_the_rest_of_its_round(self):
@@ -238,7 +238,7 @@ class ApprovalTests(ModelFixture):
                          [('manual', 'test', True), ('second', 'test', False)])
 
     def test_a_partial_verdict_keeps_the_later_gates_lapse(self):
-        client = self.gated(extra=('--approval-hold-ms', '0'), approve_expire_ms=1000)
+        client = self.gated(settings={'approval_hold_ms': 0}, approve_expire_ms=1000)
         client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['shell'],
                        approver='second', approve_expire_ms=2500)
         turn = client.request('submit', bot='Carol', request_id='t', prompt='shell:printf x')['result']['turn']
@@ -266,11 +266,11 @@ class ApprovalTests(ModelFixture):
                          [('manual', None, False)])
 
     def test_a_later_calls_lapse_ends_a_turn_waiting_on_an_earlier_verdict(self):
-        for hold in ('2000', '50'):
+        for hold in (2000, 50):
             with self.subTest(hold=hold):
                 self.setUp()
                 # The shell gate never lapses; the echo gate after it does.
-                client = self.gated(extra=('--approval-hold-ms', hold))
+                client = self.gated(settings={'approval_hold_ms': hold})
                 client.request('fork', source='Bob', bot='Carol', workspace=str(self.path), approve=['echo'],
                                approver='second', approve_expire_ms=300)
                 turn = client.request('submit', bot='Carol', request_id='t',
@@ -285,7 +285,7 @@ class ApprovalTests(ModelFixture):
                     self.assertTrue(self.tool_output(client, call_id, bot='Carol')[0]['cancelled'])
                 self.assertFalse((self.path / 'first').exists())
                 self.assertEqual(len(self.events(client, turn, 'turn_waiting', bot='Carol')),
-                                 1 if hold == '50' else 0)
+                                 1 if hold == 50 else 0)
                 client.close()
 
     def test_a_gate_lapses_on_time_while_its_turn_waits_on_a_handle(self):
@@ -308,7 +308,7 @@ class ApprovalTests(ModelFixture):
                          {'results': {alice['handle']: {'pending': True}}, 'pending': [alice['handle']]})
 
     def test_a_parked_verdict_survives_restart_and_interrupt_cancels_it(self):
-        client = self.gated(extra=('--approval-hold-ms', '0'))
+        client = self.gated(settings={'approval_hold_ms': 0})
         client.request('create', bot='Dan', workspace=str(self.path), approve=['shell'], approver='manual')
         turn = client.request('submit', bot='Bob', request_id='t', prompt='shell:printf restarted')['result']['turn']
         dan = client.request('submit', bot='Dan', request_id='d', prompt='shell:touch never')['result']['turn']
@@ -326,15 +326,16 @@ class ApprovalTests(ModelFixture):
         self.assertEqual(client.request('approvals')['result']['approvals'], [])
         self.assertEqual(self.answer(client, dan, 'shell-1', bot='Dan')['error'], 'stale_turn')
 
-    def park_and_allow(self, client, turn, calls, restart_at, extra, tools):
+    def park_and_allow(self, client, turn, calls, restart_at, tools):
         """Allow each call once its turn parks for it, restarting the daemon
-        while the call at `restart_at` waits. Returns the client in use."""
+        while the call at `restart_at` waits; the bot keeps its settings.
+        Returns the client in use."""
         for n, call_id in enumerate(calls):
             client.receive(lambda m: m.get('event') == 'turn_waiting' and m.get('turn') == turn
                            and m['data'].get('approval'), timeout=30)
             if n == restart_at:
                 client.close(kill=True)
-                client = self.client(tools, extra=extra)
+                client = self.client(tools)
             self.assertEqual(self.answer(client, turn, call_id)['result']['pending'], [])
         return client
 
@@ -342,14 +343,13 @@ class ApprovalTests(ModelFixture):
         # Every shell call parks for its verdict while the turn outgrows its
         # budget: stubs and summaries come between parks, and one park spans
         # a restart. Each round runs once, with its allow.
-        extra = ('--approval-hold-ms', '0', '--context-bytes', '24576')
-        client = self.client('shell,read', extra=extra)
+        client = self.client('shell,read', settings={'approval_hold_ms': 0, 'context_bytes': 24576})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        approve=['shell'], approver='manual', compaction_instructions='Summarize.')
         rounds = 24
         turn = client.request('submit', bot='Bob', request_id='1', prompt=f'long:{rounds}')['result']['turn']
         calls = [f'long-{n}' for n in range(rounds)]
-        client = self.park_and_allow(client, turn, calls, rounds // 2, extra, 'shell,read')
+        client = self.park_and_allow(client, turn, calls, rounds // 2, 'shell,read')
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
@@ -377,12 +377,11 @@ class ApprovalTests(ModelFixture):
         # Four small rounds, then a call whose result takes the turn past its
         # budget. That call parks, the daemon restarts, and once allowed its
         # result forces a summary of the earlier rounds before the next call.
-        extra = ('--approval-hold-ms', '0', '--context-bytes', '24576', '--compact-at', '99')
-        client = self.client('shell', extra=extra)
+        client = self.client('shell', settings={'approval_hold_ms': 0, 'context_bytes': 24576, 'compact_at': 99})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'],
                        approve=['shell'], approver='manual', compaction_instructions='Summarize.')
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:4x250,1x600')['result']['turn']
-        client = self.park_and_allow(client, turn, [f'long-{n}' for n in range(5)], 4, extra, 'shell')
+        client = self.park_and_allow(client, turn, [f'long-{n}' for n in range(5)], 4, 'shell')
         ended = client.finished(turn, timeout=30)
         self.assertEqual(ended['data']['status'], 'completed', ended)
         answer = node_item(client, 'Bob', ended['data']['checkpoint'])['result']
@@ -403,8 +402,8 @@ class ServedApprovalTests(ModelFixture):
     """One session serves a gate tag: it holds the tag under a lease, gets
     the calls waiting on it, then each call announced for it."""
 
-    def daemon(self, extra=()):
-        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait', extra=extra)
+    def daemon(self, settings=None):
+        daemon = SocketClient(self.binary, self.path / 'state.sqlite', self.url, 'echo,shell,wait', settings=settings)
         self.addCleanup(daemon.close)
         created = daemon.request('create', bot='Bob', workspace=str(self.path), approve=['shell'],
                                  approver='auto')['result']
@@ -424,7 +423,7 @@ class ServedApprovalTests(ModelFixture):
                                decision=decision, by='test', **extra)
 
     def test_a_served_tag_gets_its_waiting_calls_then_each_new_one(self):
-        daemon = self.daemon(extra=('--approval-hold-ms', '60000'))
+        daemon = self.daemon(settings={'approval_hold_ms': 60000})
         first = daemon.request('submit', bot='Bob', request_id='a', prompt='shell:printf one')['result']['turn']
         deadline = time.monotonic() + 5
         while not daemon.request('approvals', tag='auto')['result']['approvals']:
@@ -487,7 +486,7 @@ class ServedApprovalTests(ModelFixture):
                          {'auto': {'in_row': 0, 'in_turn': 1, 'turn': second}})
 
     def test_a_quiet_holder_loses_its_tag_to_the_next_server(self):
-        daemon = self.daemon(extra=('--approval-hold-ms', '60000'))
+        daemon = self.daemon(settings={'approval_hold_ms': 60000})
         quiet, next_ = self.session(daemon), self.session(daemon)
         old = quiet.request('serve_approvals', tag='auto', lease_ms=100)['result']['lease']
         self.assertEqual(next_.request('serve_approvals', tag='auto', lease_ms=5000)['error'], 'approvals_served')

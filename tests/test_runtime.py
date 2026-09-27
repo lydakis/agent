@@ -1,4 +1,5 @@
 """Actual Rust process, disk recovery, provider transport, and tool loop."""
+from contextlib import closing
 import hashlib
 import http.server
 import json
@@ -923,8 +924,8 @@ class ModelFixture(unittest.TestCase):
         self.binary = root / '.local/target/release/agent'
         self.url = f'http://127.0.0.1:{self.model.server_port}/v1'
 
-    def client(self, tools="echo", extra=()):
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools, extra=extra)
+    def client(self, tools="echo", extra=(), settings=None):
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, tools, extra=extra, settings=settings)
         self.addCleanup(client.close)
         return client
 
@@ -1649,7 +1650,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(all(self.model.auth_checks))
 
     def test_history_pages_recover_an_omitted_long_message(self):
-        client = self.client(tools='echo,history', extra=('--context-items', '6'))
+        client = self.client(tools='echo,history', settings={'context_items': 6})
         client.request('create', bot='Bob', workspace=str(self.path))
         prompt = 'é🦀"\\' * 9000 + ' final fact'
         reasoning = {'type': 'reasoning', 'id': 'rs_history',
@@ -1665,7 +1666,11 @@ class RuntimeTests(ModelFixture):
         self.assertIn(reasoning, seed_requests[1]['input'])
         client.request('shutdown')
         client.close()
-        client = self.client(tools='echo,history', extra=('--context-items', '6', '--context-bytes', '65536'))
+        # Cut Bob's stored budget below the long message; settings are fixed
+        # at creation, so the test edits the store.
+        with closing(sqlite3.connect(self.path / 'state.sqlite')) as db, db:
+            db.execute('''UPDATE bots SET settings='{"context_items":6,"context_bytes":65536}' WHERE name='Bob' ''')
+        client = self.client(tools='echo,history')
         offset, pieces, completed_items = 0, [], 0
         while True:
             while not self.model.requests.empty():
@@ -1702,7 +1707,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(records[2]['content'][0]['text'], 'reply:' + prompt)
 
     def test_long_history_is_windowed_at_turn_boundaries_and_readable_by_ordinal(self):
-        client = self.client(tools='echo,history', extra=('--context-items', '6'))
+        client = self.client(tools='echo,history', settings={'context_items': 6})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(1, 6):
             turn = client.request('submit', bot='Bob', request_id=f'p{n}', prompt=f'p{n}')['result']['turn']
@@ -1743,7 +1748,7 @@ class RuntimeTests(ModelFixture):
         self.assertTrue(requests[-2]['input'][0]['content'][0]['text'].startswith('[context note]'))
 
     def test_retention_prunes_records_and_deletes_idle_bots(self):
-        client = self.client(extra=('--retain-turns', '2'))
+        client = self.client(settings={'retain_turns': 2})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(4):
             turn = client.request('submit', bot='Bob', request_id=str(n), prompt=f'p{n}')['result']['turn']
@@ -1777,7 +1782,7 @@ class RuntimeTests(ModelFixture):
         self.assertEqual(client.request('bots')['result']['bots'], [])
 
     def test_retention_preserves_background_completion_and_stale_turn_identity(self):
-        client = self.client(tools='shell,wait', extra=('--retain-turns', '1'))
+        client = self.client(tools='shell,wait', settings={'retain_turns': 1})
         client.request('create', bot='Bob', workspace=str(self.path))
         old = client.request('submit', bot='Bob', request_id='bg',
                              prompt='bg:while [ ! -f release ]; do sleep .01; done; printf done')['result']['turn']
@@ -1796,7 +1801,7 @@ class RuntimeTests(ModelFixture):
         self.assertIn('result', client.request('delete', bot='Bob'))
         client.request('shutdown')
         client.close()
-        client = self.client(tools='shell,wait', extra=('--retain-turns', '1'))
+        client = self.client(tools='shell,wait', settings={'retain_turns': 1})
         for index in range(10):
             client.request('create', bot='Bob', workspace=str(self.path))
             new = client.request('submit', bot='Bob', request_id='r', prompt='replacement')['result']['turn']

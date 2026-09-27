@@ -296,7 +296,7 @@ The UI bounds payload buffering, history decoding, and rendered fleet rows:
 
 - **Attach** replays events from the page's cursor, which on a first start is
   the beginning of the daemon's retained log. That log is bounded by the
-  daemon's retention (`--retain-turns`, `prune`), and a `pruned` notice marks
+  daemon's retention (each bot's `retain_turns`, `prune`), and a `pruned` notice marks
   the gap. Nothing is staged on the way: the page pulls the replay a batch
   at a time and applies each before the next, so the transport's 4,096-event / 8 MiB encoded
   queue is the buffer between the daemon and the screen, and pulls also stop at 1 MiB (plus one event). A page

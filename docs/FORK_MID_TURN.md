@@ -69,7 +69,7 @@ Costs behind the rule:
 
 - **A fork starts warm and large.** Its first call carries the source's
   context window, mostly from cache. That window is bounded by
-  `--context-bytes` and `--context-items`, and compaction, not by the whole
+  `context_bytes` and `context_items`, and compaction, not by the whole
   lineage. It is cheap per token, but every later call carries a window that
   size too. Warm holds for the forks this note designs: the default fork
   point and the model that warmed the cache. A fork at an older

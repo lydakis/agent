@@ -33,7 +33,7 @@ def trial(binary, directory, fixture):
     rss = []
     sampler = None
     try:
-        client = Client(binary, store, url, 'shell', extra=('--retain-turns', '4', '--context-bytes', '524288'))
+        client = Client(binary, store, url, 'shell', settings={'retain_turns': 4, 'context_bytes': 524288})
         process = psutil.Process(client.process.pid)
         def sample():
             while not stop.wait(.01):

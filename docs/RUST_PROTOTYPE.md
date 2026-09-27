@@ -327,14 +327,29 @@ bound; the operating system is then the only limit.
 | `--keep-warm` | Seconds an Anthropic prompt cache may sit unread while a turn runs a tool before it is refreshed (see [keeping the cache warm](#keeping-the-anthropic-cache-warm)). Below 300; 0 disables. | 240 |
 | `--cache-ttl` | Anthropic prompt-cache lifetime, `5m` or `1h`, on both cache markers. `1h` bills each write at twice the input rate instead of 1.25 times and sends no refreshes. Responses providers are unaffected; Bedrock's acceptance of `1h` is unverified. | `5m` |
 | `--idle-exit` | Seconds after which a socket daemon with no sessions, no live turns, and no running background commands exits. Parked turns are durable and resume on the next start; the client restarts the daemon on demand. | none |
-| `--context-bytes` | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
-| `--context-items` | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
-| `--note-turns` | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
-| `--compact-at` | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
-| `--compact-keep` | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `--compact-at`. | 25 |
-| `--retain-turns` | Retention policy: after each turn finishes, prune that bot to this many turns' records (see [Retention](#retention)). | none |
-| `--approval-hold-ms` | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 | (derived) `connections` | HTTP/2 connections per provider: `max-active` divided by 64 streams per connection (both providers allow 100; fewer bounds how many turns one reset connection takes with it), 1 to 256; 64 when active is unbounded. Reported in `ready`, not a flag. | 64 |
+
+### Bot settings
+
+A bot's context, compaction, retention and approval hold are its own:
+`create` takes them as a `settings` object, the bot keeps them, a fork
+copies its source's, and `resume` reports every one as it applies, defaults
+included. A setting left out takes the default below; a value out of range
+answers `invalid_setting` naming it, and nothing is created. `agent run`
+sets them on a new bot with the flags shown; an existing bot keeps its own.
+Each bot can choose differently, so one daemon serves bots on models with
+different context windows. These were daemon flags before schema 40; a bot
+from before then takes the defaults.
+
+| Setting (flag) | Meaning | Default |
+| --- | --- | --- |
+| `context_bytes` (`--context-bytes`) | Encoded input conversation-envelope bytes, including pinned context and separators (see [long history](#long-history-and-context-windows)). Minimum 1,024. | 8 MiB |
+| `context_items` (`--context-items`) | Input conversation-envelope items, including pinned context. Minimum 2. | 4,096 |
+| `note_turns` (`--note-turns`) | Omitted turns the context note lists, newest first, with the first line of each prompt. 0 lists none. | 48 |
+| `compact_at` (`--compact-at`) | Percent of either context envelope that triggers compaction, and of the byte envelope that triggers tool-result elision first. Estimated completion headroom can advance the byte trigger without reducing the input allowance. | 75 |
+| `compact_keep` (`--compact-keep`) | Target percent of either context envelope kept verbatim: as newest whole turns by compaction, as newest items by elision. Reduced when pinned context leaves less room. Must be below `compact_at`. | 25 |
+| `retain_turns` (`--retain-turns`) | After each of its turns finishes, prune the bot to this many turns' records (see [Retention](#retention)). | none |
+| `approval_hold_ms` (`--approval-hold-ms`) | Milliseconds a gated call waits live for its verdict before its turn parks (see [tool approval](#tool-approval)). 0 parks at once; at most 3,600,000. | 2,000 |
 
 Provider requests multiplex over HTTP/2, and one connection carries at most
 the 100 streams the provider advertises; the HTTP layer queues the rest, so a
@@ -850,7 +865,7 @@ own path from the turn. Example requests:
 {"id":17,"op":"wait","handles":["turn:Bob/1","turn:Alice/3"],"any":true,"timeout_ms":60000}
 {"id":18,"op":"stats"}
 {"id":19,"op":"provider_models"}
-{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual"}
+{"id":21,"op":"create","bot":"Carol","workspace":"/workspaces/project","model":"openai/gpt-6-luna","instructions":"...","tools":["shell","read","write","edit","wait","history"],"approve":["shell","write","edit","read"],"approver":"manual","settings":{"context_bytes":1048576,"retain_turns":16}}
 {"id":22,"op":"approvals","bot":"Carol","limit":64}
 {"id":23,"op":"answer","bot":"Carol","turn":7,"call_id":"call_1","request":1,"decision":"deny","reason":"not on main","by":"cli"}
 {"id":24,"op":"serve_approvals","tag":"auto","lease_ms":5000,"limit":64}
@@ -1164,8 +1179,8 @@ the turn's id and handle at once, and `wait`, `turns`, and
   turn (its summary, pinned context, notes, and the context note without
   the previews of omitted turns, which yield to the turn), the turn's own
   items, and each
-  encoded steer stay within three quarters of `--context-bytes` and
-  `--context-items`, the target the window itself keeps, so a burst of
+  encoded steer stay within three quarters of `context_bytes` and
+  `context_items`, the target the window itself keeps, so a burst of
   large steers cannot make the running turn exceed its context and fail
   with `context_limit`. A boundary builds the view first, so a note a tool
   wrote during the round counts, and a steer that goes in sends the view
@@ -1178,7 +1193,7 @@ the turn's id and handle at once, and `wait`, `turns`, and
   compaction instructions and a summarizer the daemon serves in the bot's
   family, a steer still queued after a boundary's elision and compaction
   steps, or after a final reply, is measured against the whole
-  `--context-bytes` and `--context-items` instead: when
+  `context_bytes` and `context_items` instead: when
   one large result in the newest round fills the turn, no stub or summary
   can take it, and the steer would otherwise wait out the task. Beside
   what no summary takes, the view's prefix and the turn's prompt, it
@@ -1465,7 +1480,7 @@ with it.
 
 Stored history has no length limit. What a model sees per request is a
 context window: the newest whole turns of the bot's lineage that fit
-the full input allowance of `--context-bytes` and `--context-items`. Completion
+the full input allowance of `context_bytes` and `context_items`. Completion
 headroom can advance the compaction trigger; it does not reduce the hard input
 allowance. The allowance counts the encoded summary, retained prompts, carry-forward
 note, omission item, transcript items, and JSON separators. These are runtime
@@ -1473,7 +1488,7 @@ conversation-byte/item bounds; system instructions, tool schemas, provider JSON
 framing, and model token limits are separate, not inferred from byte counts.
 For compaction planning, a known output-token cap is estimated at four bytes
 per token, capped at a quarter of the envelope. The earlier of that headroom
-threshold and `--compact-at` triggers compaction. An unset Responses cap adds
+threshold and `compact_at` triggers compaction. An unset Responses cap adds
 no estimate; Anthropic uses its configured wire cap. This estimate is not a
 guarantee about encoded completion size or model token capacity.
 The window starts at a turn boundary
@@ -1490,7 +1505,7 @@ When turns are omitted, the request begins with one user item:
 bot has the `history` tool, the note adds `Use the history tool with a turn
 number from 1 to N to read any of them.` It then lists,
 newest first, the ordinal and the first line (up to 120 bytes) of each
-omitted turn's prompt, at most `--note-turns` of them (default 48, 0 lists
+omitted turn's prompt, at most `note_turns` of them (default 48, 0 lists
 none), and a line naming the older turns the list left out. The optional
 listing is additionally bounded so pinned context plus the listing targets at
 most two thirds of the input byte allowance. On overflow, previews shrink further
@@ -1632,8 +1647,8 @@ needs, and one optional policy composes them:
   cursor: an `events` page starting before it carries `pruned_before`, and a
   `follow` from before it is preceded by a `pruned` notification, so no
   consumer replays a silent gap. `agent prune --bot --keep-turns N`.
-- `--retain-turns N` on the daemon applies `prune` to a bot after each of
-  its turns finishes, including cancelled or failed queued work and interruption
+- A bot's `retain_turns` setting applies `prune` to it after each of
+  its turns finishes, inside the same commit, including cancelled or failed queued work and interruption
   while parked, before the terminal
   event is delivered. Whoever sees `turn_finished` sees the store as retention
   left it. Each completion removes one piece, the four oldest turns past N at
@@ -1790,7 +1805,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   got, so an allow before the deny is kept; the turn goes on.
 - **Hold, then park.** A verdict for a running turn is held by the storage
   worker, which wakes the turn's task, until the call's start, its denial,
-  or a park writes it. A gated call waits live for `--approval-hold-ms`
+  or a park writes it. A gated call waits live for its bot's `approval_hold_ms`
   (default 2,000; 0 parks at once), then its turn parks like `wait`: one
   commit, `turn_waiting` with `approval: true`, no task, no active slot, and
   it survives restart. A verdict for a parked turn is committed on arrival
@@ -1921,7 +1936,7 @@ that allow or deny it.
 
 Most of a long tool-using turn is tool output the model has already read.
 At a round boundary, after steers are absorbed and before compaction, once
-the window and its pinned context hold `--compact-at` percent of the byte
+the window and its pinned context hold `compact_at` percent of the byte
 envelope, or the current turn cannot fit at all, alone or beside the
 summary, pinned context, and notes sent ahead of it, the daemon moves the
 bot's elision floor. Every tool result at or below the floor goes to the model as
@@ -1931,7 +1946,7 @@ output's size, the `read` reference that returns it whole
 else, the model's own messages and calls, user prompts and steers, and
 small results, stays verbatim, and no call is ever separated from its
 result. There is no model call. The floor goes through the newest item the
-verbatim tail of `--compact-keep` percent cannot take, and never past the
+verbatim tail of `compact_keep` percent cannot take, and never past the
 model's newest output, so the model reads every result whole in the request
 that answers it. A move must save a sixteenth of the byte envelope, so a
 context of mostly other text does not rewrite its cached prefix each round
@@ -2008,8 +2023,8 @@ its raw results.
 A bot created with `compaction_instructions` compacts, and one without never
 does. At a round boundary, after steers are absorbed and before the next
 model call, when the effective view since the last summary reaches
-`--compact-at` percent of either envelope, the daemon summarizes everything
-older than the newest boundary whose tail holds `--compact-keep` percent
+`compact_at` percent of either envelope, the daemon summarizes everything
+older than the newest boundary whose tail holds `compact_keep` percent
 verbatim, limited by the room left after pinned context. A boundary is a
 turn's prompt or, [inside the newest turn](#cuts-inside-a-turn), a round
 start: the first item after a tool result that is not one, a model output or
@@ -2241,7 +2256,7 @@ with its results [elided](#tool-result-elision): its own calls, messages,
 and stubs keep growing. So the newest turn offers more boundaries than its
 prompt: every model round after a completed tool exchange. The newest
 boundary whose tail reaches the keep target wins, whether a prompt or a
-round, so compaction leaves about `--compact-keep` percent verbatim however
+round, so compaction leaves about `compact_keep` percent verbatim however
 the view is split into turns; a turn smaller than that is never cut. The
 summarizer reads the span up to the cut, which ends with a whole exchange:
 every call in it has its result, and the tail begins with the model's

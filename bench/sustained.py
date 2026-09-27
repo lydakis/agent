@@ -48,8 +48,8 @@ def run(agent, out, bots, minutes, model, context_items, window_seconds, retain_
         raise SystemExit(f'{key_env} is not set')
     client = Client(agent, store, url, 'shell,read,write,edit,wait', model=name, key_env=key_env,
                     env=os.environ.copy(), provider=provider, family=family,
-                    extra=('--context-items', str(context_items),
-                           *(['--retain-turns', str(retain_turns)] if retain_turns else [])))
+                    settings={'context_items': context_items,
+                              **({'retain_turns': retain_turns} if retain_turns else {})})
     daemon = psutil.Process(client.process.pid)
     for index in range(bots):
         client.request('create', bot=f'b{index}', workspace=str(workspace), reasoning='low')
@@ -159,7 +159,7 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--context-items', type=int, default=8)
     parser.add_argument('--window-seconds', type=int, default=30)
-    parser.add_argument('--retain-turns', type=int, default=None, help='daemon retention policy; none by default')
+    parser.add_argument('--retain-turns', type=int, default=None, help="each bot's retention; none by default")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     out = args.out.resolve()

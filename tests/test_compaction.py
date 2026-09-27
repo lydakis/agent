@@ -19,7 +19,7 @@ class AnthropicCompactionTests(ModelFixture):
                         tools='echo,shell', provider='anthropic', family='anthropic',
                         model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                        extra=('--context-bytes', '8192', '--compact-at', '50'))
+                        settings={'context_bytes': 8192, 'compact_at': 50})
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                compaction_instructions='Summarize.', reasoning='low'))
@@ -59,7 +59,7 @@ class AnthropicCompactionTests(ModelFixture):
                         tools='echo,shell', provider='anthropic', family='anthropic',
                         model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                        extra=('--context-bytes', '32768'))
+                        settings={'context_bytes': 32768})
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['echo', 'shell'], compaction_instructions='Summarize.',
@@ -91,7 +91,7 @@ class AnthropicCompactionTests(ModelFixture):
                             tools='echo,shell', provider='anthropic', family='anthropic',
                             model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                             env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                            extra=('--context-bytes', '8192'))
+                            settings={'context_bytes': 8192})
             self.addCleanup(client.close)
             return client
         client = start()
@@ -120,7 +120,7 @@ class AnthropicCompactionTests(ModelFixture):
 class CompactionTests(ModelFixture):
     def test_optional_previews_do_not_block_compaction_of_large_turns(self):
         self.model.compaction_text = 'A brief summary.'
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(15):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'],
@@ -144,10 +144,9 @@ class CompactionTests(ModelFixture):
     def test_output_cap_advances_compaction_without_reducing_the_input_envelope(self):
         for cap in (None, 2048):
             with self.subTest(cap=cap):
-                extra = ('--context-bytes', '8192', '--compact-at', '95')
-                if cap is not None:
-                    extra += ('--max-output-tokens', str(cap))
-                client = Client(self.binary, self.path / f'cap-{cap}.sqlite', self.url, extra=extra)
+                extra = ('--max-output-tokens', str(cap)) if cap is not None else ()
+                client = Client(self.binary, self.path / f'cap-{cap}.sqlite', self.url, extra=extra,
+                                settings={'context_bytes': 8192, 'compact_at': 95})
                 self.addCleanup(client.close)
                 self.create(client)
                 for n in range(7):
@@ -159,7 +158,7 @@ class CompactionTests(ModelFixture):
                 client.close()
 
     def test_retained_prompts_leave_room_for_history_after_repeated_compactions(self):
-        client = self.client(tools='echo,history', extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(tools='echo,history', settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(12):
             text = 'x' * 500 if n % 2 == 0 else '\"\\\nλ' * 100
@@ -180,7 +179,7 @@ class CompactionTests(ModelFixture):
 
     def test_nonshrinking_summary_is_billed_without_installing_it(self):
         self.model.compaction_text = 'x' * 900
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(3):
             self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
@@ -192,7 +191,7 @@ class CompactionTests(ModelFixture):
 
     def test_escaped_summary_cannot_exceed_the_encoded_prefix_budget(self):
         self.model.compaction_text = '\\' * 1100  # raw target fits; encoded block does not
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(3):
             self.assertEqual(self.run_turn(client, 'Bob', n, str(n) * 500)['data']['status'], 'completed')
@@ -203,7 +202,7 @@ class CompactionTests(ModelFixture):
                             for m in client.saved))
 
     def test_small_items_trigger_compaction_below_the_byte_threshold(self):
-        client = self.client(extra=('--context-bytes', '65536', '--context-items', '16'))
+        client = self.client(settings={'context_bytes': 65536, 'context_items': 16})
         self.create(client)
         for n in range(10):
             self.assertEqual(self.run_turn(client, 'Bob', n, 'small')['data']['status'], 'completed')
@@ -212,7 +211,7 @@ class CompactionTests(ModelFixture):
         self.assertTrue(all(len(r['input']) <= 15 for r in requests))
 
     def test_history_result_takes_precedence_over_optional_previews(self):
-        client = self.client(tools='history', extra=('--context-bytes', '4096'))
+        client = self.client(tools='history', settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(30):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'], 'completed')
@@ -235,7 +234,7 @@ class CompactionTests(ModelFixture):
             self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
 
     def test_optional_previews_leave_room_for_the_current_prompt(self):
-        client = self.client(extra=('--context-bytes', '4096'))
+        client = self.client(settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path))
         for n in range(30):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 150)['data']['status'], 'completed')
@@ -249,7 +248,7 @@ class CompactionTests(ModelFixture):
         self.assertTrue(any('[context note]' in str(r['input']) for r in requests))
 
     def test_oversized_note_preserves_previous_note_and_bot_remains_usable(self):
-        client = self.client(tools='note', extra=('--context-bytes', '4096'))
+        client = self.client(tools='note', settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path))
         self.assertEqual(self.run_turn(client, 'Bob', 'seed', 'note:remember violet')['data']['status'], 'completed')
         for n, note in enumerate(('x' * 5000, '\\' * 2100, 'n' * 2000)):
@@ -271,7 +270,7 @@ class CompactionTests(ModelFixture):
         self.assertEqual(self.run_turn(client, 'Bob', 'clear', 'note:')['data']['status'], 'completed')
 
     def test_pinned_note_counts_toward_compaction_and_request_room(self):
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '75'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 75})
         self.create(client)
         # Seed a durable note at an existing node, then reopen the daemon.
         # Escaped note bytes count; transcript payloads remain small.
@@ -284,7 +283,7 @@ class CompactionTests(ModelFixture):
         db.commit()
         db.close()
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        extra=('--context-bytes', '4096', '--compact-at', '75'))
+                        settings={'context_bytes': 4096, 'compact_at': 75})
         self.addCleanup(client.close)
         self.requests()
         for n in range(6):
@@ -296,8 +295,7 @@ class CompactionTests(ModelFixture):
                             for r in normal))
 
     def test_parked_summary_resumes_as_a_summary_after_restart(self):
-        extra = ('--context-bytes', '4096', '--compact-at', '50')
-        client = self.client(extra=extra)
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(2):
             self.run_turn(client, 'Bob', n, str(n) * 500)
@@ -306,7 +304,8 @@ class CompactionTests(ModelFixture):
         turn = client.request('submit', bot='Bob', request_id='next', prompt='2' * 500)['result']['turn']
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
-        client = Client(self.binary, self.path / 'state.sqlite', self.url, extra=extra)
+        # The bot keeps its settings across the restart.
+        client = Client(self.binary, self.path / 'state.sqlite', self.url)
         self.addCleanup(client.close)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = self.requests()
@@ -318,8 +317,7 @@ class CompactionTests(ModelFixture):
         for restart in (False, True):
             with self.subTest(restart=restart):
                 path = self.path / f'park-{restart}.sqlite'
-                extra = ('--context-bytes', '4096', '--compact-at', '50')
-                client = Client(self.binary, path, self.url, extra=extra)
+                client = Client(self.binary, path, self.url, settings={'context_bytes': 4096, 'compact_at': 50})
                 self.addCleanup(client.close)
                 self.create(client)
                 for n in range(2):
@@ -331,7 +329,7 @@ class CompactionTests(ModelFixture):
                 client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
                 if restart:
                     client.close(kill=True)
-                    client = Client(self.binary, path, self.url, extra=extra)
+                    client = Client(self.binary, path, self.url)
                     self.addCleanup(client.close)
                 self.assertEqual(client.finished(turn)['data']['status'], 'completed')
                 requests = self.requests()
@@ -360,7 +358,7 @@ class CompactionTests(ModelFixture):
         self.assertIn('result', response)
 
     def test_summary_cost_is_durable_and_stops_the_next_call_at_budget(self):
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client, budget_tokens=330)
         for n in range(3):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
@@ -390,7 +388,7 @@ class CompactionTests(ModelFixture):
 
     def test_empty_summary_is_charged_even_though_the_view_is_not_changed(self):
         self.model.empty_compaction = True
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client, budget_tokens=330)
         for n in range(3):
             ended = self.run_turn(client, 'Bob', n, str(n) * 500)
@@ -403,19 +401,18 @@ class CompactionTests(ModelFixture):
                             for m in client.saved))
 
     def test_forks_compact_shared_cuts_and_keep_their_own_summary(self):
-        client = self.client(extra=('--context-bytes', '65536'))
+        client = self.client(settings={'context_bytes': 8192, 'compact_at': 50, 'compact_keep': 25})
         self.create(client)
-        for n in range(6):
+        for n in range(3):
             self.run_turn(client, 'Bob', n, str(n) * 500)
+        # The fork copies Bob's settings with his history, so the same next
+        # prompt crosses both thresholds at the same point.
         client.request('fork', source='Bob', bot='Alice', workspace=str(self.path))
-        client.close()
-        client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        extra=('--context-bytes', '8192', '--compact-at', '50', '--compact-keep', '25'))
-        self.addCleanup(client.close)
-        for bot in ('Bob', 'Alice'):
-            self.assertEqual(self.run_turn(client, bot, 'next', 'continue')['data']['status'], 'completed')
         db = sqlite3.connect(self.path / 'state.sqlite')
         self.addCleanup(db.close)
+        self.assertEqual(db.execute('select count(*) from compactions').fetchone()[0], 0)
+        for bot in ('Bob', 'Alice'):
+            self.assertEqual(self.run_turn(client, bot, 'next', 'y' * 1500)['data']['status'], 'completed')
         rows = db.execute('select node,cut from compactions order by node').fetchall()
         self.assertEqual(len(rows), 2)
         self.assertNotEqual(rows[0][0], rows[1][0])
@@ -423,7 +420,7 @@ class CompactionTests(ModelFixture):
 
     def test_failed_summaries_do_not_grow_requests_with_the_transcript(self):
         self.model.reject_compaction = True
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(24):
             self.assertEqual(self.run_turn(client, 'Bob', n, f'{n}: ' + 'x' * 500)['data']['status'], 'completed')
@@ -444,7 +441,7 @@ class CompactionTests(ModelFixture):
     def test_a_backlog_is_caught_up_oldest_first_once_summaries_succeed(self):
         self.model.reply_text = 'x' * 500
         self.model.reject_compaction = True
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(12):
             self.run_turn(client, 'Bob', n, f'{n}: short')
@@ -473,7 +470,7 @@ class CompactionTests(ModelFixture):
             self.assertEqual(c['headroom_bytes'], c['input_limit']['bytes'] - c['context_after']['bytes'])
 
     def test_prompt_cache_keys_follow_the_shared_prefix(self):
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         self.create(client, bot='Eve')
         # A fork repeats its source's prefix and so shares its key, as does a
@@ -498,7 +495,7 @@ class CompactionTests(ModelFixture):
         self.assertTrue(all(k.startswith(identity + '-') for k in calls | set(keys.values())))
         client.close()
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        extra=('--context-bytes', '4096', '--compact-at', '50'))
+                        settings={'context_bytes': 4096, 'compact_at': 50})
         self.addCleanup(client.close)
         self.assertEqual(client.ready['store']['identity'], identity)
         self.run_turn(client, 'Bob', 'again', 'small')
@@ -513,7 +510,7 @@ class CompactionTests(ModelFixture):
         source.close()
         destination.close()
         clone = Client(self.binary, copied, self.url,
-                       extra=('--context-bytes', '4096', '--compact-at', '50'))
+                       settings={'context_bytes': 4096, 'compact_at': 50})
         self.addCleanup(clone.close)
         self.assertEqual(clone.ready['store']['lineage'], client.ready['store']['lineage'])
         self.assertNotEqual(clone.ready['store']['identity'], identity)
@@ -529,21 +526,21 @@ class CompactionTests(ModelFixture):
         destination.close()
         os.replace(replacement, copied)
         restored = Client(self.binary, copied, self.url,
-                          extra=('--context-bytes', '4096', '--compact-at', '50'))
+                          settings={'context_bytes': 4096, 'compact_at': 50})
         self.addCleanup(restored.close)
         self.assertNotEqual(restored.ready['store']['identity'], copied_identity)
         self.assertEqual({keys['Alice'], keys['Ann']}, calls)
         self.assertEqual(len({keys['Eve']} | calls), 2)
 
     def test_normal_calls_and_forks_reuse_an_unchanged_compacted_prefix(self):
-        client = self.client(extra=('--context-bytes', '4096', '--compact-at', '50'))
+        client = self.client(settings={'context_bytes': 4096, 'compact_at': 50})
         self.create(client)
         for n in range(3):
             self.run_turn(client, 'Bob', n, str(n) * 500)
         # A larger budget prevents another compaction while testing pure append.
         client.close()
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        extra=('--context-bytes', '16384'))
+                        settings={'context_bytes': 16384})
         self.addCleanup(client.close)
         self.requests()
         self.run_turn(client, 'Bob', 'a', 'small-a')
@@ -571,11 +568,11 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.model.bind_thinking = True
         self.model.binding_errors = []
 
-    def anthropic(self, extra):
+    def anthropic(self, settings):
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
                         tools='echo,shell', provider='anthropic', family='anthropic',
                         model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
-                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}, extra=extra)
+                        env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'}, settings=settings)
         self.addCleanup(client.close)
         return client
 
@@ -594,7 +591,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         return sum(b['type'] == 'thinking' for b in message['content'])
 
     def test_a_sliding_window_drops_thinking_bound_to_the_turns_it_left(self):
-        client = self.anthropic(('--context-bytes', '4096'))
+        client = self.anthropic(settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
         for n in range(12):
             self.turn(client, 'Bob', n, ('tool:' if n % 3 == 0 else f'{n}:') + 'x' * 400)
@@ -607,7 +604,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertTrue(any(counts and counts[-1] == 1 and 0 in counts for counts in assistants))
 
     def test_summaries_and_the_compacted_window_replay_only_bound_thinking(self):
-        client = self.anthropic(('--context-bytes', '8192', '--compact-at', '50'))
+        client = self.anthropic(settings={'context_bytes': 8192, 'compact_at': 50})
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low',
                        compaction_instructions='Summarize.')
         for n in range(8):
@@ -621,7 +618,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertTrue(any(self.thinking(m) for r in summaries for m in r['messages']))
 
     def test_a_fork_keeps_its_sources_thinking(self):
-        client = self.anthropic(('--context-bytes', '65536'))
+        client = self.anthropic(settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
         for n in range(3):
             self.turn(client, 'Bob', n, ('tool:' if n == 0 else f'{n}:') + 'x' * 100)
@@ -633,7 +630,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertTrue(all(self.thinking(m) for m in alice['messages'] if m['role'] == 'assistant'))
 
     def test_an_answer_of_only_thinking_is_left_out_once_its_context_changes(self):
-        client = self.anthropic(('--context-bytes', '4096'))
+        client = self.anthropic(settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
         text = lambda m: m['content'][0].get('text')
         self.turn(client, 'Bob', 0, 'x' * 1500)
@@ -657,7 +654,7 @@ class AnthropicThinkingBindingTests(ModelFixture):
         self.assertFalse(any(self.thinking(m) for m in slid['messages'][:at + 2]))
 
     def test_thinking_the_provider_drops_is_reported_live(self):
-        client = self.anthropic(())
+        client = self.anthropic(None)
         client.request('create', bot='Bob', workspace=str(self.path), reasoning='low')
         self.turn(client, 'Bob', 0, 'kept')
         self.model.report_drops = 2
@@ -674,7 +671,7 @@ class SummaryCopyTests(ModelFixture):
     own."""
 
     def start(self, tools='echo', budget=4096, **options):
-        client = self.client(tools=tools, extra=('--context-bytes', str(budget), '--compact-at', '50'))
+        client = self.client(tools=tools, settings={'context_bytes': budget, 'compact_at': 50})
         response = client.request('create', bot='Bob', workspace=str(self.path), tools=tools.split(','),
                                   compaction_instructions='Summarize.', **options)
         self.assertIn('result', response)
@@ -792,7 +789,7 @@ class SummaryCopyTests(ModelFixture):
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell',
-                        extra=('--context-bytes', '16384', '--compact-at', '50'))
+                        settings={'context_bytes': 16384, 'compact_at': 50})
         self.addCleanup(client.close)
         self.assertEqual(client.finished(turn)['data']['status'], 'completed')
         requests = self.requests()

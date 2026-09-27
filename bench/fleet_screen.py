@@ -72,9 +72,10 @@ class Screen:
         self.finished, self.waiting = {}, set()
 
     def daemon(self):
-        extra = ['--max-active', str(self.max_active), '--context-items', '8']
+        extra = ['--max-active', str(self.max_active)]
         self.client = Client(self.binary, self.store, self.url, 'shell,read,write,edit,wait', model=self.name,
-                             key_env=self.key_env, env=self.env, provider=self.provider, family=self.family, extra=extra)
+                             key_env=self.key_env, env=self.env, provider=self.provider, family=self.family, extra=extra,
+                             settings={'context_items': 8})
         self.process = psutil.Process(self.client.process.pid)
         return self.client
 

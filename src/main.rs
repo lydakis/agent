@@ -90,13 +90,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     let mut stall_timeout = None;
     let mut keep_warm = None;
     let mut cache_hour = false;
-    let mut context_bytes = None;
-    let mut context_items = None;
-    let mut note_turns = None;
-    let mut compact_at = None;
-    let mut compact_keep = None;
-    let mut retain_turns = None;
-    let mut approval_hold_ms = None;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
         let value = iter
@@ -124,62 +117,10 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
                     _ => max_connecting = Some(parsed),
                 }
             }
-            "--context-bytes" | "--context-items" => {
-                let parsed: usize = value.parse().ok().filter(|n| *n > 0).ok_or(Error::with(
-                    "usage",
-                    format!("{flag} needs a positive integer"),
-                ))?;
-                if flag == "--context-bytes" {
-                    context_bytes = Some(parsed);
-                } else {
-                    context_items = Some(parsed);
-                }
-            }
             "--max-output-tokens" => {
                 max_output_tokens = Some(value.parse::<u32>().ok().filter(|n| *n > 0).ok_or(
                     Error::with("usage", "--max-output-tokens needs a positive integer"),
                 )?)
-            }
-            "--compact-at" | "--compact-keep" => {
-                let parsed: usize =
-                    value
-                        .parse()
-                        .ok()
-                        .filter(|n| (1..=99).contains(n))
-                        .ok_or(Error::with(
-                            "usage",
-                            format!("{flag} needs a percentage from 1 to 99"),
-                        ))?;
-                if flag == "--compact-at" {
-                    compact_at = Some(parsed);
-                } else {
-                    compact_keep = Some(parsed);
-                }
-            }
-            "--note-turns" => {
-                note_turns = Some(value.parse::<usize>().ok().filter(|n| *n <= 1024).ok_or(
-                    Error::with(
-                        "usage",
-                        "--note-turns needs an integer up to 1024; 0 lists none",
-                    ),
-                )?)
-            }
-            "--retain-turns" => {
-                retain_turns = Some(value.parse::<usize>().ok().filter(|n| *n > 0).ok_or(
-                    Error::with("usage", "--retain-turns needs a positive integer"),
-                )?)
-            }
-            "--approval-hold-ms" => {
-                approval_hold_ms = Some(
-                    value
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|n| *n <= 3_600_000)
-                        .ok_or(Error::with(
-                            "usage",
-                            "--approval-hold-ms needs milliseconds up to 3600000 (0 parks at once)",
-                        ))?,
-                )
             }
             "--stall-timeout" => {
                 stall_timeout = Some(
@@ -217,9 +158,6 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
     if providers.is_empty() {
         return fail_with("usage", "serve needs at least one --provider");
     }
-    if compact_keep.unwrap_or(25) >= compact_at.unwrap_or(75) {
-        return fail_with("usage", "--compact-keep must be below --compact-at");
-    }
     Ok(server::Configuration {
         store: store.ok_or(Error::with("usage", "serve needs --store"))?,
         socket,
@@ -235,12 +173,5 @@ fn configuration(args: &[String]) -> Result<server::Configuration> {
         keep_warm,
         cache_hour,
         idle_exit,
-        context_bytes,
-        context_items,
-        note_turns,
-        compact_at,
-        compact_keep,
-        retain_turns,
-        approval_hold_ms,
     })
 }

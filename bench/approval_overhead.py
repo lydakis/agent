@@ -7,7 +7,7 @@ every turn one synthetic `shell` call (`true`) and a reply. Arms:
   daemon with approvals costs an ungated bot nothing.
 - `held`: `shell` gated; this client answers `allow` as soon as a call is
   announced, within the hold, so the turn never parks.
-- `parked`: the same gate with `--approval-hold-ms 0`; this client answers
+- `parked`: the same gate with an `approval_hold_ms` of 0; this client answers
   after `turn_waiting`, so every call parks and resumes.
 
 Over a Unix socket instead of stdio, with the approver a process of its own:
@@ -113,7 +113,7 @@ def live_bytes(path):
 
 def run(binary, arm, *, bots, turns, fsync=False):
     server, url = start()
-    hold = '0' if arm == 'parked' else '2000'
+    hold = 0 if arm == 'parked' else 2000
     with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent.parent / '.local') as temp:
         path = Path(temp)
         if fsync:
@@ -123,7 +123,7 @@ def run(binary, arm, *, bots, turns, fsync=False):
             wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
             binary = wrapper
         client = Client(binary, path / 'state.sqlite', url, 'shell',
-                        extra=() if arm == 'ungated' else ('--approval-hold-ms', hold))
+                        settings=None if arm == 'ungated' else {'approval_hold_ms': hold})
         try:
             process = psutil.Process(client.process.pid)
             names = [f'b{n}' for n in range(bots)]
@@ -249,7 +249,7 @@ def run_socket(binary, arm, *, bots, turns):
             tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp') as short:
         path, sock = Path(temp), Path(short) / 'daemon.sock'
         daemon = subprocess.Popen(
-            [str(binary), *serve_args(path / 'state.sqlite', url, extra=('--approval-hold-ms', '2000')),
+            [str(binary), *serve_args(path / 'state.sqlite', url),
              '--socket', str(sock)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, env=clean_env())
@@ -265,7 +265,8 @@ def run_socket(binary, arm, *, bots, turns):
             names = [f'b{n}' for n in range(bots)]
             for name in names:
                 assert 'result' in control.request('create', bot=name, workspace=str(path),
-                                                   approve=['shell'], approver=tag)
+                                                   approve=['shell'], approver=tag,
+                                                   settings={'approval_hold_ms': 2000})
             if arm != 'socket':
                 env, args = clean_env(), [str(binary), 'approver', '--store', str(path / 'state.sqlite'),
                                          '--socket', str(sock)]

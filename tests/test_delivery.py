@@ -26,7 +26,7 @@ class DeliveryTests(ModelFixture):
         self.model.all_streaming = threading.Event()
         self.model.all_streaming.set()
         self.addCleanup(self.model.release_headers.set)
-        client = self.client(extra=('--max-active', '1', '--retain-turns', '1'))
+        client = self.client(extra=('--max-active', '1'), settings={'retain_turns': 1})
         for bot in ('Alice', 'Bob'):
             client.request('create', bot=bot, workspace=str(self.path))
         first = client.request('submit', bot='Alice', request_id='a', prompt='gate')['result']['turn']
@@ -203,7 +203,7 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(poll(client, 'Bob', successor)['result']['text'], 'reply:successor')
 
     def test_retention_preserves_completion_with_queued_and_steered_work(self):
-        client = self.client(extra=('--retain-turns', '1'))
+        client = self.client(settings={'retain_turns': 1})
         client.request('create', bot='Bob', workspace=str(self.path))
         first = client.request('submit', bot='Bob', request_id='a', prompt='slow')['result']['turn']
         successor = client.request('submit', bot='Bob', request_id='b', prompt='next',
@@ -318,7 +318,7 @@ class DeliveryTests(ModelFixture):
         self.assertEqual(client.finished(idle['turn'])['data']['status'], 'completed')
 
     def test_compaction_fires_at_the_threshold_and_replaces_older_turns_with_a_summary(self):
-        client = self.client('echo,history', extra=('--context-bytes', '4096', '--compact-at', '50', '--compact-keep', '25'))
+        client = self.client('echo,history', settings={'context_bytes': 4096, 'compact_at': 50, 'compact_keep': 25})
         client.request('create', bot='Bob', workspace=str(self.path), compaction_instructions='Summarize the conversation.')
         client.request('create', bot='Plain', workspace=str(self.path))
         prompts = [f'Task {n}: ' + f'{n}' * 500 for n in range(1, 7)]
@@ -425,7 +425,7 @@ class DeliveryTests(ModelFixture):
         # The steer arrives while the model is asked; the model's answer
         # writes a large carry-forward note. Beside that note the steer does
         # not fit, though it would have beside the request that was sent.
-        client = self.client('echo,note', extra=('--context-bytes', '8192'))
+        client = self.client('echo,note', settings={'context_bytes': 8192})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
         self.model.note_text = 'N' * 3500
         gate = threading.Event()
@@ -448,7 +448,7 @@ class DeliveryTests(ModelFixture):
         # note it does not fit at the next boundary. The model then clears
         # the note, and the steer goes in at the boundary after that,
         # before the answer, rather than failing when the turn ends.
-        client = self.client('echo,note', extra=('--context-bytes', '8192'))
+        client = self.client('echo,note', settings={'context_bytes': 8192})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['echo', 'note'])
         self.model.note_text = 'N' * 3500
         noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
@@ -481,7 +481,7 @@ class DeliveryTests(ModelFixture):
         # A long history leaves most turns out of view, and the context note
         # lists how each began. Those previews yield to the running turn, so
         # a strict steer that fits beside the note without them goes in.
-        client = self.client('echo', extra=('--context-bytes', '16384'))
+        client = self.client('echo', settings={'context_bytes': 16384})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['echo'])
         for n in range(50):
             turn = client.request('submit', bot='Bob', request_id=str(n),
@@ -514,7 +514,7 @@ class DeliveryTests(ModelFixture):
         # The note names the history tool only to a bot that has it.
         for note_turns, listing, tools in (('3', True, ['echo', 'history']), ('0', False, ['echo'])):
             with self.subTest(note_turns=note_turns):
-                client = self.client(extra=('--context-bytes', '2048', '--note-turns', note_turns))
+                client = self.client(settings={'context_bytes': 2048, 'note_turns': int(note_turns)})
                 client.request('create', bot=f'Bob{note_turns}', workspace=str(self.path), tools=tools)
                 for n, prompt in enumerate(prompts):
                     turn = client.request('submit', bot=f'Bob{note_turns}', request_id=str(n), prompt=prompt)['result']['turn']
@@ -544,7 +544,7 @@ class DeliveryTests(ModelFixture):
     def test_steers_beyond_the_context_budget_stay_queued_and_run_as_their_own_turns(self):
         # 4 KiB of context keeps 3 KiB for the running turn; one 1.5 KiB steer fits at
         # its boundary, the other two would have pushed the turn past its budget.
-        client = self.client('echo,shell', extra=('--context-bytes', '4096'))
+        client = self.client('echo,shell', settings={'context_bytes': 4096})
         client.request('create', bot='Bob', workspace=str(self.path))
         first = client.request('submit', bot='Bob', request_id='1', prompt='shell:sleep .4')['result']['turn']
         client.receive(lambda m: m.get('event') == 'tool_started' and m.get('turn') == first)

@@ -17,7 +17,7 @@ pub use context::{ContextPrefix, ContextUsage, pinned_item, thinking_bytes, with
 pub use db::{
     Absorbed, Answered, Binding, Bot, CatchUp, CompactionPlan, CompactionView, CopiedCall,
     Database, Decision, Delivery, ElisionPlan, Fork, Gate, Gated, MAX_GATES, Planning, Publication,
-    Served, Started, Strip, TurnContext, TurnOptions, Waiting, Wake, Window, cache_hit,
+    Served, Settings, Started, Strip, TurnContext, TurnOptions, Waiting, Wake, Window, cache_hit,
     merge_gates,
 };
 
@@ -795,6 +795,7 @@ mod tests {
                             compaction_model: None,
                             fallbacks: false,
                             gate: None,
+                            settings: Default::default(),
                         },
                     )?;
                 }
@@ -909,6 +910,7 @@ mod tests {
                         compaction_model: None,
                         fallbacks: false,
                         gate: None,
+                        settings: Default::default(),
                     },
                 )?;
                 db.connection().execute("DELETE FROM events", [])?;
@@ -1063,6 +1065,7 @@ mod tests {
                         compaction_model: None,
                         fallbacks: false,
                         gate: None,
+                        settings: Default::default(),
                     },
                 )?;
                 let options = TurnOptions {

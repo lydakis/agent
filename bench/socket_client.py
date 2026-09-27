@@ -59,6 +59,8 @@ class Connection:
             params.setdefault('model', 'openai/synthetic-model')
             params.setdefault('instructions', 'Test agent.')
             params.setdefault('tools', getattr(self, 'tools', ['echo']))
+            if getattr(self, 'settings', None):
+                params.setdefault('settings', self.settings)
         self.next_id += 1
         self.socket.sendall((json.dumps(dict(id=self.next_id, op=op, **params)) + '\n').encode())
         return self.receive(lambda e: e.get('id') == self.next_id)
@@ -74,7 +76,7 @@ class Connection:
 
 
 class SocketClient:
-    def __init__(self, binary, path, url, tools, extra=()):
+    def __init__(self, binary, path, url, tools, extra=(), settings=None):
         # Keep AF_UNIX paths short even in deep remote snapshot directories.
         self.directory = tempfile.TemporaryDirectory(prefix='agent-bench-', dir='/tmp')
         self.socket_path = Path(self.directory.name) / 'daemon.sock'
@@ -92,6 +94,7 @@ class SocketClient:
                 time.sleep(.01)
             self.control = Connection(self.socket_path)
             self.control.tools = tools.split(',')
+            self.control.settings = settings
         except Exception:
             self.close(kill=True)
             raise
