@@ -311,6 +311,7 @@ enum Command {
         tag: Option<String>,
         #[serde(default)]
         after: i64,
+        through: Option<i64>,
         limit: Option<usize>,
     },
     /// Serve one gate tag: the calls waiting on it now, then each call
@@ -2151,11 +2152,18 @@ impl Service {
                 bot,
                 tag,
                 after,
+                through,
                 limit,
             } => {
                 store
                     .op("approvals", move |db| {
-                        db.approvals(bot.as_deref(), tag.as_deref(), after, limit.unwrap_or(64))
+                        db.approvals(
+                            bot.as_deref(),
+                            tag.as_deref(),
+                            after,
+                            through,
+                            limit.unwrap_or(64),
+                        )
                     })
                     .await
             }
@@ -2188,6 +2196,7 @@ impl Service {
                     .await;
                 match page {
                     Ok(mut page) => {
+                        self.hub.replaced(before);
                         page["tag"] = json!(tag);
                         page["lease"] = json!(lease);
                         page["lease_ms"] = json!(lease_ms);
@@ -4782,7 +4791,7 @@ mod tests {
             .call(move |db| {
                 Ok((
                     db.turn_status("Bob", turn)?,
-                    db.approvals(None, None, 0, 64)?,
+                    db.approvals(None, None, 0, None, 64)?,
                 ))
             })
             .await

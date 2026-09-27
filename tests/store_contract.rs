@@ -656,7 +656,7 @@ fn late_verdicts_are_refused_and_listings_find_each_calls_own_item() {
     let (second, s2) = shell_call("fc_2", "s2", "ls");
     db.append(turn, vec![first, second], &[s1.clone(), s2], None)
         .unwrap();
-    let listed = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
     let listed = listed["approvals"].as_array().unwrap();
     let [first, second] = &listed[..] else {
         panic!("{listed:?}")
@@ -935,7 +935,7 @@ fn a_failure_after_a_later_call_lapsed_keeps_its_request() {
     };
     db.tool_finish(turn, "r1", &failed).unwrap();
     // Announcing it again would restart its clock; its lapse ends the turn.
-    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
     assert_eq!(page["approvals"][0]["request"], 1);
     assert!(matches!(
         db.approval_start(turn, &round[1], epoch_now()).unwrap(),
@@ -1006,7 +1006,7 @@ fn a_tag_listing_reads_only_that_tags_calls() {
         &[("shell", "s1"), ("write", "w1"), ("shell", "s2")],
     );
     let listed = |db: &Database, tag| {
-        let page = db.approvals(None, Some(tag), 0, 64).unwrap();
+        let page = db.approvals(None, Some(tag), 0, None, 64).unwrap();
         page["approvals"]
             .as_array()
             .unwrap()
@@ -1106,10 +1106,10 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
     // Answers held for a running turn are stepped past unread, each counted
     // toward the page's reads: the page ends there, and the next one goes on.
     answer_all(&mut db, "a", &round[..1024]);
-    let first = db.approvals(None, Some("a"), 0, 64).unwrap();
+    let first = db.approvals(None, Some("a"), 0, None, 64).unwrap();
     assert_eq!(first["approvals"], json!([]));
     let after = first["next_after"].as_i64().unwrap();
-    let rest = db.approvals(None, Some("a"), after, 64).unwrap();
+    let rest = db.approvals(None, Some("a"), after, None, 64).unwrap();
     assert_eq!(rest["approvals"][0]["call_id"], "s1024");
     assert_eq!(rest["next_after"], Value::Null);
     // They leave the index when the turn parks.
@@ -1118,12 +1118,15 @@ fn a_tag_listing_reads_no_call_that_tag_answered() {
             .unwrap(),
         Some(None)
     );
-    let listed = db.approvals(None, Some("a"), 0, 64).unwrap();
+    let listed = db.approvals(None, Some("a"), 0, None, 64).unwrap();
     assert_eq!((count(&listed), &listed["next_after"]), (1, &Value::Null));
-    assert_eq!(count(&db.approvals(None, Some("b"), 0, 64).unwrap()), 64);
+    assert_eq!(
+        count(&db.approvals(None, Some("b"), 0, None, 64).unwrap()),
+        64
+    );
     // Answers stored for a parked turn leave it at once.
     answer_all(&mut db, "b", &round);
-    assert_eq!(db.approvals(None, Some("b"), 0, 64).unwrap(), empty);
+    assert_eq!(db.approvals(None, Some("b"), 0, None, 64).unwrap(), empty);
 }
 
 #[test]
@@ -1147,7 +1150,7 @@ fn a_long_field_hides_no_other_in_a_listing() {
         None,
     )
     .unwrap();
-    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
     let [listed] = &page["approvals"].as_array().unwrap()[..] else {
         panic!("{page}")
     };
@@ -1212,7 +1215,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     allow(&mut db, turn, "s1").unwrap();
     allow(&mut db, turn, "s2").unwrap();
     // A caller pages past the answered calls to s3.
-    let page = db.approvals(Some("Bob"), None, 0, 1).unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, None, 1).unwrap();
     assert_eq!(page["approvals"][0]["call_id"], "s3");
     let after = page["next_after"].as_i64().unwrap();
     // Then s1 fails, and s2 needs a verdict again.
@@ -1228,7 +1231,7 @@ fn a_call_announced_again_is_found_by_a_listing_already_past_it() {
     let mut seen = Vec::new();
     let mut after = json!(after);
     while let Some(from) = after.as_i64() {
-        let page = db.approvals(Some("Bob"), None, from, 1).unwrap();
+        let page = db.approvals(Some("Bob"), None, from, None, 1).unwrap();
         for call in page["approvals"].as_array().unwrap() {
             seen.push((call["call_id"].clone(), call["request"].clone()));
         }
@@ -1250,7 +1253,7 @@ fn a_call_larger_than_a_page_still_fills_one() {
     let turn = gated_turn(&mut db, None);
     let (item, call) = shell_call("fc_1", &"h".repeat(300 * 1024), "true");
     db.append(turn, vec![item], &[call], None).unwrap();
-    let page = db.approvals(Some("Bob"), None, 0, 64).unwrap();
+    let page = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
     assert_eq!(page["approvals"].as_array().unwrap().len(), 1);
     assert!(page["next_after"].is_null());
 }
@@ -1362,8 +1365,10 @@ fn the_announced_call_count_follows_the_rows() {
 fn served_since(db: &mut Database, watermark: &mut i64) -> Vec<Value> {
     let mut served = Vec::new();
     db.publish_since(watermark, |p| {
-        if let agent_runtime::store::Publication::Approval(message) = p {
-            served.push(message);
+        if let agent_runtime::store::Publication::Approval(round) = p {
+            for tag in &round.tags {
+                served.extend(round.messages(tag).unwrap());
+            }
         }
         true
     })
@@ -1410,7 +1415,7 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         json!({"manual":{"in_row":0,"in_turn":0}})
     );
     // Each call is as `approvals` lists it.
-    let listed = db.approvals(None, Some("manual"), 0, 64).unwrap();
+    let listed = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
     assert_eq!(listed["approvals"].as_array().unwrap(), calls);
     // A denial counts, and the rest of the round is announced again with
     // the count it made.
@@ -1508,6 +1513,46 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
         json!({"manual":{"in_row":0,"in_turn":0}}),
         "a denial in an earlier turn is none in this one"
     );
+}
+
+#[test]
+fn a_served_listing_pages_only_to_where_serving_began() {
+    let mut db = db();
+    let turn = gated_turn(&mut db, None);
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = ["s1", "s2"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| shell_call(&format!("fc_{i}"), id, "ls"))
+        .unzip();
+    db.append(turn, items, &round, None).unwrap();
+    let (_, page) = db.serve_approvals("manual", 1).unwrap();
+    let ids = |page: &Value| -> Vec<String> {
+        page["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["call_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids(&page), ["s1"]);
+    let (after, through) = (
+        page["next_after"].as_i64().unwrap(),
+        page["through"].as_i64(),
+    );
+    // A call planned once serving began is delivered to the holder, so the
+    // listing's later pages stop short of it.
+    let (item, call) = shell_call("fc_2", "s3", "ls");
+    db.append(turn, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    let rest = db
+        .approvals(None, Some("manual"), after, through, 64)
+        .unwrap();
+    assert_eq!(
+        (ids(&rest), &rest["next_after"]),
+        (vec!["s2".to_owned()], &Value::Null)
+    );
+    let unbounded = db.approvals(None, Some("manual"), after, None, 64).unwrap();
+    assert_eq!(ids(&unbounded), ["s2", "s3"]);
 }
 
 #[test]
@@ -4073,7 +4118,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
         order.push(match p {
             Publication::Event(e) => e["event"].as_str().unwrap().to_owned(),
             Publication::Through(through) => format!("through:{through}"),
-            Publication::Approval(a) => format!("approval:{}", a["cursor"]),
+            Publication::Approval(a) => format!("approval:{}", a.cursor),
             Publication::Finished { turn, .. } => format!("finished:{turn}"),
         });
         true
@@ -7771,7 +7816,7 @@ fn schema_33_adds_approvals_with_no_gates_on_existing_bots() {
         .turn;
     let (item, call) = shell_call("fc_1", "s1", "true");
     db.append(turn, vec![item], &[call], None).unwrap();
-    let listed = db.approvals(None, Some("manual"), 0, 64).unwrap();
+    let listed = db.approvals(None, Some("manual"), 0, None, 64).unwrap();
     assert_eq!(listed["approvals"][0]["call_id"], "s1");
     drop(db);
     let version: i32 = Connection::open(&path)

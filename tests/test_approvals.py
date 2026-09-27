@@ -434,6 +434,9 @@ class ServedApprovalTests(ModelFixture):
         served = approver.request('serve_approvals', tag='auto', lease_ms=5000)['result']
         lease = served['lease']
         self.assertEqual((served['tag'], served['lease_ms'], served['next_after']), ('auto', 5000, None))
+        # Later pages end where serving began.
+        self.assertEqual(daemon.request('approvals', tag='auto', through=served['through'])['result']['approvals'],
+                         served['approvals'])
         # The waiting call comes with the listing, whole, with the counts.
         [waiting] = served['approvals']
         self.assertEqual((waiting['turn'], waiting['call_id'], waiting['request']), (first, 'shell-1', 1))

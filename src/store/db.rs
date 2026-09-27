@@ -216,7 +216,7 @@ pub enum Publication {
     /// Calls announced for a verdict, as approvers serving a gate tag get
     /// them: `approval_requested` with each call's arguments previewed and
     /// its bot's denial counts. Only committed announcements are sent.
-    Approval(Value),
+    Approval(Served),
     Finished {
         bot: String,
         turn: i64,
@@ -774,7 +774,7 @@ pub struct Database {
     live_before: HashMap<i64, Option<Live>>,
     /// Announcements the group's jobs committed, for serving approvers,
     /// published after the group's events.
-    served: Vec<Value>,
+    served: Vec<Served>,
 }
 
 /// The share of input tokens the provider served from its prompt cache,
@@ -3702,7 +3702,7 @@ impl Database {
         // Every gated call of the round is announced in the commit that
         // plans it, one event for the round.
         let mut announced_calls = 0;
-        let mut served = Vec::new();
+        let mut served = None;
         if gated {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
@@ -3777,7 +3777,7 @@ impl Database {
                     data,
                 ));
             }
-            served = serving(&bot.name, turn, last, judged, None)?;
+            served = Some(Served::new(&bot.name, turn, last, judged, None));
         }
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
@@ -3924,7 +3924,7 @@ impl Database {
         };
         tx.commit()?;
         if let Some(served) = served {
-            self.served.extend(served);
+            self.served.push(served);
             if let Some(live) = self.live_changed(turn) {
                 live.verdicts.clear();
                 live.answered.clear();
@@ -4038,7 +4038,7 @@ impl Database {
             };
             tx.commit()?;
             if let Some(served) = served {
-                self.served.extend(served);
+                self.served.push(served);
                 if let Some(live) = self.live_changed(turn) {
                     live.verdicts.clear();
                     live.answered.clear();
@@ -4290,18 +4290,22 @@ impl Database {
     /// Planned calls still waiting on a gate, in announcement order, each
     /// naming only its unanswered gates. One page is at most `limit` calls,
     /// 256 KiB (or the one call, when it alone is larger), and 1,024
-    /// requests read, so no single job builds a large list.
+    /// requests read, so no single job builds a large list. `through` ends
+    /// the listing at a request id, as a served listing's later pages stop
+    /// where serving began.
     pub fn approvals(
         &self,
         bot: Option<&str>,
         tag: Option<&str>,
         after: i64,
+        through: Option<i64>,
         limit: usize,
     ) -> Result<Value> {
         const READ: usize = 1024;
         if !(1..=256).contains(&limit) || after < 0 {
             return fail("invalid_approval_page");
         }
+        let through = through.unwrap_or(i64::MAX);
         let mut page = ApprovalPage {
             listed: Vec::new(),
             bytes: 0,
@@ -4317,13 +4321,13 @@ impl Database {
             // toward the page's reads, so paging advances past held answers.
             (None, Some(tag)) => {
                 let mut ids = self.conn.prepare_cached(
-                    "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 ORDER BY approval",
+                    "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 AND approval<=?3 ORDER BY approval",
                 )?;
                 let mut call = self.conn.prepare_cached(
                     "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
                      FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot WHERE a.id=?",
                 )?;
-                let mut rows = ids.query(params![tag, after])?;
+                let mut rows = ids.query(params![tag, after, through])?;
                 while read < READ
                     && let Some(r) = rows.next()?
                 {
@@ -4353,15 +4357,15 @@ impl Database {
                     Some(_) => self.conn.prepare_cached(
                         "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
                          FROM bots b JOIN approvals a ON a.turn=b.running_turn
-                         WHERE a.id>?1 AND b.name=?2 ORDER BY a.id LIMIT ?3",
+                         WHERE a.id>?1 AND a.id<=?4 AND b.name=?2 ORDER BY a.id LIMIT ?3",
                     )?,
                     None => self.conn.prepare_cached(
                         "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
                          FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
-                         WHERE a.id>?1 ORDER BY a.id LIMIT ?3",
+                         WHERE a.id>?1 AND a.id<=?4 ORDER BY a.id LIMIT ?3",
                     )?,
                 };
-                let mut rows = statement.query(params![after, bot, READ as i64])?;
+                let mut rows = statement.query(params![after, bot, READ as i64, through])?;
                 while let Some(r) = rows.next()? {
                     read += 1;
                     let id: i64 = r.get(0)?;
@@ -4425,16 +4429,24 @@ impl Database {
     }
     /// Begin serving `tag`: the newest event id assigned so far, which the
     /// cursor of every later announcement passes, with the first page of
-    /// the calls waiting on the tag now. Read in one job, so a waiting call
-    /// is on this page or a later one, or is announced after the cursor.
+    /// the calls waiting on the tag now and `through`, the newest request
+    /// id, where its later pages end. Read in one job, so a waiting call is
+    /// on this page or a later one, or is announced after the cursor, and
+    /// not both.
     pub fn serve_approvals(&self, tag: &str, limit: usize) -> Result<(i64, Value)> {
-        let cursor: i64 = self
+        let mut newest = self
             .conn
-            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
-            .query_row([], |row| row.get(0))
-            .optional()?
-            .unwrap_or(0);
-        Ok((cursor, self.approvals(None, Some(tag), 0, limit)?))
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name=?")?;
+        let mut seq = |table: &str| -> Result<i64> {
+            Ok(newest
+                .query_row([table], |row| row.get(0))
+                .optional()?
+                .unwrap_or(0))
+        };
+        let (cursor, through) = (seq("events")?, seq("approvals")?);
+        let mut page = self.approvals(None, Some(tag), 0, Some(through), limit)?;
+        page["through"] = json!(through);
+        Ok((cursor, page))
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
     pub fn approval_requests(&self) -> i64 {
@@ -6134,7 +6146,7 @@ fn untag_answered(tx: &Connection, approval: i64, verdicts: &[Verdict]) -> Resul
 /// Answers computed for the old request are refused as superseded. Returns
 /// what serving approvers get once the commit lands, or `None` when no
 /// call was waiting.
-fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Option<Vec<Value>>> {
+fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Option<Served>> {
     let rows: Vec<(i64, String, String, i64, i64, String, String)> = tx
         .prepare_cached(
             "SELECT id,call_id,name,node,request,gates,arguments FROM approvals WHERE turn=? ORDER BY id",
@@ -6208,7 +6220,13 @@ fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Opt
             json!({"calls":calls,"failed":failed}),
         )?;
     }
-    serving(&bot.name, turn, last, judged, Some(failed)).map(Some)
+    Ok(Some(Served::new(
+        &bot.name,
+        turn,
+        last,
+        judged,
+        Some(failed),
+    )))
 }
 /// A call waiting on gates, as `approvals` lists it and serving approvers
 /// get it: `request`'s gates are the ones still open, and the bot's denial
@@ -6242,60 +6260,78 @@ fn pending_call(
     }
     entry
 }
-/// A round's announcement as serving approvers get it, after the commit
-/// that makes it: the announcing event's cursor, and each call whole, as
-/// `approvals` lists it. Each gate tag gets the calls waiting on it, in
-/// messages of up to 256 KiB of calls numbered `part` of `parts`, so its
-/// approver knows when it holds the whole round.
-fn serving(
-    bot: &str,
+/// A committed round of calls announced for a verdict. It is held once,
+/// however many gate tags its calls wait on; a tag's messages are built
+/// only for a session serving that tag.
+#[derive(Debug)]
+pub struct Served {
+    bot: String,
     turn: i64,
-    cursor: i64,
+    /// The announcing event's cursor.
+    pub cursor: i64,
+    failed: Option<String>,
     calls: Vec<Value>,
-    failed: Option<&str>,
-) -> Result<Vec<Value>> {
-    let mut tags: Vec<&str> = calls
-        .iter()
-        .flat_map(|call| call["gates"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
-        .collect();
-    tags.sort_unstable();
-    tags.dedup();
-    let tags: Vec<String> = tags.into_iter().map(str::to_owned).collect();
-    // One tag is the usual round: its calls move rather than copy.
-    let rounds: Vec<(String, Vec<Value>)> = match &tags[..] {
-        [tag] => vec![(tag.clone(), calls)],
-        _ => tags
-            .into_iter()
-            .map(|tag| {
-                let waiting = calls
-                    .iter()
-                    .filter(|call| {
-                        call["gates"]
-                            .as_array()
-                            .is_some_and(|gates| gates.iter().any(|g| *g == tag.as_str()))
-                    })
-                    .cloned()
-                    .collect();
-                (tag, waiting)
-            })
-            .collect(),
-    };
-    let mut served = Vec::new();
-    for (tag, calls) in rounds {
-        let parts = announcements(calls)?;
-        let count = parts.len();
-        for (index, calls) in parts.into_iter().enumerate() {
-            let mut data = json!({"calls":calls,"part":index + 1,"parts":count});
-            if let Some(failed) = failed {
-                data["failed"] = json!(failed);
-            }
-            let mut message = entry(cursor, bot, Some(turn), "approval_requested", data);
-            message["tag"] = json!(tag);
-            served.push(message);
+    /// The gate tags its calls wait on, sorted.
+    pub tags: Vec<String>,
+}
+impl Served {
+    /// A round's announcement as serving approvers get it, after the commit
+    /// that makes it: the announcing event's cursor, and each call whole,
+    /// as `approvals` lists it.
+    pub fn new(bot: &str, turn: i64, cursor: i64, calls: Vec<Value>, failed: Option<&str>) -> Self {
+        let mut tags: Vec<String> = calls
+            .iter()
+            .flat_map(|call| call["gates"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        Self {
+            bot: bot.to_owned(),
+            turn,
+            cursor,
+            failed: failed.map(str::to_owned),
+            calls,
+            tags,
         }
     }
-    Ok(served)
+    /// The calls waiting on `tag`, in messages of up to 256 KiB of calls
+    /// numbered `part` of `parts`, so its approver knows when it holds the
+    /// whole round.
+    pub fn messages(&self, tag: &str) -> Result<Vec<Value>> {
+        let waiting = self
+            .calls
+            .iter()
+            .filter(|call| {
+                call["gates"]
+                    .as_array()
+                    .is_some_and(|gates| gates.iter().any(|g| *g == tag))
+            })
+            .cloned()
+            .collect();
+        let parts = announcements(waiting)?;
+        let count = parts.len();
+        Ok(parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, calls)| {
+                let mut data = json!({"calls":calls,"part":index + 1,"parts":count});
+                if let Some(failed) = &self.failed {
+                    data["failed"] = json!(failed);
+                }
+                let mut message = entry(
+                    self.cursor,
+                    &self.bot,
+                    Some(self.turn),
+                    "approval_requested",
+                    data,
+                );
+                message["tag"] = json!(tag);
+                message
+            })
+            .collect())
+    }
 }
 /// A round's announced calls in events small enough to page: up to 256 KiB
 /// each, well under the half-event page bound, since one call is at most its
@@ -7148,8 +7184,17 @@ mod tests {
     #[test]
     fn a_round_is_served_per_tag_in_numbered_parts() {
         let call = |id: usize, gates: &[&str], bytes: usize| json!({"call_id":format!("c{id}"),"gates":gates,"arguments":{"command":"x".repeat(bytes)}});
-        // One tag: every call in one part, moved rather than copied.
-        let served = serving("Bob", 3, 9, vec![call(1, &["auto"], 8)], None).unwrap();
+        let messages = |calls, failed| {
+            let round = Served::new("Bob", 3, 9, calls, failed);
+            let messages: Vec<Value> = round
+                .tags
+                .iter()
+                .flat_map(|tag| round.messages(tag).unwrap())
+                .collect();
+            messages
+        };
+        // One tag: every call in one part.
+        let served = messages(vec![call(1, &["auto"], 8)], None);
         let [one] = &served[..] else {
             panic!("{served:?}")
         };
@@ -7168,7 +7213,7 @@ mod tests {
             call(2, &["manual"], 200 * 1024),
             call(3, &["auto"], 10),
         ];
-        let served = serving("Bob", 3, 9, calls, Some("c0")).unwrap();
+        let served = messages(calls, Some("c0"));
         let shape: Vec<(String, u64, u64, Vec<String>)> = served
             .iter()
             .map(|m| {

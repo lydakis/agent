@@ -1727,7 +1727,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `approval_superseded`. Not when one of them lapsed while the failing
   call ran: a new request would restart its clock, so the round keeps its
   requests and the lapse ends the turn at the next call.
-- **Listing.** `{"op":"approvals","bot"?,"tag"?,"after"?,"limit"?}` lists
+- **Listing.** `{"op":"approvals","bot"?,"tag"?,"after"?,"through"?,"limit"?}` lists
   calls still waiting on a gate in announcement order, each naming only its
   unanswered gates, with `expires_ms` and `arguments`: the call's top-level
   fields, each cut to 2,048 characters on its own, so a long `content`
@@ -1746,7 +1746,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   or empty with `next_after` set. A page holds at most `limit` (1 to 256, default 64) calls and
   256 KiB, or the one call when it alone is larger (bounded by the 64 KiB
   call id and the previews, well inside a 1 MiB line); `next_after` continues
-  it. Positions are never reused, and a call announced again takes a new
+  it, and `through` ends it at a position. Positions are never reused, and a call announced again takes a new
   one at the end, so a listing that pages on finds it. `stats` reports `approval_requests`, the calls
   announced and not yet started or denied: a count the storage worker
   keeps at each announcement, start, denial, and turn end, as it does
@@ -1764,8 +1764,9 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   counts on where the last one left off.
 - **Serving a tag.** `{"op":"serve_approvals","tag","lease_ms","limit"?}`
   hands the session the tag. The reply is the first page of the calls
-  waiting on it, as `approvals {tag}` lists them, with the `lease` number
-  and `lease_ms`; the session pages the rest with `approvals`. From then
+  waiting on it, as `approvals {tag}` lists them, with the `lease` number,
+  `lease_ms`, and `through`, the newest position when serving began; the
+  session pages the rest with `approvals {tag, after, through}`. From then
   on it receives, for each round announced for the tag, the
   `approval_requested` event's envelope with `tag`, `lease`, and
   `durable: false`, whose `data.calls` are only the calls waiting on the
@@ -1774,8 +1775,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   several such messages, numbered by `data.part` of `data.parts`, so the
   holder knows when it has the whole round. The listing and the start of delivery are read in
   one storage job, so a call waiting on the tag is on a page or arrives
-  after; a call on a later page may also arrive pushed, and the request
-  number tells the two apart. One session holds a tag: another gets
+  after, not both; a listed call announced again takes a new position past
+  `through` and arrives pushed. One session holds a tag: another gets
   `approvals_served` while the holder's session is open and its lease
   runs or its listing is still being read. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
@@ -1792,7 +1793,12 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   holder alone: bot followers get the compact event. Pushes to a holder
   wait in order for room in its output, so a group commit's burst does not
   drop a holder that is reading; one with 128 pushes waiting has stopped
-  reading and is closed, like a lagging follower.
+  reading and is closed, like a lagging follower. A session that serves
+  its tag again gets no more of its old lease's waiting pushes: they are
+  held while the new listing is read, then dropped, since the listing has
+  them, or sent if it fails. Each round is held once, however many tags
+  its calls wait on, and a tag's messages are built only when a session
+  serves it.
 - Interrupting a turn cancels its gated calls like any planned call.
   Anything that reaches the socket can answer, a bot's own shell included:
   this is oversight, not containment.
