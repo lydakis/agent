@@ -18,6 +18,10 @@ from bench.socket_client import Connection, SocketClient
 from bench.targets import clean_env
 from tests.test_runtime import Model, ModelFixture
 
+# The socket protocol version a daemon of this build announces in `ready`.
+PROTOCOL = int(re.search(r'pub const PROTOCOL: u64 = (\d+);',
+                         (Path(__file__).parent.parent/'client/src/lib.rs').read_text()).group(1))
+
 
 @unittest.skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'set AGENT_TEST_RUNTIME=1 after a Rust release build')
 class SocketAndCliTests(ModelFixture):
@@ -777,7 +781,7 @@ class CliTests(ModelFixture):
                                 with peer.makefile('rb') as reader:
                                     def send(*events):
                                         peer.sendall(b''.join((json.dumps(event)+'\n').encode() for event in events))
-                                    send(dict(event='ready', protocol=3))
+                                    send(dict(event='ready', protocol=PROTOCOL))
                                     request = json.loads(reader.readline())
                                     if request['op'] == 'resume':
                                         # Snapshot while active, then finish before subscription.
@@ -932,7 +936,7 @@ class CliTests(ModelFixture):
                                            env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
                     with listener.accept()[0] as peer:
-                        peer.sendall(b'{"event":"ready","protocol":2}\n')
+                        peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1))+'\n').encode())
                         _, stderr = process.communicate(timeout=5)
                     self.assertEqual(process.returncode, 1)
                     self.assertIn(b'daemon_protocol_mismatch', stderr)
