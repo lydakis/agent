@@ -1236,6 +1236,10 @@ pub async fn run(config: Configuration) -> Result<()> {
                                     };
                                     let admission = matches!(request.command, Command::Create { .. } | Command::Submit { .. });
                                     let serves = matches!(request.command, Command::ServeApprovals { .. });
+                                    let answered = match &request.command {
+                                        Command::Answer { tag: Some(tag), lease: Some(lease), .. } => Some((tag.clone(), *lease)),
+                                        _ => None,
+                                    };
                                     let result = service.dispatch(request.command, id, &output, request.id.clone(), bound).await;
                                     if result.as_ref().is_err_and(|e| e.code == "deferred") { continue; }
                                     // A refused admission still answers after those queued before it.
@@ -1245,16 +1249,17 @@ pub async fn run(config: Configuration) -> Result<()> {
                                     }
                                     let serving = result.as_ref().ok().filter(|_| serves).and_then(|page| {
                                         Some((page["tag"].as_str()?.to_owned(), page["lease"].as_u64()?))
-                                    });
+                                    }).or(answered);
                                     (request.id, result, shutdown, serving)
                                 }
                                 Err(error) => (Value::Null, Err(error), None, None),
                             };
                             let shutdown = shutdown.filter(|_| result.is_ok());
                             reply(&mut service, &mut sessions, stdio_owner, id, &output, request_id, result).await?;
-                            // A served tag's lease and pushes start behind its reply.
+                            // A served tag's lease and pushes start behind its reply,
+                            // and an answer's lease runs again behind its own.
                             if let Some((tag, lease)) = serving {
-                                service.hub.start(&tag, lease);
+                                service.hub.start(&tag, id, lease);
                             }
                             if let Some(grace_ms) = shutdown {
                                 // A later shutdown can only bring the deadline closer.
@@ -2153,13 +2158,14 @@ impl Service {
                 if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
                     return fail("invalid_by");
                 }
-                // A served answer renews its lease, and one under a lease
-                // that ended changes nothing: the tag's new holder decides.
+                // A served answer holds its lease until its reply is queued,
+                // and one under a lease that ended changes nothing: the
+                // tag's new holder decides.
                 if let Some(lease) = lease {
                     let Some(tag) = &tag else {
                         return fail_with("invalid_lease", "a lease answers for its tag");
                     };
-                    self.hub.renew(tag, session, lease)?;
+                    self.hub.hold(tag, session, lease)?;
                 }
                 let name = bot.clone();
                 let answered = store
@@ -2220,8 +2226,7 @@ impl Service {
                 if !(1..=256).contains(&limit) {
                     return fail("invalid_approval_page");
                 }
-                let (lease, serving, before) =
-                    self.hub.serve(&tag, session, output.clone(), lease_ms)?;
+                let (lease, serving) = self.hub.serve(&tag, session, output.clone(), lease_ms)?;
                 // The listing and the start of delivery share one job, so
                 // every waiting call is on a page or announced after it.
                 let listed = tag.clone();
@@ -2234,14 +2239,13 @@ impl Service {
                     .await;
                 match page {
                     Ok(mut page) => {
-                        self.hub.replaced(before);
                         page["tag"] = json!(tag);
                         page["lease"] = json!(lease);
                         page["lease_ms"] = json!(lease_ms);
                         Ok(page)
                     }
                     Err(error) => {
-                        self.hub.unserve(&tag, lease, before);
+                        self.hub.unserve(&tag, lease);
                         Err(error)
                     }
                 }

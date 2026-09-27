@@ -1693,7 +1693,8 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   records one gate's verdict on the call's current request; `tag` may be
   left out when the call has one gate, and `reason` goes only with a deny
   (`invalid_reason` otherwise). `lease` is for a session serving `tag`
-  (below): the answer renews the lease, and one under a lease that ended
+  (below): the answer holds the lease while it is stored and starts its
+  period again when the reply is queued, and one under a lease that ended
   gets `approvals_lost` and changes nothing; a lease without a `tag` is
   `invalid_lease`. An answer without one is an override, whoever serves
   the tag. The reply lists the gates still
@@ -1792,9 +1793,10 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   `approvals_served` while the holder's session is open and its lease
   runs or its serve reply is not out yet. The holder keeps it with `{"op":"renew_approvals","tag","lease"}`
   or an answer under the lease, each at least every `lease_ms` (100 to
-  600,000), counted from when its serve reply is queued; pushes follow
-  the reply, so neither the rest of a storage group nor a burst of pushes
-  uses up the lease or the reply's room. A holder whose lease ran out keeps
+  600,000), counted from when its serve reply, or its last answer's
+  reply, is queued; pushes follow the serve reply, so neither the rest of
+  a storage group, a slow store, nor a burst of pushes uses up the lease
+  or the reply's room. A holder whose lease ran out keeps
   the tag until any session next serves a tag, which ends the lease (and
   another may take the tag over under a new one), or until it renews or
   answers, which is refused; either way it is sent
@@ -1812,7 +1814,7 @@ keeping the shorter expiry. A bot carries at most 8 gates: a `create` or
   output included, and sends only `approvals_lost`. A session that serves
   its tag again gets no more of its old lease's waiting pushes: they are
   held while the new listing is read, then dropped, since the listing has
-  them, or sent if it fails. Each round is held once, however many tags
+  them, or sent if it fails, with any call announced meanwhile. Each round is held once, however many tags
   its calls wait on, and a tag's messages are built only when a session
   serves it.
 - Interrupting a turn cancels its gated calls like any planned call.

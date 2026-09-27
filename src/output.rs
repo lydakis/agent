@@ -155,6 +155,14 @@ impl Output {
     /// `send` for an event the caller keeps: cancelled while it waits for
     /// room, it has queued nothing, and the event can be sent again.
     pub async fn send_ref(&self, event: &Value) -> Result<()> {
+        self.reserve(event).await?.send();
+        Ok(())
+    }
+
+    /// Wait for room for `event`, without queueing it: the caller decides
+    /// whether it still goes out once there is room. Cancelled while it
+    /// waits, it holds nothing.
+    pub async fn reserve(&self, event: &Value) -> Result<Room> {
         let bytes = Self::encode(event)?;
         let permit = self
             .budget
@@ -162,10 +170,17 @@ impl Output {
             .acquire_many_owned(bytes.len() as u32)
             .await
             .map_err(|_| Error::new("output_closed"))?;
-        self.sender
-            .send((bytes, permit, None))
+        let slot = self
+            .sender
+            .clone()
+            .reserve_owned()
             .await
-            .map_err(|_| Error::new("output_closed"))
+            .map_err(|_| Error::new("output_closed"))?;
+        Ok(Room {
+            bytes,
+            permit,
+            slot,
+        })
     }
 
     /// Bytes and packets `try_send` would accept right now.
@@ -187,6 +202,19 @@ impl Output {
                 mpsc::error::TrySendError::Full(_) => Error::new("output_lagged"),
                 mpsc::error::TrySendError::Closed(_) => Error::new("output_closed"),
             })
+    }
+}
+
+/// Room for one event in an output, held: sending it cannot wait.
+pub struct Room {
+    bytes: Vec<u8>,
+    permit: OwnedSemaphorePermit,
+    slot: mpsc::OwnedPermit<Packet>,
+}
+
+impl Room {
+    pub fn send(self) {
+        self.slot.send((self.bytes, self.permit, None));
     }
 }
 
