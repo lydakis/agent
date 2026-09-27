@@ -1357,6 +1357,183 @@ fn the_announced_call_count_follows_the_rows() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// What a serving approver would get: each approval publication since the
+/// watermark.
+fn served_since(db: &mut Database, watermark: &mut i64) -> Vec<Value> {
+    let mut served = Vec::new();
+    db.publish_since(watermark, |p| {
+        if let agent_runtime::store::Publication::Approval(message) = p {
+            served.push(message);
+        }
+        true
+    })
+    .unwrap();
+    served
+}
+
+#[test]
+fn served_announcements_carry_each_call_and_the_denials_so_far() {
+    let mut db = db();
+    let mut watermark = 0;
+    let turn = gated_turn(&mut db, None);
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = [("s1", "rm -rf build"), ("s2", "ls")]
+        .iter()
+        .enumerate()
+        .map(|(i, (id, command))| shell_call(&format!("fc_{i}"), id, command))
+        .unzip();
+    // The plan commit publishes its announcement to serving approvers
+    // after its events, under the announcing event's cursor.
+    let entries = db.append(turn, items, &round, None).unwrap();
+    let announced = entries
+        .iter()
+        .find(|e| e["event"] == "approval_requested")
+        .unwrap();
+    let served = served_since(&mut db, &mut watermark);
+    let [message] = &served[..] else {
+        panic!("{served:?}")
+    };
+    assert_eq!(message["cursor"], announced["cursor"]);
+    assert_eq!(
+        (&message["bot"], &message["turn"]),
+        (&json!("Bob"), &json!(turn))
+    );
+    let calls = message["data"]["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["arguments"], json!({"command":"rm -rf build"}));
+    assert_eq!(calls[0]["gates"], json!(["manual"]));
+    assert_eq!(
+        calls[0]["denials"],
+        json!({"manual":{"in_row":0,"in_turn":0}})
+    );
+    // Each call is as `approvals` lists it.
+    let listed = db.approvals(None, Some("manual"), 0, 64).unwrap();
+    assert_eq!(listed["approvals"].as_array().unwrap(), calls);
+    // A denial counts, and the rest of the round is announced again with
+    // the count it made.
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s1",
+        request: 1,
+        tag: None,
+        allow: false,
+        reason: Some("not that"),
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &round[0], 0).unwrap(),
+        Gated::Denied
+    ));
+    let served = served_since(&mut db, &mut watermark);
+    let [again] = &served[..] else {
+        panic!("{served:?}")
+    };
+    assert_eq!(again["data"]["failed"], "s1");
+    let calls = again["data"]["calls"].as_array().unwrap();
+    assert_eq!(
+        (&calls[0]["call_id"], &calls[0]["request"]),
+        (&json!("s2"), &json!(2))
+    );
+    assert_eq!(
+        calls[0]["denials"],
+        json!({"manual":{"in_row":1,"in_turn":1}})
+    );
+    // A call every gate allowed ends the run of denials; the turn's count
+    // stays, and a later turn starts from none.
+    db.answer(Decision {
+        bot: "Bob",
+        turn,
+        call_id: "s2",
+        request: 2,
+        tag: None,
+        allow: true,
+        reason: None,
+        by: Some("test"),
+    })
+    .unwrap();
+    assert!(matches!(
+        db.approval_start(turn, &round[1], 0).unwrap(),
+        Gated::Started
+    ));
+    let denials = db.inspect("Bob").unwrap().denials;
+    assert_eq!(
+        (
+            denials["manual"].in_row,
+            denials["manual"].in_turn,
+            denials["manual"].turn
+        ),
+        (0, 1, turn)
+    );
+    assert!(served_since(&mut db, &mut watermark).is_empty());
+    // A group that does not commit publishes no announcement.
+    db.finish(turn, None).unwrap();
+    let next = db
+        .begin(
+            "Bob",
+            "again",
+            "more",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    served_since(&mut db, &mut watermark);
+    db.begin_group().unwrap();
+    let (item, call) = shell_call("fc_9", "s9", "ls");
+    db.append(next, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    db.abandon_group().unwrap();
+    assert!(served_since(&mut db, &mut watermark).is_empty());
+    // Serving starts after the newest event: the listing holds what came
+    // before it, and delivery what comes after.
+    db.append(
+        next,
+        vec![shell_call("fc_8", "s8", "ls").0],
+        &[shell_call("fc_8", "s8", "ls").1],
+        None,
+    )
+    .unwrap();
+    let (cursor, page) = db.serve_approvals("manual", 64).unwrap();
+    assert_eq!(cursor, db.last_event_id().unwrap());
+    let listed = page["approvals"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0]["denials"],
+        json!({"manual":{"in_row":0,"in_turn":0}}),
+        "a denial in an earlier turn is none in this one"
+    );
+}
+
+#[test]
+fn schema_35_starts_every_bot_with_no_denials() {
+    let path = std::env::temp_dir().join(format!("agent-denials-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        gated_turn(&mut db, None);
+    }
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE bots DROP COLUMN denials; PRAGMA user_version=34;")
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert!(db.inspect("Bob").unwrap().denials.is_empty());
+    let resumed = serde_json::to_value(db.inspect("Bob").unwrap()).unwrap();
+    assert!(
+        resumed.get("denials").is_none(),
+        "none counted, none reported"
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 fn a_group_waits_for_a_write_lock_another_connection_holds() {
     let path = std::env::temp_dir().join(format!("agent-group-lock-{}.sqlite", std::process::id()));
@@ -3810,6 +3987,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
         .map(|p| match p {
             Publication::Event(e) => e["event"].as_str().unwrap(),
             Publication::Through(_) => "through",
+            Publication::Approval(_) => "approval",
             Publication::Finished { .. } => "finished",
         })
         .collect();
@@ -3870,6 +4048,7 @@ fn the_worker_publishes_only_what_committed_in_commit_order() {
         order.push(match p {
             Publication::Event(e) => e["event"].as_str().unwrap().to_owned(),
             Publication::Through(through) => format!("through:{through}"),
+            Publication::Approval(a) => format!("approval:{}", a["cursor"]),
             Publication::Finished { turn, .. } => format!("finished:{turn}"),
         });
         true
@@ -7538,7 +7717,7 @@ fn schema_34_records_whether_a_call_or_a_summary_changed_the_view_last() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 34);
+    assert_eq!(version, Database::SCHEMA);
     std::fs::remove_file(path).unwrap();
 }
 

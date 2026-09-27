@@ -301,6 +301,9 @@ enum Command {
         reason: Option<String>,
         /// A label for audit, the client's choice; not verified.
         by: Option<String>,
+        /// The lease of the session serving `tag`: an answer under a lease
+        /// that ended is refused. Without one, the answer is an override.
+        lease: Option<u64>,
     },
     /// Planned calls waiting on a gate, in announcement order.
     Approvals {
@@ -309,6 +312,18 @@ enum Command {
         #[serde(default)]
         after: i64,
         limit: Option<usize>,
+    },
+    /// Serve one gate tag: the calls waiting on it now, then each call
+    /// announced for it after, for as long as the session renews its lease.
+    ServeApprovals {
+        tag: String,
+        lease_ms: u64,
+        limit: Option<usize>,
+    },
+    /// Keep a served tag for another lease period.
+    RenewApprovals {
+        tag: String,
+        lease: u64,
     },
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
@@ -835,6 +850,7 @@ pub(crate) async fn publish(
                 let _ = hub.durable(&bot, entry).await;
             }
             Publication::Through(cursor) => hub.published_to(cursor),
+            Publication::Approval(message) => hub.approval(&message),
             Publication::Finished { bot, turn, outcome } => {
                 handles.turn_finished(&bot, turn, outcome);
             }
@@ -955,7 +971,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -2050,6 +2066,7 @@ impl Service {
                     "waiting_turns": waiting,
                     "paced_turns": paced,
                     "approval_requests": approvals,
+                    "approvers": self.hub.served(),
                     "queued_turns": queued,
                     "pending_bytes": pending_bytes,
                     "pending_limit": self.limits.pending,
@@ -2074,6 +2091,7 @@ impl Service {
                 decision,
                 reason,
                 by,
+                lease,
             } => {
                 let allow = match decision.as_str() {
                     "allow" => true,
@@ -2095,6 +2113,14 @@ impl Service {
                 }
                 if by.as_ref().is_some_and(|b| b.is_empty() || b.len() > 128) {
                     return fail("invalid_by");
+                }
+                // A served answer renews its lease, and one under a lease
+                // that ended changes nothing: the tag's new holder decides.
+                if let Some(lease) = lease {
+                    let Some(tag) = &tag else {
+                        return fail_with("invalid_lease", "a lease answers for its tag");
+                    };
+                    self.hub.renew(tag, session, lease)?;
                 }
                 let name = bot.clone();
                 let answered = store
@@ -2132,6 +2158,43 @@ impl Service {
                         db.approvals(bot.as_deref(), tag.as_deref(), after, limit.unwrap_or(64))
                     })
                     .await
+            }
+            Command::ServeApprovals {
+                tag,
+                lease_ms,
+                limit,
+            } => {
+                name(&tag).map_err(|_| Error::new("invalid_approver"))?;
+                if !(100..=600_000).contains(&lease_ms) {
+                    return fail_with("invalid_lease", "lease_ms from 100 to 600000");
+                }
+                let (lease, serving) = self.hub.serve(&tag, session, output.clone(), lease_ms)?;
+                // The listing and the start of delivery share one job, so
+                // every waiting call is on a page or announced after it.
+                let listed = tag.clone();
+                let page = store
+                    .op("serve_approvals", move |db| {
+                        let (cursor, page) = db.serve_approvals(&listed, limit.unwrap_or(64))?;
+                        serving.lock().unwrap().go_live(cursor);
+                        Ok(page)
+                    })
+                    .await;
+                match page {
+                    Ok(mut page) => {
+                        page["tag"] = json!(tag);
+                        page["lease"] = json!(lease);
+                        page["lease_ms"] = json!(lease_ms);
+                        Ok(page)
+                    }
+                    Err(error) => {
+                        self.hub.unserve(&tag, lease);
+                        Err(error)
+                    }
+                }
+            }
+            Command::RenewApprovals { tag, lease } => {
+                let lease_ms = self.hub.renew(&tag, session, lease)?;
+                Ok(json!({"tag":tag,"lease":lease,"lease_ms":lease_ms}))
             }
             Command::Wait {
                 handles,

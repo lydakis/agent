@@ -10,7 +10,11 @@ use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tokio::sync::Notify;
 
 // Sharing tiny prompts adds an index entry without avoiding an overflow page.
@@ -85,6 +89,26 @@ pub struct Bot {
     /// Tools whose calls wait for a verdict, per approver tag. Fixed at
     /// creation: a bot keeps every gate it descends from.
     pub gates: Vec<Gate>,
+    /// The denials each gate tag has given this bot's calls, kept by the
+    /// daemon so an approver that restarts or takes over counts on.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub denials: BTreeMap<String, Denials>,
+}
+/// A bot's denials under one gate tag: how many in a row, reset when a call
+/// every gate allowed starts, and how many in the turn that gave the last.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Denials {
+    pub in_row: u32,
+    pub in_turn: u32,
+    pub turn: i64,
+}
+impl Denials {
+    /// The counts as a client sees them from `turn`: a denial in another
+    /// turn is none in this one.
+    fn seen(&self, turn: i64) -> Value {
+        let in_turn = if self.turn == turn { self.in_turn } else { 0 };
+        json!({"in_row":self.in_row,"in_turn":in_turn})
+    }
 }
 impl Bot {
     /// Whether a call of this tool waits for a verdict.
@@ -189,6 +213,10 @@ pub enum Publication {
     /// could be: a job that deletes events can share a group with the job
     /// that wrote them.
     Through(i64),
+    /// Calls announced for a verdict, as approvers serving a gate tag get
+    /// them: `approval_requested` with each call's arguments previewed and
+    /// its bot's denial counts. Only committed announcements are sent.
+    Approval(Value),
     Finished {
         bot: String,
         turn: i64,
@@ -744,6 +772,9 @@ pub struct Database {
     /// Each turn's `live` entry as it was before the current group changed
     /// it, so a group that fails to commit puts held verdicts back.
     live_before: HashMap<i64, Option<Live>>,
+    /// Announcements the group's jobs committed, for serving approvers,
+    /// published after the group's events.
+    served: Vec<Value>,
 }
 
 /// The share of input tokens the provider served from its prompt cache,
@@ -783,7 +814,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 34;
+    pub const SCHEMA: i32 = 35;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -813,6 +844,7 @@ impl Database {
             pending_stale: false,
             live: HashMap::new(),
             live_before: HashMap::new(),
+            served: Vec::new(),
         })
     }
 
@@ -906,7 +938,7 @@ impl Database {
                 elision INTEGER REFERENCES elisions(node),
                 thinking_from INTEGER NOT NULL DEFAULT 0,
                 thinking_to INTEGER NOT NULL DEFAULT 0,
-                thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT);
+                thinking_elided INTEGER NOT NULL DEFAULT 0, gates TEXT, denials TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS bots_id ON bots(id);
             CREATE INDEX IF NOT EXISTS bots_note ON bots(note);
             CREATE INDEX IF NOT EXISTS bots_compaction ON bots(compaction);
@@ -992,6 +1024,7 @@ impl Database {
             pending_stale: false,
             live: HashMap::new(),
             live_before: HashMap::new(),
+            served: Vec::new(),
         };
         // A deletion interrupted between pieces finishes now: the bot was
         // already refusing work, and nothing else may see it half gone.
@@ -1071,6 +1104,7 @@ impl Database {
     /// methods it calls release their own savepoints into this one.
     pub fn atomic<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("SAVEPOINT atomic")?;
+        let served = self.served.len();
         let done = work(self);
         if done.is_ok() {
             self.conn.execute_batch("RELEASE atomic")?;
@@ -1078,6 +1112,7 @@ impl Database {
             // Unless SQLite already rolled back the whole transaction.
             self.conn
                 .execute_batch("ROLLBACK TO atomic; RELEASE atomic")?;
+            self.served.truncate(served);
             self.recount_pending()?;
         }
         done
@@ -1101,6 +1136,7 @@ impl Database {
     /// turns they counted.
     pub fn abandon_group(&mut self) -> Result<()> {
         self.outcomes.clear();
+        self.served.clear();
         self.pending_stale = true;
         for (turn, before) in self.live_before.drain() {
             match before {
@@ -1125,9 +1161,10 @@ impl Database {
         self.outcomes.push((bot.to_owned(), turn, outcome));
     }
     /// Hand everything the last job committed to the publisher, in commit
-    /// order: events past the watermark, then announced outcomes. Only
-    /// committed rows are read, so a job that failed mid-transaction
-    /// publishes nothing. Stops early when the sink is gone.
+    /// order: events past the watermark, then announcements for serving
+    /// approvers, then announced outcomes. Only committed rows are read, so
+    /// a job that failed mid-transaction publishes nothing. Stops early
+    /// when the sink is gone.
     pub fn publish_since(
         &mut self,
         watermark: &mut i64,
@@ -1153,6 +1190,7 @@ impl Database {
                 delivered += 1;
                 if !sink(Publication::Event(event)) {
                     self.outcomes.clear();
+                    self.served.clear();
                     return Ok(());
                 }
             }
@@ -1169,6 +1207,13 @@ impl Database {
         if assigned > *watermark {
             *watermark = assigned;
             if !sink(Publication::Through(assigned)) {
+                self.outcomes.clear();
+                self.served.clear();
+                return Ok(());
+            }
+        }
+        for served in std::mem::take(&mut self.served) {
+            if !sink(Publication::Approval(served)) {
                 self.outcomes.clear();
                 return Ok(());
             }
@@ -1237,9 +1282,19 @@ impl Database {
                     )
                 })?,
             },
+            denials: match r.get::<_, Option<String>>(31)? {
+                None => BTreeMap::new(),
+                Some(text) => serde_json::from_str(&text).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        31,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -3618,9 +3673,11 @@ impl Database {
         // Every gated call of the round is announced in the commit that
         // plans it, one event for the round.
         let mut announced_calls = 0;
+        let mut served = Vec::new();
         if gated {
             let announced_ms = epoch_ms();
             let mut announced = Vec::new();
+            let mut judged = Vec::new();
             for call in calls {
                 let gates: Vec<CallGate> = bot
                     .gates
@@ -3654,11 +3711,29 @@ impl Database {
                 tag_approval(&tx, tx.last_insert_rowid(), turn, &gates)?;
                 announced.push(json!({"call_id":call.call_id,"request":1,
                     "announced_ms":announced_ms,"gates":tags,"name":call.name,"node":node}));
+                let request = Request {
+                    id: 0,
+                    request: 1,
+                    announced_ms,
+                    gates,
+                    verdicts: Vec::new(),
+                };
+                judged.push(pending_call(
+                    &bot.name,
+                    turn,
+                    &call.call_id,
+                    &request,
+                    &call.name,
+                    node,
+                    arguments,
+                    &bot.denials,
+                ));
             }
             announced_calls = announced.len() as i64;
+            let mut last = 0;
             for calls in announcements(announced)? {
                 let data = json!({"calls":calls});
-                let cursor = event(
+                last = event(
                     &tx,
                     &bot.name,
                     Some(turn),
@@ -3666,13 +3741,14 @@ impl Database {
                     data.clone(),
                 )?;
                 entries.push(entry(
-                    cursor,
+                    last,
                     &bot.name,
                     Some(turn),
                     "approval_requested",
                     data,
                 ));
             }
+            served = serving(&bot.name, turn, last, judged, None)?;
         }
         tx.execute(
             "UPDATE bots SET head=? WHERE name=?",
@@ -3686,6 +3762,7 @@ impl Database {
         )?;
         tx.commit()?;
         self.approvals += announced_calls;
+        self.served.extend(served);
         Ok(entries)
     }
     /// Charge an unsuccessful provider call without accepting its output.
@@ -3812,11 +3889,17 @@ impl Database {
         let data = json!({"call_id":call_id,"node":head,"artifacts":artifacts,
             "note":outcome.note.as_ref().map(|_| head)});
         let cursor = event(&tx, &bot.name, Some(turn), "tool_completed", data.clone())?;
-        let reannounced = reannounce_rest && reannounce(&tx, &bot.name, turn, call_id)?;
+        let served = match reannounce_rest {
+            true => reannounce(&tx, &bot, turn, call_id)?,
+            false => None,
+        };
         tx.commit()?;
-        if reannounced && let Some(live) = self.live_changed(turn) {
-            live.verdicts.clear();
-            live.answered.clear();
+        if let Some(served) = served {
+            self.served.extend(served);
+            if let Some(live) = self.live_changed(turn) {
+                live.verdicts.clear();
+                live.answered.clear();
+            }
         }
         Ok((
             item.into(),
@@ -3893,7 +3976,7 @@ impl Database {
     /// say what it still waits for. Allows ride the call's `tool_start`
     /// commit and a denial is its result, so a verdict adds no commit.
     pub fn approval_start(&mut self, turn: i64, call: &ToolCall, now_ms: u64) -> Result<Gated> {
-        let bot = self.active(turn)?;
+        let mut bot = self.active(turn)?;
         let request = self
             .request(turn, &call.call_id)?
             .ok_or(Error::new("invalid_tool_state"))?;
@@ -3907,6 +3990,7 @@ impl Database {
             // As after a failure, a lapse already due keeps its request.
             let reannounce_rest = !(expiring(&bot) && self.lapsed(turn, now_ms)?);
             let tx = self.conn.savepoint()?;
+            count_denials(&tx, &mut bot, turn, &[denial.tag.as_str()], true)?;
             deny(
                 &tx,
                 &bot,
@@ -3919,11 +4003,17 @@ impl Database {
             )?;
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
-            let reannounced = reannounce_rest && reannounce(&tx, &bot.name, turn, &call.call_id)?;
+            let served = match reannounce_rest {
+                true => reannounce(&tx, &bot, turn, &call.call_id)?,
+                false => None,
+            };
             tx.commit()?;
-            if reannounced && let Some(live) = self.live_changed(turn) {
-                live.verdicts.clear();
-                live.answered.clear();
+            if let Some(served) = served {
+                self.served.extend(served);
+                if let Some(live) = self.live_changed(turn) {
+                    live.verdicts.clear();
+                    live.answered.clear();
+                }
             }
             Gated::Denied
         } else if request.unanswered().next().is_none() {
@@ -3941,6 +4031,8 @@ impl Database {
             }
             tx.prepare_cached("DELETE FROM approvals WHERE id=?")?
                 .execute([request.id])?;
+            let tags: Vec<&str> = request.gates.iter().map(|g| g.tag.as_str()).collect();
+            count_denials(&tx, &mut bot, turn, &tags, false)?;
             let mut data = started(call);
             data["approvals"] = request.approvals();
             event(&tx, &bot.name, Some(turn), "tool_started", data)?;
@@ -4199,8 +4291,8 @@ impl Database {
                     "SELECT approval,turn FROM approval_tags WHERE tag=?1 AND approval>?2 ORDER BY approval",
                 )?;
                 let mut call = self.conn.prepare_cached(
-                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
-                     FROM approvals a JOIN turns t ON t.id=a.turn WHERE a.id=?",
+                    "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
+                     FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot WHERE a.id=?",
                 )?;
                 let mut rows = ids.query(params![tag, after])?;
                 while read < READ
@@ -4230,13 +4322,13 @@ impl Database {
             _ => {
                 let mut statement = match bot {
                     Some(_) => self.conn.prepare_cached(
-                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
+                        "SELECT a.id,b.name,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
                          FROM bots b JOIN approvals a ON a.turn=b.running_turn
                          WHERE a.id>?1 AND b.name=?2 ORDER BY a.id LIMIT ?3",
                     )?,
                     None => self.conn.prepare_cached(
-                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments
-                         FROM approvals a JOIN turns t ON t.id=a.turn
+                        "SELECT a.id,t.bot,a.turn,a.call_id,a.name,a.node,a.request,a.announced_ms,a.gates,a.verdicts,a.arguments,b.denials
+                         FROM approvals a JOIN turns t ON t.id=a.turn JOIN bots b ON b.name=t.bot
                          WHERE a.id>?1 ORDER BY a.id LIMIT ?3",
                     )?,
                 };
@@ -4276,26 +4368,44 @@ impl Database {
         {
             request.verdicts.extend(held.iter().cloned());
         }
-        let open: Vec<&str> = if request.denial().is_some() {
-            Vec::new()
-        } else {
-            request.unanswered().map(|g| g.tag.as_str()).collect()
-        };
-        if open.is_empty() || tag.is_some_and(|tag| !open.contains(&tag)) {
+        if request.denial().is_some()
+            || request
+                .unanswered()
+                .all(|g| tag.is_some_and(|tag| g.tag != tag))
+        {
             return Ok(None);
         }
-        let mut entry = json!({"bot":r.get::<_, String>(1)?,"turn":turn,"call_id":call_id,
-            "request":request.request,"announced_ms":request.announced_ms,
-            "expires_ms":request.expires_ms(),"gates":open,"name":r.get::<_, String>(4)?,
-            "node":r.get::<_, i64>(5)?});
-        // The previews stored when the call was planned.
-        if let (Value::Object(entry), Value::Object(arguments)) = (
-            &mut entry,
-            serde_json::from_str::<Value>(&r.get::<_, String>(10)?)?,
-        ) {
-            entry.extend(arguments);
-        }
-        Ok(Some(entry))
+        let denials: BTreeMap<String, Denials> = r
+            .get::<_, Option<String>>(11)?
+            .map(|d| serde_json::from_str(&d))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(pending_call(
+            &r.get::<_, String>(1)?,
+            turn,
+            &call_id,
+            &Request {
+                gates: request.unanswered().cloned().collect(),
+                ..request
+            },
+            &r.get::<_, String>(4)?,
+            r.get(5)?,
+            serde_json::from_str(&r.get::<_, String>(10)?)?,
+            &denials,
+        )))
+    }
+    /// Begin serving `tag`: the newest event id assigned so far, which the
+    /// cursor of every later announcement passes, with the first page of
+    /// the calls waiting on the tag now. Read in one job, so a waiting call
+    /// is on this page or a later one, or is announced after the cursor.
+    pub fn serve_approvals(&self, tag: &str, limit: usize) -> Result<(i64, Value)> {
+        let cursor: i64 = self
+            .conn
+            .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='events'")?
+            .query_row([], |row| row.get(0))
+            .optional()?
+            .unwrap_or(0);
+        Ok((cursor, self.approvals(None, Some(tag), 0, limit)?))
     }
     /// Planned calls announced and not yet started or denied, for `stats`.
     pub fn approval_requests(&self) -> i64 {
@@ -5925,6 +6035,41 @@ fn deny(
     event(tx, &bot.name, Some(turn), "tool_completed", data)?;
     Ok(())
 }
+/// Count a denial under each of `tags`, or end their runs of denials when
+/// a call they allowed starts. The bot's row is written only when a count
+/// changes, so a bot that is never denied writes nothing.
+fn count_denials(
+    tx: &Connection,
+    bot: &mut Bot,
+    turn: i64,
+    tags: &[&str],
+    denied: bool,
+) -> Result<()> {
+    let mut changed = false;
+    for tag in tags {
+        if denied {
+            let counts = bot.denials.entry((*tag).to_owned()).or_default();
+            counts.in_turn = if counts.turn == turn {
+                counts.in_turn.saturating_add(1)
+            } else {
+                1
+            };
+            counts.in_row = counts.in_row.saturating_add(1);
+            counts.turn = turn;
+            changed = true;
+        } else if let Some(counts) = bot.denials.get_mut(*tag)
+            && counts.in_row > 0
+        {
+            counts.in_row = 0;
+            changed = true;
+        }
+    }
+    if changed {
+        tx.prepare_cached("UPDATE bots SET denials=? WHERE name=?")?
+            .execute(params![serde_json::to_string(&bot.denials)?, bot.name])?;
+    }
+    Ok(())
+}
 /// Whether any of the bot's gates can lapse.
 fn expiring(bot: &Bot) -> bool {
     bot.gates.iter().any(|gate| gate.expire_ms.is_some())
@@ -5957,8 +6102,10 @@ fn untag_answered(tx: &Connection, approval: i64, verdicts: &[Verdict]) -> Resul
 }
 /// Announce again every gated call of the turn still waiting to run, with
 /// a new request number and no verdicts, naming the call that failed.
-/// Answers computed for the old request are refused as superseded.
-fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<bool> {
+/// Answers computed for the old request are refused as superseded. Returns
+/// what serving approvers get once the commit lands, or `None` when no
+/// call was waiting.
+fn reannounce(tx: &Connection, bot: &Bot, turn: i64, failed: &str) -> Result<Option<Vec<Value>>> {
     let rows: Vec<(i64, String, String, i64, i64, String, String)> = tx
         .prepare_cached(
             "SELECT id,call_id,name,node,request,gates,arguments FROM approvals WHERE turn=? ORDER BY id",
@@ -5976,10 +6123,11 @@ fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<boo
         })?
         .collect::<rusqlite::Result<_>>()?;
     if rows.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let announced_ms = epoch_ms();
     let mut calls = Vec::with_capacity(rows.len());
+    let mut judged = Vec::with_capacity(rows.len());
     for (id, call_id, name, node, request, gates, arguments) in rows {
         // A new request takes a new row, so a listing already paged past
         // the old one still finds it.
@@ -6003,17 +6151,88 @@ fn reannounce(tx: &Connection, bot: &str, turn: i64, failed: &str) -> Result<boo
         let tags: Vec<&str> = gates.iter().map(|g| g.tag.as_str()).collect();
         calls.push(json!({"call_id":call_id,"request":request + 1,
             "announced_ms":announced_ms,"gates":tags,"name":name,"node":node}));
+        let request = Request {
+            id: 0,
+            request: request + 1,
+            announced_ms,
+            gates,
+            verdicts: Vec::new(),
+        };
+        judged.push(pending_call(
+            &bot.name,
+            turn,
+            &call_id,
+            &request,
+            &name,
+            node,
+            serde_json::from_str(&arguments)?,
+            &bot.denials,
+        ));
     }
+    let mut last = 0;
     for calls in announcements(calls)? {
-        event(
+        last = event(
             tx,
-            bot,
+            &bot.name,
             Some(turn),
             "approval_requested",
             json!({"calls":calls,"failed":failed}),
         )?;
     }
-    Ok(true)
+    serving(&bot.name, turn, last, judged, Some(failed)).map(Some)
+}
+/// A call waiting on gates, as `approvals` lists it and serving approvers
+/// get it: `request`'s gates are the ones still open, and the bot's denial
+/// counts go with each of them.
+#[allow(clippy::too_many_arguments)]
+fn pending_call(
+    bot: &str,
+    turn: i64,
+    call_id: &str,
+    request: &Request,
+    name: &str,
+    node: i64,
+    arguments: Value,
+    denials: &BTreeMap<String, Denials>,
+) -> Value {
+    let open: Vec<&str> = request.gates.iter().map(|g| g.tag.as_str()).collect();
+    let counts: serde_json::Map<String, Value> = open
+        .iter()
+        .map(|tag| {
+            let seen = denials.get(*tag).copied().unwrap_or_default().seen(turn);
+            ((*tag).to_owned(), seen)
+        })
+        .collect();
+    let mut entry = json!({"bot":bot,"turn":turn,"call_id":call_id,
+        "request":request.request,"announced_ms":request.announced_ms,
+        "expires_ms":request.expires_ms(),"gates":open,"name":name,"node":node,
+        "denials":counts});
+    // The previews stored when the call was planned.
+    if let (Value::Object(entry), Value::Object(arguments)) = (&mut entry, arguments) {
+        entry.extend(arguments);
+    }
+    entry
+}
+/// A round's announcement as serving approvers get it, after the commit
+/// that makes it: the announcing event's cursor, and each call whole, as
+/// `approvals` lists it, in messages of up to 256 KiB of calls.
+fn serving(
+    bot: &str,
+    turn: i64,
+    cursor: i64,
+    calls: Vec<Value>,
+    failed: Option<&str>,
+) -> Result<Vec<Value>> {
+    Ok(announcements(calls)?
+        .into_iter()
+        .map(|calls| {
+            let mut data = json!({"calls":calls});
+            if let Some(failed) = failed {
+                data["failed"] = json!(failed);
+            }
+            entry(cursor, bot, Some(turn), "approval_requested", data)
+        })
+        .collect())
 }
 /// A round's announced calls in events small enough to page: up to 256 KiB
 /// each, well under the half-event page bound, since one call is at most its
@@ -6556,6 +6775,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 33 -> 34: whether a turn's call sent the bot's view last. Turns
         // stored before record neither, so none is taken as having sent it.
         conn.execute_batch("ALTER TABLE turns ADD COLUMN view_sent INTEGER;")?;
+    }
+    if !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bots') WHERE name='denials')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )? {
+        // 34 -> 35: denial counts per gate tag. None was kept before, so
+        // every bot starts from none.
+        conn.execute_batch("ALTER TABLE bots ADD COLUMN denials TEXT;")?;
     }
     Ok(())
 }

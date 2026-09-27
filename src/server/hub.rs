@@ -2,11 +2,13 @@
 //! socket followers receive their bots' events and are dropped when they lag.
 //! A follower of `*` receives every bot's events on one connection, replayed
 //! from a store-wide cursor, so a fleet controller needs one subscription.
+//! A session serving a gate tag receives only the calls announced for it.
 use agent_runtime::{Result, fail, output::Output, store::Store};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -46,18 +48,212 @@ fn retain_other_session(subs: &mut Vec<(u64, Sub)>, session: u64) {
 }
 /// The subscription name that means every bot.
 pub const ALL: &str = "*";
-#[derive(Clone, Default)]
+/// The session serving one gate tag. It receives each call announced for
+/// the tag past `cursor`, the point where the listing it was handed ends,
+/// and keeps the tag while it renews before `deadline`.
+pub struct Approver {
+    session: u64,
+    output: Output,
+    lease: u64,
+    lease_ms: u64,
+    deadline: Instant,
+    cursor: i64,
+    live: bool,
+}
+impl Approver {
+    /// Start delivery after the listing the serving job read: only calls
+    /// announced past `cursor` are new to the approver.
+    pub fn go_live(&mut self, cursor: i64) {
+        self.cursor = cursor;
+        self.live = true;
+    }
+}
+pub type Serving = Arc<Mutex<Approver>>;
+#[derive(Clone)]
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
     /// The newest durable cursor delivered to every live follower.
     published: Arc<watch::Sender<i64>>,
 }
+impl Default for Hub {
+    fn default() -> Self {
+        // Leases differ across restarts, so a number from before one never
+        // matches the lease its tag has after.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        Self {
+            inner: Arc::new(Mutex::new(HubInner {
+                next_lease: seed,
+                ..HubInner::default()
+            })),
+            published: Arc::default(),
+        }
+    }
+}
 #[derive(Default)]
 struct HubInner {
     firehose: Vec<(u64, Output)>,
     subs: HashMap<String, Vec<(u64, Sub)>>,
+    approvers: HashMap<String, Serving>,
+    next_lease: u64,
+}
+/// What a serving session is told when its tag passes to another holder,
+/// its lease runs out, or it answers with a lease that ended.
+fn lost(tag: &str, lease: u64) -> Value {
+    json!({"event":"approvals_lost","tag":tag,"lease":lease,"durable":false})
 }
 impl Hub {
+    /// Hand `tag` to `session` under a new lease, not yet live: the job
+    /// that lists the tag's waiting calls makes it live. A tag another
+    /// session holds is refused until that session closes or lets its
+    /// lease run out; the one it had is then told so.
+    pub fn serve(
+        &self,
+        tag: &str,
+        session: u64,
+        output: Output,
+        lease_ms: u64,
+    ) -> Result<(u64, Serving)> {
+        let mut inner = self.inner.lock().unwrap();
+        let now = Instant::now();
+        if let Some(held) = inner.approvers.get(tag) {
+            let held = held.lock().unwrap();
+            if held.session != session && held.deadline > now {
+                return fail("approvals_served");
+            }
+            if held.session != session {
+                let _ = held.output.try_send(lost(tag, held.lease));
+            }
+        }
+        inner.next_lease += 1;
+        let lease = inner.next_lease;
+        let approver = Arc::new(Mutex::new(Approver {
+            session,
+            output,
+            lease,
+            lease_ms,
+            deadline: now + Duration::from_millis(lease_ms),
+            cursor: i64::MAX,
+            live: false,
+        }));
+        inner.approvers.insert(tag.to_owned(), approver.clone());
+        Ok((lease, approver))
+    }
+    /// Give up `tag` if `lease` still holds it, as when serving it failed.
+    pub fn unserve(&self, tag: &str, lease: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner
+            .approvers
+            .get(tag)
+            .is_some_and(|held| held.lock().unwrap().lease == lease)
+        {
+            inner.approvers.remove(tag);
+        }
+    }
+    /// Keep `tag` for `session` under `lease` for another lease period.
+    /// A lease that ended, by takeover, by running out, or by the session
+    /// closing, is refused with `approvals_lost`; one that ran out is ended
+    /// here, and its holder told.
+    pub fn renew(&self, tag: &str, session: u64, lease: u64) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(held) = inner.approvers.get(tag).cloned() else {
+            return fail("approvals_lost");
+        };
+        let mut held = held.lock().unwrap();
+        if held.session != session || held.lease != lease {
+            return fail("approvals_lost");
+        }
+        let now = Instant::now();
+        if held.deadline <= now {
+            let _ = held.output.try_send(lost(tag, lease));
+            drop(held);
+            inner.approvers.remove(tag);
+            return fail("approvals_lost");
+        }
+        held.deadline = now + Duration::from_millis(held.lease_ms);
+        Ok(held.lease_ms)
+    }
+    /// The tags served now, for `stats`.
+    pub fn served(&self) -> Vec<String> {
+        let now = Instant::now();
+        let inner = self.inner.lock().unwrap();
+        let mut tags: Vec<String> = inner
+            .approvers
+            .iter()
+            .filter(|(_, held)| {
+                let held = held.lock().unwrap();
+                held.live && held.deadline > now
+            })
+            .map(|(tag, _)| tag.clone())
+            .collect();
+        tags.sort();
+        tags
+    }
+    /// Deliver an announcement to the session serving each gate tag its
+    /// calls name, each receiving only the calls that wait on its tag. A
+    /// holder whose lease ran out is told it lost the tag instead; one that
+    /// cannot keep up is closed, like a lagging follower.
+    pub fn approval(&self, message: &Value) {
+        let calls = message["data"]["calls"].as_array();
+        let mut tags: Vec<&str> = calls
+            .into_iter()
+            .flatten()
+            .flat_map(|call| call["gates"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        let cursor = message["cursor"].as_i64().unwrap_or(0);
+        let now = Instant::now();
+        for tag in tags {
+            let Some(held) = self.inner.lock().unwrap().approvers.get(tag).cloned() else {
+                continue;
+            };
+            let (session, output, sent) = {
+                let held = held.lock().unwrap();
+                if !held.live || cursor <= held.cursor {
+                    continue;
+                }
+                if held.deadline <= now {
+                    let (session, lease) = (held.session, held.lease);
+                    drop(held);
+                    self.expire(tag, session, lease);
+                    continue;
+                }
+                let mut sent = message.clone();
+                if let Some(Value::Array(calls)) = sent["data"].get_mut("calls") {
+                    calls.retain(|call| {
+                        call["gates"]
+                            .as_array()
+                            .is_some_and(|gates| gates.iter().any(|g| g == tag))
+                    });
+                }
+                sent["tag"] = json!(tag);
+                sent["lease"] = json!(held.lease);
+                sent["durable"] = json!(false);
+                (held.session, held.output.clone(), sent)
+            };
+            if output.try_send(sent).is_err() {
+                self.close_session(session);
+                output.close();
+            }
+        }
+    }
+    /// End a lease that ran out, if it still holds its tag, and tell its
+    /// holder.
+    fn expire(&self, tag: &str, session: u64, lease: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(held) = inner.approvers.get(tag).cloned() else {
+            return;
+        };
+        let held = held.lock().unwrap();
+        if held.session == session && held.lease == lease {
+            let _ = held.output.try_send(lost(tag, lease));
+            drop(held);
+            inner.approvers.remove(tag);
+        }
+    }
     pub fn add_firehose(&self, session: u64, output: Output) {
         self.inner.lock().unwrap().firehose.push((session, output));
     }
@@ -92,6 +288,10 @@ impl Hub {
             retain_other_session(subs, session);
             !subs.is_empty()
         });
+        // A closed session's tags are free at once; nobody is left to tell.
+        inner
+            .approvers
+            .retain(|_, held| held.lock().unwrap().session != session);
     }
     /// How many copies of one of `bot`'s events `session` receives: once
     /// for the firehose, once following `*`, and once following the bot.
