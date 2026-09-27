@@ -7,7 +7,9 @@
 //! not the user's shell, so provider keys exported in a shell profile would be
 //! missing. `agent start` therefore runs with the environment of the user's
 //! login shell, read once per start; if that cannot be read it runs with the
-//! app's own.
+//! app's own. Keys kept out of shell profiles go in `~/.agent/env`, `KEY=VALUE`
+//! lines readable only by their owner, which the app adds on top: the file is
+//! the app's, and neither the CLI nor the daemon reads it.
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -55,6 +57,9 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
     if let Some(environment) = login_environment().await {
         command.env_clear().envs(environment);
     }
+    if let Some(file) = env_file() {
+        command.envs(read_env_file(&file)?);
+    }
     command
         .arg("start")
         .arg("--store")
@@ -72,7 +77,7 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
     }
     // The CLI's error line, `agent: CODE: DETAIL`, is the reason to show.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(stderr
+    let reason = stderr
         .lines()
         .rev()
         .find_map(|line| line.strip_prefix("agent: "))
@@ -82,7 +87,74 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
                 "daemon_start_failed: agent start exited with {}",
                 output.status
             )
-        }))
+        });
+    Err(if reason.starts_with("usage: no provider") {
+        format!("{reason}; or put KEY=VALUE lines in ~/.agent/env")
+    } else {
+        reason
+    })
+}
+
+fn env_file() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/env"))
+}
+
+/// `KEY=VALUE` lines, `export` optional, `#` comments, and values optionally
+/// in matching quotes. A missing file is empty. One others can read, or a line
+/// that is not an assignment, is refused by path and line, never by value.
+fn read_env_file(path: &Path) -> Result<Vec<(String, String)>, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("env_file_unreadable: {}: {error}", path.display())),
+    };
+    let mode = std::fs::metadata(path)
+        .map_err(|error| format!("env_file_unreadable: {}: {error}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "env_file_permissions: {} is readable by others; chmod 600 it",
+            path.display()
+        ));
+    }
+    let mut environment = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let valid = |key: &str| {
+            key.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        };
+        let Some((key, value)) = line
+            .split_once('=')
+            .map(|(key, value)| (key.trim_end(), value))
+            .filter(|(key, _)| valid(key))
+        else {
+            return Err(format!(
+                "env_file_invalid: {} line {}: expected KEY=VALUE",
+                path.display(),
+                index + 1
+            ));
+        };
+        let value = value.trim();
+        let value = ['"', '\'']
+            .iter()
+            .find_map(|quote| {
+                value
+                    .strip_prefix(*quote)
+                    .and_then(|inner| inner.strip_suffix(*quote))
+            })
+            .unwrap_or(value);
+        environment.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(environment)
 }
 
 /// The environment an interactive login shell ends up with, where people
@@ -151,6 +223,55 @@ mod tests {
         assert!(parse_environment(format!("{MARKER}\n").as_bytes()).is_none());
     }
 
+    #[test]
+    fn the_env_file_takes_assignments_and_refuses_anything_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("agent-app-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("env");
+        assert_eq!(read_env_file(&file).unwrap(), vec![]);
+        std::fs::write(
+            &file,
+            "# keys\n\nOPENAI_API_KEY=sk-1\nexport ANTHROPIC_API_KEY = \"a b\"\nX='q'\nEMPTY=\nURL=a=b\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pairs = |list: &[(&str, &str)]| {
+            list.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read_env_file(&file).unwrap(),
+            pairs(&[
+                ("OPENAI_API_KEY", "sk-1"),
+                ("ANTHROPIC_API_KEY", "a b"),
+                ("X", "q"),
+                ("EMPTY", ""),
+                ("URL", "a=b"),
+            ])
+        );
+        std::fs::write(&file, "OK=1\nsk-secret\n").unwrap();
+        let error = read_env_file(&file).unwrap_err();
+        assert!(
+            error.starts_with("env_file_invalid: ")
+                && error.ends_with("line 2: expected KEY=VALUE"),
+            "{error}"
+        );
+        assert!(!error.contains("sk-secret"));
+        std::fs::write(&file, "1X=1\n").unwrap();
+        assert!(read_env_file(&file).is_err());
+        std::fs::write(&file, "OK=1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_env_file(&file)
+                .unwrap_err()
+                .starts_with("env_file_permissions: ")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn a_failed_start_reports_the_cli_reason_and_is_not_repeated_at_once() {
         let root = std::env::temp_dir().join(format!("agent-app-start-{}", std::process::id()));
@@ -170,14 +291,9 @@ mod tests {
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut starts = Starts::default();
         let store = root.join("state.sqlite");
-        assert_eq!(
-            starts.start(&agent, &store).await.unwrap_err(),
-            "usage: no provider"
-        );
-        assert_eq!(
-            starts.start(&agent, &store).await.unwrap_err(),
-            "usage: no provider"
-        );
+        let reason = "usage: no provider; or put KEY=VALUE lines in ~/.agent/env";
+        assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
+        assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "started\n");
         std::fs::remove_dir_all(root).unwrap();
     }

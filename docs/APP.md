@@ -130,9 +130,12 @@ starts the daemon exactly as a CLI command would: providers from
 `AGENT_PROVIDER` or the keys that are set, the log beside the store, a
 process that outlives the window. A window opened from the Dock inherits
 launchd's environment rather than a terminal's, so `agent start` runs with
-the environment of the user's login shell (`$SHELL -l -i`), where provider
-keys are usually exported; the store and socket themselves are resolved from
-the app's own arguments and environment. A failed start shows the CLI's
+the environment of the user's login shell (`$SHELL -l -i`), plus
+`~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
+(`export` and quotes allowed, `#` comments), refused unless only its owner
+can read it. That file is the app's; the CLI and the daemon never read it. The
+store and socket themselves are resolved from the app's own arguments and
+environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
 or `AGENT_SOCKET` never starts anything.
 
