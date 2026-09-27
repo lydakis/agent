@@ -221,7 +221,8 @@ function shortName(b) {
 }
 // The sidebar's rows: each project's coordinator, then its tasks by lineage (unless folded), then
 // the bots in no project. Rebuilt once per fleet shape change; it also stamps each bot's project.
-function tree() {
+// `all` includes folded projects' tasks, for finding rather than drawing.
+function tree(all = false) {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
   const children = new Map(), projects = new Map();
@@ -260,7 +261,7 @@ function tree() {
   for (const p of [...projects.keys()].sort()) {
     const lead = projects.get(p); seen.add(lead.name); lead.project = p;
     const head = { b: lead, depth: 0, prefix: '', head: p, tasks: 0 }; out.push(head);
-    pushKids(lead.name, 1, '', p, prefixed.get(p)); head.tasks = walk(S.ui.folded.has(p));
+    pushKids(lead.name, 1, '', p, prefixed.get(p)); head.tasks = walk(!all && S.ui.folded.has(p));
   }
   const loose = out.length;
   pushKids(null, 0, '', null); walk(false);
@@ -459,7 +460,7 @@ function entries(item) {
   const text = (content, keys) => Array.isArray(content) ? content.filter((p) => keys.includes(p.type)).map((p) => p.text ?? '').join('') : typeof content === 'string' ? content : '';
   const shell = (o) => { let v; try { v = JSON.parse(o); } catch (_) { return o; } if (!v || typeof v !== 'object' || !('stdout' in v)) return o; let s = (v.stdout ?? '').trimEnd(); if (v.stderr?.trim()) s += (s ? '\n' : '') + 'stderr: ' + v.stderr.trimEnd(); if (v.exit_code) s += (s ? '\n' : '') + `exit ${v.exit_code}`; return s || '(no output)'; };
   // A failed call says so on its run's one line, so folding never hides a failure.
-  const failure = (o) => { let v; try { v = JSON.parse(o); } catch (_) { return null; } if (!v || typeof v !== 'object') return null; if (v.error) return String(v.error); return typeof v.exit_code === 'number' && v.exit_code !== 0 ? `exit ${v.exit_code}` : null; };
+  const failure = (o) => { let v; try { v = JSON.parse(o); } catch (_) { return null; } if (!v || typeof v !== 'object') return null; if (v.error) return String(v.error); if (v.timed_out) return 'timed out'; if (typeof v.exit_code === 'number' && v.exit_code !== 0) return `exit ${v.exit_code}`; return v.success === false ? 'failed' : null; };
   const out_ = (callId, raw, isError) => ({ kind: 'out', callId, raw, text: shell(raw), err: failure(raw) ?? (isError ? 'error' : null) });
   if (item.type === 'function_call_output') return [out_(item.call_id, item.output ?? '')];
   if (item.type === 'function_call') return [storedTool(item.name, item.call_id, item.arguments)];
@@ -1092,7 +1093,7 @@ setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (
 // ---------- picker ----------
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
-  return tree().filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
+  return tree(true).filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
 const PICKER_ROWS = 200;
 function renderPicker() {
@@ -1285,11 +1286,13 @@ async function openOnly(name) {
 async function openBeside(name) {
   if (!S.bots.has(name) || name === S.selected) return;
   S.ui.side = S.ui.side === name ? null : name;
+  // A draft belongs to the bot it was typed for, not to the pane.
+  $('sideinput').value = '';
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side ? 'side' : 'main');
 }
 function swap() { if (!S.ui.side) return; [S.selected, S.ui.side] = [S.ui.side, S.selected]; render(); save(); focusInput('main'); }
-function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(); focusInput('main'); }
+function closeSide() { if (!S.ui.side) return; S.ui.side = null; $('sideinput').value = ''; render(); save(); focusInput('main'); }
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
 function showNewProject(on) {
   $('projform').hidden = !on; $('newproj').hidden = on;

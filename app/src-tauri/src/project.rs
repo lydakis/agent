@@ -107,7 +107,8 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     }))
 }
 
-/// Write a new project's file. An existing file is the user's and is kept.
+/// Write a new project's file. An existing file is the user's and is kept:
+/// one that appeared since the folder was read is refused, to be read again.
 pub fn write(dir: &Path, name: &str, model: &str) -> Result<(), String> {
     if !valid_name(name) {
         return Err("project_invalid: name must be 1-64 of A-Z a-z 0-9 - _ .".into());
@@ -120,7 +121,15 @@ pub fn write(dir: &Path, name: &str, model: &str) -> Result<(), String> {
         quote(&format!("{name}.lead")),
         quote(model)
     );
-    let failed = |e: std::io::Error| format!("project_unwritable: {}: {e}", path.display());
+    let failed = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => {
+            format!(
+                "project_changed: {} appeared; open the folder again",
+                path.display()
+            )
+        }
+        _ => format!("project_unwritable: {}: {e}", path.display()),
+    };
     std::fs::create_dir_all(dir.join(".agent")).map_err(failed)?;
     place_new(&path, |file| {
         std::io::Write::write_all(file, text.as_bytes())?;
@@ -145,10 +154,7 @@ fn place_new(
         .create_new(true)
         .open(&temp)
         .and_then(|mut file| fill(&mut file))
-        .and_then(|()| match std::fs::hard_link(&temp, path) {
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            other => other,
-        });
+        .and_then(|()| std::fs::hard_link(&temp, path));
     let removed = std::fs::remove_file(&temp);
     result?;
     match removed {
@@ -184,7 +190,9 @@ mod tests {
     fn a_written_file_reads_back_and_is_never_overwritten() {
         let dir = root("write");
         write(&dir, "demo", "alpha/one").unwrap();
-        write(&dir, "other", "beta/two").unwrap();
+        // One that appeared since the folder was read is kept and reported.
+        let refused = write(&dir, "other", "beta/two").unwrap_err();
+        assert!(refused.starts_with("project_changed: "), "{refused}");
         let project = read(&dir).unwrap();
         assert_eq!(project["name"], "demo");
         assert_eq!(project["coordinator"], "demo.lead");

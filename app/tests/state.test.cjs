@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -870,4 +870,18 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
   assert.match(items[user + 1].content[0].text, /^Noted: mention the wait op too\./);
   assert.equal(events.filter((e) => e.event === 'turn_finished').length, 1, 'the steer joined the running turn');
   d.close();
+});
+
+test('a folded run names a timeout or a failed call; the finder reaches folded tasks; a side draft stays with its bot', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])
+    assert.equal(p.entries({ type: 'function_call_output', call_id: 'c', output: JSON.stringify(out) })[0].err, want);
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.tree(); p.S.selected = 'app.lead'; p.S.ui.folded.add('app');
+  p.context.document.getElementById('pickerq').value = 'build';
+  assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.build'], 'a folded task is still found');
+  const draft = p.context.document.getElementById('sideinput');
+  await p.openBeside('app.build'); draft.value = 'for build only';
+  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside starts empty');
+  draft.value = 'for test only'; p.closeSide(); assert.equal(draft.value, '');
 });
