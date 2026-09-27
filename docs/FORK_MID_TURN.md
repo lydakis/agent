@@ -219,6 +219,9 @@ The app's side chats offer three choices: answer only, read files, and all
 tools in a new worktree. Callers need a way to express them that keeps the
 fork on its source's cache.
 
+Since 2026-09-27 the app's side chats take all their source's tools in its
+folder (George wants them to edit); the list stays for other callers.
+
 - **Tools stay shown.** Removing a tool changes the tool definitions, which
   rebuilds the whole cache on every model.
 - **Answer only can't use `tool_choice: none` on Anthropic.** Per the
