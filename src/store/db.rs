@@ -837,7 +837,7 @@ impl Database {
     /// Stored schema version, kept in `PRAGMA user_version`. Stores created
     /// before versioning and stores from newer binaries are rejected; an older
     /// versioned store is migrated forward, one version at a time, at open.
-    pub const SCHEMA: i32 = 38;
+    pub const SCHEMA: i32 = 39;
     /// Verbatim user prompts a compaction keeps: per-prompt text, and the
     /// total text plus `(ordinal, String)` entry metadata. Empty entries cost
     /// space too, so the retained list cannot grow with conversation length.
@@ -3695,14 +3695,16 @@ impl Database {
             let id = node(&tx, head, &item)?;
             head = Some(id);
             if size >= PROMPT_SHARE_BYTES {
-                tx.execute("UPDATE turns SET status='steered',finished_ms=?,prompt='',prompt_node=?,
-                    workspace=COALESCE(workspace,(SELECT workspace FROM turns WHERE id=?)) WHERE id=?",
+                tx.execute("UPDATE turns SET status='steered',finished_ms=?1,prompt='',prompt_node=?2,
+                    (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                        FROM turns s, turns t WHERE s.id=?4 AND t.id=?3) WHERE id=?4",
                     params![epoch_ms(), id, turn, steer])?;
             } else {
-                // A steer that named no folder records the one it ran in.
+                // A steer that named no folder or model records the ones it ran with.
                 tx.execute(
-                    "UPDATE turns SET status='steered',finished_ms=?,
-                        workspace=COALESCE(workspace,(SELECT workspace FROM turns WHERE id=?)) WHERE id=?",
+                    "UPDATE turns SET status='steered',finished_ms=?1,
+                        (workspace,model)=(SELECT COALESCE(s.workspace,t.workspace),COALESCE(s.model,t.model)
+                            FROM turns s, turns t WHERE s.id=?3 AND t.id=?2) WHERE id=?3",
                     params![epoch_ms(), turn, steer],
                 )?;
             }
@@ -7274,6 +7276,14 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE turns ADD COLUMN from_bot TEXT;
              ALTER TABLE turns ADD COLUMN from_turn INTEGER;",
+        )?;
+    }
+    if from < 39 {
+        // 38 -> 39: a bot's folder can move. A turn that named none ran in
+        // its bot's folder, fixed until now, so the turn records it.
+        conn.execute_batch(
+            "UPDATE turns SET workspace=(SELECT workspace FROM bots WHERE name=turns.bot)
+             WHERE workspace IS NULL;",
         )?;
     }
     Ok(())

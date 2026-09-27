@@ -1731,6 +1731,46 @@ fn schema_38_reads_every_stored_prompt_as_a_persons() {
 }
 
 #[test]
+fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
+    let path = std::env::temp_dir().join(format!("agent-folders-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        let turn = gated_turn(&mut db, None);
+        db.create("Carol", None, binding()).unwrap();
+        turn
+    };
+    // Before 39 a turn that named no folder stored none and read its bot's.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("UPDATE turns SET workspace=NULL; PRAGMA user_version=38;")
+        .unwrap();
+    let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    let moving = TurnOptions {
+        workspace: Some("/synthetic/moved".into()),
+        delivery: Delivery::Queue,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "r-move", "later", true, &moving, allow_provider)
+        .unwrap();
+    let listed = db.turns("Bob", 0, 10).unwrap();
+    let row = listed["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["turn"] == turn)
+        .unwrap();
+    assert_eq!(row["workspace"], "/synthetic");
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_served_listing_pages_only_to_where_serving_began() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
@@ -4557,6 +4597,18 @@ fn steers_preserve_explicit_overrides_and_do_not_overtake_a_deferred_steer() {
             .outcomes[0]
             .0,
         inherited
+    );
+    // The steer named neither, so it records the model and folder it ran with.
+    let listed = db.turns("Bob", 0, 10).unwrap();
+    let row = listed["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["turn"] == inherited)
+        .unwrap();
+    assert_eq!(
+        (&row["model"], &row["workspace"]),
+        (&json!("openai/other"), &json!("/active"))
     );
     assert!(!db.steers_waiting("Bob").unwrap());
 }
