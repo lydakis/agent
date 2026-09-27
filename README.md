@@ -159,8 +159,9 @@ protocol directly; [`client/`](client) is a Rust client for it. See the
 
 ## Desktop app
 
-[`app/`](app) is a Tauri desktop client over the same socket: bots, their
-peers, and background commands in one window. See [desktop client](docs/APP.md)
+[`app/`](app) is a Tauri desktop client over the same socket: projects and
+their tasks, a thread with another beside it, and background commands in one
+window. See [desktop client](docs/APP.md)
 to build and run it.
 
 ## How fast is it?

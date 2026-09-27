@@ -18,8 +18,15 @@ const S = {
   // removed (shapeGen), so the activity check and the rail's tree rebuild once per change instead of
   // scanning the fleet on every event.
   botsGen: 0, shapeGen: 0, deleted: new Set(),
-  config: null, ui: { rail: false, peek: null, picker: false, pickerSel: 0, help: false, thoughts: false, output: false, toast: null },
+  config: null, ui: { rail: true, side: null, picker: false, pickerSel: 0, help: false, steps: false, toast: null, menu: false, folded: new Set() },
+  // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
+  // model each bot's next turns run on when it differs from the one it was created with.
+  send: loadSend(), override: new Map(),
+  // Each provider's model family, from the bot records that name both; a turn may run on any
+  // provider of its bot's family.
+  families: new Map(),
 };
+function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' ? 'steer' : 'queue'; } catch (_) { return 'queue'; } }
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
 const bot = (name) => S.bots.get(name);
 const transcript = (name) => { if (!S.transcripts.has(name)) S.transcripts.set(name, { items: [], nodes: 0, thoughts: 0, longOut: 0, peers: [], anchor: 'end', gen: 0, text: '', thinking: '', thinkingSince: 0, thinkingMs: 0, streamingTurn: null, streamGen: 0 }); return S.transcripts.get(name); };
@@ -178,10 +185,16 @@ function upsert(record) {
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  learnFamily(b, record);
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
   seedHistory(record);
+}
+// Records carry the family; creation events do not, so a bot seated from one takes its provider's.
+function learnFamily(b, record) {
+  if (typeof record.family === 'string') { b.family = record.family; if (typeof record.provider === 'string') S.families.set(record.provider, record.family); }
+  else b.family ??= S.families.get(record.provider) ?? null;
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
@@ -190,33 +203,74 @@ function forgetBot(name) {
   const parent = bot(name) && creatorOf(bot(name));
   const t = parent && S.transcripts.get(parent.name);
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
-  S.bots.delete(name); S.transcripts.delete(name); if (S.ui.peek === name) S.ui.peek = null;
+  S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
+  // A draft belongs to its bot, so it goes with it.
+  if (S.ui.side === name) { S.ui.side = null; $('sideinput').value = ''; }
+  if (S.selected === name) $('input').value = '';
 }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
-function tree() {
+
+// ---------- projects ----------
+// A project is a folder, its coordinator bot `<project>.lead`, and `.agent/project.toml`. The list is
+// the coordinator bots in the store, so nothing else can drift from it. A project's tasks are its
+// coordinator's lineage, and any root bot named `<project>.<task>`.
+const LEAD = '.lead';
+const leadProject = (name) => name.length > LEAD.length && name.endsWith(LEAD) ? name.slice(0, -LEAD.length) : null;
+function shortName(b) {
+  const p = b?.project; if (!p) return b?.name ?? '';
+  if (b.name === p + LEAD) return p;
+  return b.name.startsWith(p + '.') ? b.name.slice(p.length + 1) : b.name;
+}
+// The sidebar's rows: each project's coordinator, then its tasks by lineage (unless folded), then
+// the bots in no project. Rebuilt once per fleet shape change; it also stamps each bot's project.
+// `all` includes folded projects' tasks, for finding rather than drawing.
+function tree(all = false) {
   // One pass builds the children index; an explicit stack walks it, so a deep delegation chain
   // costs one prefix string per row and no recursion.
-  const children = new Map();
-  for (const b of S.bots.values()) { const key = creatorOf(b)?.name ?? null; if (!children.has(key)) children.set(key, []); children.get(key).push(b); }
-  const out = []; const seen = new Set(); const stack = [];
-  const pushKids = (parent, depth, cont) => {
-    const kids = (children.get(parent) ?? []).filter((b) => !seen.has(b.name));
-    for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth, i === kids.length - 1, cont]);
-  };
-  const walk = () => {
-    while (stack.length) {
-      const [b, depth, last, cont] = stack.pop();
-      if (seen.has(b.name)) continue; seen.add(b.name);
-      const prefix = depth === 0 ? '' : cont + (last ? '└ ' : '├ ');
-      out.push({ b, depth, prefix });
-      // The continuation stops growing past a few levels: a chain of thousands must not cost thousands per row.
-      pushKids(b.name, depth + 1, depth === 0 ? '' : depth > 6 ? cont : cont + (last ? '  ' : '│ '));
+  const children = new Map(), projects = new Map();
+  for (const b of S.bots.values()) {
+    b.project = null;
+    const key = creatorOf(b)?.name ?? null; if (!children.has(key)) children.set(key, []); children.get(key).push(b);
+    const p = leadProject(b.name); if (p) projects.set(p, b);
+  }
+  // A root named `<project>.<task>` joins the longest project its name starts with.
+  const prefixed = new Map();
+  if (projects.size) for (const b of children.get(null) ?? []) {
+    if (leadProject(b.name)) continue;
+    for (let at = b.name.lastIndexOf('.'); at > 0; at = b.name.lastIndexOf('.', at - 1)) {
+      const p = b.name.slice(0, at);
+      if (projects.has(p)) { if (!prefixed.has(p)) prefixed.set(p, []); prefixed.get(p).push(b); break; }
     }
+  }
+  const out = []; const seen = new Set(); const stack = [];
+  // Coordinators head their own projects wherever they were created.
+  const pushKids = (parent, depth, cont, project, extra) => {
+    const kids = [...(children.get(parent) ?? []), ...(extra ?? [])].filter((b) => !seen.has(b.name) && !leadProject(b.name));
+    for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth, i === kids.length - 1, cont, project]);
   };
-  pushKids(null, 0, ''); walk();
+  const walk = (hidden) => {
+    let visited = 0;
+    while (stack.length) {
+      const [b, depth, last, cont, project] = stack.pop();
+      if (seen.has(b.name)) continue; seen.add(b.name); b.project = project; visited++;
+      const prefix = depth === 0 ? '' : cont + (last ? '└ ' : '├ ');
+      if (!hidden) out.push({ b, depth, prefix });
+      // The continuation stops growing past a few levels: a chain of thousands must not cost thousands per row.
+      pushKids(b.name, depth + 1, depth === 0 ? '' : depth > 6 ? cont : cont + (last ? '  ' : '│ '), project);
+    }
+    return visited;
+  };
+  for (const p of [...projects.keys()].sort()) {
+    const lead = projects.get(p); seen.add(lead.name); lead.project = p;
+    const head = { b: lead, depth: 0, prefix: '', head: p, tasks: 0 }; out.push(head);
+    pushKids(lead.name, 1, '', p, prefixed.get(p)); head.tasks = walk(!all && S.ui.folded.has(p));
+  }
+  const loose = out.length;
+  pushKids(null, 0, '', null); walk(false);
   // Anything the roots do not reach is rooted where it stands: one pass, nothing hidden.
-  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '']); walk(); }
+  for (const b of S.bots.values()) if (!seen.has(b.name)) { stack.push([b, 0, true, '', null]); walk(false); }
+  if (projects.size && out.length > loose) out.splice(loose, 0, { label: 'bots' });
   return out;
 }
 function callSummary(name, args) {
@@ -308,7 +362,7 @@ async function onEvent(ev) {
       const t = transcript(name);
       let call = null;
       for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if ((it.kind === 'tool' || it.kind === 'tool_stub') && it.turn === turn && it.callId === data.call_id) { call = it; break; } }
-      if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchItem(name, `[data-call="${cssEsc(call.callId)}"]`, call); }
+      if (call) { call.done = true; if (call.started) call.took = Date.now() - call.started; call.started = 0; patchRun(name, call); }
       if (typeof data.node === 'number') {
         pushNode(t, { kind: 'node', node: data.node, callId: data.call_id, turn });
         if (call && (call.background || call.name === 'wait') && await loadWaitOrProc(name, data.node, call)) {
@@ -337,7 +391,10 @@ async function onEvent(ev) {
     }
     case 'deleted': {
       if (S.snapshot) S.deleted.add(name);
-      forgetBot(name); if (S.selected === name) S.selected = S.bots.keys().next().value ?? ''; break;
+      const p = bot(name)?.project;
+      forgetBot(name);
+      if (S.selected === name) S.selected = p && S.bots.has(p + LEAD) ? p + LEAD : S.bots.keys().next().value ?? '';
+      break;
     }
     case 'pruned': {
       // A `follow *` replay reports a retention gap with bot "*": a notice about the store, not a transcript.
@@ -405,11 +462,14 @@ function entries(item) {
   const out = [];
   const text = (content, keys) => Array.isArray(content) ? content.filter((p) => keys.includes(p.type)).map((p) => p.text ?? '').join('') : typeof content === 'string' ? content : '';
   const shell = (o) => { let v; try { v = JSON.parse(o); } catch (_) { return o; } if (!v || typeof v !== 'object' || !('stdout' in v)) return o; let s = (v.stdout ?? '').trimEnd(); if (v.stderr?.trim()) s += (s ? '\n' : '') + 'stderr: ' + v.stderr.trimEnd(); if (v.exit_code) s += (s ? '\n' : '') + `exit ${v.exit_code}`; return s || '(no output)'; };
-  if (item.type === 'function_call_output') return [{ kind: 'out', callId: item.call_id, raw: item.output ?? '', text: shell(item.output ?? '') }];
+  // A failed call says so on its run's one line, so folding never hides a failure.
+  const failure = (o) => { let v; try { v = JSON.parse(o); } catch (_) { return null; } if (!v || typeof v !== 'object') return null; if (v.error) return String(v.error); if (v.timed_out) return 'timed out'; if (typeof v.exit_code === 'number' && v.exit_code !== 0) return `exit ${v.exit_code}`; return v.success === false ? 'failed' : null; };
+  const out_ = (callId, raw, isError) => ({ kind: 'out', callId, raw, text: shell(raw), err: failure(raw) ?? (isError ? 'error' : null) });
+  if (item.type === 'function_call_output') return [out_(item.call_id, item.output ?? '')];
   if (item.type === 'function_call') return [storedTool(item.name, item.call_id, item.arguments)];
   if (item.type === 'reasoning') { const s = text(item.summary, ['summary_text']); if (s) out.push({ kind: 'thought', text: s, secs: null }); return out; }
   if (item.role === 'user') {
-    if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push({ kind: 'out', callId: p.tool_use_id, raw: text(p.content, ['text']), text: shell(text(p.content, ['text'])) }); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
+    if (Array.isArray(item.content)) { let t = ''; for (const p of item.content) { if (p.type === 'tool_result') out.push(out_(p.tool_use_id, text(p.content, ['text']), p.is_error === true)); else if (p.type === 'text' || p.type === 'input_text') t += p.text ?? ''; } if (t) out.unshift({ kind: 'user', text: t }); }
     else out.push({ kind: 'user', text: text(item.content, ['text']) });
   } else if (item.role === 'assistant' && Array.isArray(item.content)) {
     for (const p of item.content) {
@@ -516,9 +576,9 @@ async function loadBatch(name) {
 }
 async function loadVisible() {
   await load(S.selected);
-  if (S.ui.peek && S.ui.peek !== S.selected) await load(S.ui.peek);
+  if (S.ui.side && S.ui.side !== S.selected) await load(S.ui.side);
   // Cards on screen show their peer's last line, so those peers load too.
-  for (const who of peers().slice(-12)) if (who !== S.selected && who !== S.ui.peek) await load(who);
+  for (const who of peers().slice(-12)) if (who !== S.selected && who !== S.ui.side) await load(who);
 }
 
 // All transcript mutations, including snapshot pages and creation replies,
@@ -574,6 +634,7 @@ function seat(record, session) {
   if (conflict) return;
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  learnFamily(b, record);
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   seedHistory(record);
@@ -653,10 +714,17 @@ function restore() {
   let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
   if (!saved) return;
   if (saved.selected && S.bots.has(saved.selected)) { S.selected = saved.selected; S.autoSelect = false; }
-  if (saved.peek && S.bots.has(saved.peek)) S.ui.peek = saved.peek;
-  S.ui.rail = !!saved.rail; S.ui.thoughts = !!saved.thoughts; S.ui.output = !!saved.output;
+  if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
+  S.ui.rail = saved.rail !== false; S.ui.steps = !!saved.steps;
+  if (Array.isArray(saved.folded)) { S.ui.folded = new Set(saved.folded.filter((p) => typeof p === 'string')); S.shapeGen += 1; }
+  // A model pick belongs to the identity it was made for, not to whichever bot holds the name now.
+  if (Array.isArray(saved.override)) for (const entry of saved.override) {
+    const [name, id, model] = Array.isArray(entry) ? entry : [];
+    const b = bot(name);
+    if (b && b.id != null && b.id === id && typeof model === 'string' && runsOn(b, model)) S.override.set(name, model);
+  }
 }
-function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, peek: S.ui.peek, rail: S.ui.rail, thoughts: S.ui.thoughts, output: S.ui.output })); } catch (_) {} }
+function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 
 // ---------- render ----------
@@ -675,37 +743,56 @@ function markdown(text) {
   if (fence) out.push(`<pre class="code">${fence.lang ? `<span class="lang">${esc(fence.lang)}</span>` : ''}${esc(fence.body.join('\n'))}</pre>`);
   return out.join('');
 }
+const moreButton = (name) => `<button type="button" class="ibtn" data-act="more" data-who="${esc(name)}" title="More" aria-label="More">⋯</button>`;
 function cardInner({ status, name, last, elapsed, body }) {
-  return `<span class="glyph ${status}">${glyphOf(status)}</span><span class="pn">${esc(name)}</span><span class="el">${elapsed ?? ''}</span><span class="pl">${esc(last)}</span>${body ?? ''}`;
+  return `<span class="glyph ${status}" data-f="g">${glyphOf(status)}</span><span class="pn">${esc(name)}</span><span class="el" data-f="el">${elapsed ?? ''}</span><span class="pl" data-f="pl">${esc(last)}</span>${body ?? ''}`;
 }
 function cardHTML(card) {
-  return `<div class="peer${card.sel ? ' sel' : ''}" ${card.attr} role="button" tabindex="0">${cardInner(card)}</div>`;
+  return `<div class="peer${card.sel ? ' sel' : ''}" ${card.attr}${card.task ? ' role="button" tabindex="0"' : ''}>${cardInner(card)}${card.task ? `<span class="tacts">${moreButton(card.task)}</span>` : ''}</div>`;
 }
 const cssEsc = (s) => String(s).replace(/[\x00-\x1f\x7f"\\]/g, (c) => c === '\0' ? '\ufffd' : c === '"' || c === '\\' ? '\\' + c : '\\' + c.charCodeAt(0).toString(16) + ' ');
-function peerCard(who) {
+// A task's card: its status, its elapsed time and its newest line. Click opens it beside.
+function taskCard(who) {
   const p = bot(who); if (!p) return null;
   const el = p.turnStarted ? fmt(Date.now() - p.turnStarted) : p.elapsed ? fmt(p.elapsed) : '';
-  return { attr: `data-peek="${esc(p.name)}"`, status: p.status, name: p.name, last: lastLine(transcript(who)), elapsed: el, sel: S.ui.peek === who };
+  return { attr: `data-task="${esc(p.name)}"`, task: p.name, status: p.status, name: shortName(p), last: lastLine(transcript(who)), elapsed: el, sel: S.ui.side === who || S.selected === who };
 }
-// Replace one rendered item in place, in whichever pane shows that bot, so a tool finishing or a
-// process ending costs the size of its own line, not a rebuild of the window.
+// The two panes that show a transcript: the main thread and the one beside it.
+const PANES = [['log', () => S.selected], ['side', () => S.ui.side]];
+const paneKey = (name, t) => `${name}|${t.gen}|${S.ui.steps}`;
+// Replace one rendered card in place, in whichever pane shows that bot, so a process ending costs the
+// size of its own card, not a rebuild of the window.
 function patchItem(name, selector, it) {
-  for (const [id, shown] of [['log', S.selected], ['peek', S.ui.peek]]) {
-    if (shown !== name) continue;
+  for (const [id, shown] of PANES) {
+    if (shown() !== name) continue;
     const old = $(id).querySelector(selector);
     if (old) old.outerHTML = itemHTML(it);
   }
 }
-// What changes with time, refreshed in place: peer cards (their peer's status and last line), and
-// running tools' elapsed. Cheap: a pane holds a few cards and fewer running tools.
+// A run's line is redrawn in place when one of its calls finishes. Only a run already on screen, and
+// only as far as its pane has rendered; the next render appends the rest.
+function patchRun(name, it) {
+  const t = S.transcripts.get(name); if (!t) return;
+  for (const [id, shown] of PANES) {
+    if (shown() !== name) continue;
+    const el = $(id); if (el.dataset.key !== paneKey(name, t)) continue;
+    const len = Number(el.dataset.len), i = t.items.lastIndexOf(it);
+    if (i < 0 || i >= len) continue;
+    const s = runStart(t, i), old = el.querySelector(`.steps[data-i="${s}"]`);
+    if (old) old.outerHTML = runHTML(t, s, len).html;
+  }
+}
+// What changes with time, refreshed in place: task cards (their bot's status and last line), and
+// running tools' elapsed. Fields change, not the card, so a card under the pointer is never replaced.
 function refreshLive(el) {
-  for (const card of el.querySelectorAll('.peer[data-peek]')) {
-    const c = peerCard(card.dataset.peek); if (!c) continue;
-    card.classList.toggle('sel', c.sel); card.innerHTML = cardInner(c);
+  for (const card of el.querySelectorAll('.peer[data-task]')) {
+    const c = taskCard(card.dataset.task); if (!c) continue;
+    card.classList.toggle('sel', c.sel);
+    const g = card.querySelector('[data-f="g"]'); if (g) { g.className = `glyph ${c.status}`; g.textContent = glyphOf(c.status); }
+    const e = card.querySelector('[data-f="el"]'); if (e) e.textContent = c.elapsed;
+    const l = card.querySelector('[data-f="pl"]'); if (l) l.textContent = c.last;
   }
-  for (const line of el.querySelectorAll('.tool[data-started]')) {
-    const span = line.querySelector('.el'); if (span) span.textContent = fmt(Date.now() - Number(line.dataset.started));
-  }
+  for (const span of el.querySelectorAll('.el[data-started]')) span.textContent = fmt(Date.now() - Number(span.dataset.started));
 }
 // A card's one line: the last non-empty line of the newest text, bounded, so a long reply costs the
 // parent's render nothing.
@@ -715,35 +802,93 @@ function lastLine(t) {
   for (let i = t.items.length - 1; i >= 0; i--) { const it = t.items[i]; if (it.kind === 'text') return tailOf(it.text); if (it.kind === 'tool') return `▸ ${it.name} ${it.summary}`; }
   return '';
 }
+
+// ---------- runs ----------
+// Thinking, tool calls and their output between two messages form one run of steps. A run is one
+// line, folded until clicked: the call in progress, or the tools it used, and any failure.
+const STEP = new Set(['thought', 'tool', 'out']);
+const inRun = (it, turn) => (STEP.has(it.kind) || it.kind === 'backing') && it.turn === turn;
+function runStart(t, i) {
+  const turn = t.items[i].turn; let s = i;
+  while (s > 0 && inRun(t.items[s - 1], turn)) s--;
+  while (s < i && !STEP.has(t.items[s].kind)) s++;
+  return s;
+}
+function runEnd(t, s, limit = t.items.length) { const turn = t.items[s].turn; let e = s + 1; while (e < limit && inRun(t.items[e], turn)) e++; return e; }
+function runHTML(t, s, limit = t.items.length) {
+  const end = runEnd(t, s, limit), items = t.items.slice(s, end);
+  const tools = items.filter((it) => it.kind === 'tool'), thoughts = items.filter((it) => it.kind === 'thought');
+  const open = S.ui.steps || items.some((it) => it.runOpen);
+  const n = tools.length + thoughts.length;
+  // Output whose call is not loaded yet shows as output, not as a fold labeled thought.
+  if (!n) return { html: `<div class="steps" data-i="${s}"><div class="body">${items.map((it, k) => stepHTML(it, s + k)).join('')}</div></div>`, end };
+  let head;
+  if (!tools.length) {
+    const secs = thoughts.length && thoughts.every((it) => it.secs != null) ? thoughts.reduce((a, it) => a + it.secs, 0) : null;
+    head = `thought${secs == null ? '' : ' ' + fmt(secs * 1000)}`;
+  } else {
+    const last = tools[tools.length - 1];
+    const el = last.started ? ` <span class="el" data-started="${last.started}">${fmt(Date.now() - last.started)}</span>` : last.took >= 1500 ? ` <span class="el">${fmt(last.took)}</span>` : '';
+    const now = n === 1 || last.started ? `<b>${esc(last.name)}</b> ${esc(last.summary)}${el}` : esc([...new Set(tools.map((it) => it.name))].join(' · '));
+    head = n === 1 ? `<span class="now">${now}</span>` : `${n} steps <span class="now">${now}</span>`;
+  }
+  let err = null; for (const it of items) if (it.kind === 'out' && it.err) err = it.err;
+  if (err) head += ` <span class="err">✘ ${esc(err)}</span>`;
+  const body = open ? `<div class="body">${items.map((it, k) => stepHTML(it, s + k)).join('')}</div>` : '';
+  return { html: `<div class="steps" data-i="${s}"><div class="sum" data-run="${s}" role="button" tabindex="0">${open ? '▾' : '▸'} ${head}</div>${body}</div>`, end };
+}
+function stepHTML(it, i) {
+  switch (it.kind) {
+    case 'thought': return `<div class="line think">${esc(it.text)}</div>`;
+    case 'tool': { const el = it.started ? `<span class="el" data-started="${it.started}">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}">▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
+    case 'out': {
+      const rows = it.text.split('\n').filter((l) => l.trim()); const long = rows.length > 2;
+      const shown = long && !S.ui.steps && !it.open ? rows.slice(0, 2) : rows;
+      return `<div class="line out${long ? ' fold' : ''}${it.err ? ' bad' : ''}"${long ? ` data-out="${i}"` : ''}>${esc(shown.join('\n'))}${shown.length < rows.length ? ` <span class="more">+${rows.length - shown.length} lines</span>` : ''}</div>`;
+    }
+    default: return '';
+  }
+}
+// Open or close a run, or unfold one output, and redraw just that run.
+function toggleStep(target) {
+  const pane = target.closest('.scroll'); if (!pane) return;
+  const name = pane.id === 'side' ? S.ui.side : S.selected, t = name && S.transcripts.get(name);
+  if (!t || pane.dataset.key !== paneKey(name, t)) return;
+  const len = Number(pane.dataset.len);
+  const i = Number(target.dataset.out ?? target.dataset.run); if (!(i >= 0 && i < len)) return;
+  const s = runStart(t, i), end = runEnd(t, s, len);
+  if (target.dataset.out != null) t.items[i].open = !t.items[i].open;
+  else { const open = !t.items.slice(s, end).some((it) => it.runOpen); for (let k = s; k < end; k++) t.items[k].runOpen = open; }
+  const old = pane.querySelector(`.steps[data-i="${s}"]`); if (old) old.outerHTML = runHTML(t, s, len).html;
+}
+
 function itemHTML(it) {
   switch (it.kind) {
     case 'user': return `<div class="line user">› ${esc(it.text)}</div>`;
     case 'text': return markdown(it.text);
-    case 'thought': return S.ui.thoughts ? `<div class="line think">${esc(it.text)}</div>` : `<div class="line think folded">thought${it.secs == null ? '' : ' ' + fmt(it.secs * 1000)}</div>`;
-    case 'tool': { const el = it.started ? `<span class="el">${fmt(Date.now() - it.started)}</span>` : it.took >= 1500 ? `<span class="el">${fmt(it.took)}</span>` : ''; return `<div class="line tool" data-call="${esc(it.callId)}"${it.started ? ` data-started="${it.started}"` : ''}>▸ <b>${esc(it.name)}</b> ${esc(it.summary)}${el}</div>`; }
-    case 'out': { const rows = it.text.split('\n').filter((l) => l.trim()); const shown = !S.ui.output && rows.length > 2 ? rows.slice(0, 2) : rows; return `<div class="line out">${esc(shown.join('\n'))}${shown.length < rows.length ? ` <span class="more">+${rows.length - shown.length} lines</span>` : ''}</div>`; }
     case 'note': return `<div class="line note">${esc(it.text)}</div>`;
     case 'note_gap': return `<div class="line note">${it.total} ${it.later ? 'later' : 'earlier'} activity notes summarized · durable messages remain available</div>`;
-    case 'peer_gap': return `<div class="line note">${it.total} earlier peers · use ^k to find a bot</div>`;
-    case 'peer': { const c = peerCard(it.who); return c ? cardHTML(c) : ''; }
+    case 'peer_gap': return `<div class="line note">${it.total} earlier tasks · ^k finds a bot</div>`;
+    case 'peer': { const c = taskCard(it.who); return c ? cardHTML(c) : ''; }
     case 'proc': { const status = it.done === null ? 'running' : 'idle'; const last = it.done === null ? it.handle : (it.done || 'done'); return cardHTML({ attr: `data-proc="${esc(it.handle)}"`, status, name: `$ ${it.cmd}`, last, elapsed: '', sel: false }); }
-    case 'node': return '';
-    default: return '';
+    default: return STEP.has(it.kind) ? stepHTML(it, -1) : '';
   }
 }
 // The items from `from` on; a blank line separates turns, judged against the nearest earlier item with
-// one. A run of bare nodes is one placeholder row, so unloaded history costs one element per gap.
+// one. A run of bare nodes is one placeholder row, so unloaded history costs one element per gap, and a
+// run of steps is one line.
 function itemsHTML(t, from = 0) {
   let h = ''; let lastTurn = null; let gap = 0;
   for (let i = from - 1; i >= 0; i--) if (t.items[i].turn != null) { lastTurn = t.items[i].turn; break; }
   const flush = () => { if (gap) { h += `<div class="line pending">… ${gap} earlier</div>`; gap = 0; } };
-  for (let i = from; i < t.items.length; i++) {
+  for (let i = from; i < t.items.length;) {
     const it = t.items[i];
-    if (it.kind === 'history') { flush(); h += `<div class="line pending">… ${it.forward ? 'later history · scroll down' : 'earlier history · scroll up'} to load</div>`; continue; }
-    if (it.kind === 'node' || it.kind === 'tool_stub') { gap += 1; continue; }
+    if (it.kind === 'history') { flush(); h += `<div class="line pending">… ${it.forward ? 'later history · scroll down' : 'earlier history · scroll up'} to load</div>`; i++; continue; }
+    if (it.kind === 'node' || it.kind === 'tool_stub') { gap += 1; i++; continue; }
     flush();
-    if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += '<div class="line"></div>'; lastTurn = it.turn; }
-    h += itemHTML(it);
+    if (it.turn != null && it.turn !== lastTurn) { if (h || from > 0) h += `<div class="line sep" data-sep="${i}"></div>`; lastTurn = it.turn; }
+    if (STEP.has(it.kind)) { const run = runHTML(t, i); h += run.html; i = run.end; continue; }
+    h += itemHTML(it); i++;
   }
   flush();
   return h;
@@ -767,18 +912,15 @@ function renderTail(el, name, t) {
   // or HTML replacement on each delta, and provider text never becomes markup.
   if (value.length > state.offset) { state.text.appendData(value.slice(state.offset)); state.offset = value.length; }
 }
-// A streamed delta touches only the tail. The items rebuild when their
-// count or a fold changes, when a load replaced nodes (gen), or on the
-// slow tick that refreshes elapsed counters and cards.
+// A streamed delta touches only the tail. The items rebuild when a load replaced nodes (gen) or the
+// steps fold changes; items appended since the last render are added on their own, and a step that
+// extends the run on screen redraws that run alone.
 function renderTranscript(el, name) {
   const t = S.transcripts.get(name);
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   const before = el.scrollHeight;
   if (!t) { el.innerHTML = ''; el.dataset.key = ''; return; }
-  // A structural change (a load, a fold, another bot) rebuilds the window; items appended since the
-  // last render are added on their own; everything else changes in place. A streamed delta touches
-  // only the tail.
-  const key = `${name}|${t.gen}|${S.ui.thoughts}|${S.ui.output}`;
+  const key = paneKey(name, t);
   const rendered = el.dataset.key === key ? Number(el.dataset.len) : -1;
   let tail = el.lastElementChild;
   if (rendered < 0 || rendered > t.items.length || !tail || !tail.classList.contains('tail')) {
@@ -788,14 +930,21 @@ function renderTranscript(el, name) {
     // History loaded above the reader keeps their place instead of shoving it down.
     if (!atBottom) el.scrollTop += el.scrollHeight - before;
   } else if (rendered < t.items.length) {
-    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, rendered));
+    let from = rendered;
+    const next = t.items[rendered], prev = t.items[rendered - 1];
+    if (prev && inRun(prev, next.turn) && inRun(next, next.turn)) {
+      const s = runStart(t, rendered - 1);
+      const old = STEP.has(t.items[s].kind) ? el.querySelector(`.steps[data-i="${s}"]`) : null;
+      if (old) { const sep = old.previousElementSibling; if (sep?.dataset?.sep === String(s)) sep.remove(); old.remove(); from = s; }
+    }
+    tail.insertAdjacentHTML('beforebegin', itemsHTML(t, from));
   }
   el.dataset.len = String(t.items.length);
   refreshLive(el);
   renderTail(tail, name, t);
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
-for (const [id, who] of [['log', () => S.selected], ['peek', () => S.ui.peek]]) {
+for (const [id, who] of PANES) {
   $(id).addEventListener('scroll', () => {
     const el = $(id); const name = who(); const t = name && S.transcripts.get(name); if (!t) return;
     const nearTop = el.scrollTop < 200, nearEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
@@ -804,28 +953,84 @@ for (const [id, who] of [['log', () => S.selected], ['peek', () => S.ui.peek]]) 
     if ((nearTop || nearEnd) && (t.nodes > 0 || t.history != null)) enqueue(async () => { await load(name, nearTop); render(); });
   });
 }
-function titleHTML(b, closable) { return `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><b>${esc(b.name)}</b><span>${labelOf(b.status)}</span>${closable ? '<span class="x">Esc closes</span>' : ''}`; }
-// The rail shows a window of rows around the selection; scrolling to an edge extends it. The tree is
-// rebuilt when the fleet's shape changes (a bot created, forked or deleted); a status change patches
-// the bot's own row. A fleet of thousands costs a screenful of rows, not a row each per event.
+
+// ---------- heads and composers ----------
+function headHTML(b, pane) {
+  const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
+  const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
+  if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
+  const lead = b.project ? bot(b.project + LEAD) : null;
+  const crumbs = !lead ? `<b>${esc(b.name)}</b>` : lead === b ? `<b>${esc(b.project)}</b>`
+    : `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(b.project)}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`;
+  return `<div class="crumbs">${crumbs}${state}</div><div class="tools">${moreButton(b.name)}</div>`;
+}
+// A head names a few of the handles a bot waits on and counts the rest, so its cost stays bounded.
+const WAIT_SHOWN = 3;
+function waitSummary(b) {
+  const shown = b.waitingOn.slice(0, WAIT_SHOWN).map((h) => h.replace(/^turn:/, '')).join(', ');
+  const more = b.waitingOn.length - WAIT_SHOWN;
+  return more > 0 ? `${shown} +${more}` : shown;
+}
+// Heads change with their bot's status, not with time, so they are written only when that changes.
+function renderHead(el, b, pane) {
+  const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}` : '-';
+  if (el.dataset.k === key) return; el.dataset.k = key;
+  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME creates one</span></div>' : '';
+}
+const PANE = {
+  main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
+  side: { form: 'sideform', input: 'sideinput', model: 'sidemodel', send: 'sidesend', stop: 'sidestop', bot: () => S.ui.side },
+};
+const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer' };
+// Send starts a turn on a bot at rest; on a working bot it does what the menu last picked.
+// Only a turn that has started can take a steer; one waiting for a slot takes a queue.
+const RUNNING = new Set(['running', 'waiting', 'paced']);
+const sendMode = (b) => !b || !isActive(b.status) ? 'send' : S.send === 'steer' && !RUNNING.has(b.status) ? 'queue' : S.send;
+const providerOf = (model) => String(model ?? '').split('/')[0];
+// A turn may run on the bot's own provider, or on another the fleet's records show in its family.
+function runsOn(b, model) {
+  const p = providerOf(model), own = providerOf(b.model);
+  if (p === own) return true;
+  const fam = b.family ?? S.families.get(own);
+  return fam != null && S.families.get(p) === fam;
+}
+const modelOf = (b) => S.override.get(b.name) ?? b.model;
+function renderComposer(pane, b) {
+  const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '';
+  const key = b ? `${b.name}|${mode}|${model}|${b.runningTurn !== null}` : '-';
+  const send = $(ids.send); if (send.dataset.k === key) return; send.dataset.k = key;
+  send.textContent = ACTION[mode];
+  $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model} ▾` : '';
+  $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
+  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME [PROVIDER/MODEL]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : '';
+}
+
+// ---------- sidebar ----------
+// The sidebar shows a window of rows around the selection; scrolling to an edge extends it. The rows
+// are rebuilt when the fleet's shape changes (a bot created, forked or deleted, a project folded); a
+// status change patches the bot's own row. A fleet of thousands costs a screenful of rows, not a row
+// each per event.
 const RAIL_ROWS = 300;
-const rail = { shapeGen: -1, selected: null, rows: [], index: new Map(), start: 0, end: 0, key: '' };
+const rail = { shapeGen: -1, drawn: -1, selected: null, rows: [], index: new Map(), start: 0, end: 0, key: '' };
 function railRows() {
-  if (rail.shapeGen !== S.shapeGen) { rail.rows = tree(); rail.index = new Map(rail.rows.map((n, i) => [n.b.name, i])); rail.shapeGen = S.shapeGen; rail.key = ''; }
+  if (rail.shapeGen !== S.shapeGen) {
+    rail.rows = tree(); rail.index = new Map(); rail.rows.forEach((n, i) => { if (n.b) rail.index.set(n.b.name, i); });
+    rail.shapeGen = S.shapeGen; rail.key = '';
+  }
   return rail.rows;
 }
 function renderRail() {
-  const recenter = rail.shapeGen !== S.shapeGen || rail.selected !== S.selected;
+  const recenter = rail.drawn !== S.shapeGen || rail.selected !== S.selected;
   const rows = railRows(); const el = $('bots');
   const sel = rail.index.get(S.selected) ?? 0;
-  const key = `${S.shapeGen}|${S.selected}|${rail.start}|${rail.end}`;
-  if (rail.key !== key) {
+  const key = () => `${S.shapeGen}|${S.selected}|${S.ui.side}|${rail.start}|${rail.end}`;
+  if (rail.key !== key()) {
     if (recenter) { rail.start = Math.max(0, sel - RAIL_ROWS / 2); rail.end = Math.min(rows.length, rail.start + RAIL_ROWS); }
-    rail.selected = S.selected;
-    rail.key = `${S.shapeGen}|${S.selected}|${rail.start}|${rail.end}`;
+    rail.selected = S.selected; rail.drawn = S.shapeGen;
+    rail.key = key();
     const above = rail.start ? `<div class="botrow more">… ${rail.start} above</div>` : '';
     const below = rail.end < rows.length ? `<div class="botrow more">… ${rows.length - rail.end} below</div>` : '';
-    el.innerHTML = above + rows.slice(rail.start, rail.end).map((n) => botRowHTML(n, n.b.name === S.selected)).join('') + below;
+    el.innerHTML = above + rows.slice(rail.start, rail.end).map((n) => botRowHTML(n, n.b?.name === S.selected)).join('') + below;
     el.dataset.key = rail.key;
   }
 }
@@ -834,7 +1039,6 @@ function patchRailRow(name) {
   if (!S.ui.rail) return;
   const i = rail.index.get(name); if (i === undefined || i < rail.start || i >= rail.end) return;
   const el = $('bots'); const old = el.querySelector(`.botrow[data-bot="${cssEsc(name)}"]`); if (!old) return;
-  if (old.nextElementSibling?.classList.contains('w')) old.nextElementSibling.remove();
   old.outerHTML = botRowHTML(rail.rows[i], name === S.selected);
 }
 $('bots').addEventListener('scroll', () => {
@@ -843,7 +1047,7 @@ $('bots').addEventListener('scroll', () => {
   else if (el.scrollHeight - el.scrollTop - el.clientHeight < 100 && rail.end < rows.length) { rail.start = Math.min(Math.max(0, rows.length - RAIL_ROWS), rail.start + RAIL_ROWS / 2); moved = true; }
   if (moved) {
     rail.end = Math.min(rows.length, rail.start + RAIL_ROWS);
-    const name = rows[Math.max(previousStart, rail.start)]?.b.name;
+    const name = rows.slice(Math.max(previousStart, rail.start)).find((n) => n.b)?.b.name;
     const selector = `.botrow[data-bot="${cssEsc(name)}"]`;
     const before = el.querySelector(selector)?.offsetTop, top = el.scrollTop;
     rail.key = ''; renderRail();
@@ -851,50 +1055,55 @@ $('bots').addEventListener('scroll', () => {
     if (before != null && after != null) el.scrollTop = top + after - before;
   }
 });
+// A project's row is its coordinator: click it to talk to the coordinator; the chevron folds its tasks.
 function botRowHTML(n, sel) {
-  const b = n.b;
-  const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => esc(h.replace(/^turn:/, '').split('/')[0])).join(' ')}</div>` : '';
-  return `<div class="botrow${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span><span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="n">${esc(b.name)}</span></div>${w}`;
+  if (n.label) return `<div class="sblabel">${esc(n.label)}</div>`;
+  const b = n.b, acts = `<span class="acts">${moreButton(b.name)}</span>`;
+  const glyph = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span>`;
+  if (n.head != null) {
+    const folded = S.ui.folded.has(n.head);
+    const chev = n.tasks ? `<button type="button" class="chev" data-act="fold" data-v="${esc(n.head)}" aria-label="${folded ? 'Show' : 'Hide'} tasks">${folded ? '▸' : '▾'}</button>` : '<span class="chev"></span>';
+    return `<div class="botrow proj${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0">${chev}${glyph}<span class="n">${esc(n.head)}</span>${acts}</div>`;
+  }
+  const beside = S.ui.side === b.name ? ' beside' : '';
+  return `<div class="botrow${sel ? ' sel' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span>${glyph}<span class="n">${esc(shortName(b))}</span>${acts}</div>`;
 }
 function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
 function keybarHTML(b) {
   const busy = b && isActive(b.status);
-  const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : busy ? labelOf(b.status) : 'live'}</span>`;
+  const dot = `<span><span class="dot${!S.attached ? ' off' : busy ? ' busy' : ''}"></span>${!S.attached ? 'detached' : 'live'}</span>`;
   const keys = [];
-  if (S.ui.picker) keys.push('<kbd>↑↓</kbd> choose', '<kbd>Enter</kbd> switch', '<kbd>Esc</kbd> cancel');
-  else if (S.ui.peek) keys.push('<kbd>Esc</kbd> close', '<kbd>^p</kbd> next peer', '<kbd>^k</kbd> switch');
-  else {
-    keys.push('<kbd>^k</kbd> switch'); if (peers().length) keys.push('<kbd>^p</kbd> peek'); keys.push('<kbd>^b</kbd> bots');
-    const t = S.transcripts.get(S.selected);
-    if (t?.thoughts > 0) keys.push(`<kbd>^t</kbd> ${S.ui.thoughts ? 'fold' : 'thoughts'}`);
-    if (t?.longOut > 0) keys.push(`<kbd>^o</kbd> ${S.ui.output ? 'fold' : 'output'}`);
-    if (busy) keys.push('<kbd>Esc</kbd> interrupt');
-    keys.push('<kbd>^d</kbd> detach');
-  }
-  return `${dot}<span class="bot">${esc(b?.name ?? '')}</span>${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
+  if (S.ui.picker) keys.push('<kbd>↑↓</kbd> choose', '<kbd>Enter</kbd> open', '<kbd>Esc</kbd> cancel');
+  else { keys.push('<kbd>^k</kbd> find'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
+  return `${dot}${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
 }
 function render() {
-  const app = $('app'); const b = bot(S.selected);
-  app.classList.toggle('rail', S.ui.rail); app.classList.toggle('peek', !!S.ui.peek && S.bots.has(S.ui.peek));
-  $('title').innerHTML = b ? titleHTML(b) : '<span>no bots · /new NAME creates one</span>';
-  if (b) renderTranscript($('log'), b.name); else $('log').innerHTML = '';
+  const app = $('app');
+  // The sidebar's rows also stamp each bot's project, which names and crumbs use.
+  railRows();
+  const b = bot(S.selected);
+  if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
+  const side = S.ui.side ? bot(S.ui.side) : null;
+  app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
+  renderHead($('title'), b, 'main');
+  if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; }
   if (S.ui.rail) renderRail();
-  if (S.ui.peek && bot(S.ui.peek)) { $('peektitle').innerHTML = titleHTML(bot(S.ui.peek), true); renderTranscript($('peek'), S.ui.peek); }
-  $('who').textContent = b ? `${b.name} ›` : '›';
-  $('input').placeholder = b ? (b.status === 'idle' ? '' : `${b.name} is ${labelOf(b.status)}; your message queues`) : '/new NAME [PROVIDER/MODEL]';
+  if (side) { renderHead($('sidetitle'), side, 'side'); renderTranscript($('side'), side.name); }
+  renderComposer('main', b); renderComposer('side', side);
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
+  refreshMenu();
 }
-// Once a second, while anything runs: the clocks on cards and tool lines, in place. The activity
+// Once a second, while anything runs: the clocks on cards and run lines, in place. The activity
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
 let activeAt = -1, active = false;
 function anyActive() { if (activeAt !== S.botsGen) { activeAt = S.botsGen; active = [...S.bots.values()].some((b) => isActive(b.status)); } return active; }
-setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.peek) refreshLive($('peek')); const b = bot(S.selected); if (b) $('title').innerHTML = titleHTML(b); } }, 1000);
+setInterval(() => { if (S.attached && anyActive()) { refreshLive($('log')); if (S.ui.side) refreshLive($('side')); } }, 1000);
 
 // ---------- picker ----------
 function pickerRows() {
   const q = $('pickerq').value.trim().toLowerCase();
-  return tree().map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
+  return tree(true).filter((n) => n.b).map((n) => ({ ...n, i: q ? n.b.name.toLowerCase().indexOf(q) : -1 })).filter((r) => !q || r.i >= 0);
 }
 const PICKER_ROWS = 200;
 function renderPicker() {
@@ -908,21 +1117,114 @@ function renderPicker() {
     return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
-function openPicker() { S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
-function closePicker() { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $('input').focus(); }
-async function switchTo(name) { if (!S.bots.has(name)) return; S.selected = name; S.autoSelect = false; if (S.ui.peek === name) S.ui.peek = null; await enqueue(loadVisible); render(); save(); }
+let pickerPane = 'main';
+function openPicker() { pickerPane = paneOf(document.activeElement, menuPane); closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
+// A pick opens its bot alone, so focus goes to the main composer; Escape goes back where it was.
+function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
 async function showHelp() {
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   switch bot        ^b   pin the bot rail\n ^p   peek next peer    Esc  close · then interrupt\n ^t   unfold thoughts   ^o   unfold tool output\n ^d   detach (close)    ↑ ↓  previous / next bot\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot\n Enter sends · Shift-Enter a new line\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: agent models --discover writes ~/.agent/models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
 }
 function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $('input').focus(); }
 
+// ---------- menus ----------
+// One menu at a time: an agent's ⋯ (from its head, its sidebar row, its card, or a right-click), the
+// model chip, and Send's ▾.
+let menuAnchor = null, menuFor = null, menuKey = '', menuPane = 'main';
+const menuSig = (items) => items.map((i) => `${i.act}:${!!i.disabled}:${!!i.on}:${i.hint ?? ''}`).join('|');
+function menuHTML(items) {
+  return items.map((i) => i.sep ? '<hr>' : i.head ? `<div class="lab">${esc(i.head)}</div>` :
+    `<button type="button" role="menuitem"${i.disabled ? ' disabled' : ''}${i.danger ? ' class="danger"' : ''} data-act="${i.act}"${i.who != null ? ` data-who="${esc(i.who)}"` : ''}${i.v != null ? ` data-v="${esc(i.v)}"` : ''}${i.pane ? ` data-pane="${i.pane}"` : ''}><span><span class="ck">${i.on ? '✓' : ''}</span>${esc(i.label)}</span><span class="mh">${esc(i.hint ?? '')}</span></button>`).join('');
+}
+function showMenu(items, anchor, who = null) {
+  // Focus goes back to the pane the menu came from, so typing after it reaches the same bot.
+  menuPane = paneOf(document.activeElement, menuPane);
+  const m = $('menu'); m.innerHTML = menuHTML(items); m.classList.add('on'); S.ui.menu = true; menuAnchor = anchor; menuFor = who; menuKey = menuSig(items);
+  const w = m.offsetWidth, h = m.offsetHeight, W = window.innerWidth, H = window.innerHeight;
+  let x = anchor.x, y = anchor.y;
+  if (anchor.rect) { const a = anchor.rect; x = a.right - w; y = anchor.up ? a.top - h - 4 : a.bottom + 4; }
+  m.style.left = `${Math.max(4, Math.min(x, W - w - 4))}px`; m.style.top = `${Math.max(4, Math.min(y, H - h - 4))}px`;
+  m.querySelector('button:not([disabled])')?.focus({ preventScroll: true });
+}
+function closeMenu() {
+  if (!S.ui.menu) return; S.ui.menu = false; menuFor = null;
+  const m = $('menu'), had = m.contains?.(document.activeElement); m.classList.remove('on');
+  // A menu that replaces this one (Delete's confirmation) keeps the focus.
+  if (had) setTimeout(() => { if (!S.ui.menu && !S.ui.picker) $(PANE[S.ui.side ? menuPane : 'main'].input)?.focus({ preventScroll: true }); }, 0);
+}
+// The composer pane an element sits in; focus inside the menu keeps the pane it came from.
+function paneOf(el, fallback = 'main') {
+  if ($('menu').contains?.(el)) return fallback;
+  return el?.closest?.('.pane.side') ? 'side' : 'main';
+}
+// An open agent menu follows its bot: a status change rebuilds it in place, a deletion closes it.
+function refreshMenu() {
+  if (!S.ui.menu || menuFor == null) return;
+  if (!S.bots.has(menuFor)) { closeMenu(); return; }
+  const items = botMenuItems(menuFor);
+  if (menuSig(items) !== menuKey) showMenu(items, menuAnchor, menuFor);
+}
+// Side chat needs a fork of a running bot, which the daemon does not do yet; Keep belongs to a side chat.
+function botMenuItems(name) {
+  const b = bot(name); if (!b) return [];
+  const busy = isActive(b.status);
+  return [
+    { act: 'side-chat', who: name, label: 'Side chat', hint: '⑂', disabled: true },
+    { act: 'stop', who: name, label: 'Stop', disabled: b.runningTurn === null },
+    { act: 'fork', who: name, label: 'Fork', hint: busy ? 'when idle' : '', disabled: busy },
+    { act: 'delete', who: name, label: 'Delete', hint: busy ? 'when idle' : '', disabled: busy },
+    { sep: true },
+    { act: 'steps', label: 'Show all thoughts and output', on: S.ui.steps, hint: '^o' },
+  ];
+}
+// A bot keeps its model family for life; a turn may run on any model of that family. Another family,
+// or a provider whose family no record shows, is a new agent. The bot's own model is always offered.
+function modelChoices(b, list) {
+  const ids = list.map((m) => m.id);
+  const mine = ids.filter((id) => runsOn(b, id)), others = ids.filter((id) => !runsOn(b, id));
+  if (!mine.includes(b.model)) mine.unshift(b.model);
+  const current = modelOf(b);
+  return [...mine.map((id) => ({ id, ok: true, on: id === current })), ...others.map((id) => ({ id, ok: false, on: false }))];
+}
+function modelMenuItems(b, list, error) {
+  const items = []; let group = null;
+  for (const c of modelChoices(b, list)) {
+    if (group !== null && providerOf(c.id) !== group) items.push({ sep: true });
+    group = providerOf(c.id);
+    items.push({ act: 'set-model', who: b.name, v: c.id, label: c.id, on: c.on, disabled: !c.ok, hint: c.ok ? '' : 'new agent' });
+  }
+  if (error) items.push({ sep: true }, { act: 'none', label: error, disabled: true });
+  return items;
+}
+function sendMenuItems(pane) {
+  return [
+    { act: 'set-send', pane, v: 'queue', label: 'Queue after this turn', on: S.send === 'queue' },
+    { act: 'set-send', pane, v: 'steer', label: 'Steer into this turn', on: S.send === 'steer' },
+    { act: 'side-chat', label: 'Side chat', hint: '⑂', disabled: true },
+  ];
+}
+function setSend(mode) { S.send = mode === 'steer' ? 'steer' : 'queue'; try { localStorage.setItem('agent:send', S.send); } catch (_) {} }
+function setModel(name, model) {
+  const b = bot(name); if (!b || !runsOn(b, model)) return false;
+  if (model === b.model) S.override.delete(name); else S.override.set(name, model);
+  save(); return true;
+}
+async function modelMenu(pane, anchor) {
+  const b = bot(PANE[pane].bot()); if (!b) return;
+  // Read now, so an edited ~/.agent/models shows without a restart.
+  let list = [], error = null;
+  try { list = await Daemon.models(); if (!list.length) error = 'agent models --discover lists more'; } catch (e) { error = String(e?.message ?? e); }
+  // The pane may show another bot, or this name another identity, by the time the list is read.
+  if (PANE[pane].bot() !== b.name || bot(b.name) !== b) return;
+  showMenu(modelMenuItems(b, list, error), anchor);
+}
+
 // ---------- actions ----------
-async function submit(text) {
-  if (text.startsWith('/new ')) {
+async function submit(text, pane = 'main') {
+  if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
     const m = model || S.config?.model; if (!m) throw new Error('model_required: NAME PROVIDER/MODEL, or set AGENT_MODEL');
@@ -932,55 +1234,193 @@ async function submit(text) {
     const session = S.session;
     const record = await Daemon.request('create', { bot: name, workspace: S.config.workspace, model: m, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
     await enqueue(() => { if (S.session === session) seat(record, session); });
-    await switchTo(name); toast(`created ${name} · ${policy.note}`); return;
+    await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(); return; }
-  const b = bot(S.selected); if (!b) throw new Error('no bot selected; /new NAME creates one');
+  const b = bot(PANE[pane].bot()); if (!b) throw new Error('no bot selected; /new NAME creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
+  const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
+  // A steer joins the running turn only on that turn's model and folder, so it names neither.
+  // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
+  // rather than the message landing in whatever turn runs next.
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { workspace: b.workspace ?? S.config.workspace, ...(model && model !== b.model ? { model } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
-  await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, workspace: b.workspace ?? S.config.workspace, delivery: b.status === 'idle' ? 'reject' : 'queue' });
+  try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
+  catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
 }
-async function interrupt() { const b = bot(S.selected); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
+async function interrupt(name = S.selected) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
+// `NAME-fork`, then `NAME-fork-2` on, with NAME cut whole characters short so the daemon's
+// 128-byte name limit holds.
+const NAME_BYTES = 128;
+function forkName(name, k) {
+  const suffix = k > 1 ? `-fork-${k}` : '-fork';
+  let base = '', bytes = 0;
+  for (const c of name) {
+    const n = c.codePointAt(0) < 0x80 ? 1 : c.codePointAt(0) < 0x800 ? 2 : c.codePointAt(0) < 0x10000 ? 3 : 4;
+    if (bytes + n + suffix.length > NAME_BYTES) break;
+    base += c; bytes += n;
+  }
+  return base + suffix;
+}
+// A fork is an exact copy of a bot at rest, next to it in the tree, opened beside.
+async function fork(name) {
+  const b = bot(name); if (!b) return;
+  if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
+  if (isActive(b.status)) throw new Error('bot_busy: a running bot forks once its turn ends');
+  let copy = forkName(name, 1); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k);
+  // A task known only by its project prefix sits under the coordinator, and so does its fork.
+  const lead = b.project ? bot(b.project + LEAD) : null;
+  const parent = creatorOf(b) ?? (lead && lead !== b && lead.id != null ? lead : b), session = S.session;
+  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: parent.name, created_by_id: parent.id, ...(b.workspace ? { workspace: b.workspace } : {}) });
+  await enqueue(() => { if (S.session === session) seat(record, session); });
+  S.shapeGen += 1;
+  await openBeside(copy);
+}
+async function remove(name) { await Daemon.request('delete', { bot: name }); }
+// A project in a folder: the folder's `.agent/project.toml` names it, or the folder's own name does,
+// and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
+// twice, unless it works in another folder. The file is written only once the daemon has accepted
+// the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
+// the file it lacks, with that coordinator's model, so a failed write retries.
+async function createProject(dir) {
+  const info = await Daemon.project(dir);
+  const existing = bot(info.coordinator);
+  if (existing) {
+    if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
+    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model });
+    await openOnly(info.coordinator); return;
+  }
+  const model = info.model || S.config?.model;
+  if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agent/project.toml');
+  const policy = await Daemon.policy(info.dir);
+  const session = S.session;
+  const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
+  await enqueue(() => { if (S.session === session) seat(record, session); });
+  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
+  await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
+}
 function detach() { save(); Daemon.close(); }
 
+// ---------- opening threads ----------
+// From the sidebar or the finder a thread takes the whole window, with nothing beside it.
+async function openOnly(name) {
+  if (!S.bots.has(name)) return;
+  S.selected = name; S.autoSelect = false; S.ui.side = null;
+  const p = bot(name).project; if (p && S.ui.folded.delete(p)) S.shapeGen += 1;
+  await enqueue(loadVisible); render(); save();
+}
+// A task card opens its bot beside the thread; clicking it again closes it.
+async function openBeside(name) {
+  if (!S.bots.has(name) || name === S.selected) return;
+  S.ui.side = S.ui.side === name ? null : name;
+  // A draft belongs to the bot it was typed for, not to the pane.
+  $('sideinput').value = '';
+  await enqueue(loadVisible); render(); save();
+  focusInput(S.ui.side ? 'side' : 'main');
+}
+// Ctrl-P puts the next peer beside; like any other bot opened there, it starts with an empty draft.
+async function nextBeside() {
+  const ps = peers().filter((who) => who !== S.selected); if (!ps.length) return;
+  const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next === S.ui.side) return;
+  S.ui.side = next; $('sideinput').value = '';
+  await enqueue(loadVisible); render(); save(); focusInput('side');
+}
+// Drafts travel with their bots.
+function swap() {
+  if (!S.ui.side) return;
+  [S.selected, S.ui.side] = [S.ui.side, S.selected];
+  [$('input').value, $('sideinput').value] = [$('sideinput').value, $('input').value];
+  render(); save(); focusInput('main');
+}
+function closeSide() { if (!S.ui.side) return; S.ui.side = null; $('sideinput').value = ''; render(); save(); focusInput('main'); }
+function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
+function showNewProject(on) {
+  $('projform').hidden = !on; $('newproj').hidden = on;
+  if (on) { $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus(); }
+}
+
 // ---------- input ----------
-$('form').addEventListener('submit', async (e) => {
-  e.preventDefault(); const v = $('input').value.trim(); if (!v) return; $('input').value = '';
-  try { await submit(v); } catch (err) { toast(String(err?.message ?? err)); $('input').value = v; }
+function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.height = `${Math.min(160, el.scrollHeight)}px`; }
+for (const [pane, ids] of Object.entries(PANE)) {
+  $(ids.form).addEventListener('submit', async (e) => {
+    e.preventDefault(); const input = $(ids.input); const v = input.value.trim(); if (!v) return; input.value = ''; grow(input);
+    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); input.value = v; grow(input); }
+  });
+  $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
+  $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });
+}
+$('projform').addEventListener('submit', async (e) => {
+  e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
+  try { await createProject(dir); showNewProject(false); } catch (err) { toast(String(err?.message ?? err), 5000); }
 });
-$('input').addEventListener('input', () => { if ($('input').value === '?') { $('input').value = ''; showHelp(); } });
+$('projdir').addEventListener('keydown', (e) => { if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
   const rows = pickerRows();
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
-  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker(); if (r) await switchTo(r.b.name); e.preventDefault(); }
+  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await openOnly(r.b.name); e.preventDefault(); }
 });
-$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker(); await switchTo(r.dataset.pick); } });
+$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await openOnly(r.dataset.pick); } });
+const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
-  if (S.ui.picker) return;
+  // The finder and the folder field handle their own keys; Escape there must not stop a turn.
+  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
+  if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
   if (ctrl && k === 'b') { S.ui.rail = !S.ui.rail; render(); save(); e.preventDefault(); return; }
   if (ctrl && k === 'd') { detach(); e.preventDefault(); return; }
-  if (ctrl && k === 't') { S.ui.thoughts = !S.ui.thoughts; render(); save(); e.preventDefault(); return; }
-  if (ctrl && k === 'o') { S.ui.output = !S.ui.output; render(); save(); e.preventDefault(); return; }
-  if (ctrl && k === 'p') { const ps = peers(); if (ps.length) { const i = ps.indexOf(S.ui.peek); S.ui.peek = ps[(i + 1) % ps.length]; await enqueue(loadVisible); render(); save(); } e.preventDefault(); return; }
-  if (k === 'Escape') { if (S.ui.peek) S.ui.peek = null; else if (S.ui.rail) S.ui.rail = false; else await interrupt(); render(); save(); e.preventDefault(); return; }
-  const empty = $('input').value === '';
-  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await switchTo(names[i]); } e.preventDefault(); return; }
-  if (e.target.id !== 'input' && k.length === 1 && !ctrl) $('input').focus();
+  if (ctrl && k === 'o') { S.ui.steps = !S.ui.steps; render(); save(); e.preventDefault(); return; }
+  if (ctrl && k === 'p') { await nextBeside(); e.preventDefault(); return; }
+  if (k === 'Escape') { if (S.ui.side) closeSide(); else await interrupt(); e.preventDefault(); return; }
+  const empty = e.target.id === 'input' && $('input').value === '';
+  if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
+  if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
 });
+async function act(el) {
+  const a = el.dataset.act, who = el.dataset.who, v = el.dataset.v, pane = el.dataset.pane, rect = el.getBoundingClientRect?.();
+  switch (a) {
+    case 'more': showMenu(botMenuItems(who), { rect }, who); return;
+    case 'model': await modelMenu(pane, { rect, up: true }); return;
+    case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
+    case 'set-model': setModel(who, v); render(); focusInput(who === S.ui.side ? 'side' : 'main'); return;
+    case 'set-send': setSend(v); render(); focusInput(pane); return;
+    case 'stop': await interrupt(who); return;
+    case 'stop-pane': await interrupt(PANE[pane].bot()); return;
+    case 'fork': await fork(who); return;
+    case 'delete': showMenu([{ act: 'delete-yes', who, label: `Delete ${shortName(bot(who))}`, danger: true }, { act: 'close-menu', label: 'Cancel' }], menuAnchor ?? { rect }); return;
+    case 'delete-yes': await remove(who); return;
+    case 'steps': S.ui.steps = !S.ui.steps; render(); save(); return;
+    case 'fold': if (!S.ui.folded.delete(v)) S.ui.folded.add(v); S.shapeGen += 1; render(); save(); return;
+    case 'open': await openOnly(who); return;
+    case 'swap': swap(); return;
+    case 'close-side': closeSide(); return;
+    case 'new-project': showNewProject(true); return;
+    default: return;
+  }
+}
 document.addEventListener('click', async (e) => {
   if (S.ui.help) { hideHelp(); return; }
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
-  const row = e.target.closest('[data-bot]'); const peek = e.target.closest('[data-peek]');
-  if (row) await switchTo(row.dataset.bot);
-  else if (peek) { S.ui.peek = S.ui.peek === peek.dataset.peek ? null : peek.dataset.peek; await enqueue(loadVisible); render(); save(); }
-  if (!e.target.closest('input')) $('input').focus();
+  const button = e.target.closest('[data-act]');
+  closeMenu();
+  if (button) { if (!button.disabled) { try { await act(button); } catch (err) { toast(String(err?.message ?? err), 4000); } } return; }
+  if (e.target.closest('#menu')) return;
+  const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]');
+  if (step) toggleStep(step);
+  else if (task) await openBeside(task.dataset.task);
+  else if (row) await openOnly(row.dataset.bot);
+  // Clicks return the keyboard to the pane's composer, unless they selected text to copy.
+  if (!e.target.closest('input, textarea, form') && window.getSelection?.()?.isCollapsed !== false) focusInput(e.target.closest('.pane.side') ? 'side' : 'main');
+});
+document.addEventListener('contextmenu', (e) => {
+  const t = e.target.closest('[data-bot], [data-task]'); if (!t) return;
+  const who = t.dataset.bot ?? t.dataset.task;
+  e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
 
 // ---------- boot ----------

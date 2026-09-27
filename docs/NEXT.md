@@ -939,11 +939,26 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     the daemon's `provider_models`. Source read 2026-09-27: Codex (9db8162)
     refreshes its bundled catalog from the Codex backend's `/models`,
     OpenCode (b471c2b) and Pi (badlogic/pi-mono 2b0a123) from models.dev
-    catalogs. The daemon never reads the list. Next, in
-    order: the app shell (projects in the sidebar from coordinator bots and
-    `.agent/project.toml`, a side pane with its own composer, the model chip,
-    Send with queue, steer or side chat, one ⋯ menu, runs folded to one line);
-    tasks in worktrees (`run --new --worktree` with a setup command, in the
+    catalogs. The daemon never reads the list. Done
+    (2026-09-27): the app shell ([APP.md](APP.md#projects-and-panes)):
+    projects in the sidebar from coordinator bots and `.agent/project.toml`,
+    a side pane with its own composer, the model chip, Send with queue or
+    steer, one ⋯ menu, runs folded to one line. Side chat shows disabled
+    until item 43. Follow-up: `delete` and `fork` take only a name, so a
+    delete or fork the app started can land on a bot recreated under that
+    name meanwhile; both should take the bot's id, as `submit` does. The
+    same holds for a model menu left open across such a recreation. And a
+    `project.toml` another window writes between the app reading the folder
+    and creating the coordinator is refused only after the coordinator
+    exists; creation should re-check the file or remove that coordinator.
+    A coordinator on a model other than its file's opens without a word.
+    `created` and `forked` events carry no protocol family, so a bot on a
+    provider the window has not seen marks that family's models "new agent"
+    until the app reattaches. After a reattach, task cards inside the side
+    pane show no latest line until opened, since only the main pane's peers
+    are loaded.
+    Next, in
+    order: tasks in worktrees (`run --new --worktree` with a setup command, in the
     client); side chats once item 43's fork changes land; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
     text in the client policy; swarms last, since that design is not decided.

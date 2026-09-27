@@ -8,13 +8,30 @@
 </head>
 <body>
 <div id="app">
-  <div class="pane rail"><div class="pane-title">bots</div><div class="scroll" id="bots"></div></div>
-  <div class="pane main"><div class="pane-title" id="title"></div><div class="scroll" id="log"></div></div>
-  <div class="pane peekpane"><div class="pane-title" id="peektitle"></div><div class="scroll" id="peek"></div></div>
-  <form class="prompt" id="form"><span class="who" id="who">›</span><input id="input" autocomplete="off" spellcheck="false" aria-label="Prompt"></form>
+  <div class="pane sidebar">
+    <div class="pane-title">projects</div>
+    <div class="scroll" id="bots"></div>
+    <button type="button" class="newproj" id="newproj" data-act="new-project">＋ New project</button>
+    <form class="newproj" id="projform" hidden><span>＋</span><input id="projdir" autocomplete="off" spellcheck="false" aria-label="Project folder" placeholder="folder"></form>
+  </div>
+  <div class="pane main">
+    <div class="phead" id="title"></div>
+    <div class="scroll" id="log"></div>
+    <form class="composer" id="form">
+      <div class="cbox"><textarea id="input" rows="1" autocomplete="off" spellcheck="false" aria-label="Message"></textarea><div class="cacts"><button type="button" class="mchip" id="model" data-act="model" data-pane="main" title="Model" hidden></button><button type="button" class="cbtn stop" id="stop" data-act="stop-pane" data-pane="main" title="Stop" aria-label="Stop" hidden>■</button><span class="split"><button type="submit" class="cbtn send" id="send">Send</button><button type="button" class="cbtn send caret" data-act="sendmenu" data-pane="main" title="Queue, steer or side chat" aria-label="Ways to send">▾</button></span></div></div>
+    </form>
+  </div>
+  <div class="pane side">
+    <div class="phead" id="sidetitle"></div>
+    <div class="scroll" id="side"></div>
+    <form class="composer" id="sideform">
+      <div class="cbox"><textarea id="sideinput" rows="1" autocomplete="off" spellcheck="false" aria-label="Message beside"></textarea><div class="cacts"><button type="button" class="mchip" id="sidemodel" data-act="model" data-pane="side" title="Model" hidden></button><button type="button" class="cbtn stop" id="sidestop" data-act="stop-pane" data-pane="side" title="Stop" aria-label="Stop" hidden>■</button><span class="split"><button type="submit" class="cbtn send" id="sidesend">Send</button><button type="button" class="cbtn send caret" data-act="sendmenu" data-pane="side" title="Queue, steer or side chat" aria-label="Ways to send">▾</button></span></div></div>
+    </form>
+  </div>
   <div class="keybar" id="keybar"></div>
 </div>
-<div class="overlay" id="pickerwrap"><div class="picker"><div class="q"><span>›</span><input id="pickerq" placeholder="switch to…" aria-label="Filter bots"></div><div class="list" id="pickerlist"></div></div></div>
+<div class="menu" id="menu" role="menu"></div>
+<div class="overlay" id="pickerwrap"><div class="picker"><div class="q"><span>›</span><input id="pickerq" placeholder="find a bot…" aria-label="Filter bots"></div><div class="list" id="pickerlist"></div></div></div>
 <div class="overlay" id="helpwrap"><div class="helpbox" id="helptext"></div></div>
 <div class="detached" id="detached"></div>
 <script src="daemon.js"></script>
