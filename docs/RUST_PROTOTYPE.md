@@ -1319,6 +1319,11 @@ cannot be read back without a transcript scan, so the upgrade ends a turn
 left parked the way every open ends a running one: interrupted, its calls
 answered, its history kept. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
 prompt; turns stored before record none, so they read as a person's.
+Schema 39 records the folder each earlier turn ran in. Schema 40 adds each
+bot's own [settings](#bot-settings), the daemon's flags before it, so an
+existing bot takes the defaults; it also gives a turn an earlier daemon
+parked the fields added to its record since, with the values that daemon ran
+it with, so every parked record has one shape.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may
 use lossless LZ4 blocks. Each remains one SQLite BLOB with a small offset

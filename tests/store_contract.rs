@@ -1815,19 +1815,57 @@ fn schema_39_records_the_folder_each_earlier_turn_ran_in() {
 }
 
 #[test]
-fn schema_40_gives_every_existing_bot_the_defaults() {
+fn schema_40_gives_every_existing_bot_the_defaults_and_completes_parked_turns() {
     let path = std::env::temp_dir().join(format!("agent-settings-{}.sqlite", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    {
+    let turn = {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
         db.create("Bob", Some("/synthetic"), binding()).unwrap();
-    }
+        converse(&mut db, "Bob", 1);
+        let turn = db
+            .begin(
+                "Bob",
+                "r2",
+                "work",
+                true,
+                &TurnOptions::default(),
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let (item, w) = call("w");
+        db.append(turn, vec![item], std::slice::from_ref(&w), None)
+            .unwrap();
+        db.tool_start(turn, &w).unwrap();
+        db.suspend(turn, "w", &["turn:Nobody/1".into()], None, false, &[], None)
+            .unwrap();
+        turn
+    };
+    // An earlier daemon parked it before these fields were recorded.
     Connection::open(&path)
         .unwrap()
-        .execute_batch("ALTER TABLE bots DROP COLUMN settings; PRAGMA user_version=39;")
+        .execute_batch(
+            "ALTER TABLE bots DROP COLUMN settings;
+             UPDATE turns SET waiting=json_remove(waiting,'$.any','$.paced_since_ms',
+                '$.call_attempts','$.call_spent_ms','$.compaction') WHERE waiting IS NOT NULL;
+             PRAGMA user_version=39;",
+        )
         .unwrap();
     let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
     assert_eq!(db.inspect("Bob").unwrap().settings, Settings::default());
+    let parked = db.waiting_turns().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        (
+            parked[0].turn,
+            parked[0].any,
+            parked[0].paced_since_ms,
+            parked[0].call_attempts,
+            parked[0].call_spent_ms,
+            parked[0].compaction
+        ),
+        (turn, false, None, 0, 0, false)
+    );
     drop(db);
     let version: i32 = Connection::open(&path)
         .unwrap()

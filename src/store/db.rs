@@ -409,21 +409,16 @@ pub struct Waiting {
     pub handles: Vec<String>,
     pub deadline_ms: Option<u64>,
     /// Resume on the first resolved handle rather than all of them.
-    #[serde(default)]
     pub any: bool,
     /// Tool calls from the same model response that follow the wait.
     pub pending: Vec<ToolCall>,
     /// A rate-limit park's start time. Its deadline is only a wake-up hint;
     /// elapsed waiting is charged when resumed or finished, even after restart.
-    #[serde(default)]
     pub paced_since_ms: Option<i64>,
     /// Retry state of the unfinished model call, separate from turn totals.
-    #[serde(default)]
     pub call_attempts: u32,
-    #[serde(default)]
     pub call_spent_ms: u64,
     /// Which model call to resume; ordinary calls bypass compaction once.
-    #[serde(default)]
     pub compaction: bool,
     /// The provider's sticky-routing token for the turn, so its calls after
     /// the park keep going to the server that holds its cache.
@@ -7429,6 +7424,15 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         // 39 -> 40: a bot's own settings. These were the daemon's flags
         // before; an existing bot takes the defaults.
         conn.execute_batch("ALTER TABLE bots ADD COLUMN settings TEXT;")?;
+    }
+    if from < 40 {
+        // A turn parked by an earlier daemon may lack fields added to its
+        // record since; each gets the value that daemon ran it with.
+        conn.execute_batch(
+            "UPDATE turns SET waiting=json_insert(waiting,'$.any',json('false'),
+                '$.call_attempts',0,'$.call_spent_ms',0,'$.compaction',json('false'))
+             WHERE waiting IS NOT NULL;",
+        )?;
     }
     Ok(())
 }
