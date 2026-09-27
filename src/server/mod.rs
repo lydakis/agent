@@ -2030,15 +2030,20 @@ impl Service {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
                 tokio::spawn(async move {
-                    let mut names: Vec<&String> = providers.keys().collect();
+                    let mut names: Vec<String> = providers.keys().cloned().collect();
                     names.sort();
-                    let listed = futures_util::future::join_all(
-                        names.iter().map(|name| providers[*name].models()),
+                    // A few at a time, so bodies being read stay a few limits' worth.
+                    let asks = names.clone().into_iter().map(|name| {
+                        let providers = providers.clone();
+                        async move { providers[&name].models().await }
+                    });
+                    let listed: Vec<_> = futures_util::StreamExt::collect(
+                        futures_util::StreamExt::buffered(futures_util::stream::iter(asks), 4),
                     )
                     .await;
-                    let answer =
-                        fit_listings(names.into_iter().cloned().zip(listed), output::MAX_EVENT);
-                    retention_reply(session, &output, id, Ok(json!({"providers": answer}))).await;
+                    let answer = fit_listings(names.into_iter().zip(listed), output::MAX_EVENT)
+                        .map(|answer| json!({"providers": answer}));
+                    retention_reply(session, &output, id, answer).await;
                 });
                 Err(Error::new("deferred"))
             }
@@ -2582,15 +2587,21 @@ async fn retention_reply(session: u64, output: &Output, id: Value, result: Resul
 /// One `provider_models` reply carries every listing, so it must fit one
 /// event of `limit` bytes: a listing past what is left is refused by name
 /// rather than failing the whole answer. Room for each refusal is held back
-/// first, so refusals always fit.
+/// first, so refusals always fit; more providers than even refusals fit
+/// for fail the request as a whole.
 fn fit_listings(
     listed: impl ExactSizeIterator<Item = (String, Result<Arc<Vec<Value>>>)>,
     limit: usize,
-) -> serde_json::Map<String, Value> {
+) -> Result<serde_json::Map<String, Value>> {
     const REFUSAL: usize = 160;
     let listed: Vec<_> = listed.collect();
     let held: usize = listed.iter().map(|(name, _)| name.len() + REFUSAL).sum();
-    let mut room = limit.saturating_sub(4096).saturating_sub(held);
+    let Some(mut room) = limit.saturating_sub(4096).checked_sub(held) else {
+        return Err(Error::with(
+            "provider_models_limit",
+            format!("{} providers are more than one reply holds", listed.len()),
+        ));
+    };
     let mut answer = serde_json::Map::new();
     for (name, result) in listed {
         let mut entry = match result {
@@ -2609,7 +2620,7 @@ fn fit_listings(
         }
         answer.insert(name, entry);
     }
-    answer
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -2623,11 +2634,16 @@ mod tests {
         for i in 0..300 {
             listed.push((format!("b-{i:03}"), Ok(Arc::new(vec![model.clone(); 20]))));
         }
-        let answer = fit_listings(listed.into_iter(), limit);
+        let answer = fit_listings(listed.into_iter(), limit).unwrap();
         assert!(json!({"providers": answer}).to_string().len() <= limit - 4096);
         assert!(answer["a-near"]["models"].is_array());
         assert_eq!(answer["b-299"]["error"], "provider_models_limit");
         assert_eq!(answer.len(), 301);
+        let many = (0..2000).map(|i| (format!("p-{i}"), Ok(Arc::new(Vec::new()))));
+        assert_eq!(
+            fit_listings(many, limit).unwrap_err().code,
+            "provider_models_limit"
+        );
     }
 
     use super::*;

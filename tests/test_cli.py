@@ -1028,6 +1028,15 @@ class ModelListTests(ModelFixture):
                    'shell:"$AGENT_BIN" models > seen')
         self.assertEqual(json.loads((self.path / 'seen').read_text()), listed)
 
+        # A terminal is shown what a note says, not what it would do.
+        self.list.write_text('openai/synthetic-model  # \x1b[2Jcleared\n')
+        self.assertIn('\\u{1b}[2Jcleared', self.agent('models', '--pretty').stdout)
+        self.list.unlink()
+        os.mkfifo(self.list)
+        fifo = self.agent('models', check=False)
+        self.assertIn('not a regular file', fifo.stderr)
+        self.list.unlink()
+
         self.list.write_text('openai/synthetic-model\nnot a model\n')
         broken = self.agent('models', check=False)
         self.assertEqual(broken.returncode, 1)

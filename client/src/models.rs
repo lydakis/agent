@@ -32,22 +32,46 @@ pub fn path() -> Option<PathBuf> {
 
 /// The listed models in file order, each once. No file is no list.
 pub fn read(path: &Path) -> Result<Vec<Model>, Error> {
+    use std::io::Read;
     let unreadable = |error: std::io::Error| Error {
         code: "models_unreadable".into(),
         detail: Some(format!("{}: {error}", path.display())),
     };
-    let size = match std::fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
+    // Opened without blocking, so a FIFO put in its place is refused below
+    // rather than waited on; reads of a regular file are unaffected.
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+    };
+    let file = match opened {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(unreadable(error)),
     };
-    if size > LIMIT {
+    if !file.metadata().map_err(unreadable)?.is_file() {
+        return Err(Error::with(
+            "models_invalid",
+            &format!("{}: not a regular file", path.display()),
+        ));
+    }
+    // Read once and never past the limit, whatever the file became since.
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > LIMIT {
         return Err(Error::with(
             "models_invalid",
             &format!("{}: larger than 1 MiB", path.display()),
         ));
     }
-    let text = std::fs::read_to_string(path).map_err(unreadable)?;
+    let text = String::from_utf8(bytes).map_err(|error| Error {
+        code: "models_unreadable".into(),
+        detail: Some(format!("{}: {}", path.display(), error.utf8_error())),
+    })?;
     parse(&text).map_err(|(line, reason)| {
         Error::with(
             "models_invalid",

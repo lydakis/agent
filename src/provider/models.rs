@@ -38,7 +38,17 @@ impl Provider {
         let listed = tokio::time::timeout(DEADLINE, self.list_models())
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
-            .map(Arc::new);
+            .and_then(|models| {
+                // Kept only if one reply could carry it.
+                let size = serde_json::to_vec(&models).map_or(usize::MAX, |bytes| bytes.len());
+                match size <= crate::output::MAX_EVENT {
+                    true => Ok(Arc::new(models)),
+                    false => Err(Error::with(
+                        "provider_models_limit",
+                        format!("{} models, {size} bytes listed", models.len()),
+                    )),
+                }
+            });
         *kept = Some((Instant::now(), listed.clone()));
         listed
     }

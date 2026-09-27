@@ -857,8 +857,8 @@ fn models(options: &Options) -> Result<i32> {
     if options.pretty {
         for model in &models {
             match &model.note {
-                Some(note) => println!("{}  # {note}", model.id),
-                None => println!("{}", model.id),
+                Some(note) => println!("{}  # {}", visible(&model.id), visible(note)),
+                None => println!("{}", visible(&model.id)),
             }
         }
         if models.is_empty() {
