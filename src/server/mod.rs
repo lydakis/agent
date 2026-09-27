@@ -313,6 +313,9 @@ enum Command {
     /// The daemon's live state for a fleet controller: sessions, turns,
     /// connections, pools, storage worker, and handle registry.
     Stats,
+    /// Each provider's own model listing, for a client writing its model
+    /// list. Asked when requested and kept five minutes; nothing runs on it.
+    ProviderModels,
     Bots {
         after: Option<String>,
         limit: Option<usize>,
@@ -955,7 +958,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","provider_models"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -2022,6 +2025,27 @@ impl Service {
                         Ok(serde_json::to_value(db.inspect(&bot)?)?)
                     })
                     .await
+            }
+            Command::ProviderModels => {
+                // Off the dispatch path: a listing waits on the network.
+                let (providers, output) = (self.providers.clone(), output.clone());
+                tokio::spawn(async move {
+                    let names: Vec<&String> = providers.keys().collect();
+                    let listed = futures_util::future::join_all(
+                        names.iter().map(|name| providers[*name].models()),
+                    )
+                    .await;
+                    let mut answer = serde_json::Map::new();
+                    for (name, result) in names.into_iter().zip(listed) {
+                        let entry = match result {
+                            Ok(models) => json!({"models": models.as_slice()}),
+                            Err(error) => json!({"error": error.code, "detail": error.detail}),
+                        };
+                        answer.insert(name.clone(), entry);
+                    }
+                    retention_reply(session, &output, id, Ok(json!({"providers": answer}))).await;
+                });
+                Err(Error::new("deferred"))
             }
             Command::Stats => {
                 let (waiting, running, queued, paced, pending_bytes, approvals) = store

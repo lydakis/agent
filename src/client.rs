@@ -57,6 +57,7 @@ struct Options {
     compaction_instructions: Option<String>,
     compaction_model: Option<String>,
     fallbacks: bool,
+    discover: bool,
     after: i64,
     pretty: bool,
     new: bool,
@@ -112,6 +113,7 @@ fn parse(args: &[String]) -> Result<Options> {
         compaction_instructions: Some(DEFAULT_COMPACTION_INSTRUCTIONS.to_owned()),
         compaction_model: None,
         fallbacks: false,
+        discover: false,
         after: 0,
         pretty: false,
         new: false,
@@ -149,6 +151,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--agents" => options.agents = true,
             "--no-compaction" => options.compaction_instructions = None,
             "--fallbacks" => options.fallbacks = true,
+            "--discover" => options.discover = true,
             "--detach" => options.detach = true,
             "--all" => options.all = true,
             "--any" => options.any = true,
@@ -756,6 +759,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "prune" => prune(&options),
         "approvals" => approvals(&options),
         "answer" => answer(&options),
+        "models" => models(&options),
         "stats" => {
             let mut connection = ensure_existing_daemon(&options)?;
             let stats = connection.request("stats", json!({}))?;
@@ -800,6 +804,68 @@ fn await_exit(pid: i32, timeout: Duration) -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
+}
+
+/// The models clients offer, from `~/.agent/models`; reading it needs no
+/// daemon. `--discover` first writes one from the listings of the providers
+/// the daemon runs, and never replaces a list that exists.
+fn models(options: &Options) -> Result<i32> {
+    let path = agent_client::models::path().ok_or(Error::with("usage", "set HOME"))?;
+    let client_error = |e: agent_client::Error| Error {
+        code: e.code,
+        detail: e.detail,
+    };
+    if options.discover {
+        if path.exists() {
+            return fail_with(
+                "models_file_exists",
+                format!(
+                    "{}: edit it, or remove it to discover again",
+                    path.display()
+                ),
+            );
+        }
+        let mut connection = ensure_daemon(options)?;
+        let listing = connection.request("provider_models", json!({}))?;
+        let text = agent_client::models::render(&listing);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    Error::with("models_file_exists", path.display().to_string())
+                }
+                _ => error.into(),
+            })?
+            .write_all(text.as_bytes())?;
+        eprintln!("wrote {}", path.display());
+    }
+    let models = agent_client::models::read(&path).map_err(client_error)?;
+    if options.pretty {
+        for model in &models {
+            match &model.note {
+                Some(note) => println!("{}  # {note}", model.id),
+                None => println!("{}", model.id),
+            }
+        }
+        if models.is_empty() {
+            eprintln!(
+                "no models listed in {}; agent models --discover writes a first list",
+                path.display()
+            );
+        }
+    } else {
+        print_json(
+            &Value::Array(models.iter().map(|model| model.json()).collect()),
+            false,
+        )?;
+    }
+    Ok(0)
 }
 
 fn print_json(value: &Value, pretty: bool) -> Result<()> {

@@ -13,6 +13,7 @@ window.Daemon = (() => {
       log,
       setup: () => invoke('setup'),
       policy: () => invoke('policy'),
+      models: () => invoke('models'),
       attach: (after) => invoke('attach', { after }),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
@@ -168,11 +169,12 @@ window.Daemon = (() => {
   }
 
   return {
-    setup: async () => ({ socket: 'demo', model: 'openai/gpt-5.6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    setup: async () => ({ socket: 'demo', model: 'openai/gpt-6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
+    models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {
       if (!S.bots.size) {
-        await create('main', 'openai/gpt-5.6-luna');
+        await create('main', 'openai/gpt-6-luna');
         const t = start('main', 'what does the daemon do when a bot is busy?');
         emit({ event: 'message', bot: 'main', turn: t, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three answers, chosen per submission: reject it, queue it behind the running turn, or steer it into that turn as a mid-flight message. The client sends the mode every time; the daemon has no default of its own.' }] }) } });
         finish('main', t);

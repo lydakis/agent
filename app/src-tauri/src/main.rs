@@ -152,6 +152,16 @@ fn policy(state: State<'_, Shared>) -> Result<Value, String> {
     compose(std::path::Path::new(&state.config.workspace))
 }
 
+/// The models to offer, read from `~/.agent/models` each time, so an edit
+/// shows without a restart. The daemon has no list.
+#[tauri::command]
+fn models() -> Result<Value, String> {
+    let path = agent_client::models::path().ok_or("no HOME for ~/.agent/models")?;
+    let models = agent_client::models::read(&path)
+        .map_err(|error| format!("{}: {}", error.code, error.detail.unwrap_or_default()))?;
+    Ok(models.iter().map(|model| model.json()).collect())
+}
+
 /// Too much or unreadable text fails with the CLI's `--agents` code, and
 /// `/new` creates nothing: a bot without its workspace's rules is worse
 /// than no bot.
@@ -280,7 +290,7 @@ fn main() {
             events: Mutex::new(SessionSlot::default()),
         })
         .invoke_handler(tauri::generate_handler![
-            setup, policy, attach, pull, request, log
+            setup, policy, models, attach, pull, request, log
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");

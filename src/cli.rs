@@ -85,6 +85,12 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "models",
+        usage: "models [--discover]",
+        flags: "--discover --pretty --no-spawn",
+        startup: true,
+    },
+    Command {
         name: "stats",
         usage: "stats [OPTIONS]",
         flags: "--pretty --no-spawn",
@@ -177,6 +183,10 @@ fn print_flags(flags: &str) {
             "--no-spawn" => ("", "Require an already running daemon"),
             "--keep-turns" => ("N", "Keep the latest N turns' operational records"),
             "--provider" => ("SPEC", "Register a provider; repeat for multiple providers"),
+            "--discover" => (
+                "",
+                "Write ~/.agent/models from the providers' own model listings",
+            ),
             "--model" => (
                 "PROVIDER/MODEL",
                 "Set the model; new bots default to AGENT_MODEL, existing bots keep theirs",
@@ -322,6 +332,7 @@ pub fn prepare(args: Vec<String>) -> Result<Option<Vec<String>>> {
                 | "--no-compaction"
                 | "--agents"
                 | "--fallbacks"
+                | "--discover"
         ) {
             if inline.is_some() {
                 return fail_with("usage", format!("{flag} takes no value"));

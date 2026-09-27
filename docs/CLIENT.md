@@ -11,7 +11,9 @@ Implemented 2026-09-19.
 ## Three layers
 
 1. **The harness preamble.** How to delegate through this runtime: `agent
-   run --detach --new --bot NAME` from the shell tool, collect with `wait`,
+   run --detach --new --bot NAME` from the shell tool, with `--model` one of
+   those `agent models` lists (named as a command, so the text stays one
+   cached prefix whatever the list holds), collect with `wait`,
    and that `AGENT_BOT`/`AGENT_BOT_ID` identify the bot itself
    and `AGENT_PARENT`/`AGENT_PARENT_ID` its creator. Calls to that creator use
    `--bot-id` so a reused name cannot receive the work, and are for questions, not

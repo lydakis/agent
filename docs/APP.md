@@ -91,7 +91,8 @@ the snapshot pages. A connected peer must send its ready line within five second
 Keys are the concept's: `^k` switch, `^b` rail, `^p` peek, `^t` thoughts,
 `^o` output, `Esc` close then interrupt, `↑` `↓` on an empty prompt to move
 between bots, `^d` close the window, `/new NAME [PROVIDER/MODEL]` to create a
-bot, `?` on an empty prompt for the list. `⌘` works where `^` does.
+bot, `?` on an empty prompt for the list and the models in `~/.agent/models`,
+read each time. `⌘` works where `^` does.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -200,6 +201,8 @@ without a recorded duration show no invented time.
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
 2. Packaging: a real icon set, `bundle.active`, a signed build.
+3. The projects design (the "Agent App Concepts" prototype), in the order
+   [NEXT item 47](NEXT.md) gives.
 
 ## Regression checks
 

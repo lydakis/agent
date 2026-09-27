@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 mod anthropic;
 pub mod aws;
 pub mod login;
+mod models;
 pub mod pace;
 mod responses;
 mod socket;
@@ -208,6 +209,8 @@ pub struct Provider {
     /// A Bedrock endpoint, however it authenticates: it runs no server-side
     /// fallbacks and serves no WebSocket.
     bedrock: bool,
+    /// The models this provider last listed, shared by every clone.
+    listing: Arc<models::Listing>,
 }
 
 #[derive(Debug)]
@@ -436,6 +439,7 @@ impl Provider {
             sockets: None,
             aws: None,
             bedrock,
+            listing: Arc::default(),
         })
     }
     /// Model pool levels behind this provider, for `stats`.
