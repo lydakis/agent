@@ -897,6 +897,10 @@ test('swap carries each draft with its bot; a long wait list stays short in the 
   assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'to lead');
   p.upsert({ name: 'app.test', id: 3, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   p.transcript('app.build').peers = ['app.lead', 'app.test'];
+  p.transcript('app.build').peers = ['app.lead'];
+  side.value = 'still to lead'; await p.nextBeside();
+  assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'still to lead', 'Ctrl-P onto the same bot keeps its draft');
+  p.transcript('app.build').peers = ['app.lead', 'app.test'];
   await p.nextBeside(); assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'Ctrl-P starts the next bot with an empty draft');
   const b = p.S.bots.get('app.lead'); b.status = 'waiting';
   b.waitingOn = Array.from({ length: 5000 }, (_, i) => `turn:app.t${i}/1`);
