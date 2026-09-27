@@ -14,7 +14,7 @@ from .config import digest
 from .events import percentiles
 from .processes import Tree, snapshot
 from .runner import provider_ready, stop
-from .runtime_client import Client
+from .runtime_client import Client, node_item
 from .socket_client import SocketClient
 from .targets import clean_env, file_hash
 from .responses import prompt
@@ -131,7 +131,7 @@ def run_once(binary, directory, config, mode, toolset, transport='stdio', memory
             assert client.request('events', bot=bot, after=0, limit=256)['result'] == page
             for event in page['events']:
                 if 'node' in event['data']:
-                    assert 'result' in client.request('item', bot=bot, node=event['data']['node'])
+                    assert 'result' in node_item(client, bot, event['data']['node'])
             assert client.request('submit', bot=bot, request_id='0', prompt=prompt(config,int(bot),0))['result']['duplicate']
             branch = directory/f'fork-{bot}'
             branch.mkdir()

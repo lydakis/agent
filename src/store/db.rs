@@ -6019,18 +6019,6 @@ impl Database {
         snapshot.commit()?;
         Ok(json!({"items":items}))
     }
-    pub fn item(&self, name: &str, wanted: i64) -> Result<Value> {
-        let snapshot = self.conn.unchecked_transaction()?;
-        let head = self.inspect(name)?.head;
-        if !self.in_lineage(head, wanted)? {
-            return fail("item_not_in_bot_history");
-        }
-        let item: Vec<u8> =
-            self.conn
-                .query_row("SELECT item FROM nodes WHERE id=?", [wanted], |r| r.get(0))?;
-        snapshot.commit()?;
-        Ok(serde_json::from_slice(&item)?)
-    }
     /// A bot's turns in id order, paged by `after`, with accounting a program
     /// needs without replaying events.
     /// Flush an execution segment's retry and pacing accounting once when it
@@ -6247,28 +6235,6 @@ impl Database {
         };
         crate::tools::page_pieces(&output, offset, limit, max_bytes)
     }
-    pub fn artifact(&self, name: &str, turn: i64, call_id: &str) -> Result<Value> {
-        self.authorize_artifact(name, turn, call_id)?;
-        let mut statement = self
-            .conn
-            .prepare("SELECT stream FROM artifacts WHERE turn=? AND call_id=?")?;
-        let mut rows = statement.query(params![turn, call_id])?;
-        let mut streams = serde_json::Map::new();
-        while let Some(row) = rows.next()? {
-            let stream: String = row.get(0)?;
-            let (_, data) = artifact::read(&self.conn, turn, call_id, &stream, 0, usize::MAX)?
-                .ok_or_else(|| Error::new("storage_error"))?;
-            streams.insert(
-                stream,
-                Value::String(String::from_utf8_lossy(&data).into_owned()),
-            );
-        }
-        if streams.is_empty() {
-            return self.missing_artifact(turn);
-        }
-        Ok(Value::Object(streams))
-    }
-
     /// Byte-addressed UTF-8 pages. SQL slicing bounds the bytes returned to
     /// Rust instead of assembling every retained stream in one response.
     pub fn artifact_page(

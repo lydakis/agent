@@ -4,6 +4,25 @@ use agent_runtime::{
 };
 use rusqlite::{Connection, params};
 
+/// A whole artifact stream, read page by page as clients read it.
+fn artifact(
+    db: &Database,
+    bot: &str,
+    turn: i64,
+    call: &str,
+    stream: &str,
+) -> agent_runtime::Result<String> {
+    let (mut text, mut offset) = (String::new(), 0);
+    loop {
+        let page = db.artifact_page(bot, turn, call, stream, offset, 64 * 1024)?;
+        text.push_str(page["text"].as_str().unwrap());
+        offset = page["next_offset"].as_u64().unwrap();
+        if page["done"] == true {
+            return Ok(text);
+        }
+    }
+}
+
 fn binding(family: Family) -> Binding<'static> {
     Binding {
         provider: "test",
@@ -179,7 +198,7 @@ fn old_prompt_copies_migrate_without_touching_queued_work() {
     );
     assert_eq!(db.pending().unwrap(), (1, 7));
     assert_eq!(
-        db.artifact("bot", 1, "legacy").unwrap()["stdout"],
+        artifact(&db, "bot", 1, "legacy", "stdout").unwrap(),
         "legacy bytes"
     );
     let conn = Connection::open(&path).unwrap();
@@ -260,9 +279,9 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
     }
     {
         let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
-        assert_eq!(db.artifact("bot", turn, "call").unwrap()["stdout"], data);
+        assert_eq!(artifact(&db, "bot", turn, "call", "stdout").unwrap(), data);
         assert_eq!(
-            db.artifact("bot", turn, "background").unwrap()["stderr"],
+            artifact(&db, "bot", turn, "background", "stderr").unwrap(),
             data
         );
         let mut offset = 0;
@@ -300,7 +319,9 @@ fn large_artifacts_remain_exact_after_reopen_and_background_completion() {
         db.finish(next, None).unwrap();
         db.prune("bot", 1).unwrap();
         assert_eq!(
-            db.artifact("bot", turn, "call").unwrap_err().code,
+            artifact(&db, "bot", turn, "call", "stdout")
+                .unwrap_err()
+                .code,
             "artifact_pruned"
         );
     }

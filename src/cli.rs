@@ -49,12 +49,6 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
-        name: "result",
-        usage: "result --bot NAME --turn TURN",
-        flags: "--bot --turn --pretty --no-spawn",
-        startup: true,
-    },
-    Command {
         name: "wait",
         usage: "wait [--any] [--timeout-ms N] HANDLE...",
         flags: "--any --timeout-ms --pretty",

@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from unittest import skipUnless
 from tests.test_runtime import AnthropicModel, ModelFixture, is_summary
-from bench.runtime_client import Client
+from bench.runtime_client import Client, node_item
 from bench.targets import clean_env
 
 STUB = '[tool result elided from this request:'
@@ -73,7 +73,7 @@ class ElisionTests(ModelFixture):
         # The stored transcript itself keeps every result whole.
         node = next(e['data']['node'] for e in events
                     if e['event'] == 'tool_completed' and e['data']['call_id'] == 'long-0')
-        self.assertIn('round 0 line 300', client.request('item', bot='Bob', node=node)['result']['output'])
+        self.assertIn('round 0 line 300', node_item(client, 'Bob', node)['result']['output'])
         # A historical fork from inside the turn sees what the source saw
         # there, and continues on its own.
         fork_at = next(e['data']['node'] for e in events

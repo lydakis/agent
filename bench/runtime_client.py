@@ -12,6 +12,31 @@ def serve_args(path, url, key_env=None, provider="openai", family="responses", e
     return ['serve', '--store', str(path), '--provider', spec, *extra]
 
 
+def node_item(client, bot, node):
+    """One node's item, read as a batch of one, in `request`'s shape."""
+    response = client.request('history_items', bot=bot, nodes=[node])
+    if 'result' not in response:
+        return response
+    entry = response['result']['items'][0]
+    return {'error': entry['error']} if 'error' in entry else {'result': entry['item']}
+
+
+def poll(client, bot, turn):
+    """A turn's outcome without waiting, in `request`'s shape: `result` holds
+    it, or {'finished': False} while the turn runs; `error` says why there is
+    none: `wait` with no time to wait."""
+    handle = f'turn:{bot}/{turn}'
+    response = client.request('wait', handles=[handle], timeout_ms=0)
+    if 'result' not in response:
+        return response
+    found = response['result']['results'][handle]
+    if found.get('pending'):
+        return {'result': {'turn': turn, 'finished': False}}
+    if 'error' in found and 'status' not in found:
+        return {'error': found['error']}
+    return {'result': found}
+
+
 class Client:
     def __init__(self, binary, path, url, tools="echo", model="synthetic-model", key_env=None, env=None,
                  provider="openai", family="responses", extra=()):

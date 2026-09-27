@@ -142,7 +142,7 @@ agent run --pretty --bot scout-b -- "Try it with a streaming parser instead"
 
 Without `--checkpoint`, the fork starts from the source's latest state. To
 branch from an earlier turn, pass the `checkpoint` that
-`agent result --bot scout --turn N` reports for it. Each branch continues
+`agent wait turn:scout/N` reports for it. Each branch continues
 independently.
 
 ## Use it from a program

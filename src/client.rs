@@ -934,7 +934,6 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         "interrupt" => interrupt(&options),
         "wait" => wait(&options),
         "turns" => turns(&options),
-        "result" => result(&options),
         "rm" => remove(&options),
         "prune" => prune(&options),
         "approvals" => approvals(&options),
@@ -1540,21 +1539,6 @@ fn turns(options: &Options) -> Result<i32> {
     Ok(0)
 }
 
-/// A finished turn's outcome, or its live status. Exit 0 only when completed.
-fn result(options: &Options) -> Result<i32> {
-    let (Some(bot), Some(turn)) = (&options.bot, options.turn) else {
-        return fail_with("usage", "result needs --bot and --turn");
-    };
-    let mut connection = ensure_existing_daemon(options)?;
-    let outcome = connection.request("result", json!({"bot":bot,"turn":turn}))?;
-    print_json(&outcome, options.pretty)?;
-    Ok(if outcome["status"] == "completed" {
-        0
-    } else {
-        1
-    })
-}
-
 fn list(options: &Options) -> Result<i32> {
     let mut connection = Connection::connect(&options.socket)?;
     let mut after = Value::Null;
@@ -1664,7 +1648,11 @@ impl Renderer {
             // A retried turn may have lost its terminal event to retention.
             // Reconcile the selected turn, not merely the bot's newest state.
             // Retained and running turns still finish through normal events.
-            connection.request("result", json!({"bot":event["bot"],"turn":turn}))?;
+            let handle = format!("turn:{}/{turn}", event["bot"].as_str().unwrap_or(""));
+            let found = connection.request("wait", json!({"handles":[&handle],"timeout_ms":0}))?;
+            if let Some(code) = found["results"][&handle]["error"].as_str() {
+                return Err(Error::new(code));
+            }
         }
         let finished =
             event["event"] == "turn_finished" && self.turn.is_some_and(|t| event["turn"] == t);
@@ -1715,8 +1703,10 @@ impl Renderer {
             "tool_completed" => {
                 let bot = event["bot"].as_str().unwrap_or("");
                 if let Some(node) = data["node"].as_i64()
-                    && let Ok(item) = connection.request("item", json!({"bot":bot,"node":node}))
+                    && let Ok(read) =
+                        connection.request("history_items", json!({"bot":bot,"nodes":[node]}))
                 {
+                    let item = &read["items"][0]["item"];
                     let output = item["output"]
                         .as_str()
                         .or_else(|| item["content"][0]["content"].as_str())
