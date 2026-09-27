@@ -566,8 +566,8 @@ per arm, all five arms at once, at 128 KiB except `large-full`.
   with `stale_turn` when the task ended (hidden tests 5/9; the cause is
   inferred from their views). A scripted task reproduces it on `d9ecbcf`
   as well, so the choice did not cause it. Since fixed: such a steer goes
-  in against the whole budget (acceptance case 6); no live run has
-  measured it yet.
+  in against the whole budget (acceptance case 6), measured in
+  [run 7](#live-run-7).
 - Summaries held the model back about 41 s each in the choice arm, against
   35 s for requests of their own; fifty bots ran at once, and a summary of
   908 uncached tokens took 51.6 s, so the time here is the backend's
@@ -575,6 +575,60 @@ per arm, all five arms at once, at 128 KiB except `large-full`.
 - Compacting still did not pay on this task: full context cost 82,670
   token-equivalents per bot against 86,929 with the choice, the cheapest
   of the compacting arms.
+
+## Live run 6
+
+2026-09-27, 01:54 to 01:57 UTC, main after the choice merged (`0b295d2`,
+with the fixes that followed run 5) against `dd95047`, the choice as run 5
+measured it: the summary condition with the choice, ten bots per arm, both
+at once, at 128 KiB, same model, plan and host.
+
+- Main: 9/10 correct, 14 summaries, all copies, 91% of the summarizer's
+  input from cache. One copy read no cache at the provider; the other 13
+  read about 98%, as the baseline's did (15 summaries, all copies, 98%,
+  10/10 correct). Run 5's baseline had the same kind of one-off miss.
+- Every catch-up step on main was priced and copied the call, where run 5
+  sent one as a request of its own.
+- Main's one wrong bot lost its steer as run 5's two did (`stale_turn`,
+  hidden tests 5/9).
+
+## Live run 7
+
+2026-09-27, the steer fix at `cd1d45f` against main (`0b295d2`): the
+summary condition with the choice, 20 bots per arm, both at once, at
+128 KiB, same model, plan and host; about 185 s per arm. The fixes to
+admission that followed `cd1d45f` (a comma counted per item, a summarizer
+the daemon serves, a call left in the turn) only narrow it, and the three
+steers below that needed the whole budget had at least 7.6 KiB to spare.
+
+| | summary, choice, steer fix | summary, choice, main |
+| --- | --- | --- |
+| Correct | 20/20 | 18/20 |
+| Steers that went in / failed with `stale_turn` | 20 / 0 | 18 / 2 |
+| Steers that went in past three quarters of the budget | 3 | 0 |
+| Summaries (catch-up steps), all copies | 20 (7) | 18 (5) |
+| Summarizer input served from cache | 93.7% | 98.6% |
+| Work calls | 262 | 264 |
+| Work input served from cache | 83.5% | 83.3% |
+| Peak input tokens per bot, highest | 37.0k | 36.2k |
+
+- Main's two wrong bots are the case the fix targets: a catch-up step
+  left the view at about 109 KiB, past three quarters, so the steer
+  waited, failed with `stale_turn` when the task ended, and the bot missed
+  the correction (hidden tests 5/9).
+- With the fix, three steers went in after the same kind of catch-up step
+  (view about 108 KiB). The view right after each was 117.7 to 120.4 KiB,
+  and the largest any of those bots reached later was 130,732 bytes,
+  under the 131,072 budget. View sizes are rebuilt from the stored node
+  totals and each summary's `context_after`, which matched the runtime's
+  own `context_before` within 40 bytes on the earlier 128 KiB runs.
+- The fix's lower cache share is one summary the provider did not cache
+  (21,445 input tokens), which ran before that bot's steer was queued;
+  without it the share is 98.6%, as on main. One bot with the fix left the
+  benchmark's figure out of its answer, with no summary and a steer that
+  went in normally (model variance, inferred).
+- Both arms otherwise match: workflow followed, vendor intact and the
+  migration applied once in 20 of 20, and no retrievals.
 
 ## Not covered yet
 
@@ -585,6 +639,4 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
 compactions and retrievals. From runs 3 to 5: a task whose context grows
-well past the budget, where compacting could pay, and a live run with a
-steer arriving while one result fills the room, since fixed and covered
-only by a scripted test.
+well past the budget, where compacting could pay.

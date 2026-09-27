@@ -4755,6 +4755,44 @@ fn absorption_leaves_steers_that_do_not_fit_the_context_queued() {
 }
 
 #[test]
+fn absorption_counts_the_separator_of_every_item_the_request_sends() {
+    // The request puts a comma between items, so a steer that fits the
+    // whole budget by its bytes alone does not fit the request: the turn's
+    // prompt and the steer each take one byte more.
+    for (spare, taken) in [(0, false), (1, false), (2, true)] {
+        let mut db = db();
+        db.create("Bob", Some("/synthetic"), binding()).unwrap();
+        let options = TurnOptions::default();
+        let first = db
+            .begin("Bob", "first", "work", true, &options, allow_provider)
+            .unwrap()
+            .turn;
+        let steer = db
+            .begin(
+                "Bob",
+                "s",
+                "steer",
+                true,
+                &TurnOptions {
+                    delivery: Delivery::Steer,
+                    ..TurnOptions::default()
+                },
+                allow_provider,
+            )
+            .unwrap()
+            .turn;
+        let (family, used, _) = db.turn_usage("Bob", first).unwrap();
+        let steer_bytes = family.user_item("steer").unwrap().len();
+        let budget = used + steer_bytes + spare;
+        let absorbed = db
+            .absorb(first, None, budget, 64, ContextUsage::default(), true)
+            .unwrap();
+        let ids: Vec<i64> = absorbed.outcomes.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, if taken { vec![steer] } else { vec![] }, "{spare}");
+    }
+}
+
+#[test]
 fn turn_usage_counts_only_the_active_branch_including_absorbed_steers() {
     let mut db = db();
     db.create("Bob", Some("/synthetic"), binding()).unwrap();

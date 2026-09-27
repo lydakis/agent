@@ -309,6 +309,35 @@ class ElisionTests(ModelFixture):
         client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
+        turn, ended, outcome, correction = self.steer_behind_a_large_result(client)
+        self.assertEqual(ended['status'], 'completed', ended)
+        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
+        carried = lambda r: any(i.get('role') == 'user' and i['content'][0]['text'] == correction
+                                for i in r['input'])
+        work = [r for r in drain(self.model) if not is_summary(r)]
+        self.assertTrue(any(carried(r) for r in work))
+        self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
+
+    def test_a_steer_keeps_three_quarters_when_the_summarizer_is_not_served(self):
+        # The bot's summarizer is on a provider this daemon no longer
+        # serves, so no summary could take the rounds behind a steer let in
+        # against the whole budget: it keeps the three-quarter share.
+        budget = ('--context-bytes', '24576')
+        client = Client(self.binary, self.path / 'state.sqlite', self.url, 'shell,read',
+                        extra=('--provider', f'other=responses,{self.url}', *budget))
+        created = client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
+                                 compaction_instructions='Summarize.', compaction_model='other/synthetic-model')
+        client.close()
+        self.assertIn('result', created)
+        client = self.client(tools='shell,read', extra=budget)
+        _, ended, outcome, _ = self.steer_behind_a_large_result(client)
+        self.assertEqual(ended['status'], 'completed', ended)
+        self.assertEqual(outcome.get('error'), 'stale_turn', outcome)
+
+    def steer_behind_a_large_result(self, client):
+        """Bob's turn asks for a result of about 15 KiB, and a strict steer
+        lands while that call waits. The turn, both outcomes, and the
+        steer's text."""
         passed, gate = threading.Event(), threading.Event()
         passed.set()
         self.model.request_gates = queue.Queue()
@@ -322,15 +351,27 @@ class ElisionTests(ModelFixture):
         steer = client.request('submit', bot='Bob', request_id='s', prompt=correction,
                                delivery='steer', expected_turn=turn)['result']['turn']
         gate.set()
-        ended = client.finished(turn, timeout=30)
-        self.assertEqual(ended['data']['status'], 'completed', ended)
-        outcome = client.finished(steer)['data']
-        self.assertEqual((outcome['status'], outcome.get('into')), ('steered', turn), outcome)
-        carried = lambda r: any(i.get('role') == 'user' and i['content'][0]['text'] == correction
-                                for i in r['input'])
-        work = [r for r in drain(self.model) if not is_summary(r)]
-        self.assertTrue(any(carried(r) for r in work))
-        self.assertTrue(all(encoded(r['input']) <= 24576 for r in work))
+        return turn, client.finished(turn, timeout=30)['data'], client.finished(steer)['data'], correction
+
+    def test_a_steer_after_the_call_that_spends_the_budget_is_not_taken(self):
+        # The final answer spends the rest of the bot's budget, so the turn
+        # cannot call again: the steer that arrived meanwhile stays out of
+        # it, and the turn completes rather than failing with the steer in.
+        client = self.client()
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), budget_tokens=1,
+                                               compaction_instructions='Summarize.'))
+        gate = threading.Event()
+        self.model.request_gates = queue.Queue()
+        self.model.request_gates.put(gate)
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='hello')['result']['turn']
+        self.model.requests.get(timeout=5)
+        steer = client.request('submit', bot='Bob', request_id='s', prompt='steer:stop',
+                               delivery='steer', expected_turn=turn)['result']['turn']
+        gate.set()
+        ended = client.finished(turn)['data']
+        self.assertEqual(ended['status'], 'completed', ended)
+        self.assertEqual(client.finished(steer)['data'].get('error'), 'stale_turn')
+        self.assertEqual(drain(self.model), [])
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class AnthropicElisionTests(ModelFixture):

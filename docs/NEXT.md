@@ -629,7 +629,8 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     call and 0.337 for requests of their own. Two of its 50 bots lost a
     steer that waited while one result in the newest boundary filled the
     room it needed; such a steer now goes in against the whole budget
-    (scripted test, no live rerun yet). Still open: stub
+    ([run 7](LONG_TASK_EVAL.md#live-run-7): 20 of 20 steers went in,
+    against 18 of 20 on main). Still open: stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts
     conditions, a realistic preamble, a task long enough that summaries

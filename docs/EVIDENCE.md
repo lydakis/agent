@@ -5,7 +5,7 @@ updated at `095ff68` for admission batching and disk-full containment, at
 `e707632` and `6a81bd6` for the realistic-budget long-task runs, at
 `973be14`, the change that built tool approval, for its cost and a store
 lock fix, at `dd95047` for the per-summary choice between a copy and a
-request of its own, and on 2026-09-27 for the fix to run 5's lost steers.
+request of its own, and at `cd1d45f` for the fix to run 5's lost steers.
 This is the one place that says what is currently known. The documents it links to
 keep the method, the raw tables and superseded runs. When a history document's
 opening disagrees with this page, this page is current. A change that lands a
@@ -267,9 +267,12 @@ Reconnects, retention, overload, compaction and recovery.
   whole call and 0.337 never copying, and 9 of 10 bots finished correctly
   in both the choice arm and the arm with no copy. The two misses were
   a steer left waiting for room, which a scripted task reproduces on the
-  build before the choice; since fixed, with no live rerun. `dd95047`
-  against `d9ecbcf`, 2026-09-26.
-  [Record](LONG_TASK_EVAL.md#live-run-5).
+  build before the choice. `dd95047` against `d9ecbcf`, 2026-09-26.
+  [Record](LONG_TASK_EVAL.md#live-run-5). With such a steer admitted
+  against the whole budget, 20 bots a side: 20 of 20 steers went in and
+  20 of 20 bots were correct, against 18 of 20 on main, whose two misses
+  were that steer. `cd1d45f` against `0b295d2`, 2026-09-27.
+  [Record](LONG_TASK_EVAL.md#live-run-7).
 - **Reconnects.** HTTP is the default transport. Live fleets saw transport
   failures (54 turns lost to connection failures in one 256-bot run, clean on
   rerun), retried per [the retry policy](RUST_PROTOTYPE.md). The WebSocket
@@ -291,9 +294,6 @@ Reconnects, retention, overload, compaction and recovery.
 - Whether compacting pays on any task at a realistic budget: on this one,
   full context cost less than every compacting arm at 128 KiB (runs 4
   and 5).
-- Whether a steer admitted against the whole budget, when one result
-  fills the turn, lets a live task follow it: a scripted test covers the
-  fix, and no live run has.
 - Admission batching on macOS.
 - Enqueue-to-answer latency for small control operations: `stats` reports
   it per operation, but no run has recorded it.

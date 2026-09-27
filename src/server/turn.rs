@@ -1646,8 +1646,13 @@ impl Turn {
             if capped.is_some() && made_room {
                 self.steers.store(true, Relaxed);
             }
-            let whole = record.compaction_instructions.is_some();
-            if self.absorb(&context.prefix, &mut capped, whole).await? {
+            // A summary may have spent the last round or the budget; a steer
+            // then stays queued rather than joining a turn that cannot call.
+            if calls_left(&record, model_rounds)
+                && self
+                    .absorb(&context.prefix, &mut capped, self.summarizes(&record))
+                    .await?
+            {
                 resume_window = resuming;
                 continue;
             }
@@ -1744,9 +1749,13 @@ impl Turn {
             };
             if response.calls.is_empty() {
                 // A steer that arrived during the final call keeps the turn
-                // going for one more round rather than ending it unheard.
-                let whole = record.compaction_instructions.is_some();
-                if self.absorb(&context.prefix, &mut capped, whole).await? {
+                // going for one more round rather than ending it unheard,
+                // when the budget and round limit allow one.
+                if calls_left(&record, model_rounds)
+                    && self
+                        .absorb(&context.prefix, &mut capped, self.summarizes(&record))
+                        .await?
+                {
                     last = LastCall::of(&context, true);
                     continue;
                 }
@@ -1806,6 +1815,15 @@ impl Turn {
     /// budget when it stayed against three quarters. Returns whether any
     /// went in; `capped` holds how one stayed queued, and is left alone
     /// when nothing was tried.
+    /// Whether a summary could take the rounds behind a steer admitted
+    /// against the whole budget: the bot has compaction instructions and
+    /// its summarizer's provider is served here.
+    fn summarizes(&self, record: &agent_runtime::store::Bot) -> bool {
+        record.compaction_instructions.is_some()
+            && split_model(&summarizer(record))
+                .is_ok_and(|(name, _)| self.providers.contains_key(name))
+    }
+
     async fn absorb(
         &self,
         ahead: &ContextPrefix,
@@ -2855,6 +2873,11 @@ async fn settle(
 /// When `at` was, in milliseconds since the Unix epoch.
 fn epoch_ms(at: tokio::time::Instant) -> u64 {
     now_ms().saturating_sub(at.elapsed().as_millis() as u64)
+}
+
+/// Whether the turn may make another model call.
+fn calls_left(record: &agent_runtime::store::Bot, model_rounds: usize) -> bool {
+    model_rounds < MAX_ROUNDS && budget_error(record.budget_tokens, record.tokens_used).is_none()
 }
 
 fn budget_error(budget: Option<u64>, used: u64) -> Option<Error> {

@@ -3486,13 +3486,15 @@ impl Database {
         // and notes); what does not fit stays queued and starts as its own
         // turn when the line moves. `whole` measures against the whole
         // budget instead, for a steer no elision or summary made room for.
+        // A request separates its items with a comma each, so every item
+        // held and absorbed is counted a byte wider.
         let (family, used_bytes, used_items) = self.turn_usage(&bot.name, turn)?;
         let (share_bytes, share_items) = if whole {
             (context_bytes, context_items)
         } else {
             (context_bytes / 4 * 3, context_items / 4 * 3)
         };
-        let mut room_bytes = share_bytes.saturating_sub(used_bytes + reserved.bytes);
+        let mut room_bytes = share_bytes.saturating_sub(used_bytes + used_items + reserved.bytes);
         let mut room_items = share_items.saturating_sub(used_items + reserved.items);
         let mut steers: Vec<(i64, Vec<u8>, usize)> = Vec::new();
         let mut more = false;
@@ -3525,11 +3527,11 @@ impl Database {
                 }
                 bytes += size;
                 let item = family.user_item(&row.get::<_, String>(1)?)?;
-                if item.len() > room_bytes || room_items == 0 {
+                if item.len() + 1 > room_bytes || room_items == 0 {
                     capped = true;
                     break;
                 }
-                room_bytes -= item.len();
+                room_bytes -= item.len() + 1;
                 room_items -= 1;
                 steers.push((row.get(0)?, item, size));
             }
