@@ -251,7 +251,8 @@ settlement that stands, whether its benchmark ran after it was first
 settled (a close settled again after the correction needs no second
 benchmark, since its number does not change), how often it was settled,
 whether its `out/` file holds the right entries, and whether the answer
-carries its number and its benchmark ran. A sustained bot is correct only
+carries its number, whole rather than inside a longer one, and its
+benchmark ran. A sustained bot is correct only
 when the hidden tests pass and all six settlements are right, reports its
 numbers only when all six are there, and followed the workflow when it
 ran `tools/env-check` first, every close's steps came in order, and each
@@ -259,8 +260,9 @@ close was first settled after the one before it. Each close's number is
 its own, so one number in an answer credits one close. It
 also counts the step commands that sent their output elsewhere or cut it
 (a pipe, or a redirect other than `2>&1`) and those that ran several
-steps or looped over them. A step counts where a command runs it, not
-where it reads the step's source. In the scripted run at 128 KiB, the default
+steps or looped over them. A step counts where a command runs it,
+inside a conditional or a loop too, not where it reads the step's
+source. In the scripted run at 128 KiB, the default
 tools stub old results nine times and summarize never; without `read`,
 seven summaries make the room.
 
@@ -830,9 +832,10 @@ closes are settled. Four arms at once, 10 bots each, seed 7,
   submissions and the runner's handling of other events, inferred to be
   well under a second against 300 s or more.
 - Runs 8 and 9 sent the correction after two successful settlements, not
-  two distinct closes, and scored the workflow without comparing the
-  closes' order. Their raw results keep each close's settlement count and
-  every command; they were not rescored for either change.
+  two distinct closes, scored the workflow without comparing the closes'
+  order, and matched each number anywhere in the answer, even inside a
+  longer one. Their raw results keep each close's settlement count, every
+  command and each answer; they were not rescored for these changes.
 
 This is one model, one synthetic task and seed, and 10 bots per arm,
 with a prompt that makes the model read each step whole. Left to choose,

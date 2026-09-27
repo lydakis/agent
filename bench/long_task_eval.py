@@ -627,24 +627,34 @@ def settled_closes(root):
 # A step command as the sustained task asks for it: one step, its output
 # neither sent elsewhere nor cut. Merging stderr into it is fine. A step
 # runs where a command begins, in a segment between `;`, `&&`, `||` and
-# newlines, after any variable assignments, a wrapper such as `env` or
-# `time`, or an interpreter, so reading `tools/settle` does not count as
-# running it; `make` may take options and variables before its target.
+# newlines, after a shell keyword such as `if` or `do`, any variable
+# assignments, a wrapper such as `env` or `time`, or an interpreter, so
+# reading `tools/settle` does not count as running it; `make` may take
+# options and variables before its target. A group or loop that ran a step
+# filters it when its end is piped or redirected.
 STEP_RUN = re.compile(
-    r"""^[\s('"]*(?:(?:do|then)\s+)?"""
+    r"""^[\s('"{]*(?:(?:do|then|else|if|elif|while|until|!)\s+)*"""
     r"""(?:(?:(?:env|command|exec|time|nice|nohup|stdbuf)(?:\s+-\S+)*|timeout(?:\s+-\S+)*\s+\S+"""
     r"""|\w+=\S*)\s+)*"""
     r"""(?:(?:python3?|bash|sh)\s+)?"""
     r"""(?:make(?:\s+(?:-C\s+\S+|-\S+|\w+=\S*))*\s+(?:check|bench)\b|(?:[\w.~/-]*/)?tools/settle\b)""")
+GROUP_END = re.compile(r'\s*(?:\}|\)|done\b|fi\b|esac\b)')
 
 
 def step_command_faults(command):
     """Whether a command that runs a step filters its output, and whether
     it runs more than one step or loops over them."""
-    steps = [segment for segment in re.split(r'&&|\|\||;|\n', command) if STEP_RUN.match(segment)]
-    looped = any(re.match(r'[\s(]*do\s', step) for step in steps) or bool(
+    segments = re.split(r'&&|\|\||;|\n', command)
+    runs = [bool(STEP_RUN.match(segment)) for segment in segments]
+    steps = [segment for segment, run in zip(segments, runs) if run]
+
+    def sends(segment):
+        return '|' in segment or '>' in segment.replace('2>&1', '')
+    filtered = any(sends(step) for step in steps) or any(
+        GROUP_END.match(segment) and sends(segment) and any(runs[:n]) for n, segment in enumerate(segments))
+    looped = any(re.match(r'[\s({]*do\s', step) for step in steps) or bool(
         re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
-    return any('|' in step or '>' in step.replace('2>&1', '') for step in steps), len(steps) > 1 or looped
+    return filtered, len(steps) > 1 or looped
 
 
 def close_workflow(root, closes):
@@ -674,6 +684,12 @@ def close_workflow(root, closes):
     return out
 
 
+def reports(answer, number):
+    """Whether an answer gives a number whole, with or without thousands
+    separators, not inside a longer number."""
+    return re.search(rf'(?<![\d.]){number}(?!\.?\d)', (answer or '').replace(',', '')) is not None
+
+
 def score(root, facts, events, answer):
     """Outcomes from the workspace and the bot's events."""
     passed, cases, failure = hidden_tests(root)
@@ -696,8 +712,7 @@ def score(root, facts, events, answer):
     closes = close_workflow(root, facts['closes'])
     # Each close's number counts when its benchmark printed it.
     for month, close in closes.items():
-        close['reported'] = bool(close['bench_runs']) and str(
-            facts['closes'][month]['throughput']) in (answer or '').replace(',', '')
+        close['reported'] = bool(close['bench_runs']) and reports(answer, facts['closes'][month]['throughput'])
     # The prompt asks for the closes in order: each first settled after
     # the one before it.
     firsts = [close['first_settled_at'] for close in closes.values()]
@@ -774,7 +789,7 @@ def score(root, facts, events, answer):
         # was read from where the benchmark keeps it; the sustained task
         # needs every close's.
         'reported_throughput': all(c['reported'] for c in closes.values()) if closes else bool(
-            steps['bench_runs']) and str(facts['throughput']) in (answer or '').replace(',', ''),
+            steps['bench_runs']) and reports(answer, facts['throughput']),
         **steps,
         'followed_workflow': steps['env_check_before_edits'] and (
             in_order and all(c['checked_before_settle'] and c['benched_after_settle'] for c in closes.values())

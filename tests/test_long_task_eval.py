@@ -231,6 +231,11 @@ class LongTaskScoreTests(unittest.TestCase):
                       answer=' '.join(str(numbers[month]) for month in MONTHS[1:]))
         self.assertFalse(missing['reported_throughput'])
         self.assertEqual(missing['closes_reported'], 2)
+        # A number inside a longer one is not the close's.
+        longer = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)],
+                     answer=' '.join(f'1{numbers[MONTHS[0]]}' if month == MONTHS[0] else f'{numbers[month]:,}.'
+                                     for month in MONTHS))
+        self.assertEqual(longer['closes_reported'], 2)
         unbenched = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)[:2]])
         self.assertEqual(unbenched['closes_reported'], 0)
         self.assertFalse(unbenched['followed_workflow'])
@@ -414,7 +419,13 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('time make -C . check CLOSE=2026-02', (False, False)),
                 ('timeout 600 ./tools/settle 2026-03 | tail -3', (True, False)),
                 ('bash /work/tools/settle 2026-04 2>&1', (False, False)),
-                ('less tools/settle', (False, False))):
+                ('less tools/settle', (False, False)),
+                # Inside shell conditionals and groups.
+                ('if make check CLOSE=2026-01; then tools/settle 2026-01; fi', (False, True)),
+                ('make check CLOSE=2026-01 || echo failed', (False, False)),
+                ('{ make check CLOSE=2026-01; } 2>&1 | tail -5', (True, False)),
+                ('for m in 2026-01 2026-02; do make bench CLOSE=$m; done | tail -2', (True, True)),
+                ('for f in tests/*.py; do wc -l $f; done | sort; make check CLOSE=2026-06', (False, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 
