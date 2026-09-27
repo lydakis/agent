@@ -1118,7 +1118,8 @@ Built on 2026-09-27, the automatic approver:
 
 - `agent approver`: serves a tag, groups each round's calls, reads what
   the judge is shown with `prompts` and `item`, follows delegations up to
-  8 turns to the person's words, redacts, and asks one judge request per
+  8 turns to the person's words (a deeper chain, or more than 64 delegating
+  turns, is judged too long), redacts, and asks one judge request per
   round: Jev over its API or any model through the daemon ([Which model
   judges](#which-model-judges)). A round takes one of 32 judge slots
   before it reads anything, so rounds past those wait holding only their
@@ -1161,8 +1162,10 @@ the tag already served waiting for that approver's `serving` line too;
 judging a later call against consent an earlier call in the same round may
 use up; counting the questions (eleven a call) in a round's request limit;
 writing the verdict lines so a stalled reader of stdout cannot hold up
-the approver; and reading completions in `prompts` only for the calls that
-fit, rather than for the whole turn. Dropped with the rules on 2026-09-27:
+the approver; reading completions in `prompts` only for the calls that
+fit, rather than for the whole turn; and forgetting a bot's judged
+requests once its turn ends, so the dedupe map follows active bots, not
+every bot the approver has seen. Dropped with the rules on 2026-09-27:
 `until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions

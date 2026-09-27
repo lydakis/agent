@@ -51,8 +51,11 @@ const RENEW: Duration = Duration::from_secs(1);
 const IN_FLIGHT: usize = 32;
 /// Text one `prompts` read returns: past the judge's whole state limit.
 const PROMPT_BYTES: usize = 128 * 1024;
-/// How many delegations the approver follows up to the person's words.
+/// How many delegations deep the approver follows up to the person's
+/// words, and how many delegating turns it reads for one round; past either
+/// the round is too long to judge, rather than judged without them.
 const CHAIN: usize = 8;
+const DELEGATING: usize = 64;
 /// The largest file written this turn that a judged call may run: a call
 /// that runs a larger one is refused rather than judged on its first part.
 const FILE_BYTES: u64 = 48 * 1024;
@@ -1099,10 +1102,13 @@ async fn persons_above(
     let mut levels: Vec<std::vec::IntoIter<Value>> = Vec::new();
     let mut next = Some(from.clone());
     loop {
-        if let Some(from) = next.take()
-            && let Some(prompts) = delegated(client, &from, visited).await?
-        {
-            levels.push(prompts.into_iter());
+        if let Some(from) = next.take() {
+            if levels.len() >= CHAIN {
+                return Err(Unjudged::TooLong);
+            }
+            if let Some(prompts) = delegated(client, &from, visited).await? {
+                levels.push(prompts.into_iter());
+            }
         }
         let Some(level) = levels.last_mut() else {
             return Ok(());
@@ -1124,8 +1130,8 @@ async fn persons_above(
     }
 }
 
-/// The prompts of the turn `from` names, unless it was read already, the
-/// chain is too long, or it is gone.
+/// The prompts of the turn `from` names, unless it was read already or is
+/// gone.
 async fn delegated(
     client: &Client,
     from: &Value,
@@ -1134,8 +1140,11 @@ async fn delegated(
     let (Some(bot), Some(turn)) = (from["bot"].as_str(), from["turn"].as_i64()) else {
         return Ok(None);
     };
-    if visited.len() > CHAIN || !visited.insert((bot.to_owned(), turn)) {
+    if !visited.insert((bot.to_owned(), turn)) {
         return Ok(None);
+    }
+    if visited.len() > DELEGATING {
+        return Err(Unjudged::TooLong);
     }
     match client
         .request(

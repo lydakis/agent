@@ -187,7 +187,14 @@ pub enum Verdict {
 /// unasked; denied as unclear otherwise. `None` when an answer is missing,
 /// which the caller treats as a failed check.
 pub fn verdict(call: &str, answers: &Value, consent: bool) -> Option<Verdict> {
-    let answer = |id: String| answers.get(&id)?.get("noul")?.as_f64();
+    // A probability outside 0 to 1 is a malformed answer: a failed check.
+    let answer = |id: String| {
+        answers
+            .get(&id)?
+            .get("noul")?
+            .as_f64()
+            .filter(|p| (0.0..=1.0).contains(p))
+    };
     let mut risky = Vec::new();
     let mut unclear = Vec::new();
     for risk in &RISKS {
@@ -782,6 +789,10 @@ mod tests {
             verdict("c1", &round(0.1, 0.0, &[]), true),
             Some(Verdict::Allow)
         );
+        // A probability out of range fails the check rather than deciding.
+        assert_eq!(verdict("c1", &round(-0.5, 0.0, &[]), true), None);
+        let over = round(0.1, 0.0, &[("c1_shared", 0.9), ("c1_shared_ok", 1.5)]);
+        assert_eq!(verdict("c1", &over, true), None);
         // A high risk the person asked for is allowed; unasked, denied as risky.
         let deploy = round(0.1, 0.0, &[("c1_shared", 0.9), ("c1_shared_ok", 0.9)]);
         assert_eq!(verdict("c1", &deploy, true), Some(Verdict::Allow));
