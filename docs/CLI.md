@@ -57,12 +57,25 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   passing them while continuing an existing named bot is an error.
 - `run --new --approval MODE` and `fork --approval MODE` choose whether a
   new bot's tool calls wait for a verdict: `full` runs every allowed call (no
-  gate), `manual` waits for an answer from any client, and `auto` is refused
-  with `approval_mode_unsupported` until an automatic approver exists.
+  gate), `manual` waits for an answer from any client, and `auto` has a
+  judge model decide each call. For `auto`, and whenever `run` continues or
+  `fork` copies a bot an `auto` gate answers, the CLI starts `agent
+  approver` detached when no session serves the `auto` tag, and gives a
+  call 45 s before its gate lapses.
   Without the flag, `AGENT_APPROVAL` applies, then `full`. `--approve LIST`
   picks the gated tools and must name at least one; the default is every
   tool but `history`, `wait`, `note`, and `echo`. A fork keeps its source's gates and a created bot its
   creator's ([APPROVALS.md](APPROVALS.md)).
+- `approver [--tag TAG] [--judge PROVIDER/MODEL] [--reasoning LEVEL]
+  [--note FILE] [--judge-url URL]` serves a gate tag (default `auto`) and
+  has a judge decide every call waiting on it, one request per round,
+  printing one JSON line per round. The judge is `--judge`, else
+  `AGENT_APPROVER_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
+  is set, else `AGENT_MODEL`; any model but Jev (`typesafe/jev-*`) runs
+  through the daemon, with
+  a tag of at most 87 bytes, and `--reasoning` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
+  is a regular file of at most 96,000 bytes the judge always sees, such as
+  trusted remotes and hosts ([APPROVALS.md](APPROVALS.md#automatic-mode)).
 - `approvals [--bot NAME] [--tag TAG]` lists the calls waiting on a gate.
   With `--pretty`, each call shows what it would do (every line of its
   command, or of what a `write` or `edit` puts in its file, terminal

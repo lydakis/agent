@@ -157,6 +157,7 @@ fn historical_fork_and_exact_resume_preserve_independent_lineage() {
         model: None,
         delivery: Delivery::Reject,
         expected_turn: None,
+        from: None,
     };
     let alt = db
         .begin("Alternative", "r1", "different", true, &branch, |_, _| {
@@ -1516,6 +1517,208 @@ fn served_announcements_carry_each_call_and_the_denials_so_far() {
 }
 
 #[test]
+fn prompts_name_who_wrote_each_and_what_the_turn_ran() {
+    let mut db = db();
+    let person = gated_turn(&mut db, None);
+    db.create("Carol", Some("/synthetic"), binding()).unwrap();
+    // The author is declared, but it has to be a turn of the bot it names.
+    let wrong = TurnOptions {
+        from: Some(("Carol".into(), person)),
+        ..TurnOptions::default()
+    };
+    let refused = db.begin("Carol", "r0", "x", true, &wrong, allow_provider);
+    assert_eq!(refused.unwrap_err().code, "invalid_from");
+    let by_bob = TurnOptions {
+        from: Some(("Bob".into(), person)),
+        ..TurnOptions::default()
+    };
+    let started = db
+        .begin(
+            "Carol",
+            "r1",
+            "delegated work",
+            true,
+            &by_bob,
+            allow_provider,
+        )
+        .unwrap();
+    let turn = started.turn;
+    assert_eq!(
+        started.entry.unwrap()["data"]["from"],
+        json!({"bot":"Bob","turn":person})
+    );
+    // The same request from someone else is not a retry of it.
+    let conflict = db.begin(
+        "Carol",
+        "r1",
+        "delegated work",
+        true,
+        &TurnOptions::default(),
+        allow_provider,
+    );
+    assert_eq!(conflict.unwrap_err().code, "idempotency_conflict");
+    // A person steers the delegated turn.
+    let steer = TurnOptions {
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    let steered = db
+        .begin(
+            "Carol",
+            "r2",
+            "also check the docs",
+            true,
+            &steer,
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    db.absorb(turn, None, 8 << 20, 4096, ContextUsage::default(), false)
+        .unwrap();
+    // One call fails, one is still running.
+    let (items, round): (Vec<Bytes>, Vec<ToolCall>) = [("c1", "false"), ("c2", "sleep 5")]
+        .iter()
+        .enumerate()
+        .map(|(i, (id, command))| shell_call(&format!("fc_{i}"), id, command))
+        .unzip();
+    db.append(turn, items, &round, None).unwrap();
+    db.tool_start(turn, &round[0]).unwrap();
+    let failed = Outcome {
+        failed: true,
+        ..result("exit 1")
+    };
+    let (_, completed) = db.tool_finish(turn, "c1", &failed).unwrap();
+    assert_eq!(completed["data"]["failed"], true);
+    db.tool_start(turn, &round[1]).unwrap();
+    let read = db.prompts("Carol", turn, 64 * 1024).unwrap();
+    assert_eq!(
+        read["prompts"],
+        json!([{"turn":turn,"text":"delegated work","from":{"bot":"Bob","turn":person}},
+            {"turn":steered,"text":"also check the docs","steer":true}])
+    );
+    assert_eq!(
+        read["calls"],
+        json!([{"call_id":"c1","name":"shell","arguments":"{\"command\":\"false\"}",
+                "arguments_truncated":false,"done":true,"failed":true},
+            {"call_id":"c2","name":"shell","arguments":"{\"command\":\"sleep 5\"}",
+                "arguments_truncated":false,"done":false}])
+    );
+    assert_eq!(
+        (&read["workspace"], &read["earlier"], &read["more"]),
+        (&json!("/synthetic"), &json!([]), &json!(false))
+    );
+    assert_eq!(
+        (&read["prompts_more"], &read["calls_more"]),
+        (&json!(false), &json!(false))
+    );
+    // The author's own turn is a person's words.
+    let bob = db.prompts("Bob", person, 1024).unwrap();
+    assert_eq!(bob["prompts"], json!([{"turn":person,"text":"work"}]));
+    // A gated call cut short names the item holding its whole arguments.
+    let (item, call) = shell_call("fc_b", "b1", "make deploy");
+    db.append(person, vec![item], std::slice::from_ref(&call), None)
+        .unwrap();
+    allow(&mut db, person, "b1").unwrap();
+    assert!(matches!(
+        db.approval_start(person, &call, 0).unwrap(),
+        Gated::Started
+    ));
+    let entry = Database::PROMPTS_ENTRY;
+    let cut = db.prompts("Bob", person, 4 + entry + 10).unwrap();
+    let listed = db.approvals(Some("Bob"), None, 0, None, 64).unwrap();
+    assert_eq!(cut["calls"][0]["arguments"], "{\"command\"");
+    assert_eq!(cut["calls"][0]["arguments_truncated"], true);
+    assert!(cut["calls"][0]["node"].is_i64(), "{cut}");
+    assert!(listed["approvals"].as_array().unwrap().is_empty());
+    // Text past the budget is cut and marked; steers and calls past it are
+    // left out.
+    let cut = db.prompts("Carol", turn, 5).unwrap();
+    assert_eq!(cut["prompts"][0]["text"], "deleg");
+    assert_eq!(cut["prompts"][0]["truncated"], true);
+    assert_eq!(cut["prompts"].as_array().unwrap().len(), 1);
+    assert_eq!(cut["prompts_more"], true);
+    assert_eq!(
+        (&cut["calls"], &cut["calls_more"]),
+        (&json!([]), &json!(true))
+    );
+    let cut = db.prompts("Carol", turn, 14 + entry + 3).unwrap();
+    assert_eq!(cut["prompts"][1]["text"], "als");
+    assert_eq!(cut["prompts_more"], false);
+    // Each call counts against the budget, so a long turn stays within it.
+    let cut = db.prompts("Carol", turn, 33 + 2 * entry + 3).unwrap();
+    assert_eq!(cut["calls"].as_array().unwrap().len(), 1);
+    assert_eq!(cut["calls"][0]["arguments"], "{\"c");
+    assert_eq!(cut["calls"][0]["arguments_truncated"], true);
+    assert_eq!(cut["calls_more"], true);
+    // A cut call names the item holding its whole arguments, when gated.
+    assert!(cut["calls"][0].get("node").is_none(), "Carol is not gated");
+    // A later turn sees the earlier prompts newest first.
+    db.tool_finish(turn, "c2", &result("done")).unwrap();
+    db.finish(turn, None).unwrap();
+    let next = db
+        .begin(
+            "Carol",
+            "r3",
+            "next",
+            true,
+            &TurnOptions::default(),
+            allow_provider,
+        )
+        .unwrap()
+        .turn;
+    let read = db.prompts("Carol", next, 4 + entry + 3).unwrap();
+    assert_eq!(
+        read["earlier"],
+        json!([{"turn":steered,"text":"als","truncated":true,"steer":true}])
+    );
+    assert_eq!(read["more"], true);
+    let read = db.prompts("Carol", next, 1024).unwrap();
+    assert_eq!(read["earlier"].as_array().unwrap().len(), 2);
+    assert_eq!(read["more"], false);
+    assert_eq!(
+        db.prompts("Carol", person, 1024).unwrap_err().code,
+        "turn_not_found"
+    );
+    assert_eq!(
+        db.prompts("Nobody", 1, 1024).unwrap_err().code,
+        "bot_not_found"
+    );
+    assert_eq!(
+        db.prompts("Carol", next, 0).unwrap_err().code,
+        "invalid_limit"
+    );
+}
+
+#[test]
+fn schema_38_reads_every_stored_prompt_as_a_persons() {
+    let path = std::env::temp_dir().join(format!("agent-authors-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let turn = {
+        let mut db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+        gated_turn(&mut db, None)
+    };
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE turns DROP COLUMN from_bot; ALTER TABLE turns DROP COLUMN from_turn;
+             PRAGMA user_version=37;",
+        )
+        .unwrap();
+    let db = Database::initialize(Connection::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        db.prompts("Bob", turn, 1024).unwrap()["prompts"],
+        json!([{"turn":turn,"text":"work"}])
+    );
+    drop(db);
+    let version: i32 = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, Database::SCHEMA);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_served_listing_pages_only_to_where_serving_began() {
     let mut db = db();
     let turn = gated_turn(&mut db, None);
@@ -1770,6 +1973,7 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
         model: Some("openai/other-model".into()),
         delivery: Delivery::Reject,
         expected_turn: None,
+        from: None,
     };
     let started = db
         .begin("Bob", "r1", "work", true, &options, allow_provider)
@@ -1841,6 +2045,7 @@ fn a_bot_without_a_default_workspace_needs_one_per_submission() {
         model: None,
         delivery: Delivery::Reject,
         expected_turn: None,
+        from: None,
     };
     let turn = db
         .begin("Nomad", "r1", "work", true, &options, allow_provider)
@@ -2475,6 +2680,7 @@ fn forks_start_at_any_answered_message_and_default_to_the_head() {
                 model: None,
                 delivery: Delivery::Reject,
                 expected_turn: None,
+                from: None,
             },
             allow_provider,
         )

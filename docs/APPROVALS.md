@@ -412,7 +412,9 @@ own clock.
   once, and a program can invent its own tag and serve those bots itself.
 - **`auto` needs its approver running.** The CLI already starts the daemon
   when it is not running; with `auto` it starts `agent approver` the same
-  way. A gated call with no approver waits, parked and visible in
+  way, whenever it makes, continues, or forks a bot that an `auto` gate
+  answers, so a bot continued after a daemon restart gets its approver
+  back. A gated call with no approver waits, parked and visible in
   `approvals`, rather than running or failing silently, until its gate's
   15 s expiry denies it and ends the turn. So if the approver dies and
   nothing restarts it, each auto bot stops at its next gated call with
@@ -467,10 +469,11 @@ so only one instance runs at a time, and answers in layers:
    to keep a resolved path honest) are dropped from `auto`; they are in
    this note as merged in #26, the starting point for rules in manual
    mode.
-3. **Jev, about 0.3 s.** One request per round: the state is the context
-   below plus the round's calls, and each call gets `noul` (true or false)
-   questions, each naming one judgment and returning a probability. Five
-   name a risk:
+3. **A judge model, one request per round.** The judge is Jev (about
+   0.3 s) or any model the daemon serves ([Which model
+   judges](#which-model-judges)). The state is the context below plus the
+   round's calls, and each call gets `noul` (true or false) questions,
+   each naming one judgment and returning a probability. Five name a risk:
    - Does it delete or overwrite data outside the workspace, or rewrite
      history someone else has (a force push)?
    - Does it send files, secrets, or code to a destination the user did
@@ -508,7 +511,8 @@ so only one instance runs at a time, and answers in layers:
    credentials", with the same verbs as the risk question, raised it to
    0.91 and left every unrequested call at 0.13 or below. Asking all
    eleven in one request keeps it to one round trip; they share the state, and
-   Jev bills input only.
+   Jev bills input only. The eleven are asked of every judge in the same
+   words.
 
    Allow when every risk is either low or has a high consent answer. A
    task that says to install a package, publish, or deploy has consented
@@ -545,7 +549,8 @@ so only one instance runs at a time, and answers in layers:
    never allows on an unclear, failed, or timed-out verdict. As in Codex,
    the reason says which it was: "judged risky: REASON" or "not reviewed:
    the check failed", so the model can tell a refusal from an outage. A Jev
-   request gets 10 s, the SDK's default, before it counts as failed.
+   request gets 10 s, the SDK's default, before it counts as failed, and a
+   general model's round 30 s.
 5. **Circuit breaker.** After 3 denials in a row for a bot, or 20 in one
    turn, counted from the daemon's `denials` so a restart does not reset
    them, the approver denies the call with a reason asking the model to
@@ -558,7 +563,43 @@ so only one instance runs at a time, and answers in layers:
    a row or 10 of the last 50 and interrupts. A model that keeps trying
    variations of a denied action is the pattern this catches.
 
-**What Jev is shown.** The human prompts, the round's planned calls, the
+#### Which model judges
+
+George decided on 2026-09-27 that `auto` works without a Jev key, with
+whatever model is configured, and that Jev is one judge among others.
+`agent approver --judge PROVIDER/MODEL`, or `AGENT_APPROVER_JUDGE`, picks
+it. Without either, the judge is Jev when `TYPESAFE_API_KEY` is set, and
+otherwise `AGENT_MODEL` for `agent approver`, or the bot's own model for the
+approver the CLI starts.
+
+- **Jev** (`typesafe/jev-latest`, or any `typesafe/jev-*`) is called on
+  TypeSafe's own API from the approver, with the questions as `noul` primitives. It stays outside the
+  daemon because it is a classifier, not a model that takes turns:
+  running it there would add a call shape that one client uses to the
+  provider layer.
+- **Any other model** runs through the daemon, with the providers and
+  logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
+  approver keeps an idle bot, `approver.TAG`, with the judge's
+  instructions and no tools, and made fresh when it starts; a bot of that
+  name without exactly those is left alone and the approver refuses to start
+  (`approver_name_taken`). Each round forks it, submits one JSON prompt
+  holding the state and the eleven questions (each with what makes it yes
+  or no), queued when every active slot is taken so it starts within the
+  round's deadline, reads back one JSON object of probabilities, and
+  deletes the fork. A reply without every answer, or
+  with one outside 0 to 1, is a failed check. The forks keep rounds apart,
+  run them at once, and share the base's prompt cache. Forks left by an
+  approver that stopped are deleted when the next one starts.
+  `--reasoning` sets the judge bot's effort; the model's default is used
+  otherwise.
+
+A general model is slower than Jev, so its round gets 30 s, and the CLI
+gives an `auto` call 45 s before its gate lapses. Which judge is better at
+what cost is measured, not assumed: the labeled calls of item 2 are replayed
+through the daemon and the approver with each judge
+([Measure](#measure-before-building), item 4).
+
+**What the judge is shown.** The human prompts, the round's planned calls, the
 calls already allowed in this turn with whether each succeeded, the
 workspace path, and the user's environment note (trusted remotes and
 hosts). Not tool results, not the model's prose, and not the model's
@@ -596,10 +637,11 @@ descended from its own tools, but a process that double-forks escapes that,
 and macOS has no equivalent. Consent, like the gate, is advisory without
 isolation.
 
-**Secrets are redacted before Jev sees them.** A planned call can carry a
-secret the model learned from an earlier result, such as a token in a
-`curl -H 'Authorization: …'`, and sending it to Jev would disclose it
-to one more service before the call is judged. So the approver runs a
+**Secrets are redacted before the judge sees them.** A planned call can
+carry a secret the model learned from an earlier result, such as a token
+in a `curl -H 'Authorization: …'`, and sending it to the judge would
+disclose it to one more service, or once more to the bot's own, before
+the call is judged. So the approver runs a
 local detector over everything it sends: the values of credential
 variables in its own environment and the daemon's provider keys, known
 key formats (provider prefixes, PEM blocks, JWTs, cloud access keys),
@@ -611,7 +653,8 @@ where, and judges the destination. A secret the detector does not
 recognize is sent as is; like the `read` list, this is a list.
 
 **The intent view is bounded.** Jev takes at most 32k tokens of state,
-and a long-lived bot's prompts outgrow that. The approver sends, in this
+and a long-lived bot's prompts outgrow that; every judge gets the same
+bound, so they see the same view. The approver sends, in this
 order: the environment note, the root person's prompt for this turn, the
 current turn's prompt and its steers, each marked as a person's or a
 model's words, the calls being judged, the calls already allowed, and
@@ -646,7 +689,8 @@ chain is where consent is easiest to fake.
 **Where the key lives.** The approver process holds the Jev key, so it is
 not in the environment the bots' shells inherit. When the CLI starts the
 daemon and the approver together, it starts the daemon with the Jev key's
-variable removed and passes it only to the approver; the daemon also adds
+variable removed, unless a `--provider` names it as its key variable, and
+passes it only to the approver; the daemon also adds
 that variable to the set it already strips from tool environments, as it
 does for provider keys, in case it was started some other way. That is
 all it gets. A
@@ -663,9 +707,10 @@ fleet ran 60 model calls a second through one daemon. With every round
 that has a gated call going to Jev, that is three times the request
 limit: one key caps an `auto` fleet at about 20 such rounds a second.
 Hence one request per round rather than per call, and a pace in the
-approver that backs off on 429
-and 529 as TypeSafe's docs ask. The pace has a bound: each round gets 10 s
-from announcement to verdict, queue time included, measured from the
+approver that backs off on 429 and 529 as TypeSafe's docs ask. A general
+model judge is paced by the daemon like any bot, under its provider's
+limits. The pace has a bound: each round gets 10 s (30 s with a general
+model) from announcement to verdict, queue time included, measured from the
 request's `announced_ms` so a new holder after a takeover inherits the
 clock instead of starting a fresh one. The queue holds at most as many
 rounds as Jev's current limit admits in that time. A round that would
@@ -936,6 +981,69 @@ as one.
    a socket rather than stdio, and a verdict that arrives while the turn
    is parked on an earlier `wait` (covered by a behavior test, not
    timed).
+4. **Judges compared.** Approved by George on 2026-09-27 (about $0.07 of
+   Jev) and run that day on his Mac (macOS 27.0, M1 Max) at `81458d2`:
+   the 341 labeled calls of item 2, in 338 rounds, replayed through the
+   daemon and `agent approver`, once with Jev and once with `gpt-6-luna`
+   at low reasoning on a ChatGPT plan, the same rounds, questions,
+   thresholds, and state on both sides, in two passes of opposite order.
+   Every labeled call should run, so the set measures false denials only.
+
+   | Per pass | Jev | `gpt-6-luna` |
+   |---|---:|---:|
+   | Allowed, of 341 | 275, 276 | 303, 309 |
+   | Denied as unclear / risky | 59 / 7, 60 / 5 | 0 / 38, 0 / 32 |
+   | Judge time p50 / p99, ms | 170 / 305, 161 / 345 | 3,041 / 12,314, 2,787 / 12,036 |
+   | Slowest round, ms | 453, 429 | 19,590, 25,444 |
+   | Tokens in / out, thousands | 516 / 0 | 438 / 33 |
+   | Cost | $0.0217 | on the plan |
+
+   - Neither judge failed a check or ran past its deadline; the slowest
+     general-model round came within 5 s of its 30 s.
+   - `gpt-6-luna` refused 9 to 11% of benign calls, Jev 19%. Most of
+     Jev's refusals are unclear answers, which the thresholds decide; all
+     of `gpt-6-luna`'s are risky ones.
+   - Jev is about 17 times faster at the median and 35 to 40 times at
+     p99. Order made no difference beyond run-to-run spread.
+   - False allows are still unmeasured: that needs labeled calls that
+     should not run.
+
+   The approver's own path is measured (2026-09-27, `74f726b`) with
+   judges that answer at once, in three arms of
+   [`bench.approval_overhead`](../bench/approval_overhead.py) over a Unix
+   socket: `socket`, the screen answering as in item 3; `jev`, `agent
+   approver` asking a stand-in for Jev's API; and `judge`, `agent approver`
+   with the synthetic model as a general judge through the daemon. Same
+   container and workload as item 3, medians of three rotated runs:
+
+   | | socket | jev | judge |
+   |---|---:|---:|---:|
+   | Turn latency p50 / p99, ms | 14.8 / 27.1 | 17.5 / 30.8 | 26.3 / 40.6 |
+   | Daemon CPU per turn, ms | 9.8 | 10.9 | 18.3 |
+   | Approver CPU per turn, ms | | 1.1 | 1.3 |
+   | Judge time the approver reports, p50, ms | | 1 | 8 |
+   | Store commits per turn | 12.0 | 12.0 | 23.2 |
+   | Storage worker time per turn, ms | 8.9 | 9.7 | 17.7 |
+
+   - With Jev the approver adds 2.7 ms a round and no commit: the
+     `prompts` read (0.8 ms of storage time), building and redacting the
+     state, and the HTTP round trip.
+   - A general model through the daemon adds 11.5 ms, 8.6 ms of daemon
+     CPU, and 11 commits a round: the fork, the judge's turn (its accept,
+     window, response, and finish), reading its tokens, and the deletion,
+     which runs in three bounded pieces. Against a short model turn (1.9 s
+     at the median in the live fleet check) this is small; at 100 such
+     rounds a second it is most of a core, so a lighter path (a judge turn
+     that leaves no bot behind) is worth building if general judges run at
+     that rate.
+   - The same arms before the rebase onto the landed lease changes gave
+     16.0, 18.8, and 26.6 ms at the median: the same differences within
+     the run-to-run spread.
+   - After the review fixes (`aed1669`, 2026-09-27), interleaved with
+     `74f726b`, two runs of each and six rounds per arm: socket 13.5 and
+     13.9 ms, Jev 15.8 and 16.3 ms, general model 22.3 and 23.6 ms, the
+     same commits. The fixes (the slot taken before reads, the queued judge
+     turn, per-bot dedupe) cost nothing measurable.
 
 ## Built so far
 
@@ -1007,12 +1115,69 @@ Where it differs from the design above:
 - A lapsed gate's denial is not counted in `denials`: nobody judged the
   call.
 
-Not built yet: the automatic approver itself (`agent approver`, Jev, the
-redaction, the pace, and the breaker); `from` and `AGENT_TURN`; and the
-app's cards. `--approval auto` is refused with
-`approval_mode_unsupported` until the approver exists, rather than
-creating bots whose gates nobody answers. Dropped with the rules on
-2026-09-27: `until_prior`, `path`, and the `path_changed` check.
+Built on 2026-09-27, the automatic approver:
+
+- `agent approver`: serves a tag, groups each round's calls, reads what
+  the judge is shown with `prompts` and `item`, follows delegations up to
+  8 turns to the person's words (a deeper chain, more than 64 delegating
+  turns, or more prompt text across them than one 128 KiB read holds, is
+  judged too long), redacts, and asks one judge request per
+  round: Jev over its API or any model through the daemon ([Which model
+  judges](#which-model-judges)). A round takes one of 32 judge slots
+  before it reads anything, so rounds past those wait holding only their
+  calls. It answers under its lease, backs off on 429 and 529 (an answer
+  to an earlier request leaves a newer wait in place), fails a Jev answer
+  past 64 KiB, denies as not reviewed past the round's deadline, and trips
+  the breaker. Each round prints one JSON line with the verdicts, the
+  judge's time, and its tokens.
+- `from` on `submit`, `AGENT_TURN` in tool shells, and the `prompts` read
+  op; `failed` on `tool_completed` and the planning `node` on a gated
+  `tool_started`, so the calls already allowed show how they ended.
+- `--approval auto` in the CLI, which starts the approver when nobody
+  serves `auto` and waits for its `serving` line, printed once the judge
+  is ready rather than when the lease is taken.
+
+Where the approver differs from the design above:
+
+- `from` rides `submit` only; `create` and `fork` carry no prompt. The
+  approver reads authors with `prompts` rather than from
+  `approval_requested`.
+- A file the turn wrote is shown whole with a call that names it, by its
+  path or its file name as a whole word in one of the call's strings, up
+  to 48 KiB counted as it is read, read off the approver's runtime
+  thread; a larger one is refused as "not reviewed: it runs a file too
+  large to show", and one that is no longer a regular file is not read. A
+  write or edit that failed shows no file. One planned earlier in the same
+  round is named in its place, since it runs first. A call no gate covers
+  has no planning `node`, so when its preview was cut its arguments cannot
+  be read back: a write or edit is matched by the path its preview holds,
+  with its size unknown, and is judged too long if the preview ends before
+  the path; any other such call keeps its preview and consent is not
+  counted.
+- A general model is asked the same questions as text, each with what
+  makes it yes or no, and answers them as one JSON object.
+- A turn whose steers do not all fit the `prompts` read is denied as
+  "intent too long", since the person's latest word may be the one left
+  out. A model judge's tag is at most 87 bytes, so its forks' names fit.
+
+Not built yet: the app's cards and the app's own approver, and a labeled
+set of calls that should not run, to measure false allows. Follow-ups
+from review (2026-09-27): a fork's inherited turns in `earlier` (they belong to the source bot, so a
+fork's first checks see none of that history); rotation for the
+CLI-started approver's log, which grows one line a round; a CLI that finds
+the tag already served waiting for that approver's `serving` line too;
+judging a later call against consent an earlier call in the same round may
+use up; counting the questions (eleven a call) in a round's request limit;
+writing the verdict lines so a stalled reader of stdout cannot hold up
+the approver; reading completions in `prompts` only for the calls that
+fit, rather than for the whole turn; and forgetting a bot's judged
+requests once its turn ends, so the dedupe map follows active bots, not
+every bot the approver has seen; and showing the judge a round's calls
+that wait on another tag's gate, or on none and have not started yet,
+when they come before the calls it judges, since a manual gate's `write`
+can still run before an `auto` gate's `shell` that runs what it wrote.
+Dropped with the rules on 2026-09-27:
+`until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions
 

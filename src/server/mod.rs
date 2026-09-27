@@ -157,6 +157,13 @@ pub struct Request {
     #[serde(flatten)]
     command: Command,
 }
+/// Who wrote a submitted prompt: a bot's turn. Declared by the submitter.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Author {
+    bot: String,
+    turn: i64,
+}
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -242,6 +249,8 @@ enum Command {
         delivery: Option<String>,
         /// With `steer`: the running turn this message is for, or `stale_turn`.
         expected_turn: Option<i64>,
+        /// The bot turn whose model wrote this prompt; absent for a person.
+        from: Option<Author>,
     },
     Interrupt {
         bot: String,
@@ -267,6 +276,13 @@ enum Command {
     Item {
         bot: String,
         node: i64,
+    },
+    /// A turn's prompts with who wrote each, its started calls, and the
+    /// bot's earlier prompts, within `bytes` of text.
+    Prompts {
+        bot: String,
+        turn: i64,
+        bytes: Option<usize>,
     },
     Artifact {
         bot: String,
@@ -1007,7 +1023,7 @@ pub async fn run(config: Configuration) -> Result<()> {
     let identity = store.instance_identity(lineage)?;
     let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
-        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals","provider_models"],
+        "capabilities":["create","resume","fork_any_node","context_window","submit","bot_identity","delivery","interrupt","events","item","history_nodes","history_items","artifact","follow","follow_all","bots","wait","wait_any","stats","turns","result","budgets","delete","prune","shutdown_grace","approvals","serve_approvals","prompts","prompt_authors","provider_models"],
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
@@ -2250,8 +2266,7 @@ impl Service {
                 if !(100..=600_000).contains(&lease_ms) {
                     return fail_with("invalid_lease", "lease_ms from 100 to 600000");
                 }
-                // Checked before the tag changes hands, so a bad page keeps
-                // the lease this session may already hold.
+                // Checked before a lease is made.
                 let limit = limit.unwrap_or(64);
                 if !(1..=256).contains(&limit) {
                     return fail("invalid_approval_page");
@@ -2420,6 +2435,13 @@ impl Service {
                     .await
             }
             Command::Item { bot, node } => store.read("item", move |db| db.item(&bot, node)).await,
+            Command::Prompts { bot, turn, bytes } => {
+                store
+                    .read("prompts", move |db| {
+                        db.prompts(&bot, turn, bytes.unwrap_or(64 * 1024))
+                    })
+                    .await
+            }
             Command::Artifact {
                 bot,
                 turn,
@@ -2477,6 +2499,7 @@ impl Service {
                 model,
                 delivery,
                 expected_turn,
+                from,
             } => {
                 name(&request_id)?;
                 if prompt.len() > 256 * 1024 {
@@ -2497,6 +2520,7 @@ impl Service {
                     model,
                     delivery,
                     expected_turn,
+                    from: from.map(|author| (author.bot, author.turn)),
                 };
                 // A slot is promised before the commit that may take it, so
                 // admissions queued together cannot start more turns than
@@ -3411,6 +3435,7 @@ mod tests {
             model: None,
             delivery: None,
             expected_turn: None,
+            from: None,
         }
     }
     /// Take requests the way the run loop does: an admission with room joins
