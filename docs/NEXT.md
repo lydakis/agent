@@ -944,7 +944,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     A coordinator on a model other than its file's opens without a word.
     `created` and `forked` events carry no protocol family, so a bot on a
     provider the window has not seen marks that family's models "new agent"
-    until the app reattaches.
+    until the app reattaches. After a reattach, task cards inside the side
+    pane show no latest line until opened, since only the main pane's peers
+    are loaded.
     Next, in
     order: tasks in worktrees (`run --new --worktree` with a setup command, in the
     client); side chats once item 43's fork changes land; approvals in the

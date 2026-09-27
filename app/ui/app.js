@@ -1117,8 +1117,10 @@ function renderPicker() {
     return `<div class="row${idx === S.ui.pickerSel ? ' sel' : ''}" data-pick="${esc(n)}">${q ? '' : `<span class="tree">${r.prefix}</span>`}<span class="glyph ${r.b.status}">${glyphOf(r.b.status)}</span><span class="n">${hit}</span><span class="h">${esc(hint)}</span></div>`;
   }).join('') : '<div class="empty">no bot matches</div>') + more;
 }
-function openPicker() { closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
-function closePicker() { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $('input').focus(); }
+let pickerPane = 'main';
+function openPicker() { pickerPane = paneOf(document.activeElement, menuPane); closeMenu(); S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').value = ''; $('pickerwrap').classList.add('on'); render(); $('pickerq').focus(); }
+// A pick opens its bot alone, so focus goes to the main composer; Escape goes back where it was.
+function closePicker(pane = pickerPane) { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $(PANE[S.ui.side ? pane : 'main'].input).focus(); }
 async function showHelp() {
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
   const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot\n Enter sends · Shift-Enter a new line\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
@@ -1139,7 +1141,7 @@ function menuHTML(items) {
 }
 function showMenu(items, anchor, who = null) {
   // Focus goes back to the pane the menu came from, so typing after it reaches the same bot.
-  if (!S.ui.menu) menuPane = document.activeElement?.closest?.('.pane.side') ? 'side' : 'main';
+  menuPane = paneOf(document.activeElement, menuPane);
   const m = $('menu'); m.innerHTML = menuHTML(items); m.classList.add('on'); S.ui.menu = true; menuAnchor = anchor; menuFor = who; menuKey = menuSig(items);
   const w = m.offsetWidth, h = m.offsetHeight, W = window.innerWidth, H = window.innerHeight;
   let x = anchor.x, y = anchor.y;
@@ -1150,7 +1152,13 @@ function showMenu(items, anchor, who = null) {
 function closeMenu() {
   if (!S.ui.menu) return; S.ui.menu = false; menuFor = null;
   const m = $('menu'), had = m.contains?.(document.activeElement); m.classList.remove('on');
-  if (had) focusInput(menuPane);
+  // A menu that replaces this one (Delete's confirmation) keeps the focus.
+  if (had) setTimeout(() => { if (!S.ui.menu && !S.ui.picker) $(PANE[S.ui.side ? menuPane : 'main'].input)?.focus({ preventScroll: true }); }, 0);
+}
+// The composer pane an element sits in; focus inside the menu keeps the pane it came from.
+function paneOf(el, fallback = 'main') {
+  if ($('menu').contains?.(el)) return fallback;
+  return el?.closest?.('.pane.side') ? 'side' : 'main';
 }
 // An open agent menu follows its bot: a status change rebuilds it in place, a deletion closes it.
 function refreshMenu() {
@@ -1353,9 +1361,9 @@ $('pickerq').addEventListener('keydown', async (e) => {
   if (e.key === 'Escape') { closePicker(); e.preventDefault(); }
   else if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { S.ui.pickerSel = Math.min(rows.length - 1, S.ui.pickerSel + 1); renderPicker(); e.preventDefault(); }
   else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { S.ui.pickerSel = Math.max(0, S.ui.pickerSel - 1); renderPicker(); e.preventDefault(); }
-  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker(); if (r) await openOnly(r.b.name); e.preventDefault(); }
+  else if (e.key === 'Enter') { const r = rows[S.ui.pickerSel]; closePicker('main'); if (r) await openOnly(r.b.name); e.preventDefault(); }
 });
-$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker(); await openOnly(r.dataset.pick); } });
+$('pickerlist').addEventListener('click', async (e) => { const r = e.target.closest('[data-pick]'); if (r) { closePicker('main'); await openOnly(r.dataset.pick); } });
 const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
