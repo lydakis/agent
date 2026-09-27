@@ -847,6 +847,10 @@ test('a new project creates its coordinator in the folder, writes its file once,
   assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
   assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME"/);
   assert.match(create.instructions, /pass the same --workspace whenever you message that task again/);
+  // Tasks get the worktree's own policy, failed starts clean up, and a folder without git keeps tasks in place.
+  assert.match(create.instructions, /run --detach --new --agents --bot NAME/);
+  assert.match(create.instructions, /git worktree remove --force, git branch -D/);
+  assert.match(create.instructions, /when this folder is not a git repository, works in this folder/);
   assert.equal(calls.find(([op]) => op === 'policy')[1], '/synthetic/weather');
   assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/one' });
   assert.equal(p.S.selected, 'weather.lead');

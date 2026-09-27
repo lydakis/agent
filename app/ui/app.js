@@ -1352,11 +1352,11 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 const COORDINATOR = `
 
 ## Coordinating this project
-You coordinate the work in this folder. Give a task that changes files its own git worktree, so tasks do not collide: from this folder run
+You coordinate the work in this folder. When it is a git repository, give a task that changes files its own worktree, so tasks do not collide. Pick a NAME that is also a valid git branch name, and from this folder run
 git worktree add -b agent/NAME "$HOME/.agent/worktrees/NAME" HEAD
-then, if .agent/setup exists here, run it inside that worktree with AGENT_SOURCE set to this folder, and start the task with
-"$AGENT_BIN" run --detach --new --bot NAME --workspace "$HOME/.agent/worktrees/NAME" -- TASK
-A turn runs in the folder it is sent with, so pass the same --workspace whenever you message that task again. A task that only reads works in this folder. The branch holds a task's work until it is merged.
+The worktree starts at the last commit, so uncommitted changes here are not in it. If .agent/setup exists here, run it inside the worktree with AGENT_SOURCE set to this folder, then start the task with
+"$AGENT_BIN" run --detach --new --agents --bot NAME --workspace "$HOME/.agent/worktrees/NAME" -- TASK
+If setup or the start fails, remove the worktree and its branch (git worktree remove --force, git branch -D) before trying again. A turn runs in the folder it is sent with, so pass the same --workspace whenever you message that task again. A task that only reads, or any task when this folder is not a git repository, works in this folder. The branch holds a task's work until it is merged.
 `;
 async function createProject(dir) {
   const info = await Daemon.project(dir);

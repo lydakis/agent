@@ -149,7 +149,7 @@ window.Daemon = (() => {
       // The task that edits code gets its own worktree, as the app tells its coordinators; the others read the project folder.
       const tree = n === 'demo.build';
       const at = `"$HOME/.agent/worktrees/${n}"`;
-      const cmd = tree ? `git worktree add -b agent/${n} ${at} HEAD && "$AGENT_BIN" run --new --bot ${n} --workspace ${at} --model "$AGENT_MODEL" --detach '${tasks[n]}'`
+      const cmd = tree ? `git worktree add -b agent/${n} ${at} HEAD && "$AGENT_BIN" run --new --agents --bot ${n} --workspace ${at} --model "$AGENT_MODEL" --detach '${tasks[n]}'`
         : `"$AGENT_BIN" run --new --bot ${n} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
