@@ -639,7 +639,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     ([run 8](LONG_TASK_EVAL.md#live-run-8)) never compacted: the model sent
     long outputs to files and read their tails, and 25 of 40 bots finished
     before the correction was sent. With each step read whole and the
-    correction sent once two closes are settled
+    correction sent after two successful settlements
     ([run 9](LONG_TASK_EVAL.md#live-run-9)), 38 of 40 were correct and
     compacting took 39 to 45% less input per correct task than full
     context; stubs matched full context's median time but not its tail

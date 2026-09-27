@@ -647,6 +647,28 @@ STEP_RUN = re.compile(
 GROUP_END = re.compile(r'\s*(?:\}|\)|done\b|fi\b|esac\b)')
 
 
+SEPARATORS = r'&&|\|\||\|&?|;|\n|(?<![>&|])&(?![&>])|\$\(|<\(|`'
+
+
+def redirected_groups(command):
+    """The inside of each parenthesized group whose output a redirect or
+    pipe right after its closing parenthesis sends elsewhere, as in
+    `(make check; echo done) >log`."""
+    groups = []
+    for close in re.finditer(r'\)', command):
+        after = command[close.end():].replace('2>&1', '')
+        rest = re.match(r'(?:[^;&|\n]|&>)*', after).group()
+        if '>' not in rest and not re.match(r'\|(?!\|)', after[len(rest):]):
+            continue
+        depth = 0
+        for at in range(close.start() - 1, -1, -1):
+            depth += {')': 1, '(': -1}.get(command[at], 0)
+            if depth < 0:
+                groups.append(command[at + 1:close.start()])
+                break
+    return groups
+
+
 def step_command_faults(command, unread=False):
     """Whether a command that runs a step filters its output, and whether
     it runs more than one step or loops over them. A call run in the
@@ -656,7 +678,7 @@ def step_command_faults(command, unread=False):
     # List separators, a lone `&` included, pipeline stages, and the
     # openings of command and process substitutions; `2>&1` and `&>` are
     # redirects, not separators.
-    parts = re.split(r'(&&|\|\||\|&?|;|\n|(?<![>&|])&(?![&>])|\$\(|<\(|`)', command)
+    parts = re.split(f'({SEPARATORS})', command)
     segments, openers, closers = parts[0::2], [''] + parts[1::2], parts[1::2] + ['']
     runs = [bool(STEP_RUN.match(segment)) for segment in segments]
     steps = [segment for segment, run in zip(segments, runs) if run]
@@ -666,6 +688,8 @@ def step_command_faults(command, unread=False):
         return closers[n] in ('|', '|&') or '>' in segments[n].replace('2>&1', '')
     filtered = (unread or substituted) and bool(steps) or any(sends(n) for n, run in enumerate(runs) if run) or any(
         GROUP_END.match(segment) and sends(n) and any(runs[:n]) for n, segment in enumerate(segments))
+    filtered = filtered or any(STEP_RUN.match(segment) for inner in redirected_groups(command)
+                               for segment in re.split(SEPARATORS, inner))
     looped = any(re.match(r'[\s({]*do\s', step) for step in steps) or bool(
         re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
     return filtered, len(steps) > 1 or looped
@@ -673,10 +697,10 @@ def step_command_faults(command, unread=False):
 
 def close_workflow(root, closes, corrected_at=None):
     """Each close's steps, from the same record: whether a passing check
-    of the close, or of every close, came before it was first settled and
-    its benchmark after, how often it was settled and where it first was,
-    whether a close first settled before the correction reached the record
-    at `corrected_at` was settled again after it, and whether its
+    of the close came before it was first settled and its benchmark
+    after, how often it was settled and where it first was,
+    whether a close first settled before the model took in the correction,
+    when the record held `corrected_at` steps, was settled again after it, and whether its
     settlement file holds the right entries. A close settled again after
     the correction needs no second check or benchmark, since its number
     does not change."""
@@ -686,7 +710,7 @@ def close_workflow(root, closes, corrected_at=None):
     for month, facts in closes.items():
         def ran(step):
             return [n for n, (name, status) in enumerate(runs) if name == step and status == '0']
-        settled, checks, benched = ran(f'settle:{month}'), ran(f'check:{month}') + ran('check'), ran(f'bench:{month}')
+        settled, checks, benched = ran(f'settle:{month}'), ran(f'check:{month}'), ran(f'bench:{month}')
         try:
             entries = json.loads((root / 'out' / f'{month}.json').read_text())
         except (OSError, ValueError):
@@ -762,8 +786,8 @@ def reported_closes(answer, numbers):
 
 def score(root, facts, events, answer, corrected_at=None):
     """Outcomes from the workspace and the bot's events. For the sustained
-    task, `corrected_at` is how many steps the record held when the
-    correction was sent."""
+    task, `corrected_at` is how many steps the record held when the turn
+    took in the correction."""
     passed, cases, failure = hidden_tests(root)
     vendor_intact = vendor_manifest(root) == facts['vendor']
     compactions = [e for e in events if e['event'] == 'compacted']
@@ -939,6 +963,12 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 continue
             if message['event'] == 'turn_finished' and message.get('turn') == steers.get(name, {}).get('turn'):
                 ends[name] = message['data']
+                # The turn took the correction in at a round boundary,
+                # before the model's next call can run a tool; the steps
+                # recorded so far were made without it.
+                if size == 'sustained' and message['data'].get('status') == 'steered':
+                    log = root / name / '.steps.log'
+                    marks[name] = len(log.read_text().splitlines()) if log.exists() else 0
                 continue
             if message.get('turn') != turns[name]:
                 continue
@@ -950,13 +980,9 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
             due = (settled_closes(root / name) >= SUSTAINED_STEER_CLOSES if size == 'sustained'
                    else completed[name] >= STEER_AFTER)
             if due and name not in steers:
-                log = root / name / '.steps.log'
-                mark = len(log.read_text().splitlines()) if log.exists() else 0
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
                                        delivery='steer', expected_turn=turns[name])
                 steers[name] = reply.get('result') or {'error': reply.get('error')}
-                if size == 'sustained' and 'turn' in steers[name]:
-                    marks[name] = mark
         wall = round(max(m['_received_at'] for m in done.values()) - started, 1)
         # A steer still queued when its task ends fails then, as it names
         # that task's turn.

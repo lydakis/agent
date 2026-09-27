@@ -282,7 +282,7 @@ Reconnects, retention, overload, compaction and recovery.
   and 25 of 40 finished before the correction was sent, which alone
   decided who was correct. `7061fab`, 2026-09-27.
   [Record](LONG_TASK_EVAL.md#live-run-8). With each step read whole and
-  the correction sent once two closes were settled, 38 of 40 were
+  the correction sent after two successful settlements, 38 of 40 were
   correct, and compacting took 39 to 45% less input per correct task than
   full context (416k input token-equivalents with stubs at 128 KiB, 438k
   with summaries only, 457k with stubs at 256 KiB, against 754k). Bots

@@ -278,7 +278,7 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual(unbenched['closes_reported'], 0)
         self.assertFalse(unbenched['followed_workflow'])
         # Settling before the check, or benching before settling, is out of
-        # order; a check of every close counts for each.
+        # order, and a check of every close counts for none.
         early = run(*setup, HALF_EVEN, f'tools/settle {MONTHS[0]}', f'make check CLOSE={MONTHS[0]}',
                     f'make bench CLOSE={MONTHS[0]}', *[step for month in MONTHS[1:] for step in close(month)])
         self.assertFalse(early['closes'][MONTHS[0]]['checked_before_settle'] or early['followed_workflow'])
@@ -303,7 +303,9 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertFalse(float_convert['correct'])
         self.assertTrue(float_convert['hidden_tests'].startswith('0/'), float_convert['hidden_tests'])
         whole = run(*setup, HALF_EVEN, 'make check', *[step for month in MONTHS for step in close(month)[1:]])
-        self.assertTrue(whole['followed_workflow'], whole['closes'])
+        self.assertTrue(whole['correct'])
+        self.assertFalse(any(c['checked_before_settle'] for c in whole['closes'].values())
+                         or whole['followed_workflow'])
         # Every close's own steps in order, but the closes out of it.
         swapped = run(*setup, HALF_EVEN, *close(MONTHS[1]), *close(MONTHS[0]), *close(MONTHS[2]))
         self.assertTrue(swapped['correct'] and all(
@@ -498,7 +500,12 @@ class LongTaskScoreTests(unittest.TestCase):
                 # Behind an interpreter's options.
                 ("bash -lc 'make check CLOSE=2026-01 >log'", (True, False)),
                 ("sh -c 'tools/settle 2026-01 | tail -1'", (True, False)),
-                ('bash -c "make check CLOSE=2026-01; tools/settle 2026-01"', (False, True))):
+                ('bash -c "make check CLOSE=2026-01; tools/settle 2026-01"', (False, True)),
+                # A redirect or pipe on a subshell holding a step.
+                ('(make check CLOSE=2026-01; echo done) >log', (True, False)),
+                ('(make check CLOSE=2026-01; echo done) | tail -3', (True, False)),
+                ('(tools/settle 2026-01; echo done) &>log', (True, False)),
+                ('make check CLOSE=2026-01; echo $(date) > log', (False, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 
@@ -645,6 +652,10 @@ class LongTaskRunnerTests(ModelFixture):
                 self.assertEqual((result['closes_settled_correctly'], result['closes_reported']),
                                  (len(MONTHS), len(MONTHS)))
                 self.assertEqual([result['closes'][month]['settle_runs'] for month in MONTHS], [2, 2, 1, 1, 1, 1])
+                # The two closes settled before the turn took in the
+                # correction were settled again after it.
+                self.assertEqual([result['closes'][month]['settled_after_correction'] for month in MONTHS],
+                                 [True, True, None, None, None, None])
                 self.assertEqual((result['make_quick_runs'], result['migrations_applied']), (0, 1))
                 self.assertEqual(result['compaction_failures'], [])
                 if condition == 'sustained-compact':
