@@ -28,6 +28,7 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MARKER: &str = "__agent_app_environment__";
 /// Keys, not documents: bounds the read that starts every daemon.
 const MAX_ENV_FILE: u64 = 64 * 1024;
+const MAX_SHELL_OUTPUT: u64 = 1024 * 1024;
 
 static LOGIN: OnceCell<Option<Vec<(OsString, OsString)>>> = OnceCell::const_new();
 
@@ -210,25 +211,29 @@ fn read_env_file(path: &Path) -> Result<Vec<(String, String)>, String> {
 /// export provider keys. Anything the profile prints comes before the marker;
 /// a value may contain anything, the marker included.
 async fn login_environment() -> Option<Vec<(OsString, OsString)>> {
+    use tokio::io::AsyncReadExt;
     let shell = std::env::var_os("SHELL").filter(|shell| !shell.is_empty())?;
-    let output = tokio::time::timeout(
-        SHELL_TIMEOUT,
-        Command::new(shell)
-            .args(["-l", "-i", "-c"])
-            .arg(format!("echo {MARKER}; /usr/bin/env -0"))
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    output
-        .status
-        .success()
-        .then(|| parse_environment(&output.stdout))
-        .flatten()
+    let mut child = Command::new(shell)
+        .args(["-l", "-i", "-c"])
+        .arg(format!("echo {MARKER}; /usr/bin/env -0"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?.take(MAX_SHELL_OUTPUT + 1);
+    let mut output = Vec::new();
+    let read = async {
+        stdout.read_to_end(&mut output).await.ok()?;
+        child.wait().await.ok()
+    };
+    // Bounded in time and in bytes: a noisy profile is not an environment.
+    let status = tokio::time::timeout(SHELL_TIMEOUT, read).await.ok()??;
+    if !status.success() || output.len() as u64 > MAX_SHELL_OUTPUT {
+        return None;
+    }
+    parse_environment(&output)
 }
 
 fn parse_environment(stdout: &[u8]) -> Option<Vec<(OsString, OsString)>> {

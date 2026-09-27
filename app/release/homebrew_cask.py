@@ -39,10 +39,12 @@ def render_cask(version: str, archive: Path) -> str:
 
   # The app starts a daemon from its bundle that outlives the window. Stop it
   # (letting running turns finish) before the bundle goes, as on an upgrade.
+  # The store is named: the uninstalling shell's AGENT_STORE or AGENT_SOCKET
+  # may point elsewhere than the Dock-launched app did.
   uninstall quit:   "me.lydakis.agent",
             script: {{
               executable:   "#{{appdir}}/Agent.app/Contents/MacOS/agent",
-              args:         ["shutdown", "--grace", "30"],
+              args:         ["shutdown", "--store", "#{{Dir.home}}/.agent/state.sqlite", "--grace", "30"],
               must_succeed: false,
             }}
 

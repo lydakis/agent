@@ -663,7 +663,8 @@ function attach() {
 }
 async function attachOnce() {
   try {
-    if (!S.config) S.config = await Daemon.setup();
+    // A model found only later (a repaired ~/.agent/env) is picked up on the next attach.
+    if (!S.config?.model) S.config = await Daemon.setup();
     const { session } = await Daemon.attach(S.cursor);
     S.session = session;
     S.deleted = new Set(); S.snapshot = true;

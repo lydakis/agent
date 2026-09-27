@@ -18,7 +18,7 @@ class CaskTest(unittest.TestCase):
         self.assertIn('  app "Agent.app"', cask)
         # The bundled daemon is stopped before its binary goes.
         self.assertIn('Agent.app/Contents/MacOS/agent",', cask)
-        self.assertIn('args:         ["shutdown", "--grace", "30"]', cask)
+        self.assertIn('args:         ["shutdown", "--store", "#{Dir.home}/.agent/state.sqlite", "--grace", "30"]', cask)
         # brew style (Homebrew/OSDependsOn) requires it of a macOS-only cask.
         self.assertIn("  depends_on :macos\n", cask)
         # The store is shared with the CLI and is the user's data, not the app's.

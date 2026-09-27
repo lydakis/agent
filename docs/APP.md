@@ -140,9 +140,12 @@ store and socket themselves are resolved from the app's own arguments and
 environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
 or `AGENT_SOCKET` never starts anything. Uninstalling or upgrading the cask
-quits the app and runs the bundled `agent shutdown --grace 30`, so the default
-store's daemon, whoever started it, lets running turns finish and exits before
-its binary is replaced.
+quits the app and runs the bundled `agent shutdown --store
+~/.agent/state.sqlite --grace 30`, so the default store's daemon, whoever
+started it, lets running turns finish and exits before its binary is replaced.
+The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
+cannot point the shutdown elsewhere. A default model that appears only after
+launch, from a repaired `~/.agent/env`, is picked up on the next attach.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
