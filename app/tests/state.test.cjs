@@ -878,6 +878,22 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
   d.close();
 });
 
+test('the demo daemon ends a stopped turn quietly when its bot is deleted before the script wakes', async () => {
+  const context = vm.createContext({ window: {}, setTimeout, clearTimeout, Math, JSON, Promise, Error, String, Set, Map, Infinity });
+  vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
+  const d = context.window.Daemon, failures = [], onFail = (e) => failures.push(e);
+  process.on('unhandledRejection', onFail);
+  try {
+    await d.request('create', { bot: 'solo', model: 'alpha/one' });
+    await d.request('submit', { bot: 'solo', prompt: 'read the dispatch', delivery: 'reject' });
+    await new Promise((r) => setTimeout(r, 300));
+    await d.request('interrupt', { bot: 'solo' });
+    await d.request('delete', { bot: 'solo' });
+    await new Promise((r) => setTimeout(r, 1200));
+    assert.deepEqual(failures, []);
+  } finally { process.off('unhandledRejection', onFail); d.close(); }
+});
+
 test('a folded run names a timeout or a failed call; the finder reaches folded tasks; a side draft stays with its bot', async () => {
   const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])

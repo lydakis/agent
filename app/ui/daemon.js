@@ -42,8 +42,10 @@ window.Daemon = (() => {
     emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
+  // Scripted work outlives a stop; a bot deleted meanwhile reads as interrupted, so it ends quietly.
+  const GONE = { interrupted: true, status: 'idle' };
   async function stream(name, turn, text, pace = 40) {
-    const b = S.bots.get(name);
+    const b = S.bots.get(name) ?? GONE;
     for (const word of text.split(' ')) {
       if (b.interrupted) return false;
       emit({ event: 'text_delta', bot: name, turn, text: word + ' ', durable: false });
@@ -56,7 +58,7 @@ window.Daemon = (() => {
   // A steer waits for the running turn's next round boundary, joins it as a user message, and the
   // scripted model acknowledges it before carrying on.
   async function steerIn(name, turn) {
-    const b = S.bots.get(name);
+    const b = S.bots.get(name) ?? GONE;
     while (b.steers?.length && !b.interrupted) {
       const prompt = b.steers.shift();
       emit({ event: 'message', bot: name, turn, data: { node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }) } });
@@ -65,7 +67,7 @@ window.Daemon = (() => {
     }
   }
   async function think(name, turn, text) {
-    const b = S.bots.get(name);
+    const b = S.bots.get(name) ?? GONE;
     for (const word of text.split(' ')) {
       if (b.interrupted) return false;
       emit({ event: 'thinking_delta', bot: name, turn, text: word + ' ', durable: false });
@@ -76,7 +78,7 @@ window.Daemon = (() => {
   }
   let calls = 0;
   async function tool(name, turn, tname, args, output, ms = 500) {
-    const b = S.bots.get(name);
+    const b = S.bots.get(name) ?? GONE;
     if (b.interrupted) return;
     const call_id = `call_${++calls}`;
     emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: tname, arguments: JSON.stringify(args), arguments_truncated: false } });
@@ -94,7 +96,7 @@ window.Daemon = (() => {
     return turn;
   }
   function finish(name, turn, status = 'completed') {
-    const b = S.bots.get(name);
+    const b = S.bots.get(name); if (!b) return;
     b.status = 'idle'; b.running_turn = null;
     emit({ event: 'turn_finished', bot: name, turn, data: { status, checkpoint: status === 'completed' ? S.nextNode - 1 : null, error: status === 'completed' ? null : 'cancelled', detail: null } });
   }
@@ -112,7 +114,7 @@ window.Daemon = (() => {
     } else {
       await stream(name, turn, `Got it. ${prompt.trim().replace(/[.?!]+$/, '')}: I will keep it small and report back with a diff, not a story.`);
     }
-    if (!S.bots.get(name).interrupted) finish(name, turn);
+    if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
   }
   async function scenario(name, turn) {
     const m = S.bots.get(name);
@@ -145,7 +147,7 @@ window.Daemon = (() => {
     m.status = 'waiting';
     emit({ event: 'turn_waiting', bot: name, turn, data: { call_id: wid, handles, deadline_ms: null, any: false } });
     await wait(9000);
-    while (Object.keys(tasks).some((n) => S.bots.get(n).status !== 'idle') && !m.interrupted) await wait(200);
+    while (Object.keys(tasks).some((n) => (S.bots.get(n) ?? GONE).status !== 'idle') && !m.interrupted) await wait(200);
     if (m.interrupted) return;
     m.status = 'running';
     emit({ event: 'turn_resumed', bot: name, turn, data: { call_id: wid } });
@@ -163,6 +165,7 @@ window.Daemon = (() => {
       await tool(n, turn, 'edit', { path: 'src/auth/session.rs' }, '+23 −8', 900);
       await tool(n, turn, 'shell', { command: 'cargo check -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'Finished dev profile in 2.1s\n', success: true }), 1100);
       // build asks a peer of its own to review, and waits on it: depth two.
+      if ((S.bots.get(n) ?? GONE).interrupted) return;
       const cmd = `"$AGENT_BIN" run --new --bot demo.review --model "$AGENT_MODEL" --detach 'Review the auth diff for regressions.'`;
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: n, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
@@ -242,7 +245,7 @@ window.Daemon = (() => {
           const turn = S.nextTurn; reply(params.bot, params.prompt); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); if (src.status !== 'idle') throw new Error('bot_busy'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace); return { ...S.bots.get(params.bot) }; }
-        case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
+        case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); b.interrupted = true; S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
         default: throw new Error(`unsupported_in_demo:${op}`);
       }
     },

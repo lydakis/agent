@@ -941,6 +941,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     `project.toml` another window writes between the app reading the folder
     and creating the coordinator is refused only after the coordinator
     exists; creation should re-check the file or remove that coordinator.
+    A coordinator on a model other than its file's opens without a word.
+    `created` and `forked` events carry no protocol family, so a bot on a
+    provider the window has not seen marks that family's models "new agent"
+    until the app reattaches.
     Next, in
     order: tasks in worktrees (`run --new --worktree` with a setup command, in the
     client); side chats once item 43's fork changes land; approvals in the
