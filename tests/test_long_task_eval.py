@@ -10,9 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bench import long_task_eval
-from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_CLOSES, TASK, close_numbers,
-                                  prompt, run_condition, score, settled_closes, settled_cents, step_command_faults,
-                                  steer_outcome, workspace)
+from bench.long_task_eval import (CORRECTION, MONTHS, STEER_AFTER, SUSTAINED_STEER_CLOSES, TASK, close_labels,
+                                  close_numbers, prompt, run_condition, score, settled_closes, settled_cents,
+                                  step_command_faults, steer_outcome, workspace)
 from bench.targets import clean_env
 from tests.test_runtime import ModelFixture, is_summary
 
@@ -197,15 +197,19 @@ class LongTaskScoreTests(unittest.TestCase):
         numbers = {month: facts['closes'][month]['throughput'] for month in MONTHS}
 
         def run(*steps, answer=None):
+            # CORRECTION marks where the runner sent it.
             self.setUp()
             workspace(self.root, 7, 'sustained')
+            corrected_at = None
             for step in steps:
                 if step in (HALF_EVEN, TRUNCATING):
                     (self.root / 'ledger/convert.py').write_text(step)
+                elif step == CORRECTION:
+                    corrected_at = len((self.root / '.steps.log').read_text().splitlines())
                 else:
                     shell(self.root, step)
             report = ', '.join(f'{month}: {number:,} rows/s' for month, number in numbers.items())
-            return score(self.root, facts, [], report if answer is None else answer)
+            return score(self.root, facts, [], report if answer is None else answer, corrected_at)
 
         def close(month):
             return (f'make check CLOSE={month}', f'tools/settle {month}', f'make bench CLOSE={month}')
@@ -216,10 +220,17 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertEqual((clean['closes_settled_correctly'], clean['closes_reported']), (3, 3))
         # A close settled before the correction and settled again after it
         # counts, without a second benchmark.
-        again = run(*setup, TRUNCATING, *close(MONTHS[0]), HALF_EVEN, f'tools/settle {MONTHS[0]}',
+        again = run(*setup, TRUNCATING, *close(MONTHS[0]), CORRECTION, HALF_EVEN, f'tools/settle {MONTHS[0]}',
                     *[step for month in MONTHS[1:] for step in close(month)])
         self.assertTrue(again['correct'] and again['followed_workflow'], again)
         self.assertEqual(again['closes'][MONTHS[0]]['settle_runs'], 2)
+        self.assertEqual([c['settled_after_correction'] for c in again['closes'].values()], [True, None, None])
+        # A close settled before the correction must be settled again after
+        # it, even when its first settlement already used the new rule.
+        early_rule = run(*setup, HALF_EVEN, *close(MONTHS[0]), CORRECTION,
+                         *[step for month in MONTHS[1:] for step in close(month)])
+        self.assertEqual(early_rule['closes_settled_correctly'], 3)
+        self.assertFalse(early_rule['closes'][MONTHS[0]]['settled_after_correction'] or early_rule['correct'])
         # One not settled again is wrong, and the task with it.
         stale = run(*setup, TRUNCATING, *close(MONTHS[0]), HALF_EVEN,
                     *[step for month in MONTHS[1:] for step in close(month)])
@@ -253,6 +264,7 @@ class LongTaskScoreTests(unittest.TestCase):
                 (f'January and February: {numbers[MONTHS[0]]} and {numbers[MONTHS[1]]} rows/s, respectively; '
                  f'March: {numbers[MONTHS[2]]}', 3),
                 (', '.join(f'{numbers[m]} ({m})' for m in MONTHS), 3),
+                ('\n'.join(f'{name}: {numbers[m]}' for name, m in zip(('january', 'FEB', 'March'), MONTHS)), 3),
                 # Across a line, as a table's heading row or a plain one.
                 ('| Close | ' + ' | '.join(MONTHS) + ' |\n|---|---|---|---|\n| Throughput | '
                  + ' | '.join(str(numbers[m]) for m in MONTHS) + ' |', 3),
@@ -482,9 +494,16 @@ class LongTaskScoreTests(unittest.TestCase):
                 # A later stage of a pipeline is a step too.
                 ('printf x | make check CLOSE=2026-01 >log', (True, False)),
                 ('printf x | tools/settle 2026-01', (False, False)),
-                ('echo y | tools/settle 2026-01 | tail -3', (True, False))):
+                ('echo y | tools/settle 2026-01 | tail -3', (True, False)),
+                # Behind an interpreter's options.
+                ("bash -lc 'make check CLOSE=2026-01 >log'", (True, False)),
+                ("sh -c 'tools/settle 2026-01 | tail -1'", (True, False)),
+                ('bash -c "make check CLOSE=2026-01; tools/settle 2026-01"', (False, True))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
+
+    def test_a_month_name_labels_its_close_in_any_case_but_the_verb_may(self):
+        self.assertEqual([at for at, _ in close_labels('May: 1, it may vary, MAY, may', ['2026-05'])], [0, 21])
 
     def test_a_step_run_in_the_background_goes_unread(self):
         # A background or detached call returns a handle, not the step's

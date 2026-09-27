@@ -248,33 +248,36 @@ model wrote, so they run in a child process that keeps only `PATH`,
 The sustained task is scored per close from the same record: whether a
 passing check of the close, or of every close, came before its first
 settlement and its benchmark after it, as one attempt (a close settled
-again after the correction needs no second check or benchmark, since
-its number does not change), how often it was settled, whether its
-`out/` file holds the right entries, in integer cents, and whether the
-answer carries its number under its own close, whole rather than inside
-a longer one, and its benchmark ran. A line that names as many closes as
-it gives close numbers pairs them in order (`2026-01: n, 2026-02: m`, or
-`January and February: n and m`); otherwise a number's close is the
-last label before it on its line, else the first after it. A line with
-numbers and no label pairs them in order with the last labelled line
-above when that names as many, as under a table's heading row, else
-takes its label when it names one. A label is the month (`2026-01`) or
-its name (`January` or `Jan`). The hidden tests also require integer
-cents. A sustained bot is correct only when the hidden tests pass and
-all six settlements are right, reports its numbers only when all six are
-there, and followed the workflow when it ran `tools/env-check` first,
-every close's steps came in order, and each close was first settled
-after the one before it. Each close's number is its own, so one number
-in an answer credits one close. It also counts the step commands that
-sent their output elsewhere or cut it (a pipe, or a redirect other than
+again after the correction needs no second check or benchmark, since its
+number does not change), how often it was settled, whether a close first
+settled before the correction was sent was settled again after it,
+whether its `out/` file holds the right entries, in integer cents, and
+whether the answer carries its number under its own close, whole rather
+than inside a longer one, and its benchmark ran. A line that names as
+many closes as it gives close numbers pairs them in order (`2026-01: n,
+2026-02: m`, or `January and February: n and m`); otherwise a number's
+close is the last label before it on its line, else the first after it.
+A line with numbers and no label pairs them in order with the last
+labelled line above when that names as many, as under a table's heading
+row, else takes its label when it names one. A label is the month
+(`2026-01`) or its name (`January` or `Jan`) in any case, except the
+lowercase verb "may". The hidden tests also require integer cents. A
+sustained bot is correct only when the hidden tests pass, all six
+settlements are right, and each close settled before the correction was
+settled again after it, reports its numbers only when all six are there,
+and followed the workflow when it ran `tools/env-check` first, every
+close's steps came in order, and each close was first settled after the
+one before it. Each close's number is its own, so one number in an
+answer credits one close. It also counts the step commands that sent
+their output elsewhere or cut it (a pipe, or a redirect other than
 `2>&1`, at any stage of a pipeline), ran them inside a command
 substitution, or ran them in the background or detached, where the call
 returns a handle rather than the output, and those that ran several
 steps, joined by any list separator (`&` included), or looped over them.
-A step counts where a command runs it, inside a conditional or a loop
-too, not where it reads the step's source. In the scripted run at
-128 KiB, the default tools stub old results nine times and summarize
-never; without `read`, seven summaries make the room.
+A step counts where a command runs it, inside a conditional, a loop or
+an interpreter's `-c` too, not where it reads the step's source. In the
+scripted run at 128 KiB, the default tools stub old results nine times
+and summarize never; without `read`, seven summaries make the room.
 
 Every condition also records each bot's shell commands (the first 160
 characters each), its time from submission to its task's end, and the
@@ -846,7 +849,8 @@ closes are settled. Four arms at once, 10 bots each, seed 7,
 - Run 8 sent the correction after the twelfth completed tool call, and
   run 9 after two successful settlements, not two distinct closes. Both
   scored the workflow without comparing the closes' order or binding
-  each close's check, first settlement and benchmark into one attempt,
+  each close's check, first settlement and benchmark into one attempt or
+  requiring a close settled before the correction to be settled again,
   matched each number anywhere in the answer, even inside a longer one or
   under another close, compared cents by value rather than as integers,
   and did not count background, detached, substituted or later-pipeline

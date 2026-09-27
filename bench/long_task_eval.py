@@ -642,7 +642,7 @@ STEP_RUN = re.compile(
     r"""^[\s('"{]*(?:(?:do|then|else|if|elif|while|until|!)\s+)*"""
     r"""(?:(?:(?:env|command|exec|time|nice|nohup|stdbuf)(?:\s+-\S+)*|timeout(?:\s+-\S+)*\s+\S+"""
     r"""|\w+=\S*)\s+)*"""
-    r"""(?:(?:python3?|bash|sh)\s+)?"""
+    r"""(?:(?:python3?|bash|sh)(?:\s+-\w+)*\s+['"]?)?"""
     r"""(?:make(?:\s+(?:-C\s+\S+|-\S+|\w+=\S*))*\s+(?:check|bench)\b|(?:[\w.~/-]*/)?tools/settle\b)""")
 GROUP_END = re.compile(r'\s*(?:\}|\)|done\b|fi\b|esac\b)')
 
@@ -671,13 +671,15 @@ def step_command_faults(command, unread=False):
     return filtered, len(steps) > 1 or looped
 
 
-def close_workflow(root, closes):
+def close_workflow(root, closes, corrected_at=None):
     """Each close's steps, from the same record: whether a passing check
     of the close, or of every close, came before it was first settled and
     its benchmark after, how often it was settled and where it first was,
-    and whether its settlement file holds the right entries. A close
-    settled again after the correction needs no second check or
-    benchmark, since its number does not change."""
+    whether a close first settled before the correction reached the record
+    at `corrected_at` was settled again after it, and whether its
+    settlement file holds the right entries. A close settled again after
+    the correction needs no second check or benchmark, since its number
+    does not change."""
     log = root / '.steps.log'
     runs = [line.split()[:2] for line in log.read_text().splitlines()] if log.exists() else []
     out = {}
@@ -693,6 +695,9 @@ def close_workflow(root, closes):
                       'bench_runs': len(benched),
                       'checked_before_settle': bool(settled) and any(n < settled[0] for n in checks),
                       'benched_after_settle': bool(settled) and any(n > settled[0] for n in benched),
+                      # None when the close needed no second settlement.
+                      'settled_after_correction': None if corrected_at is None or not settled
+                      or settled[0] >= corrected_at else any(n >= corrected_at for n in settled),
                       'settled_correctly': exact(entries, facts['entries'])}
     return out
 
@@ -713,12 +718,15 @@ MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July', '
 
 def close_labels(text, months):
     """Each close label in a text, by position: the month as the prompt
-    names it, 2026-01, or its name, January or Jan."""
+    names it, 2026-01, or its name, January or Jan, in any case but the
+    lowercase verb "may"."""
     labels = []
     for month in months:
         year, n = month.split('-')
         name = MONTH_NAMES[int(n) - 1]
-        labels += [(found.start(), month) for found in re.finditer(rf'\b(?:{year}-{n}|{name}|{name[:3]})\b', text)]
+        labels += [(found.start(), month)
+                   for found in re.finditer(rf'\b(?:{year}-{n}|{name}|{name[:3]})\b', text, re.IGNORECASE)
+                   if found.group() != 'may']
     return sorted(labels)
 
 
@@ -752,8 +760,10 @@ def reported_closes(answer, numbers):
     return reported
 
 
-def score(root, facts, events, answer):
-    """Outcomes from the workspace and the bot's events."""
+def score(root, facts, events, answer, corrected_at=None):
+    """Outcomes from the workspace and the bot's events. For the sustained
+    task, `corrected_at` is how many steps the record held when the
+    correction was sent."""
     passed, cases, failure = hidden_tests(root)
     vendor_intact = vendor_manifest(root) == facts['vendor']
     compactions = [e for e in events if e['event'] == 'compacted']
@@ -772,7 +782,7 @@ def score(root, facts, events, answer):
                 commands.append((event['cursor'], arguments.get('command', ''),
                                  bool(arguments.get('background') or arguments.get('detach'))))
     steps = workflow(root, facts['state'])
-    closes = close_workflow(root, facts['closes'])
+    closes = close_workflow(root, facts['closes'], corrected_at)
     # Each close's number counts when its benchmark printed it and the
     # answer gives it for that close.
     reported = reported_closes(answer, {month: facts['closes'][month]['throughput'] for month in closes})
@@ -845,7 +855,8 @@ def score(root, facts, events, answer):
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,
         # The sustained task is also its settlements.
-        'correct': passed == cases and all(c['settled_correctly'] for c in closes.values()),
+        'correct': passed == cases and all(c['settled_correctly'] and c['settled_after_correction'] is not False
+                                           for c in closes.values()),
         'vendor_intact': vendor_intact,
         'make_quick_runs': count_lines(root / '.quick-attempts'),
         'make_quick_calls_after_first_compaction': sum(first_cut is not None and c > first_cut for c in quick),
@@ -919,7 +930,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         # and steers, with each task's time from its submission to its end
         # as the reader received it. The sustained task's point is in its
         # step record, written before the tool completes.
-        done, steers, ends, completed, finished = {}, {}, {}, {name: 0 for name in names}, {}
+        done, steers, ends, completed, finished, marks = {}, {}, {}, {name: 0 for name in names}, {}, {}
         while len(done) < len(names):
             message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
                                      timeout=timeout)
@@ -939,9 +950,13 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
             due = (settled_closes(root / name) >= SUSTAINED_STEER_CLOSES if size == 'sustained'
                    else completed[name] >= STEER_AFTER)
             if due and name not in steers:
+                log = root / name / '.steps.log'
+                mark = len(log.read_text().splitlines()) if log.exists() else 0
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
                                        delivery='steer', expected_turn=turns[name])
                 steers[name] = reply.get('result') or {'error': reply.get('error')}
+                if size == 'sustained' and 'turn' in steers[name]:
+                    marks[name] = mark
         wall = round(max(m['_received_at'] for m in done.values()) - started, 1)
         # A steer still queued when its task ends fails then, as it names
         # that task's turn.
@@ -962,7 +977,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                              'wall_s': finished[name],
                              'steer': steer_outcome(steers.get(name), ends.get(name)),
                              'answer': answer[:2000], 'compaction_failures': failures[name],
-                             **score(root / name, facts[name], events, answer)}
+                             **score(root / name, facts[name], events, answer, marks.get(name))}
         client.request('shutdown')
     finally:
         client.close(kill=True)
