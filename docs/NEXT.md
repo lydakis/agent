@@ -943,8 +943,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     (2026-09-27): the app shell ([APP.md](APP.md#projects-and-panes)):
     projects in the sidebar from coordinator bots and `.agent/project.toml`,
     a side pane with its own composer, the model chip, Send with queue or
-    steer, one ⋯ menu, runs folded to one line. Side chat shows disabled
-    until item 43. Follow-up: `delete` and `fork` take only a name, so a
+    steer, one ⋯ menu, runs folded to one line. Done (2026-09-27): side
+    chats, forks of a running or resting bot opened beside, that read files
+    or only answer ([APP.md](APP.md#projects-and-panes)). Follow-up: `delete` and `fork` take only a name, so a
     delete or fork the app started can land on a bot recreated under that
     name meanwhile; both should take the bot's id, as `submit` does. The
     same holds for a model menu left open across such a recreation. And a
@@ -959,7 +960,7 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     are loaded.
     Next, in
     order: tasks in worktrees (`run --new --worktree` with a setup command, in the
-    client); side chats once item 43's fork changes land; approvals in the
+    client), then side chats with all tools in a new worktree, and Keep; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
     text in the client policy; swarms last, since that design is not decided.
     A fork into another provider stays out: history is provider-native.
