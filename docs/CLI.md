@@ -71,7 +71,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   has a judge decide every call waiting on it, one request per round,
   printing one JSON line per round. The judge is `--judge`, else
   `AGENT_APPROVER_JUDGE`, else `typesafe/jev-latest` when `TYPESAFE_API_KEY`
-  is set, else `AGENT_MODEL`; any model but Jev runs through the daemon, with
+  is set, else `AGENT_MODEL`; any model but Jev (`typesafe/jev-*`) runs
+  through the daemon, with
   a tag of at most 87 bytes, and `--reasoning` sets its effort. `--note` (default `AGENT_APPROVER_NOTE`)
   is text the judge always sees, such as trusted remotes and hosts
   ([APPROVALS.md](APPROVALS.md#automatic-mode)).

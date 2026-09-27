@@ -839,11 +839,16 @@ class AutoApproverTests(ModelFixture):
         self.assertEqual(daemon.request('resume', bot='approver.auto')['result']['instructions'],
                          'Help with the repo.')
         self.assertIn('result', daemon.request('delete', bot='approver.auto'))
-        # A fork left by an approver that stopped mid-round is removed, and
-        # a bot that only shares its prefix is kept.
-        daemon.request('create', bot='approver.auto', workspace='/', model='openai/old-judge',
-                       instructions='You judge tool calls an AI agent has planned, before they run. Old.',
-                       tools=[])
+        # An approver that stopped leaves its judge and a fork from mid-round:
+        # the next one makes the judge afresh, removes the fork, and keeps a
+        # bot that only shares its prefix.
+        old, _ = self.approver(daemon, judge='openai/old-judge')
+        old.kill()
+        old.wait()
+        deadline = time.monotonic() + 5
+        while daemon.request('stats')['result']['approvers']:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
         daemon.request('fork', source='approver.auto', bot='approver.auto.1.0', created_by='approver.auto')
         daemon.request('create', bot='approver.auto.notes', workspace='/', model='openai/synthetic-model',
                        tools=['shell'])

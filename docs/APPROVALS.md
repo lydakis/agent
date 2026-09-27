@@ -572,8 +572,8 @@ it. Without either, the judge is Jev when `TYPESAFE_API_KEY` is set, and
 otherwise `AGENT_MODEL` for `agent approver`, or the bot's own model for the
 approver the CLI starts.
 
-- **Jev** (`typesafe/jev-latest`) is called on TypeSafe's own API from the
-  approver, with the questions as `noul` primitives. It stays outside the
+- **Jev** (`typesafe/jev-latest`, or any `typesafe/jev-*`) is called on
+  TypeSafe's own API from the approver, with the questions as `noul` primitives. It stays outside the
   daemon because it is a classifier, not a model that takes turns:
   running it there would add a call shape that one client uses to the
   provider layer.
@@ -581,7 +581,7 @@ approver the CLI starts.
   logins the bots use (an API key, Bedrock, or a ChatGPT plan). The
   approver keeps an idle bot, `approver.TAG`, with the judge's
   instructions and no tools, and made fresh when it starts; a bot of that
-  name that is not a judge is left alone and the approver refuses to start
+  name without exactly those is left alone and the approver refuses to start
   (`approver_name_taken`). Each round forks it, submits one JSON prompt
   holding the state and the eleven questions (each with what makes it yes
   or no), queued when every active slot is taken so it starts within the
@@ -1141,10 +1141,11 @@ Where the approver differs from the design above:
   `approval_requested`.
 - A file the turn wrote is shown whole with a call that names it, by its
   path or its file name as a whole word in one of the call's strings, up
-  to 48 KiB counted as it is read, read off the approver's runtime thread; a larger one
-  is refused as "not reviewed: it runs a file too large to show", and one
-  that is no longer a regular file is not read. A write or edit planned
-  earlier in the same round is named in its place, since it runs first.
+  to 48 KiB counted as it is read, read off the approver's runtime
+  thread; a larger one is refused as "not reviewed: it runs a file too
+  large to show", and one that is no longer a regular file is not read. A
+  write or edit that failed shows no file. One planned earlier in the same
+  round is named in its place, since it runs first.
 - A general model is asked the same questions as text, each with what
   makes it yes or no, and answers them as one JSON object.
 - A turn whose steers do not all fit the `prompts` read is denied as
@@ -1159,8 +1160,9 @@ CLI-started approver's log, which grows one line a round; a CLI that finds
 the tag already served waiting for that approver's `serving` line too;
 judging a later call against consent an earlier call in the same round may
 use up; counting the questions (eleven a call) in a round's request limit;
-and writing the verdict lines so a stalled reader of stdout cannot hold up
-the approver. Dropped with the rules on 2026-09-27:
+writing the verdict lines so a stalled reader of stdout cannot hold up
+the approver; and reading completions in `prompts` only for the calls that
+fit, rather than for the whole turn. Dropped with the rules on 2026-09-27:
 `until_prior`, `path`, and the `path_changed` check.
 
 ## Open decisions

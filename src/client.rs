@@ -1382,7 +1382,12 @@ fn approver(options: &Options) -> Result<i32> {
         ),
         None => None,
     };
-    let judge = match judge.strip_prefix("typesafe/") {
+    // Jev is `typesafe/jev-*`; any other name, a daemon provider called
+    // `typesafe` included, runs through the daemon.
+    let judge = match judge
+        .strip_prefix("typesafe/")
+        .filter(|model| model.starts_with("jev"))
+    {
         Some(model) => crate::approver::JudgeSpec::Jev {
             url: options
                 .judge_url

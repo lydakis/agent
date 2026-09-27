@@ -190,7 +190,8 @@ impl Jev {
                     .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                     .map(|seconds| Duration::from_secs_f64(seconds.min(RETRY_MAX_SECS)));
                 let mut backoff = self.backoff.lock().unwrap();
-                let wait = retry.unwrap_or(backoff.1);
+                // A server's shorter wait, zero included, still paces.
+                let wait = retry.map_or(backoff.1, |retry| retry.max(backoff.1));
                 backoff.1 = (backoff.1 * 2).min(BACKOFF_MAX);
                 backoff.0 = Some(Instant::now() + wait);
                 continue;
@@ -342,15 +343,10 @@ impl Model {
 }
 
 /// Whether a bot record is a judge an approver made: no tools, and the
-/// judge's instructions.
+/// judge's instructions exactly.
 fn judge_bot(bot: &Value) -> bool {
-    let opening = policy::JUDGE_INSTRUCTIONS
-        .split_once(". ")
-        .map_or(policy::JUDGE_INSTRUCTIONS, |(first, _)| first);
     bot["tools"].as_array().is_some_and(Vec::is_empty)
-        && bot["instructions"]
-            .as_str()
-            .is_some_and(|text| text.starts_with(opening))
+        && bot["instructions"] == policy::JUDGE_INSTRUCTIONS
 }
 
 /// The judge's one turn, and the turn if it is still running.
@@ -937,6 +933,8 @@ async fn intent(
         }
     }
     let mut planned = Vec::with_capacity(calls.len());
+    // Past this the state is too long to judge anyway: stop reading.
+    let mut size = 0;
     for (index, call) in calls.iter().enumerate() {
         let whole = call["arguments"].is_object()
             && call["arguments_cut"].as_array().is_none_or(Vec::is_empty)
@@ -951,6 +949,10 @@ async fn intent(
                     .ok_or(Unjudged::Failed)?
             }
         };
+        size += arguments.to_string().len();
+        if size > PROMPT_BYTES {
+            return Err(Unjudged::TooLong);
+        }
         planned.push(Planned {
             id: format!("c{}", index + 1),
             tool: call["name"].as_str().unwrap_or_default().to_owned(),
@@ -988,7 +990,10 @@ async fn intent(
         };
         // A file's content is not what consent is about: its path and size.
         if writes && let Value::Object(fields) = &arguments {
-            if let Some(path) = fields.get("path").and_then(Value::as_str) {
+            // A failed write changed nothing this turn: its file is not shown.
+            if let Some(path) = fields.get("path").and_then(Value::as_str)
+                && call["failed"] != true
+            {
                 written.push(path.to_owned());
             }
             let bytes: usize = fields
@@ -1139,6 +1144,8 @@ async fn delegated(
         )
         .await
     {
+        // Steers left out may hold that person's latest word.
+        Ok(read) if read["prompts_more"] == true => Err(Unjudged::TooLong),
         Ok(mut read) => Ok(match read["prompts"].take() {
             Value::Array(prompts) => Some(prompts),
             _ => None,
@@ -1201,6 +1208,8 @@ mod tests {
         assert!(!judge_bot(
             &json!({"tools":[],"instructions":"Help with the repo."})
         ));
+        let opening = format!("{} And more.", &policy::JUDGE_INSTRUCTIONS[..60]);
+        assert!(!judge_bot(&json!({"tools":[],"instructions":opening})));
     }
 
     #[test]
