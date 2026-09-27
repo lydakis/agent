@@ -238,6 +238,7 @@ impl Provider {
             return Err(Error {
                 code: format!("provider_http_{status}"),
                 detail,
+                facts: None,
             });
         }
         let mut stream = response.bytes_stream();

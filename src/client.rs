@@ -14,6 +14,7 @@ use std::{
 };
 
 const DEFAULT_TOOLS: &str = "shell,read,write,edit,wait,history";
+use agent_client::approver::{AUTO_EXPIRE_MS, UNGATED};
 use agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS;
 /// What a new bot is told when the caller gives no instructions: the
 /// harness preamble every client shares. `--agents` layers AGENTS.md files
@@ -447,13 +448,18 @@ impl Connection {
         loop {
             let message = self.read_line()?;
             if message.get("id").is_some_and(|id| *id == json!(self.next)) {
-                return match message.get("error").and_then(Value::as_str) {
-                    Some(code) => Err(Error {
-                        code: code.to_owned(),
-                        detail: message["detail"].as_str().map(str::to_owned),
-                    }),
-                    None => Ok(message["result"].clone()),
+                let Some(code) = message.get("error").and_then(Value::as_str) else {
+                    return Ok(message["result"].clone());
                 };
+                let mut error = Error::new(code);
+                error.detail = message["detail"].as_str().map(str::to_owned);
+                if let Value::Object(mut facts) = message {
+                    for key in ["id", "error", "detail"] {
+                        facts.remove(key);
+                    }
+                    error.facts = (!facts.is_empty()).then(|| Box::new(facts));
+                }
+                return Err(error);
             }
             if message.get("id").is_none() {
                 self.pending.push_back(message);
@@ -724,11 +730,6 @@ fn author() -> Result<Value> {
     }
 }
 
-/// How long an `auto` call may wait for its verdict before it is denied and
-/// the turn ends: the approver's own deadline (30 s for a general model),
-/// plus margin.
-const AUTO_EXPIRE_MS: u64 = 45_000;
-
 /// Whether a bot record has a gate the `auto` approver answers.
 fn answered_by_auto(bot: &Value) -> bool {
     bot["gates"]
@@ -852,10 +853,6 @@ fn ensure_approver(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
-/// Tools the approval modes never gate: they touch only the bot's own
-/// store records.
-const UNGATED: [&str; 4] = ["history", "wait", "note", "echo"];
 
 /// The gate a new bot asks for, as `create` or `fork` fields. The mode
 /// comes from --approval or AGENT_APPROVAL, `full` by default: no gate.
@@ -1000,6 +997,7 @@ fn models(options: &Options) -> Result<i32> {
     let client_error = |e: agent_client::Error| Error {
         code: e.code,
         detail: e.detail,
+        facts: e.facts,
     };
     if options.discover {
         if path.exists() {
@@ -1165,13 +1163,15 @@ fn run(options: &Options) -> Result<i32> {
     let request_id = options.request_id.clone().unwrap_or_else(|| unique("run"));
     // Existing bots keep their model unless --model explicitly overrides it.
     // AGENT_MODEL is only a creation default, including inside a peer's shell.
-    let submitted = connection.request(
-        "submit",
-        json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
-            "workspace":options.workspace.as_ref().and(workspace.as_ref()),
-            "model":if created { Value::Null } else { json!(options.model) },
-            "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
-    )?;
+    let submitted = connection
+        .request(
+            "submit",
+            json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
+                "workspace":options.workspace.as_ref().and(workspace.as_ref()),
+                "model":if created { Value::Null } else { json!(options.model) },
+                "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
+        )
+        .map_err(|error| ways_past_busy(&bot, error))?;
     if options.detach {
         print_json(&submitted, options.pretty)?;
         return Ok(0);
@@ -1198,6 +1198,36 @@ fn run(options: &Options) -> Result<i32> {
             return Ok(code);
         }
     }
+}
+
+/// A busy bot's refusal, with the ways past it as flags to copy: callers,
+/// models included, do not act on a description of them. The daemon names
+/// the same ways as request fields.
+fn ways_past_busy(bot: &str, error: Error) -> Error {
+    if error.code != "bot_busy" {
+        return error;
+    }
+    // The refusal's own fact, as of the refusing transaction.
+    let running = error
+        .facts
+        .as_deref()
+        .and_then(|facts| facts.get("running_turn"))
+        .and_then(Value::as_i64);
+    let join = match running {
+        Some(turn) => format!(
+            "resend with --delivery steer --turn {turn} to add this to it, \
+             or --delivery queue to run it afterwards"
+        ),
+        None => "resend with --delivery queue to run this after it".to_owned(),
+    };
+    let fork =
+        format!("; to ask without interrupting, fork --source {bot} --bot NEW and send it to NEW");
+    // The daemon's own detail names request fields; this says the same in flags.
+    let stated = match running {
+        Some(turn) => format!("turn {turn} is running"),
+        None => "earlier work is waiting".to_owned(),
+    };
+    Error::with("bot_busy", format!("{stated}; {join}{fork}"))
 }
 
 fn follow(options: &Options) -> Result<i32> {

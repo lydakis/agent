@@ -19,6 +19,10 @@ use tokio::{
 pub struct Error {
     pub code: String,
     pub detail: Option<String>,
+    /// Facts the daemon sent beside `detail`, such as `running_turn` and
+    /// `fork_point` on `bot_busy`, so a caller need not parse the detail or
+    /// ask again.
+    pub facts: Option<Box<serde_json::Map<String, Value>>>,
 }
 
 impl std::fmt::Display for Error {
@@ -34,29 +38,24 @@ impl Error {
         Self {
             code: code.to_owned(),
             detail: None,
+            facts: None,
         }
     }
     pub fn with(code: &str, detail: &str) -> Self {
         Self {
-            code: code.to_owned(),
             detail: Some(detail.to_owned()),
+            ..Self::new(code)
         }
     }
 }
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
-        Self {
-            code: "io".into(),
-            detail: Some(error.to_string()),
-        }
+        Self::with("io", &error.to_string())
     }
 }
 impl From<serde_json::Error> for Error {
     fn from(error: serde_json::Error) -> Self {
-        Self {
-            code: "invalid_json".into(),
-            detail: Some(error.to_string()),
-        }
+        Self::with("invalid_json", &error.to_string())
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -144,9 +143,11 @@ impl Client {
         let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket))
             .await
             .map_err(|_| Error::new("daemon_connect_timeout"))?
-            .map_err(|error| Error {
-                code: "daemon_unavailable".into(),
-                detail: Some(format!("{}: {error}", socket.display())),
+            .map_err(|error| {
+                Error::with(
+                    "daemon_unavailable",
+                    &format!("{}: {error}", socket.display()),
+                )
             })?;
         let (read, write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
@@ -271,13 +272,18 @@ impl Client {
         let message = receiver
             .await
             .map_err(|_| Error::new("daemon_disconnected"))?;
-        match message.get("error").and_then(Value::as_str) {
-            Some(code) => Err(Error {
-                code: code.to_owned(),
-                detail: message["detail"].as_str().map(str::to_owned),
-            }),
-            None => Ok(message["result"].clone()),
+        let Some(code) = message.get("error").and_then(Value::as_str) else {
+            return Ok(message["result"].clone());
+        };
+        let mut error = Error::new(code);
+        error.detail = message["detail"].as_str().map(str::to_owned);
+        if let Value::Object(mut facts) = message {
+            for key in ["id", "error", "detail"] {
+                facts.remove(key);
+            }
+            error.facts = (!facts.is_empty()).then(|| Box::new(facts));
         }
+        Err(error)
     }
 }
 
@@ -311,6 +317,41 @@ mod tests {
             assert!(client.pending.lock().unwrap().is_empty());
             assert!(!client.closed.load(std::sync::atomic::Ordering::SeqCst));
         }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_keeps_the_facts_sent_beside_its_detail() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let (_, write) = stream.into_split();
+        let client = Arc::new(Client {
+            writer: Mutex::new(write),
+            pending: Arc::default(),
+            next: std::sync::atomic::AtomicU64::new(0),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let mut lines = BufReader::new(peer).lines();
+        let request = tokio::spawn({
+            let client = client.clone();
+            async move { client.request("submit", json!({"bot":"Bob"})).await }
+        });
+        let sent: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        let id = sent["id"].as_u64().unwrap();
+        let reply = client.pending.lock().unwrap().remove(&id).unwrap();
+        reply
+            .send(
+                json!({"id":id,"error":"bot_busy","detail":"turn 3 is running",
+                "running_turn":3,"fork_point":42}),
+            )
+            .unwrap();
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(
+            (error.code.as_str(), error.detail.as_deref()),
+            ("bot_busy", Some("turn 3 is running"))
+        );
+        assert_eq!(
+            error.facts.map(|facts| Value::Object(*facts)),
+            Some(json!({"running_turn":3,"fork_point":42}))
+        );
     }
 
     #[tokio::test]

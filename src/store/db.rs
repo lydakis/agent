@@ -98,6 +98,12 @@ pub struct Bot {
     /// daemon so an approver that restarts or takes over counts on.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub denials: BTreeMap<String, Denials>,
+    /// Where a fork without a checkpoint starts: an idle bot's head, or its
+    /// running turn's newest finished round. `None` when there is none yet:
+    /// no history, or a turn that began before that round was kept. A busy
+    /// refusal reports it.
+    #[serde(skip)]
+    pub fork_point: Option<i64>,
 }
 /// A bot's denials under one gate tag: how many in a row, reset when a call
 /// every gate allowed starts, and how many in the turn that gave the last.
@@ -1325,9 +1331,15 @@ impl Database {
                     )
                 })?,
             },
+            // A running turn's newest closed node is kept as it moves, from
+            // the moment the turn starts.
+            fork_point: match r.get::<_, Option<i64>>(4)? {
+                Some(_) => r.get(33)?,
+                None => r.get(1)?,
+            },
         })
     }
-    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed";
+    const COLUMNS: &str = "name,head,workspace,status,running_turn,provider,family,model,instructions,reasoning,budget_tokens,tokens_used,tools,input_tokens,cached_input_tokens,id,created_by,created_by_id,note,compaction,compaction_instructions,compaction_model,cache_bot,thinking_prefix,thinking_floor,fallbacks,elision,thinking_from,thinking_to,thinking_elided,gates,denials,allowed,closed";
     /// Validate the caller's captured identity in the same transaction that
     /// creates the child. Never resolve a stale shell's name to a new bot.
     fn creator_id(
@@ -3321,35 +3333,21 @@ impl Database {
         }
         let busy = bot.running_turn.is_some() || self.has_ready_turn(name)?;
         if busy && reject {
-            // Name the ways past a busy bot as flags to copy; callers, models
-            // included, do not act on a description of them.
-            let wait = match bot.running_turn {
+            // What is in the way, as of this transaction, and the requests
+            // that get past it, in this protocol's terms.
+            let fork = "to ask without interrupting, fork this bot and submit to the fork";
+            let detail = match bot.running_turn {
                 Some(turn) => format!(
-                    "turn {turn} is running; resend with --delivery steer --turn {turn} \
-                     to add this to it, or --delivery queue to run it afterwards"
+                    "turn {turn} is running; submit with delivery \"steer\" and expected_turn \
+                     {turn} to add this to it, or delivery \"queue\" to run it afterwards; {fork}"
                 ),
-                None => "earlier work is waiting; resend with --delivery queue to run \
-                         this after it"
-                    .to_owned(),
+                None => format!(
+                    "earlier work is waiting; submit with delivery \"queue\" to run this after \
+                     it; {fork}"
+                ),
             };
-            // A fork without a checkpoint starts at the running turn's
-            // newest finished round, or at the head of an idle bot. A turn
-            // from before that round was kept has none to offer yet.
-            let forkable = bot.running_turn.is_none()
-                || self
-                    .conn
-                    .prepare_cached("SELECT closed IS NOT NULL FROM bots WHERE name=?")?
-                    .query_row([name], |r| r.get::<_, bool>(0))?;
-            if !forkable {
-                return fail_with("bot_busy", wait);
-            }
-            return fail_with(
-                "bot_busy",
-                format!(
-                    "{wait}; to ask without interrupting, fork --source {name} --bot NEW \
-                     and send it to NEW"
-                ),
-            );
+            return Err(Error::with("bot_busy", detail)
+                .facts(json!({"running_turn":bot.running_turn,"fork_point":bot.fork_point})));
         }
         if bot.budget_tokens.is_some_and(|b| bot.tokens_used >= b) {
             return fail("budget_exhausted");
@@ -3993,8 +3991,7 @@ impl Database {
             tx.prepare_cached("INSERT INTO stubs(node,item) VALUES (?,?)")?
                 .execute(params![head, stub])?;
         }
-        // The round's last result closes it. A turn from before the count
-        // was kept has none, and gets one at its next response.
+        // The round's last result closes it.
         tx.execute(
             "UPDATE bots SET head=?1,open_calls=open_calls-1,
              closed=CASE WHEN open_calls=1 THEN ?1 ELSE closed END WHERE name=?2",
@@ -5382,23 +5379,7 @@ impl Database {
                 }
                 (Some(node), false)
             }
-            None if parent.running_turn.is_some() => {
-                let closed: Option<i64> =
-                    self.conn
-                        .query_row("SELECT closed FROM bots WHERE name=?", [source], |r| {
-                            r.get(0)
-                        })?;
-                match closed {
-                    Some(closed) => (Some(closed), true),
-                    None => {
-                        return fail_with(
-                            "fork_point_unknown",
-                            "this turn began before its finished rounds were kept; \
-                             pass --checkpoint, or fork after its next model response",
-                        );
-                    }
-                }
-            }
+            None if parent.running_turn.is_some() => (parent.fork_point, true),
             None => (parent.head, false),
         };
         if let Some(node) = checkpoint.filter(|_| !validated) {
@@ -7218,14 +7199,16 @@ fn migrate(conn: &Connection, from: i32) -> Result<()> {
         |r| r.get::<_, bool>(0),
     )? {
         // 35 -> 36: a running turn's newest closed node, and which wait
-        // result delivered a background process. Nothing is read or
-        // guessed: a turn running across the upgrade gets its closed node
-        // at its next model response or steer, and a process finished
-        // before it is readable by the bot that started it alone.
+        // result delivered a background process. A parked turn's closed
+        // node cannot be read back without a transcript scan, so the
+        // upgrade ends it rather than guess: it joins the running turns
+        // that every open interrupts, and its history is kept. A process
+        // finished before it is readable by the bot that started it alone.
         conn.execute_batch(
             "ALTER TABLE bots ADD COLUMN closed INTEGER;
              ALTER TABLE bots ADD COLUMN open_calls INTEGER;
-             ALTER TABLE processes ADD COLUMN delivered INTEGER;",
+             ALTER TABLE processes ADD COLUMN delivered INTEGER;
+             UPDATE turns SET status='running' WHERE status IN ('waiting','paced');",
         )?;
     }
     if !conn.query_row(

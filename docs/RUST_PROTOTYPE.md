@@ -818,6 +818,8 @@ remain available through replay if the drain deadline is reached.
 
 Requests include a string or nonnegative integer `id`. Responses carry the same
 `id` and either `result` or an explicit `error` code with optional `detail`.
+A refusal a program acts on also carries its facts as fields beside them:
+`bot_busy` from `submit` reports `running_turn` and `fork_point`.
 Notifications carry `event`; durable ones carry `cursor`, `bot`, `turn`, and
 `data`, in exactly the shape `events` replays them. Durable events reach
 followers in commit order: the storage worker itself hands each group's
@@ -1066,9 +1068,9 @@ source's head is used, and a running or parked turn's newest finished round:
 the last result of its newest fully answered round, a steer absorbed at a
 round boundary, a final answer not yet finished, or the turn's prompt before
 any round finishes. The store keeps that node current as the turn appends, so
-this fork reads no transcript. A turn that began before the store kept it
-(schema 36) refuses a default fork with `fork_point_unknown` until its next
-model response or steer. A fork keeps its source's window start when the fork
+this fork reads no transcript. The upgrade to schema 36, which began keeping
+it, ends a turn left running or parked as interrupted, so every turn has
+one. A fork keeps its source's window start when the fork
 point is at or after it and carries the source's current compaction, so its
 first request can read the source's cache. `allow` narrows which of the
 source's tools the fork may call: absent keeps the source's list, `[]` allows
@@ -1112,13 +1114,20 @@ the turn's id and handle at once, and `wait`, `turns`, and
 
 - `reject` (default): `bot_busy` while a turn runs or is parked,
   `active_agent_limit` when no slot is free. Nothing is written. The
-  `bot_busy` detail names the running turn and the ways past it as flags
-  to copy (`--delivery steer --turn N`, `--delivery queue`, or
-  `fork --source NAME --bot NEW` to ask without interrupting, which starts
-  at the running turn's newest finished round; a turn from before schema 36
-  has none until its next response or steer, so no fork is offered). A model
-  calling `agent run` does not discover them otherwise, and in benchmark runs
-  it ignored a prose description of them.
+  `bot_busy` detail says what is in the way (`turn N is running`, or
+  `earlier work is waiting`) and which requests get past it, in this
+  protocol's fields: `submit` with `delivery` `steer` and `expected_turn`
+  N, `submit` with `delivery` `queue`, or a `fork` of the bot to ask
+  without interrupting, which starts at the running turn's newest finished
+  round. `agent run` says the same as flags to copy
+  (`--delivery steer --turn N`, `--delivery queue`, or
+  `fork --source NAME --bot NEW`), built from the
+  refusal's `running_turn` and `fork_point`, taken in the refusing
+  transaction, so it asks nothing more and never names a turn that started
+  since. `fork_point` is where a fork without a checkpoint starts, the head
+  of an idle bot or that newest finished round. A model calling `agent run`
+  does not discover them otherwise, and in benchmark runs it ignored a prose
+  description of them.
 - `queue`: the turn is a durable row that starts when the bot is free and a
   slot is open. The response reports `status`: `running` when it started at
   once, `queued` behind the bot's own work, or `ready` when only a slot is
@@ -1282,7 +1291,10 @@ summary or elision changed the bot's view last; turns stored before record
 neither, so a [summary](#compaction) after them never takes their call as
 having sent the view. Schema 35 adds `bots.denials`, the [denial
 counts](#tool-approval); none were kept before, so every bot starts from
-none. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
+none. Schema 36 keeps a running turn's newest finished round. That round
+cannot be read back without a transcript scan, so the upgrade ends a turn
+left parked the way every open ends a running one: interrupted, its calls
+answered, its history kept. Schema 38 adds `turns.from_bot` and `turns.from_turn`, who wrote a
 prompt; turns stored before record none, so they read as a person's.
 
 New artifacts larger than 64 KiB, up to the existing 1 MiB output bound, may

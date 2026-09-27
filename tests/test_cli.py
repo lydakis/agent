@@ -184,6 +184,7 @@ class SocketAndCliTests(ModelFixture):
         # fork it offers works while the turn runs.
         for flags in (f"--delivery steer --turn {busy['turn']}", '--delivery queue'):
             self.assertIn(flags, refused.stderr + refused.stdout)
+        self.assertNotIn('expected_turn', refused.stderr + refused.stdout)
         fork = re.search(r'fork (--source Bob) --bot NEW', refused.stderr + refused.stdout)
         self.assertIsNotNone(fork, refused.stderr + refused.stdout)
         self.agent('fork', '--store', str(self.store), *fork.group(1).split(), '--bot', 'Side')
