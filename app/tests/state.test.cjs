@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 // Run the actual page state machine without booting a provider or a webview.
-function page(daemon = {}) {
+function page(daemon = {}, storage = null) {
   const elements = new Map(), timers = new Map();
   let timer = 0;
   const element = () => ({
@@ -28,12 +28,12 @@ function page(daemon = {}) {
     Daemon: transport, console, queueMicrotask, crypto: require('node:crypto').webcrypto,
     document: { getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, addEventListener() {},
       createElement: element, createTextNode: () => ({ data: '', appended: 0, appendData(s) { this.data += s; this.appended += s.length; } }) },
-    window: { addEventListener() {} }, localStorage: { getItem() { return null; } },
+    window: { addEventListener() {} }, localStorage: storage ? { getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) } : { getItem() { return null; } },
     setTimeout(fn) { const id = ++timer; timers.set(id, fn); return id; }, clearTimeout(id) { timers.delete(id); }, setInterval() {},
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -91,7 +91,7 @@ test('large fan-out keeps rendered peer cards and retained peer entries bounded'
   const t = p.transcript('parent');
   assert.ok(t.items.filter(it => it.kind === 'peer').length <= 600);
   assert.ok(t.peers.length <= 600);
-  assert.ok((p.itemsHTML(t).match(/data-peek=/g) || []).length <= 600);
+  assert.ok((p.itemsHTML(t).match(/data-task=/g) || []).length <= 600);
   assert.equal(p.S.bots.size, 10001, 'older peers remain reachable through the fleet');
   await p.onEvent({ event: 'deleted', bot: 'child9999' });
   assert.ok(!t.items.some(it => it.kind === 'peer' && it.who === 'child9999'));
@@ -327,7 +327,7 @@ test('completed process results retain stdout and stderr in ordinary output', as
   const p=page({request:async()=>({type:'function_call_output',call_id:'wait',output})});const t=p.transcript('Bob');
   await p.onEvent({event:'tool_started',bot:'Bob',turn:1,data:{name:'wait',call_id:'wait',arguments:'{"handles":["proc:1"]}'}});
   await p.onEvent({event:'tool_completed',bot:'Bob',turn:1,data:{call_id:'wait',node:1}});
-  await p.loadBatch('Bob');p.S.ui.output=true;
+  await p.loadBatch('Bob');p.S.ui.steps=true;
   const html=p.itemsHTML(t);assert.match(html,/first line/);assert.match(html,/important diagnostic/);
 });
 
@@ -591,4 +591,145 @@ test('completed Responses and Anthropic thoughts retain observed thinking durati
     now=15000;await p.onEvent({event:'message',bot:'Bob',turn:1,data:{node:1}});
     await p.load('Bob');assert.equal(p.transcript('Bob').items.find(it=>it.kind==='thought').secs,7);
   }
+});
+
+// ---------- the app shell: projects, panes, composers, menus, runs ----------
+const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
+const names = (rows) => Array.from(rows, (r) => r.label ?? r.b.name);
+
+test('projects list coordinators with their lineage and prefixed tasks, then other bots', () => {
+  const p = shell();
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.upsert({ name: 'app.review', id: 3, provider: 'alpha', model: 'one', created_by: 'app.build', created_by_id: 2 });
+  p.upsert({ name: 'app.manual', id: 4, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'loose', id: 5, provider: 'alpha', model: 'one' });
+  // A coordinator started by a task heads its own project instead of nesting under the task.
+  p.upsert({ name: 'zeta.lead', id: 6, provider: 'alpha', model: 'one', created_by: 'app.build', created_by_id: 2 });
+  const rows = p.tree();
+  assert.deepEqual(names(rows), ['app.lead', 'app.build', 'app.review', 'app.manual', 'zeta.lead', 'bots', 'loose']);
+  assert.equal(rows[0].head, 'app'); assert.equal(rows[0].tasks, 3); assert.equal(rows[4].tasks, 0);
+  const bot = (n) => p.S.bots.get(n);
+  assert.equal(p.shortName(bot('app.lead')), 'app'); assert.equal(p.shortName(bot('app.review')), 'review'); assert.equal(p.shortName(bot('loose')), 'loose');
+  assert.match(p.botRowHTML(rows[0], true), /data-act="fold"/); assert.doesNotMatch(p.botRowHTML(rows[4], false), /data-act="fold"/);
+  assert.match(p.botRowHTML(rows[1], false), /data-act="more" data-who="app.build"/);
+  p.S.ui.folded.add('app');
+  assert.deepEqual(names(p.tree()), ['app.lead', 'zeta.lead', 'bots', 'loose']);
+  assert.equal(bot('app.review').project, 'app', 'a folded project still owns its tasks');
+});
+
+test('a sidebar row opens a thread alone, a card opens it beside, and swap trades them', async () => {
+  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.tree(); p.S.selected = 'app.lead';
+  await p.openBeside('app.build'); assert.equal(p.S.ui.side, 'app.build');
+  await p.openBeside('app.build'); assert.equal(p.S.ui.side, null, 'the same card closes it again');
+  await p.openBeside('app.lead'); assert.equal(p.S.ui.side, null, 'the thread in view never opens beside itself');
+  await p.openBeside('app.build'); p.swap();
+  assert.equal(p.S.selected, 'app.build'); assert.equal(p.S.ui.side, 'app.lead');
+  p.S.ui.folded.add('app');
+  await p.openOnly('app.test');
+  assert.equal(p.S.selected, 'app.test'); assert.equal(p.S.ui.side, null); assert.equal(p.S.ui.folded.has('app'), false);
+});
+
+test('each composer sends to its own pane, and a working bot gets the sticky queue or steer pick', async () => {
+  const sent = [], storage = new Map();
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); } }, storage);
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
+  p.S.selected = 'lead'; p.S.ui.side = 'task';
+  await p.submit('hello');
+  await p.submit('more', 'side');
+  p.setSend('steer'); await p.submit('now', 'side');
+  assert.deepEqual(sent.map(([, q]) => [q.bot, q.delivery]), [['lead', 'reject'], ['task', 'queue'], ['task', 'steer']]);
+  assert.equal(storage.get('agent:send'), 'steer');
+  assert.equal(shell({}, storage).S.send, 'steer', 'the last pick sticks for the next window');
+  const items = p.sendMenuItems('side');
+  assert.deepEqual(Array.from(items, (i) => [i.v ?? i.act, !!i.on, !!i.disabled]), [['queue', false, false], ['steer', true, false], ['side-chat', false, true]]);
+});
+
+test('the model chip switches within the provider and offers other providers as new agents', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(q); } });
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); p.S.selected = 'lead';
+  const b = p.S.bots.get('lead');
+  const choices = p.modelChoices(b, [{ id: 'beta/x' }, { id: 'alpha/two' }, { id: 'alpha/one' }]);
+  assert.deepEqual(Array.from(choices, (c) => [c.id, c.ok, c.on]), [['alpha/two', true, false], ['alpha/one', true, true], ['beta/x', false, false]]);
+  assert.deepEqual(Array.from(p.modelChoices(b, []), (c) => c.id), ['alpha/one'], 'the bot\'s own model is offered even when unlisted');
+  const other = p.modelMenuItems(b, [{ id: 'beta/x' }]).find((i) => i.v === 'beta/x');
+  assert.equal(other.disabled, true); assert.equal(other.hint, 'new agent');
+  assert.equal(p.setModel('lead', 'beta/x'), false);
+  assert.equal(p.setModel('lead', 'alpha/two'), true);
+  await p.submit('next turn'); assert.equal(sent.at(-1).model, 'alpha/two');
+  p.setModel('lead', 'alpha/one');
+  await p.submit('back'); assert.equal('model' in sent.at(-1), false);
+});
+
+test('one menu per agent: side chat waits on the daemon, stop while running, fork and delete at rest', () => {
+  const p = shell();
+  p.upsert({ name: 'busy', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 4 });
+  p.upsert({ name: 'rest', id: 2, provider: 'alpha', model: 'one' });
+  const state = (name) => Object.fromEntries(p.botMenuItems(name).filter((i) => i.act).map((i) => [i.act, !i.disabled]));
+  assert.deepEqual(state('busy'), { 'side-chat': false, stop: true, fork: false, delete: false, steps: true });
+  assert.deepEqual(state('rest'), { 'side-chat': false, stop: false, fork: true, delete: true, steps: true });
+});
+
+test('fork copies a bot at rest next to it and opens the copy beside', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', created_by: q.created_by, created_by_id: q.created_by_id } : { nodes: [], next_from: null }; } });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  p.upsert({ name: 'app.busy', id: 3, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
+  p.S.selected = 'app.lead';
+  await p.fork('app.task'); await p.fork('app.task');
+  const forks = sent.filter(([op]) => op === 'fork').map(([, q]) => q);
+  assert.deepEqual(forks.map((q) => [q.source, q.bot, q.created_by, q.created_by_id]), [['app.task', 'app.task-fork', 'app.lead', 1], ['app.task', 'app.task-fork-2', 'app.lead', 1]]);
+  assert.equal(p.S.ui.side, 'app.task-fork-2');
+  await assert.rejects(p.fork('app.busy'), /bot_busy/);
+  assert.equal(sent.filter(([op]) => op === 'fork').length, 2);
+});
+
+test('a new project creates its coordinator in the folder, writes its file once, and is not made twice', async () => {
+  const calls = [];
+  const p = shell({
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
+    policy: async (dir) => { calls.push(['policy', dir]); return { instructions: 'rules', compaction_instructions: 'summary', note: 'test' }; },
+    writeProject: async (q) => { calls.push(['write', q]); },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one' } : { nodes: [], next_from: null }; },
+  });
+  await p.createProject('/synthetic/weather');
+  const create = calls.find(([op]) => op === 'create')[1];
+  assert.deepEqual([create.bot, create.workspace, create.model, create.instructions], ['weather.lead', '/synthetic/weather', 'alpha/one', 'rules']);
+  assert.equal(calls.find(([op]) => op === 'policy')[1], '/synthetic/weather');
+  assert.deepEqual({ ...calls.find(([op]) => op === 'write')[1] }, { dir: '/synthetic/weather', name: 'weather', model: 'alpha/one' });
+  assert.equal(p.S.selected, 'weather.lead');
+  const before = calls.length;
+  await p.createProject('/synthetic/weather');
+  assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
+});
+
+test('runs fold thinking and tool calls to one line each, keep failures visible, and expand on demand', () => {
+  const p = shell(); const t = p.transcript('Bob');
+  const tool = (name, callId, summary, turn) => ({ kind: 'tool', name, callId, summary, done: true, started: 0, took: 0, turn });
+  t.items = [
+    { kind: 'user', text: 'go', turn: 1 },
+    { kind: 'thought', text: 'private plan', secs: 2, turn: 1 },
+    tool('shell', 'a', 'ls', 1), { kind: 'out', callId: 'a', text: 'one\ntwo\nthree\nfour', turn: 1 },
+    { kind: 'backing', turn: 1 },
+    tool('read', 'b', 'notes.md', 1), { kind: 'out', callId: 'b', text: 'denied', err: 'denied', turn: 1 },
+    { kind: 'text', text: 'done', turn: 1 },
+    { kind: 'thought', text: 'again', secs: 1, turn: 2 },
+    tool('shell', 'c', 'make', 2),
+  ];
+  let html = p.itemsHTML(t);
+  assert.equal((html.match(/class="steps"/g) || []).length, 2);
+  assert.match(html, /3 steps <span class="now">shell · read<\/span> <span class="err">✘ denied<\/span>/);
+  assert.match(html, /2 steps/); assert.doesNotMatch(html, /private plan/);
+  assert.equal(p.runStart(t, 6), 1); assert.equal(p.runStart(t, 9), 8);
+  t.items[3].runOpen = true; html = p.itemsHTML(t);
+  assert.match(html, /private plan/); assert.match(html, /\+2 lines/); assert.doesNotMatch(html, /again/);
+  p.S.ui.steps = true; html = p.itemsHTML(t);
+  assert.match(html, /four/); assert.match(html, /again/);
+  const thoughtOnly = p.transcript('Ann'); thoughtOnly.items = [{ kind: 'thought', text: 'hm', secs: 7, turn: 1 }]; p.S.ui.steps = false;
+  assert.match(p.itemsHTML(thoughtOnly), /▸ thought 7s/);
 });

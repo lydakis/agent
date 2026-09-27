@@ -12,8 +12,10 @@ window.Daemon = (() => {
     return {
       log,
       setup: () => invoke('setup'),
-      policy: () => invoke('policy'),
+      policy: (workspace) => invoke('policy', { workspace: workspace ?? null }),
       models: () => invoke('models'),
+      project: (dir) => invoke('project', { dir }),
+      writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
       attach: (after) => invoke('attach', { after }),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
@@ -29,12 +31,15 @@ window.Daemon = (() => {
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
 
-  async function create(name, model, createdBy = null) {
+  async function create(name, model, createdBy = null, source = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
     const b = { ...record(name, model), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false };
     S.bots.set(name, b);
-    emit({ event: 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id } });
+    // A fork shares its source's history up to the source's newest node.
+    if (source) S.lineages.set(name, [...(S.lineages.get(source) ?? [])]);
+    const checkpoint = source ? S.lineages.get(source)?.at(-1)?.node ?? null : undefined;
+    emit({ event: source ? 'forked' : 'created', bot: name, turn: null, data: { id: b.id, provider: b.provider, model: b.model, workspace: b.workspace, status: 'idle', running_turn: null, created_by: createdBy, created_by_id: b.created_by_id, ...(source ? { source, checkpoint } : {}) } });
     return b;
   }
   async function stream(name, turn, text, pace = 40) {
@@ -102,11 +107,11 @@ window.Daemon = (() => {
     await stream(name, turn, 'Splitting this into three peers, kicking off the release build in the background, and waiting on all of it.');
     const proc = S.nextProc++;
     await tool(name, turn, 'shell', { command: 'cargo build --release', background: true }, JSON.stringify({ handle: `proc:${proc}`, background: true }), 300);
-    const tasks = { plan: 'Write the change plan for the login fix: files, risks, tests.', build: 'Apply the login fix under src/auth and keep the diff tight.', test: 'Run the auth suite and the daemon smoke, report failures verbatim.' };
+    const tasks = { 'demo.plan': 'Write the change plan for the login fix: files, risks, tests.', 'demo.build': 'Apply the login fix under src/auth and keep the diff tight.', 'demo.test': 'Run the auth suite and the daemon smoke, report failures verbatim.' };
     const replies = {
-      plan: 'Three files touch the session cookie. Risk is the refresh path; it needs a regression test. Plan written to PLAN.md.',
-      build: 'Patched refresh_session to reissue the cookie on rotation. Two files changed, 41 lines, cargo check clean. review signed off with one nit, now a comment in the code.',
-      test: 'Auth suite passes. Daemon smoke passes. One warning about an unused import in tests/auth.rs, harmless.',
+      'demo.plan': 'Three files touch the session cookie. Risk is the refresh path; it needs a regression test. Plan written to PLAN.md.',
+      'demo.build': 'Patched refresh_session to reissue the cookie on rotation. Two files changed, 41 lines, cargo check clean. review signed off with one nit, now a comment in the code.',
+      'demo.test': 'Auth suite passes. Daemon smoke passes. One warning about an unused import in tests/auth.rs, harmless.',
     };
     const handles = [];
     for (const n of Object.keys(tasks)) {
@@ -139,46 +144,54 @@ window.Daemon = (() => {
   }
   async function work(n, turn, text) {
     await wait(300);
-    if (n === 'plan') { await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600); }
-    if (n === 'build') {
+    if (n === 'demo.plan') { await tool(n, turn, 'read', { path: 'src/auth/' }, 'session.rs refresh.rs cookie.rs · 612 lines', 500); await tool(n, turn, 'write', { path: 'PLAN.md' }, '1.2 KiB', 600); }
+    if (n === 'demo.build') {
       await tool(n, turn, 'edit', { path: 'src/auth/session.rs' }, '+23 −8', 900);
       await tool(n, turn, 'shell', { command: 'cargo check -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'Finished dev profile in 2.1s\n', success: true }), 1100);
       // build asks a peer of its own to review, and waits on it: depth two.
-      const cmd = `"$AGENT_BIN" run --new --bot review --model "$AGENT_MODEL" --detach 'Review the auth diff for regressions.'`;
+      const cmd = `"$AGENT_BIN" run --new --bot demo.review --model "$AGENT_MODEL" --detach 'Review the auth diff for regressions.'`;
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: n, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
       const b = S.bots.get(n);
-      await create('review', `${b.provider}/${b.model}`, n);
-      const rt = start('review', 'Review the auth diff for regressions.');
-      emit({ event: 'tool_completed', bot: n, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: 'review', handle: `turn:review/${rt}`, status: 'running', turn: rt }) + '\n', success: true }) }), artifacts: [] } });
+      await create('demo.review', `${b.provider}/${b.model}`, n);
+      const rt = start('demo.review', 'Review the auth diff for regressions.');
+      emit({ event: 'tool_completed', bot: n, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: 'demo.review', handle: `turn:demo.review/${rt}`, status: 'running', turn: rt }) + '\n', success: true }) }), artifacts: [] } });
       const wid = `call_${++calls}`;
-      emit({ event: 'tool_started', bot: n, turn, data: { call_id: wid, name: 'wait', arguments: JSON.stringify({ handles: [`turn:review/${rt}`] }), arguments_truncated: false } });
+      emit({ event: 'tool_started', bot: n, turn, data: { call_id: wid, name: 'wait', arguments: JSON.stringify({ handles: [`turn:demo.review/${rt}`] }), arguments_truncated: false } });
       b.status = 'waiting';
-      emit({ event: 'turn_waiting', bot: n, turn, data: { call_id: wid, handles: [`turn:review/${rt}`], deadline_ms: null, any: false } });
-      await tool('review', rt, 'shell', { command: 'git diff --stat' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'src/auth/session.rs | 31 +-\nsrc/auth/refresh.rs | 10 +\n', success: true }), 500);
-      await stream('review', rt, 'Diff is sound. One nit: the rotation path drops the old cookie before the new one is written; harmless today, worth a comment.', 50);
-      finish('review', rt);
+      emit({ event: 'turn_waiting', bot: n, turn, data: { call_id: wid, handles: [`turn:demo.review/${rt}`], deadline_ms: null, any: false } });
+      await tool('demo.review', rt, 'shell', { command: 'git diff --stat' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'src/auth/session.rs | 31 +-\nsrc/auth/refresh.rs | 10 +\n', success: true }), 500);
+      await stream('demo.review', rt, 'Diff is sound. One nit: the rotation path drops the old cookie before the new one is written; harmless today, worth a comment.', 50);
+      finish('demo.review', rt);
       b.status = 'running';
       emit({ event: 'turn_resumed', bot: n, turn, data: { call_id: wid } });
-      emit({ event: 'tool_completed', bot: n, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [`turn:review/${rt}`]: { status: 'completed', text: 'Diff is sound.' } } }) }), artifacts: [] } });
+      emit({ event: 'tool_completed', bot: n, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [`turn:demo.review/${rt}`]: { status: 'completed', text: 'Diff is sound.' } } }) }), artifacts: [] } });
     }
-    if (n === 'test') { await tool(n, turn, 'shell', { command: 'cargo test -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'test result: ok. 34 passed; 0 failed\n', success: true }), 1600); }
+    if (n === 'demo.test') { await tool(n, turn, 'shell', { command: 'cargo test -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'test result: ok. 34 passed; 0 failed\n', success: true }), 1600); }
     await stream(n, turn, text, 50);
     finish(n, turn);
   }
 
-  return {
+  const api = {
     setup: async () => ({ socket: 'demo', model: 'openai/gpt-6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
+    project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
+    writeProject: async () => {},
     models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {
       if (!S.bots.size) {
-        await create('main', 'openai/gpt-6-luna');
-        const t = start('main', 'what does the daemon do when a bot is busy?');
-        emit({ event: 'message', bot: 'main', turn: t, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three answers, chosen per submission: reject it, queue it behind the running turn, or steer it into that turn as a mid-flight message. The client sends the mode every time; the daemon has no default of its own.' }] }) } });
-        finish('main', t);
-        setTimeout(() => reply('main', 'ship the login fix; split the work and wait for it'), 900);
+        // Two projects: a coordinator is a bot named `<project>.lead`, and its tasks nest under it.
+        const { model } = await api.setup();
+        await create('demo.lead', model);
+        const t = start('demo.lead', 'what does the daemon do when a bot is busy?');
+        emit({ event: 'message', bot: 'demo.lead', turn: t, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three answers, chosen per submission: reject it, queue it behind the running turn, or steer it into that turn as a mid-flight message. The client sends the mode every time; the daemon has no default of its own.' }] }) } });
+        finish('demo.lead', t);
+        await create('notes.lead', model);
+        const n = start('notes.lead', 'summarize the open questions in NOTES.md');
+        emit({ event: 'message', bot: 'notes.lead', turn: n, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Two open questions: where worktrees live, and who runs the setup command.' }] }) } });
+        finish('notes.lead', n);
+        setTimeout(() => reply('demo.lead', 'ship the login fix; split the work and wait for it'), 900);
       }
       setTimeout(() => emit({ event: 'follow_live', durable: false, cursor: S.cursor }), 0);
       return { session: ++S.session };
@@ -208,12 +221,16 @@ window.Daemon = (() => {
         case 'item': { const item = S.nodes.get(params.node); if (!item) throw new Error('item_not_in_bot_history'); return item; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null); return { ...S.bots.get(params.bot) }; }
-        case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy'); reply(params.bot, params.prompt); return { bot: params.bot, turn: S.nextTurn, status: 'running', handle: `turn:${params.bot}/${S.nextTurn}` }; }
+        case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
+          if (b.status !== 'idle' && params.delivery === 'steer') { emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
+          reply(params.bot, params.prompt); return { bot: params.bot, turn: S.nextTurn, status: 'running', handle: `turn:${params.bot}/${S.nextTurn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
-        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`); return { ...S.bots.get(params.bot) }; }
+        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); if (src.status !== 'idle') throw new Error('bot_busy'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source); return { ...S.bots.get(params.bot) }; }
+        case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
         default: throw new Error(`unsupported_in_demo:${op}`);
       }
     },
     close: () => { for (const t of S.timers) clearTimeout(t); },
   };
+  return api;
 })();
