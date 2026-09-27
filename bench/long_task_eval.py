@@ -424,11 +424,13 @@ bench:
 
 
 # Each run of a step the task requires appends its name, its exit status,
-# and a digest of the workspace's files as it ran: dotfiles and bytecode
-# caches aside, the same digest `state_digest` takes.
+# a digest of the workspace's files as it ran (dotfiles and bytecode caches
+# aside, the same digest `state_digest` takes), and when it ran, in epoch
+# milliseconds on the daemon's clock.
 STEP = '''#!/usr/bin/env python3
 import hashlib
 import sys
+import time
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
@@ -438,7 +440,7 @@ for path in sorted(root.rglob('*')):
     if path.is_file() and not any(part.startswith('.') or part == '__pycache__' for part in parts):
         digest.update('/'.join(parts).encode() + b'\\0' + path.read_bytes() + b'\\0')
 with (root / '.steps.log').open('a') as log:
-    log.write(f'{sys.argv[1]} {sys.argv[2]} {digest.hexdigest()}\\n')
+    log.write(f'{sys.argv[1]} {sys.argv[2]} {digest.hexdigest()} {time.time_ns() // 1_000_000}\\n')
 '''
 
 MAKEFILE = '''.PHONY: check quick bench
@@ -605,7 +607,7 @@ def workflow(root, initial):
     after it on the same files. A command that only names a step, or a
     step that fails, does not count."""
     log = root / '.steps.log'
-    runs = [line.split() for line in log.read_text().splitlines()] if log.exists() else []
+    runs = [line.split()[:3] for line in log.read_text().splitlines()] if log.exists() else []
     final = state_digest(root)
     envs = [state for step, _, state in runs if step == 'env-check']
     checked = next((n for n, (step, status, state) in enumerate(runs)
@@ -618,6 +620,14 @@ def workflow(root, initial):
             n > checked and runs[n][2] == final for n in benched),
         'bench_runs': len(benched),
     }
+
+
+def steps_before(root, ms):
+    """How many steps the record holds from before an epoch millisecond:
+    what the bot had run when its turn took in the correction."""
+    log = root / '.steps.log'
+    lines = log.read_text().splitlines() if log.exists() else []
+    return sum(int(line.split()[3]) <= ms for line in lines)
 
 
 def settled_closes(root):
@@ -644,6 +654,10 @@ STEP_RUN = re.compile(
     r"""|\w+=\S*)\s+)*"""
     r"""(?:(?:python3?|bash|sh)(?:\s+-\w+)*\s+['"]?)?"""
     r"""(?:make(?:\s+(?:-C\s+\S+|-\S+|\w+=\S*))*\s+(?:check|bench)\b|(?:[\w.~/-]*/)?tools/settle\b)""")
+# The plain step command the sustained prompt asks for, and any command
+# that names a step.
+PLAIN_STEP = re.compile(r'\s*(?:make (?:check|bench) CLOSE=[\w-]+|tools/settle [\w-]+)(?:\s+2>&1)?\s*$')
+NAMES_STEP = re.compile(r'\bmake\b|tools/settle')
 GROUP_END = re.compile(r'\s*(?:\}|\)|done\b|fi\b|esac\b)')
 
 
@@ -698,12 +712,12 @@ def step_command_faults(command, unread=False):
 def close_workflow(root, closes, corrected_at=None):
     """Each close's steps, from the same record: whether a passing check
     of the close came before it was first settled and its benchmark
-    after, how often it was settled and where it first was,
-    whether a close first settled before the model took in the correction,
-    when the record held `corrected_at` steps, was settled again after it, and whether its
-    settlement file holds the right entries. A close settled again after
-    the correction needs no second check or benchmark, since its number
-    does not change."""
+    after, how often it was settled and where it first was, whether a
+    close first settled before the turn took in the correction, when the
+    record held `corrected_at` steps, was settled again after it, and
+    whether its settlement file holds the right entries. A close settled
+    again after the correction needs no second check or benchmark, since
+    its number does not change."""
     log = root / '.steps.log'
     runs = [line.split()[:2] for line in log.read_text().splitlines()] if log.exists() else []
     out = {}
@@ -799,12 +813,19 @@ def score(root, facts, events, answer, corrected_at=None):
         if event['event'] == 'tool_started':
             calls[data['call_id']] = data
             if data['name'] == 'shell':
+                # The event previews the arguments to 2,048 characters. A
+                # longer call is kept as its preview, which the counters
+                # cannot read, and listed for review.
+                preview = data.get('arguments') or '{}'
                 try:
-                    arguments = json.loads(data.get('arguments') or '{}')
+                    arguments = json.loads(preview)
                 except ValueError:
-                    arguments = {}
-                commands.append((event['cursor'], arguments.get('command', ''),
-                                 bool(arguments.get('background') or arguments.get('detach'))))
+                    arguments = None
+                if not isinstance(arguments, dict) or data.get('arguments_truncated'):
+                    commands.append((event['cursor'], preview, False, True))
+                else:
+                    commands.append((event['cursor'], arguments.get('command', ''),
+                                     bool(arguments.get('background') or arguments.get('detach')), False))
     steps = workflow(root, facts['state'])
     closes = close_workflow(root, facts['closes'], corrected_at)
     # Each close's number counts when its benchmark printed it and the
@@ -816,11 +837,11 @@ def score(root, facts, events, answer, corrected_at=None):
     # the one before it.
     firsts = [close['first_settled_at'] for close in closes.values()]
     in_order = None not in firsts and firsts == sorted(firsts)
-    quick = [c for c, command, _ in commands if 'make quick' in command]
-    faults = [step_command_faults(command, unread) for _, command, unread in commands]
+    quick = [c for c, command, *_ in commands if 'make quick' in command]
+    faults = [step_command_faults(command, unread) for _, command, unread, cut in commands if not cut]
     repeated = {}
     seen = set()
-    for cursor, command, _ in commands:
+    for cursor, command, *_ in commands:
         if command in seen and first_cut is not None and cursor > first_cut:
             repeated[command] = repeated.get(command, 0) + 1
         seen.add(command)
@@ -879,8 +900,10 @@ def score(root, facts, events, answer, corrected_at=None):
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,
         # The sustained task is also its settlements.
-        'correct': passed == cases and all(c['settled_correctly'] and c['settled_after_correction'] is not False
-                                           for c in closes.values()),
+        # A sustained bot is correct only once it has taken in the
+        # correction.
+        'correct': passed == cases and (not closes or corrected_at is not None) and all(
+            c['settled_correctly'] and c['settled_after_correction'] is not False for c in closes.values()),
         'vendor_intact': vendor_intact,
         'make_quick_runs': count_lines(root / '.quick-attempts'),
         'make_quick_calls_after_first_compaction': sum(first_cut is not None and c > first_cut for c in quick),
@@ -897,11 +920,17 @@ def score(root, facts, events, answer, corrected_at=None):
         'closes': closes,
         'closes_settled_correctly': sum(c['settled_correctly'] for c in closes.values()),
         'closes_reported': sum(c['reported'] for c in closes.values()),
-        'commands': [command[:160] for _, command, _ in commands],
+        'commands': [command[:160] for _, command, *_ in commands],
         # Step commands against the sustained prompt: output filtered, or
         # several steps in one command.
         'filtered_step_commands': sum(filtered for filtered, _ in faults),
         'combined_step_commands': sum(combined for _, combined in faults),
+        # The parser cannot follow every shell form, so a command that names
+        # a step in any form but the plain one is listed for a person, as is
+        # every call too long for its event to hold.
+        'step_commands_to_review': [('[cut] ' if cut else '') + command[:160] for _, command, _, cut in commands
+                                    if closes and (cut or NAMES_STEP.search(command)
+                                                   and not PLAIN_STEP.match(command))],
         'compactions': len(compactions),
         'elisions': sum(e['event'] == 'elided' for e in events),
         'repeated_commands_after_first_compaction': repeated,
@@ -954,7 +983,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         # and steers, with each task's time from its submission to its end
         # as the reader received it. The sustained task's point is in its
         # step record, written before the tool completes.
-        done, steers, ends, completed, finished, marks = {}, {}, {}, {name: 0 for name in names}, {}, {}
+        done, steers, ends, completed, finished = {}, {}, {}, {name: 0 for name in names}, {}
         while len(done) < len(names):
             message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
                                      timeout=timeout)
@@ -963,12 +992,6 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 continue
             if message['event'] == 'turn_finished' and message.get('turn') == steers.get(name, {}).get('turn'):
                 ends[name] = message['data']
-                # The turn took the correction in at a round boundary,
-                # before the model's next call can run a tool; the steps
-                # recorded so far were made without it.
-                if size == 'sustained' and message['data'].get('status') == 'steered':
-                    log = root / name / '.steps.log'
-                    marks[name] = len(log.read_text().splitlines()) if log.exists() else 0
                 continue
             if message.get('turn') != turns[name]:
                 continue
@@ -992,6 +1015,14 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
         # Failed summaries are reported live only.
         failures = {name: [m.get('error') for m in client.saved
                            if m.get('event') == 'compaction_failed' and m.get('bot') == name] for name in names}
+        # Where each sustained bot took in the correction: the steps it had
+        # recorded by the time the daemon marked the steer's turn steered,
+        # at a round boundary before the model's next call could run one.
+        marks = {}
+        for name, end in ends.items():
+            if size == 'sustained' and end.get('status') == 'steered':
+                steered = next(t for t in page_rows(client, 'turns', name) if t['turn'] == steers[name]['turn'])
+                marks[name] = steps_before(root / name, steered['finished_ms'])
         for name in names:
             events = list(page_rows(client, 'events', name))
             checkpoint = done[name]['data'].get('checkpoint')
@@ -1054,7 +1085,8 @@ def summarize(block):
                 'closes_reported': [b['closes_reported'] for b in bots],
                 'settle_runs': [sum(c['settle_runs'] for c in b['closes'].values()) for b in bots],
                 'filtered_step_commands': [b['filtered_step_commands'] for b in bots],
-                'combined_step_commands': [b['combined_step_commands'] for b in bots]}
+                'combined_step_commands': [b['combined_step_commands'] for b in bots],
+                'step_commands_to_review': [len(b['step_commands_to_review']) for b in bots]}
                if block['task'] == 'sustained' else {}),
             'wall_s': block['wall_s']}
 

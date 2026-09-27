@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from decimal import ROUND_DOWN, ROUND_HALF_EVEN
 from pathlib import Path
@@ -196,11 +197,12 @@ class LongTaskScoreTests(unittest.TestCase):
         facts = workspace(self.root, 7, 'sustained')
         numbers = {month: facts['closes'][month]['throughput'] for month in MONTHS}
 
-        def run(*steps, answer=None):
-            # CORRECTION marks where the runner sent it.
+        def run(*steps, answer=None, corrected=True):
+            # CORRECTION marks where the turn took it in; without one, it
+            # came before any step, or with corrected=False never.
             self.setUp()
             workspace(self.root, 7, 'sustained')
-            corrected_at = None
+            corrected_at = 0 if corrected else None
             for step in steps:
                 if step in (HALF_EVEN, TRUNCATING):
                     (self.root / 'ledger/convert.py').write_text(step)
@@ -218,6 +220,12 @@ class LongTaskScoreTests(unittest.TestCase):
         clean = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)])
         self.assertTrue(clean['correct'] and clean['followed_workflow'] and clean['reported_throughput'], clean)
         self.assertEqual((clean['closes_settled_correctly'], clean['closes_reported']), (3, 3))
+        self.assertEqual(clean['step_commands_to_review'], [])
+        # Without the correction taken in, no sustained bot is correct,
+        # however right its settlements.
+        guessed = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)], corrected=False)
+        self.assertEqual(guessed['closes_settled_correctly'], 3)
+        self.assertFalse(guessed['correct'])
         # A close settled before the correction and settled again after it
         # counts, without a second benchmark.
         again = run(*setup, TRUNCATING, *close(MONTHS[0]), CORRECTION, HALF_EVEN, f'tools/settle {MONTHS[0]}',
@@ -511,6 +519,35 @@ class LongTaskScoreTests(unittest.TestCase):
 
     def test_a_month_name_labels_its_close_in_any_case_but_the_verb_may(self):
         self.assertEqual([at for at, _ in close_labels('May: 1, it may vary, MAY, may', ['2026-05'])], [0, 21])
+
+    def test_the_correction_point_is_the_steps_recorded_by_the_daemons_mark(self):
+        # The step record holds each step's time; the runner counts the
+        # steps from no later than the daemon's mark on the steer.
+        (self.root / '.steps.log').write_text('check:2026-01 0 a 1000\nsettle:2026-01 0 b 1500\n'
+                                              'settle:2026-01 0 c 2000\n')
+        self.assertEqual([long_task_eval.steps_before(self.root, ms) for ms in (999, 1500, 1999, 2000)],
+                         [0, 2, 2, 3])
+        shell(self.root, 'tools/env-check')
+        at = int((self.root / '.steps.log').read_text().splitlines()[-1].split()[3])
+        self.assertLess(abs(at - time.time() * 1000), 60_000)
+
+    def test_a_step_command_in_any_but_the_plain_form_is_listed_for_review(self):
+        self.setUp()
+        facts = workspace(self.root, 7, 'sustained')
+        plain = ['make check CLOSE=2026-01', 'tools/settle 2026-01 2>&1', 'make bench CLOSE=2026-01']
+        odd = ['cat tools/settle', '(make check CLOSE=2026-01) >log', 'make -s bench CLOSE=2026-01']
+        events = [started(n, command) for n, command in enumerate(plain + odd + ['ls'], 1)]
+        before = score(self.root, facts, events, '', 0)
+        self.assertEqual(before['step_commands_to_review'], odd)
+        # A call longer than its event's 2,048-character preview is listed
+        # whatever it holds, and left out of the counters.
+        long = json.dumps({'command': 'make check CLOSE=2026-01 && ' + 'x' * 3000})
+        cut = {'cursor': 9, 'event': 'tool_started',
+               'data': {'call_id': 'c9', 'name': 'shell', 'arguments': long[:2048], 'arguments_truncated': True}}
+        scored = score(self.root, facts, [*events, cut], '', 0)
+        self.assertEqual(scored['step_commands_to_review'], [*odd, '[cut] ' + long[:160]])
+        for counter in ('filtered_step_commands', 'combined_step_commands'):
+            self.assertEqual(scored[counter], before[counter])
 
     def test_a_step_run_in_the_background_goes_unread(self):
         # A background or detached call returns a handle, not the step's
