@@ -1311,16 +1311,18 @@ async function sideChat(name, text = '') {
   const record = await Daemon.request('fork', { source: name, bot: copy, created_by: name, created_by_id: b.id, allow: sideAllow(b), ...(b.workspace ? { workspace: b.workspace } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
-  if (S.ui.side !== copy) await openBeside(copy);
-  if (!text) return;
-  try {
-    await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace });
-  } catch (err) {
-    // The side chat exists, so an unsent first message waits in its composer, not its source's.
-    const pane = Object.values(PANE).find((p) => p.bot() === copy), input = pane && $(pane.input);
-    if (input && !input.value) { input.value = text; grow(input); }
-    throw Object.assign(err instanceof Error ? err : new Error(String(err)), { kept: true });
+  // The first message goes before the pane loads any history, so the turn starts at once.
+  let failed = null;
+  if (text) {
+    try { await Daemon.request('submit', { bot: copy, bot_id: record.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery: 'reject', workspace: record.workspace ?? b.workspace ?? S.config.workspace }); }
+    catch (err) { failed = err instanceof Error ? err : new Error(String(err)); }
   }
+  if (S.ui.side !== copy) await openBeside(copy);
+  if (!failed) return;
+  // The side chat exists, so an unsent first message waits in its composer, not its source's.
+  const pane = Object.values(PANE).find((p) => p.bot() === copy), input = pane && $(pane.input);
+  if (input && !input.value) { input.value = text; grow(input); }
+  throw Object.assign(failed, { kept: true });
 }
 function setSideTools(v) { S.sideTools = v === 'answer' ? 'answer' : 'read'; try { localStorage.setItem('agent:side-tools', S.sideTools); } catch (_) {} }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }

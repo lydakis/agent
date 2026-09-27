@@ -739,8 +739,8 @@ test('one menu per agent: side chat any time, stop while running, fork and delet
 });
 
 test('a side chat forks a running bot under it, beside, with read tools or none, and takes the first message', async () => {
-  const sent = [], storage = new Map();
-  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], next_from: null }; } }, storage);
+  const sent = [], storage = new Map(); let sideAtSubmit;
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); if (op === 'submit') sideAtSubmit = p.S.ui.side; return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one', workspace: q.workspace, created_by: q.created_by, created_by_id: q.created_by_id, allowed: q.allow } : { nodes: [], next_from: null }; } }, storage);
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic', status: 'running', running_turn: 3, tools: ['shell', 'read', 'write', 'history'] });
   p.S.selected = 'app.lead';
   await p.sideChat('app.lead');
@@ -753,6 +753,7 @@ test('a side chat forks a running bot under it, beside, with read tools or none,
   assert.deepEqual(Array.from(forks().at(-1).allow), []); assert.equal(forks().at(-1).bot, 'app.lead-side-2');
   const submits = sent.filter(([op]) => op === 'submit').map(([, q]) => [q.bot, q.bot_id, q.prompt, q.delivery]);
   assert.deepEqual(submits, [['app.lead-side-2', 12, 'what are you waiting on?', 'reject']]);
+  assert.equal(sideAtSubmit, 'app.lead-side', 'the first message goes before the new side chat opens and loads its history');
   assert.equal(p.S.ui.side, 'app.lead-side-2');
   assert.equal(storage.get('agent:side-tools'), 'answer'); assert.equal(shell({}, storage).S.sideTools, 'answer');
   // A bot at rest sends normally; the side pick is only for a working one.
