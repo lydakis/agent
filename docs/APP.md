@@ -111,20 +111,24 @@ daemon learns nothing about projects; everything here is client work.
   under it: the coordinator's `created_by` lineage, plus any root bot named
   `<project>.<task>`. Bots in no project follow. A project row opens its
   coordinator; its chevron folds the tasks. **＋ New project** takes a
-  folder, reads its `project.toml` or names the project after the folder,
-  creates the coordinator there with the folder's own client policy, and
-  writes the file if there was none. An existing coordinator is opened.
+  folder, reads its `project.toml` (unknown keys are refused) or names the
+  project after the folder, writes the file if there was none, and creates
+  the coordinator there with the folder's own client policy. An existing
+  coordinator is opened if it works in that folder; one in another folder
+  is a name collision, reported and not opened.
 - **Panes.** A sidebar row opens that thread alone. A task card opens its
   bot in a side pane with its own composer; ⤢ swaps it into full view, ✕ or
   `Esc` closes it.
 - **Composer.** The model chip lists `~/.agent/models`, read on each open.
-  Models of the bot's provider switch the next turns (sent as `submit`'s
-  `model`); other providers show disabled as "new agent", since a bot keeps
-  its provider. Send starts a turn on a bot at rest; on a working bot it
-  queues or steers, as picked last from its ▾.
+  Models of any provider in the bot's family (known from the fleet's bot
+  records) switch the next turns (sent as `submit`'s `model`); other
+  families, and providers no record places, show disabled as "new agent",
+  since a bot keeps its family. Send starts a turn on a bot at rest; on a
+  working bot it queues or steers, as picked last from its ▾. A steer names
+  no model or workspace, so it joins the running turn.
 - **One menu per agent**, from the head's ⋯, a sidebar row's or card's ⋯ on
-  hover, or a right-click: stop, fork (an exact copy of a bot at rest, next
-  to it in the tree, opened beside), delete (confirmed), and every run's
+  hover, or a right-click: stop, fork (an exact copy of a bot at rest in its
+  folder, next to it in the tree, opened beside), delete (confirmed), and every run's
   thoughts and output.
 - **Runs.** Thinking, tool calls and their output between two messages fold
   to one line: the call in progress with its clock, or the tools used, and

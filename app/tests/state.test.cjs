@@ -665,6 +665,35 @@ test('the model chip switches within the provider and offers other providers as 
   await p.submit('back'); assert.equal('model' in sent.at(-1), false);
 });
 
+test('the model chip offers every provider of the bot\'s family and keeps unknown families apart', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(q); } });
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', family: 'anthropic', model: 'one' });
+  p.upsert({ name: 'peer', id: 2, provider: 'gamma', family: 'anthropic', model: 'two' });
+  p.upsert({ name: 'other', id: 3, provider: 'beta', family: 'responses', model: 'x' });
+  p.S.selected = 'lead';
+  const b = p.S.bots.get('lead');
+  const choices = p.modelChoices(b, [{ id: 'beta/x' }, { id: 'gamma/two' }, { id: 'delta/y' }, { id: 'alpha/one' }]);
+  assert.deepEqual(Array.from(choices, (c) => [c.id, c.ok]), [['gamma/two', true], ['alpha/one', true], ['beta/x', false], ['delta/y', false]]);
+  assert.equal(p.setModel('lead', 'beta/x'), false);
+  assert.equal(p.setModel('lead', 'gamma/two'), true);
+  await p.submit('next turn'); assert.equal(sent.at(-1).model, 'gamma/two');
+  // A creation event carries no family; the bot takes its provider's.
+  await p.onEvent({ event: 'created', bot: 'late', data: { id: 4, provider: 'alpha', model: 'one' } });
+  assert.equal(p.S.bots.get('late').family, 'anthropic');
+});
+
+test('a steer joins the running turn: it names no model and no workspace', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(q); } });
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic/task', status: 'running', running_turn: 3 });
+  p.S.selected = 'task'; p.setModel('task', 'alpha/two');
+  p.setSend('queue'); await p.submit('later');
+  assert.equal(sent.at(-1).workspace, '/synthetic/task'); assert.equal(sent.at(-1).model, 'alpha/two');
+  p.setSend('steer'); await p.submit('now');
+  assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('workspace' in sent.at(-1), false); assert.equal('model' in sent.at(-1), false);
+});
+
 test('one menu per agent: side chat waits on the daemon, stop while running, fork and delete at rest', () => {
   const p = shell();
   p.upsert({ name: 'busy', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 4 });
@@ -689,13 +718,24 @@ test('fork copies a bot at rest next to it and opens the copy beside', async () 
   assert.equal(sent.filter(([op]) => op === 'fork').length, 2);
 });
 
+test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'s folder', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push([op, q]); return op === 'fork' ? { name: q.bot, id: 10 + sent.length, provider: 'alpha', model: 'one' } : { nodes: [], next_from: null }; } });
+  const long = 'a'.repeat(128);
+  p.upsert({ name: long, id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/elsewhere' });
+  p.S.selected = long;
+  await p.fork(long); await p.fork(long);
+  const forks = sent.filter(([op]) => op === 'fork').map(([, q]) => q);
+  assert.deepEqual(forks.map((q) => [q.bot.length, q.bot.slice(-7), q.workspace]), [[128, 'aa-fork', '/synthetic/elsewhere'], [128, '-fork-2', '/synthetic/elsewhere']]);
+});
+
 test('a new project creates its coordinator in the folder, writes its file once, and is not made twice', async () => {
   const calls = [];
   const p = shell({
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
     policy: async (dir) => { calls.push(['policy', dir]); return { instructions: 'rules', compaction_instructions: 'summary', note: 'test' }; },
     writeProject: async (q) => { calls.push(['write', q]); },
-    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one' } : { nodes: [], next_from: null }; },
+    request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
   });
   await p.createProject('/synthetic/weather');
   const create = calls.find(([op]) => op === 'create')[1];
@@ -706,6 +746,24 @@ test('a new project creates its coordinator in the folder, writes its file once,
   const before = calls.length;
   await p.createProject('/synthetic/weather');
   assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
+});
+
+test('a project name taken by another folder\'s coordinator is refused, and the file is written before the coordinator', async () => {
+  const calls = []; let fail = true;
+  const p = shell({
+    project: async (dir) => ({ dir, name: dir.endsWith('taken') ? 'demo' : 'weather', coordinator: dir.endsWith('taken') ? 'demo.lead' : 'weather.lead', model: null, file: false }),
+    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
+    writeProject: async (q) => { calls.push(['write', q.dir]); },
+    request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
+  });
+  p.upsert({ name: 'demo.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/first' });
+  p.S.selected = '';
+  await assert.rejects(p.createProject('/synthetic/taken'), /demo\.lead already belongs to \/synthetic\/first/);
+  assert.equal(p.S.selected, ''); assert.equal(calls.length, 0);
+  await assert.rejects(p.createProject('/synthetic/weather'), /create_failed/);
+  assert.deepEqual(calls.map(([op]) => op), ['write', 'create'], 'a failed create leaves the file for the retry');
+  fail = false; await p.createProject('/synthetic/weather');
+  assert.equal(p.S.selected, 'weather.lead');
 });
 
 test('runs fold thinking and tool calls to one line each, keep failures visible, and expand on demand', () => {
@@ -732,4 +790,8 @@ test('runs fold thinking and tool calls to one line each, keep failures visible,
   assert.match(html, /four/); assert.match(html, /again/);
   const thoughtOnly = p.transcript('Ann'); thoughtOnly.items = [{ kind: 'thought', text: 'hm', secs: 7, turn: 1 }]; p.S.ui.steps = false;
   assert.match(p.itemsHTML(thoughtOnly), /▸ thought 7s/);
+  // A page that starts at an output whose call is not loaded shows the output, not a thought.
+  const outputOnly = p.transcript('Cy'); outputOnly.items = [{ kind: 'out', callId: 'z', text: 'result', turn: 1 }, { kind: 'text', text: 'ok', turn: 1 }];
+  const out = p.itemsHTML(outputOnly);
+  assert.doesNotMatch(out, /thought|class="sum"/); assert.match(out, /class="line out">result</);
 });

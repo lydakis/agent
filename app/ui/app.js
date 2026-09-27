@@ -22,6 +22,9 @@ const S = {
   // How Send reaches a working bot, the last pick from its menu (sticky across windows), and the
   // model each bot's next turns run on when it differs from the one it was created with.
   send: loadSend(), override: new Map(),
+  // Each provider's model family, from the bot records that name both; a turn may run on any
+  // provider of its bot's family.
+  families: new Map(),
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' ? 'steer' : 'queue'; } catch (_) { return 'queue'; } }
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
@@ -182,10 +185,16 @@ function upsert(record) {
   b.status = record.status === 'completed' ? 'idle' : (record.status || 'idle');
   b.runningTurn = record.running_turn ?? null;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  learnFamily(b, record);
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   S.bots.set(b.name, b);
   seedHistory(record);
+}
+// Records carry the family; creation events do not, so a bot seated from one takes its provider's.
+function learnFamily(b, record) {
+  if (typeof record.family === 'string') { b.family = record.family; if (typeof record.provider === 'string') S.families.set(record.provider, record.family); }
+  else b.family ??= S.families.get(record.provider) ?? null;
 }
 // The creator, when the bot holding that name now is the identity that did the creating. A later
 // bot reusing the name is a stranger, and a creator the store could not resolve links to nothing.
@@ -621,6 +630,7 @@ function seat(record, session) {
   if (conflict) return;
   if (record.id != null) b.id = record.id;
   b.model = `${record.provider ?? '?'}/${record.model ?? '?'}`;
+  learnFamily(b, record);
   b.workspace = record.workspace ?? null;
   if (record.created_by) { b.parent = record.created_by; b.parentId = record.created_by_id ?? null; }
   seedHistory(record);
@@ -705,7 +715,7 @@ function restore() {
   if (Array.isArray(saved.folded)) { S.ui.folded = new Set(saved.folded.filter((p) => typeof p === 'string')); S.shapeGen += 1; }
   if (Array.isArray(saved.override)) for (const entry of saved.override) {
     const [name, model] = Array.isArray(entry) ? entry : [];
-    if (bot(name) && typeof model === 'string' && family(model) === family(bot(name).model)) S.override.set(name, model);
+    if (bot(name) && typeof model === 'string' && runsOn(bot(name), model)) S.override.set(name, model);
   }
 }
 function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override] })); } catch (_) {} }
@@ -804,6 +814,8 @@ function runHTML(t, s, limit = t.items.length) {
   const tools = items.filter((it) => it.kind === 'tool'), thoughts = items.filter((it) => it.kind === 'thought');
   const open = S.ui.steps || items.some((it) => it.runOpen);
   const n = tools.length + thoughts.length;
+  // Output whose call is not loaded yet shows as output, not as a fold labeled thought.
+  if (!n) return { html: `<div class="steps" data-i="${s}"><div class="body">${items.map((it, k) => stepHTML(it, s + k)).join('')}</div></div>`, end };
   let head;
   if (!tools.length) {
     const secs = thoughts.length && thoughts.every((it) => it.secs != null) ? thoughts.reduce((a, it) => a + it.secs, 0) : null;
@@ -959,7 +971,14 @@ const PANE = {
 const ACTION = { send: 'Send', queue: 'Queue', steer: 'Steer' };
 // Send starts a turn on a bot at rest; on a working bot it does what the menu last picked.
 const sendMode = (b) => b && isActive(b.status) ? S.send : 'send';
-const family = (model) => String(model ?? '').split('/')[0];
+const providerOf = (model) => String(model ?? '').split('/')[0];
+// A turn may run on the bot's own provider, or on another the fleet's records show in its family.
+function runsOn(b, model) {
+  const p = providerOf(model), own = providerOf(b.model);
+  if (p === own) return true;
+  const fam = b.family ?? S.families.get(own);
+  return fam != null && S.families.get(p) === fam;
+}
 const modelOf = (b) => S.override.get(b.name) ?? b.model;
 function renderComposer(pane, b) {
   const ids = PANE[pane], mode = sendMode(b), model = b ? modelOf(b) : '';
@@ -1125,20 +1144,20 @@ function botMenuItems(name) {
     { act: 'steps', label: 'Show all thoughts and output', on: S.ui.steps, hint: '^o' },
   ];
 }
-// A bot keeps its provider for life; a turn may run on another model of that provider. Another
-// provider is a new agent. The bot's own model is always offered, listed or not.
+// A bot keeps its model family for life; a turn may run on any model of that family. Another family,
+// or a provider whose family no record shows, is a new agent. The bot's own model is always offered.
 function modelChoices(b, list) {
-  const own = family(b.model), ids = list.map((m) => m.id);
-  const mine = ids.filter((id) => family(id) === own), others = ids.filter((id) => family(id) !== own);
+  const ids = list.map((m) => m.id);
+  const mine = ids.filter((id) => runsOn(b, id)), others = ids.filter((id) => !runsOn(b, id));
   if (!mine.includes(b.model)) mine.unshift(b.model);
   const current = modelOf(b);
   return [...mine.map((id) => ({ id, ok: true, on: id === current })), ...others.map((id) => ({ id, ok: false, on: false }))];
 }
 function modelMenuItems(b, list, error) {
-  const items = []; let fam = null;
+  const items = []; let group = null;
   for (const c of modelChoices(b, list)) {
-    if (fam !== null && family(c.id) !== fam) items.push({ sep: true });
-    fam = family(c.id);
+    if (group !== null && providerOf(c.id) !== group) items.push({ sep: true });
+    group = providerOf(c.id);
     items.push({ act: 'set-model', who: b.name, v: c.id, label: c.id, on: c.on, disabled: !c.ok, hint: c.ok ? '' : 'new agent' });
   }
   if (error) items.push({ sep: true }, { act: 'none', label: error, disabled: true });
@@ -1153,7 +1172,7 @@ function sendMenuItems(pane) {
 }
 function setSend(mode) { S.send = mode === 'steer' ? 'steer' : 'queue'; try { localStorage.setItem('agent:send', S.send); } catch (_) {} }
 function setModel(name, model) {
-  const b = bot(name); if (!b || family(model) !== family(b.model)) return false;
+  const b = bot(name); if (!b || !runsOn(b, model)) return false;
   if (model === b.model) S.override.delete(name); else S.override.set(name, model);
   save(); return true;
 }
@@ -1183,35 +1202,55 @@ async function submit(text, pane = 'main') {
   const b = bot(PANE[pane].bot()); if (!b) throw new Error('no bot selected; /new NAME creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
-  const model = S.override.get(b.name);
+  const model = S.override.get(b.name), delivery = isActive(b.status) ? S.send : 'reject';
+  // A steer joins the running turn only on that turn's model and folder, so it names neither.
+  const where = delivery === 'steer' ? {} : { workspace: b.workspace ?? S.config.workspace, ...(model && model !== b.model ? { model } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
-  await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, workspace: b.workspace ?? S.config.workspace, delivery: isActive(b.status) ? S.send : 'reject', ...(model && model !== b.model ? { model } : {}) });
+  await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where });
 }
 async function interrupt(name = S.selected) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
+// `NAME-fork`, then `NAME-fork-2` on, with NAME cut whole characters short so the daemon's
+// 128-byte name limit holds.
+const NAME_BYTES = 128;
+function forkName(name, k) {
+  const suffix = k > 1 ? `-fork-${k}` : '-fork';
+  let base = '', bytes = 0;
+  for (const c of name) {
+    const n = c.codePointAt(0) < 0x80 ? 1 : c.codePointAt(0) < 0x800 ? 2 : c.codePointAt(0) < 0x10000 ? 3 : 4;
+    if (bytes + n + suffix.length > NAME_BYTES) break;
+    base += c; bytes += n;
+  }
+  return base + suffix;
+}
 // A fork is an exact copy of a bot at rest, next to it in the tree, opened beside.
 async function fork(name) {
   const b = bot(name); if (!b) return;
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   if (isActive(b.status)) throw new Error('bot_busy: a running bot forks once its turn ends');
-  let copy = `${name}-fork`; for (let k = 2; S.bots.has(copy); k++) copy = `${name}-fork-${k}`;
+  let copy = forkName(name, 1); for (let k = 2; S.bots.has(copy); k++) copy = forkName(name, k);
   const parent = creatorOf(b) ?? b, session = S.session;
-  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: parent.name, created_by_id: parent.id });
+  const record = await Daemon.request('fork', { source: name, bot: copy, created_by: parent.name, created_by_id: parent.id, ...(b.workspace ? { workspace: b.workspace } : {}) });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   S.shapeGen += 1;
   await openBeside(copy);
 }
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // A project in a folder: the folder's `.agent/project.toml` names it, or the folder's own name does,
-// and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made twice.
+// and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
+// twice, unless it works in another folder. The file is written first, so a failed create retries.
 async function createProject(dir) {
   const info = await Daemon.project(dir);
-  if (bot(info.coordinator)) { await openOnly(info.coordinator); return; }
+  const existing = bot(info.coordinator);
+  if (existing) {
+    if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
+    await openOnly(info.coordinator); return;
+  }
   const model = info.model || S.config?.model;
   if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agent/project.toml');
   const policy = await Daemon.policy(info.dir);
+  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   const session = S.session;
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
-  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   await enqueue(() => { if (S.session === session) seat(record, session); });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }

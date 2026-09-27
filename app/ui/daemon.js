@@ -31,10 +31,10 @@ window.Daemon = (() => {
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
   const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
 
-  async function create(name, model, createdBy = null, source = null) {
+  async function create(name, model, createdBy = null, source = null, workspace = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
     // Lineage is pinned to the creator's identity, and the event carries the record's list fields, as the daemon's does.
-    const b = { ...record(name, model), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false };
+    const b = { ...record(name, model), ...(workspace ? { workspace } : {}), id: S.nextId++, created_by: createdBy, created_by_id: createdBy ? S.bots.get(createdBy)?.id ?? null : null, turns: 0, interrupted: false };
     S.bots.set(name, b);
     // A fork shares its source's history up to the source's newest node.
     if (source) S.lineages.set(name, [...(S.lineages.get(source) ?? [])]);
@@ -220,12 +220,12 @@ window.Daemon = (() => {
         }
         case 'item': { const item = S.nodes.get(params.node); if (!item) throw new Error('item_not_in_bot_history'); return item; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
-        case 'create': { await create(params.bot, params.model, params.created_by ?? null); return { ...S.bots.get(params.bot) }; }
+        case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (b.status !== 'idle' && params.delivery === 'steer') { emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
           reply(params.bot, params.prompt); return { bot: params.bot, turn: S.nextTurn, status: 'running', handle: `turn:${params.bot}/${S.nextTurn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
-        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); if (src.status !== 'idle') throw new Error('bot_busy'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source); return { ...S.bots.get(params.bot) }; }
+        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); if (src.status !== 'idle') throw new Error('bot_busy'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace); return { ...S.bots.get(params.bot) }; }
         case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
         default: throw new Error(`unsupported_in_demo:${op}`);
       }

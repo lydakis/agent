@@ -10,6 +10,8 @@ use std::path::Path;
 
 pub const FILE: &str = ".agent/project.toml";
 const LIMIT: u64 = 64 * 1024;
+/// Every key the file may hold; anything else is a mistake, not ignored.
+const KEYS: [&str; 3] = ["name", "coordinator", "model"];
 
 /// A name that is also a bot-name prefix: the daemon's name characters,
 /// short enough that `NAME.lead` and its task names fit.
@@ -80,6 +82,9 @@ pub fn read(dir: &Path) -> Result<Value, String> {
     let table: toml::Table = text
         .parse()
         .map_err(|e: toml::de::Error| invalid(e.message()))?;
+    if let Some(key) = table.keys().find(|key| !KEYS.contains(&key.as_str())) {
+        return Err(invalid(&format!("unknown key {key}")));
+    }
     let field = |key: &str| match table.get(key) {
         None => Ok(None),
         Some(toml::Value::String(value)) => Ok(Some(value.clone())),
@@ -176,6 +181,23 @@ mod tests {
             let error = read(&dir).unwrap_err();
             assert!(error.starts_with("project_invalid: "), "{error}");
         }
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused_by_name() {
+        let dir = root("unknown");
+        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        std::fs::write(dir.join(FILE), "name = \"demo\"\nrole = \"lead\"\n").unwrap();
+        let error = read(&dir).unwrap_err();
+        assert!(error.starts_with("project_invalid: "), "{error}");
+        assert!(error.ends_with("unknown key role"), "{error}");
+        std::fs::write(
+            dir.join(FILE),
+            "name = \"demo\"\ncoordinator = \"demo.lead\"\nmodel = \"alpha/one\"\n",
+        )
+        .unwrap();
+        assert_eq!(read(&dir).unwrap()["model"], "alpha/one");
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 }
