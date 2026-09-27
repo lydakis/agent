@@ -50,7 +50,19 @@ window.Daemon = (() => {
       await wait(pace + Math.random() * pace);
     }
     emit({ event: 'message', bot: name, turn, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] }) } });
+    await steerIn(name, turn);
     return true;
+  }
+  // A steer waits for the running turn's next round boundary, joins it as a user message, and the
+  // scripted model acknowledges it before carrying on.
+  async function steerIn(name, turn) {
+    const b = S.bots.get(name);
+    while (b.steers?.length && !b.interrupted) {
+      const prompt = b.steers.shift();
+      emit({ event: 'message', bot: name, turn, data: { node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }) } });
+      await wait(200);
+      await stream(name, turn, `Noted: ${prompt.trim().replace(/[.?!]+$/, '')}. Carrying on with that in mind.`);
+    }
   }
   async function think(name, turn, text) {
     const b = S.bots.get(name);
@@ -71,12 +83,13 @@ window.Daemon = (() => {
     await wait(ms);
     if (b.interrupted) return;
     emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output }), artifacts: [] } });
+    await steerIn(name, turn);
   }
   function start(name, prompt) {
     const b = S.bots.get(name);
     if (b.status !== 'idle') { emit({ event: 'queued', bot: name, turn: S.nextTurn, data: { delivery: 'queue' } }); return null; }
     const turn = S.nextTurn++;
-    b.turns++; b.running_turn = turn; b.status = 'running'; b.interrupted = false;
+    b.turns++; b.running_turn = turn; b.status = 'running'; b.interrupted = false; b.steers = [];
     emit({ event: 'accepted', bot: name, turn, data: { request_id: `demo-${turn}`, node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }), workspace: b.workspace, model: `${b.provider}/${b.model}` } });
     return turn;
   }
@@ -138,6 +151,7 @@ window.Daemon = (() => {
     emit({ event: 'turn_resumed', bot: name, turn, data: { call_id: wid } });
     const results = {}; for (const h of handles) results[h] = h.startsWith('proc:') ? { exit_code: 0, stdout: 'Finished release profile in 41.2s\n', stderr: '', success: true } : { status: 'completed', text: replies[h.split(':')[1].split('/')[0]] };
     emit({ event: 'tool_completed', bot: name, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results }) }), artifacts: [] } });
+    await steerIn(name, turn);
     await wait(400);
     await stream(name, turn, 'All of it landed. Plan matches the diff, tests are green with one harmless warning, release build finished. Ready for review: two files, 41 lines.');
     finish(name, turn);
@@ -167,6 +181,7 @@ window.Daemon = (() => {
       b.status = 'running';
       emit({ event: 'turn_resumed', bot: n, turn, data: { call_id: wid } });
       emit({ event: 'tool_completed', bot: n, turn, data: { call_id: wid, node: node({ type: 'function_call_output', call_id: wid, output: JSON.stringify({ pending: [], results: { [`turn:demo.review/${rt}`]: { status: 'completed', text: 'Diff is sound.' } } }) }), artifacts: [] } });
+      await steerIn(n, turn);
     }
     if (n === 'demo.test') { await tool(n, turn, 'shell', { command: 'cargo test -p auth' }, JSON.stringify({ exit_code: 0, stderr: '', stdout: 'test result: ok. 34 passed; 0 failed\n', success: true }), 1600); }
     await stream(n, turn, text, 50);
@@ -222,8 +237,9 @@ window.Daemon = (() => {
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
-          if (b.status !== 'idle' && params.delivery === 'steer') { emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
-          reply(params.bot, params.prompt); return { bot: params.bot, turn: S.nextTurn, status: 'running', handle: `turn:${params.bot}/${S.nextTurn}` }; }
+          if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
+          if (b.status !== 'idle' && params.delivery === 'steer') { (b.steers ??= []).push(params.prompt); emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
+          const turn = S.nextTurn; reply(params.bot, params.prompt); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); if (src.status !== 'idle') throw new Error('bot_busy'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace); return { ...S.bots.get(params.bot) }; }
         case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); S.bots.delete(params.bot); S.lineages.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }

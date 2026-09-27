@@ -119,14 +119,38 @@ pub fn write(dir: &Path, name: &str, model: &str) -> Result<(), String> {
     );
     let failed = |e: std::io::Error| format!("project_unwritable: {}: {e}", path.display());
     std::fs::create_dir_all(dir.join(".agent")).map_err(failed)?;
-    match std::fs::OpenOptions::new()
+    place_new(&path, |file| {
+        std::io::Write::write_all(file, text.as_bytes())?;
+        file.sync_all()
+    })
+    .map_err(failed)
+}
+
+/// Fill a temporary file beside `path`, then link it into place. The link
+/// refuses an existing file, which is kept, and `path` never holds a partial
+/// file: a failed fill leaves nothing behind.
+fn place_new(
+    path: &Path,
+    fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let temp = path.with_extension(format!("toml.{}.{nanos}.tmp", std::process::id()));
+    let result = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => std::io::Write::write_all(&mut file, text.as_bytes()).map_err(failed),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(failed(error)),
+        .open(&temp)
+        .and_then(|mut file| fill(&mut file))
+        .and_then(|()| match std::fs::hard_link(&temp, path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            other => other,
+        });
+    let removed = std::fs::remove_file(&temp);
+    result?;
+    match removed {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -164,6 +188,28 @@ mod tests {
         assert_eq!(project["model"], "alpha/one");
         assert_eq!(project["file"], true);
         assert!(write(&dir, "bad name", "alpha/one").is_err());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_file_and_no_temporary() {
+        let dir = root("partial");
+        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        let path = dir.join(FILE);
+        let error = place_new(&path, |file| {
+            std::io::Write::write_all(file, b"name = \"de")?;
+            Err(std::io::Error::other("synthetic disk full"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "synthetic disk full");
+        assert!(!path.exists(), "no partial project file");
+        write(&dir, "demo", "alpha/one").unwrap();
+        assert_eq!(read(&dir).unwrap()["name"], "demo");
+        let left: Vec<_> = std::fs::read_dir(dir.join(".agent"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["project.toml"], "temporaries are removed");
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 

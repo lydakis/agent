@@ -8,7 +8,7 @@ function page(daemon = {}, storage = null) {
   const elements = new Map(), timers = new Map();
   let timer = 0;
   const element = () => ({
-    children: [], replaceChildren(...nodes) { this.children = nodes; }, dataset: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
+    children: [], replaceChildren(...nodes) { this.children = nodes; }, dataset: {}, style: {}, innerHTML: '', value: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0,
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     listeners: {}, addEventListener(type,fn) { this.listeners[type]=fn; }, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
   });
@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -287,11 +287,13 @@ test('process-heavy history folds cards into recoverable result ranges', async (
 });
 
 
-test('waiting rail handles are escaped as text', () => {
+test('a waiting sidebar row is one row: its glyph says waiting, and no handle line follows it', () => {
   const p=page();p.upsert({name:'Bob',id:1});const b=p.S.bots.get('Bob');
-  b.waitingOn=['turn:<img src=x onerror=alert(1)>/1'];
-  const html=p.botRowHTML({b,depth:0,prefix:''},false);
-  assert.ok(!html.includes('<img'));assert.match(html,/&lt;img/);
+  b.status='waiting';b.waitingOn=['turn:<img src=x onerror=alert(1)>/1'];
+  const html=p.botRowHTML({b,depth:1,prefix:'│ └'},false);
+  assert.ok(!html.includes('img'));assert.doesNotMatch(html,/class="w"/);
+  assert.match(html,/<span class="tree">│ └<\/span><span class="glyph waiting">/);
+  assert.ok(html.endsWith('</div>') && html.indexOf('<div class="botrow')===0 && html.lastIndexOf('<div')===0,'exactly one element per row');
 });
 
 test('event-only notes are bounded with an explicit summary', async () => {
@@ -683,6 +685,23 @@ test('the model chip offers every provider of the bot\'s family and keeps unknow
   assert.equal(p.S.bots.get('late').family, 'anthropic');
 });
 
+test('a saved model pick comes back only for the same bot identity', () => {
+  const storage = new Map();
+  const p = shell({}, storage);
+  p.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one' });
+  p.setModel('lead', 'alpha/two'); p.setModel('task', 'alpha/two'); p.save();
+  const q = shell({}, storage);
+  q.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' });
+  q.upsert({ name: 'task', id: 9, provider: 'alpha', model: 'one' }); // deleted and made again
+  q.restore();
+  assert.equal(q.S.override.get('lead'), 'alpha/two');
+  assert.equal(q.S.override.has('task'), false, 'a new bot under an old name starts on its own model');
+  storage.set([...storage.keys()].find((k) => k !== 'agent:send'), JSON.stringify({ override: [['lead', 'alpha/two']] }));
+  const r = shell({}, storage); r.upsert({ name: 'lead', id: 1, provider: 'alpha', model: 'one' }); r.restore();
+  assert.equal(r.S.override.has('lead'), false, 'a pick with no identity is not restored');
+});
+
 test('a steer joins the running turn: it names no model and no workspace', async () => {
   const sent = [];
   const p = shell({ request: async (op, q) => { sent.push(q); } });
@@ -692,6 +711,17 @@ test('a steer joins the running turn: it names no model and no workspace', async
   assert.equal(sent.at(-1).workspace, '/synthetic/task'); assert.equal(sent.at(-1).model, 'alpha/two');
   p.setSend('steer'); await p.submit('now');
   assert.equal(sent.at(-1).delivery, 'steer'); assert.equal('workspace' in sent.at(-1), false); assert.equal('model' in sent.at(-1), false);
+  assert.equal(sent.at(-1).expected_turn, 3, 'a steer is for the turn on screen');
+});
+
+test('a steer whose turn ended meanwhile is refused as stale, with a short message, and never queued', async () => {
+  const sent = [];
+  const p = shell({ request: async (op, q) => { sent.push(q); if (q.delivery === 'steer' && q.expected_turn !== 4) throw new Error('stale_turn: turn 3 is not running'); } });
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 3 });
+  p.S.selected = 'task'; p.setSend('steer');
+  await assert.rejects(p.submit('now'), /^Error: that turn ended; not steered$/);
+  assert.equal(sent.length, 1);
+  p.setSend('queue'); await assert.doesNotReject(p.submit('later'));
 });
 
 test('one menu per agent: side chat waits on the daemon, stop while running, fork and delete at rest', () => {
@@ -701,6 +731,22 @@ test('one menu per agent: side chat waits on the daemon, stop while running, for
   const state = (name) => Object.fromEntries(p.botMenuItems(name).filter((i) => i.act).map((i) => [i.act, !i.disabled]));
   assert.deepEqual(state('busy'), { 'side-chat': false, stop: true, fork: false, delete: false, steps: true });
   assert.deepEqual(state('rest'), { 'side-chat': false, stop: false, fork: true, delete: true, steps: true });
+});
+
+test('an open agent menu is rebuilt when its bot changes status and closed when it is deleted', async () => {
+  const p = shell();
+  p.upsert({ name: 'task', id: 2, provider: 'alpha', model: 'one', status: 'running', running_turn: 4 });
+  p.upsert({ name: 'other', id: 3, provider: 'alpha', model: 'one' });
+  p.showMenu(p.botMenuItems('task'), { x: 10, y: 10 }, 'task');
+  const menu = p.elements.get('menu');
+  assert.match(menu.innerHTML, /when idle/); assert.match(menu.innerHTML, /<button type="button" role="menuitem" data-act="stop"/);
+  await p.onEvent({ event: 'turn_finished', bot: 'task', turn: 4, data: { status: 'completed' } }); p.refreshMenu();
+  assert.equal(p.S.ui.menu, true);
+  assert.doesNotMatch(menu.innerHTML, /when idle/); assert.match(menu.innerHTML, /disabled data-act="stop"/);
+  const before = menu.innerHTML; p.S.bots.get('other').status = 'running'; p.refreshMenu();
+  assert.equal(menu.innerHTML, before, 'another bot changing leaves the menu alone');
+  await p.onEvent({ event: 'deleted', bot: 'task' }); p.refreshMenu();
+  assert.equal(p.S.ui.menu, false);
 });
 
 test('fork copies a bot at rest next to it and opens the copy beside', async () => {
@@ -730,11 +776,11 @@ test('fork names fit the daemon\'s 128-byte limit and forks work in the source\'
 });
 
 test('a new project creates its coordinator in the folder, writes its file once, and is not made twice', async () => {
-  const calls = [];
+  const calls = []; let written = false;
   const p = shell({
-    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: written }),
     policy: async (dir) => { calls.push(['policy', dir]); return { instructions: 'rules', compaction_instructions: 'summary', note: 'test' }; },
-    writeProject: async (q) => { calls.push(['write', q]); },
+    writeProject: async (q) => { calls.push(['write', q]); written = true; },
     request: async (op, q) => { calls.push([op, q]); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
   });
   await p.createProject('/synthetic/weather');
@@ -748,12 +794,12 @@ test('a new project creates its coordinator in the folder, writes its file once,
   assert.equal(calls.filter(([op]) => op === 'create').length, 1); assert.equal(calls.length, before);
 });
 
-test('a project name taken by another folder\'s coordinator is refused, and the file is written before the coordinator', async () => {
-  const calls = []; let fail = true;
+test('a project name taken by another folder\'s coordinator is refused, and a refused model is never written', async () => {
+  const calls = []; let fail = true, failWrite = false;
   const p = shell({
     project: async (dir) => ({ dir, name: dir.endsWith('taken') ? 'demo' : 'weather', coordinator: dir.endsWith('taken') ? 'demo.lead' : 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
-    writeProject: async (q) => { calls.push(['write', q.dir]); },
+    writeProject: async (q) => { calls.push(['write', q.dir, q.model]); if (failWrite) throw new Error('project_unwritable'); },
     request: async (op, q) => { calls.push([op, q.bot]); if (op === 'create' && fail) throw new Error('create_failed'); return op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one', workspace: q.workspace } : { nodes: [], next_from: null }; },
   });
   p.upsert({ name: 'demo.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/first' });
@@ -761,8 +807,13 @@ test('a project name taken by another folder\'s coordinator is refused, and the 
   await assert.rejects(p.createProject('/synthetic/taken'), /demo\.lead already belongs to \/synthetic\/first/);
   assert.equal(p.S.selected, ''); assert.equal(calls.length, 0);
   await assert.rejects(p.createProject('/synthetic/weather'), /create_failed/);
-  assert.deepEqual(calls.map(([op]) => op), ['write', 'create'], 'a failed create leaves the file for the retry');
-  fail = false; await p.createProject('/synthetic/weather');
+  assert.deepEqual(calls.map(([op]) => op), ['create'], 'a model the daemon refuses is not saved to the folder');
+  fail = false; failWrite = true;
+  await assert.rejects(p.createProject('/synthetic/weather'), /project_unwritable/);
+  assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
+  failWrite = false; await p.createProject('/synthetic/weather');
+  assert.deepEqual(calls.at(-1), ['write', '/synthetic/weather', 'alpha/one'], 'a retry writes the missing file with the coordinator\'s model');
+  assert.equal(calls.filter(([op]) => op === 'create').length, 2);
   assert.equal(p.S.selected, 'weather.lead');
 });
 
@@ -794,4 +845,24 @@ test('runs fold thinking and tool calls to one line each, keep failures visible,
   const outputOnly = p.transcript('Cy'); outputOnly.items = [{ kind: 'out', callId: 'z', text: 'result', turn: 1 }, { kind: 'text', text: 'ok', turn: 1 }];
   const out = p.itemsHTML(outputOnly);
   assert.doesNotMatch(out, /thought|class="sum"/); assert.match(out, /class="line out">result</);
+});
+
+test('the demo daemon delivers a steer at the next round boundary and refuses a stale one', async () => {
+  const context = vm.createContext({ window: {}, setTimeout, clearTimeout, Math, JSON, Promise, Error, String, Set, Map, Infinity });
+  vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
+  const d = context.window.Daemon;
+  await d.request('create', { bot: 'solo', model: 'alpha/one' });
+  const { turn } = await d.request('submit', { bot: 'solo', prompt: 'read the dispatch', delivery: 'reject' });
+  await new Promise((r) => setTimeout(r, 300));
+  await assert.rejects(d.request('submit', { bot: 'solo', prompt: 'x', delivery: 'steer', expected_turn: turn + 1 }), /stale_turn/);
+  await d.request('submit', { bot: 'solo', prompt: 'mention the wait op too', delivery: 'steer', expected_turn: turn });
+  const events = [];
+  while (!events.some((e) => e.event === 'turn_finished')) events.push(...(await d.pull()).events);
+  const nodes = events.filter((e) => e.event === 'message').map((e) => e.data.node);
+  const items = await Promise.all(nodes.map((node) => d.request('item', { node })));
+  const user = items.findIndex((i) => i.role === 'user');
+  assert.equal(items[user].content[0].text, 'mention the wait op too');
+  assert.match(items[user + 1].content[0].text, /^Noted: mention the wait op too\./);
+  assert.equal(events.filter((e) => e.event === 'turn_finished').length, 1, 'the steer joined the running turn');
+  d.close();
 });

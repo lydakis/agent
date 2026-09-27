@@ -713,12 +713,14 @@ function restore() {
   if (saved.side && S.bots.has(saved.side) && saved.side !== S.selected) S.ui.side = saved.side;
   S.ui.rail = saved.rail !== false; S.ui.steps = !!saved.steps;
   if (Array.isArray(saved.folded)) { S.ui.folded = new Set(saved.folded.filter((p) => typeof p === 'string')); S.shapeGen += 1; }
+  // A model pick belongs to the identity it was made for, not to whichever bot holds the name now.
   if (Array.isArray(saved.override)) for (const entry of saved.override) {
-    const [name, model] = Array.isArray(entry) ? entry : [];
-    if (bot(name) && typeof model === 'string' && runsOn(bot(name), model)) S.override.set(name, model);
+    const [name, id, model] = Array.isArray(entry) ? entry : [];
+    const b = bot(name);
+    if (b && b.id != null && b.id === id && typeof model === 'string' && runsOn(b, model)) S.override.set(name, model);
   }
 }
-function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override] })); } catch (_) {} }
+function save() { try { localStorage.setItem(sessionKey(), JSON.stringify({ selected: S.selected, side: S.ui.side, rail: S.ui.rail, steps: S.ui.steps, folded: [...S.ui.folded], override: [...S.override].map(([name, model]) => [name, bot(name)?.id ?? null, model]) })); } catch (_) {} }
 window.addEventListener('beforeunload', save);
 
 // ---------- render ----------
@@ -1024,7 +1026,6 @@ function patchRailRow(name) {
   if (!S.ui.rail) return;
   const i = rail.index.get(name); if (i === undefined || i < rail.start || i >= rail.end) return;
   const el = $('bots'); const old = el.querySelector(`.botrow[data-bot="${cssEsc(name)}"]`); if (!old) return;
-  if (old.nextElementSibling?.classList.contains('w')) old.nextElementSibling.remove();
   old.outerHTML = botRowHTML(rail.rows[i], name === S.selected);
 }
 $('bots').addEventListener('scroll', () => {
@@ -1051,9 +1052,8 @@ function botRowHTML(n, sel) {
     const chev = n.tasks ? `<button type="button" class="chev" data-act="fold" data-v="${esc(n.head)}" aria-label="${folded ? 'Show' : 'Hide'} tasks">${folded ? '▸' : '▾'}</button>` : '<span class="chev"></span>';
     return `<div class="botrow proj${sel ? ' sel' : ''}" data-bot="${esc(b.name)}" role="button" tabindex="0">${chev}${glyph}<span class="n">${esc(n.head)}</span>${acts}</div>`;
   }
-  const w = b.waitingOn.length ? `<div class="w" style="padding-left:${3 + n.depth * 2}ch">⏳ ${b.waitingOn.map((h) => esc(h.replace(/^turn:/, '').split('/')[0])).join(' ')}</div>` : '';
   const beside = S.ui.side === b.name ? ' beside' : '';
-  return `<div class="botrow${sel ? ' sel' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span>${glyph}<span class="n">${esc(shortName(b))}</span>${acts}</div>${w}`;
+  return `<div class="botrow${sel ? ' sel' : ''}${beside}" data-bot="${esc(b.name)}" role="button" tabindex="0"><span class="tree">${n.prefix}</span>${glyph}<span class="n">${esc(shortName(b))}</span>${acts}</div>`;
 }
 function peers() { return (S.transcripts.get(S.selected)?.peers ?? []).filter((who) => S.bots.has(who)); }
 function keybarHTML(b) {
@@ -1079,6 +1079,7 @@ function render() {
   renderComposer('main', b); renderComposer('side', side);
   $('keybar').innerHTML = keybarHTML(b);
   if (S.ui.picker) renderPicker();
+  refreshMenu();
 }
 // Once a second, while anything runs: the clocks on cards and run lines, in place. The activity
 // check is cached per fleet change, so a quiet fleet of any size costs nothing here.
@@ -1117,20 +1118,28 @@ function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $
 // ---------- menus ----------
 // One menu at a time: an agent's ⋯ (from its head, its sidebar row, its card, or a right-click), the
 // model chip, and Send's ▾.
-let menuAnchor = null;
+let menuAnchor = null, menuFor = null, menuKey = '';
+const menuSig = (items) => items.map((i) => `${i.act}:${!!i.disabled}:${!!i.on}:${i.hint ?? ''}`).join('|');
 function menuHTML(items) {
   return items.map((i) => i.sep ? '<hr>' : i.head ? `<div class="lab">${esc(i.head)}</div>` :
     `<button type="button" role="menuitem"${i.disabled ? ' disabled' : ''}${i.danger ? ' class="danger"' : ''} data-act="${i.act}"${i.who != null ? ` data-who="${esc(i.who)}"` : ''}${i.v != null ? ` data-v="${esc(i.v)}"` : ''}${i.pane ? ` data-pane="${i.pane}"` : ''}><span><span class="ck">${i.on ? '✓' : ''}</span>${esc(i.label)}</span><span class="mh">${esc(i.hint ?? '')}</span></button>`).join('');
 }
-function showMenu(items, anchor) {
-  const m = $('menu'); m.innerHTML = menuHTML(items); m.classList.add('on'); S.ui.menu = true; menuAnchor = anchor;
+function showMenu(items, anchor, who = null) {
+  const m = $('menu'); m.innerHTML = menuHTML(items); m.classList.add('on'); S.ui.menu = true; menuAnchor = anchor; menuFor = who; menuKey = menuSig(items);
   const w = m.offsetWidth, h = m.offsetHeight, W = window.innerWidth, H = window.innerHeight;
   let x = anchor.x, y = anchor.y;
   if (anchor.rect) { const a = anchor.rect; x = a.right - w; y = anchor.up ? a.top - h - 4 : a.bottom + 4; }
   m.style.left = `${Math.max(4, Math.min(x, W - w - 4))}px`; m.style.top = `${Math.max(4, Math.min(y, H - h - 4))}px`;
   m.querySelector('button:not([disabled])')?.focus({ preventScroll: true });
 }
-function closeMenu() { if (!S.ui.menu) return; S.ui.menu = false; $('menu').classList.remove('on'); }
+function closeMenu() { if (!S.ui.menu) return; S.ui.menu = false; menuFor = null; $('menu').classList.remove('on'); }
+// An open agent menu follows its bot: a status change rebuilds it in place, a deletion closes it.
+function refreshMenu() {
+  if (!S.ui.menu || menuFor == null) return;
+  if (!S.bots.has(menuFor)) { closeMenu(); return; }
+  const items = botMenuItems(menuFor);
+  if (menuSig(items) !== menuKey) showMenu(items, menuAnchor, menuFor);
+}
 // Side chat needs a fork of a running bot, which the daemon does not do yet; Keep belongs to a side chat.
 function botMenuItems(name) {
   const b = bot(name); if (!b) return [];
@@ -1204,9 +1213,12 @@ async function submit(text, pane = 'main') {
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   const model = S.override.get(b.name), delivery = isActive(b.status) ? S.send : 'reject';
   // A steer joins the running turn only on that turn's model and folder, so it names neither.
-  const where = delivery === 'steer' ? {} : { workspace: b.workspace ?? S.config.workspace, ...(model && model !== b.model ? { model } : {}) };
+  // It also names the turn on screen, so a turn that ended meanwhile refuses it as stale_turn
+  // rather than the message landing in whatever turn runs next.
+  const where = delivery === 'steer' ? (b.runningTurn != null ? { expected_turn: b.runningTurn } : {}) : { workspace: b.workspace ?? S.config.workspace, ...(model && model !== b.model ? { model } : {}) };
   // The identity on screen, so a name that changed hands in between is refused rather than handed the prompt.
-  await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where });
+  try { await Daemon.request('submit', { bot: b.name, bot_id: b.id, request_id: `app-${crypto.randomUUID()}`, prompt: text, delivery, ...where }); }
+  catch (e) { if (delivery === 'steer' && /stale_turn/.test(String(e?.message ?? e))) throw new Error('that turn ended; not steered'); throw e; }
 }
 async function interrupt(name = S.selected) { const b = bot(name); if (!b || b.runningTurn === null) return; try { await Daemon.request('interrupt', { bot: b.name, turn: b.runningTurn }); } catch (e) { toast(`interrupt: ${e?.message ?? e}`); } }
 // `NAME-fork`, then `NAME-fork-2` on, with NAME cut whole characters short so the daemon's
@@ -1237,21 +1249,24 @@ async function fork(name) {
 async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // A project in a folder: the folder's `.agent/project.toml` names it, or the folder's own name does,
 // and its coordinator is `<name>.lead` working there. An existing coordinator is opened, not made
-// twice, unless it works in another folder. The file is written first, so a failed create retries.
+// twice, unless it works in another folder. The file is written only once the daemon has accepted
+// the coordinator, so a model it refuses is never saved; a folder whose coordinator exists gets
+// the file it lacks, with that coordinator's model, so a failed write retries.
 async function createProject(dir) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
   if (existing) {
     if (existing.workspace !== info.dir) throw new Error(`${info.coordinator} already belongs to ${existing.workspace ?? 'another folder'}`);
+    if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model: existing.model });
     await openOnly(info.coordinator); return;
   }
   const model = info.model || S.config?.model;
   if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agent/project.toml');
   const policy = await Daemon.policy(info.dir);
-  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   const session = S.session;
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
+  if (!info.file) await Daemon.writeProject({ dir: info.dir, name: info.name, model });
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }
 function detach() { save(); Daemon.close(); }
@@ -1322,7 +1337,7 @@ document.addEventListener('keydown', async (e) => {
 async function act(el) {
   const a = el.dataset.act, who = el.dataset.who, v = el.dataset.v, pane = el.dataset.pane, rect = el.getBoundingClientRect?.();
   switch (a) {
-    case 'more': showMenu(botMenuItems(who), { rect }); return;
+    case 'more': showMenu(botMenuItems(who), { rect }, who); return;
     case 'model': await modelMenu(pane, { rect, up: true }); return;
     case 'sendmenu': showMenu(sendMenuItems(pane), { rect, up: true }); return;
     case 'set-model': setModel(who, v); render(); return;
@@ -1357,7 +1372,8 @@ document.addEventListener('click', async (e) => {
 });
 document.addEventListener('contextmenu', (e) => {
   const t = e.target.closest('[data-bot], [data-task]'); if (!t) return;
-  e.preventDefault(); closeMenu(); showMenu(botMenuItems(t.dataset.bot ?? t.dataset.task), { x: e.clientX, y: e.clientY });
+  const who = t.dataset.bot ?? t.dataset.task;
+  e.preventDefault(); closeMenu(); showMenu(botMenuItems(who), { x: e.clientX, y: e.clientY }, who);
 });
 
 // ---------- boot ----------

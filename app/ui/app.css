@@ -96,7 +96,6 @@ button.newproj:hover{background:var(--t-raised);color:var(--t-ink)}
 form.newproj{border:1px solid var(--t-line);color:var(--amber)}
 form.newproj input{flex:1;min-width:0;background:transparent;border:0;color:var(--t-ink);font:inherit;outline:none;caret-color:var(--amber)}
 [hidden]{display:none!important}
-#bots .w{color:var(--wait);opacity:.8;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tree{color:var(--t-faint);white-space:pre}
 
 .peer{margin:6px 0;border:1px solid var(--t-line);border-radius:6px;background:var(--t-panel);padding:5px 10px;display:grid;grid-template-columns:auto 1fr auto;gap:0 1ch;position:relative;transition:border-color 160ms,background 160ms}

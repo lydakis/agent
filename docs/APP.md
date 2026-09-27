@@ -99,7 +99,9 @@ client/          agent-client: the socket protocol and the client policy
   mutation queue, so a pending read cannot splice over a newer snapshot.
 - **Demo mode.** In a plain browser there is no Rust core, so `daemon.js`
   becomes a simulated daemon that emits the same protocol shapes and answers
-  `item`, `submit`, `create`, `fork`, `delete`, `interrupt`. The scenario
+  `item`, `submit`, `create`, `fork`, `delete`, `interrupt`. A steer joins
+  the running turn at its next round boundary as a user message, and the
+  scripted reply acknowledges it. The scenario
   plays on load in two projects: `demo.lead` thinks, starts a release build
   in the background, spawns its tasks plan, build and test, build spawns
   review, and the coordinator waits on all of it. Serve `app/ui` with any
@@ -145,10 +147,13 @@ daemon learns nothing about projects; everything here is client work.
   `<project>.<task>`. Bots in no project follow. A project row opens its
   coordinator; its chevron folds the tasks. **＋ New project** takes a
   folder, reads its `project.toml` (unknown keys are refused) or names the
-  project after the folder, writes the file if there was none, and creates
-  the coordinator there with the folder's own client policy. An existing
-  coordinator is opened if it works in that folder; one in another folder
-  is a name collision, reported and not opened.
+  project after the folder, creates the coordinator there with the folder's
+  own client policy, and then writes the file if there was none, so a model
+  the daemon refuses is never saved. The file goes in through a temporary
+  and a link, so it is never partial and never replaces one. An existing
+  coordinator is opened if it works in that folder (and the file it lacks is
+  written with its model); one in another folder is a name collision,
+  reported and not opened.
 - **Panes.** A sidebar row opens that thread alone. A task card opens its
   bot in a side pane with its own composer; ⤢ swaps it into full view, ✕ or
   `Esc` closes it.
@@ -158,11 +163,15 @@ daemon learns nothing about projects; everything here is client work.
   families, and providers no record places, show disabled as "new agent",
   since a bot keeps its family. Send starts a turn on a bot at rest; on a
   working bot it queues or steers, as picked last from its ▾. A steer names
-  no model or workspace, so it joins the running turn.
+  no model or workspace, so it joins the running turn, and it names that
+  turn (`expected_turn`): if the turn ended meanwhile, the daemon refuses it
+  as `stale_turn` and the message stays in the composer. A model pick is
+  remembered for the bot's identity, not its name.
 - **One menu per agent**, from the head's ⋯, a sidebar row's or card's ⋯ on
   hover, or a right-click: stop, fork (an exact copy of a bot at rest in its
   folder, next to it in the tree, opened beside), delete (confirmed), and every run's
-  thoughts and output.
+  thoughts and output. An open menu follows its bot's status. A sidebar row
+  is one line; its glyph and the pane head say what it waits on.
 - **Runs.** Thinking, tool calls and their output between two messages fold
   to one line: the call in progress with its clock, or the tools used, and
   any failure. A click opens a run or unfolds one long output.
@@ -298,8 +307,12 @@ compaction policy propagation, creation refusal when the workspace policy
 cannot compose, completed thought timing, and the shell: projects from
 coordinators and lineage, folding, opening alone or beside and swapping,
 per-pane sends with the sticky queue or steer pick, model choices within a
-provider, the agent menu's enabled items, fork naming and placement, project
-creation, and runs folded with failures on their line.
+provider, the agent menu's enabled items and its refresh on a status change,
+fork naming and placement, project creation (no file for a refused model),
+steers pinned to their turn, model picks pinned to identity, the demo
+daemon's steer delivery, and runs folded with failures on their line.
+`cargo test -p agent-app` includes a failed project-file write leaving
+neither a partial file nor a temporary.
 `cargo test --workspace` includes the silent-listener readiness deadline,
 fork workspace parity between durable records, live events, and replay, and
 the app's policy errors for oversized and unreadable AGENTS.md files.
