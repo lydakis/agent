@@ -641,16 +641,18 @@ STEP_RUN = re.compile(
 GROUP_END = re.compile(r'\s*(?:\}|\)|done\b|fi\b|esac\b)')
 
 
-def step_command_faults(command):
+def step_command_faults(command, unread=False):
     """Whether a command that runs a step filters its output, and whether
-    it runs more than one step or loops over them."""
+    it runs more than one step or loops over them. A call run in the
+    background or detached returns a handle, not the output, so a step in
+    it goes unread."""
     segments = re.split(r'&&|\|\||;|\n', command)
     runs = [bool(STEP_RUN.match(segment)) for segment in segments]
     steps = [segment for segment, run in zip(segments, runs) if run]
 
     def sends(segment):
         return '|' in segment or '>' in segment.replace('2>&1', '')
-    filtered = any(sends(step) for step in steps) or any(
+    filtered = unread and bool(steps) or any(sends(step) for step in steps) or any(
         GROUP_END.match(segment) and sends(segment) and any(runs[:n]) for n, segment in enumerate(segments))
     looped = any(re.match(r'[\s({]*do\s', step) for step in steps) or bool(
         re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
@@ -687,7 +689,39 @@ def close_workflow(root, closes):
 def reports(answer, number):
     """Whether an answer gives a number whole, with or without thousands
     separators, not inside a longer number."""
-    return re.search(rf'(?<![\d.]){number}(?!\.?\d)', (answer or '').replace(',', '')) is not None
+    return whole(number).search((answer or '').replace(',', '')) is not None
+
+
+def whole(number):
+    return re.compile(rf'(?<![\d.]){number}(?!\.?\d)')
+
+
+MONTH_NAMES = ('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October',
+               'November', 'December')
+
+
+def reported_closes(answer, numbers):
+    """The closes an answer gives its own number for: the number whole, as
+    `reports` finds it, under that close's label. A number's label is the
+    last close label before it on its line, else the first after it on its
+    line, else the last on a line above. A label is the month as the prompt
+    names it, 2026-01, or its name, January or Jan."""
+    reported, above = set(), None
+    for line in (answer or '').replace(',', '').splitlines():
+        labels = []
+        for month in numbers:
+            year, n = month.split('-')
+            name = MONTH_NAMES[int(n) - 1]
+            labels += [(found.start(), month) for found in re.finditer(rf'\b(?:{year}-{n}|{name}|{name[:3]})\b', line)]
+        labels.sort()
+        for month, number in numbers.items():
+            for found in whole(number).finditer(line):
+                before = [label for start, label in labels if start < found.start()]
+                after = [label for start, label in labels if start > found.start()]
+                if (before[-1:] or after[:1] or [above]) == [month]:
+                    reported.add(month)
+        above = labels[-1][1] if labels else above
+    return reported
 
 
 def score(root, facts, events, answer):
@@ -704,24 +738,27 @@ def score(root, facts, events, answer):
             calls[data['call_id']] = data
             if data['name'] == 'shell':
                 try:
-                    command = json.loads(data.get('arguments') or '{}').get('command', '')
+                    arguments = json.loads(data.get('arguments') or '{}')
                 except ValueError:
-                    command = ''
-                commands.append((event['cursor'], command))
+                    arguments = {}
+                commands.append((event['cursor'], arguments.get('command', ''),
+                                 bool(arguments.get('background') or arguments.get('detach'))))
     steps = workflow(root, facts['state'])
     closes = close_workflow(root, facts['closes'])
-    # Each close's number counts when its benchmark printed it.
+    # Each close's number counts when its benchmark printed it and the
+    # answer gives it for that close.
+    reported = reported_closes(answer, {month: facts['closes'][month]['throughput'] for month in closes})
     for month, close in closes.items():
-        close['reported'] = bool(close['bench_runs']) and reports(answer, facts['closes'][month]['throughput'])
+        close['reported'] = bool(close['bench_runs']) and month in reported
     # The prompt asks for the closes in order: each first settled after
     # the one before it.
     firsts = [close['first_settled_at'] for close in closes.values()]
     in_order = None not in firsts and firsts == sorted(firsts)
-    quick = [c for c, command in commands if 'make quick' in command]
-    faults = [step_command_faults(command) for _, command in commands]
+    quick = [c for c, command, _ in commands if 'make quick' in command]
+    faults = [step_command_faults(command, unread) for _, command, unread in commands]
     repeated = {}
     seen = set()
-    for cursor, command in commands:
+    for cursor, command, _ in commands:
         if command in seen and first_cut is not None and cursor > first_cut:
             repeated[command] = repeated.get(command, 0) + 1
         seen.add(command)
@@ -797,7 +834,7 @@ def score(root, facts, events, answer):
         'closes': closes,
         'closes_settled_correctly': sum(c['settled_correctly'] for c in closes.values()),
         'closes_reported': sum(c['reported'] for c in closes.values()),
-        'commands': [command[:160] for _, command in commands],
+        'commands': [command[:160] for _, command, _ in commands],
         # Step commands against the sustained prompt: output filtered, or
         # several steps in one command.
         'filtered_step_commands': sum(filtered for filtered, _ in faults),

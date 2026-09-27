@@ -155,7 +155,8 @@ class Model(http.server.BaseHTTPRequestHandler):
                                                  'content': [{'type': 'output_text', 'text': text}]}])
             elif getattr(self.server, 'task_script', None) is not None:
                 # A scripted agent: one shell command a model call, then an
-                # answer quoting every throughput the last result reported.
+                # answer quoting every throughput the last result reported,
+                # each with its close.
                 step = self.server.task_step
                 if not is_summary(request):
                     self.server.task_step += 1
@@ -164,8 +165,9 @@ class Model(http.server.BaseHTTPRequestHandler):
                     output = [{'type': 'function_call', 'name': 'shell', 'call_id': f'task-{step}',
                                'arguments': json.dumps({'command': self.server.task_script[step]})}]
                 else:
-                    found = re.findall(r'throughput: ([0-9]+)', last.get('output', ''))
-                    text = f"Done. make bench reports throughput: {', '.join(found) or '?'} rows/s."
+                    found = re.findall(r'(?:close (\S+) )?throughput: ([0-9]+)', last.get('output', ''))
+                    numbers = ', '.join(f'{close} {number}'.strip() for close, number in found)
+                    text = f"Done. make bench reports throughput: {numbers or '?'} rows/s."
                     output = [{'type': 'message', 'role': 'assistant',
                                'content': [{'type': 'output_text', 'text': text}]}]
             elif last.get('type') == 'function_call_output' and user.startswith('bgwait:') and '"handle"' in last['output']:

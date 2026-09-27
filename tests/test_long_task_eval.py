@@ -42,9 +42,10 @@ def shell(root, command):
     return subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, env=clean_env())
 
 
-def started(cursor, command):
+def started(cursor, command, **arguments):
     return {'cursor': cursor, 'event': 'tool_started',
-            'data': {'call_id': f'c{cursor}', 'name': 'shell', 'arguments': json.dumps({'command': command})}}
+            'data': {'call_id': f'c{cursor}', 'name': 'shell',
+                     'arguments': json.dumps({'command': command, **arguments})}}
 
 
 class LongTaskScoreTests(unittest.TestCase):
@@ -227,15 +228,29 @@ class LongTaskScoreTests(unittest.TestCase):
         self.assertTrue(stale['hidden_tests'].startswith(str(len(long_task_eval.HIDDEN))))
         # A number missing from the answer, or one whose benchmark never
         # ran, is not reported.
-        missing = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)],
-                      answer=' '.join(str(numbers[month]) for month in MONTHS[1:]))
+        closed = [step for month in MONTHS for step in close(month)]
+        missing = run(*setup, HALF_EVEN, *closed, answer=' '.join(f'{m}: {numbers[m]}' for m in MONTHS[1:]))
         self.assertFalse(missing['reported_throughput'])
         self.assertEqual(missing['closes_reported'], 2)
         # A number inside a longer one is not the close's.
-        longer = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)],
-                     answer=' '.join(f'1{numbers[MONTHS[0]]}' if month == MONTHS[0] else f'{numbers[month]:,}.'
-                                     for month in MONTHS))
+        longer = run(*setup, HALF_EVEN, *closed,
+                     answer=' '.join(f'{m}: 1{numbers[m]}' if m == MONTHS[0] else f'{m}: {numbers[m]:,}.'
+                                     for m in MONTHS))
         self.assertEqual(longer['closes_reported'], 2)
+        # Each number counts under its own close's label: before it on its
+        # line, else after it on its line, else on a line above. A label is
+        # the month or its name.
+        for answer, reported in (
+                (' '.join(f'{m}: {numbers[m]}' for m in MONTHS), 3),
+                (f'{MONTHS[1]}: {numbers[MONTHS[0]]}, {MONTHS[0]}: {numbers[MONTHS[1]]}, '
+                 f'{MONTHS[2]}: {numbers[MONTHS[2]]}', 1),
+                ('\n'.join(f'{numbers[m]:,} rows/s ({m})' for m in MONTHS), 3),
+                ('| Close | Throughput |\n' + '\n'.join(f'| {m} | {numbers[m]} |' for m in MONTHS), 3),
+                ('\n'.join(f'{name}:\n- throughput {numbers[m]}'
+                           for name, m in zip(('January', 'Feb', 'March'), MONTHS)), 3),
+                (' '.join(str(numbers[m]) for m in MONTHS), 0)):
+            with self.subTest(answer=answer):
+                self.assertEqual(run(*setup, HALF_EVEN, *closed, answer=answer)['closes_reported'], reported)
         unbenched = run(*setup, HALF_EVEN, *[step for month in MONTHS for step in close(month)[:2]])
         self.assertEqual(unbenched['closes_reported'], 0)
         self.assertFalse(unbenched['followed_workflow'])
@@ -428,6 +443,18 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('for f in tests/*.py; do wc -l $f; done | sort; make check CLOSE=2026-06', (False, False))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
+
+    def test_a_step_run_in_the_background_goes_unread(self):
+        # A background or detached call returns a handle, not the step's
+        # output.
+        self.assertEqual(step_command_faults('make bench CLOSE=2026-01', unread=True), (True, False))
+        self.assertEqual(step_command_faults('sleep 5', unread=True), (False, False))
+        self.setUp()
+        facts = workspace(self.root, 7, 'sustained')
+        events = [started(1, 'make check CLOSE=2026-01', background=True),
+                  started(2, 'tools/settle 2026-01', detach=True), started(3, 'make bench CLOSE=2026-01'),
+                  started(4, 'sleep 5', background=True)]
+        self.assertEqual(score(self.root, facts, events, '')['filtered_step_commands'], 2)
 
 
 # A scripted agent that does the task right.
