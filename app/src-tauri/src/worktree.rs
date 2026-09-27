@@ -3,9 +3,13 @@
 //! head never runs git.
 use std::path::Path;
 
-/// The branch checked out in `dir` when it is a linked worktree; `None` for
-/// a main checkout, a detached head, or anything else.
+/// The branch checked out in `dir` when it is in a linked worktree, at its
+/// root or below; `None` for a main checkout, a detached head, or anything
+/// else.
 pub fn linked_branch(dir: &Path) -> Option<String> {
+    // The nearest `.git` decides: a file in a linked worktree, a folder in
+    // a main checkout.
+    let dir = dir.ancestors().find(|d| d.join(".git").exists())?;
     let pointer = std::fs::read_to_string(dir.join(".git")).ok()?;
     let gitdir = Path::new(pointer.strip_prefix("gitdir:")?.trim());
     let gitdir = if gitdir.is_absolute() {
@@ -42,6 +46,8 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "--quiet", "-b", "main"]);
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        std::fs::create_dir_all(repo.join("pkg")).unwrap();
+        std::fs::write(repo.join("pkg/b.txt"), "two\n").unwrap();
         git(&repo, &["add", "."]);
         git(
             &repo,
@@ -70,7 +76,13 @@ mod tests {
             ],
         );
         assert_eq!(linked_branch(&tree).as_deref(), Some("agent/app.build"));
+        // A task started in the project's subfolder of its worktree.
+        assert_eq!(
+            linked_branch(&tree.join("pkg")).as_deref(),
+            Some("agent/app.build")
+        );
         assert_eq!(linked_branch(&repo), None);
+        assert_eq!(linked_branch(&repo.join("pkg")), None);
         assert_eq!(linked_branch(&base.join("missing")), None);
         let _ = std::fs::remove_dir_all(&base);
     }

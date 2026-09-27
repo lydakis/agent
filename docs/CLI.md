@@ -47,8 +47,8 @@ an idle bot returns after replay. `follow --all` stays connected for future work
 - `run --workspace DIR` chooses the folder. A new bot starts in it, or in
   the directory `run` was invoked from. A bot keeps its folder: a later
   `run` without the flag runs there wherever it is invoked, and one with it
-  runs in `DIR` and moves the bot there. A `fork` starts in its source's
-  folder unless it names one.
+  runs in `DIR` and moves the bot there; a steer's folder never moves it.
+  A `fork` starts in its source's folder unless it names one.
 - Unknown flags, flags belonging to another command, unexpected operands,
   and repeated singleton flags are usage errors. `--provider` is repeatable.
 - `--instructions` and `--instructions-file` are mutually exclusive.

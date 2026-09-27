@@ -1092,12 +1092,16 @@ fn run(options: &Options) -> Result<i32> {
     }
     let from = author()?;
     let mut connection = ensure_daemon(options)?;
-    // A new bot starts here or in --workspace; a bot keeps its folder
-    // unless --workspace moves it.
-    let workspace = workspace(options)?;
     // A named bot is continued, never silently replaced: an unknown name is an
     // error unless --new asks for creation. No name means a fresh identity.
     let created = options.new || options.bot.is_none();
+    // A new bot starts here or in --workspace; a bot keeps its folder
+    // unless --workspace moves it, so only then is a folder resolved.
+    let workspace = if created || options.workspace.is_some() {
+        Some(workspace(options)?)
+    } else {
+        None
+    };
     if !created && options.tools_explicit {
         return fail_with(
             "usage",
@@ -1122,7 +1126,8 @@ fn run(options: &Options) -> Result<i32> {
                 "usage",
                 "a new bot needs a model: pass --model PROVIDER/MODEL or set AGENT_MODEL",
             ))?;
-        let instructions = composed_instructions(options, &workspace)?;
+        let workspace = workspace.as_deref().expect("a new bot resolves its folder");
+        let instructions = composed_instructions(options, workspace)?;
         let (created_by, created_by_id) = created_by()?;
         let tools: Vec<String> = options
             .tools
@@ -1158,7 +1163,7 @@ fn run(options: &Options) -> Result<i32> {
     let submitted = connection.request(
         "submit",
         json!({"bot":bot,"bot_id":options.bot_id,"request_id":request_id,"prompt":prompt,
-            "workspace":options.workspace.as_ref().map(|_| &workspace),
+            "workspace":options.workspace.as_ref().and(workspace.as_ref()),
             "model":if created { Value::Null } else { json!(options.model) },
             "delivery":options.delivery,"expected_turn":options.turn,"from":from}),
     )?;
@@ -1176,11 +1181,10 @@ fn run(options: &Options) -> Result<i32> {
         eprintln!(
             "agent: {bot} turn {turn}{}{}",
             if created { " (new bot)" } else { "" },
-            if created || options.workspace.is_some() {
-                format!(" in {workspace}")
-            } else {
-                String::new()
-            }
+            workspace
+                .as_deref()
+                .map(|w| format!(" in {w}"))
+                .unwrap_or_default()
         );
     }
     loop {

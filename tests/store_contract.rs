@@ -2041,6 +2041,18 @@ fn turn_options_are_recorded_and_part_of_idempotency() {
     let after = db
         .begin("Bob", "r5", "after", true, &queue, allow_provider)
         .unwrap();
+    // A steer's folder never moves the bot, whether or not the steer runs.
+    let steer = TurnOptions {
+        workspace: Some("/synthetic/steer".into()),
+        delivery: Delivery::Steer,
+        ..TurnOptions::default()
+    };
+    db.begin("Bob", "r6", "aside", true, &steer, allow_provider)
+        .unwrap();
+    assert_eq!(
+        db.inspect("Bob").unwrap().workspace.as_deref(),
+        Some("/synthetic/third")
+    );
     for (turn, folder) in [
         (plain.turn, None),
         (before.turn, Some("/synthetic/elsewhere")),

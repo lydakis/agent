@@ -3356,7 +3356,10 @@ impl Database {
             .or(bot.workspace.as_deref())
             .ok_or(Error::new("workspace_required"))?
             .to_owned();
-        let moved = options.workspace.is_some() && bot.workspace.as_deref() != Some(&workspace);
+        // A steer's folder is for that message alone: it may never run.
+        let moved = options.workspace.is_some()
+            && options.delivery != Delivery::Steer
+            && bot.workspace.as_deref() != Some(&workspace);
         // Only the head of a bot's line is ready; the rest wait behind it.
         let status = if busy {
             "queued"

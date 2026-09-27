@@ -91,6 +91,14 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(stays['data']['workspace'], str(elsewhere.resolve()))
         listed = {b['name']: b['workspace'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
         self.assertEqual(listed['Bob'], str(elsewhere.resolve()))
+        # Continuing a bot never reads the caller's folder, so a deleted one does not matter.
+        gone = self.path / 'gone'
+        gone.mkdir()
+        from_gone = subprocess.run(['sh', '-c', 'cd "$0" && rmdir "$0" && exec "$@"', str(gone), *self.base,
+                                    'run', '--store', str(self.store), '--bot', 'Bob', 'shell:printf gone > marker'],
+                                   env=clean_env(), capture_output=True, text=True, timeout=30)
+        self.assertEqual(from_gone.returncode, 0, from_gone.stderr)
+        self.assertEqual((elsewhere / 'marker').read_text(), 'gone')
         failing = self.agent('run', '--store', str(self.store), '--bot', 'Bob', 'truncate', check=False)
         self.assertEqual(failing.returncode, 1)
         last = json.loads(failing.stdout.splitlines()[-1])

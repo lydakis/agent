@@ -142,7 +142,8 @@ directory `run` was invoked from (or `--workspace`), and later turns run there
 wherever `run` is invoked. A submission that names a workspace runs there and
 moves the bot, so the same conversation can continue in a new checkout,
 worktree, or snapshot. Work already queued keeps the folder it was sent to; a
-steer that names none joins the running turn wherever it runs. A fork starts in
+steer that names none joins the running turn wherever it runs, and a steer's
+folder never moves the bot. A fork starts in
 its source's folder unless `fork` names another. A bot without a folder rejects
 a submission that names none with `workspace_required`. The conversation does not know about
 filesystem state; the caller is responsible for the workspace matching what the
