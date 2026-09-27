@@ -480,6 +480,17 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
             assert 'input_schema' in request['tools'][0]
             last = request['messages'][-1]
             assert last['role'] == 'user'
+            if summary and getattr(self.server, 'compaction_refusals', 0):
+                # As on Responses: a rate limit whose last wait parks the turn.
+                self.server.compaction_refusals -= 1
+                body = b'{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+                self.send_response(429)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Retry-After', '0.4' if self.server.compaction_refusals == 0 else '0.001')
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                return
             if warm and getattr(self.server, 'refuse_warm', False):
                 body = b'{"type":"error","error":{"type":"invalid_request_error","message":"no"}}'
                 self.send_response(400)
@@ -528,9 +539,14 @@ class AnthropicModel(http.server.BaseHTTPRequestHandler):
                 calls = max((int(b['id'][11:]) + 1 for m in request['messages'][start:]
                              for b in m['content'] if b['type'] == 'tool_use'
                              and b['id'].startswith('toolu_long_')), default=0)
-                if calls < int(prompt[5:]):
+                # `long:COUNTxLINES,...` sets each round's lines, as on Responses.
+                spec = prompt[5:]
+                sizes = ([600] * int(spec) if 'x' not in spec else
+                         [int(lines) for part in spec.split(',')
+                          for count, lines in [part.split('x')] for _ in range(int(count))])
+                if calls < len(sizes):
                     blocks.append({'type': 'tool_use', 'id': f'toolu_long_{calls}', 'name': 'shell',
-                                   'input': {'command': f"seq -f 'round {calls} line %g' 1 600"}})
+                                   'input': {'command': f"seq -f 'round {calls} line %g' 1 {sizes[calls]}"}})
                     stop = 'tool_use'
                 else:
                     blocks.append({'type': 'text', 'text': f'done after {calls} rounds'})

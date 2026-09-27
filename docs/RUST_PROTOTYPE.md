@@ -1867,8 +1867,9 @@ model a cache that expired while a tool ran or the bot sat idle. The
 and `items`, the window items copied) with both estimates, `null` where a
 way could not be sent. A summary that parks on a rate limit
 keeps in its park record the floor that window was read under, where it
-starts, and that prefix when the view no longer sends it, so its retry,
-after a restart too, can copy the same call through the span. A summary
+starts, where it ends when the copy had the call's window whole, and that
+prefix when the view no longer sends it, so its retry, after a restart
+too, sends the same request, though the view since holds another round. A summary
 the budget forced keeps that prefix, and its retry reads the window from
 the saved start the call's window was read from, past the budget, since
 the view it summarizes holds one round more than the call it copied. The copy does not set `tool_choice`, which on

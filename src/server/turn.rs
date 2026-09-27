@@ -1164,8 +1164,9 @@ impl Turn {
     /// when the view holds the whole span and a copy is estimated cheaper
     /// than a request of its own; returned with the choice and its
     /// estimates. What a park record keeps of the copy goes in
-    /// `accounting`: the window's start and floor, and what went ahead of
-    /// it when the view now (`ahead`) no longer sends that.
+    /// `accounting`: the window's floor, start, and end when `whole`, and
+    /// what went ahead of it when the view now (`ahead`) no longer sends
+    /// that.
     #[allow(clippy::too_many_arguments)]
     async fn summary_copy<'a>(
         &self,
@@ -1225,6 +1226,7 @@ impl Turn {
         accounting.copied = Some(agent_runtime::store::CopiedCall {
             floor: window.elided,
             first: window.ids[0],
+            last: whole.then(|| window.ids[window.ids.len() - 1]),
             prefix,
         });
         Ok((choice, Some((window, len, thinking, request))))
@@ -1232,11 +1234,13 @@ impl Turn {
 
     /// The view a parked summary copied, rebuilt for its retry: under the
     /// floor its call was read under, behind what that call sent ahead of
-    /// it when the view no longer sends that. A summary made because the
-    /// view outgrew the budget kept what went ahead, and its window is
-    /// read from the saved start past the budget, as the call sent less
-    /// than the view now holds. `None` when the window no longer starts
-    /// where the call's did.
+    /// it when the view no longer sends that, and through the node the
+    /// call's window ended at when the copy had it whole, so the retry
+    /// sends the same request. A summary made because the view outgrew
+    /// the budget kept what went ahead, and its window is read from the
+    /// saved start past the budget, as the call sent less than the view
+    /// now holds. `None` when the window no longer starts, or ends, where
+    /// the call's did.
     async fn restored(&self, call: agent_runtime::store::CopiedCall) -> Result<Option<LastCall>> {
         let prefix_budget = self.context_bytes * 2 / 3;
         let under = self.context_under(
@@ -1274,14 +1278,26 @@ impl Turn {
             Err(error) if error.code == "context_limit" => return Ok(None),
             Err(error) => return Err(error),
         };
-        if view.window.as_ref().and_then(|window| window.ids.first()) != Some(&call.first) {
+        let Some(window) = view.window.as_mut() else {
             return Ok(None);
+        };
+        if window.ids.first() != Some(&call.first) {
+            return Ok(None);
+        }
+        if let Some(last) = call.last {
+            let Ok(at) = window.ids.binary_search(&last) else {
+                return Ok(None);
+            };
+            window.truncate(at + 1);
         }
         if let Some((prefix, items)) = call.prefix {
             view.prefix.bytes = Bytes::from(prefix);
             view.prefix.items = items;
         }
-        Ok(Some(LastCall { view, whole: false }))
+        Ok(Some(LastCall {
+            view,
+            whole: call.last.is_some(),
+        }))
     }
 
     async fn plan_compaction(

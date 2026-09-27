@@ -245,13 +245,16 @@ pub struct Waiting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copied: Option<CopiedCall>,
 }
-/// The call a summary copies: the elision floor its window was read under
-/// and the node that window starts at, and what went ahead of it when that
-/// was not what the view sends there now.
+/// The call a summary copies: the elision floor its window was read under,
+/// the node that window starts at, the node it ends at when the copy had
+/// the window exactly as the call sent it, and what went ahead of it when
+/// that was not what the view sends there now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct CopiedCall {
     pub floor: i64,
     pub first: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<(String, usize)>,
 }
@@ -923,6 +926,7 @@ impl Database {
                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(bot,request_id));
             CREATE INDEX IF NOT EXISTS turns_bot_id ON turns(bot,id);
+            CREATE INDEX IF NOT EXISTS turns_started ON turns(bot,id) WHERE started_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS turns_prompt_node ON turns(prompt_node) WHERE prompt_node IS NOT NULL;
             CREATE TABLE IF NOT EXISTS retained_turns(turn INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
                 bot TEXT NOT NULL REFERENCES bots(name));
@@ -4299,17 +4303,17 @@ impl Database {
             )?;
         let bot = self.active(turn)?;
         let default = format!("{}/{}", bot.provider, bot.model);
-        // Turns that never started (steers absorbed elsewhere, refusals)
-        // have no prompt node. One that stored its prompt and failed before
-        // a call made no model round, or left its prompt, a prompt node,
+        // A turn that started stored its prompt node then; steers absorbed
+        // elsewhere and refusals never start, and the partial index skips
+        // them in one probe. One that stored its prompt and failed before a
+        // call made no model round, or left its prompt, a prompt node,
         // right before this one.
         let previous_model = self
             .conn
             .prepare_cached(
                 "SELECT COALESCE(t.model,?3),t.model_rounds>0 AND p.turn IS NULL
                    FROM turns t,nodes s LEFT JOIN nodes p ON p.id=s.parent
-                  WHERE t.bot=?1 AND t.id<?2 AND s.turn=?2
-                    AND EXISTS(SELECT 1 FROM nodes WHERE turn=t.id)
+                  WHERE t.bot=?1 AND t.id<?2 AND t.started_ms IS NOT NULL AND s.turn=?2
                   ORDER BY t.id DESC LIMIT 1",
             )?
             .query_row(params![bot.name, turn, default], |r| {

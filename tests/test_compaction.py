@@ -79,6 +79,40 @@ class AnthropicCompactionTests(ModelFixture):
         self.assertEqual([(r['form'], r['items']) for r in requested], [('copy', 5), ('copy', 5)])
         self.assertTrue(all(r['estimate']['copy'] * 5 < r['estimate']['own'] for r in requested))
 
+    def test_a_paced_copy_inside_a_turn_sends_the_same_call_after_a_restart(self):
+        # Small rounds, so the span ends before the call's window does. The
+        # copy had that window whole; the retry reads the view with the
+        # round since, and sends the call again through the node it ended
+        # at, not through the span or a later node.
+        def start():
+            client = Client(self.binary, self.path / 'state.sqlite', self.url,
+                            tools='echo,shell', provider='anthropic', family='anthropic',
+                            model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
+                            env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
+                            extra=('--context-bytes', '8192'))
+            self.addCleanup(client.close)
+            return client
+        client = start()
+        self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
+                                               tools=['echo', 'shell'], compaction_instructions='Summarize.',
+                                               reasoning='low'))
+        self.model.compaction_refusals = 1
+        turn = client.request('submit', bot='Bob', request_id='1', prompt='long:12x40')['result']['turn']
+        client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
+        client.close(kill=True)
+        client = start()
+        self.assertEqual(client.finished(turn)['data']['status'], 'completed')
+        requests = []
+        while not self.model.requests.empty():
+            requests.append(self.model.requests.get())
+        paced, retry, _ = [n for n, r in enumerate(requests) if is_summary(r)]
+        self.assertEqual(retry, paced + 1)
+        self.assertEqual(requests[retry], requests[paced])
+        self.assertEqual(requests[paced]['messages'][:-1], requests[paced - 1]['messages'])
+        events = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
+        requested = [e['data']['request'] for e in events if e['event'] == 'compacted']
+        self.assertEqual([(r['form'], r['items']) for r in requested], [('copy', 11), ('copy', 11)])
+
 
 @skipUnless(os.environ.get('AGENT_TEST_RUNTIME') == '1', 'requires release binary')
 class CompactionTests(ModelFixture):
