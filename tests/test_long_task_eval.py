@@ -340,7 +340,8 @@ class LongTaskScoreTests(unittest.TestCase):
 
     def test_a_step_command_that_filters_or_combines_steps_is_counted(self):
         # As run 8's bots ran them: output to a file and its tail read, or
-        # every close in one loop.
+        # every close in one loop. Reading a step's source, as run 9's bots
+        # did, runs no step.
         for command, faults in (
                 ('make check CLOSE=2026-01', (False, False)),
                 ('make check CLOSE=2026-01 2>&1', (False, False)),
@@ -350,7 +351,15 @@ class LongTaskScoreTests(unittest.TestCase):
                 ('for m in 2026-01 2026-02; do tools/settle $m; done', (False, True)),
                 ('make check CLOSE=2026-03 && tools/settle 2026-03', (False, True)),
                 ("cat > ledger/convert.py <<'EOF'\nx = 1\nEOF", (False, False)),
-                ('grep -n rows/s tools/.seed', (False, False))):
+                ('grep -n rows/s tools/.seed', (False, False)),
+                ('cat tools/settle | head -90', (False, False)),
+                ('sed -n 1,120p tools/settle', (False, False)),
+                ("for f in tests/*.py; do wc -l $f; done; cat tools/settle", (False, False)),
+                ('python3 tools/settle 2026-04 | tail -2', (True, False)),
+                ('make bench CLOSE=2026-05 2>&1; cat tools/settle | head', (False, False)),
+                ('for f in tests/*.py; do wc -l $f; done; make check CLOSE=2026-06', (False, False)),
+                ('while read m; do make bench CLOSE=$m; done < months', (False, True)),
+                ('printf "2026-01 2026-02" | xargs -n1 tools/settle', (False, True))):
             with self.subTest(command=command):
                 self.assertEqual(step_command_faults(command), faults)
 

@@ -41,6 +41,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -599,19 +600,19 @@ def settlements(root):
 
 
 # A step command as the sustained task asks for it: one step, its output
-# neither sent elsewhere nor cut. Merging stderr into it is fine.
-STEP_NAMES = ('make check', 'tools/settle', 'make bench')
+# neither sent elsewhere nor cut. Merging stderr into it is fine. A step
+# runs where a command begins, in a segment between `;`, `&&`, `||` and
+# newlines, so reading `tools/settle` does not count as running it.
+STEP_RUN = re.compile(r"""^[\s('"]*(?:(?:do|then)\s+)?(?:python3?\s+)?(?:\./)?(?:make (?:check|bench)\b|tools/settle\b)""")
 
 
 def step_command_faults(command):
     """Whether a command that runs a step filters its output, and whether
     it runs more than one step or loops over them."""
-    names = sum(command.count(name) for name in STEP_NAMES)
-    if not names:
-        return False, False
-    plain = command.replace('2>&1', '')
-    return '|' in plain or '>' in plain, names > 1 or any(
-        f'{word} ' in command for word in ('for', 'while', 'xargs'))
+    steps = [segment for segment in re.split(r'&&|\|\||;|\n', command) if STEP_RUN.match(segment)]
+    looped = any(re.match(r'[\s(]*do\s', step) for step in steps) or bool(
+        re.search(r'xargs\b[^;&\n]*(?:make (?:check|bench)|tools/settle)', command))
+    return any('|' in step or '>' in step.replace('2>&1', '') for step in steps), len(steps) > 1 or looped
 
 
 def close_workflow(root, closes):

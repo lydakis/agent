@@ -253,7 +253,8 @@ numbers only when all six are there, and followed the workflow when it
 ran `tools/env-check` first and every close's steps came in order. It
 also counts the step commands that sent their output elsewhere or cut it
 (a pipe, or a redirect other than `2>&1`) and those that ran several
-steps or looped over them. In the scripted run at 128 KiB, the default
+steps or looped over them. A step counts where a command runs it, not
+where it reads the step's source. In the scripted run at 128 KiB, the default
 tools stub old results nine times and summarize never; without `read`,
 seven summaries make the room.
 
@@ -765,7 +766,62 @@ Codex's login, macOS arm64. Codex 0.157.1's bundled model list gives
 
 The task now asks for each step as its own command, read whole, and sends
 the correction once two closes are settled, and the scores count step
-commands against that rule. That version has not run live.
+commands against that rule. [Run 9](#live-run-9) ran that version.
+
+## Live run 9
+
+2026-09-27, 03:45 to 03:56 UTC, the sustained task at `7c1904d`: each
+step its own command, read whole, and the correction sent once two
+closes are settled. Four arms at once, 10 bots each, seed 7,
+`chatgpt/gpt-6-sol` on the ChatGPT plan with Codex's login, macOS arm64.
+
+| | stubs and summaries, 128 KiB | the same, 256 KiB | summaries only, 128 KiB | full, 4 MiB |
+| --- | --- | --- | --- | --- |
+| Correct | 9/10 | 10/10 | 10/10 | 9/10 |
+| Stub passes per bot | 14 to 20 | 5 to 7 | 0 | 0 |
+| Summaries, all copies | 1 | 0 | 94, 8 to 11 per bot | 0 |
+| Retrievals | 5 | 3 | 0 | 0 |
+| Peak input tokens per bot, highest | 36.1k | 67.0k | 37.5k | 294.8k |
+| Work input served from cache | 46.9% | 69.9% | 58.0% | 93.2% |
+| Input token-equivalents per bot, median | 391k | 447k | 435k | 702k |
+| Input token-equivalents per correct task | 416k | 457k | 438k | 754k |
+| Output tokens, work + summarizer | 20.3k + 1.1k | 18.7k | 20.1k + 113.3k | 18.9k |
+| Bot time to finish, p50 / max | 347 / 530 s | 381 / 534 s | 541 / 604 s | 374 / 383 s |
+
+- Compacting paid on this task. Per correct task, the budgeted arms took
+  39 to 45% less input than full context, counting cached input at a
+  tenth and every summary; full context's bots reached 224k to 295k
+  tokens. Stubs at 128 KiB cost least and matched full context on
+  correctness and time. Summaries only cost about the same and got 10 of
+  10, but their bots took 45% longer. Output is not in the
+  token-equivalents: the summaries-only arm's summarizer wrote 113k
+  output tokens, about 11k per bot, beside about 2k of the bot's own.
+- Summaries cost time more than input: 6.8% of the summaries-only arm's
+  input went to them, all 94 sent as copies with 98.9% of their input
+  from cache. They held the bots' calls 3,490 s in all, about 37 s each,
+  a span that includes any plan pacing in between.
+- Stubs break the cache: 46.9% of the stub arm's work input came from
+  cache at 128 KiB and 69.9% at 256 KiB, against 93.2% with full context.
+  The smaller context still made 128 KiB the cheapest.
+- Every steer went in (40 of 40). The two wrong bots, one with stubs at
+  128 KiB and one with full context, made the same mistake: after the
+  correction they looked at `tests/fixtures.json`, found only two-place
+  amounts, decided the rounding rule changed nothing, and never settled
+  2026-01 and 2026-02 again (4 of 6 closes right). The closes' rows have
+  four places. Nothing in either bot's events points at its context.
+- No bot redirected, piped, filtered or truncated a step's output, or
+  read another bot's files. The counters as run flagged 10 commands, all
+  reads of `tools/settle`'s source such as `cat tools/settle | head -90`;
+  they now count only commands that run a step.
+- The provider served inputs up to 294,809 tokens, past the 272,000 in
+  Codex's model list.
+- The plan paced every bot about six times, and every pause resumed.
+  There were no errors, failed turns, refused steers or compaction
+  failures, and setup facts held and the workflow was followed in 40 of 40.
+
+This is one model, one synthetic task and seed, and 10 bots per arm,
+with a prompt that makes the model read each step whole. Left to choose,
+the same model kept its context small by itself (run 8).
 
 ## Not covered yet
 
@@ -776,6 +832,8 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
 compactions and retrievals. From runs 3 to 5: a task whose context grows
-well past the budget, where compacting could pay. The sustained task is
-built for that; its first live run (run 8) never compacted, and the
-version that asks for each step read whole has not run live.
+well past the budget, where compacting could pay. The sustained task,
+read whole, is that task: in run 9 compacting cost 39 to 45% less input
+per correct task than full context. Still open: a task whose output the
+model has to read without being told to, other models, and pricing the
+summarizer's output.
