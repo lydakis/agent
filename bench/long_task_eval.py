@@ -13,12 +13,18 @@ a repository whose tools print what real ones do, long diagnostics, a
 fixture suite and verbose logs, so the task outgrows a realistic 256 KiB
 budget on its own: `large-compact` with the default tools, `large-summary`
 without `read`, so summaries rather than stubs make the room, and
-`large-full` as the control. Scores come from the workspace and the event
-log, not from the model's account of itself: hidden tests, the vendor
-checksum, how often `make quick` ran and the migration was applied, whether
-the correction reached the task, whether the final answer carries the
-measured number, plus every model and summarizer token, compactions, and
-retrieval calls.
+`large-full` as the control. The `sustained-` conditions keep the task's
+setup and then settle six monthly closes in the same turn, each with a
+check, a settlement and a benchmark that print long outputs, so the context
+outgrows the budget again and again and the final answer needs a number
+from every close. The correction arrives after two closes can have been
+settled, so a close settled under the old rule has to be settled again.
+Scores come from the workspace and the event log, not from the model's
+account of itself: hidden tests, the vendor checksum, each close's
+settlement file, how often `make quick` ran and the migration was applied,
+whether the correction reached the task, whether the final answer carries
+the measured numbers, plus every model and summarizer token, compactions,
+retrieval calls, and each bot's time to finish.
 
 Real model, real spend. Run it on the ChatGPT plan with Codex's login,
 naming the model as Codex's /model picker shows it:
@@ -57,10 +63,18 @@ SUMMARY_TOOLS = 'shell,write,edit,history'
 # prints, and stubs alone make room for it unless the bot lacks `read`.
 CONDITIONS = {'compact': ('small', 20480, TOOLS), 'full': ('small', 4 << 20, TOOLS),
               'large-compact': ('large', 256 << 10, TOOLS), 'large-summary': ('large', 256 << 10, SUMMARY_TOOLS),
-              'large-full': ('large', 4 << 20, TOOLS)}
+              'large-full': ('large', 4 << 20, TOOLS),
+              'sustained-compact': ('sustained', 128 << 10, TOOLS),
+              'sustained-summary': ('sustained', 128 << 10, SUMMARY_TOOLS),
+              'sustained-full': ('sustained', 4 << 20, TOOLS)}
 # The steer arrives once this many tool calls have completed, in every
-# condition, so the correction lands at the same point of the task.
+# condition of a task, so the correction lands at the same point of it. The
+# sustained task's setup takes about five calls and each close three, so
+# its correction comes after up to two closes are settled.
 STEER_AFTER = 6
+SUSTAINED_STEER_AFTER = 12
+# The sustained task's closes, settled in this order.
+MONTHS = tuple(f'2026-{n:02d}' for n in range(1, 7))
 
 TASK = """Implement `convert(rows)` in ledger/convert.py.
 
@@ -69,6 +83,21 @@ Each row is a dict with `account`, `amount` (a decimal string with up to four pl
 Before you change anything, run `tools/env-check` and follow what it reports. data/accounts.json is created by `tools/migrate`. `make quick` runs the fast tests and `make check` runs everything. When `make check` passes, run `make bench` and finish with a short report that includes the throughput it prints."""
 CORRECTION = ('Correction to the task: round amounts to cents half to even (banker\'s rounding) instead of '
               'truncating toward zero. Everything else stands.')
+LAST_STEP = (' When `make check` passes, run `make bench` and finish with a short report that includes the '
+             'throughput it prints.')
+assert TASK.endswith(LAST_STEP)
+
+
+def prompt(size):
+    """The task as submitted: the sustained one settles the closes after
+    the setup instead of running one benchmark."""
+    if size != 'sustained':
+        return TASK
+    return (TASK[:-len(LAST_STEP)]
+            + f'\n\nThen settle the monthly closes {MONTHS[0]} through {MONTHS[-1]}, in order. For each close, '
+            'run `make check CLOSE=<month>`; when it passes, run `tools/settle <month>`, which writes '
+            'out/<month>.json with your convert, then `make bench CLOSE=<month>`. Finish with a short report '
+            "that lists the throughput each close's benchmark printed.")
 
 LEGACY = {f'L-{n:03d}': f'A-{n:03d}' for n in range(100, 140)}
 LEGACY_LARGE = {**LEGACY, **{f'L-{n}': f'A-{n}' for n in range(1000, 1900)}}
@@ -253,16 +282,119 @@ def fixtures(rng, count=560):
     """Past closes' batches for the large task's suite. Every amount has
     whole cents, so they hold under either rounding rule, and none reaches
     20,000 cents, so no entry holds the number the benchmark prints."""
-    accounts, out = list(LEGACY_LARGE), []
-    for n in range(count):
-        rows = []
-        for _ in range(rng.randrange(3, 13)):
-            cents = rng.randrange(-9_999, 20_000)
-            amount = f"{'-' if cents < 0 else ''}{abs(cents) // 100}.{abs(cents) % 100:02d}"
-            rows.append(dict(account=rng.choice(accounts), amount=amount,
-                             currency=rng.choice(('USD', 'USD', 'EUR', 'GBP'))))
-        out.append({'close': f'2025-{n // 42 + 1:02d}', 'batch': n % 42 + 1, 'rows': rows, 'entries': expected(rows)})
-    return out
+    return [{'close': f'2025-{n // 42 + 1:02d}', 'batch': n % 42 + 1, 'rows': rows, 'entries': expected(rows)}
+            for n, rows in enumerate(batch(rng) for _ in range(count))]
+
+
+def batch(rng):
+    """One fixture batch's rows, in whole cents."""
+    accounts, rows = list(LEGACY_LARGE), []
+    for _ in range(rng.randrange(3, 13)):
+        cents = rng.randrange(-9_999, 20_000)
+        amount = f"{'-' if cents < 0 else ''}{abs(cents) // 100}.{abs(cents) % 100:02d}"
+        rows.append(dict(account=rng.choice(accounts), amount=amount,
+                         currency=rng.choice(('USD', 'USD', 'EUR', 'GBP'))))
+    return rows
+
+
+# The sustained task's closes. Each has a fixture suite that `make check
+# CLOSE=<month>` runs, whose verbose listing is its long output; rows to
+# settle, whose amounts have four places, so the rounding rule decides
+# about half their entries; a settlement that prints its journal; and a
+# benchmark with its own number, six digits where every entry's cents have
+# at most five, so no other output holds it.
+CLOSE_BATCHES = 300
+CLOSE_ROWS = 640
+BENCH_LINES = 300
+
+
+def close_rows(rng, count):
+    """A close's rows to settle."""
+    accounts, rows = list(LEGACY_LARGE), []
+    for _ in range(count):
+        units = rng.randrange(-99_999_999, 200_000_000)
+        amount = f"{'-' if units < 0 else ''}{abs(units) // 10_000}.{abs(units) % 10_000:04d}"
+        rows.append(dict(account=rng.choice(accounts), amount=amount,
+                         currency=rng.choice(('USD', 'USD', 'EUR', 'GBP'))))
+    return rows
+
+
+FIXTURE_TESTS_SUSTAINED = FIXTURE_TESTS.replace(
+    '''    """Batches settled at past monthly closes."""''',
+    '''    """Reference batches for each monthly close; CLOSE selects one."""''').replace(
+    "for fixture in FIXTURES:\n    setattr(",
+    "CLOSE = os.environ.get('CLOSE')\n"
+    "if CLOSE and not any(fixture['close'] == CLOSE for fixture in FIXTURES):\n"
+    "    raise SystemExit(f'no close {CLOSE}; closes: ' + ', '.join(sorted({f[\"close\"] for f in FIXTURES})))\n"
+    "for fixture in (f for f in FIXTURES if not CLOSE or f['close'] == CLOSE):\n    setattr(").replace(
+    'import json\n', 'import json\nimport os\n', 1)
+assert FIXTURE_TESTS_SUSTAINED.count('CLOSE') > 3 and 'import os' in FIXTURE_TESTS_SUSTAINED
+
+SETTLE = '''#!/usr/bin/env python3
+"""Settle one monthly close: its rows through ledger.convert into out/<month>.json."""
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+closes = sorted(path.stem for path in (root / 'data/closes').glob('*.json'))
+month = sys.argv[1] if len(sys.argv) == 2 else ''
+if month not in closes:
+    print(f"usage: tools/settle <month>, one of {', '.join(closes)}")
+    sys.exit(2)
+sys.path.insert(0, str(root))
+status = 1
+try:
+    from ledger.convert import convert
+    entries = convert(json.loads((root / 'data/closes' / f'{month}.json').read_text()))
+    (root / 'out').mkdir(exist_ok=True)
+    (root / 'out' / f'{month}.json').write_text(json.dumps(entries, indent=1))
+    for n, entry in enumerate(entries, 1):
+        print(f"  {month} entry {n}: {entry['account']} {entry['cents']} {entry['currency']} posted to "
+              f"journal page {n // 40 + 1}; counterparty reconciled")
+    print(f'settled {month}: {len(entries)} entries written to out/{month}.json')
+    status = 0
+except Exception as error:
+    print(f'settle {month} failed: {error!r}')
+subprocess.run([sys.executable, str(root / 'tools/.step'), f'settle:{month}', str(status)], check=True)
+sys.exit(status)
+'''
+
+BENCH_SUSTAINED = f'''#!/usr/bin/env python3
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+seeds = json.loads((Path(__file__).resolve().parent / '.seed').read_text())
+month = sys.argv[1] if len(sys.argv) == 2 else ''
+if month not in seeds:
+    print(f"usage: make bench CLOSE=<month>, one of {{', '.join(seeds)}}")
+    sys.exit(2)
+seed = seeds[month]
+for n in range(1, {BENCH_LINES + 1}):
+    print(f'bench {{month}} warmup {{n}}: {{seed % 997 + n}} rows in {{n * 3}} ms; batch {{n % 24 + 1:02d}}; '
+          f'p50 {{n % 7 + 2}} us; p99 {{n % 31 + 40}} us')
+time.sleep(.1)
+print(f'close {{month}} throughput: {{seed}} rows/s')
+subprocess.run([sys.executable, str(Path(__file__).resolve().parent / '.step'), f'bench:{{month}}', '0'],
+               check=True)
+'''
+
+# The check and the benchmark take the close as CLOSE; a check without it
+# runs every close's fixtures.
+MAKEFILE_SUSTAINED = '''.PHONY: check quick bench
+check:
+\t@python3 tools/verify-vendor && CLOSE='$(CLOSE)' python3 -m unittest discover -s tests -v 2>&1; s=$$?; python3 tools/.step check$(if $(CLOSE),:$(CLOSE)) $$s; exit $$s
+quick:
+\t@echo 1 >> .quick-attempts
+\t@echo "make quick was removed: it skipped the vendor checksum and let broken builds through. Use make check." >&2
+\t@exit 2
+bench:
+\t@python3 tools/bench $(CLOSE)
+'''
 
 
 # Each run of a step the task requires appends its name, its exit status,
@@ -298,9 +430,12 @@ bench:
 def workspace(root, seed, size='small'):
     """A fresh task workspace and the facts its scorer needs. The large
     one has the same files and facts, with longer outputs and a fixture
-    suite; the same seed gives the same number to report."""
+    suite; the same seed gives the same number to report. The sustained
+    one has the small one's setup, then the closes: their fixtures, rows,
+    settlement, and a number for each."""
     rng = random.Random(seed)
     throughput = rng.randrange(20_000, 90_000)
+    closes = {}
     files = {
         'README.md': ('# ledger\n\nSettles raw ledger rows into entries for the monthly close.\n\n'
                       + ''.join(f'- Note {n}: rows arrive in batches; each batch is settled independently and '
@@ -333,15 +468,34 @@ def workspace(root, seed, size='small'):
             'tools/bench': BENCH_LARGE,
             'data/legacy.json': json.dumps(LEGACY_LARGE, indent=1),
         })
+    elif size == 'sustained':
+        suite = [{'close': month, 'batch': n + 1, 'rows': rows, 'entries': expected(rows)}
+                 for month in MONTHS for n, rows in enumerate(batch(rng) for _ in range(CLOSE_BATCHES))]
+        rows = {month: close_rows(rng, CLOSE_ROWS) for month in MONTHS}
+        closes = {month: {'throughput': rng.randrange(100_000, 1_000_000), 'entries': expected(rows[month])}
+                  for month in MONTHS}
+        files.update({
+            'Makefile': MAKEFILE_SUSTAINED,
+            'tests/test_fixtures.py': FIXTURE_TESTS_SUSTAINED,
+            'tests/fixtures.json': json.dumps(suite, indent=1),
+            'tools/bench': BENCH_SUSTAINED,
+            'tools/settle': SETTLE,
+            'tools/.seed': json.dumps({month: close['throughput'] for month, close in closes.items()}),
+            'data/legacy.json': json.dumps(LEGACY_LARGE, indent=1),
+            **{f'data/closes/{month}.json': json.dumps(rows[month], indent=1) for month in MONTHS},
+        })
     for name, text in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
-    for name in ('tools/env-check', 'tools/migrate', 'tools/verify-vendor', 'tools/bench', 'tools/.step'):
-        (root / name).chmod(0o755)
+    for name in ('tools/env-check', 'tools/migrate', 'tools/verify-vendor', 'tools/bench', 'tools/.step',
+                 'tools/settle'):
+        if (root / name).exists():
+            (root / name).chmod(0o755)
     vendor = hashlib.sha256((root / 'vendor/money.py').read_bytes()).hexdigest()
     (root / 'vendor/CHECKSUMS').write_text(f'{vendor}  vendor/money.py\n')
-    return {'throughput': throughput, 'vendor': vendor_manifest(root), 'state': state_digest(root)}
+    return {'throughput': throughput, 'closes': closes, 'vendor': vendor_manifest(root),
+            'state': state_digest(root)}
 
 
 def state_digest(root):
@@ -432,6 +586,31 @@ def workflow(root, initial):
     }
 
 
+def close_workflow(root, closes):
+    """Each close's steps, from the same record: whether a passing check
+    of the close, or of every close, came before the settlement that
+    stands, whether its benchmark ran after it was first settled, how
+    often it was settled, and whether its settlement file holds the right
+    entries. A close settled again after the correction needs no second
+    benchmark, since its number does not change."""
+    log = root / '.steps.log'
+    runs = [line.split()[:2] for line in log.read_text().splitlines()] if log.exists() else []
+    out = {}
+    for month, facts in closes.items():
+        def ran(step):
+            return [n for n, (name, status) in enumerate(runs) if name == step and status == '0']
+        settled, checks, benched = ran(f'settle:{month}'), ran(f'check:{month}') + ran('check'), ran(f'bench:{month}')
+        try:
+            entries = json.loads((root / 'out' / f'{month}.json').read_text())
+        except (OSError, ValueError):
+            entries = None
+        out[month] = {'settle_runs': len(settled), 'bench_runs': len(benched),
+                      'checked_before_settle': bool(settled) and any(n < settled[-1] for n in checks),
+                      'benched_after_settle': bool(settled) and any(n > settled[0] for n in benched),
+                      'settled_correctly': entries == facts['entries']}
+    return out
+
+
 def score(root, facts, events, answer):
     """Outcomes from the workspace and the bot's events."""
     passed, cases, failure = hidden_tests(root)
@@ -451,6 +630,11 @@ def score(root, facts, events, answer):
                     command = ''
                 commands.append((event['cursor'], command))
     steps = workflow(root, facts['state'])
+    closes = close_workflow(root, facts['closes'])
+    # Each close's number counts when its benchmark printed it.
+    for month, close in closes.items():
+        close['reported'] = bool(close['bench_runs']) and str(
+            facts['closes'][month]['throughput']) in (answer or '').replace(',', '')
     quick = [c for c, command in commands if 'make quick' in command]
     repeated = {}
     seen = set()
@@ -512,17 +696,25 @@ def score(root, facts, events, answer):
 
     return {
         'hidden_tests': f'{passed}/{cases}', 'hidden_failure': failure,
-        'correct': passed == cases,
+        # The sustained task is also its settlements.
+        'correct': passed == cases and all(c['settled_correctly'] for c in closes.values()),
         'vendor_intact': vendor_intact,
         'make_quick_runs': count_lines(root / '.quick-attempts'),
         'make_quick_calls_after_first_compaction': sum(first_cut is not None and c > first_cut for c in quick),
         'migrations_applied': count_lines(root / '.migrations.log'),
         # The number counts only when the benchmark printed it, not when it
-        # was read from where the benchmark keeps it.
-        'reported_throughput': bool(steps['bench_runs'])
-        and str(facts['throughput']) in (answer or '').replace(',', ''),
+        # was read from where the benchmark keeps it; the sustained task
+        # needs every close's.
+        'reported_throughput': all(c['reported'] for c in closes.values()) if closes else bool(
+            steps['bench_runs']) and str(facts['throughput']) in (answer or '').replace(',', ''),
         **steps,
-        'followed_workflow': steps['env_check_before_edits'] and steps['bench_after_check'],
+        'followed_workflow': steps['env_check_before_edits'] and (
+            all(c['checked_before_settle'] and c['benched_after_settle'] for c in closes.values())
+            if closes else steps['bench_after_check']),
+        'closes': closes,
+        'closes_settled_correctly': sum(c['settled_correctly'] for c in closes.values()),
+        'closes_reported': sum(c['reported'] for c in closes.values()),
+        'commands': [command[:160] for _, command in commands],
         'compactions': len(compactions),
         'elisions': sum(e['event'] == 'elided' for e in events),
         'repeated_commands_after_first_compaction': repeated,
@@ -541,6 +733,10 @@ def score(root, facts, events, answer):
         'summarizer_output_tokens': total(summarizer, 'output_tokens'),
         'summarizer_ms': held,
         'summaries': summaries,
+        # The whole task's input, model and summarizer, with cached tokens
+        # at a tenth of the price.
+        'input_token_equivalents': round(sum(
+            total(rows, 'input_tokens') - total(rows, 'cached_input_tokens') * 0.9 for rows in (work, summarizer))),
     }
 
 
@@ -561,12 +757,14 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
             facts[name] = workspace(work, seed + n, size)
             client.request('create', bot=name, workspace=str(work), instructions=INSTRUCTIONS,
                            tools=tools.split(','), compaction_instructions=COMPACTION)
+        task, steer_after = prompt(size), SUSTAINED_STEER_AFTER if size == 'sustained' else STEER_AFTER
         started = time.monotonic()
         for name in names:
-            turns[name] = client.request('submit', bot=name, request_id='task', prompt=TASK)['result']['turn']
+            turns[name] = client.request('submit', bot=name, request_id='task', prompt=task)['result']['turn']
         # Live events: count completed tools per bot, steer once each passes
-        # STEER_AFTER, and collect the terminal events of tasks and steers.
-        done, steers, ends, completed = {}, {}, {}, {name: 0 for name in names}
+        # the task's steer point, and collect the terminal events of tasks
+        # and steers, with each task's time to finish.
+        done, steers, ends, completed, finished = {}, {}, {}, {name: 0 for name in names}, {}
         while len(done) < len(names):
             message = client.receive(lambda m: m.get('event') in ('tool_completed', 'turn_finished'),
                                      timeout=timeout)
@@ -580,9 +778,10 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 continue
             if message['event'] == 'turn_finished':
                 done[name] = message
+                finished[name] = round(time.monotonic() - started, 1)
                 continue
             completed[name] += 1
-            if completed[name] == STEER_AFTER and name not in steers:
+            if completed[name] == steer_after and name not in steers:
                 reply = client.request('submit', bot=name, request_id='correction', prompt=CORRECTION,
                                        delivery='steer', expected_turn=turns[name])
                 steers[name] = reply.get('result') or {'error': reply.get('error')}
@@ -603,6 +802,7 @@ def run_condition(binary, spec, model, condition, trials, out_dir, env, seed, ti
                 item = client.request('item', bot=name, node=checkpoint)['result']
                 answer = ''.join(c.get('text', '') for c in item.get('content', []) if isinstance(c, dict))
             results[name] = {'status': done[name]['data']['status'], 'error': done[name]['data'].get('error'),
+                             'wall_s': finished[name],
                              'steer': steer_outcome(steers.get(name), ends.get(name)),
                              'answer': answer[:2000], 'compaction_failures': failures[name],
                              **score(root / name, facts[name], events, answer)}
@@ -646,6 +846,14 @@ def summarize(block):
                                          sum(b['summarizer_cached_input_tokens'] for b in bots),
                                          sum(b['summarizer_output_tokens'] for b in bots)],
             'summarizer_ms': sum(b['summarizer_ms'] for b in bots),
+            # What a correct task cost and how long a bot took to finish.
+            'input_token_equivalents_per_correct_task': round(
+                sum(b['input_token_equivalents'] for b in bots) / max(1, sum(b['correct'] for b in bots))),
+            'bot_wall_s': sorted(b['wall_s'] for b in bots),
+            **({'closes_settled_correctly': [b['closes_settled_correctly'] for b in bots],
+                'closes_reported': [b['closes_reported'] for b in bots],
+                'settle_runs': [sum(c['settle_runs'] for c in b['closes'].values()) for b in bots]}
+               if block['task'] == 'sustained' else {}),
             'wall_s': block['wall_s']}
 
 

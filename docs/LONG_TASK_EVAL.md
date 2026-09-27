@@ -7,7 +7,9 @@ against scripted providers, and an evaluation of a real model on one
 synthetic repository task (roadmap [item 36](NEXT.md)). Written 2026-09-26.
 The acceptance cases pass. The evaluation has run twice live on the small
 task, recorded [below](#live-run-1), and twice on the large task at
-realistic budgets ([live runs 3 and 4](#live-run-3)).
+realistic budgets ([live runs 3 and 4](#live-run-3)). The
+[sustained task](#the-sustained-task), which outgrows a realistic budget
+several times in one turn, has run only against the scripted provider.
 
 ## Acceptance cases
 
@@ -145,6 +147,44 @@ a passing check 60,954 before and again after the correction, and the
 benchmark 59,380: about 357 KB before any read the model chooses, against
 a 256 KiB budget, about 64k tokens.
 
+### The sustained task
+
+Runs 3 to 5 did not show whether compacting pays: the large task's context
+never grew far past the budget, and full context was the cheaper arm. The
+sustained task keeps going. It has the small task's setup (the same
+restriction, removed `make quick`, migration with an unknown outcome, and
+hidden tests), then settles six monthly closes, 2026-01 to 2026-06, in
+the same turn. For each close the prompt asks for `make check
+CLOSE=<month>`, then `tools/settle <month>`, which runs the bot's
+`convert` on that close's rows and writes `out/<month>.json`, then `make
+bench CLOSE=<month>`, and the final report must list every close's
+throughput.
+
+| Fact | Where it appears | What losing it looks like |
+| --- | --- | --- |
+| The setup's four facts | as in the small task | as in the small task |
+| Each close's number | the last line of that close's benchmark; only `tools/.seed` holds the six | the final answer lacks one |
+| Which closes were settled under the old rule | the correction arrives after the twelfth completed tool call, when up to two closes can be settled | an `out/` file with truncated entries |
+
+- Each close has 300 fixture batches in whole cents, so its check passes
+  under either rounding rule. `make check` without `CLOSE` runs all
+  1,800, and a `CLOSE` that names no close fails.
+- Each close has 640 rows to settle with amounts to four places. About half
+  their USD entries differ between truncation and half to even (937 of
+  1,907 for seed 7), so a close settled before the correction is wrong
+  until it is settled again.
+- The settlement prints one journal line per entry; the benchmark prints
+  300 warmup lines. Each number to report has six digits, where no entry's
+  cents have more than five.
+
+Measured on the seed-7 workspace, each close's steps print 83,905 to
+86,438 bytes (check about 33.5 KB, settlement 28 to 30 KB, benchmark
+22.7 KB), each under the 64 KiB preview: 507,868 bytes over the six
+closes before any read the model chooses, about 3.9 times a 128 KiB
+budget. Read whole, that is about 124k tokens at the 4 bytes a token
+this page takes for budgets (an estimate, not a count). The setup's own
+steps print under 3 KB.
+
 ## Conditions and scores
 
 Each condition runs from fresh starts in its own daemon, with `--trials`
@@ -158,6 +198,9 @@ instructions, as the context evaluation does.
 | `large-compact` | large | 256 KiB | the same | stubs |
 | `large-summary` | large | 256 KiB | the same without `read` | summaries only |
 | `large-full` | large | 4 MiB | the same as `large-compact` | nothing needed |
+| `sustained-compact` | sustained | 128 KiB | the default tools | stubs, then summaries |
+| `sustained-summary` | sustained | 128 KiB | without `read` | summaries only |
+| `sustained-full` | sustained | 4 MiB | the default tools | nothing needed, within the model's window |
 
 At 256 KiB, stubbing everything the model has answered below the 64 KiB
 verbatim tail takes the large task's view far below the 75% trigger, so
@@ -193,6 +236,25 @@ from command text: a command that only names a step, or a step that
 fails, does not count. The hidden tests import the code the
 model wrote, so they run in a child process that keeps only `PATH`,
 `TMPDIR`, and the locale from the runner's environment, and no credentials.
+
+The sustained task is scored per close from the same record: whether a
+passing check of the close, or of every close, came before the
+settlement that stands, whether its benchmark ran after it was first
+settled (a close settled again after the correction needs no second
+benchmark, since its number does not change), how often it was settled,
+whether its `out/` file holds the right entries, and whether the answer
+carries its number and its benchmark ran. A sustained bot is correct only
+when the hidden tests pass and all six settlements are right, reports its
+numbers only when all six are there, and followed the workflow when it
+ran `tools/env-check` first and every close's steps came in order. In the
+scripted run at 128 KiB, the default tools stub old results nine times
+and summarize never; without `read`, seven summaries make the room.
+
+Every condition also records each bot's shell commands (the first 160
+characters each), its time from submission to its task's end, and the
+whole task's input in token-equivalents, model and summarizer, with
+cached input at a tenth; the condition's summary line gives those per
+correct task.
 
 ## Running it
 
@@ -244,6 +306,22 @@ Each JSON file records its binary's digest, which tells the `large-summary`
 arms apart. `--context-bytes N` gives every condition the
 run names the budget N instead of its own, for example to run the
 `large-` arms at 128 KiB beside a `large-full` run without it.
+
+The sustained comparison runs one build, with its arms at once:
+
+```sh
+run() { .local/venv/bin/python -m bench.long_task_eval --model chatgpt/MODEL --trials 10 "$@"; }
+run --conditions sustained-compact --out .local/long-task-eval/sustained-compact-128.json &
+run --conditions sustained-compact --context-bytes 262144 \
+    --out .local/long-task-eval/sustained-compact-256.json &
+run --conditions sustained-summary --out .local/long-task-eval/sustained-summary-128.json &
+run --conditions sustained-full --out .local/long-task-eval/sustained-full.json &
+wait
+```
+
+`sustained-full` holds everything the model reads, so it needs a model
+whose window holds the task: check the model's context window before the
+run.
 
 ## Live run 1
 
@@ -643,4 +721,5 @@ prompt-excerpts conditions, a realistic preamble (the CLI's is about
 beside stubs at a realistic budget, comparing threshold policies before
 changing the 75/25 defaults, and enough trials to attribute differences in
 compactions and retrievals. From runs 3 to 5: a task whose context grows
-well past the budget, where compacting could pay.
+well past the budget, where compacting could pay. The sustained task is
+built for that and has not run live yet.

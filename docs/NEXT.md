@@ -630,7 +630,13 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     steer that waited while one result in the newest boundary filled the
     room it needed; such a steer now goes in against the whole budget
     ([run 7](LONG_TASK_EVAL.md#live-run-7): 20 of 20 steers went in,
-    against 18 of 20 on main). Still open: stub
+    against 18 of 20 on main). Next (Astra's order): a
+    [sustained task](LONG_TASK_EVAL.md#the-sustained-task) that settles
+    six closes in one turn, about 508 KB of required output, so the
+    context outgrows 128 KiB about four times over; it scores each
+    close's settlement and number, the whole task's cost, and each bot's
+    time to finish, and has run only against the scripted provider.
+    Still open: stub
     passes and cuts that break the cache on separate rounds; branching
     from identical checkpoints, the omission-listing and prompt-excerpts
     conditions, a realistic preamble, a task long enough that summaries
