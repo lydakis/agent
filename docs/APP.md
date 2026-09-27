@@ -11,6 +11,39 @@ Started 2026-09-19. A terminal client (`agent-tui`, ratatui) came first the
 same day and reached the limit of its grid; it was removed once the app
 covered it, so one state model exists, not two.
 
+## Screenshots
+
+Demo mode in headless Chromium, 1280×780, captured 2026-09-27. The data is
+the synthetic `demo` project.
+
+The lead splits the work, build opens beside it, then build's ⋯ menu.
+
+![The lead runs, a task opens beside it, and its ⋯ menu opens](app/shell.gif)
+
+The lead waits on its tasks; each task is a card.
+
+![Projects and tasks in the sidebar, the lead mid-run](app/shell.png)
+
+A task opened beside the lead, with its own composer.
+
+![build open beside the lead](app/side-pane.png)
+
+One menu per agent: side chat (not built yet), stop, fork, delete, show all.
+
+![The agent menu](app/menu.png)
+
+The model chip: models of the bot's family; others need a new agent.
+
+![The model chip's menu](app/model-chip.png)
+
+Send on a busy agent: queue after this turn or steer into it.
+
+![Send's queue or steer choice](app/send.png)
+
+New project takes a folder.
+
+![New project](app/new-project.png)
+
 ## What the daemon speaks, and why the client speaks it directly
 
 The daemon's contract is JSONL over a Unix socket: requests with an `id`,
