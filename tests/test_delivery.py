@@ -268,8 +268,9 @@ class DeliveryTests(ModelFixture):
         second = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']
         third = client.request('submit', bot='Bob', request_id='3', prompt='third', delivery='queue')['result']
         self.assertEqual((second['status'], third['status']), ('queued', 'queued'))
-        self.assertEqual(poll(client, 'Bob', second['turn'])['result'],
-                         {'turn': second['turn'], 'status': 'queued', 'finished': False})
+        self.assertEqual(poll(client, 'Bob', second['turn'])['result'], {'turn': second['turn'], 'finished': False})
+        listed = client.request('turns', bot='Bob', after=first['turn'], limit=2)['result']['turns']
+        self.assertEqual([t['status'] for t in listed], ['queued', 'queued'])
         retry = client.request('submit', bot='Bob', request_id='2', prompt='second', delivery='queue')['result']
         self.assertEqual((retry['turn'], retry['duplicate'], retry['status']), (second['turn'], True, 'queued'))
         self.assertEqual(client.request('stats')['result']['queued_turns'], 2)

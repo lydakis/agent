@@ -330,7 +330,7 @@ class SocketAndCliTests(ModelFixture):
 
     def test_help_and_invalid_flags_do_not_start_a_daemon(self):
         for args in [('--help',), ('-h',), ('help', 'run')]+[(c, '--help') for c in
-                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'result', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
+                ('run', 'follow', 'fork', 'interrupt', 'ls', 'turns', 'wait', 'rm', 'prune', 'models', 'stats', 'shutdown', 'serve')]:
             with self.subTest(args=args):
                 result = self.agent(*args)
                 self.assertIn('Usage:', result.stdout)
