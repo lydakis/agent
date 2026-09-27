@@ -912,9 +912,11 @@ function openPicker() { S.ui.picker = true; S.ui.pickerSel = 0; $('pickerq').val
 function closePicker() { S.ui.picker = false; $('pickerwrap').classList.remove('on'); render(); $('input').focus(); }
 async function switchTo(name) { if (!S.bots.has(name)) return; S.selected = name; S.autoSelect = false; if (S.ui.peek === name) S.ui.peek = null; await enqueue(loadVisible); render(); save(); }
 async function showHelp() {
-  // Read now, so an edited ~/.agent/models shows without a restart.
+  // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   switch bot        ^b   pin the bot rail\n ^p   peek next peer    Esc  close · then interrupt\n ^t   unfold thoughts   ^o   unfold tool output\n ^d   detach (close)    ↑ ↓  previous / next bot\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
+  text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: agent models --discover writes ~/.agent/models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
-  S.ui.help = true; $('helptext').innerHTML = `<b>keys</b>\n ^k   switch bot        ^b   pin the bot rail\n ^p   peek next peer    Esc  close · then interrupt\n ^t   unfold thoughts   ^o   unfold tool output\n ^d   detach (close)    ↑ ↓  previous / next bot\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; $('helpwrap').classList.add('on');
+  if (S.ui.help === shown) text(models);
 }
 function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $('input').focus(); }
 

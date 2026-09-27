@@ -935,12 +935,16 @@ class ListingModel(Model):
 
     def do_GET(self):
         self.server.listings = getattr(self.server, 'listings', 0) + 1
-        if self.path != '/v1/models':
+        if self.path == '/huge/v1/models':
+            # Parses under the listing limit but alone overflows one reply.
+            data = [{'id': f'model-{i:04d}-' + 'x' * 120} for i in range(9000)]
+        elif self.path == '/v1/models':
+            data = [{'id': 'synthetic-model', 'display_name': 'Synthetic', 'max_input_tokens': 4096},
+                    {'id': 'other-model'}]
+        else:
             self.send_error(404)
             return
-        body = json.dumps({'object': 'list', 'data': [
-            {'id': 'synthetic-model', 'display_name': 'Synthetic', 'max_input_tokens': 4096},
-            {'id': 'other-model'}]}).encode()
+        body = json.dumps({'object': 'list', 'data': data}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
@@ -960,7 +964,8 @@ class ModelListTests(ModelFixture):
         self.list = self.home / '.agent' / 'models'
         self.store = ['--store', str(self.path / 'state.sqlite')]
         self.providers = ['--provider', f'openai=responses,{self.url}',
-                          '--provider', 'gone=responses,http://127.0.0.1:1/v1']
+                          '--provider', 'gone=responses,http://127.0.0.1:1/v1',
+                          '--provider', f'huge=responses,{self.url.removesuffix("/v1")}/huge/v1']
         self.addCleanup(lambda: self.agent('shutdown', *self.store, check=False))
 
     def agent(self, *args, check=True):
@@ -979,6 +984,8 @@ class ModelListTests(ModelFixture):
         text = self.list.read_text()
         self.assertIn('openai/synthetic-model  # Synthetic, 4096 context\nopenai/other-model\n', text)
         self.assertRegex(text, r'# gone: provider_\w+')
+        # A listing too large for the reply is refused by name; the rest still arrive.
+        self.assertIn('# huge: provider_models_limit: ', text)
         listed = json.loads(self.agent('models').stdout)
         self.assertEqual(listed, [{'id': 'openai/synthetic-model', 'note': 'Synthetic, 4096 context'},
                                   {'id': 'openai/other-model'}])
@@ -987,7 +994,7 @@ class ModelListTests(ModelFixture):
         self.assertEqual(again.returncode, 1)
         self.assertIn('models_file_exists', again.stderr)
 
-        # The daemon asked each provider once and keeps the answer.
+        # The daemon asked each provider once and keeps the answers, the refused one too.
         with socket.socket(socket.AF_UNIX) as s:
             s.connect(str(self.path / 'state.sqlite.sock'))
             lines = s.makefile('rw')
@@ -997,7 +1004,7 @@ class ModelListTests(ModelFixture):
             answer = next(m for m in map(json.loads, lines) if m.get('id') == 1)
         self.assertEqual([m['id'] for m in answer['result']['providers']['openai']['models']],
                          ['synthetic-model', 'other-model'])
-        self.assertEqual(self.model.listings, 1)
+        self.assertEqual(self.model.listings, 2)
 
         # A bot reads the same list, and a model nobody listed still runs.
         self.model.models = ('synthetic-model', 'unlisted')

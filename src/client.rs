@@ -831,18 +831,26 @@ fn models(options: &Options) -> Result<i32> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => {
-                    Error::with("models_file_exists", path.display().to_string())
-                }
-                _ => error.into(),
-            })?
-            .write_all(text.as_bytes())?;
+        // Written whole beside it, then linked into place: a failed write
+        // leaves no partial list, and a list made meanwhile is not replaced.
+        let staged = path.with_file_name(format!(".models.{}", std::process::id()));
+        let installed = (|| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            std::fs::hard_link(&staged, &path)
+        })();
+        let _ = std::fs::remove_file(&staged);
+        installed.map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                Error::with("models_file_exists", path.display().to_string())
+            }
+            _ => error.into(),
+        })?;
         eprintln!("wrote {}", path.display());
     }
     let models = agent_client::models::read(&path).map_err(client_error)?;

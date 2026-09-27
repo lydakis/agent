@@ -105,10 +105,13 @@ pub fn render(listing: &Value) -> String {
         text.push('\n');
         let Some(models) = listed["models"].as_array() else {
             let error = listed["error"].as_str().unwrap_or("no listing");
-            match listed["detail"].as_str() {
-                Some(detail) => text.push_str(&format!("# {name}: {error}: {detail}\n")),
-                None => text.push_str(&format!("# {name}: {error}\n")),
-            }
+            let said = match listed["detail"].as_str() {
+                Some(detail) => format!("{name}: {error}: {detail}"),
+                None => format!("{name}: {error}"),
+            };
+            // One comment line, whatever line breaks the provider sent.
+            let said: Vec<&str> = said.split_whitespace().collect();
+            text.push_str(&format!("# {}\n", said.join(" ")));
             continue;
         };
         for model in models {
@@ -174,11 +177,13 @@ mod tests {
             "openai":{"models":[{"id":"gpt-6-luna"},{"id":"bad id"}]},
             "anthropic":{"models":[{"id":"claude-sonnet-5","name":"Claude Sonnet 5",
                 "context_tokens":1000000,"output_tokens":128000}]},
-            "bedrock":{"error":"provider_http_404","detail":"not found"}}}));
+            "bedrock":{"error":"provider_http_404","detail":"not found"},
+            "gone":{"error":"provider_http_500","detail":"down\nother/model\r\nx"}}}));
         assert!(text.contains(
             "anthropic/claude-sonnet-5  # Claude Sonnet 5, 1000000 context, 128000 output\n"
         ));
         assert!(text.contains("# bedrock: provider_http_404: not found\n"));
+        assert!(text.contains("# gone: provider_http_500: down other/model x\n"));
         let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["anthropic/claude-sonnet-5", "openai/gpt-6-luna"]);
     }

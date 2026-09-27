@@ -2030,17 +2030,33 @@ impl Service {
                 // Off the dispatch path: a listing waits on the network.
                 let (providers, output) = (self.providers.clone(), output.clone());
                 tokio::spawn(async move {
-                    let names: Vec<&String> = providers.keys().collect();
+                    let mut names: Vec<&String> = providers.keys().collect();
+                    names.sort();
                     let listed = futures_util::future::join_all(
                         names.iter().map(|name| providers[*name].models()),
                     )
                     .await;
+                    // One reply carries every listing, so it must fit one
+                    // event: a listing past what is left is refused by name
+                    // rather than failing the whole answer.
+                    let mut room = output::MAX_EVENT - 4096;
                     let mut answer = serde_json::Map::new();
                     for (name, result) in names.into_iter().zip(listed) {
-                        let entry = match result {
+                        let mut entry = match result {
                             Ok(models) => json!({"models": models.as_slice()}),
                             Err(error) => json!({"error": error.code, "detail": error.detail}),
                         };
+                        let size = entry.to_string().len() + name.len() + 8;
+                        match room.checked_sub(size) {
+                            Some(left) => room = left,
+                            None => {
+                                entry = json!({
+                                    "error": "provider_models_limit",
+                                    "detail": format!("listing is {size} bytes, {room} left in the reply"),
+                                });
+                                room = room.saturating_sub(256);
+                            }
+                        }
                         answer.insert(name.clone(), entry);
                     }
                     retention_reply(session, &output, id, Ok(json!({"providers": answer}))).await;

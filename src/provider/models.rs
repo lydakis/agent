@@ -16,46 +16,74 @@ const LIMIT: usize = 8 * 1024 * 1024;
 /// SHA-256 of an empty body, for a signer that signs the payload.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// The last answer, a refusal included, so a client asking again within
+/// `KEEP` waits on neither the network nor a provider that is down.
 #[derive(Default)]
-pub struct Listing(tokio::sync::Mutex<Option<(Instant, Arc<Vec<Value>>)>>);
+pub struct Listing(tokio::sync::Mutex<Option<(Instant, Listed)>>);
+
+type Listed = Result<Arc<Vec<Value>>>;
 
 impl Provider {
     /// `{id, name?, context_tokens?, output_tokens?}` per model, ids without
     /// the provider prefix. Callers asking at once share one request.
-    pub async fn models(&self) -> Result<Arc<Vec<Value>>> {
+    pub async fn models(&self) -> Listed {
         let mut kept = self.listing.0.lock().await;
-        if let Some((at, models)) = kept.as_ref()
+        if let Some((at, listed)) = kept.as_ref()
             && at.elapsed() < KEEP
         {
-            return Ok(models.clone());
+            return listed.clone();
         }
-        let key = self.key.clone();
-        let session = match &self.login {
-            Some(login) => Some(login.current()?),
-            None => None,
-        };
-        let token = session.as_ref().map(|s| s.token.clone()).or(key);
-        let fetched = tokio::time::timeout(DEADLINE, self.fetch_models(session.as_ref()))
+        let listed = tokio::time::timeout(DEADLINE, self.list_models())
             .await
             .unwrap_or_else(|_| fail("provider_connection_timeout"))
-            .map_err(|error| sanitize_error(error, token.as_deref()))?;
-        let models = Arc::new(fetched);
-        *kept = Some((Instant::now(), models.clone()));
-        Ok(models)
+            .map(Arc::new);
+        *kept = Some((Instant::now(), listed.clone()));
+        listed
     }
 
-    async fn fetch_models(&self, session: Option<&super::login::Session>) -> Result<Vec<Value>> {
-        // The listing sits beside the completion route: `.../v1/models`.
+    /// A ChatGPT login refused with 401 is read again from disk and tried
+    /// once more, as a completion is, since Codex may have rotated it.
+    async fn list_models(&self) -> Result<Vec<Value>> {
+        let Some(login) = &self.login else {
+            return self
+                .fetch_models(None)
+                .await
+                .map_err(|error| sanitize_error(error, self.key.as_deref()));
+        };
+        let session = login.current()?;
+        match self.fetch_models(Some(&session)).await {
+            Err(error) if error.code == "provider_http_401" && login.reload(&session)? => {
+                let session = login.current()?;
+                self.fetch_models(Some(&session))
+                    .await
+                    .map_err(|error| sanitize_error(error, Some(&session.token)))
+            }
+            listed => listed.map_err(|error| sanitize_error(error, Some(&session.token))),
+        }
+    }
+
+    fn models_url(&self) -> reqwest::Url {
+        // The listing sits beside the completion route: `.../v1/models`,
+        // except on Bedrock Mantle, which lists every family at the host's
+        // `/v1/models` (docs/BEDROCK.md).
         let mut url = self.url.clone();
-        let base = url
-            .path()
-            .rsplit_once('/')
-            .map_or("", |(base, _)| base)
-            .to_owned();
+        let base = match aws::endpoint(&url) {
+            Some((_, "bedrock-mantle")) => "/v1".to_owned(),
+            _ => url
+                .path()
+                .rsplit_once('/')
+                .map_or("", |(base, _)| base)
+                .to_owned(),
+        };
         url.set_path(&format!("{base}/models"));
         if self.family == Family::Anthropic && self.aws.is_none() {
             url.set_query(Some("limit=1000"));
         }
+        url
+    }
+
+    async fn fetch_models(&self, session: Option<&super::login::Session>) -> Result<Vec<Value>> {
+        let url = self.models_url();
         let (client, _lease) = self.transport.lease();
         let key = session.map(|s| &s.token).or(self.key.as_ref());
         let mut http = client.get(url.clone()).header("accept", "application/json");
@@ -85,7 +113,11 @@ impl Provider {
                 http = http.header(name, value);
             }
         }
+        // Started under the same bound as a turn's request, released once
+        // the headers arrive.
+        let admission = self.admit().await?;
         let response = http.send().await.map_err(connection_error)?;
+        drop(admission);
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let detail = error_body(response).await.and_then(|body| body.detail);
@@ -155,7 +187,41 @@ fn parse(listed: &Value) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::parse;
+    use crate::{
+        codec::Family,
+        provider::{Provider, Transport},
+    };
     use serde_json::json;
+
+    #[test]
+    fn each_listing_sits_where_its_provider_serves_it() {
+        let transport = Transport::new(64, 1).unwrap();
+        let url = |family, base: &str| {
+            Provider::new(transport.clone(), family, base, None)
+                .unwrap()
+                .models_url()
+                .to_string()
+        };
+        assert_eq!(
+            url(Family::Responses, "https://api.openai.com/v1"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            url(Family::Anthropic, "https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/models?limit=1000"
+        );
+        for family in [Family::Responses, Family::Anthropic] {
+            let route = match family {
+                Family::Responses => "openai",
+                Family::Anthropic => "anthropic",
+            };
+            let mantle = format!("https://bedrock-mantle.us-east-1.api.aws/{route}/v1");
+            assert_eq!(
+                url(family, &mantle).split('?').next().unwrap(),
+                "https://bedrock-mantle.us-east-1.api.aws/v1/models"
+            );
+        }
+    }
 
     #[test]
     fn each_provider_shape_reads_as_ids_with_what_it_says_about_them() {
