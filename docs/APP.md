@@ -198,9 +198,10 @@ daemon learns nothing about projects; everything here is client work.
   short text of the app's own: a task that changes files gets
   `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
   folder's `.agent/setup` run inside it, and `agent run --new --agents
-  --workspace` that worktree; the task keeps that folder for later
-  messages. The text also says the worktree starts at the
-  last commit, that a failed setup or start removes the worktree and branch,
+  --workspace` that worktree, in the project's subfolder of it; the task
+  keeps that folder for later messages. The text also says the worktree
+  starts at the last commit, that a failed setup, or a start that left no
+  bot, removes the worktree and branch,
   and that without git every task works in the project folder. The daemon only runs a
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once

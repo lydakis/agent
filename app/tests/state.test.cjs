@@ -858,10 +858,11 @@ test('a new project creates its coordinator in the folder, writes its file once,
   assert.deepEqual([create.bot, create.workspace, create.model], ['weather.lead', '/synthetic/weather', 'alpha/one']);
   // The shared policy first, then the app's own coordinator text: tasks that edit get worktrees.
   assert.ok(create.instructions.startsWith('rules\n\n## Coordinating this project'));
-  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME"/);
+  assert.match(create.instructions, /git worktree add -b agent\/NAME/); assert.match(create.instructions, /--workspace "\$HOME\/\.agent\/worktrees\/NAME\/\$\(git rev-parse --show-prefix\)"/);
   assert.match(create.instructions, /A task keeps its folder, so later messages to it need no --workspace/);
   // Tasks get the worktree's own policy, failed starts clean up, and a folder without git keeps tasks in place.
   assert.match(create.instructions, /run --detach --new --agents --bot NAME/);
+  assert.match(create.instructions, /the start fails and "\$AGENT_BIN" ls does not list NAME, remove the worktree/);
   assert.match(create.instructions, /git worktree remove --force, git branch -D/);
   assert.match(create.instructions, /when this folder is not a git repository, works in this folder/);
   assert.equal(calls.find(([op]) => op === 'policy')[1], '/synthetic/weather');

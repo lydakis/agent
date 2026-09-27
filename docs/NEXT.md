@@ -967,7 +967,9 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     shows a worktree bot's branch
     ([APP.md](APP.md#projects-and-panes)). Follow-up: deleting a bot leaves
     its worktree and branch, which hold its work; the app should offer to
-    remove them.
+    remove them. Follow-up: the coordinator text continues a task by name,
+    so a task deleted and recreated under the same name gets its messages;
+    pinning continuations with `--bot-id` would refuse the replacement.
     Next, in
     order: side chats with all tools in a new worktree, and Keep; approvals in the
     app (the daemon's manual mode exists); profiles and the coordinator role
