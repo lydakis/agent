@@ -91,6 +91,12 @@ const COMMANDS: &[Command] = &[
         startup: true,
     },
     Command {
+        name: "start",
+        usage: "start [OPTIONS]",
+        flags: "--pretty",
+        startup: true,
+    },
+    Command {
         name: "stats",
         usage: "stats [OPTIONS]",
         flags: "--pretty --no-spawn",
@@ -168,7 +174,10 @@ fn print_flags(flags: &str) {
             "--all" => ("", "Follow every bot on one connection"),
             "--any" => ("", "Return when the first handle resolves"),
             "--timeout-ms" => ("N", "Wait at most N milliseconds; 0 polls immediately"),
-            "--workspace" => ("DIR", "Select the working directory"),
+            "--workspace" => (
+                "DIR",
+                "The bot's folder: a new bot's defaults to here, a fork's to its source's; run moves a bot there",
+            ),
             "--instructions" => (
                 "TEXT",
                 "A new bot's instructions (default: the built-in text)",

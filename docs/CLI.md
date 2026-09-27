@@ -1,8 +1,8 @@
 # CLI contract
 
 Agent uses flat verbs: `run`, `follow`, `fork`, `interrupt`, `wait`, `ls`,
-`turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `stats`, `shutdown`,
-and `serve`. All named
+`turns`, `rm`, `prune`, `approvals`, `answer`, `models`, `start`, `stats`,
+`shutdown`, and `serve`. All named
 bots use the same commands. There is no parent/child command hierarchy.
 
 Use `agent --help`, `agent COMMAND --help`, or `agent help COMMAND` for help;
@@ -44,6 +44,11 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   joined) or when the turn it started completes.
   A steer with an explicit workspace or model that differs from the running
   turn stays queued and runs separately with those choices.
+- `run --workspace DIR` chooses the folder. A new bot starts in it, or in
+  the directory `run` was invoked from. A bot keeps its folder: a later
+  `run` without the flag runs there wherever it is invoked, and one with it
+  runs in `DIR` and moves the bot there; a steer's folder never moves it.
+  A `fork` starts in its source's folder unless it names one.
 - Unknown flags, flags belonging to another command, unexpected operands,
   and repeated singleton flags are usage errors. `--provider` is repeatable.
 - `--instructions` and `--instructions-file` are mutually exclusive.
@@ -138,8 +143,10 @@ Every client command accepts `--store` and `--socket`. Client store selection is
 wins; otherwise `AGENT_SOCKET` applies unless `--store` was explicit. Without a
 socket override, the socket is derived from the selected store.
 
-`run` may start the daemon. `stats`, `turns`, `rm`, `prune`,
-`approvals`, and `answer` may restart it only for an existing store. These commands accept the startup
+`run` may start the daemon. `start` starts it if none is running, with the
+same startup as `run`, and prints the running daemon's ready line. `stats`,
+`turns`, `rm`, `prune`, `approvals`, and `answer` may restart it only for an
+existing store. These commands accept the startup
 provider/limit flags shown in help and `--no-spawn` to require an
 already running daemon. Startup flags configure a newly started daemon. A
 running daemon is never reconfigured: a stated startup flag it does not match

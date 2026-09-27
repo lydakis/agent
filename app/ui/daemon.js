@@ -12,10 +12,12 @@ window.Daemon = (() => {
     return {
       log,
       setup: () => invoke('setup'),
+      defaultModel: () => invoke('default_model'),
       policy: (workspace) => invoke('policy', { workspace: workspace ?? null }),
       models: () => invoke('models'),
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
+      branch: (dir) => invoke('branch', { dir }),
       attach: (after) => invoke('attach', { after }),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
@@ -111,8 +113,8 @@ window.Daemon = (() => {
     if (turn === null) return;
     await wait(250);
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
-    // A fork given its own tool list stands in for a side chat, which
-    // answers from the history it was forked with.
+    // A side chat, a fork nested under its own source, answers from the
+    // history it was forked with.
     if (S.sides.has(name)) {
       await tool(name, turn, 'read', { path: 'PLAN.md' }, '1.2 KiB · three steps', 400);
       await stream(name, turn, 'Waiting on three peers: plan is done, build is waiting on its reviewer, and test is running. The release build is still going in the background.');
@@ -145,11 +147,15 @@ window.Daemon = (() => {
     const handles = [];
     for (const n of Object.keys(tasks)) {
       if (m.interrupted) return;
-      const cmd = `"$AGENT_BIN" run --new --bot ${n} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
+      // The task that edits code gets its own worktree, as the app tells its coordinators; the others read the project folder.
+      const tree = n === 'demo.build';
+      const at = `"$HOME/.agent/worktrees/${n}"`;
+      const cmd = tree ? `git worktree add -b agent/${n} ${at} HEAD && "$AGENT_BIN" run --new --agents --bot ${n} --workspace ${at} --model "$AGENT_MODEL" --detach '${tasks[n]}'`
+        : `"$AGENT_BIN" run --new --bot ${n} --model "$AGENT_MODEL" --detach '${tasks[n]}'`;
       const call_id = `call_${++calls}`;
       emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
-      await create(n, `${m.provider}/${m.model}`, name);
+      await create(n, `${m.provider}/${m.model}`, name, null, tree ? `~/.agent/worktrees/${n}` : m.workspace);
       const t = start(n, tasks[n]);
       handles.push(`turn:${n}/${t}`);
       emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: n, handle: `turn:${n}/${t}`, status: 'running', turn: t }) + '\n', success: true }) }), artifacts: [] } });
@@ -185,7 +191,8 @@ window.Daemon = (() => {
       emit({ event: 'tool_started', bot: n, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: cmd }), arguments_truncated: false } });
       await wait(250);
       const b = S.bots.get(n);
-      await create('demo.review', `${b.provider}/${b.model}`, n);
+      // Created from build's shell, the reviewer works in build's worktree.
+      await create('demo.review', `${b.provider}/${b.model}`, n, null, b.workspace);
       const rt = start('demo.review', 'Review the auth diff for regressions.');
       emit({ event: 'tool_completed', bot: n, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stderr: '', stdout: JSON.stringify({ bot: 'demo.review', handle: `turn:demo.review/${rt}`, status: 'running', turn: rt }) + '\n', success: true }) }), artifacts: [] } });
       const wid = `call_${++calls}`;
@@ -210,6 +217,8 @@ window.Daemon = (() => {
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
+    // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
+    branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {
       if (!S.bots.size) {
@@ -255,10 +264,11 @@ window.Daemon = (() => {
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');
           if (params.delivery === 'steer' && params.expected_turn != null && params.expected_turn !== b.running_turn) throw new Error('stale_turn');
           if (b.status !== 'idle' && params.delivery === 'steer') { (b.steers ??= []).push(params.prompt); emit({ event: 'steered', bot: params.bot, turn: b.running_turn, data: {} }); return { bot: params.bot, turn: b.running_turn, status: 'steered' }; }
+          if (params.workspace) b.workspace = params.workspace; // a message that names a folder moves the bot there
           const turn = S.nextTurn; reply(params.bot, params.prompt); return { bot: params.bot, turn, status: 'running', handle: `turn:${params.bot}/${turn}` }; }
         case 'interrupt': { const b = S.bots.get(params.bot); if (!b || b.running_turn === null) throw new Error('turn_not_running'); b.interrupted = true; finish(params.bot, b.running_turn, 'interrupted'); return { interrupt_requested: true }; }
         // A running source forks too, as the daemon's does from its newest finished round.
-        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace, Array.isArray(params.allow) ? params.allow : src.allowed ?? null); if (Array.isArray(params.allow)) S.sides.add(params.bot); return { ...S.bots.get(params.bot) }; }
+        case 'fork': { const src = S.bots.get(params.source); if (!src) throw new Error('bot_not_found'); await create(params.bot, `${src.provider}/${src.model}`, params.created_by ?? null, params.source, params.workspace ?? src.workspace, Array.isArray(params.allow) ? params.allow : src.allowed ?? null); if (params.created_by === params.source) S.sides.add(params.bot); return { ...S.bots.get(params.bot) }; }
         case 'delete': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle') throw new Error('bot_busy'); b.interrupted = true; S.bots.delete(params.bot); S.lineages.delete(params.bot); S.sides.delete(params.bot); emit({ event: 'deleted', bot: params.bot, durable: false }); return { deleted: params.bot }; }
         default: throw new Error(`unsupported_in_demo:${op}`);
       }

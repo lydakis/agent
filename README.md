@@ -161,8 +161,15 @@ protocol directly; [`client/`](client) is a Rust client for it. See the
 
 [`app/`](app) is a Tauri desktop client over the same socket: projects and
 their tasks, a thread with another beside it, and background commands in one
-window. See [desktop client](docs/APP.md)
-to build and run it.
+window. On macOS, install it with [Homebrew](https://brew.sh):
+
+```sh
+brew install --cask lydakis/agent/agent
+```
+
+The app carries its own copy of the runtime and starts the daemon when none
+is running. See [desktop client](docs/APP.md) to build and run it from
+source.
 
 ## How fast is it?
 

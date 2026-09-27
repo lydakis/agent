@@ -949,8 +949,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     projects in the sidebar from coordinator bots and `.agent/project.toml`,
     a side pane with its own composer, the model chip, Send with queue or
     steer, one ⋯ menu, runs folded to one line. Done (2026-09-27): side
-    chats, forks of a running or resting bot opened beside, that read files
-    or only answer ([APP.md](APP.md#projects-and-panes)). Follow-up: `delete` and `fork` take only a name, so a
+    chats, forks of a running or resting bot opened beside, with their
+    source's tools in its folder: George (2026-09-27) wants them to edit,
+    as the same agent asked something else at once, never read-only
+    ([APP.md](APP.md#projects-and-panes)). Follow-up: `delete` and `fork` take only a name, so a
     delete or fork the app started can land on a bot recreated under that
     name meanwhile; both should take the bot's id, as `submit` does. The
     same holds for a model menu left open across such a recreation. And a
@@ -963,11 +965,30 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     until the app reattaches. After a reattach, task cards inside the side
     pane show no latest line until opened, since only the main pane's peers
     are loaded.
+    Done (2026-09-27): tasks in worktrees, as the app's opinion. Its
+    coordinators are told to give an editing task `git worktree add` on
+    `agent/NAME`, the folder's `.agent/setup`, and `run --new --agents
+    --workspace`. A bot now keeps its folder: a message without
+    `--workspace` runs where the bot is, one with it moves the bot there,
+    and a fork starts where its source is (George, 2026-09-27); the app
+    shows a worktree bot's branch
+    ([APP.md](APP.md#projects-and-panes)). Follow-up: deleting a bot leaves
+    its worktree and branch, which hold its work; the app should offer to
+    remove them. Follow-up: the coordinator text continues a task by name,
+    so a task deleted and recreated under the same name gets its messages;
+    pinning continuations with `--bot-id` would refuse the replacement.
+    Follow-up: the app learns a bot's folder from its record, so a move by
+    another client shows after the app reattaches; and a project name with
+    `..` cannot prefix a valid branch name, so project names should refuse it.
+    Follow-up: a turn without a folder runs in the bot's retained one
+    unchecked, as the daemon's fallback always did; a folder deleted since
+    shows up as a tool spawn error rather than a refusal at submit.
     Next, in
-    order: tasks in worktrees (`run --new --worktree` with a setup command, in the
-    client), then side chats with all tools in a new worktree, and Keep; approvals in the
-    app (the daemon's manual mode exists); profiles and the coordinator role
-    text in the client policy; swarms last, since that design is not decided.
+    order (George, 2026-09-27): profiles, role files read from the
+    locations other harnesses already use, with the coordinator's role text
+    as the first; then swarms as the v12 prototype draws them (board,
+    council, streams), measured against simpler setups; Keep. Approvals in
+    the app wait: George runs with full access.
     A fork into another provider stays out: history is provider-native.
 
 Kept out of the queue: process sandboxing, which is the host's job as the

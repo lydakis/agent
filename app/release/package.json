@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "The release build's Tauri CLI, installed from package-lock.json with npm ci",
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.5"
+  }
+}

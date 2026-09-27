@@ -37,9 +37,13 @@ The model chip: models of the bot's family; others need a new agent.
 ![The model chip's menu](app/model-chip.png)
 
 Send on a busy agent: queue after this turn, steer into it, or ask a side
-chat, and what side chats may use.
+chat.
 
 ![Send's choices](app/send.png)
+
+build works in its own worktree: its branch follows its name in the head.
+
+![build on its own branch, beside the lead](app/worktree.png)
 
 A side chat asked while the lead works: a fork beside it, the lead untouched.
 
@@ -93,6 +97,9 @@ client/          agent-client: the socket protocol and the client policy
   `request` relays any protocol op; `models` reads `~/.agent/models`, and
   `project` and `write_project` read and write a folder's
   `.agent/project.toml` ([project.rs](../app/src-tauri/src/project.rs)).
+  When nothing listens on a store's socket, `attach` starts a daemon first
+  ([daemon.rs](../app/src-tauri/src/daemon.rs)); see
+  [Installing](#installing).
   State and protocol logic live in the
   page, exactly as they did in the prototype, so the design and the
   mechanics iterate in one place.
@@ -112,6 +119,74 @@ client/          agent-client: the socket protocol and the client policy
   review, and the coordinator waits on all of it. Serve `app/ui` with any
   static server to work on the design without a daemon.
 
+## Installing
+
+The app is published as a Homebrew cask for macOS (Apple silicon and Intel):
+
+```sh
+brew install --cask lydakis/agent/agent
+```
+
+The bundle carries the `agent` runtime as `Agent.app/Contents/MacOS/agent`;
+the cask does not put it on `PATH`. When the app finds no daemon on its
+store's socket, it runs that binary as `agent start --store STORE`, which
+starts the daemon exactly as a CLI command would: providers from
+`AGENT_PROVIDER` or the keys that are set, the log beside the store, a
+process that outlives the window. A window opened from the Dock inherits
+launchd's environment rather than a terminal's, so `agent start` runs with
+the environment of the user's login shell (`$SHELL -l -i`), plus
+`~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
+(`export` and quotes allowed, `#` comments), refused unless it is a regular
+file of at most 64 KiB that only its owner can read. That file is the app's; the CLI and the daemon never read it.
+The login shell is read once per app run, and without `--model` or
+`AGENT_MODEL` of its own the app takes its default model from the file, then
+the shell; the shell's is looked up beside the attach, so a slow profile never
+delays it. The
+store and socket themselves are resolved from the app's own arguments and
+environment. A failed start shows the CLI's
+reason on the page and is not retried for 30 seconds. An explicit `--socket`
+or `AGENT_SOCKET` never starts anything. Uninstalling or upgrading the cask
+quits the app and runs the bundled `agent shutdown --store
+~/.agent/state.sqlite --grace 30`, so the default store's daemon, whoever
+started it, lets running turns finish and exits before its binary is replaced.
+The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
+cannot point the shutdown elsewhere. A default model that appears only after
+launch, from a repaired `~/.agent/env`, is picked up on the next attach.
+
+Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
+`Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
+[release.yml](../.github/workflows/release.yml) on a macOS runner. The tag
+itself only starts [release-request.yml](../.github/workflows/release-request.yml),
+which holds no secrets; release.yml and publish-homebrew.yml run after it from
+`main`'s own definitions, so code at a tag never sees the signing secrets or
+the tap token. A failed run is re-run from its own page. It runs
+the tests, installs the Tauri CLI from
+[app/release/package-lock.json](../app/release/package-lock.json) before any
+signing material exists, builds a universal `agent` and app, and has Tauri sign both with
+the Developer ID and hardened runtime, notarize and staple the bundle
+([tauri.release.conf.json](../app/src-tauri/tauri.release.conf.json)); it
+then verifies the signature, Gatekeeper assessment, staple, architectures and
+versions, and leaves `Agent_X.Y.Z_universal.zip`, the generated cask,
+`source-commit.txt` (the commit it built) and `checksums.txt` on a draft
+release. Publishing the draft (not a prerelease) runs
+[publish-homebrew.yml](../.github/workflows/publish-homebrew.yml): it
+resolves the tag to a commit on `main` before running any of its code,
+refuses assets built from any other commit (a draft's tag can move) or
+lacking release.yml's build attestation (a draft's assets can be replaced),
+checks them against their checksums and the tag's cask generator,
+installs and audits the cask, and writes `Casks/agent.rb` to
+[lydakis/homebrew-agent](https://github.com/lydakis/homebrew-agent). It never
+downgrades the tap or replaces a different cask of the same version. The
+helpers and their tests are in [app/release](../app/release)
+(`python3 -m unittest discover -s app/release`).
+
+Secrets: the six Apple signing and notary secrets Errand uses
+(`APPLE_DEVELOPER_ID_CERTIFICATE_P12_BASE64`,
+`APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD`, `APPLE_DEVELOPER_ID_APPLICATION`,
+`APP_STORE_CONNECT_API_KEY_P8`, `APP_STORE_CONNECT_KEY_ID`,
+`APP_STORE_CONNECT_ISSUER_ID`), and `HOMEBREW_TAP_GITHUB_TOKEN` with Contents
+write access to the tap.
+
 ## Running it
 
 ```sh
@@ -120,7 +195,9 @@ AGENT_MODEL=anthropic/claude-sonnet-5 .local/target/release/agent-app \
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
-Arguments and environment are the CLI's: `--socket`, `--store`, `--model`,
+Without `--workspace` the workspace is the launching directory, or home when
+that is `/`, as for a window opened from the Dock. Arguments and environment
+are the CLI's: `--socket`, `--store`, `--model`,
 `--workspace`, `AGENT_SOCKET`, `AGENT_STORE`, `AGENT_MODEL`, and a store's
 socket is resolved the way the CLI and the daemon resolve it (the shared
 client crate's rendezvous), so a deep store path meets the same short socket.
@@ -185,13 +262,27 @@ daemon learns nothing about projects; everything here is client work.
   checkpoint, so the daemon copies it at its newest finished round; the
   source is untouched. The copy is named `NAME-side`, nests under its
   source, and opens beside. From the ⋯ menu it opens empty; from Send's
-  side pick, the message is its first. It may read files and its history
-  (`allow: ["read","history"]`, the default) or only answer (`allow: []`),
-  the ▾'s sticky choice. Tools stay shown, so the fork keeps its source's
-  cache; the daemon refuses a call outside the list.
-- **Not built yet.** A side chat with all tools in a new worktree waits on
-  tasks in worktrees. Keep, which turns a side chat into a task, and the
-  coordinator's role text, approvals and swarms are later steps of item 47.
+  side pick, the message is its first. It has its source's tools and works
+  in its source's folder, so it can edit there while the source runs: it
+  is the same agent asked something else at the same time (George,
+  2026-09-27). The fork names no tool list and no folder.
+- **Tasks in worktrees.** This is the app's opinion, not the CLI's or the
+  daemon's. A coordinator the app creates gets, after the shared policy, a
+  short text of the app's own: a task that changes files, named with the
+  project's prefix so projects do not collide, gets
+  `git worktree add -b agent/NAME ~/.agent/worktrees/NAME HEAD`, the
+  folder's `.agent/setup` run inside it, and `agent run --new --agents
+  --workspace` that worktree, in the project's subfolder of it; the task
+  keeps that folder for later messages. The text also says the worktree
+  starts at the last commit, that a failed setup, or a start that left no
+  bot, removes the worktree and branch,
+  and that without git every task works in the project folder. The daemon only runs a
+  turn where the bot is, or where a message moves it. A bot in a
+  linked worktree shows its branch after its name in the head, read once
+  from the worktree's files when the head is first drawn.
+- **Not built yet.** Keep, which turns a side chat into a task, removing a
+  deleted task's worktree, profiles with the coordinator's role text,
+  swarms and approvals are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -280,8 +371,7 @@ page cannot subscribe to window events and never attaches. Page errors are
 forwarded to the app's stderr through a `log` command.
 
 Not verified: the live window's rendering by eye (the debug binary is not a
-bundle, so it could not be screenshotted here), a real provider, and macOS
-packaging, which needs `bundle.active` and real icons.
+bundle, so it could not be screenshotted here) and a real provider.
 
 The tree uses the daemon's `created_by` (bots created from a shell tool since
 schema 22, with the creator's identity since 23) or the `created` event; a bot
@@ -304,8 +394,12 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
-2. Packaging: a real icon set, `bundle.active`, a signed build.
-3. The rest of the projects design (the "Agent App Concepts" prototype), in
+2. The first release: create the tap, set the secrets, tag `v0.1.0`.
+3. Refuse a `~/.agent/env` that a macOS ACL makes readable by other
+   accounts; today only its POSIX mode is checked.
+4. Stop a daemon the app started for a store other than `~/.agent`'s when
+   the cask is uninstalled; the uninstall hook stops only the default one.
+5. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
 
 ## Regression checks
@@ -322,7 +416,8 @@ coordinators and lineage, folding, opening alone or beside and swapping,
 per-pane sends with the sticky queue or steer pick, model choices within a
 provider, the agent menu's enabled items and its refresh on a status change,
 fork naming and placement, side chats (a running source, the allowed list,
-the first message going to the copy), project creation (no file for a refused model),
+the first message going to the copy), a worktree bot's branch in its head,
+project creation (no file for a refused model),
 steers pinned to their turn, model picks pinned to identity, the demo
 daemon's steer delivery, and runs folded with failures on their line.
 `cargo test -p agent-app` includes a failed project-file write leaving
