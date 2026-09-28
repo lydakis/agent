@@ -342,13 +342,10 @@ impl Kind {
             Kind::Skills => path.join("SKILL.md"),
             Kind::Profiles => path.to_path_buf(),
         };
-        let Some(meta) = file_meta(&file)? else {
-            return Ok(None);
-        };
-        // A role too large for any bot's instructions is not offered: it
-        // could never be started.
-        let fits = !matches!(self, Kind::Profiles) || meta.len() as usize <= MAX_INSTRUCTIONS;
-        Ok(fits.then_some(file))
+        // The index names what the folders hold; whether a role fits a bot's
+        // instructions is known only when it is composed, and --profile then
+        // fails with instructions_limit rather than cutting it.
+        Ok(is_file(&file)?.then_some(file))
     }
 }
 
@@ -356,20 +353,15 @@ impl Kind {
 /// is reported, so an unreadable workspace file never lets the user's file of
 /// the same name stand in for it.
 fn is_file(path: &Path) -> Result<bool, Failure> {
-    Ok(file_meta(path)?.is_some())
-}
-
-/// The metadata of `path` when it is a file, on the terms of [`is_file`].
-fn file_meta(path: &Path) -> Result<Option<std::fs::Metadata>, Failure> {
     match std::fs::metadata(path) {
-        Ok(meta) => Ok(meta.is_file().then_some(meta)),
+        Ok(meta) => Ok(meta.is_file()),
         Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            Ok(None)
+            Ok(false)
         }
         Err(error) => Err(Failure::Unreadable {
             path: path.to_path_buf(),
@@ -905,7 +897,9 @@ mod tests {
             assert_eq!(search(&root, Kind::Profiles).len(), 2);
             assert_eq!(search(&home, Kind::Profiles).len(), 1);
         }
-        // A role too large to start is not offered.
+        // A role too large to start is still listed under its name, so it
+        // keeps shadowing the user's role of that name; starting it fails
+        // explicitly instead.
         let big = std::fs::File::create(root.join(".agents/agents/huge.md")).unwrap();
         big.set_len(MAX_INSTRUCTIONS as u64 + 1).unwrap();
         assert!(
@@ -913,7 +907,11 @@ mod tests {
                 .unwrap()
                 .profiles
                 .iter()
-                .all(|p| p.name != "huge")
+                .any(|p| p.name == "huge")
+        );
+        assert_eq!(
+            profile(&root, "huge").unwrap_err().code(),
+            "instructions_limit"
         );
         std::fs::remove_file(root.join(".agents/agents/huge.md")).unwrap();
         // A broken file shadowed by an override is never probed.
