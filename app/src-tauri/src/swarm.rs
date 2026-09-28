@@ -4238,9 +4238,19 @@ mod tests {
             let child = std::fs::read_to_string(&pid).unwrap();
             let _ = std::fs::remove_file(&pid);
             // Gone, or a zombie nobody has reaped yet: either way not running.
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.trim()));
-            let running = stat.is_ok_and(|s| !s.contains(") Z "));
-            assert!(!running, "setup's background child outlived it");
+            // A kill lands at once but takes effect when the child next runs,
+            // which a busy machine can put off for a moment.
+            let running = || {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.trim()));
+                stat.is_ok_and(|s| !s.contains(") Z "))
+            };
+            for _ in 0..100 {
+                if !running() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(!running(), "setup's background child outlived it");
             // A script that never stops writing is stopped too, holding only a tail.
             let noisy = run_setup(sh("yes"), limit).await.unwrap_err();
             assert!(noisy.contains("ran past"), "{noisy}");
