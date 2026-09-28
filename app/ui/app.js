@@ -1527,7 +1527,8 @@ async function connectProvider(id, values) {
   const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
   // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
   for (const f of c.fields) if (!f.local && (!f.secret || values[f.key])) changes[f.key] = values[f.key] || '';
-  if (c.parts && aws && saved) changes.AWS_BEARER_TOKEN_BEDROCK = null;
+  // Emptied rather than removed, so a key the shell exports stays out of it too.
+  if (c.parts && aws && saved) changes.AWS_BEARER_TOKEN_BEDROCK = '';
   await applySettings(changes);
   st.adding = null;
   await refreshModels();
@@ -1580,7 +1581,8 @@ function setupHTML() {
   else {
     const c = catalogOf(st.adding);
     const value = (f) => f.key === 'AWS_REGION' ? set?.region ?? '' : f.key === 'AWS_PROFILE' ? set?.profile ?? '' : '';
-    const choice = (f) => { const on = set?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
+    // How Bedrock signs in now, from its specs: a key only the shell exports does not change it.
+    const choice = (f) => { const on = (set?.providers ?? []).some((s) => catalogOf(specName(s))?.parts && s.endsWith(',AWS_BEARER_TOKEN_BEDROCK')) ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
     const fields = c.fields.map((f) => f.choices ? choice(f) : `<label><span>${esc(f.label)}</span><input name="${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" value="${esc(value(f))}" placeholder="${esc(f.secret && set?.keys?.includes(f.key) ? 'saved; type to replace' : f.hint ?? '')}"></label>`).join('');
     const working = anyActive() ? `<p class="warn">Agents are working. Connecting restarts the daemon, which stops them.</p>` : '';
     add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;
