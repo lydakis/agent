@@ -32,14 +32,19 @@ class SwarmPostTests(ModelFixture):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
+    def ids(self):
+        return {b['name']: b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
+
     def swarm(self, members):
-        # The folder the app writes for a swarm, by hand.
+        # The folder the app writes for a swarm, by hand: each member pinned to its bot's id.
         folder = self.path / 'swarms' / 'p.s'
         folder.mkdir(parents=True)
         listed = ', '.join(json.dumps(m) for m in members)
+        ids = self.ids()
+        pinned = ''.join(f'{json.dumps(m)} = {ids[m]}\n' for m in members)
         (folder / 'swarm.toml').write_text(
             f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\nmodel = "openai/synthetic-model"\n'
-            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\n')
+            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\n[ids]\n{pinned}')
         (folder / 'board.jsonl').write_text('')
         post = folder / 'post'
         post.write_text(f'#!/bin/sh\nexec \'{APP}\' --swarm-post \'{folder}\' "$@"\n')
@@ -91,12 +96,22 @@ class SwarmPostTests(ModelFixture):
         outsider = self.path / 'outsider.json'
         self.agent('run', *self.common, '--new', '--bot', 'q', f'shell:"{folder}/post" hi > "{outsider}" 2>&1')
         self.assertIn('not_a_member', outsider.read_text())
+        # A member deleted and made again under its name is another bot: it cannot post, and a
+        # post naming it misses it rather than waking the new bot.
+        self.agent('rm', '--store', str(self.store), '--bot', 'p.s-4')
+        self.agent('run', *self.common, '--new', '--bot', 'p.s-4', 'hello')
+        again = self.path / 'again.json'
+        self.agent('run', '--store', str(self.store), '--bot', 'p.s-4', f'shell:"{folder}/post" hi > "{again}" 2>&1')
+        self.assertIn('not_a_member', again.read_text())
+        named = self.post_from('p.s-1', folder, '"@s-4 you there?"')
+        self.assertEqual(([m['agent'] for m in named['missed']], named['woke']), (['s-4'], []))
+        self.assertEqual(len(self.turns('p.s-4')), 2)
         toml = folder / 'swarm.toml'
         toml.write_text(toml.read_text().replace('stopped = false', 'stopped = true'))
         stopped = self.path / 'stopped.json'
         self.agent('run', '--store', str(self.store), '--bot', 'p.s-1', f'shell:"{folder}/post" hi > "{stopped}" 2>&1')
         self.assertIn('swarm_stopped', stopped.read_text())
-        self.assertEqual(len((folder / 'board.jsonl').read_text().splitlines()), 2)
+        self.assertEqual(len((folder / 'board.jsonl').read_text().splitlines()), 3)
 
 
 if __name__ == '__main__':

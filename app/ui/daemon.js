@@ -27,6 +27,8 @@ window.Daemon = (() => {
       swarms: () => invoke('swarms'),
       swarmCreate: ({ project, name, folder, goal, shared, model, budgetTokens }) => invoke('swarm_create', { project, name, folder, goal, shared, model, budgetTokens }),
       swarmJoin: (swarm, members) => invoke('swarm_join', { swarm, members }),
+      swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
+      swarmDiscard: (swarm) => invoke('swarm_discard', { swarm }),
       swarmStop: (swarm, stopped) => invoke('swarm_stop', { swarm, stopped }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
       swarmPost: (swarm, text) => invoke('swarm_post', { swarm, text }),
@@ -320,9 +322,11 @@ window.Daemon = (() => {
       const sw = { name: full, project, goal, model, budget: budgetTokens, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
       S.swarms.set(full, sw); await wait(300); return swarmRecord(sw);
     },
-    swarmJoin: async (swarm, members) => { const sw = S.swarms.get(swarm); for (const m of members) if (!sw.members.includes(m)) sw.members.push(m); return swarmRecord(sw); },
+    swarmJoin: async (swarm, members) => { const sw = S.swarms.get(swarm); for (const [m] of members) if (!sw.members.includes(m)) sw.members.push(m); return swarmRecord(sw); },
+    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); return swarmRecord(sw); },
+    swarmDiscard: async (swarm) => { if (S.swarms.get(swarm)?.members.length) throw new Error(`swarm_has_agents: ${swarm}`); S.swarms.delete(swarm); },
     swarmStop: async (swarm, stopped) => { const sw = S.swarms.get(swarm); sw.stopped = stopped; return swarmRecord(sw); },
-    swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false }; },
+    swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false, reset: offset == null }; },
     swarmPost: async (swarm, text) => {
       const sw = S.swarms.get(swarm); sw.stopped = false; sw.board.push({ at: Date.now(), from: 'user', text });
       const busy = sw.members.filter((m) => S.bots.get(m)?.status !== 'idle');
@@ -372,6 +376,8 @@ window.Daemon = (() => {
           for(const node of params.nodes) {const item=S.nodes.get(node),size=JSON.stringify(item).length*2;if(items.length && bytes+size>768*1024)break;items.push({node,item});bytes+=size;}
           return {items};
         }
+        // A demo bot's only unfinished turn is the one it runs.
+        case 'turns': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { turns: b.running_turn != null && params.after < b.running_turn ? [{ turn: b.running_turn, status: b.status }] : [], next_after: null }; }
         case 'resume': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); return { ...b }; }
         case 'create': { await create(params.bot, params.model, params.created_by ?? null, null, params.workspace); return { ...S.bots.get(params.bot) }; }
         case 'submit': { const b = S.bots.get(params.bot); if (!b) throw new Error('bot_not_found'); if (b.status !== 'idle' && params.delivery === 'reject') throw new Error('bot_busy');

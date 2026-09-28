@@ -1,9 +1,12 @@
 //! Swarms: many agents on one goal, talking through a board. A swarm is the
 //! app's; the daemon knows only its agents, which are ordinary bots named
-//! `SWARM-N`. A swarm is a folder, `~/.agent/swarms/SWARM/`:
+//! `SWARM-N`. A swarm is a folder, `~/.agent/swarms/DAEMON/SWARM/`, where
+//! DAEMON stands for the socket its agents' daemon listens on, so a window
+//! attached to another store never sees them:
 //!
-//! - `swarm.toml`: its project, goal, folder, model, token budget, members,
-//!   and whether you stopped it. Only the app writes it.
+//! - `swarm.toml`: its project, goal, folder, model, token budget, members
+//!   with the id of the bot each one is, and whether you stopped it. Only the
+//!   app writes it, under the board's lock.
 //! - `board.jsonl`: one post a line, appended under a lock.
 //! - `post`: the script its agents run to post. It runs this executable with
 //!   `--swarm-post`, so posting needs nothing else installed and costs one
@@ -17,6 +20,8 @@
 use agent_client::Client;
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
+    ffi::OsString,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,6 +36,10 @@ const MAX_READ: u64 = 1024 * 1024;
 const TAIL: u64 = 256 * 1024;
 /// Room for `-NNNN` after the swarm's name within the daemon's 128 bytes.
 const MAX_NAME: usize = 100;
+/// A project's `.agents/setup` gets this long, and its output is kept only
+/// as far as a failure's reason needs.
+const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const SETUP_KEEP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Swarm {
@@ -41,6 +50,9 @@ pub struct Swarm {
     pub model: String,
     pub budget_tokens: u64,
     pub members: Vec<String>,
+    /// Each member's bot id: a name can be deleted and made again, and the
+    /// new bot is not a member.
+    pub ids: BTreeMap<String, i64>,
     pub stopped: bool,
 }
 
@@ -84,6 +96,15 @@ impl Swarm {
                         .collect()
                 })
                 .unwrap_or_default(),
+            ids: table
+                .get("ids")
+                .and_then(toml::Value::as_table)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|(m, id)| Some((m.clone(), id.as_integer()?)))
+                        .collect()
+                })
+                .unwrap_or_default(),
             stopped: table
                 .get("stopped")
                 .and_then(toml::Value::as_bool)
@@ -104,6 +125,15 @@ impl Swarm {
             toml::Value::Array(self.members.iter().map(|m| m.clone().into()).collect()),
         );
         table.insert("stopped".into(), self.stopped.into());
+        table.insert(
+            "ids".into(),
+            toml::Value::Table(
+                self.ids
+                    .iter()
+                    .map(|(m, id)| (m.clone(), (*id).into()))
+                    .collect(),
+            ),
+        );
         let text = toml::to_string(&table).map_err(|e| e.to_string())?;
         // Distinct per write, so two writes at once never share a temporary.
         static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -117,7 +147,8 @@ impl Swarm {
         json!({
             "swarm": self.name, "dir": dir.to_string_lossy(), "project": self.project,
             "goal": self.goal, "workspace": self.workspace, "model": self.model,
-            "budget_tokens": self.budget_tokens, "members": self.members, "stopped": self.stopped,
+            "budget_tokens": self.budget_tokens, "members": self.members, "ids": self.ids,
+            "stopped": self.stopped,
         })
     }
 
@@ -130,10 +161,27 @@ impl Swarm {
     }
 }
 
-pub fn root() -> Result<PathBuf, String> {
+/// `~/.agent/swarms`, which holds a folder of swarms per daemon.
+pub fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".agent/swarms"))
         .ok_or_else(|| "no HOME for ~/.agent/swarms".into())
+}
+
+/// The swarms of the daemon on `socket`. Their agents are that daemon's
+/// bots, so the same names in another store are other bots.
+pub fn root(socket: &Path) -> Result<PathBuf, String> {
+    Ok(home()?.join(daemon_key(socket)))
+}
+
+/// FNV-1a over the socket's path: a stable folder name, not a secret.
+fn daemon_key(socket: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in socket.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// A swarm's name is `PROJECT.NAME`, used for its folder, its worktree and
@@ -144,6 +192,8 @@ pub fn valid_name(name: &str) -> Result<(), String> {
         && name.as_bytes()[0].is_ascii_alphanumeric()
         && !name.ends_with('.')
         && !name.contains("..")
+        // Git refuses a branch whose name ends so.
+        && !name.ends_with(".lock")
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
@@ -217,7 +267,8 @@ pub fn fill(dir: &Path, swarm: &Swarm, app: &Path) -> Result<(), String> {
 /// worktree they share, `~/.agent/worktrees/SWARM` on branch `agent/SWARM`,
 /// at the project's own subfolder. As for a coordinator's tasks, the
 /// project's `.agents/setup` runs inside a new worktree with `AGENT_SOURCE`
-/// naming the project; if that fails, the worktree and its branch go.
+/// naming the project; if that fails or outlasts its time, the worktree and
+/// its branch go.
 pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, String> {
     valid_name(swarm)?;
     if !shared {
@@ -243,8 +294,7 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
         ));
     }
     let prefix = String::from_utf8_lossy(&prefix.stdout).trim().to_owned();
-    let home = std::env::var_os("HOME").ok_or("no HOME for ~/.agent/worktrees")?;
-    let tree = PathBuf::from(home).join(".agent/worktrees").join(swarm);
+    let tree = worktrees()?.join(swarm);
     let branch = format!("agent/{swarm}");
     let added = git(&["worktree", "add", "-b", &branch])
         .arg(&tree)
@@ -269,18 +319,18 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
             sh.arg(&setup);
             sh
         };
-        let ran = command
+        let login = crate::daemon::login().await;
+        let environment = match login {
+            Some(login) => setup_env(login.iter().cloned()),
+            None => setup_env(std::env::vars_os()),
+        };
+        command
             .current_dir(&workspace)
-            .env("AGENT_SOURCE", project)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await;
-        let failed = match ran {
-            Ok(out) if out.status.success() => None,
-            Ok(out) => Some(format!(
-                "setup_failed: {}",
-                tail(&[out.stdout, out.stderr].concat())
-            )),
+            .env_clear()
+            .envs(environment)
+            .env("AGENT_SOURCE", project);
+        let failed = match run_setup(command, SETUP_TIMEOUT).await {
+            Ok(()) => None,
             Err(error) => Some(format!("setup_failed: {error}")),
         };
         if let Some(failed) = failed {
@@ -293,6 +343,75 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
         }
     }
     Ok(workspace.to_string_lossy().trim_end_matches('/').to_owned())
+}
+
+/// Setup is the project's code, run before any agent exists. It gets the
+/// login shell's ordinary variables, so its tools are on PATH, and nothing
+/// else: no provider or cloud keys, which the daemon's shell withholds too.
+fn setup_env(from: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    const KEEP: &[&str] = &[
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TERM",
+    ];
+    from.filter(|(key, _)| {
+        key.to_str()
+            .is_some_and(|key| KEEP.contains(&key) || key.starts_with("LC_"))
+    })
+    .collect()
+}
+
+/// Runs setup for at most `limit`, keeping the end of its output: a script
+/// that hangs or never stops writing is killed, not waited on.
+async fn run_setup(
+    mut command: tokio::process::Command,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    use tokio::io::{AsyncRead, AsyncReadExt};
+    async fn drain(mut from: impl AsyncRead + Unpin) -> Vec<u8> {
+        let (mut kept, mut buffer) = (Vec::new(), [0u8; 8192]);
+        while let Ok(n @ 1..) = from.read(&mut buffer).await {
+            kept.extend_from_slice(&buffer[..n]);
+            if kept.len() > 2 * SETUP_KEEP {
+                kept.drain(..kept.len() - SETUP_KEEP);
+            }
+        }
+        kept
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
+    let ran = async {
+        let (out, err, status) = tokio::join!(
+            async { drain(stdout?).await.into() },
+            async { drain(stderr?).await.into() },
+            child.wait()
+        );
+        let out: Option<Vec<u8>> = out;
+        let err: Option<Vec<u8>> = err;
+        Ok::<_, std::io::Error>((out.unwrap_or_default(), err.unwrap_or_default(), status?))
+    };
+    match tokio::time::timeout(limit, ran).await {
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(format!(
+                ".agents/setup ran past {} s and was stopped",
+                limit.as_secs()
+            ))
+        }
+        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Ok((_, _, status))) if status.success() => Ok(()),
+        Ok(Ok((out, err, _))) => Err(tail(&[out, err].concat())),
+    }
+}
+
+fn worktrees() -> Result<PathBuf, String> {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".agent/worktrees"))
+        .ok_or_else(|| "no HOME for ~/.agent/worktrees".into())
 }
 
 /// The end of a command's output, enough to say why it failed.
@@ -313,12 +432,18 @@ fn script(app: &Path, dir: &Path) -> String {
     )
 }
 
-/// The app moves when it is updated, so it writes its path again on start.
-pub fn refresh_scripts(root: &Path, app: &Path) {
-    let Ok(entries) = std::fs::read_dir(root) else {
+/// The app moves when it is updated, so it writes its path again on start,
+/// in every daemon's swarms.
+pub fn refresh_scripts(home: &Path, app: &Path) {
+    let Ok(daemons) = std::fs::read_dir(home) else {
         return;
     };
-    for entry in entries.flatten() {
+    for entry in daemons
+        .flatten()
+        .flat_map(|d| std::fs::read_dir(d.path()))
+        .flatten()
+    {
+        let Ok(entry) = entry else { continue };
         let dir = entry.path();
         let post = dir.join("post");
         let want = script(app, &dir);
@@ -328,44 +453,116 @@ pub fn refresh_scripts(root: &Path, app: &Path) {
     }
 }
 
-/// Members join in order and never twice.
-pub fn join(root: &Path, swarm: &str, members: &[String]) -> Result<Value, String> {
+/// Read, change and write `swarm.toml` under the board's lock, so two
+/// windows changing one swarm never lose each other's change.
+fn update(
+    dir: &Path,
+    change: impl FnOnce(&mut Swarm) -> Result<(), String>,
+) -> Result<Swarm, String> {
+    let board = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("board.jsonl"))
+        .map_err(|e| e.to_string())?;
+    board.lock().map_err(|e| e.to_string())?;
+    let mut s = Swarm::read(dir)?;
+    change(&mut s)?;
+    s.write(dir)?;
+    Ok(s)
+}
+
+/// Members join in order and never twice, each pinned to its bot's id.
+pub fn join(root: &Path, swarm: &str, members: &[(String, i64)]) -> Result<Value, String> {
     let dir = folder(root, swarm)?;
-    let mut s = Swarm::read(&dir)?;
-    for member in members {
-        if !member.starts_with(&format!("{swarm}-")) {
-            return Err(format!("invalid_member: {member} is not named {swarm}-N"));
+    let s = update(&dir, |s| {
+        for (member, id) in members {
+            if !member.starts_with(&format!("{swarm}-")) {
+                return Err(format!("invalid_member: {member} is not named {swarm}-N"));
+            }
+            if !s.members.contains(member) {
+                s.members.push(member.clone());
+            }
+            s.ids.insert(member.clone(), *id);
         }
-        if !s.members.contains(member) {
-            s.members.push(member.clone());
-        }
-    }
-    s.write(&dir)?;
+        Ok(())
+    })?;
+    Ok(s.json(&dir))
+}
+
+/// A deleted agent leaves: the swarm stops counting it and posting to it.
+pub fn leave(root: &Path, swarm: &str, member: &str) -> Result<Value, String> {
+    let dir = folder(root, swarm)?;
+    let s = update(&dir, |s| {
+        s.members.retain(|m| m != member);
+        s.ids.remove(member);
+        Ok(())
+    })?;
     Ok(s.json(&dir))
 }
 
 /// A stopped swarm refuses its agents' posts; your next post resumes it.
 pub fn set_stopped(root: &Path, swarm: &str, stopped: bool) -> Result<Value, String> {
     let dir = folder(root, swarm)?;
-    let mut s = Swarm::read(&dir)?;
-    s.stopped = stopped;
-    s.write(&dir)?;
+    let s = update(&dir, |s| {
+        s.stopped = stopped;
+        Ok(())
+    })?;
     Ok(s.json(&dir))
 }
 
-/// The board's complete lines from `offset`, or its last stretch when there
-/// is none, and where the next read starts. A line that is not JSON comes
+/// A swarm that never got an agent goes with its worktree and branch, as
+/// when its start fails before any agent exists.
+pub async fn discard(root: &Path, swarm: &str) -> Result<(), String> {
+    let dir = folder(root, swarm)?;
+    let s = Swarm::read(&dir)?;
+    if !s.members.is_empty() {
+        return Err(format!(
+            "swarm_has_agents: {swarm} has agents; stop it instead"
+        ));
+    }
+    let tree = worktrees()?.join(swarm);
+    if Path::new(&s.workspace).starts_with(&tree) {
+        // The repository the worktree came from, found before it goes.
+        let common = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&tree)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .await
+            .map_err(|e| format!("git: {e}"))?;
+        let common = String::from_utf8_lossy(&common.stdout).trim().to_owned();
+        if !common.is_empty() {
+            let git = |args: &[&str]| {
+                let mut command = tokio::process::Command::new("git");
+                command.arg("--git-dir").arg(&common).args(args);
+                command
+            };
+            let _ = git(&["worktree", "remove", "--force"])
+                .arg(&tree)
+                .output()
+                .await;
+            let _ = git(&["branch", "-D", &format!("agent/{swarm}")])
+                .output()
+                .await;
+        }
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+}
+
+/// The board's complete lines from `offset`, and where the next read
+/// starts. With no offset, or one so far behind that the lines between
+/// would not be kept, it reads the board's last stretch and says `reset`:
+/// the lines replace what the reader has. A line that is not JSON comes
 /// back as its text, so a hand edit shows instead of vanishing.
 pub fn board(root: &Path, swarm: &str, offset: Option<u64>) -> Result<Value, String> {
     let path = folder(root, swarm)?.join("board.jsonl");
     let mut file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
-    let (mut start, skip_partial) = match offset {
-        Some(offset) if offset <= size => (offset, false),
-        // Shorter than we read before: someone rewrote it; read it again.
-        Some(_) => (size.saturating_sub(TAIL), size > TAIL),
-        None => (size.saturating_sub(TAIL), size > TAIL),
+    // Shorter than we read before means someone rewrote it: read it again.
+    let (mut start, reset) = match offset {
+        Some(offset) if offset <= size && size - offset <= TAIL => (offset, false),
+        _ => (size.saturating_sub(TAIL), true),
     };
+    let skip_partial = reset && start > 0;
     file.seek(SeekFrom::Start(start))
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
@@ -393,7 +590,10 @@ pub fn board(root: &Path, swarm: &str, offset: Option<u64>) -> Result<Value, Str
                 .unwrap_or_else(|_| json!({"text": String::from_utf8_lossy(line)}))
         })
         .collect();
-    Ok(json!({"lines": lines, "offset": start + end as u64, "more": start + (end as u64) < size}))
+    Ok(json!({
+        "lines": lines, "offset": start + end as u64, "more": start + (end as u64) < size,
+        "reset": reset,
+    }))
 }
 
 /// One line, one write, under an exclusive lock, so posts never interleave.
@@ -419,6 +619,7 @@ fn now_ms() -> u64 {
 #[derive(Debug, Clone)]
 pub struct Author {
     pub bot: String,
+    pub id: i64,
     pub turn: i64,
 }
 
@@ -472,7 +673,8 @@ fn readers(
 }
 
 /// Each member's running turn, from the daemon's list: members are named
-/// `SWARM-N`, so they sit together in its name order.
+/// `SWARM-N`, so they sit together in its name order. A bot under a
+/// member's name that is not the member's bot is left out.
 async fn running_turns(
     client: &Client,
     swarm: &Swarm,
@@ -491,7 +693,9 @@ async fn running_turns(
             if name > prefix.as_str() && !name.starts_with(&prefix) {
                 return Ok(out);
             }
-            if swarm.members.iter().any(|m| m == name) {
+            if swarm.members.iter().any(|m| m == name)
+                && swarm.ids.get(name).copied() == bot["id"].as_i64()
+            {
                 out.push((name.to_owned(), bot["running_turn"].as_i64()));
             }
         }
@@ -523,15 +727,17 @@ pub async fn post(
     let dir = folder(root, swarm)?;
     let mut s = Swarm::read(&dir)?;
     if let Some(author) = &author {
-        if !s.members.contains(&author.bot) {
+        if s.ids.get(&author.bot) != Some(&author.id) {
             return Err(format!("not_a_member: {} is not in {}", author.bot, s.name));
         }
         if s.stopped {
             return Err("swarm_stopped: the user stopped this swarm; end your turn".into());
         }
     } else if s.stopped {
-        s.stopped = false;
-        s.write(&dir)?;
+        s = update(&dir, |s| {
+            s.stopped = false;
+            Ok(())
+        })?;
     }
     let from = author
         .as_ref()
@@ -551,7 +757,8 @@ pub async fn post(
     let mut sends = tokio::task::JoinSet::new();
     for (i, (member, reach)) in readers.into_iter().enumerate() {
         let mut params = json!({
-            "bot": member, "request_id": format!("{stamp}-{i}"), "prompt": prompt, "delivery": "steer",
+            "bot": member, "bot_id": s.ids.get(&member), "request_id": format!("{stamp}-{i}"),
+            "prompt": prompt, "delivery": "steer",
         });
         if let Reach::Running(turn) = reach {
             params["expected_turn"] = json!(turn);
@@ -595,14 +802,17 @@ pub fn cli(args: &[String]) -> i32 {
     let (Some(root), Some(swarm)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str())) else {
         return fail(format!("not a swarm folder: {}", dir.display()));
     };
+    let number = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<i64>().ok());
     let author = match (
         std::env::var("AGENT_BOT"),
-        std::env::var("AGENT_TURN").map(|t| t.parse::<i64>()),
+        number("AGENT_BOT_ID"),
+        number("AGENT_TURN"),
     ) {
-        (Ok(bot), Ok(Ok(turn))) if !bot.is_empty() => Author { bot, turn },
+        (Ok(bot), Some(id), Some(turn)) if !bot.is_empty() => Author { bot, id, turn },
         _ => {
             return fail(
-                "post runs in a swarm agent's shell, which names AGENT_BOT and AGENT_TURN".into(),
+                "post runs in a swarm agent's shell, which names AGENT_BOT, AGENT_BOT_ID and AGENT_TURN"
+                    .into(),
             );
         }
     };
@@ -659,6 +869,11 @@ mod tests {
             model: "openai/gpt-6-luna".into(),
             budget_tokens: 3_000_000,
             members: members.iter().map(|m| m.to_string()).collect(),
+            ids: members
+                .iter()
+                .zip(1..)
+                .map(|(m, id)| (m.to_string(), id))
+                .collect(),
             stopped: false,
         }
     }
@@ -727,7 +942,8 @@ mod tests {
 
     #[test]
     fn a_swarm_is_its_folder_and_members_join_once() {
-        let root = scratch("folder");
+        let home = scratch("folder");
+        let root = home.join("0123456789abcdef");
         let s = swarm(&[]);
         let dir = claim(&root, &s.name).unwrap();
         fill(&dir, &s, Path::new("/Applications/It's.app/agent-app")).unwrap();
@@ -741,12 +957,15 @@ mod tests {
         let joined = join(
             &root,
             &s.name,
-            &["agent.latency-1".into(), "agent.latency-2".into()],
+            &[
+                ("agent.latency-1".into(), 11),
+                ("agent.latency-2".into(), 12),
+            ],
         )
         .unwrap();
-        join(&root, &s.name, &["agent.latency-2".into()]).unwrap();
+        join(&root, &s.name, &[("agent.latency-2".into(), 12)]).unwrap();
         assert!(
-            join(&root, &s.name, &["other.x-1".into()])
+            join(&root, &s.name, &[("other.x-1".into(), 13)])
                 .unwrap_err()
                 .starts_with("invalid_member")
         );
@@ -756,7 +975,12 @@ mod tests {
         );
         let read = Swarm::read(&dir).unwrap();
         assert_eq!(read.members.len(), 2);
+        assert_eq!(read.ids["agent.latency-2"], 12);
         assert_eq!(read.goal, "Halve p99.");
+        // A deleted agent leaves, id and all.
+        let left = leave(&root, &s.name, "agent.latency-1").unwrap();
+        assert_eq!(left["members"], json!(["agent.latency-2"]));
+        assert_eq!(left["ids"], json!({"agent.latency-2": 12}));
         assert!(
             set_stopped(&root, &s.name, true).unwrap()["stopped"]
                 .as_bool()
@@ -766,16 +990,16 @@ mod tests {
         assert_eq!(listed["swarms"][0]["swarm"], "agent.latency");
         std::fs::write(root.join("agent.latency/swarm.toml"), "goal = 1").unwrap();
         assert_eq!(list(&root)["broken"].as_array().unwrap().len(), 1);
-        for bad in ["", ".x", "a..b", "a/b", "a.", &"a".repeat(101)] {
+        for bad in ["", ".x", "a..b", "a/b", "a.", "p.lock", &"a".repeat(101)] {
             assert!(valid_name(bad).is_err(), "{bad}");
         }
-        refresh_scripts(&root, Path::new("/moved/agent-app"));
+        refresh_scripts(&home, Path::new("/moved/agent-app"));
         assert!(
             std::fs::read_to_string(dir.join("post"))
                 .unwrap()
                 .contains("'/moved/agent-app'")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -820,6 +1044,112 @@ mod tests {
         let lines = tail["lines"].as_array().unwrap();
         assert!(lines.len() > 200 && lines.len() < 400);
         assert!(lines.iter().all(|l| l["from"] == "latency-2"));
+        assert_eq!(tail["reset"], true);
+        // A reader far behind gets the same tail, not the backlog; one
+        // close behind reads on.
+        let behind = board(&root, &s.name, last["offset"].as_u64()).unwrap();
+        assert_eq!(
+            (&behind["reset"], &behind["lines"]),
+            (&tail["reset"], &tail["lines"])
+        );
+        append(&dir, &json!({"from": "latency-3", "text": "done"})).unwrap();
+        let next = board(&root, &s.name, tail["offset"].as_u64()).unwrap();
+        assert_eq!(
+            (
+                next["reset"].as_bool(),
+                next["lines"].as_array().map(Vec::len)
+            ),
+            (Some(false), Some(1))
+        );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_a_swarm_without_agents_is_discarded() {
+        let root = scratch("discard");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let s = swarm(&[]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        join(&root, &s.name, &[("agent.latency-1".into(), 1)]).unwrap();
+        let kept = runtime.block_on(discard(&root, &s.name)).unwrap_err();
+        assert!(kept.starts_with("swarm_has_agents"), "{kept}");
+        leave(&root, &s.name, "agent.latency-1").unwrap();
+        runtime.block_on(discard(&root, &s.name)).unwrap();
+        assert!(!dir.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn each_daemon_has_its_own_swarms() {
+        let a = root(Path::new("/tmp/agent-501/v1-a.sock")).unwrap();
+        let b = root(Path::new("/tmp/agent-501/v1-b.sock")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), b.parent());
+        assert_eq!(a, root(Path::new("/tmp/agent-501/v1-a.sock")).unwrap());
+    }
+
+    #[test]
+    fn changes_from_two_windows_are_both_kept() {
+        let root = scratch("race");
+        let s = swarm(&[]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let threads: Vec<_> = (1..=8)
+            .map(|i| {
+                let (root, name) = (root.clone(), s.name.clone());
+                std::thread::spawn(move || {
+                    join(&root, &name, &[(format!("{name}-{i}"), i)]).unwrap();
+                    set_stopped(&root, &name, i % 2 == 0).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(Swarm::read(&dir).unwrap().ids.len(), 8);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_gets_no_keys_and_no_more_than_its_time() {
+        let env = setup_env(
+            [
+                ("PATH", "/bin"),
+                ("LC_ALL", "C"),
+                ("OPENAI_API_KEY", "x"),
+                ("AWS_SECRET_ACCESS_KEY", "x"),
+                ("HOME", "/h"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into())),
+        );
+        let keys: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+        assert_eq!(keys, ["PATH", "LC_ALL", "HOME"]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sh = |script: &str| {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            command
+        };
+        let limit = std::time::Duration::from_millis(500);
+        runtime.block_on(async {
+            assert_eq!(run_setup(sh("true"), limit).await, Ok(()));
+            let hung = run_setup(sh("sleep 30"), limit).await.unwrap_err();
+            assert!(hung.contains("ran past"), "{hung}");
+            // A script that never stops writing is stopped too, holding only a tail.
+            let noisy = run_setup(sh("yes"), limit).await.unwrap_err();
+            assert!(noisy.contains("ran past"), "{noisy}");
+            let failed = run_setup(sh("seq 1 100000; echo why >&2; exit 3"), limit)
+                .await
+                .unwrap_err();
+            assert!(failed.ends_with("why") && failed.len() < 1000, "{failed}");
+        });
     }
 }

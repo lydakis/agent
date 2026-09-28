@@ -529,8 +529,13 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
 /// Every swarm in `~/.agent/swarms`, and the folders there that are not
 /// readable swarms.
 #[tauri::command]
-fn swarms() -> Result<Value, String> {
-    Ok(swarm::list(&swarm::root()?))
+fn swarms(state: State<'_, Shared>) -> Result<Value, String> {
+    Ok(swarm::list(&swarms_of(&state)?))
+}
+
+/// The swarms of the daemon this window attaches to.
+fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
+    swarm::root(&state.config.socket)
 }
 
 /// A new swarm in a project folder: its name taken, the place its agents
@@ -539,6 +544,7 @@ fn swarms() -> Result<Value, String> {
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn swarm_create(
+    state: State<'_, Shared>,
     project: String,
     name: String,
     folder: String,
@@ -547,7 +553,7 @@ async fn swarm_create(
     model: String,
     budget_tokens: u64,
 ) -> Result<Value, String> {
-    let root = swarm::root()?;
+    let root = swarms_of(&state)?;
     let folder = workspace_path(std::path::Path::new(&folder))?;
     let full = format!("{project}.{name}");
     if goal.trim().is_empty() {
@@ -569,6 +575,7 @@ async fn swarm_create(
         model,
         budget_tokens,
         members: Vec::new(),
+        ids: Default::default(),
         stopped: false,
     };
     let app = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -576,19 +583,38 @@ async fn swarm_create(
     Ok(s.json(&dir))
 }
 
+/// Agents the daemon made, by name and bot id.
 #[tauri::command]
-fn swarm_join(swarm: String, members: Vec<String>) -> Result<Value, String> {
-    swarm::join(&swarm::root()?, &swarm, &members)
+fn swarm_join(
+    state: State<'_, Shared>,
+    swarm: String,
+    members: Vec<(String, i64)>,
+) -> Result<Value, String> {
+    swarm::join(&swarms_of(&state)?, &swarm, &members)
 }
 
 #[tauri::command]
-fn swarm_stop(swarm: String, stopped: bool) -> Result<Value, String> {
-    swarm::set_stopped(&swarm::root()?, &swarm, stopped)
+fn swarm_leave(state: State<'_, Shared>, swarm: String, member: String) -> Result<Value, String> {
+    swarm::leave(&swarms_of(&state)?, &swarm, &member)
 }
 
 #[tauri::command]
-fn swarm_board(swarm: String, offset: Option<u64>) -> Result<Value, String> {
-    swarm::board(&swarm::root()?, &swarm, offset)
+async fn swarm_discard(state: State<'_, Shared>, swarm: String) -> Result<(), String> {
+    swarm::discard(&swarms_of(&state)?, &swarm).await
+}
+
+#[tauri::command]
+fn swarm_stop(state: State<'_, Shared>, swarm: String, stopped: bool) -> Result<Value, String> {
+    swarm::set_stopped(&swarms_of(&state)?, &swarm, stopped)
+}
+
+#[tauri::command]
+fn swarm_board(
+    state: State<'_, Shared>,
+    swarm: String,
+    offset: Option<u64>,
+) -> Result<Value, String> {
+    swarm::board(&swarms_of(&state)?, &swarm, offset)
 }
 
 /// Your post, over the window's own connection.
@@ -599,7 +625,7 @@ async fn swarm_post(
     text: String,
 ) -> Result<Value, String> {
     let client = state.client.lock().await.clone().ok_or("detached")?;
-    swarm::post(&client, &swarm::root()?, &swarm, None, &text).await
+    swarm::post(&client, &swarms_of(&state)?, &swarm, None, &text).await
 }
 
 #[tauri::command]
@@ -621,8 +647,8 @@ fn main() {
     if args.get(1).map(String::as_str) == Some(swarm::POST_FLAG) {
         std::process::exit(swarm::cli(&args[2..]));
     }
-    if let (Ok(root), Ok(app)) = (swarm::root(), std::env::current_exe()) {
-        swarm::refresh_scripts(&root, &app);
+    if let (Ok(home), Ok(app)) = (swarm::home(), std::env::current_exe()) {
+        swarm::refresh_scripts(&home, &app);
     }
     let config = match config() {
         Ok(config) => config,
@@ -658,6 +684,8 @@ fn main() {
             swarms,
             swarm_create,
             swarm_join,
+            swarm_leave,
+            swarm_discard,
             swarm_stop,
             swarm_board,
             swarm_post
