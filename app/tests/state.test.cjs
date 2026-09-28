@@ -1331,12 +1331,18 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   await p.tick();
   assert.equal(reads, 1);
   assert.equal(p.S.swarms.size, 0);
+  // Once that task is deleted, a bot that takes its name is looked for again.
+  await p.handle({ event: 'deleted', bot: 'app.fix-2' }, 1);
+  p.upsert({ name: 'app.fix-2', id: 5, provider: 'alpha', model: 'one' });
+  await p.handle({ event: 'accepted', bot: 'app.fix-2', turn: 1, durable: true }, 1);
+  await p.tick();
+  assert.equal(reads, 2);
   listed = [swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } })];
   for (const [name, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   await p.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
   await p.handle({ event: 'queued', bot: 'app.latency-2', turn: 1, durable: true }, 1);
   await p.tick();
-  assert.equal(reads, 2, 'one read for the burst');
+  assert.equal(reads, 3, 'one read for the burst');
   assert.deepEqual([...p.S.swarms.keys()], ['app.latency']);
   // A read that failed is tried again at the agent's next turn.
   let failing = true;

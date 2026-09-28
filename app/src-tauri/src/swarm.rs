@@ -529,19 +529,21 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
     let branch = format!("agent/{swarm}");
     // Worktrees and branches are shared by every store: a name another
     // store's swarm holds is taken here too, and the page picks another.
-    let branched = git(&[
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        &format!("refs/heads/{branch}"),
-    ])
-    .output()
-    .await
-    .is_ok_and(|out| out.status.success());
-    if tree.exists() || branched {
-        return Err(format!(
-            "swarm_exists: {swarm} has a worktree or branch already"
-        ));
+    let held = || async {
+        let branched = git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .await
+        .is_ok_and(|out| out.status.success());
+        tree.exists() || branched
+    };
+    let exists = || format!("swarm_exists: {swarm} has a worktree or branch already");
+    if held().await {
+        return Err(exists());
     }
     let added = git(&["worktree", "add", "-b", &branch])
         .arg(&tree)
@@ -550,7 +552,12 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
         .await
         .map_err(|e| format!("git: {e}"))?;
     if !added.status.success() {
-        return Err(format!("worktree_failed: {}", tail(&added.stderr)));
+        // Another store's start may have claimed the name in between.
+        return Err(if held().await {
+            exists()
+        } else {
+            format!("worktree_failed: {}", tail(&added.stderr))
+        });
     }
     let workspace = tree.join(&prefix);
     let setup = project.join(".agents/setup");

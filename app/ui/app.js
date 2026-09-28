@@ -414,8 +414,8 @@ function swarmOfHelper(name) {
   return null;
 }
 // A swarm a coordinator started from its shell shows once its first agent takes its brief: an agent's
-// first turn comes after it joined. Each name is looked for once, so a task named like an agent costs
-// one read of the swarms, not one per event.
+// first turn comes after it joined. Each name is looked for once while its bot lives, so a task named
+// like an agent costs one read of the swarms, not one per event.
 const BRIEFED = new Set(['accepted', 'queued']), SWARM_AGENT = /-\d+$/, looked = new Set();
 let swarmsTimer = null;
 let lookFor = [];
@@ -613,6 +613,8 @@ async function onEvent(ev) {
     }
     case 'deleted': {
       if (S.snapshot) S.deleted.add(name);
+      // A later bot may take the name as a swarm's agent, so it is looked for again.
+      looked.delete(name);
       const p = bot(name)?.project;
       forgetBot(name);
       if (S.selected === name) S.selected = p && S.bots.has(p + LEAD) ? p + LEAD : S.bots.keys().next().value ?? '';
