@@ -533,14 +533,20 @@ daemon learns nothing about projects; everything here is client work.
   `PROJECT.lead`, the id its shell names still that bot's), reaches the
   daemon that shell belongs to, starts the swarm in the coordinator's
   project and folder through the same Rust start as the sheet, and prints
-  the swarm, its agents' names and its board's path. The app's
+  the swarm, its agents' names and its board's path. Without rows its
+  agents get the model of the coordinator's current turn (`AGENT_MODEL`).
+  The start runs in a process group of its own, so a shell that gives up
+  on it (its timeout, or its turn ending) cannot cut it off between making
+  a worktree and undoing it; the role asks for a ten-minute shell timeout.
+  When the goal's name and eight more are all taken it makes nothing. The app's
   [coordinator.md](../app/agents/coordinator.md) says when and how to run
   it. A window learns of a swarm it did not start when an agent it does
   not know, named like an agent (`-N`), takes a turn: it reads the swarms
   again once for a burst of those, and at most once for each such name.
 - **The roles as files.** Settings lists the app's `coordinator` and
   `swarm` roles and whether you have your own file for each. Edit writes
-  `~/.agents/agents/NAME.md` from the app's text only when it is missing,
+  `~/.agents/agents/NAME.md` from the app's text only when it is missing
+  (whole beside it, then linked into place),
   then opens it with `open -t` (`xdg-open` elsewhere). The file is the
   user's profile of that name, read in every folder that has none of its
   own. A bot's instructions are fixed when it is made, so an edit applies

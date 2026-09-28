@@ -1026,8 +1026,14 @@ pub async fn start(
             k => format!("{}.{base}-{k}", start.project),
         };
         let taken = |error: &str| error.starts_with("swarm_exists") && tries < NAME_TRIES;
-        if tries < NAME_TRIES && named_already(client, &full).await? {
-            continue;
+        if named_already(client, &full).await? {
+            if tries < NAME_TRIES {
+                continue;
+            }
+            return Err(format!(
+                "swarm_exists: {full} and the {} names before it are taken; give the goal other words",
+                NAME_TRIES - 1
+            ));
         }
         let dir = match claim(root, &full) {
             Ok(dir) => dir,
@@ -2447,6 +2453,9 @@ pub fn cli(args: &[String]) -> i32 {
     }
 }
 
+/// Set in the start's own process, which runs apart from the shell's group.
+const ALONE: &str = "AGENT_SWARM_START_ALONE";
+
 /// What `start` takes from a coordinator's shell, besides the goal after `--`.
 const START_USAGE: &str = "usage: start [--agents N] [--budget MILLIONS] [--council 3] [--in-project] [--row MODEL,SHARE[,IDENTITY]]... -- GOAL";
 
@@ -2547,6 +2556,26 @@ pub fn start_cli(args: &[String]) -> i32 {
         Ok(asked) => asked,
         Err(error) => return fail(error),
     };
+    // A shell that gives up on the start, at its timeout or when its turn
+    // ends, kills its process group. The start runs in a group of its own,
+    // so it always finishes or undoes what it made, and this process relays
+    // its answer while the shell waits.
+    if std::env::var_os(ALONE).is_none() {
+        use std::os::unix::process::CommandExt;
+        let status = std::env::current_exe().and_then(|app| {
+            std::process::Command::new(app)
+                .arg(START_FLAG)
+                .args(args)
+                .env(ALONE, "1")
+                .stdin(std::process::Stdio::null())
+                .process_group(0)
+                .status()
+        });
+        return match status {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(error) => fail(error.to_string()),
+        };
+    }
     let lead = std::env::var("AGENT_BOT").unwrap_or_default();
     let id = std::env::var("AGENT_BOT_ID")
         .ok()
@@ -2585,10 +2614,15 @@ pub fn start_cli(args: &[String]) -> i32 {
             if me["id"].as_i64() != Some(id) {
                 return Err(format!("{lead} is not this shell's bot any more"));
             }
+            // This turn's model, which the shell names, else the bot's own.
+            let model = std::env::var("AGENT_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| format!("{provider}/{model}"));
             let mix = if asked.mix.is_empty() {
                 vec![Mix {
                     identity: String::new(),
-                    model: format!("{provider}/{model}"),
+                    model,
                     share: 100,
                 }]
             } else {
@@ -3745,6 +3779,42 @@ mod tests {
         );
         // Other swarms' scripts are refreshed around it.
         refresh_scripts(&home, Path::new("/Apps/agent-app"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn a_start_whose_every_name_is_held_makes_nothing() {
+        let home = scratch("names-held");
+        let (root, project) = (home.join("swarms"), home.join("project"));
+        std::fs::create_dir_all(&project).unwrap();
+        let fake = Fake::start(
+            "names-held",
+            Box::new(|op, _| match op {
+                "resume" => Ok(json!({"id": 7})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let start = Start {
+            project: "p".into(),
+            folder: project,
+            goal: "Ship it".into(),
+            shared: false,
+            mix: vec![Mix {
+                identity: String::new(),
+                model: "a/x".into(),
+                share: 100,
+            }],
+            agents: 1,
+            budget_tokens: 1_000,
+            council: 0,
+        };
+        let error = rt
+            .block_on(super::start(&client, &root, Path::new("/app"), start))
+            .unwrap_err();
+        assert!(error.starts_with("swarm_exists: p.ship-9"), "{error}");
+        assert!(!root.exists() || std::fs::read_dir(&root).unwrap().next().is_none());
         std::fs::remove_dir_all(home).unwrap();
     }
 

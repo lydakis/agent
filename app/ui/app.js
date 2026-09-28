@@ -418,12 +418,14 @@ function swarmOfHelper(name) {
 // one read of the swarms, not one per event.
 const BRIEFED = new Set(['accepted', 'queued']), SWARM_AGENT = /-\d+$/, looked = new Set();
 let swarmsTimer = null;
+let lookFor = [];
 function swarmsSoon(name) {
-  if (looked.has(name)) return; looked.add(name);
+  if (looked.has(name)) return; looked.add(name); lookFor.push(name);
   if (swarmsTimer) return;
   swarmsTimer = setTimeout(async () => {
-    swarmsTimer = null; const before = new Set(S.swarms.keys());
-    try { await loadSwarms(); } catch (e) { Daemon.log?.(`swarms: ${e?.message ?? e}`); return; }
+    swarmsTimer = null; const before = new Set(S.swarms.keys()), names = lookFor; lookFor = [];
+    // A read that failed looks again at these names' next turn.
+    try { await loadSwarms(); } catch (e) { for (const n of names) looked.delete(n); Daemon.log?.(`swarms: ${e?.message ?? e}`); return; }
     const added = [...S.swarms.keys()].filter((n) => !before.has(n));
     if (added.length) { toast(`swarm ${added.join(', ')} started`, 4000); render(); }
   }, 200);

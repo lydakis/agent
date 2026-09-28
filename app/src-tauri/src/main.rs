@@ -246,20 +246,24 @@ fn own_role(home: &std::path::Path, name: &str) -> Result<PathBuf, String> {
     let dir = home.join(".agents/agents");
     let path = dir.join(format!("{name}.md"));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(text.as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("{}: {error}", path.display())),
+    if path.exists() {
+        return Ok(path);
     }
+    // Written whole beside it, then linked into place only if still absent:
+    // a failed write leaves no half a role that later reads take for yours.
+    let temporary = dir.join(format!(".{name}.md.{}", std::process::id()));
+    let made = (|| {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        match std::fs::hard_link(&temporary, &path) {
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => Err(error),
+            _ => std::fs::File::open(&dir)?.sync_all(),
+        }
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    made.map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
 
@@ -544,6 +548,12 @@ mod policy_tests {
                 .unwrap_err()
                 .starts_with("profile_not_found")
         );
+        // Nothing but the role is left beside it.
+        let names: Vec<_> = std::fs::read_dir(home.join(".agents/agents"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["coordinator.md"]);
         std::fs::remove_dir_all(home).unwrap();
     }
 

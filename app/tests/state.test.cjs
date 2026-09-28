@@ -1338,6 +1338,18 @@ test('a swarm a coordinator started from its shell shows once its first agent ta
   await p.tick();
   assert.equal(reads, 2, 'one read for the burst');
   assert.deepEqual([...p.S.swarms.keys()], ['app.latency']);
+  // A read that failed is tried again at the agent's next turn.
+  let failing = true;
+  const q = shell({ swarms: async () => { reads += 1; if (failing) throw new Error('unavailable'); return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  q.S.live = true;
+  q.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  await q.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
+  await q.tick();
+  assert.equal(q.S.swarms.size, 0);
+  failing = false;
+  await q.handle({ event: 'accepted', bot: 'app.latency-1', turn: 2, durable: true }, 1);
+  await q.tick();
+  assert.deepEqual([...q.S.swarms.keys()], ['app.latency']);
   assert.equal(p.S.memberOf.get('app.latency-2'), 'app.latency');
 });
 
