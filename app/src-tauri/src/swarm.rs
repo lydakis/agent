@@ -988,10 +988,12 @@ async fn enlist(
             left.join(", "),
             others.join(", ")
         );
+        let stamp = stamp();
         let told = (made.iter()).filter(|(name, _, _)| joined.members.contains(name));
-        for (name, _, _) in told {
+        for (i, (name, _, _)) in told.enumerate() {
             let params = json!({
-                "bot": name, "bot_id": joined.ids.get(name), "prompt": prompt, "delivery": "steer",
+                "bot": name, "bot_id": joined.ids.get(name), "request_id": format!("{stamp}-{i}"),
+                "prompt": prompt, "delivery": "steer",
             });
             let _ = client.request("submit", params).await;
         }
@@ -1054,9 +1056,11 @@ pub async fn leave(
     // swarm tells nobody; the board says it for when it resumes.
     // A send that failed is in the answer; the board keeps what it said.
     let mut missed = Vec::new();
-    for (member, prompt) in told.into_iter().filter(|_| !s.stopped) {
+    let stamp = stamp();
+    for (i, (member, prompt)) in told.into_iter().filter(|_| !s.stopped).enumerate() {
         let params = json!({
-            "bot": member, "bot_id": s.ids.get(&member), "prompt": prompt, "delivery": "steer",
+            "bot": member, "bot_id": s.ids.get(&member), "request_id": format!("{stamp}-{i}"),
+            "prompt": prompt, "delivery": "steer",
         });
         if let Err(error) = client.request("submit", params).await {
             missed.push(json!({"agent": s.short(&member), "error": error.to_string()}));
@@ -1449,7 +1453,7 @@ pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Valu
     let dir = folder(root, swarm)?;
     let board = lock_board_async(&dir).await?;
     let at = dir.clone();
-    let (board, s, state) = tokio::task::spawn_blocking(move || {
+    let (mut board, s, state) = tokio::task::spawn_blocking(move || {
         let mut s = Swarm::read(&at)?;
         s.stopped = true;
         s.write(&at)?;
@@ -1492,18 +1496,36 @@ pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Valu
         // A member given a turn meanwhile, from another window, is ended
         // again; a helper once.
         match scan(client, &s, &roots).await {
-            Ok(seen) => {
+            Ok(mut seen) => {
                 roots.extend(&seen.roots);
                 next.extend(
-                    (seen.turns.into_iter())
+                    (std::mem::take(&mut seen.turns).into_iter())
                         .filter(|(_, turn)| turn.is_some())
                         .map(|(m, _)| (m.clone(), s.ids.get(&m).copied(), true)),
                 );
                 next.extend(
-                    (seen.helpers.into_iter())
+                    (std::mem::take(&mut seen.helpers).into_iter())
                         .filter(|(h, _)| !ended.contains(h))
                         .map(|(h, id)| (h, Some(id), false)),
                 );
+                // Kept at once, with every root Stop knows of, so a Stop
+                // that fails or is cancelled after this look leaves the next
+                // one able to find a helper whose maker is gone.
+                let (at, known) = (dir.clone(), roots.clone());
+                let kept;
+                (board, kept) = tokio::task::spawn_blocking(move || {
+                    let kept = locked_with(&mut board, &at, |state| {
+                        seen.record(state);
+                        state.roots = known;
+                        Ok((Vec::new(), ()))
+                    });
+                    (board, kept)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Err(error) = kept {
+                    failed.push(json!({"agent": "helpers", "error": error}));
+                }
             }
             Err(error) => failed.push(json!({"agent": "helpers", "error": error})),
         }
@@ -1521,7 +1543,6 @@ pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Valu
     } else {
         // A stopped swarm tells nobody who holds a seat or leads now.
         let at = dir.clone();
-        let mut board = board;
         tokio::task::spawn_blocking(move || depart(&mut board, &at, &gone))
             .await
             .map_err(|e| e.to_string())??
@@ -1686,7 +1707,7 @@ async fn brief_all(
     made: &[Made],
     late: bool,
 ) -> Vec<(String, agent_client::Error)> {
-    let stamp = format!("app-swarm-{}-{}", now_ms(), std::process::id());
+    let stamp = stamp();
     let mut sends = tokio::task::JoinSet::new();
     for (i, (name, _, record)) in made.iter().enumerate() {
         let params = json!({
@@ -2154,6 +2175,14 @@ async fn lock_board_async(dir: &Path) -> Result<std::fs::File, String> {
     tokio::task::spawn_blocking(move || lock_board(&dir))
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// Request ids for one batch of submits, `{stamp}-{i}`: distinct per
+/// batch, even for two in one millisecond from one process.
+fn stamp() -> String {
+    static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("app-swarm-{}-{}-{n}", now_ms(), std::process::id())
 }
 
 fn now_ms() -> u64 {
@@ -2801,10 +2830,7 @@ pub async fn act(
         }
         Ok((lines, (sends, answer)))
     })?;
-    // Distinct per post, even for two in one millisecond from one process.
-    static POSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stamp = format!("swarm-{}-{}-{n}", now_ms(), std::process::id());
+    let stamp = stamp();
     let mut submits = tokio::task::JoinSet::new();
     for (i, (member, reach, prompt, authored)) in sends.into_iter().enumerate() {
         let mut params = json!({
@@ -4083,7 +4109,13 @@ mod tests {
                         let request: Value = serde_json::from_str(&line).unwrap();
                         let op = request["op"].as_str().unwrap().to_owned();
                         kept.lock().unwrap().push((op.clone(), request.clone()));
-                        let reply = match answer(&op, &request) {
+                        // The daemon refuses a submit without one.
+                        let answered = if op == "submit" && !request["request_id"].is_string() {
+                            Err("invalid_request".to_owned())
+                        } else {
+                            answer(&op, &request)
+                        };
+                        let reply = match answered {
                             Ok(result) => json!({"id": request["id"], "result": result}),
                             Err(code) => {
                                 json!({"id": request["id"], "error": code, "detail": "fake"})
@@ -4938,6 +4970,71 @@ mod tests {
         let out = rt.block_on(stop(&client, &root, &s.name)).unwrap();
         assert_eq!(out["failed"], json!([]));
         let ended: Vec<Value> = (fake.ops("interrupt").iter())
+            .map(|i| i["bot"].clone())
+            .collect();
+        assert!(
+            ended.contains(&json!("agent.latency-1.fix.deep")),
+            "{ended:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stop_retried_finds_a_helper_whose_maker_the_first_saw_and_lost() {
+        let root = scratch("retry");
+        let s = swarm(&[&agent(1)]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let looked = looks.clone();
+        let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let once = refused.clone();
+        let fake = Fake::start(
+            "retry",
+            Box::new(move |op, request| match op {
+                // fix shows only at the first Stop's first look; deep, which
+                // fix made, only after.
+                "bots" => {
+                    let first = looked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+                    let mut bots = vec![json!({"name": agent(1), "id": 1})];
+                    bots.push(if first {
+                        json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1})
+                    } else {
+                        json!({"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40})
+                    });
+                    Ok(json!({"bots": bots, "next_after": null}))
+                }
+                "resume" => Ok(json!({"id": match request["bot"].as_str().unwrap() {
+                    "agent.latency-1.fix" => 40,
+                    "agent.latency-1.fix.deep" => 41,
+                    _ => 1,
+                }})),
+                "turns" => {
+                    Ok(json!({"turns": [{"turn": 2, "status": "running"}], "next_after": null}))
+                }
+                // deep's turn will not end the first time.
+                "interrupt"
+                    if request["bot"] == "agent.latency-1.fix.deep"
+                        && !once.swap(true, std::sync::atomic::Ordering::Relaxed) =>
+                {
+                    Err("busy".into())
+                }
+                "interrupt" => Ok(json!({"interrupt_requested": true})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let out = rt.block_on(stop(&client, &root, &s.name)).unwrap();
+        assert_eq!(
+            out["failed"][0]["agent"],
+            json!("latency-1.fix.deep"),
+            "{out}"
+        );
+        let before = fake.ops("interrupt").len();
+        let out = rt.block_on(stop(&client, &root, &s.name)).unwrap();
+        assert_eq!(out["failed"], json!([]));
+        let ended: Vec<Value> = (fake.ops("interrupt").into_iter().skip(before))
             .map(|i| i["bot"].clone())
             .collect();
         assert!(

@@ -570,7 +570,9 @@ daemon learns nothing about projects; everything here is client work.
   a helper deleted since counts on (`gone`) with what that look saw it use;
   what it used after that look is not counted. It keeps where each helper
   comes from too (`roots`), so a helper whose maker was deleted still
-  counts and still stops, as long as a look saw its maker first. Each act that reads the daemon's list, and a check the page
+  counts and still stops, as long as a look saw its maker first; Stop keeps
+  what each of its looks saw, so a Stop tried again after one that failed
+  still finds such a helper. Each act that reads the daemon's list, and a check the page
   asks for at most every five seconds a swarm as its agents finish turns,
   tells the working agents when the swarm passes 50%, 75% or 90% of its
   budget: a `budget` line on the board, each share once (`state.json`
