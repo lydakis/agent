@@ -1331,7 +1331,8 @@ function renderSwarm(el, sw) {
 // A goal, how many agents, what they are, where they work, and a budget they share. What they are is
 // a mix: rows of an identity (a profile the folder offers, or a plain agent), a model, and a share,
 // shown as the whole agents it makes at the size picked.
-const SWARM_SIZES = [2, 4, 6, 8, 12, 16], SWARM_BUDGETS = [[1e6, '1M tokens'], [3e6, '3M tokens'], [1e7, '10M tokens']];
+// A swarm starts with up to 64 agents, as the app's side takes; Add goes on from there.
+const MAX_AGENTS = 64, SWARM_BUDGETS = [[1e6, '1M tokens'], [3e6, '3M tokens'], [1e7, '10M tokens']];
 const MIX_ROWS = 8;
 let sheetFor = null;
 const sheet = { models: [], profiles: [], mix: [] };
@@ -1347,7 +1348,7 @@ async function openSwarmSheet(project) {
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
-    <div class="row"><div><label for="sw-n">Agents</label>${sel('sw-n', SWARM_SIZES.map((n) => [n, String(n)]), 4)}</div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
+    <div class="row"><div><label for="sw-n">Agents</label><input id="sw-n" type="number" min="1" max="${MAX_AGENTS}" step="1" value="4"></div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
     <label>Made of</label><div id="sw-mix" class="mix"></div>
     <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: each agent takes a piece'], [3, 'A council of 3 approves streams of work']], 0)}
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
@@ -1355,6 +1356,9 @@ async function openSwarmSheet(project) {
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
   setTimeout(() => $('sw-goal').focus?.(), 0);
 }
+// Any whole number of agents typed; the counts show nothing until it is one.
+function agentCount() { const n = Number($('sw-n')?.value); return Number.isInteger(n) && n >= 1 && n <= MAX_AGENTS ? n : 0; }
+const sheetProblem = (n) => (n ? mixProblem(sheet.mix) : `Agents is a whole number from 1 to ${MAX_AGENTS}`);
 // The mix's rows, each with how many agents it makes, and what is wrong with it if anything.
 function mixProblem(mix) {
   const total = mix.reduce((a, r) => a + (Number(r.share) || 0), 0);
@@ -1364,7 +1368,7 @@ function mixProblem(mix) {
   return null;
 }
 function renderMix() {
-  const n = Number($('sw-n')?.value ?? 4), problem = mixProblem(sheet.mix);
+  const n = agentCount(), problem = sheetProblem(n);
   const counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n));
   const identities = [['', 'Plain agent'], ...sheet.profiles.map((p) => [p.name, p.name])];
   const row = (r, i) => `<div class="mixrow"><select data-mix="${i}" data-f="identity" aria-label="Identity">${identities.map(([v, l]) => `<option value="${esc(v)}"${v === r.identity ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${modelSelectHTML(`sw-model-${i}`, sheet.models, r.model).replace('<select ', `<select data-mix="${i}" data-f="model" `)}<span class="share"><input type="number" min="1" max="100" step="1" value="${esc(r.share)}" data-mix="${i}" data-f="share" aria-label="Share in percent">%</span><span class="count${counts && !counts[i] ? ' none' : ''}">${counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''}</span>${sheet.mix.length > 1 ? `<button type="button" class="x" data-act="mix-remove" data-v="${i}" title="Remove this row">×</button>` : '<span class="x"></span>'}</div>`;
@@ -1394,15 +1398,15 @@ function mixChange(el) {
 function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); focusInput('main'); }
 $('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n') renderMix(); });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
-$('sheet').addEventListener('input', (e) => { if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = Number($('sw-n').value), problem = mixProblem(sheet.mix), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
+$('sheet').addEventListener('input', (e) => { if (e.target.id === 'sw-n') { renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
-    const problem = mixProblem(sheet.mix); if (problem) throw new Error(problem);
+    const n = agentCount(), problem = sheetProblem(n); if (problem) throw new Error(problem);
     const mix = sheet.mix.map((r) => ({ identity: r.identity, model: r.model, share: r.share }));
-    await createSwarm(project, { goal: $('sw-goal').value, n: Number($('sw-n').value), mix, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value), council: Number($('sw-org').value) });
+    await createSwarm(project, { goal: $('sw-goal').value, n, mix, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value), council: Number($('sw-org').value) });
     closeSheet();
   } catch (err) { toast(String(err?.message ?? err), 6000); start.disabled = false; start.textContent = 'Start swarm'; }
 });

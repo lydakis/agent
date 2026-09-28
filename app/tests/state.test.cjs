@@ -1173,10 +1173,16 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
   });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
   const el = (id) => p.context.document.getElementById(id);
-  el('sw-n').value = '4';
+  el('sw-n').value = '4'; el('sw-n').id = 'sw-n';
   await p.openSwarmSheet('app');
   assert.match(el('sw-mix').innerHTML, /<option value="" selected>Plain agent<\/option><option value="reviewer">reviewer<\/option>/);
   assert.match(el('sw-mix').innerHTML, /4 agents/);
+  // Any whole number of agents can be typed; anything else says what it takes.
+  el('sw-n').value = '23'; el('sheet').listeners.input({ target: el('sw-n') });
+  assert.match(el('sw-mix').innerHTML, /23 agents/);
+  el('sw-n').value = '2.5'; el('sheet').listeners.input({ target: el('sw-n') });
+  assert.match(el('sw-mix').innerHTML, /Agents is a whole number from 1 to 64/);
+  el('sw-n').value = '4'; el('sheet').listeners.input({ target: el('sw-n') });
   await p.act({ dataset: { act: 'mix-add' } });
   assert.equal((el('sw-mix').innerHTML.match(/2 agents/g) ?? []).length, 2);
   // Picking an identity picks the model its profile names.

@@ -404,7 +404,7 @@ daemon learns nothing about projects; everything here is client work.
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
 - **Swarms.** Also the app's opinion; the daemon learns nothing new. A
-  project's ⋯ menu has **New swarm**: a goal, 2 to 16 agents, a mix, where
+  project's ⋯ menu has **New swarm**: a goal, any number of agents up to 64 (typed), a mix, where
   they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
   `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
   project folder), and a token budget split evenly among them. A goal is
