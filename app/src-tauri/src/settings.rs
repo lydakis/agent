@@ -69,11 +69,11 @@ fn assigned(line: &str) -> Option<&str> {
     Some(key.trim_end())
 }
 
-/// `text` with each named setting set to its value, or removed for null or
-/// an empty value. An empty key is written empty instead: it hides a key the
-/// login shell exports, which a start would otherwise detect as a provider.
-/// Every other line is kept as it was, and a setting given twice keeps only
-/// its first place.
+/// `text` with each named setting set to its value, or removed for null, so
+/// the login shell's applies again. An empty value is written empty: a start
+/// unsets it, clearing what the shell exports (a profile, or a key it would
+/// detect as a provider). Every other line is kept as it was, and a setting
+/// given twice keeps only its first place.
 pub fn edit(text: &str, changes: &Map<String, Value>) -> Result<String, String> {
     let mut wanted = Vec::new();
     for (key, value) in changes {
@@ -82,10 +82,6 @@ pub fn edit(text: &str, changes: &Map<String, Value>) -> Result<String, String> 
         }
         let value = match value {
             Value::Null => None,
-            Value::String(_) if SECRET.contains(&key.as_str()) && value.as_str() == Some("") => {
-                Some("")
-            }
-            Value::String(value) if value.trim().is_empty() => None,
             Value::String(value) => Some(value.trim()),
             _ => return Err(format!("settings_invalid: {key} must be text")),
         };
@@ -210,8 +206,8 @@ mod tests {
                 "AWS_REGION": "us-west-2",
                 "OPENAI_API_KEY": null,
                 "AGENT_PROVIDER": "bedrock chatgpt",
-                "AWS_PROFILE": "  ",
-                "ANTHROPIC_API_KEY": "",
+                "AWS_PROFILE": null,
+                "ANTHROPIC_API_KEY": "  ",
             })),
         )
         .unwrap();

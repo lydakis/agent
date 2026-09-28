@@ -22,7 +22,6 @@ struct Config {
     /// The store the socket was derived from; a daemon is started only for
     /// a store, never behind an explicit socket.
     store: Option<PathBuf>,
-    model: Option<String>,
     workspace: String,
 }
 
@@ -50,7 +49,7 @@ const PULL: usize = 256;
 /// short socket the daemon listens on.
 fn config() -> Result<Config, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut socket, mut store, mut model, mut workspace) = (None, None, None, None);
+    let (mut socket, mut store, mut workspace) = (None, None, None);
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -71,7 +70,6 @@ fn config() -> Result<Config, String> {
         match flag {
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--store" => store = Some(PathBuf::from(value()?)),
-            "--model" => model = Some(value()?),
             "--workspace" => workspace = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -104,7 +102,6 @@ fn config() -> Result<Config, String> {
     Ok(Config {
         socket,
         store,
-        model: model.or_else(|| std::env::var("AGENT_MODEL").ok()),
         workspace,
     })
 }
@@ -174,16 +171,12 @@ mod config_tests {
     }
 }
 
-/// What the page needs to create bots and to say where it is.
-/// A window opened from the Dock has no `AGENT_MODEL` of its own; the model
-/// is then `~/.agent/env`'s. The login shell's comes later, from
-/// `default_model`, so a slow profile never delays attaching.
+/// What the page needs to create bots and to say where it is. There is no
+/// default model: each project and agent is given its own.
 #[tauri::command]
 fn setup(state: State<'_, Shared>) -> Result<Value, String> {
-    let model = state.config.model.clone().or_else(daemon::file_model);
     Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
-        "model": model,
         "workspace": state.config.workspace,
         "tools": ["shell", "read", "write", "edit", "wait", "history"],
     }))
@@ -228,13 +221,6 @@ fn write_project(dir: String, name: String, model: String) -> Result<(), String>
     )
 }
 
-/// `AGENT_MODEL` as a daemon this app starts would see it, the login shell's
-/// included. Read again on each call: `~/.agent/env` may have been repaired.
-#[tauri::command]
-async fn default_model() -> Option<String> {
-    daemon::model().await
-}
-
 /// The models to offer, read from `~/.agent/models` each time, so an edit
 /// shows without a restart. The daemon has no list.
 /// The branch a bot's folder has checked out when it is a linked git
@@ -253,9 +239,10 @@ fn models() -> Result<Value, String> {
 }
 
 /// What a daemon this app starts would run with: its providers, the AWS
-/// region and profile, and which keys are set (never their values).
+/// region and profile, and which keys are set (never their values), and
+/// whether this window can restart its daemon to apply a change.
 #[tauri::command]
-async fn settings() -> Result<Value, String> {
+async fn settings(state: State<'_, Shared>) -> Result<Value, String> {
     let file = match daemon::env_file() {
         Some(path) => daemon::read_env_file(&path)?,
         None => Vec::new(),
@@ -269,7 +256,9 @@ async fn settings() -> Result<Value, String> {
             &inherited
         }
     };
-    Ok(settings::view(&file, Some(environment)))
+    let mut view = settings::view(&file, Some(environment));
+    view["restartable"] = json!(state.agent.is_some() && state.config.store.is_some());
+    Ok(view)
 }
 
 /// Set or remove settings in `~/.agent/env`; they reach the daemon when it
@@ -555,7 +544,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             setup,
-            default_model,
             policy,
             branch,
             models,

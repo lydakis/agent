@@ -12,7 +12,6 @@ window.Daemon = (() => {
     return {
       log,
       setup: () => invoke('setup'),
-      defaultModel: () => invoke('default_model'),
       policy: (workspace, profile) => invoke('policy', { workspace: workspace ?? null, profile: profile ?? null }),
       models: () => invoke('models'),
       settings: () => invoke('settings'),
@@ -33,7 +32,7 @@ window.Daemon = (() => {
   // `?first` opens as a first run: nothing connected, no model, no projects.
   const FIRST = /[?&]first\b/.test(globalThis.location?.search ?? '');
   // The settings a started daemon would get, and what each provider lists.
-  const ENV = FIRST ? {} : { AGENT_PROVIDER: 'openai anthropic', AGENT_MODEL: 'openai/gpt-6-luna', OPENAI_API_KEY: 'demo', ANTHROPIC_API_KEY: 'demo' };
+  const ENV = FIRST ? {} : { AGENT_PROVIDER: 'openai anthropic', OPENAI_API_KEY: 'demo', ANTHROPIC_API_KEY: 'demo' };
   const LISTS = {
     openai: [{ id: 'gpt-6-luna' }, { id: 'gpt-6-sol' }],
     anthropic: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }],
@@ -231,7 +230,7 @@ window.Daemon = (() => {
   }
 
   const api = {
-    setup: async () => ({ socket: 'demo', model: ENV.AGENT_MODEL ?? null, workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    setup: async () => ({ socket: 'demo', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
     settings: async () => ({ providers: specs(), region: ENV.AWS_REGION ?? null, profile: ENV.AWS_PROFILE ?? null, keys: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK'].filter((k) => ENV[k]) }),
     saveSettings: async (changes) => { for (const [k, v] of Object.entries(changes)) { if (v) ENV[k] = v; else delete ENV[k]; } },
     restartDaemon: async () => { await wait(400); },
@@ -252,7 +251,7 @@ window.Daemon = (() => {
       if (!specs().length) throw new Error('no_provider: connect a provider in Settings');
       if (!S.bots.size && !FIRST) {
         // Two projects: a coordinator is a bot named `<project>.lead`, and its tasks nest under it.
-        const { model } = await api.setup();
+        const model = 'openai/gpt-6-luna';
         await create('demo.lead', model);
         const t = start('demo.lead', 'what does the daemon do when a bot is busy?');
         emit({ event: 'message', bot: 'demo.lead', turn: t, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three answers, chosen per submission: reject it, queue it behind the running turn, or steer it into that turn as a mid-flight message. The client sends the mode every time; the daemon has no default of its own.' }] }) } });

@@ -164,10 +164,9 @@ the environment of the user's login shell (`$SHELL -l -i`), plus
 (`export` and quotes allowed, `#` comments), refused unless it is a regular
 file of at most 64 KiB that only its owner can read. That file is the app's; the CLI and the daemon never read it.
 [Settings](#setup-and-settings) writes it.
-The login shell is read once per app run, and without `--model` or
-`AGENT_MODEL` of its own the app takes its default model from the file, then
-the shell; the shell's is looked up beside the attach, so a slow profile never
-delays it. The
+The login shell is read once per app run. A value the file sets empty is
+unset for the start, so Settings can clear what the shell exports. There is
+no default model: a project or agent is given its own when it is made. The
 store and socket themselves are resolved from the app's own arguments and
 environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
@@ -217,14 +216,14 @@ write access to the tap.
 
 ```sh
 cargo build --release -p agent-app
-AGENT_MODEL=anthropic/claude-sonnet-5 .local/target/release/agent-app \
+.local/target/release/agent-app \
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
 Without `--workspace` the workspace is the launching directory, or home when
 that is `/`, as for a window opened from the Dock. Arguments and environment
-are the CLI's: `--socket`, `--store`, `--model`,
-`--workspace`, `AGENT_SOCKET`, `AGENT_STORE`, `AGENT_MODEL`, and a store's
+are the CLI's: `--socket`, `--store`, `--workspace`, `AGENT_SOCKET`,
+`AGENT_STORE`, and a store's
 socket is resolved the way the CLI and the daemon resolve it (the shared
 client crate's rendezvous), so a deep store path meets the same short socket.
 The page draws with the machine's own monospace face and fetches nothing.
@@ -265,23 +264,26 @@ first run and later changes:
    starts a daemon with the new settings, and asks every provider for its
    models. Each row then shows its model count, or its refusal with a Retry.
    A key is never read back into the page: the core reports only which keys
-   are set, and a key field left empty keeps the saved one. Removing a
-   provider drops its key unless another provider uses it; removing the last
-   one also writes an empty value for each key the shell exports, since a
-   start with no provider named would otherwise detect one from it. Refresh
+   are set, and a key field left empty keeps the saved one; any other field
+   left empty is saved empty, which clears the shell's value too (an AWS
+   profile, say). Removing a provider drops its key unless another provider
+   uses it; removing the last one also empties each key the shell exports,
+   since a start with no provider named would otherwise detect one from it,
+   and the window then waits for a provider instead of retrying. Refresh
    models asks again and writes the answer to `~/.agent/models`, replacing
    it: a provider that answers replaces its lines, one that fails keeps the
    lines it had, one no longer running loses them, and an answer with no
    usable model leaves the file as it was. A file that no longer reads is
-   replaced whole. A change that would make `~/.agent/env` larger than a
-   start accepts (64 KiB) is refused.
+   replaced whole. Pickers offer only the models of connected providers. A
+   change that would make `~/.agent/env` larger than a start accepts
+   (64 KiB) is refused.
 2. **First project**, shown until one exists: a folder and a model, the
    models listed under their providers, then New project's path.
 
 It opens on its own when a daemon cannot start for lack of a provider, and
 once when a window first attaches to a store with no agents. An
 `agent` the app did not bundle, or an explicit `--socket`, cannot be
-restarted; Settings says so.
+restarted, so Settings saves no provider change there and says why.
 
 ## Projects and panes
 

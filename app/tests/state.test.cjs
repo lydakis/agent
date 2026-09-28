@@ -111,17 +111,6 @@ test('retries cannot overlap a slow snapshot and a lost attachment retries after
   assert.equal(p.S.attached, true);
 });
 
-test('a slow login-shell model lookup never delays attaching, and a later answer fills the default', async () => {
-  const lookup = deferred(); let lookups = 0, setups = 0;
-  const p = page({ setup: async () => (++setups, {}), defaultModel: () => (++lookups, lookup.promise), attach: async () => ({ session: 1 }), pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
-  await p.attach(); await settle();
-  assert.equal(p.S.attached, true);
-  assert.equal(lookups, 1);
-  lookup.resolve('anthropic/model-x'); await settle();
-  assert.equal(p.S.config.model, 'anthropic/model-x');
-  assert.equal(setups, 1);
-});
-
 test('stream rendering appends only new characters and resets between messages', () => {
   const p = page(); assert.equal(typeof p.renderTail, 'function');
   const t = p.transcript('Bob'); t.streamingTurn = 1;
@@ -903,12 +892,14 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   p.S.selected = '';
   await assert.rejects(p.createProject('/synthetic/taken'), /demo\.lead already belongs to \/synthetic\/first/);
   assert.equal(p.S.selected, ''); assert.equal(calls.length, 0);
-  await assert.rejects(p.createProject('/synthetic/weather'), /create_failed/);
+  await assert.rejects(p.createProject('/synthetic/weather'), /model_required/);
+  assert.equal(calls.length, 0, 'there is no default model to fall back on');
+  await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /create_failed/);
   assert.deepEqual(calls.map(([op]) => op), ['create'], 'a model the daemon refuses is not saved to the folder');
   fail = false; failWrite = true;
-  await assert.rejects(p.createProject('/synthetic/weather'), /project_unwritable/);
+  await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /project_unwritable/);
   assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
-  failWrite = false; await p.createProject('/synthetic/weather');
+  failWrite = false; await p.createProject('/synthetic/weather', 'alpha/one');
   assert.deepEqual(calls.at(-1), ['write', '/synthetic/weather', 'alpha/one'], 'a retry writes the missing file with the coordinator\'s model');
   assert.equal(calls.filter(([op]) => op === 'create').length, 2);
   assert.equal(p.S.selected, 'weather.lead');
@@ -1171,7 +1162,8 @@ test('connecting a provider keeps the others, saves only what was typed, restart
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
   // Only providers are saved; the empty key field keeps whatever key was saved.
   assert.deepEqual(calls.map(([c]) => c), ['save', 'restart', 'attach', 'discover']);
-  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: null });
+  // An empty profile is saved empty, so a start clears one the shell exports too.
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: '' });
   assert.deepEqual(JSON.parse(JSON.stringify(p.S.setup.status)), { openai: { models: 1 }, bedrock: { models: 2 }, 'bedrock-openai': { models: 1 } });
   assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt', 'bedrock/claude', 'bedrock/haiku', 'bedrock-openai/grok']);
   // One row and one model group for Bedrock, whichever of its APIs serves a model.
@@ -1217,7 +1209,7 @@ test('removing the last provider hides a key the shell exports, so the next star
   const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-west-2', OPENAI_API_KEY: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
   await p.removeProvider('bedrock');
-  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: null, AWS_BEARER_TOKEN_BEDROCK: null, OPENAI_API_KEY: '' });
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: '', AWS_BEARER_TOKEN_BEDROCK: null, OPENAI_API_KEY: '' });
   // The daemon then has nothing to run, which is where removing the last provider should end.
   assert.equal(p.S.setup.error, null);
   assert.equal(calls.filter(([c]) => c === 'discover').length, 0);
@@ -1238,6 +1230,34 @@ test('a first launch with a provider but no agents opens setup on the first proj
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(p.S.setup.open, true);
   assert.match(p.setupHTML(), /First project/);
+});
+
+test('the list offers only models of connected providers', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  p.context.Daemon.models = async () => [{ id: 'openai/gpt' }, { id: 'anthropic/claude' }];
+  await p.openSetup();
+  assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt']);
+});
+
+test('a window that cannot restart its daemon saves no provider change', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  const settings = p.context.Daemon.settings;
+  p.context.Daemon.settings = async () => ({ ...(await settings()), restartable: false });
+  await p.openSetup();
+  await assert.rejects(p.connectProvider('anthropic', { ANTHROPIC_API_KEY: 'k' }), /restart_unavailable/);
+  await assert.rejects(p.removeProvider('openai'), /restart_unavailable/);
+  assert.equal(calls.filter(([c]) => c === 'save').length, 0);
+  assert.match(p.setupHTML(), /cannot apply provider changes/);
+});
+
+test('a daemon with no provider is not started again until settings change', async () => {
+  let attaches = 0;
+  const p = shell({ attach: async () => { attaches += 1; throw new Error('no_provider: connect a provider in Settings'); }, settings: async () => ({ providers: [], keys: [] }), models: async () => [] });
+  p.S.attached = false;
+  await p.attach(); await settle();
+  await p.tick(); await p.tick();
+  assert.equal(attaches, 1);
+  assert.match(p.elements.get('detached').innerHTML, /waiting for a provider/);
 });
 
 test('a project starts on the model picked for it, and the pick is offered first next time', async () => {

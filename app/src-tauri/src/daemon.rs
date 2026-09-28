@@ -36,39 +36,6 @@ pub async fn login() -> Option<&'static [(OsString, OsString)]> {
     LOGIN.get_or_init(login_environment).await.as_deref()
 }
 
-/// `AGENT_MODEL` as a daemon this app starts would see it: `~/.agent/env`
-/// over the login shell.
-pub async fn model() -> Option<String> {
-    pick_model(file_pairs().as_deref(), login().await)
-}
-
-/// `~/.agent/env`'s `AGENT_MODEL` alone: no shell, so it is quick enough to
-/// be on the path to attaching.
-pub fn file_model() -> Option<String> {
-    pick_model(file_pairs().as_deref(), None)
-}
-
-pub fn file_pairs() -> Option<Vec<(String, String)>> {
-    env_file().and_then(|file| read_env_file(&file).ok())
-}
-
-fn pick_model(
-    file: Option<&[(String, String)]>,
-    login: Option<&[(OsString, OsString)]>,
-) -> Option<String> {
-    let model =
-        match file.and_then(|pairs| pairs.iter().rev().find(|(key, _)| key == "AGENT_MODEL")) {
-            Some((_, value)) => value.clone(),
-            None => login?
-                .iter()
-                .find(|(key, _)| key == "AGENT_MODEL")?
-                .1
-                .to_str()?
-                .to_owned(),
-        };
-    (!model.is_empty()).then_some(model)
-}
-
 /// The `agent` shipped beside this executable, if there is one.
 pub fn bundled() -> Option<PathBuf> {
     let agent = std::env::current_exe().ok()?.parent()?.join("agent");
@@ -143,7 +110,7 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
         command.env_clear().envs(environment.iter().cloned());
     }
     if let Some(file) = env_file() {
-        command.envs(read_env_file(&file)?);
+        apply(&mut command, read_env_file(&file)?);
     }
     command
         .arg("start")
@@ -172,6 +139,17 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
     } else {
         reason
     })
+}
+
+/// The env file's settings over the command's environment. An empty value
+/// unsets what the login shell set: Settings writes one to clear it.
+fn apply(command: &mut Command, pairs: Vec<(String, String)>) {
+    for (key, value) in pairs {
+        match value.is_empty() {
+            true => command.env_remove(key),
+            false => command.env(key, value),
+        };
+    }
 }
 
 pub fn env_file() -> Option<PathBuf> {
@@ -323,26 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn the_model_is_the_env_files_then_the_login_shells() {
-        let file = |model: &str| vec![("AGENT_MODEL".to_owned(), model.to_owned())];
-        let login = vec![(
-            OsString::from("AGENT_MODEL"),
-            OsString::from("openai/login"),
-        )];
-        assert_eq!(
-            pick_model(Some(&file("anthropic/file")), Some(&login)).as_deref(),
-            Some("anthropic/file")
-        );
-        assert_eq!(
-            pick_model(Some(&[]), Some(&login)).as_deref(),
-            Some("openai/login")
-        );
-        assert_eq!(pick_model(None, None), None);
-        // An empty assignment in the file means no model, as it would for the daemon.
-        assert_eq!(pick_model(Some(&file("")), Some(&login)), None);
-    }
-
-    #[test]
     fn the_env_file_takes_assignments_and_refuses_anything_else() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("agent-app-env-{}", std::process::id()));
@@ -403,6 +361,23 @@ mod tests {
                 .starts_with("env_file_permissions: ")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_empty_setting_unsets_the_login_shells() {
+        let mut command = Command::new("agent");
+        command.env("AWS_PROFILE", "shell");
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        apply(
+            &mut command,
+            vec![pair("AWS_PROFILE", ""), pair("AWS_REGION", "eu-west-1")],
+        );
+        let set: Vec<_> = command.as_std().get_envs().collect();
+        assert!(set.contains(&(std::ffi::OsStr::new("AWS_PROFILE"), None)));
+        assert!(set.contains(&(
+            std::ffi::OsStr::new("AWS_REGION"),
+            Some(std::ffi::OsStr::new("eu-west-1"))
+        )));
     }
 
     #[tokio::test]

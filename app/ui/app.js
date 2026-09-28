@@ -669,7 +669,7 @@ function attach() {
     clearTimeout(retryTimer); retryTimer = null;
     attaching = attachOnce().finally(() => {
       attaching = null;
-      if (!S.attached) retryAttach();
+      if (!S.attached && !idle()) retryAttach();
     });
   }
   return attaching;
@@ -677,9 +677,6 @@ function attach() {
 async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    // The login shell's model, looked up beside the attach so a slow profile never delays it, and
-    // again on each attach while none is known (~/.agent/env may have been repaired meanwhile).
-    if (!S.config.model) Daemon.defaultModel?.().then((m) => { if (m && !S.config.model) S.config.model = m; }, () => {});
     const { session } = await Daemon.attach(S.cursor);
     S.session = session;
     S.deleted = new Set(); S.snapshot = true;
@@ -730,11 +727,13 @@ async function attachOnce() {
     return false;
   }
 }
+// No provider to run: starting again cannot help until Settings changes, which attaches itself.
+function idle() { return /^no_provider/.test(S.lastReason ?? ''); }
 function showDetached(reason) {
   S.attached = false;
-  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · retrying</div><div style="margin-top:12px"><button type="button" class="sbtn" data-act="settings">Open Settings</button></div>`;
+  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${idle() ? 'waiting for a provider' : 'retrying'}</div><div style="margin-top:12px"><button type="button" class="sbtn" data-act="settings">Open Settings</button></div>`;
   $('detached').classList.add('on');
-  retryAttach();
+  if (!idle()) retryAttach();
 }
 function restore() {
   let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
@@ -1276,7 +1275,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
-    const m = model || S.config?.model; if (!m) throw new Error('model_required: /new NAME PROVIDER/MODEL');
+    const m = model; if (!m) throw new Error('model_required: /new NAME PROVIDER/MODEL');
     // Composed now, so an AGENTS.md edited since the window opened reaches this bot. One that
     // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
@@ -1371,7 +1370,7 @@ async function createProject(dir, picked = null) {
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
   // The model picked when the project was made, else the folder's, its profile's, or the app's --model.
-  const model = picked || info.model || policy.model || S.config?.model;
+  const model = picked || info.model || policy.model;
   if (!model) throw new Error('model_required: choose a model');
   if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   const session = S.session;
@@ -1418,7 +1417,7 @@ const providerLabel = (name) => catalogOf(name)?.label ?? name;
 // A model picker: every listed model under its provider's name, the last one picked chosen.
 function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
 function modelSelectHTML(id, list) {
-  const pick = [lastModel(), S.config?.model].find((m) => m && list.some((x) => x.id === m)) ?? '';
+  const pick = [lastModel()].find((m) => m && list.some((x) => x.id === m)) ?? '';
   const groups = new Map(); for (const m of list) { const label = providerLabel(providerOf(m.id)); if (!groups.has(label)) groups.set(label, []); groups.get(label).push(m); }
   const options = [...groups].map(([label, ms]) => `<optgroup label="${esc(label)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === pick ? ' selected' : ''}>${esc(m.id.slice(providerOf(m.id).length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
   return `<select id="${id}" aria-label="Model">${pick ? '' : '<option value="" selected disabled>Choose a model</option>'}${options}</select>`;
@@ -1465,7 +1464,9 @@ async function checkProviders() {
 const answerOf = (listed) => !listed ? { error: 'not running; restart to apply' } : Array.isArray(listed.models) ? { models: listed.models.length } : { error: listed.error ?? 'no listing', detail: listed.detail ?? null };
 async function readList() {
   const st = setupState();
-  try { st.list = await Daemon.models(); st.listError = null; } catch (e) { st.list = []; st.listError = String(e?.message ?? e); }
+  // Only what a connected provider can run: a list written before a removal may still name others.
+  const names = st.settings ? st.settings.providers.map(specName) : null;
+  try { st.list = (await Daemon.models()).filter((m) => !names || names.includes(providerOf(m.id))); st.listError = null; } catch (e) { st.list = []; st.listError = String(e?.message ?? e); }
   renderSetup();
 }
 // Ask the providers again and write the list new agents pick from. A provider that fails keeps what
@@ -1499,23 +1500,26 @@ async function restartDaemon() {
 }
 async function connectProvider(id, values) {
   const st = setupState(); const c = catalogOf(id); if (!c) return;
+  unrestartable();
   // A key already set, saved here or exported by the shell, answers for an empty field.
   for (const f of c.fields) if (f.required && !values[f.key] && !(f.secret && st.settings?.keys?.includes(f.key))) throw new Error(`${f.label} is required`);
   const specs = (st.settings?.providers ?? []).filter((s) => catalogOf(specName(s)) !== c);
   // A saved Bedrock key stays in use when its field is left empty.
   const keyed = c.parts && !values.AWS_BEARER_TOKEN_BEDROCK && st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? { ...values, AWS_BEARER_TOKEN_BEDROCK: 'saved' } : values;
   const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
-  // A key left empty keeps the one saved; other fields say what they say.
-  for (const f of c.fields) if (!f.secret || values[f.key]) changes[f.key] = values[f.key] || null;
+  // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
+  for (const f of c.fields) if (!f.secret || values[f.key]) changes[f.key] = values[f.key] || '';
   await applySettings(changes);
   st.adding = null;
   await refreshModels();
 }
 async function removeProvider(name) {
   const st = setupState(); const c = catalogOf(name);
+  unrestartable();
   const gone = c ? partsOf(c) : [name];
   const specs = (st.settings?.providers ?? []).filter((s) => !gone.includes(specName(s)));
-  const changes = { AGENT_PROVIDER: specs.join(' ') || null };
+  // Emptied rather than removed, so a list the shell exports does not come back.
+  const changes = { AGENT_PROVIDER: specs.join(' ') };
   // Its key goes too, unless another provider still uses it; the region and profile stay.
   const used = specs.flatMap(keysOf);
   for (const f of c?.fields ?? []) if (f.secret && !used.includes(f.key)) changes[f.key] = null;
@@ -1523,6 +1527,10 @@ async function removeProvider(name) {
   if (!specs.length) for (const key of DETECTED) if (key in changes || st.settings?.keys?.includes(key)) changes[key] = '';
   await applySettings(changes);
   await refreshModels();
+}
+// A window attached through a socket it did not start cannot apply a change, so none is saved.
+function unrestartable() {
+  if (setupState().settings?.restartable === false) throw new Error('restart_unavailable: this window did not start its daemon, so it cannot apply provider changes');
 }
 async function applySettings(changes) {
   const st = setupState();
@@ -1565,7 +1573,7 @@ function setupHTML() {
     : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
-    + step(1, 'Providers', ready, `${rows}<div class="row">${add}${st.adding === null ? refresh : ''}</div>${listed}`)
+    + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
