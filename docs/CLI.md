@@ -53,11 +53,15 @@ an idle bot returns after replay. `follow --all` stays connected for future work
   and repeated singleton flags are usage errors. `--provider` is repeatable.
 - `--instructions` and `--instructions-file` are mutually exclusive.
   `--agents` composes the shared client policy instead: the harness preamble,
-  every AGENTS.md from the workspace up to the root plus `~/.agent/AGENTS.md`,
-  and an index of `.agent/skills/*.md` files ([CLIENT.md](CLIENT.md)). It is
+  every AGENTS.md from the workspace up to the root plus `~/.agents/AGENTS.md`,
+  and indexes of the skills in `.agents/skills/NAME/SKILL.md` and the
+  profiles in `.agents/agents/ROLE.md` ([CLIENT.md](CLIENT.md)). It is
   opt-in on the CLI, the default in the app, and exclusive with
-  `--instructions`. `fork` takes none of the three: a fork is an exact copy
-  of its source, instructions included.
+  `--instructions`. `--profile ROLE` composes the same text with that role
+  last, and takes the role's `model` and `tools` unless `--model` or
+  `--tools` names them; a missing role is `profile_not_found`. `fork` takes
+  none of these: a fork is an exact copy of its source, instructions
+  included.
   With `run`, instructions, reasoning, and token budget apply to new identities;
   passing them while continuing an existing named bot is an error.
 - `run --new --approval MODE` and `fork --approval MODE` choose whether a

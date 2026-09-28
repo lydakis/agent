@@ -190,18 +190,25 @@ fn setup(state: State<'_, Shared>) -> Result<Value, String> {
 
 /// The shared client policy for a workspace (the app's own by default),
 /// composed now so an edited AGENTS.md reaches the next bot: preamble,
-/// AGENTS.md files, skills.
+/// AGENTS.md files, skills and profiles, and the role `profile` names.
 #[tauri::command]
-fn policy(state: State<'_, Shared>, workspace: Option<String>) -> Result<Value, String> {
-    match workspace {
-        Some(dir) => compose(std::path::Path::new(&workspace_path(
-            std::path::Path::new(&dir),
-        )?)),
-        None => compose(std::path::Path::new(&state.config.workspace)),
-    }
+fn policy(
+    state: State<'_, Shared>,
+    workspace: Option<String>,
+    profile: Option<String>,
+) -> Result<Value, String> {
+    let dir = match workspace {
+        Some(dir) => workspace_path(std::path::Path::new(&dir))?,
+        None => state.config.workspace.clone(),
+    };
+    compose(std::path::Path::new(&dir), profile.as_deref())
 }
 
-/// The project in a folder: its `.agent/project.toml`, or the defaults a
+/// The roles the app ships, used where neither the folder nor the user has
+/// a file of that name.
+const BUILT_IN: [(&str, &str); 1] = [("coordinator", include_str!("../../agents/coordinator.md"))];
+
+/// The project in a folder: its `.agents/project.toml`, or the defaults a
 /// new project there would take.
 #[tauri::command]
 fn project(dir: String) -> Result<Value, String> {
@@ -210,7 +217,7 @@ fn project(dir: String) -> Result<Value, String> {
     )?))
 }
 
-/// Write a new project's `.agent/project.toml`; an existing one is kept.
+/// Write a new project's `.agents/project.toml`; an existing one is kept.
 #[tauri::command]
 fn write_project(dir: String, name: String, model: String) -> Result<(), String> {
     project::write(
@@ -247,17 +254,42 @@ fn models() -> Result<Value, String> {
 /// Too much or unreadable text fails with the CLI's `--agents` code, and
 /// `/new` creates nothing: a bot without its workspace's rules is worse
 /// than no bot.
-fn compose(workspace: &std::path::Path) -> Result<Value, String> {
-    let composed = agent_client::policy::instructions(workspace)
-        .map_err(|error| format!("{}: {error}", error.code()))?;
+fn compose(workspace: &std::path::Path, profile: Option<&str>) -> Result<Value, String> {
+    use agent_client::policy::Profile;
+    let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
+    let role = match profile {
+        None => None,
+        Some(name) => Some(
+            match agent_client::policy::profile(workspace, name).map_err(failed)? {
+                Some(role) => role,
+                None => BUILT_IN
+                    .iter()
+                    .find(|(built, _)| *built == name)
+                    .map(|(_, text)| Profile::parse(name, None, text))
+                    .ok_or_else(|| format!("profile_not_found: no .agents/agents/{name}.md"))?,
+            },
+        ),
+    };
+    let composed = agent_client::policy::instructions(workspace, role.as_ref()).map_err(failed)?;
+    let mut note = format!(
+        "preamble + {} AGENTS.md + {} skills + {} profiles",
+        composed.sources.len(),
+        composed.skills.len(),
+        composed.profiles.len()
+    );
+    if let Some(role) = &role {
+        let from = role.path.as_ref().map_or_else(
+            || format!("{} (built in)", role.name),
+            |p| p.display().to_string(),
+        );
+        note.push_str(&format!(" · {from}"));
+    }
     Ok(json!({
         "instructions": composed.text,
         "compaction_instructions": agent_client::policy::DEFAULT_COMPACTION_INSTRUCTIONS,
-        "note": format!(
-            "preamble + {} AGENTS.md + {} skills",
-            composed.sources.len(),
-            composed.skills.len()
-        ),
+        "model": role.as_ref().and_then(|r| r.model.clone()),
+        "tools": role.as_ref().and_then(|r| r.tools.clone()),
+        "note": note,
     }))
 }
 
@@ -273,17 +305,60 @@ mod policy_tests {
         let root = root.canonicalize().unwrap();
         let file = root.join("AGENTS.md");
         std::fs::write(&file, "rule").unwrap();
-        let composed = compose(&root).unwrap();
+        let composed = compose(&root, None).unwrap();
         let rule = format!("{}\n\nrule", file.display());
         assert!(composed["instructions"].as_str().unwrap().contains(&rule));
         std::fs::write(&file, "x".repeat(agent_client::policy::MAX_INSTRUCTIONS)).unwrap();
-        let error = compose(&root).unwrap_err();
+        let error = compose(&root, None).unwrap_err();
         assert!(error.starts_with("instructions_limit: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
-        let error = compose(&root).unwrap_err();
+        let error = compose(&root, None).unwrap_err();
         assert!(error.starts_with("instructions_unreadable: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_coordinator_role_is_the_folders_own_file_else_the_built_in_one() {
+        let root = std::env::temp_dir().join(format!("agent-app-role-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let built = compose(&root, Some("coordinator")).unwrap();
+        let text = built["instructions"].as_str().unwrap();
+        assert!(text.contains("# Role: coordinator\n\nYou coordinate the work in this folder."));
+        assert!(text.contains("git worktree add -b agent/NAME"));
+        assert!(
+            !text.contains("name: coordinator"),
+            "front matter is not instructions"
+        );
+        assert!(
+            built["note"]
+                .as_str()
+                .unwrap()
+                .ends_with("coordinator (built in)")
+        );
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::fs::write(
+            root.join(".agents/agents/coordinator.md"),
+            "---\nmodel: openai/gpt-6-luna\ntools: shell, wait\n---\nOur own way.",
+        )
+        .unwrap();
+        let own = compose(&root, Some("coordinator")).unwrap();
+        assert!(
+            own["instructions"]
+                .as_str()
+                .unwrap()
+                .ends_with("# Role: coordinator\n\nOur own way.")
+        );
+        assert_eq!(own["model"], "openai/gpt-6-luna");
+        assert_eq!(own["tools"], serde_json::json!(["shell", "wait"]));
+        assert!(
+            compose(&root, Some("nobody"))
+                .unwrap_err()
+                .starts_with("profile_not_found: ")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

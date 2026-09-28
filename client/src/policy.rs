@@ -3,10 +3,11 @@
 //! the composition, so a bot created from the app or the CLI with `--agents`
 //! reads the same way.
 //!
-//! Three layers, in this order: the harness preamble (how to delegate and
-//! collect results through this runtime), every AGENTS.md from the
-//! workspace up to the filesystem root plus the user's global one, and an
-//! index of skill files the bot can open with its `read` tool. The text is
+//! Layers, in this order: the harness preamble (how to delegate and collect
+//! results through this runtime), every AGENTS.md from the workspace up to
+//! the filesystem root plus the user's global one, an index of skills the bot
+//! can open with its `read` tool and of profiles it can start peers in, and
+//! the bot's own role when it is started in one. The text is
 //! a stable prefix on purpose: it rides the provider's prompt cache after
 //! the first turn, so it changes only when a file changes.
 use std::path::{Path, PathBuf};
@@ -45,20 +46,12 @@ pub struct Source {
     pub bytes: usize,
 }
 
-/// A skill: a markdown file the bot may read when the task calls for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Skill {
-    pub name: String,
-    pub path: PathBuf,
-    /// The file's first non-empty line, stripped of heading marks.
-    pub summary: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instructions {
     pub text: String,
     pub sources: Vec<Source>,
     pub skills: Vec<Skill>,
+    pub profiles: Vec<Entry>,
 }
 
 /// Why the text could not be composed. Both are reported, never worked
@@ -66,14 +59,24 @@ pub struct Instructions {
 /// no bot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    TooLong { path: PathBuf, total: usize },
-    Unreadable { path: PathBuf, reason: String },
+    TooLong {
+        path: PathBuf,
+        total: usize,
+    },
+    /// A skills or profiles folder with more entries than an index visits.
+    TooMany {
+        path: PathBuf,
+    },
+    Unreadable {
+        path: PathBuf,
+        reason: String,
+    },
 }
 impl Failure {
     /// A stable code for programs, in the daemon's error style.
     pub fn code(&self) -> &'static str {
         match self {
-            Failure::TooLong { .. } => "instructions_limit",
+            Failure::TooLong { .. } | Failure::TooMany { .. } => "instructions_limit",
             Failure::Unreadable { .. } => "instructions_unreadable",
         }
     }
@@ -84,6 +87,11 @@ impl std::fmt::Display for Failure {
             Failure::TooLong { path, total } => write!(
                 f,
                 "instructions would be {total} bytes with {}, above {MAX_INSTRUCTIONS}",
+                path.display()
+            ),
+            Failure::TooMany { path } => write!(
+                f,
+                "more than {MAX_ENTRIES} entries in the skills or profiles folders, at {}",
                 path.display()
             ),
             Failure::Unreadable { path, reason } => {
@@ -128,61 +136,269 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Option<String>, Failure> {
         })
 }
 
-/// The first line of a skill: at most this much is read to find it.
+/// The head of a skill or profile file: at most this much is read to index it.
 const SKILL_HEAD: usize = 4096;
+/// Directory entries one index visits, indexed or not, so a folder full of
+/// other files cannot make every composition slow. A row costs more than 15
+/// bytes, so the byte budget ends a full index well before this.
+const MAX_ENTRIES: usize = 4096;
 
 /// AGENTS.md files that apply to `workspace`: the global one first, then
 /// from the filesystem root down to the workspace, so the nearest file is
 /// read last and wins where they disagree.
-pub fn agents_files(workspace: &Path) -> Vec<PathBuf> {
+pub fn agents_files(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
-    if let Some(global) = home().map(|h| h.join(".agent").join("AGENTS.md"))
-        && global.is_file()
+    if let Some(global) = home().map(|h| h.join(".agents").join("AGENTS.md"))
+        && is_file(&global)?
     {
         files.push(global);
     }
     let start = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let mut chain: Vec<PathBuf> = start
-        .ancestors()
-        .map(|dir| dir.join("AGENTS.md"))
-        .filter(|file| file.is_file())
-        .collect();
+    let mut chain = Vec::new();
+    for file in start.ancestors().map(|dir| dir.join("AGENTS.md")) {
+        if is_file(&file)? {
+            chain.push(file);
+        }
+    }
     chain.reverse();
     for file in chain {
         if !files.contains(&file) {
             files.push(file);
         }
     }
-    files
+    Ok(files)
 }
 
-/// Skill files: `<workspace>/.agent/skills/*.md` after `~/.agent/skills/*.md`,
-/// by name, the workspace's winning on a clash.
-const SKILLS_HEADER: &str =
-    "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n";
+/// The fields a skill or profile file may declare in YAML front matter
+/// between `---` lines. Only these are read; any other key is ignored, so
+/// files written for other harnesses load as they are.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Front {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub tools: Option<Vec<String>>,
+}
 
-fn skill_row(skill: &Skill) -> String {
+fn unquote(value: &str) -> String {
+    let value = value.trim();
+    for q in ['"', '\''] {
+        if value.len() >= 2 && value.starts_with(q) && value.ends_with(q) {
+            return value[1..value.len() - 1].to_owned();
+        }
+    }
+    value.to_owned()
+}
+
+/// `value` without a YAML comment: a `#` at its start or after whitespace,
+/// outside quotes.
+fn uncomment(value: &str) -> &str {
+    let mut quote = None;
+    let mut after_space = true;
+    for (i, c) in value.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '#' && after_space => return value[..i].trim_end(),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None => {}
+        }
+        after_space = c.is_whitespace();
+    }
+    value
+}
+
+/// Split front matter from the body, reading the subset of YAML agent files
+/// use. Scalars are one line or a `|`/`>` block below the key, joined by
+/// spaces; `tools` is a comma-separated line, a `[a, b]` flow list, or `- a`
+/// items below it. Comments are dropped.
+pub fn front_matter(text: &str) -> (Front, &str) {
+    let mut front = Front::default();
+    let Some(rest) = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    else {
+        return (front, text);
+    };
+    let (block, body) = match rest.find("\n---") {
+        Some(end) => {
+            let after = &rest[end + 4..];
+            (&rest[..end], after.split_once('\n').map_or("", |(_, b)| b))
+        }
+        // Unclosed: the whole head is front matter; a cut head has no body.
+        None => (rest, ""),
+    };
+    let mut in_tools = false;
+    let mut lines = block.lines().peekable();
+    while let Some(line) = lines.next() {
+        if uncomment(line).trim().is_empty() {
+            continue;
+        }
+        if in_tools && let Some(item) = line.trim_start().strip_prefix("- ") {
+            front
+                .tools
+                .get_or_insert_with(Vec::new)
+                .push(unquote(uncomment(item)));
+            continue;
+        }
+        in_tools = false;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let value = uncomment(value.trim());
+        let scalar = |lines: &mut std::iter::Peekable<std::str::Lines>| {
+            if !value.starts_with(['|', '>']) {
+                return unquote(value);
+            }
+            let mut text = Vec::new();
+            while let Some(next) =
+                lines.next_if(|l| l.trim().is_empty() || l.starts_with(char::is_whitespace))
+            {
+                if !next.trim().is_empty() {
+                    text.push(next.trim());
+                }
+            }
+            text.join(" ")
+        };
+        match key.trim() {
+            "name" => front.name = Some(scalar(&mut lines)),
+            "description" => front.description = Some(scalar(&mut lines)),
+            "model" => front.model = Some(scalar(&mut lines)),
+            "tools" if value.is_empty() => {
+                in_tools = true;
+                front.tools = Some(Vec::new());
+            }
+            "tools" => {
+                let list = value.trim_start_matches('[').trim_end_matches(']');
+                front.tools = Some(
+                    list.split(',')
+                        .map(unquote)
+                        .filter(|t| !t.is_empty())
+                        .collect(),
+                );
+            }
+            _ => {}
+        }
+    }
+    (front, body)
+}
+
+/// An entry of the skills or profiles index: a file the bot can open, or a
+/// role it can start a peer in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub path: PathBuf,
+    /// The `description` in its front matter, or its first non-empty line,
+    /// stripped of heading marks.
+    pub summary: String,
+}
+pub type Skill = Entry;
+
+/// Skills are folders `<name>/SKILL.md` in `<workspace>/.agents/skills`, then
+/// `~/.agents/skills`, the layout agentskills.io describes. Profiles are
+/// `<name>.md` files in `.agents/agents` in the same two places. The
+/// workspace's wins on a clash.
+#[derive(Clone, Copy)]
+enum Kind {
+    Skills,
+    Profiles,
+}
+impl Kind {
+    fn dir(self) -> &'static str {
+        match self {
+            Kind::Skills => "skills",
+            Kind::Profiles => "agents",
+        }
+    }
+    fn header(self) -> &'static str {
+        match self {
+            Kind::Skills => {
+                "\n\n# Skills\n\nRead a skill file with the read tool when its subject comes up.\n"
+            }
+            Kind::Profiles => {
+                "\n\n# Profiles\n\nStart an agent in one of these roles with \"$AGENT_BIN\" run --detach --new --profile ROLE --bot NAME -- TASK.\n"
+            }
+        }
+    }
+    /// The name an entry of this directory would index under. Only a name
+    /// --profile accepts is offered as a role.
+    fn name(self, path: &Path) -> Option<String> {
+        let name = path.file_name()?.to_str()?;
+        match self {
+            Kind::Skills => Some(name.to_owned()),
+            Kind::Profiles => name
+                .strip_suffix(".md")
+                .filter(|stem| profile_name(stem))
+                .map(str::to_owned),
+        }
+    }
+    /// The file the entry stands for, if it is one.
+    fn file(self, path: &Path) -> Result<Option<PathBuf>, Failure> {
+        let file = match self {
+            Kind::Skills => path.join("SKILL.md"),
+            Kind::Profiles => path.to_path_buf(),
+        };
+        // The index names what the folders hold; whether a role fits a bot's
+        // instructions is known only when it is composed, and --profile then
+        // fails with instructions_limit rather than cutting it.
+        Ok(is_file(&file)?.then_some(file))
+    }
+}
+
+/// Whether `path` is a file. Only an absent path is not one; any other error
+/// is reported, so an unreadable workspace file never lets the user's file of
+/// the same name stand in for it.
+fn is_file(path: &Path) -> Result<bool, Failure> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(Failure::Unreadable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+fn entry_row(entry: &Entry) -> String {
     format!(
         "\n- {}: {} ({})",
-        skill.name,
-        skill.summary,
-        skill.path.display()
+        entry.name,
+        entry.summary,
+        entry.path.display()
     )
 }
 
-fn skills(workspace: &Path, budget: usize) -> Result<Vec<Skill>, Failure> {
+fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
     // Visit the winning directory first, so a later directory can only add
     // entries. A budget failure can never be undone by an override.
-    let mut dirs = vec![workspace.join(".agent/skills")];
-    if let Some(h) = home() {
-        dirs.push(h.join(".agent/skills"));
+    let mut dirs = vec![workspace.join(".agents").join(kind.dir())];
+    // A workspace that is the home folder is searched once.
+    if let Some(h) = home()
+        && !matches!(
+            (std::fs::canonicalize(&h), std::fs::canonicalize(workspace)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    {
+        dirs.push(h.join(".agents").join(kind.dir()));
     }
-    skills_from(dirs, budget)
+    dirs
 }
 
-fn skills_from(dirs: Vec<PathBuf>, budget: usize) -> Result<Vec<Skill>, Failure> {
-    let mut found = std::collections::BTreeMap::<String, Skill>::new();
+fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Failure> {
+    let mut found = std::collections::BTreeMap::<String, Entry>::new();
     let mut used = 0usize;
+    let mut visited = 0usize;
     for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -197,35 +413,41 @@ fn skills_from(dirs: Vec<PathBuf>, budget: usize) -> Result<Vec<Skill>, Failure>
         // Do not collect directory contents: the index must fit before any
         // more paths or file heads are read. Final ordering is bounded above.
         for entry in entries {
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                return Err(Failure::TooMany { path: dir });
+            }
             let path = entry
                 .map_err(|error| Failure::Unreadable {
                     path: dir.clone(),
                     reason: error.to_string(),
                 })?
                 .path();
-            if !path.extension().is_some_and(|x| x == "md") || !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            // A shadowed entry is skipped before its file is probed, so an
+            // override can never be undone by the file it overrides.
+            let Some(name) = kind.name(&path) else {
                 continue;
             };
             if found.contains_key(&name) {
                 continue;
             }
-            let mut skill = Skill {
+            let Some(file) = kind.file(&path)? else {
+                continue;
+            };
+            let mut entry = Entry {
                 name,
-                path,
+                path: file,
                 summary: String::new(),
             };
             let too_long = |size| Failure::TooLong {
-                path: skill.path.clone(),
+                path: entry.path.clone(),
                 total: MAX_INSTRUCTIONS.saturating_sub(budget) + size,
             };
-            let minimum = used + skill_row(&skill).len();
+            let minimum = used + entry_row(&entry).len();
             if minimum > budget {
                 return Err(too_long(minimum));
             }
-            let mut bytes = read_head(&skill.path, SKILL_HEAD)?;
+            let mut bytes = read_head(&entry.path, SKILL_HEAD)?;
             bytes.truncate(SKILL_HEAD);
             let text = match String::from_utf8(bytes) {
                 Ok(text) => text,
@@ -235,34 +457,107 @@ fn skills_from(dirs: Vec<PathBuf>, budget: usize) -> Result<Vec<Skill>, Failure>
                 }
                 Err(error) => {
                     return Err(Failure::Unreadable {
-                        path: skill.path,
+                        path: entry.path,
                         reason: error.utf8_error().to_string(),
                     });
                 }
             };
-            skill.summary = text
-                .lines()
-                .map(|l| l.trim().trim_start_matches('#').trim())
-                .find(|l| !l.is_empty())
-                .map(|l| l.chars().take(160).collect())
+            let (front, body) = front_matter(&text);
+            let summary = front.description.filter(|d| !d.is_empty()).or_else(|| {
+                body.lines()
+                    .map(|l| l.trim().trim_start_matches('#').trim())
+                    .find(|l| !l.is_empty())
+                    .map(str::to_owned)
+            });
+            entry.summary = summary
+                .map(|s| s.chars().take(160).collect())
                 .unwrap_or_default();
-            used += skill_row(&skill).len();
+            used += entry_row(&entry).len();
             if used > budget {
                 return Err(too_long(used));
             }
-            found.insert(skill.name.clone(), skill);
+            found.insert(entry.name.clone(), entry);
         }
     }
     Ok(found.into_values().collect())
 }
 
-/// The full text for a new bot in `workspace`. Fails rather than truncates
-/// when the files do not fit: a silently shortened AGENTS.md is worse than
-/// none.
-pub fn instructions(workspace: &Path) -> Result<Instructions, Failure> {
+/// A role a bot is started in: the body of `.agents/agents/<name>.md`, and
+/// the model and tools its front matter names, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    /// None for a role a client ships built in.
+    pub path: Option<PathBuf>,
+    pub model: Option<String>,
+    pub tools: Option<Vec<String>>,
+    pub body: String,
+}
+impl Profile {
+    pub fn parse(name: &str, path: Option<PathBuf>, text: &str) -> Profile {
+        let (front, body) = front_matter(text);
+        Profile {
+            name: name.to_owned(),
+            path,
+            model: front.model.filter(|m| !m.is_empty()),
+            tools: front.tools,
+            body: body.trim().to_owned(),
+        }
+    }
+}
+
+/// A profile name is one file name, nothing that could reach another folder,
+/// and a word a shell passes unquoted.
+fn profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The profile named `name` for a bot in `workspace`: the workspace's own
+/// file, else the user's; `None` when neither exists.
+pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure> {
+    if !profile_name(name) {
+        return Err(Failure::Unreadable {
+            path: PathBuf::from(name),
+            reason: "a profile name is letters, digits, '-', '_' and '.'".into(),
+        });
+    }
+    for dir in search(workspace, Kind::Profiles) {
+        let path = dir.join(format!("{name}.md"));
+        if !is_file(&path)? {
+            continue;
+        }
+        let Some(text) = read_bounded(&path, MAX_INSTRUCTIONS)? else {
+            return Err(Failure::TooLong {
+                total: std::fs::metadata(&path).map_or(MAX_INSTRUCTIONS + 1, |m| m.len() as usize),
+                path,
+            });
+        };
+        // An unclosed head would read the whole role as front matter and
+        // start the bot without it.
+        if (text.starts_with("---\n") || text.starts_with("---\r\n"))
+            && !text[3..].contains("\n---")
+        {
+            return Err(Failure::Unreadable {
+                path,
+                reason: "front matter opened with --- is not closed".into(),
+            });
+        }
+        return Ok(Some(Profile::parse(name, Some(path), &text)));
+    }
+    Ok(None)
+}
+
+/// The full text for a new bot in `workspace`, in `role` when given. Fails
+/// rather than truncates when the files do not fit: a silently shortened
+/// AGENTS.md is worse than none.
+pub fn instructions(workspace: &Path, role: Option<&Profile>) -> Result<Instructions, Failure> {
     let mut text = String::from(PREAMBLE);
     let mut sources = Vec::new();
-    for path in agents_files(workspace) {
+    for path in agents_files(workspace)? {
         // Read no more than what could still fit; a file past the budget
         // fails on its size, not after being copied into memory.
         let header = format!("\n\n# Instructions from {}\n\n", path.display());
@@ -291,27 +586,49 @@ pub fn instructions(workspace: &Path) -> Result<Instructions, Failure> {
             bytes: body.len(),
         });
     }
-    let skills = skills(
-        workspace,
-        MAX_INSTRUCTIONS.saturating_sub(text.len() + SKILLS_HEADER.len()),
-    )?;
-    if !skills.is_empty() {
-        let mut block = String::from(SKILLS_HEADER);
-        for skill in &skills {
-            block.push_str(&skill_row(skill));
+    let mut lists = Vec::new();
+    for kind in [Kind::Skills, Kind::Profiles] {
+        let entries = index(
+            search(workspace, kind),
+            kind,
+            MAX_INSTRUCTIONS.saturating_sub(text.len() + kind.header().len()),
+        )?;
+        if !entries.is_empty() {
+            let mut block = String::from(kind.header());
+            for entry in &entries {
+                block.push_str(&entry_row(entry));
+            }
+            if text.len() + block.len() > MAX_INSTRUCTIONS {
+                return Err(Failure::TooLong {
+                    path: entries[0].path.clone(),
+                    total: text.len() + block.len(),
+                });
+            }
+            text.push_str(&block);
         }
+        lists.push(entries);
+    }
+    // The role comes last: the most specific text a bot is given.
+    if let Some(role) = role.filter(|r| !r.body.is_empty()) {
+        let block = format!("\n\n# Role: {}\n\n{}", role.name, role.body);
         if text.len() + block.len() > MAX_INSTRUCTIONS {
             return Err(Failure::TooLong {
-                path: skills[0].path.clone(),
+                path: role
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(&role.name)),
                 total: text.len() + block.len(),
             });
         }
         text.push_str(&block);
     }
+    let profiles = lists.pop().unwrap_or_default();
+    let skills = lists.pop().unwrap_or_default();
     Ok(Instructions {
         text,
         sources,
         skills,
+        profiles,
     })
 }
 
@@ -331,21 +648,22 @@ mod tests {
     fn nearest_agents_md_is_read_last_and_skills_are_indexed() {
         let root = temp("chain");
         let deep = root.join("repo").join("crate");
-        std::fs::create_dir_all(deep.join(".agent").join("skills")).unwrap();
+        std::fs::create_dir_all(deep.join(".agents/skills/deploy")).unwrap();
+        std::fs::create_dir_all(deep.join(".agents/skills/empty")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "outer rule").unwrap();
         std::fs::write(deep.join("AGENTS.md"), "# inner\n\ninner rule").unwrap();
         std::fs::write(
-            deep.join(".agent/skills/deploy.md"),
+            deep.join(".agents/skills/deploy/SKILL.md"),
             "# Deploy\n\nShip a release safely.",
         )
         .unwrap();
-        std::fs::write(deep.join(".agent/skills/notes.txt"), "not a skill").unwrap();
-        let files = agents_files(&deep);
+        std::fs::write(deep.join(".agents/skills/notes.md"), "not a skill").unwrap();
+        let files = agents_files(&deep).unwrap();
         assert_eq!(
             files.iter().rev().take(2).collect::<Vec<_>>(),
             vec![&deep.join("AGENTS.md"), &root.join("AGENTS.md")]
         );
-        let composed = instructions(&deep).unwrap();
+        let composed = instructions(&deep, None).unwrap();
         assert!(composed.text.starts_with(PREAMBLE));
         let outer = composed.text.find("outer rule").unwrap();
         let inner = composed.text.find("inner rule").unwrap();
@@ -365,7 +683,7 @@ mod tests {
     fn oversized_files_fail_instead_of_being_cut() {
         let root = temp("big");
         std::fs::write(root.join("AGENTS.md"), "x".repeat(MAX_INSTRUCTIONS)).unwrap();
-        let error = instructions(&root).unwrap_err();
+        let error = instructions(&root, None).unwrap_err();
         assert_eq!(error.code(), "instructions_limit");
         assert!(
             matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > MAX_INSTRUCTIONS)
@@ -381,16 +699,16 @@ mod tests {
         let file = std::fs::File::create(root.join("AGENTS.md")).unwrap();
         file.set_len(512 * 1024 * 1024).unwrap();
         drop(file);
-        let error = instructions(&root).unwrap_err();
+        let error = instructions(&root, None).unwrap_err();
         assert!(
             matches!(&error, Failure::TooLong { path, total } if *path == root.join("AGENTS.md") && *total > 512 * 1024 * 1024)
         );
-        std::fs::create_dir_all(root.join(".agent/skills")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills/big")).unwrap();
         std::fs::write(root.join("AGENTS.md"), "rule").unwrap();
         let mut long = String::from("# Big skill\n\n");
         long.push_str(&"x".repeat(SKILL_HEAD * 4));
-        std::fs::write(root.join(".agent/skills/big.md"), long).unwrap();
-        let composed = instructions(&root).unwrap();
+        std::fs::write(root.join(".agents/skills/big/SKILL.md"), long).unwrap();
+        let composed = instructions(&root, None).unwrap();
         assert_eq!(composed.skills[0].summary, "Big skill");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -399,10 +717,18 @@ mod tests {
     fn an_unreadable_file_is_an_error_not_a_silent_omission() {
         let root = temp("unreadable");
         std::fs::write(root.join("AGENTS.md"), [0xff, 0xfe, b'x']).unwrap();
-        let error = instructions(&root).unwrap_err();
+        let error = instructions(&root, None).unwrap_err();
         assert_eq!(error.code(), "instructions_unreadable");
         assert!(
             matches!(&error, Failure::Unreadable { path, .. } if *path == root.join("AGENTS.md"))
+        );
+        // An AGENTS.md whose metadata fails is reported, not skipped; the
+        // global file takes the same path.
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -411,9 +737,12 @@ mod tests {
     fn skill_budget_fails_before_reading_an_entry_that_cannot_fit() {
         let root = temp("skill-budget");
         // Invalid UTF-8 would give instructions_unreadable if the file were read.
-        std::fs::write(root.join("cannot-fit.md"), [0xff]).unwrap();
+        std::fs::create_dir_all(root.join("cannot-fit")).unwrap();
+        std::fs::write(root.join("cannot-fit/SKILL.md"), [0xff]).unwrap();
         assert_eq!(
-            skills_from(vec![root.clone()], 1).unwrap_err().code(),
+            index(vec![root.clone()], Kind::Skills, 1)
+                .unwrap_err()
+                .code(),
             "instructions_limit"
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -428,13 +757,18 @@ mod tests {
         std::fs::create_dir_all(&global).unwrap();
         std::fs::write(local.join("same.md"), "# Local").unwrap();
         std::fs::write(global.join("same.md"), [0xff]).unwrap();
-        let result = skills_from(vec![local.clone(), global], MAX_INSTRUCTIONS).unwrap();
+        let result = index(
+            vec![local.clone(), global],
+            Kind::Profiles,
+            MAX_INSTRUCTIONS,
+        )
+        .unwrap();
         assert_eq!(result[0].summary, "Local");
         for i in 0..1000 {
-            std::fs::write(local.join(format!("skill-{i:04}.md")), "x".repeat(160)).unwrap();
+            std::fs::write(local.join(format!("role-{i:04}.md")), "x".repeat(160)).unwrap();
         }
         assert_eq!(
-            skills_from(vec![local], MAX_INSTRUCTIONS)
+            index(vec![local], Kind::Profiles, MAX_INSTRUCTIONS)
                 .unwrap_err()
                 .code(),
             "instructions_limit"
@@ -445,10 +779,197 @@ mod tests {
     #[test]
     fn a_workspace_without_files_gets_the_preamble_only() {
         let root = temp("bare");
-        let composed = instructions(&root).unwrap();
+        let composed = instructions(&root, None).unwrap();
         assert_eq!(composed.sources, Vec::new());
         assert!(composed.skills.is_empty() || composed.text.contains("# Skills"));
         assert!(composed.text.starts_with(PREAMBLE));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skills_and_profiles_read_front_matter_and_files_from_other_harnesses_load() {
+        let root = temp("front");
+        std::fs::create_dir_all(root.join(".agents/skills/release")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::fs::write(
+            root.join(".agents/skills/release/SKILL.md"),
+            "---\nname: release\ndescription: \"Cut a release: tag, notes, publish\"\nlicense: MIT\n---\n# Releasing\n",
+        )
+        .unwrap();
+        // A Claude Code agent file: keys this client does not read are ignored.
+        std::fs::write(
+            root.join(".agents/agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews a diff for bugs\nmodel: openai/gpt-6-luna\ntools:\n  - read\n  - 'shell'\ncolor: red\n---\n\nYou review changes. Report bugs only.\n",
+        )
+        .unwrap();
+        // A file --profile cannot name is not offered as a role.
+        for unusable in ["my role.md", ".draft.md", "rôle.md"] {
+            std::fs::write(root.join(".agents/agents").join(unusable), "x").unwrap();
+        }
+        let composed = instructions(&root, None).unwrap();
+        assert_eq!(composed.profiles.len(), 1);
+        assert_eq!(composed.skills[0].name, "release");
+        assert_eq!(
+            composed.skills[0].summary,
+            "Cut a release: tag, notes, publish"
+        );
+        assert_eq!(composed.profiles[0].name, "reviewer");
+        assert!(composed.text.contains("# Profiles"));
+        assert!(
+            composed
+                .text
+                .contains("- reviewer: Reviews a diff for bugs (")
+        );
+        assert!(!composed.text.contains("# Role"));
+        let role = profile(&root, "reviewer").unwrap().unwrap();
+        assert_eq!(role.model.as_deref(), Some("openai/gpt-6-luna"));
+        assert_eq!(
+            role.tools,
+            Some(vec!["read".to_owned(), "shell".to_owned()])
+        );
+        assert_eq!(role.body, "You review changes. Report bugs only.");
+        let composed = instructions(&root, Some(&role)).unwrap();
+        assert!(
+            composed
+                .text
+                .ends_with("\n\n# Role: reviewer\n\nYou review changes. Report bugs only.")
+        );
+        assert_eq!(profile(&root, "missing").unwrap(), None);
+        for bad in ["", "../x", ".hidden", "a/b"] {
+            assert_eq!(
+                profile(&root, bad).unwrap_err().code(),
+                "instructions_unreadable"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_folders_are_bounded_and_unreadable_files_do_not_fall_back() {
+        let root = temp("entries");
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        for i in 0..=MAX_ENTRIES {
+            std::fs::write(root.join(format!(".agents/agents/{i}.txt")), "").unwrap();
+        }
+        let error = index(
+            search(&root, Kind::Profiles),
+            Kind::Profiles,
+            MAX_INSTRUCTIONS,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, Failure::TooMany { .. }));
+        assert_eq!(error.code(), "instructions_limit");
+        // A workspace file that errors other than by being absent is
+        // reported, never replaced by the user's file of the same name. A
+        // link to itself fails with ELOOP, even for root.
+        std::fs::remove_dir_all(root.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::os::unix::fs::symlink("reviewer.md", root.join(".agents/agents/reviewer.md")).unwrap();
+        assert_eq!(
+            profile(&root, "reviewer").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills/review")).unwrap();
+        std::os::unix::fs::symlink("SKILL.md", root.join(".agents/skills/review/SKILL.md"))
+            .unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/skills/review/SKILL.md")).unwrap();
+        std::fs::write(
+            root.join(".agents/agents/half.md"),
+            "---\nmodel: m\nYou review.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            profile(&root, "half").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/agents/half.md")).unwrap();
+        // A workspace that is the home folder is searched once.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            assert_eq!(search(&root, Kind::Profiles).len(), 2);
+            assert_eq!(search(&home, Kind::Profiles).len(), 1);
+        }
+        // A role too large to start is still listed under its name, so it
+        // keeps shadowing the user's role of that name; starting it fails
+        // explicitly instead.
+        let big = std::fs::File::create(root.join(".agents/agents/huge.md")).unwrap();
+        big.set_len(MAX_INSTRUCTIONS as u64 + 1).unwrap();
+        assert!(
+            instructions(&root, None)
+                .unwrap()
+                .profiles
+                .iter()
+                .any(|p| p.name == "huge")
+        );
+        assert_eq!(
+            profile(&root, "huge").unwrap_err().code(),
+            "instructions_limit"
+        );
+        std::fs::remove_file(root.join(".agents/agents/huge.md")).unwrap();
+        // A broken file shadowed by an override is never probed.
+        let other = temp("shadowed");
+        std::fs::create_dir_all(other.join(".agents/agents")).unwrap();
+        std::fs::write(other.join(".agents/agents/reviewer.md"), "You review.").unwrap();
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::os::unix::fs::symlink("reviewer.md", root.join(".agents/agents/reviewer.md")).unwrap();
+        let dirs = vec![other.join(".agents/agents"), root.join(".agents/agents")];
+        assert_eq!(
+            index(dirs, Kind::Profiles, MAX_INSTRUCTIONS).unwrap().len(),
+            1
+        );
+        std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
+        let _ = std::fs::remove_dir_all(&other);
+        // A stray file where a skill folder would be is simply not a skill.
+        std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
+        std::fs::write(root.join(".agents/skills/README.md"), "notes").unwrap();
+        assert!(instructions(&root, None).unwrap().skills.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn front_matter_takes_flow_and_inline_lists_and_leaves_plain_files_whole() {
+        let (front, body) = front_matter("---\ntools: [read, edit]\n---\nbody\n");
+        assert_eq!(
+            front.tools,
+            Some(vec!["read".to_owned(), "edit".to_owned()])
+        );
+        assert_eq!(body, "body\n");
+        let (front, _) = front_matter("---\ntools: read, shell\nmodel: ''\n---\n");
+        assert_eq!(
+            front.tools,
+            Some(vec!["read".to_owned(), "shell".to_owned()])
+        );
+        assert_eq!(
+            Profile::parse("x", None, "---\nmodel: ''\n---\nhi").model,
+            None
+        );
+        // Comments and block scalars are YAML, not part of the value.
+        let (front, _) = front_matter(
+            "---\ntools: [shell, wait] # defaults\nmodel: openai/foo # preferred\ndescription: >-\n  Reviews code,\n  #1 on\ntitle: 'a # b'\n---\n",
+        );
+        assert_eq!(
+            front.tools,
+            Some(vec!["shell".to_owned(), "wait".to_owned()])
+        );
+        assert_eq!(front.model.as_deref(), Some("openai/foo"));
+        assert_eq!(front.description.as_deref(), Some("Reviews code, #1 on"));
+        let (front, _) =
+            front_matter("---\ntools:\n  - read # first\n\n  # the rest\n  - 'edit'\n---\n");
+        assert_eq!(
+            front.tools,
+            Some(vec!["read".to_owned(), "edit".to_owned()])
+        );
+        let (front, body) = front_matter("# Title\n\ntext");
+        assert_eq!(front, Front::default());
+        assert_eq!(body, "# Title\n\ntext");
     }
 }

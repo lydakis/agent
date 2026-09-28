@@ -348,7 +348,7 @@ class SocketAndCliTests(ModelFixture):
         self.assertEqual(stats.returncode, 2)
         self.assertIn('does not accept --model', stats.stderr)
         # A fork is an exact copy of its source, so it takes no instructions.
-        for flag in ('--instructions', '--instructions-file', '--agents'):
+        for flag in ('--instructions', '--instructions-file', '--agents', '--profile'):
             args = (flag,) if flag == '--agents' else (flag, 'x')
             fork = self.agent('fork', '--store', str(self.store), '--source', 'Bob', '--bot', 'Copy', *args,
                               check=False)
@@ -593,9 +593,9 @@ class SocketAndCliTests(ModelFixture):
         # layers the workspace's AGENTS.md files and skills, and the daemon
         # stores whatever it was given.
         (self.path / 'AGENTS.md').write_text('Always answer in haiku.')
-        skills = self.path / '.agent' / 'skills'
+        skills = self.path / '.agents' / 'skills' / 'deploy'
         skills.mkdir(parents=True)
-        (skills / 'deploy.md').write_text('# Deploy\n\nShip it.')
+        (skills / 'SKILL.md').write_text('---\nname: deploy\ndescription: Ship it safely\n---\n# Deploy\n')
         plain = self.agent('run', *self.common, '--new', '--bot', 'Plain', 'hello')
         self.assertEqual(plain.returncode, 0)
         request = self.model.requests.get(timeout=5)
@@ -608,10 +608,35 @@ class SocketAndCliTests(ModelFixture):
         self.assertTrue(text.startswith('To delegate a subtask'))
         self.assertIn('Always answer in haiku.', text)
         self.assertIn(f'# Instructions from {(self.path / "AGENTS.md").resolve()}', text)
-        self.assertIn('- deploy: Deploy (', text)
+        self.assertIn('- deploy: Ship it safely (', text)
         both = self.agent('run', *self.common, '--agents', '--instructions', 'x', '--new', '--bot', 'Both', 'hello', check=False)
         self.assertEqual(both.returncode, 2)
         again = self.agent('run', *self.again, '--agents', '--bot', 'Composed', 'hello', check=False)
+        self.assertEqual(again.returncode, 2)
+
+    def test_profile_starts_a_bot_in_its_role_with_its_model_and_tools(self):
+        roles = self.path / '.agents' / 'agents'
+        roles.mkdir(parents=True)
+        (roles / 'reviewer.md').write_text('---\nname: reviewer\ndescription: Reviews diffs\n'
+                                           'model: openai/synthetic-model\ntools: [echo]\ncolor: red\n---\n'
+                                           'You review changes and report bugs only.\n')
+        # No --model and no --tools: both come from the role.
+        started = self.agent('run', *self.again, '--profile', 'reviewer', '--new', '--bot', 'Rev', 'hello')
+        self.assertEqual(started.returncode, 0)
+        request = self.model.requests.get(timeout=5)
+        text = request['instructions']
+        self.assertTrue(text.startswith('To delegate a subtask'))
+        self.assertIn('- reviewer: Reviews diffs (', text)
+        self.assertTrue(text.endswith('# Role: reviewer\n\nYou review changes and report bugs only.'), text[-200:])
+        self.assertEqual(request['model'], 'synthetic-model')
+        self.assertEqual([t.get('name') for t in request['tools']], ['echo'])
+        missing = self.agent('run', *self.again, '--profile', 'nobody', '--new', '--bot', 'None', 'hello', check=False)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn('profile_not_found', missing.stderr)
+        both = self.agent('run', *self.common, '--profile', 'reviewer', '--instructions', 'x', '--new', '--bot', 'B',
+                          'hello', check=False)
+        self.assertEqual(both.returncode, 2)
+        again = self.agent('run', *self.again, '--profile', 'reviewer', '--bot', 'Rev', 'hello', check=False)
         self.assertEqual(again.returncode, 2)
 
     def test_delegation_through_the_same_daemon_and_follow_replay(self):

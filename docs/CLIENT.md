@@ -8,7 +8,7 @@ crate also holds the socket protocol client the app uses.
 
 Implemented 2026-09-19.
 
-## Three layers
+## Layers
 
 1. **The harness preamble.** How to delegate through this runtime: `agent
    run --detach --new --bot NAME` from the shell tool, with `--model` one of
@@ -20,14 +20,33 @@ Implemented 2026-09-19.
    results: `wait` already hands the creator the bot's final reply. The tool descriptions the daemon sends
    carry the rest. It gives the bot no role and no way of working; a caller
    that wants one passes it. This is the CLI's default and only instruction text.
-2. **AGENTS.md files.** `~/.agent/AGENTS.md` first, then every `AGENTS.md`
+2. **AGENTS.md files.** `~/.agents/AGENTS.md` first, then every `AGENTS.md`
    from the filesystem root down to the workspace, so the nearest file is
    read last and wins where they disagree. Each is appended under a heading
    naming its path. Empty files are skipped.
-3. **Skills.** `~/.agent/skills/*.md` and `<workspace>/.agent/skills/*.md`
-   (the workspace's winning on a name clash) become an index: name, first
-   line, path. The bot opens a skill with its `read` tool when the subject
-   comes up; nothing else is sent, so an unused skill costs one line.
+3. **Skills.** Folders `<name>/SKILL.md` in `<workspace>/.agents/skills` and
+   `~/.agents/skills` (the workspace's winning on a name clash), the layout
+   of [agentskills.io](https://agentskills.io/specification), become an
+   index: name, the front matter's `description` (else the first line),
+   path. The bot opens a skill with its `read` tool when the subject comes
+   up; nothing else is sent, so an unused skill costs one line.
+4. **Profiles.** Files `<role>.md` in `<workspace>/.agents/agents` and
+   `~/.agents/agents` become a second index, with the command that starts a
+   peer in a role. A profile is markdown with optional YAML front matter:
+   `description`, `model`, and `tools` (a list of this runtime's tool
+   names) are read, any other key is ignored, so an agent file written for
+   another harness loads as it is. The body is the role.
+5. **Role.** A bot started in a profile (`--profile ROLE`, or the app's
+   coordinator) gets that body last, under `# Role: ROLE`. The app ships a
+   `coordinator` profile ([app/agents/coordinator.md](../app/agents/coordinator.md));
+   a folder's or the user's `coordinator.md` replaces it.
+
+Everything a client reads lives under `.agents`, the folder Codex, OpenCode
+and Pi already read skills from (sources read 2026-09-27: Codex 9db8162,
+OpenCode b471c2b, Pi 2b0a123). Claude Code keeps `.claude/skills` and
+`.claude/agents`; their files use the same format and can be copied or
+linked into `.agents` (George, 2026-09-27: one folder, and an agent can port
+other harnesses' files when asked).
 
 The text is a stable prefix on purpose: after the first turn it rides the
 provider's prompt cache, and it changes only when a file changes. The whole
@@ -38,7 +57,11 @@ and the app both report `instructions_limit` with the file that tipped it, or
 nothing: a bot without its workspace's rules is worse than no bot.
 Skill discovery visits workspace overrides first and accounts each index row
 against the remaining byte budget before reading more paths or file heads.
-It fails as soon as the index cannot fit, then sorts only the bounded result.
+It fails as soon as the index cannot fit, then sorts only the bounded result. It also stops at
+4096 folder entries, indexed or not, so a folder of other files cannot slow
+every new bot; past that, composition fails with `instructions_limit`.
+A skill or profile file the workspace has but cannot read is an error; only
+an absent one falls back to the user's.
 
 ## Who uses it
 

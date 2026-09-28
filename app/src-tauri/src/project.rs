@@ -1,5 +1,5 @@
 //! A project is a folder, its coordinator bot `NAME.lead`, and
-//! `.agent/project.toml` in that folder. The file holds mechanics only (the
+//! `.agents/project.toml` in that folder. The file holds mechanics only (the
 //! name and the coordinator's model); how the coordinator behaves stays in
 //! AGENTS.md. The project list itself comes from the coordinator bots in the
 //! store, so this file is read when a project is opened and written once
@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::io::Read;
 use std::path::Path;
 
-pub const FILE: &str = ".agent/project.toml";
+pub const FILE: &str = ".agents/project.toml";
 const LIMIT: u64 = 64 * 1024;
 /// Every key the file may hold; anything else is a mistake, not ignored.
 const KEYS: [&str; 3] = ["name", "coordinator", "model"];
@@ -130,7 +130,7 @@ pub fn write(dir: &Path, name: &str, model: &str) -> Result<(), String> {
         }
         _ => format!("project_unwritable: {}: {e}", path.display()),
     };
-    let agent = dir.join(".agent");
+    let agent = dir.join(".agents");
     let created = !agent.is_dir();
     std::fs::create_dir_all(&agent).map_err(failed)?;
     place_new(&path, |file| {
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn a_failed_write_leaves_no_file_and_no_temporary() {
         let dir = root("partial");
-        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
         let path = dir.join(FILE);
         let error = place_new(&path, |file| {
             std::io::Write::write_all(file, b"name = \"de")?;
@@ -225,7 +225,7 @@ mod tests {
         assert!(!path.exists(), "no partial project file");
         write(&dir, "demo", "alpha/one").unwrap();
         assert_eq!(read(&dir).unwrap()["name"], "demo");
-        let left: Vec<_> = std::fs::read_dir(dir.join(".agent"))
+        let left: Vec<_> = std::fs::read_dir(dir.join(".agents"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn an_invalid_file_is_an_error_not_the_defaults() {
         let dir = root("invalid");
-        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
         for text in [
             "name = ",
             "model = \"alpha/one\"",
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn an_unknown_key_is_refused_by_name() {
         let dir = root("unknown");
-        std::fs::create_dir_all(dir.join(".agent")).unwrap();
+        std::fs::create_dir_all(dir.join(".agents")).unwrap();
         std::fs::write(dir.join(FILE), "name = \"demo\"\nrole = \"lead\"\n").unwrap();
         let error = read(&dir).unwrap_err();
         assert!(error.starts_with("project_invalid: "), "{error}");

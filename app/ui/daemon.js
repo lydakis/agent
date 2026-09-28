@@ -13,7 +13,7 @@ window.Daemon = (() => {
       log,
       setup: () => invoke('setup'),
       defaultModel: () => invoke('default_model'),
-      policy: (workspace) => invoke('policy', { workspace: workspace ?? null }),
+      policy: (workspace, profile) => invoke('policy', { workspace: workspace ?? null, profile: profile ?? null }),
       models: () => invoke('models'),
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
