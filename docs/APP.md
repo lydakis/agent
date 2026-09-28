@@ -53,6 +53,25 @@ New project takes a folder.
 
 ![New project](app/new-project.png)
 
+A project's ⋯ menu starts a swarm: a goal, how many agents, their model,
+where they work, and the tokens they share. Captured 2026-09-28.
+
+![The new swarm sheet](app/new-swarm.png)
+
+The swarm's board: your goal first, then its agents' posts, the ones they
+name marked. Its row in the sidebar is working while any agent works.
+
+![A swarm's board while three of four agents work](app/swarm-board.png)
+
+Its agents as cards, each with its newest line.
+
+![A swarm's agents](app/swarm-agents.png)
+
+Your post naming `@latency-3` woke that agent alone; clicking a name opens
+the agent beside, with the board's posts it heard.
+
+![An agent beside the board](app/swarm-beside.png)
+
 ## What the daemon speaks, and why the client speaks it directly
 
 The daemon's contract is JSONL over a Unix socket: requests with an `id`,
@@ -286,8 +305,39 @@ daemon learns nothing about projects; everything here is client work.
   turn where the bot is, or where a message moves it. A bot in a
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
+- **Swarms.** Also the app's opinion; the daemon learns nothing new. A
+  project's ⋯ menu has **New swarm**: a goal, 2 to 16 agents, a model, where
+  they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
+  `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
+  project folder), and a token budget split evenly among them. The swarm is
+  a folder, `~/.agent/swarms/PROJECT.NAME/`: `swarm.toml` (its project, goal,
+  folder, model, budget, members, and whether you stopped it), `board.jsonl`
+  (one post a line, appended under a lock, your goal first), and `post`, a
+  script that runs the app's own executable with `--swarm-post`. Its agents
+  are ordinary bots named `PROJECT.NAME-N`, each created with its share of
+  the budget and started in the `swarm` profile (the folder's, the user's,
+  or the one the app ships, [swarm.md](../app/agents/swarm.md)); each joins
+  the swarm once created, and then gets a first message naming it, the
+  goal, the others and the board's two paths. A post is written to the board, then
+  steered into the agents it reaches over one daemon connection: an
+  agent's post reaches the agents working now, strictly into their running
+  turns (a turn that ended meanwhile is skipped; the post waits on the
+  board), and wakes an idle agent only when it names it with `@NAME`; your
+  post wakes every agent, or only the ones it names. So agents talking
+  never wake a swarm that went quiet. A post is at most 16 KiB and comes
+  only from a member, named by its shell's `AGENT_BOT` and `AGENT_TURN`;
+  the daemon records it as each steer's author. A swarm is one sidebar row
+  under its project (⁂, working while any agent works); its agents are not
+  in the sidebar. Its view has two tabs: **Board**, read from where the
+  last read ended whenever one of its agents does something durable, and
+  only while it is on screen; and **Agents**, their cards, which open
+  beside. The head counts working agents and tokens used against the
+  budget. Its composer posts to the board. Its ⋯ menu stops every agent
+  (the swarm refuses its agents' posts until your next one) or adds one,
+  told to read the board first.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
-  deleted task's worktree, swarms and approvals are later steps of item 47.
+  deleted task's worktree, a swarm's roles, council and streams, and
+  approvals are later steps of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -389,6 +439,13 @@ bot without it. It also supplies the same default compaction
 instructions as the CLI, so app-created bots can summarize older context.
 Completed thoughts retain locally observed thinking time; historical thoughts
 without a recorded duration show no invented time.
+
+On 2026-09-28 a swarm was started from the sheet in demo mode in headless
+Chromium: its agents posted, a post naming one woke it alone, and an agent
+opened beside from the board, with no page errors. The post tool itself runs
+against a real daemon in `tests/test_swarm.py`: an agent's post reaches the
+agent working, wakes the idle one it names and no other, and is refused for a
+bot that is not a member or while the swarm is stopped.
 
 On 2026-09-27 the shell was driven in demo mode in headless Chromium:
 projects and tasks in the sidebar, a card opened beside and swapped, the three

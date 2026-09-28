@@ -21,17 +21,23 @@ window.Daemon = (() => {
       attach: (after) => invoke('attach', { after }),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
+      swarms: () => invoke('swarms'),
+      swarmCreate: ({ project, name, folder, goal, shared, model, budgetTokens }) => invoke('swarm_create', { project, name, folder, goal, shared, model, budgetTokens }),
+      swarmJoin: (swarm, members) => invoke('swarm_join', { swarm, members }),
+      swarmStop: (swarm, stopped) => invoke('swarm_stop', { swarm, stopped }),
+      swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
+      swarmPost: (swarm, text) => invoke('swarm_post', { swarm, text }),
       close: () => tauri.window.getCurrentWindow().close(),
     };
   }
 
   // ---------- demo daemon ----------
-  const S = { bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set() };
+  const S = { swarms: new Map(), bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set() };
   // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
   const node = (item) => { const id = S.nextNode++; S.nodes.set(id, item); return id; };
   const wait = (ms) => new Promise((r) => { const t = setTimeout(() => { S.timers.delete(t); r(); }, ms); S.timers.add(t); });
-  const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0 });
+  const record = (name, model) => ({ name, status: 'idle', running_turn: null, provider: model.split('/')[0], model: model.split('/').slice(1).join('/'), workspace: '/workspace', input_tokens: 0, cached_input_tokens: 0, tokens_used: 0 });
 
   async function create(name, model, createdBy = null, source = null, workspace = null, allowed = null) {
     if (S.bots.has(name)) throw new Error('bot_exists');
@@ -70,7 +76,8 @@ window.Daemon = (() => {
       const prompt = b.steers.shift();
       emit({ event: 'message', bot: name, turn, data: { node: node({ role: 'user', content: [{ type: 'input_text', text: prompt }] }) } });
       await wait(200);
-      await stream(name, turn, `Noted: ${prompt.trim().replace(/[.?!]+$/, '')}. Carrying on with that in mind.`);
+      // A board post is read and carried on from; only a person's steer gets an answer.
+      if (!prompt.startsWith('[board]')) await stream(name, turn, `Noted: ${prompt.trim().replace(/[.?!]+$/, '')}. Carrying on with that in mind.`);
     }
   }
   async function think(name, turn, text) {
@@ -113,6 +120,15 @@ window.Daemon = (() => {
     if (turn === null) return;
     await wait(250);
     if (/scenario|ship|split/i.test(prompt)) { await scenario(name, turn); return; }
+    const sw = memberOf(name);
+    if (sw && prompt.startsWith('You are ')) { await member(sw, name, turn); return; }
+    if (sw && prompt.startsWith('[board]')) {
+      const named = prompt.includes(`@${short(sw, name)}`);
+      await stream(name, turn, named ? 'On it.' : 'Read it; nothing for me there.');
+      if (named) await agentPost(sw, name, turn, `On it: ${prompt.replace(/^\[board\] [^:]+: /, '').replace(/@[\w.-]+\s*/g, '').split(/[.?!]/)[0]}.`);
+      if (!(S.bots.get(name) ?? GONE).interrupted) finish(name, turn);
+      return;
+    }
     // A side chat, a fork nested under its own source, answers from the
     // history it was forked with.
     if (S.sides.has(name)) {
@@ -212,6 +228,58 @@ window.Daemon = (() => {
     finish(n, turn);
   }
 
+  // ---------- demo swarms ----------
+  // The app's swarm folder, kept in memory: its record and its board. The offset is a line count.
+  const memberOf = (name) => [...S.swarms.values()].find((sw) => sw.members.includes(name)) ?? null;
+  const short = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
+  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, model: sw.model, budget_tokens: sw.budget, members: [...sw.members], stopped: sw.stopped });
+  // Who hears a post, as the app's post tool decides: working agents, and idle ones only when named
+  // (or, for your post, when it names nobody).
+  function deliver(sw, from, text) {
+    const named = [...text.matchAll(/@([\w.-]*\w)/g)].map((m) => m[1]);
+    for (const m of sw.members) {
+      const b = S.bots.get(m); if (!b || m === from) continue;
+      const isNamed = named.includes(short(sw, m)) || named.includes(m);
+      const prompt = `[board] ${from ? short(sw, from) : 'user'}: ${text}`;
+      if (b.status !== 'idle') { (b.steers ??= []).push(prompt); emit({ event: 'steered', bot: m, turn: b.running_turn, data: {} }); }
+      else if (isNamed || (!from && !named.length)) reply(m, prompt);
+    }
+  }
+  async function agentPost(sw, name, turn, text) {
+    const b = S.bots.get(name) ?? GONE; if (b.interrupted || sw.stopped) return;
+    const call_id = `call_${++calls}`;
+    emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: `"$SWARM/post" ${JSON.stringify(text.length > 40 ? text.slice(0, 39) + '…' : text)}` }), arguments_truncated: false } });
+    await wait(200);
+    sw.board.push({ at: Date.now(), from: short(sw, name), bot: name, turn, text });
+    b.tokens_used += 4000;
+    emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stdout: '{"posted":true}\n', stderr: '', success: true }) }), artifacts: [] } });
+    deliver(sw, name, text);
+    await steerIn(name, turn);
+  }
+  // Four scripted roles; `@N` names the swarm's Nth agent.
+  const ROLES = [
+    [['post', 'Taking the profile first, so we know where p99 goes.'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1500], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits. @2 connections are yours.']],
+    [['wait', 2600], ['post', 'Taking provider connection reuse. Editing src/provider/socket.rs.'], ['edit', 'src/provider/socket.rs', '+36 −12', 1700], ['shell', 'python3 bench/latency.py --runs 200', 'p99 71 ms · p50 44 ms', 1500], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py. @4 can you run the full suite?']],
+    [['wait', 1200], ['post', 'Taking one store commit per model round. Editing src/store/db.rs.'], ['edit', 'src/store/db.rs', '+48 −21', 1900], ['shell', 'cargo test -p agent-runtime store', 'test result: ok. 64 passed; 0 failed', 1300], ['post', 'Batched commits are in; the 64 store tests pass.']],
+    [['wait', 1800], ['read', 'board.jsonl'], ['post', 'Keeping cargo test green: I will run the suite as changes land.'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 2200], ['post', 'Full suite after both changes: 212 passed.']],
+  ];
+  async function member(sw, name, turn) {
+    const i = sw.members.indexOf(name), mine = ROLES[i % ROLES.length], b = S.bots.get(name);
+    const base = short(sw, sw.members[0]).replace(/-\d+$/, '');
+    await think(name, turn, 'Read the goal and the board first, then take a piece nobody holds.');
+    for (const [op, ...a] of mine) {
+      if (b.interrupted) return;
+      if (op === 'wait') await wait(a[0]);
+      else if (op === 'post') await agentPost(sw, name, turn, a[0].replace(/@(\d)/g, (_, n) => `@${base}-${n}`));
+      else if (op === 'read') await tool(name, turn, 'read', { path: `${sw.dir}/${a[0]}` }, `${sw.board.length} posts`, 400);
+      else if (op === 'edit') await tool(name, turn, 'edit', { path: a[0] }, a[1], a[2]);
+      else await tool(name, turn, 'shell', { command: a[0] }, JSON.stringify({ exit_code: 0, stderr: '', stdout: a[1] + '\n', success: true }), a[2]);
+      b.tokens_used += 20000;
+    }
+    await stream(name, turn, 'My piece is done and posted.', 30);
+    if (!b.interrupted) finish(name, turn);
+  }
+
   const api = {
     setup: async () => ({ socket: 'demo', model: 'openai/gpt-6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
@@ -219,6 +287,21 @@ window.Daemon = (() => {
     writeProject: async () => {},
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
+    swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
+    swarmCreate: async ({ project, name, folder, goal, shared, model, budgetTokens }) => {
+      const full = `${project}.${name}`; if (S.swarms.has(full)) throw new Error(`swarm_exists: ${full}`);
+      const sw = { name: full, project, goal, model, budget: budgetTokens, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
+      S.swarms.set(full, sw); await wait(300); return swarmRecord(sw);
+    },
+    swarmJoin: async (swarm, members) => { const sw = S.swarms.get(swarm); for (const m of members) if (!sw.members.includes(m)) sw.members.push(m); return swarmRecord(sw); },
+    swarmStop: async (swarm, stopped) => { const sw = S.swarms.get(swarm); sw.stopped = stopped; return swarmRecord(sw); },
+    swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false }; },
+    swarmPost: async (swarm, text) => {
+      const sw = S.swarms.get(swarm); sw.stopped = false; sw.board.push({ at: Date.now(), from: 'user', text });
+      const busy = sw.members.filter((m) => S.bots.get(m)?.status !== 'idle');
+      deliver(sw, null, text);
+      return { posted: true, steered: busy.map((m) => short(sw, m)), woke: [], missed: [] };
+    },
     models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {
       if (!S.bots.size) {
@@ -243,7 +326,8 @@ window.Daemon = (() => {
     },
     request: async (op, params = {}) => {
       switch (op) {
-        case 'bots': return { bots: [...S.bots.values()].map((b) => ({ ...b })), next_after: null };
+        // In name order after `after`, as the daemon pages them.
+        case 'bots': return { bots: [...S.bots.values()].filter((b) => params.after == null || b.name > params.after).sort((a, c) => (a.name < c.name ? -1 : 1)).map((b) => ({ ...b })), next_after: null };
         case 'history_nodes': {
           const all = (S.lineages.get(params.bot) ?? []).filter(n => n.node <= (params.from ?? Infinity) && n.node >= (params.min_node ?? 0));
           const limit = params.limit ?? 400;

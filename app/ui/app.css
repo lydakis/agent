@@ -91,6 +91,7 @@ pre.code .lang{position:absolute;right:10px;top:4px;color:var(--t-faint);font-si
 .botrow .acts{display:none}
 .botrow:hover .acts,.botrow:focus-within .acts{display:flex}
 .botrow .acts .ibtn{height:20px;min-width:20px;padding:0 4px}
+.botrow .meta{color:var(--t-faint);font-size:12px}
 .sblabel{padding:12px 12px 2px;color:var(--t-faint);font-size:12px}
 .newproj{display:flex;align-items:center;gap:1ch;margin:4px 8px 8px;height:28px;padding:0 8px;border-radius:6px;color:var(--t-dim);text-align:left}
 button.newproj:hover{background:var(--t-raised);color:var(--t-ink)}
@@ -165,6 +166,31 @@ form.newproj input{flex:1;min-width:0;background:transparent;border:0;color:var(
 .helpbox{max-height:calc(100vh - 120px);overflow:auto;background:var(--t-raised);border:1px solid var(--t-line);border-radius:8px;padding:14px 20px;white-space:pre;color:var(--t-ink);line-height:22px;box-shadow:0 24px 60px -20px rgba(0,0,0,.8)}
 .helpbox b{color:var(--amber);font-weight:500}
 .helpbox i{color:var(--t-faint);font-style:normal}
+
+/* A swarm: its tabs in the head, its board of posts, and the sheet that starts one. */
+.phead .tab{height:24px;padding:0 8px;border-radius:5px;color:var(--t-dim);white-space:nowrap}
+.phead .tab:hover{background:var(--t-raised);color:var(--t-ink)}
+.phead .tab.on{color:var(--t-ink);box-shadow:inset 0 -2px 0 var(--amber)}
+.line.post{display:flex;gap:1ch;margin-top:6px}
+.line.post .who{flex-shrink:0;min-width:10ch;color:var(--amber);text-align:left}
+.line.post button.who:hover{text-decoration:underline}
+.line.post .who.you{color:var(--user)}
+.line.post .pt{min-width:0}
+.line.post .at{color:var(--amber)}
+.sheet{width:60ch;max-width:92%;background:var(--t-raised);border:1px solid var(--t-line);border-radius:8px;padding:14px 16px;box-shadow:0 24px 60px -20px rgba(0,0,0,.8);display:flex;flex-direction:column;gap:4px}
+.sheet h4{margin:0 0 6px;font-weight:500}
+.sheet label{color:var(--t-dim);font-size:12px;margin-top:6px;display:block}
+.sheet textarea,.sheet select{width:100%;background:var(--t-bg);border:1px solid var(--t-line);border-radius:6px;color:var(--t-ink);font:inherit;padding:6px 8px;outline:none}
+.sheet textarea{resize:vertical;caret-color:var(--amber)}
+.sheet textarea:focus,.sheet select:focus{border-color:#6f5a36}
+.sheet .row{display:flex;gap:12px}
+.sheet .row>div{flex:1;min-width:0}
+.sheet .row>div.wide{flex:2}
+.sheet .foot{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+.sbtn{height:28px;padding:0 12px;border-radius:6px;color:var(--t-dim);border:1px solid var(--t-line)}
+.sbtn:hover{color:var(--t-ink)}
+.sbtn.primary{background:var(--amber);color:var(--amber-ink);border-color:var(--amber);font-weight:500}
+.sbtn[disabled]{opacity:.6;cursor:default}
 
 .detached{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:6px;background:var(--t-bg);color:var(--t-dim)}
 .detached.on{display:flex}
