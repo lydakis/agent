@@ -59,14 +59,24 @@ pub struct Instructions {
 /// no bot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    TooLong { path: PathBuf, total: usize },
-    Unreadable { path: PathBuf, reason: String },
+    TooLong {
+        path: PathBuf,
+        total: usize,
+    },
+    /// A skills or profiles folder with more entries than an index visits.
+    TooMany {
+        path: PathBuf,
+    },
+    Unreadable {
+        path: PathBuf,
+        reason: String,
+    },
 }
 impl Failure {
     /// A stable code for programs, in the daemon's error style.
     pub fn code(&self) -> &'static str {
         match self {
-            Failure::TooLong { .. } => "instructions_limit",
+            Failure::TooLong { .. } | Failure::TooMany { .. } => "instructions_limit",
             Failure::Unreadable { .. } => "instructions_unreadable",
         }
     }
@@ -77,6 +87,11 @@ impl std::fmt::Display for Failure {
             Failure::TooLong { path, total } => write!(
                 f,
                 "instructions would be {total} bytes with {}, above {MAX_INSTRUCTIONS}",
+                path.display()
+            ),
+            Failure::TooMany { path } => write!(
+                f,
+                "more than {MAX_ENTRIES} entries in the skills or profiles folders, at {}",
                 path.display()
             ),
             Failure::Unreadable { path, reason } => {
@@ -123,6 +138,10 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Option<String>, Failure> {
 
 /// The head of a skill or profile file: at most this much is read to index it.
 const SKILL_HEAD: usize = 4096;
+/// Directory entries one index visits, indexed or not, so a folder full of
+/// other files cannot make every composition slow. A row costs more than 15
+/// bytes, so the byte budget ends a full index well before this.
+const MAX_ENTRIES: usize = 4096;
 
 /// AGENTS.md files that apply to `workspace`: the global one first, then
 /// from the filesystem root down to the workspace, so the nearest file is
@@ -211,6 +230,9 @@ pub fn front_matter(text: &str) -> (Front, &str) {
     let mut in_tools = false;
     let mut lines = block.lines().peekable();
     while let Some(line) = lines.next() {
+        if uncomment(line).trim().is_empty() {
+            continue;
+        }
         if in_tools && let Some(item) = line.trim_start().strip_prefix("- ") {
             front
                 .tools
@@ -341,6 +363,7 @@ fn search(workspace: &Path, kind: Kind) -> Vec<PathBuf> {
 fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Failure> {
     let mut found = std::collections::BTreeMap::<String, Entry>::new();
     let mut used = 0usize;
+    let mut visited = 0usize;
     for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -355,6 +378,10 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
         // Do not collect directory contents: the index must fit before any
         // more paths or file heads are read. Final ordering is bounded above.
         for entry in entries {
+            visited += 1;
+            if visited > MAX_ENTRIES {
+                return Err(Failure::TooMany { path: dir });
+            }
             let path = entry
                 .map_err(|error| Failure::Unreadable {
                     path: dir.clone(),
@@ -460,8 +487,18 @@ pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure>
     }
     for dir in search(workspace, Kind::Profiles) {
         let path = dir.join(format!("{name}.md"));
-        if !path.is_file() {
-            continue;
+        // Fall back to the user's file only when the workspace has none: a
+        // workspace file that cannot be read is an error, not an absence.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Failure::Unreadable {
+                    path,
+                    reason: error.to_string(),
+                });
+            }
         }
         let Some(text) = read_bounded(&path, MAX_INSTRUCTIONS)? else {
             return Err(Failure::TooLong {
@@ -760,6 +797,32 @@ mod tests {
     }
 
     #[test]
+    fn profile_folders_are_bounded_and_unreadable_files_do_not_fall_back() {
+        let root = temp("entries");
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        for i in 0..=MAX_ENTRIES {
+            std::fs::write(root.join(format!(".agents/agents/{i}.txt")), "").unwrap();
+        }
+        let error = index(
+            search(&root, Kind::Profiles),
+            Kind::Profiles,
+            MAX_INSTRUCTIONS,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, Failure::TooMany { .. }));
+        assert_eq!(error.code(), "instructions_limit");
+        // A workspace profile path that errors other than by being absent
+        // is reported, never replaced by the user's file of the same name.
+        std::fs::remove_dir_all(root.join(".agents/agents")).unwrap();
+        std::fs::write(root.join(".agents/agents"), "not a folder").unwrap();
+        assert_eq!(
+            profile(&root, "reviewer").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn front_matter_takes_flow_and_inline_lists_and_leaves_plain_files_whole() {
         let (front, body) = front_matter("---\ntools: [read, edit]\n---\nbody\n");
         assert_eq!(
@@ -786,7 +849,8 @@ mod tests {
         );
         assert_eq!(front.model.as_deref(), Some("openai/foo"));
         assert_eq!(front.description.as_deref(), Some("Reviews code, #1 on"));
-        let (front, _) = front_matter("---\ntools:\n  - read # first\n  - 'edit'\n---\n");
+        let (front, _) =
+            front_matter("---\ntools:\n  - read # first\n\n  # the rest\n  - 'edit'\n---\n");
         assert_eq!(
             front.tools,
             Some(vec!["read".to_owned(), "edit".to_owned()])
