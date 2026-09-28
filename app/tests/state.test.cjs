@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1300,6 +1300,36 @@ test('a connected provider can be edited in place', async () => {
   assert.match(p.setupHTML(), /data-act="setup-pick" data-v="bedrock"[^>]*>Edit</);
   p.S.setup.adding = 'bedrock';
   assert.match(p.setupHTML(), /name="AWS_REGION"[^>]*value="us-west-2"/);
+});
+
+test('a gateway set up by hand under a known name is not offered the catalog form, which would overwrite it', async () => {
+  const gateway = 'openai=responses,https://proxy.example/v1,PROXY_KEY';
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: `${gateway} bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK`, AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.openSetup();
+  const html = p.setupHTML();
+  assert.doesNotMatch(html, /data-act="setup-pick" data-v="openai"/);
+  assert.match(html, /data-act="setup-pick" data-v="bedrock"[^>]*>Edit</, 'a keyed Bedrock is what the form writes');
+  await assert.rejects(p.connectProvider('openai', { OPENAI_API_KEY: 'k' }), /set up by hand/);
+  assert.equal(calls.filter(([c]) => c === 'save').length, 0);
+});
+
+test('removing a provider asks nobody for models and rewrites no list', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai anthropic', OPENAI_API_KEY: 'k', ANTHROPIC_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, anthropic: { models: [{ id: 'claude' }] } } });
+  p.context.Daemon.models = async () => [{ id: 'openai/gpt' }, { id: 'openai/older-by-hand' }, { id: 'anthropic/claude' }];
+  await p.openSetup();
+  await p.removeProvider('anthropic');
+  assert.equal(calls.filter(([c]) => c === 'discover').length, 0);
+  assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt', 'openai/older-by-hand']);
+});
+
+test('the model chip offers only models of connected providers', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  p.context.Daemon.models = async () => [{ id: 'openai/gpt' }, { id: 'openrouter/gpt' }];
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'openai', model: 'gpt' });
+  p.S.selected = 'lead';
+  await p.modelMenu('main', { x: 1, y: 1 });
+  const menu = p.elements.get('menu').innerHTML;
+  assert.match(menu, /OpenAI/); assert.doesNotMatch(menu, /OpenRouter|openrouter/);
 });
 
 test('a project starts on the model picked for it, and the pick is offered first next time', async () => {

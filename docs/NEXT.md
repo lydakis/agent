@@ -1009,7 +1009,10 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     restarts it, and so does a second window on another store after the first
     changes settings. Asking the attached daemon instead means a
     `provider_models` call, which asks every provider, on each open; that
-    waits for a cheap way to ask a daemon what it runs.
+    waits for a cheap way to ask a daemon what it runs. Follow-up: connecting
+    a provider refreshes the whole list, so a model added to `~/.agent/models`
+    by hand under a provider that answers is dropped; asking only the new
+    provider needs `provider_models` and the list's writer to take a subset.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

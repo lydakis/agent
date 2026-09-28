@@ -270,8 +270,11 @@ first run and later changes:
    profile, say). Removing a provider drops its key unless another provider
    uses it; removing the last one also empties each key the shell exports,
    since a start with no provider named would otherwise detect one from it,
-   and the window then waits for a provider instead of retrying. Refresh
-   models asks again and writes the answer to `~/.agent/models`, replacing
+   and the window then waits for a provider instead of retrying. Removing
+   rewrites no list; the pickers leave that provider's models out. A provider
+   set up by hand under a known name (a gateway named `openai`, say) has no
+   Edit, since the form would replace it with the provider's defaults.
+   Refresh models asks again and writes the answer to `~/.agent/models`, replacing
    it: a provider that answers replaces its lines, one that fails keeps the
    lines it had, one no longer running loses them, and an answer with no
    usable model leaves the file as it was. A file that no longer reads is

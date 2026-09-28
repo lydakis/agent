@@ -1262,7 +1262,11 @@ async function modelMenu(pane, anchor) {
   const b = bot(PANE[pane].bot()); if (!b) return;
   // Read now, so an edited ~/.agent/models shows without a restart.
   let list = [], error = null;
-  try { list = await Daemon.models(); if (!list.length) error = 'Settings lists your providers\' models'; } catch (e) { error = String(e?.message ?? e); }
+  try {
+    // A list written before a removal may still name providers this daemon does not run.
+    const set = setupState().settings ?? await loadSettings().catch(() => null);
+    list = connected(await Daemon.models(), set); if (!list.length) error = 'Settings lists your providers\' models';
+  } catch (e) { error = String(e?.message ?? e); }
   // The pane may show another bot, or this name another identity, by the time the list is read.
   if (PANE[pane].bot() !== b.name || bot(b.name) !== b) return;
   showMenu(modelMenuItems(b, list, error), anchor);
@@ -1417,6 +1421,10 @@ const keysOf = (spec) => [
   ...String(spec).split('=').slice(1).join('=').split(',').slice(2, 3).filter(Boolean),
 ];
 const providerLabel = (name) => catalogOf(name)?.label ?? name;
+// A spec the catalog writes, which its form can edit; any other (a gateway under a known name) it
+// would overwrite with the provider's defaults.
+const editable = (spec) => spec === specName(spec) ? !!catalogOf(spec) : !!catalogOf(specName(spec))?.parts
+  && providerSpecs(catalogOf(specName(spec)).id, { AWS_REGION: spec.split('.')[1], AWS_BEARER_TOKEN_BEDROCK: 'x' }).includes(spec);
 // A model picker: every listed model under its provider's name, the last one picked chosen.
 function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
 function modelSelectHTML(id, list) {
@@ -1449,14 +1457,15 @@ async function openSetup() {
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
   renderSetup();
-  await Promise.all([checkProviders(), readList()]);
+  await Promise.all([checkProviders(st.settings?.listing), readList()]);
 }
 // What this machine would start a daemon with. A window attached to a daemon it did not start shows
 // that daemon's providers instead, which are the ones its models come from.
 async function loadSettings() {
   const set = await Daemon.settings();
   if (set.restartable === false && S.attached) {
-    try { set.providers = Object.keys((await Daemon.request('provider_models', {})).providers ?? {}); } catch (_) {}
+    // The same answer says how each provider is doing, so it is not asked for twice.
+    try { set.listing = (await Daemon.request('provider_models', {})).providers ?? {}; set.providers = Object.keys(set.listing); } catch (_) {}
   }
   setupState().settings = set;
   return set;
@@ -1468,11 +1477,11 @@ function closeSetup() {
   st.open = false; st.adding = null; $('setupwrap').classList.remove('on'); render(); focusInput('main');
 }
 // Each provider's own answer, read without writing anything: the daemon keeps listings a while.
-async function checkProviders() {
+async function checkProviders(listing) {
   const st = setupState(); const names = (st.settings?.providers ?? []).map(specName);
   if (!S.attached || !names.length) { st.status = {}; renderSetup(); return; }
   st.status = Object.fromEntries(names.map((n) => [n, 'checking'])); renderSetup();
-  try { const { providers } = await Daemon.request('provider_models', {}); st.status = Object.fromEntries(names.map((n) => [n, answerOf(providers?.[n])])); }
+  try { const providers = listing ?? (await Daemon.request('provider_models', {})).providers; st.status = Object.fromEntries(names.map((n) => [n, answerOf(providers?.[n])])); }
   catch (e) { st.status = Object.fromEntries(names.map((n) => [n, { error: String(e?.message ?? e) }])); }
   renderSetup();
 }
@@ -1519,6 +1528,7 @@ async function connectProvider(id, values) {
   // A key already set, saved here or exported by the shell, answers for an empty field.
   for (const f of c.fields) if (f.required && !values[f.key] && !(f.secret && st.settings?.keys?.includes(f.key))) throw new Error(`${f.label} is required`);
   const specs = (st.settings?.providers ?? []).filter((s) => catalogOf(specName(s)) !== c);
+  if ((st.settings?.providers ?? []).some((s) => catalogOf(specName(s)) === c && !editable(s))) throw new Error(`${c.label} is set up by hand; remove it to set it up here`);
   // Bedrock signs in one way: with the AWS login, which drops a saved key, or with a key, typed or saved.
   const saved = st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK');
   const aws = values.AUTH ? values.AUTH === 'aws' : !values.AWS_BEARER_TOKEN_BEDROCK && !saved;
@@ -1549,7 +1559,8 @@ async function removeProvider(name) {
   // With no provider named, a start detects one from any key the shell exports; an empty key hides it.
   if (!specs.length) for (const key of DETECTED) if (key in changes || st.settings?.keys?.includes(key)) changes[key] = '';
   await applySettings(changes);
-  await refreshModels();
+  // The list is not rewritten: the pickers leave its models out, and a hand-added line elsewhere stays.
+  await Promise.all([checkProviders(), readList()]);
 }
 // A window attached through a socket it did not start cannot apply a change, so none is saved.
 function unrestartable() {
@@ -1576,7 +1587,7 @@ function setupHTML() {
   };
   const errorsHTML = (names) => names.filter((n) => st.status[n]?.error).map((n) => { const s = st.status[n]; return `<div class="perr">${names.length > 1 ? `${esc(n)}: ` : ''}${esc(s.error)}${s.detail ? `: ${esc(String(s.detail).slice(0, 300))}` : ''}</div>`; }).join('');
   const entries = []; for (const spec of specs) { const n = specName(spec), c = catalogOf(n), key = c?.id ?? n; if (!entries.some((e) => e.key === key)) entries.push({ key, label: c?.label ?? n, names: specs.map(specName).filter((m) => (catalogOf(m)?.id ?? m) === key) }); }
-  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}${catalogOf(key) ? `<button type="button" class="sbtn" data-act="setup-pick" data-v="${esc(key)}"${busy}>Edit</button>` : ''}<button type="button" class="sbtn${st.confirm === key ? ' danger' : ''}" data-act="setup-remove" data-v="${esc(key)}"${busy}>${st.confirm === key ? 'Remove anyway' : 'Remove'}</button></span>${errorsHTML(names)}${st.confirm === key ? '<div class="perr warn">Agents are working. Removing restarts the daemon, which stops them.</div>' : ''}</div>`; }).join('');
+  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}${catalogOf(key) && specs.filter((s) => names.includes(specName(s))).every(editable) ? `<button type="button" class="sbtn" data-act="setup-pick" data-v="${esc(key)}"${busy}>Edit</button>` : ''}<button type="button" class="sbtn${st.confirm === key ? ' danger' : ''}" data-act="setup-remove" data-v="${esc(key)}"${busy}>${st.confirm === key ? 'Remove anyway' : 'Remove'}</button></span>${errorsHTML(names)}${st.confirm === key ? '<div class="perr warn">Agents are working. Removing restarts the daemon, which stops them.</div>' : ''}</div>`; }).join('');
   let add = '';
   if (st.adding === null) add = `<button type="button" class="sbtn" data-act="setup-add"${busy}>＋ Add a provider</button>`;
   else if (st.adding === '') add = `<div class="choices">${CATALOG.filter((c) => !specs.some((s) => catalogOf(specName(s)) === c)).map((c) => `<button type="button" class="choice" data-act="setup-pick" data-v="${c.id}"${busy}>${esc(c.label)}</button>`).join('')}</div>${specs.length ? `<button type="button" class="sbtn" data-act="setup-cancel">Cancel</button>` : ''}`;
