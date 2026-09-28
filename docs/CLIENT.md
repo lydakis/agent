@@ -60,8 +60,9 @@ against the remaining byte budget before reading more paths or file heads.
 It fails as soon as the index cannot fit, then sorts only the bounded result. It also stops at
 4096 folder entries, indexed or not, so a folder of other files cannot slow
 every new bot; past that, composition fails with `instructions_limit`.
-A skill or profile file the workspace has but cannot read is an error; only
-an absent one falls back to the user's.
+A skill, profile or AGENTS.md file that exists but cannot be read, a link to
+a missing file included, is an error; only an absent one falls back to the
+user's.
 
 ## Who uses it
 
