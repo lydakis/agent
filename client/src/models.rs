@@ -114,11 +114,14 @@ fn parse(text: &str) -> Result<Vec<Model>, (usize, &'static str)> {
     Ok(models)
 }
 
-/// A first list from the daemon's `provider_models` answer: every model each
+/// A list from the daemon's `provider_models` answer: every model each
 /// provider listed, with what it said about it as the note, and a comment for
-/// a provider that listed nothing. Refuses output with no usable model
-/// lines, including listings dropped to keep the file within its limit.
-pub fn render(listing: &Value) -> Result<String, Error> {
+/// a provider that listed nothing. A provider that failed keeps its lines
+/// from `kept`, the list being replaced, so one provider down never empties
+/// the list; a provider no longer running loses them. Refuses output with no
+/// usable model lines, including listings dropped to keep the file within
+/// its limit.
+pub fn render(listing: &Value, kept: &[Model]) -> Result<String, Error> {
     let mut text = String::from(
         "# PROVIDER/MODEL per line; clients offer these. Delete what you don't use.\n",
     );
@@ -133,14 +136,14 @@ pub fn render(listing: &Value) -> Result<String, Error> {
     let mut left_out = 0;
     let mut has_models = false;
     for name in names {
-        let (block, instead) = provider_block(name, &providers[name]);
+        let (block, instead) = provider_block(name, &providers[name], kept);
         match [block, instead]
             .into_iter()
             .flatten()
             .find(|block| text.len() + 1 + block.len() <= room)
         {
             Some(block) => {
-                has_models |= !block.starts_with('#');
+                has_models |= block.lines().any(|line| !line.starts_with('#'));
                 text.push('\n');
                 text.push_str(&block);
             }
@@ -169,7 +172,7 @@ pub fn render(listing: &Value) -> Result<String, Error> {
 
 /// A provider's lines, and a shorter comment to write in their place when
 /// they do not fit.
-fn provider_block(name: &str, listed: &Value) -> (Option<String>, Option<String>) {
+fn provider_block(name: &str, listed: &Value, kept: &[Model]) -> (Option<String>, Option<String>) {
     let comment = |said: String| {
         // One comment line, whatever line breaks the provider sent.
         let said: Vec<&str> = said.split_whitespace().collect();
@@ -177,6 +180,19 @@ fn provider_block(name: &str, listed: &Value) -> (Option<String>, Option<String>
     };
     let Some(models) = listed["models"].as_array() else {
         let error = listed["error"].as_str().unwrap_or("no listing");
+        let prefix = format!("{name}/");
+        let last: String = kept
+            .iter()
+            .filter(|model| model.id.starts_with(&prefix))
+            .map(|model| match &model.note {
+                Some(note) => format!("{}  # {note}\n", model.id),
+                None => format!("{}\n", model.id),
+            })
+            .collect();
+        if !last.is_empty() {
+            let said = comment(format!("{name}: {error}; the last list is kept"));
+            return (Some(format!("{said}{last}")), Some(said));
+        }
         let full = listed["detail"]
             .as_str()
             .map(|detail| comment(format!("{name}: {error}: {detail}")));
@@ -233,11 +249,14 @@ mod tests {
             json!([{"id":"x".repeat(257)}]),
         ] {
             let listing = json!({"providers":{"custom":{"models":models}}});
-            assert_eq!(render(&listing).unwrap_err().code, "models_none_listed");
+            assert_eq!(
+                render(&listing, &[]).unwrap_err().code,
+                "models_none_listed"
+            );
         }
         let refused = json!({"providers":{"gone":{"error":"provider_connection"}}});
         assert!(
-            render(&refused)
+            render(&refused, &[])
                 .unwrap_err()
                 .detail
                 .unwrap()
@@ -248,11 +267,46 @@ mod tests {
             .map(|i| json!({"id":format!("m{i}"), "name":"n".repeat(256)}))
             .collect();
         assert_eq!(
-            render(&json!({"providers":{"large":{"models":large}}}))
+            render(&json!({"providers":{"large":{"models":large}}}), &[])
                 .unwrap_err()
                 .code,
             "models_none_listed"
         );
+    }
+
+    #[test]
+    fn a_provider_that_fails_keeps_its_last_lines_and_one_that_left_loses_them() {
+        let kept = parse(
+            "bedrock/claude-opus-5  # Claude Opus 5\nbedrock/claude-haiku-5\ngone/model\nopenai/old\n",
+        )
+        .unwrap();
+        let text = render(
+            &json!({"providers":{
+                "bedrock":{"error":"provider_aws_credentials_expired"},
+                "openai":{"models":[{"id":"gpt-6-luna"}]}}}),
+            &kept,
+        )
+        .unwrap();
+        assert!(
+            text.contains("# bedrock: provider_aws_credentials_expired; the last list is kept\n")
+        );
+        let ids: Vec<_> = parse(&text).unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "bedrock/claude-opus-5",
+                "bedrock/claude-haiku-5",
+                "openai/gpt-6-luna"
+            ]
+        );
+        assert_eq!(
+            parse(&text).unwrap()[0].note.as_deref(),
+            Some("Claude Opus 5")
+        );
+        // Kept lines count as usable: a list is not refused while one survives.
+        let down = json!({"providers":{"bedrock":{"error":"provider_connection"}}});
+        assert!(render(&down, &kept).is_ok());
+        assert!(render(&down, &[]).is_err());
     }
 
     #[test]
@@ -279,13 +333,16 @@ mod tests {
 
     #[test]
     fn a_discovered_list_reads_back_as_the_models_listed() {
-        let text = render(&json!({"providers":{
+        let text = render(
+            &json!({"providers":{
             "openai":{"models":[{"id":"gpt-6-luna"},{"id":"bad id"}]},
             "anthropic":{"models":[{"id":"claude-sonnet-5","name":"Claude Sonnet 5",
                 "context_tokens":1000000,"output_tokens":128000}]},
             "bedrock":{"error":"provider_http_404","detail":"not found"},
             "gone":{"error":"provider_http_500","detail":"down\nother/model\r\nx"},
-            "quiet":{"models":[{"id":"bad id"}]}}}))
+            "quiet":{"models":[{"id":"bad id"}]}}}),
+            &[],
+        )
         .unwrap();
         assert!(text.contains(
             "anthropic/claude-sonnet-5  # Claude Sonnet 5, 1000000 context, 128000 output\n"
@@ -299,8 +356,11 @@ mod tests {
             .map(|i| json!({"id": format!("model-{i}")}))
             .collect();
         let long = "p".repeat(64);
-        let text = render(&json!({"providers":{
-            "openai":{"models":[{"id":"gpt-6-luna"}]}, long.clone(): {"models": many}}}))
+        let text = render(
+            &json!({"providers":{
+            "openai":{"models":[{"id":"gpt-6-luna"}]}, long.clone(): {"models": many}}}),
+            &[],
+        )
         .unwrap();
         assert!(text.len() <= super::LIMIT as usize);
         assert!(text.contains(&format!("# {long}: ")));
@@ -318,7 +378,7 @@ mod tests {
             listing[format!("z-{i:03}")] =
                 json!({"error": "provider_http_500", "detail": "d".repeat(300)});
         }
-        let text = render(&json!({ "providers": listing })).unwrap();
+        let text = render(&json!({ "providers": listing }), &[]).unwrap();
         assert!(text.len() <= super::LIMIT as usize);
         assert!(text.contains("more providers left out, past the list's 1 MiB\n"));
         assert!(parse(&text).is_ok());

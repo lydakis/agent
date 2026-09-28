@@ -1005,6 +1005,26 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     budget, on George's Mac; Keep. Approvals in the app wait: George runs
     with full access.
     A fork into another provider stays out: history is provider-native.
+    Done (2026-09-28): setup and settings, the first items of an app audit
+    (Sol, 2026-09-28) George put before swarms. A draft stays with the bot
+    it was typed for. A first run connects providers (keys, a ChatGPT plan,
+    or Bedrock, one provider for Claude and its other models, with its
+    region and AWS profile or API key) and lists what each offers; there is
+    no default model (George, 2026-09-28): a project or agent is given one
+    when it is made, from any provider, listed under its provider's name.
+    Settings is the same screen ([APP.md](APP.md#setup-and-settings)). Follow-up: a change restarts the
+    daemon and so stops running turns; a daemon that could take providers
+    while running would not, but that is a daemon op for the app's sake and
+    waits until restarts prove a cost. Follow-up: Settings shows the providers
+    the app would start a daemon with; a daemon started from a terminal with
+    other `--provider` flags runs providers it does not list until the app
+    restarts it, and so does a second window on another store after the first
+    changes settings. Asking the attached daemon instead means a
+    `provider_models` call, which asks every provider, on each open; that
+    waits for a cheap way to ask a daemon what it runs. Follow-up: connecting
+    a provider refreshes the whole list, so a model added to `~/.agent/models`
+    by hand under a provider that answers is dropped; asking only the new
+    provider needs `provider_models` and the list's writer to take a subset.
 
 Kept out of the queue: process sandboxing, which is the host's job as the
 tools section says.

@@ -27,6 +27,9 @@ const S = {
   families: new Map(),
   // Swarms, from their folders in ~/.agent/swarms, and the swarm each agent belongs to.
   swarms: new Map(), memberOf: new Map(),
+  // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
+  // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
+  drafts: new Map(),
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
@@ -222,8 +225,9 @@ function forgetBot(name) {
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
   S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
   // A draft belongs to its bot, so it goes with it.
-  if (S.ui.side === name) { S.ui.side = null; $('sideinput').value = ''; }
-  if (S.selected === name) $('input').value = '';
+  if (S.ui.side === name) S.ui.side = null;
+  S.drafts.delete(name);
+  for (const ids of Object.values(PANE)) { const input = $(ids.input); if (input.dataset.for === name) { input.value = ''; input.dataset.for = ''; } }
 }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
@@ -789,6 +793,7 @@ async function handle(ev, session, paint = true) {
   if (!terminal && paint) { if (S.live) await loadVisible(); render(); }
 }
 function lost(reason) {
+  S.lastReason = reason;
   S.session = null; S.attached = false; S.live = false;
   // Live deltas have no replay cursor. Reconnect rebuilds from durable nodes.
   for (const t of S.transcripts.values()) { t.text = ''; t.thinking = ''; t.thinkingSince = 0; t.thinkingMs = 0; t.streamingTurn = null; t.streamGen += 1; }
@@ -819,7 +824,7 @@ function attach() {
     clearTimeout(retryTimer); retryTimer = null;
     attaching = attachOnce().finally(() => {
       attaching = null;
-      if (!S.attached) retryAttach();
+      if (!S.attached && !idle()) retryAttach();
     });
   }
   return attaching;
@@ -827,9 +832,6 @@ function attach() {
 async function attachOnce() {
   try {
     if (!S.config) S.config = await Daemon.setup();
-    // The login shell's model, looked up beside the attach so a slow profile never delays it, and
-    // again on each attach while none is known (~/.agent/env may have been repaired meanwhile).
-    if (!S.config.model) Daemon.defaultModel?.().then((m) => { if (m && !S.config.model) S.config.model = m; }, () => {});
     const { session } = await Daemon.attach(S.cursor);
     S.session = session;
     S.deleted = new Set(); S.snapshot = true;
@@ -872,18 +874,23 @@ async function attachOnce() {
     if (S.session !== session) return false;
     $('detached').classList.remove('on');
     render();
+    if (!S.setupSeen && !S.bots.size) { S.setupSeen = true; offerSetup(); }
     return true;
   } catch (e) {
     Daemon.log?.(`attach failed: ${e?.message ?? e}`);
     lost(String(e?.message ?? e));
+    // Nothing to run yet: setup says what to bring, instead of an error.
+    if (S.lastReason.startsWith('no_provider') && !S.setupSeen) openSetup();
     return false;
   }
 }
+// No provider to run: starting again cannot help until Settings changes, which attaches itself.
+function idle() { return /^no_provider/.test(S.lastReason ?? ''); }
 function showDetached(reason) {
   S.attached = false;
-  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · retrying</div>`;
+  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${idle() ? 'waiting for a provider' : 'retrying'}</div><div style="margin-top:12px"><button type="button" class="sbtn" data-act="settings">Open Settings</button></div>`;
   $('detached').classList.add('on');
-  retryAttach();
+  if (!idle()) retryAttach();
 }
 function restore() {
   let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
@@ -1156,7 +1163,7 @@ function renderHead(el, b, pane) {
   if (b) readBranch(b);
   const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}|${b.branch ?? ''}` : '-';
   if (el.dataset.k === key) return; el.dataset.k = key;
-  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME creates one</span></div>' : '';
+  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME PROVIDER/MODEL creates one</span></div>' : '';
 }
 const PANE = {
   main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
@@ -1186,7 +1193,7 @@ function renderComposer(pane, b, sw = null) {
   send.textContent = ACTION[mode];
   $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
-  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME [PROVIDER/MODEL]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
+  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
 
 // ---------- swarm view ----------
@@ -1236,14 +1243,13 @@ let sheetFor = null;
 async function openSwarmSheet(project) {
   closeMenu();
   const lead = bot(project + LEAD); if (!lead) return;
-  let models = []; try { models = (await Daemon.models()).map((m) => m.id); } catch (_) {}
-  const own = lead.model && lead.model !== '?/?' ? lead.model : S.config?.model;
-  if (own && !models.includes(own)) models.unshift(own);
+  // Its agents start on the project's model unless another is picked.
+  let models = []; try { models = connected(await Daemon.models(), setupState().settings ?? await loadSettings().catch(() => null)); } catch (_) {}
   sheetFor = project;
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
-    <div class="row"><div><label for="sw-n">Agents</label>${sel('sw-n', SWARM_SIZES.map((n) => [n, String(n)]), 4)}</div><div class="wide"><label for="sw-model">Model</label>${sel('sw-model', models.map((m) => [m, m]), own)}</div></div>
+    <div class="row"><div><label for="sw-n">Agents</label>${sel('sw-n', SWARM_SIZES.map((n) => [n, String(n)]), 4)}</div><div class="wide"><label for="sw-model">Model</label>${modelSelectHTML('sw-model', models, lead.model)}</div></div>
     <div class="row"><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
@@ -1255,6 +1261,7 @@ $('sheet').addEventListener('submit', async (e) => {
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
+    if (!$('sw-model').value) throw new Error('Choose a model for its agents');
     await createSwarm(project, { goal: $('sw-goal').value, n: Number($('sw-n').value), model: $('sw-model').value, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value) });
     closeSheet();
   } catch (err) { toast(String(err?.message ?? err), 6000); start.disabled = false; start.textContent = 'Start swarm'; }
@@ -1337,6 +1344,19 @@ function keybarHTML(b) {
   else { keys.push('<kbd>^k</kbd> find'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
   return `${dot}${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
 }
+// Each composer holds the text of the bot its pane shows. When a pane shows another bot, its text is
+// put away under the bot it was typed for, then the new bot's comes back: every pane is put away
+// before any is filled, so a swap trades the two texts.
+function followDrafts() {
+  const moved = [];
+  for (const ids of Object.values(PANE)) {
+    const input = $(ids.input), who = ids.bot() ?? '';
+    if ((input.dataset.for ?? '') === who) continue;
+    if (input.dataset.for) { if (input.value) S.drafts.set(input.dataset.for, input.value); else S.drafts.delete(input.dataset.for); }
+    moved.push([input, who]);
+  }
+  for (const [input, who] of moved) { input.value = S.drafts.get(who) ?? ''; S.drafts.delete(who); input.dataset.for = who; grow(input); }
+}
 function render() {
   const app = $('app');
   // The sidebar's rows also stamp each bot's project, which names and crumbs use.
@@ -1345,6 +1365,7 @@ function render() {
   if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
   const side = S.ui.side ? bot(S.ui.side) : null;
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
+  followDrafts();
   if (sw) { renderSwarmHead($('title'), sw); renderSwarm($('log'), sw); }
   else { renderHead($('title'), b, 'main'); if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; } }
   if (S.ui.rail) renderRail();
@@ -1385,9 +1406,9 @@ let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot\n Enter sends · Shift-Enter a new line\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n\n /new NAME PROVIDER/MODEL     create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
-  let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: agent models --discover writes ~/.agent/models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
+  let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
 }
 function hideHelp() { S.ui.help = false; $('helpwrap').classList.remove('on'); $(PANE[S.ui.side ? helpPane : 'main'].input).focus(); }
@@ -1458,11 +1479,12 @@ function modelChoices(b, list) {
   return [...mine.map((id) => ({ id, ok: true, on: id === current })), ...others.map((id) => ({ id, ok: false, on: false }))];
 }
 function modelMenuItems(b, list, error) {
+  // Each provider under its own heading, so the menu says where a model comes from.
   const items = []; let group = null;
   for (const c of modelChoices(b, list)) {
-    if (group !== null && providerOf(c.id) !== group) items.push({ sep: true });
-    group = providerOf(c.id);
-    items.push({ act: 'set-model', who: b.name, v: c.id, label: c.id, on: c.on, disabled: !c.ok, hint: c.ok ? '' : 'new agent' });
+    const p = providerOf(c.id);
+    if (p !== group) { if (group !== null) items.push({ sep: true }); items.push({ head: providerLabel(p) }); group = p; }
+    items.push({ act: 'set-model', who: b.name, v: c.id, label: c.id.slice(p.length + 1), on: c.on, disabled: !c.ok, hint: c.ok ? '' : 'new agent' });
   }
   if (error) items.push({ sep: true }, { act: 'none', label: error, disabled: true });
   return items;
@@ -1484,18 +1506,24 @@ async function modelMenu(pane, anchor) {
   const b = bot(PANE[pane].bot()); if (!b) return;
   // Read now, so an edited ~/.agent/models shows without a restart.
   let list = [], error = null;
-  try { list = await Daemon.models(); if (!list.length) error = 'agent models --discover lists more'; } catch (e) { error = String(e?.message ?? e); }
+  try {
+    // A list written before a removal may still name providers this daemon does not run.
+    const set = setupState().settings ?? await loadSettings().catch(() => null);
+    list = connected(await Daemon.models(), set); if (!list.length) error = 'Settings lists your providers\' models';
+  } catch (e) { error = String(e?.message ?? e); }
   // The pane may show another bot, or this name another identity, by the time the list is read.
   if (PANE[pane].bot() !== b.name || bot(b.name) !== b) return;
   showMenu(modelMenuItems(b, list, error), anchor);
 }
 
 // ---------- actions ----------
-async function submit(text, pane = 'main') {
+// `to` is the bot the text was typed for, which is the one it goes to even if the pane has since
+// been pointed at another.
+async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
-    const m = model || S.config?.model; if (!m) throw new Error('model_required: NAME PROVIDER/MODEL, or set AGENT_MODEL');
+    const m = model; if (!m) throw new Error('model_required: /new NAME PROVIDER/MODEL');
     // Composed now, so an AGENTS.md edited since the window opened reaches this bot. One that
     // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
@@ -1505,9 +1533,9 @@ async function submit(text, pane = 'main') {
     await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(pane); return; }
-  const sw = pane === 'main' && swarmOf(S.selected);
+  const sw = pane === 'main' && swarmOf(to);
   if (sw) { await postToSwarm(sw, text); return; }
-  const b = bot(PANE[pane].bot()); if (!b) throw new Error('no bot selected; /new NAME creates one');
+  const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
@@ -1582,7 +1610,7 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // the file it lacks, with that coordinator's model, so a failed write retries.
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
-async function createProject(dir) {
+async function createProject(dir, picked = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
   if (existing) {
@@ -1591,8 +1619,11 @@ async function createProject(dir) {
     await openOnly(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
-  const model = info.model || policy.model || S.config?.model;
-  if (!model) throw new Error('model_required: set AGENT_MODEL, or model in .agents/project.toml');
+  // A folder that already has a project file keeps its model; a new one takes the model picked for it,
+  // else its coordinator profile's.
+  const model = (info.file && info.model) || picked || policy.model;
+  if (!model) throw new Error('model_required: choose a model');
+  if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   const session = S.session;
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
@@ -1600,6 +1631,243 @@ async function createProject(dir) {
   await openOnly(info.coordinator); toast(`project ${info.name} · ${policy.note}`);
 }
 function detach() { save(); Daemon.close(); }
+
+// ---------- setup ----------
+// What a daemon needs before anything runs: providers, and what each needs to sign in. The app keeps
+// them in `~/.agent/env` (read back without key values) and restarts the daemon to apply them. There
+// is no default model: each project or agent is given one when it is made, from any provider.
+// Onboarding is this screen opened on its own when no provider is set up; Settings is the same
+// screen opened from the sidebar.
+const AWS = 'Signs in with your AWS CLI login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
+// A field that is `local` is the form's own choice, never saved.
+const BEDROCK = [
+  { key: 'AWS_REGION', label: 'Region', hint: 'us-east-1', required: true },
+  { key: 'AUTH', label: 'Sign in with', local: true, choices: [['aws', 'AWS login'], ['key', 'Bedrock API key']] },
+  { key: 'AWS_PROFILE', label: 'AWS profile', hint: 'default' },
+  { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bedrock API key', hint: 'optional', secret: true },
+];
+// Keys a start without AGENT_PROVIDER turns into providers, as the CLI detects them.
+const DETECTED = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY'];
+const CATALOG = [
+  { id: 'anthropic', label: 'Anthropic', fields: [{ key: 'ANTHROPIC_API_KEY', label: 'API key', secret: true, required: true }] },
+  { id: 'openai', label: 'OpenAI', fields: [{ key: 'OPENAI_API_KEY', label: 'API key', secret: true, required: true }] },
+  { id: 'openrouter', label: 'OpenRouter', fields: [{ key: 'OPENROUTER_API_KEY', label: 'API key', secret: true, required: true }] },
+  { id: 'chatgpt', label: 'ChatGPT plan', about: 'Uses the ChatGPT sign-in Codex saved on this computer (codex login).', fields: [] },
+  // Bedrock serves Claude over Anthropic's API and every other model over OpenAI's, each a provider of
+  // its own to the daemon; to the user it is one provider, connected and removed as one.
+  { id: 'bedrock', label: 'Amazon Bedrock', about: AWS, fields: BEDROCK, parts: [['bedrock', 'anthropic', 'anthropic'], ['bedrock-openai', 'responses', 'openai']] },
+];
+const specName = (spec) => String(spec).split('=')[0];
+// The daemon providers an entry runs, and the entry a daemon provider belongs to.
+const partsOf = (c) => c.parts ? c.parts.map(([name]) => name) : [c.id];
+const catalogOf = (name) => CATALOG.find((c) => partsOf(c).includes(name));
+// The keys a spec signs with: its catalog entry's, or the one a `NAME=FAMILY,URL,KEY` spec names.
+const keysOf = (spec) => [
+  ...(catalogOf(specName(spec))?.fields ?? []).filter((f) => f.secret).map((f) => f.key),
+  ...String(spec).split('=').slice(1).join('=').split(',').slice(2, 3).filter(Boolean),
+];
+const providerLabel = (name) => catalogOf(name)?.label ?? name;
+// A spec the catalog writes, which its form can edit; any other (a gateway under a known name) it
+// would overwrite with the provider's defaults.
+const editable = (spec) => spec === specName(spec) ? !!catalogOf(spec) : !!catalogOf(specName(spec))?.parts
+  && providerSpecs(catalogOf(specName(spec)).id, { AWS_REGION: spec.split('.')[1], AWS_BEARER_TOKEN_BEDROCK: 'x' }).includes(spec);
+// A model picker: every listed model under its provider's name, the last one picked chosen.
+function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
+function modelSelectHTML(id, list, prefer = null) {
+  const pick = [prefer, lastModel()].find((m) => m && list.some((x) => x.id === m)) ?? '';
+  const groups = new Map(); for (const m of list) { const label = providerLabel(providerOf(m.id)); if (!groups.has(label)) groups.set(label, []); groups.get(label).push(m); }
+  const options = [...groups].map(([label, ms]) => `<optgroup label="${esc(label)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === pick ? ' selected' : ''}>${esc(m.id.slice(providerOf(m.id).length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
+  return `<select id="${id}" aria-label="Model">${pick ? '' : '<option value="" selected disabled>Choose a model</option>'}${options}</select>`;
+}
+// An entry's `--provider` specs. Bedrock with an API key names each endpoint so the key can be named
+// after it; without one it signs with the AWS CLI's credentials in the region.
+function providerSpecs(id, values) {
+  const c = catalogOf(id);
+  if (!c?.parts) return [id];
+  return c.parts.map(([name, family, path]) => values.AWS_BEARER_TOKEN_BEDROCK ? `${name}=${family},https://bedrock-mantle.${values.AWS_REGION}.api.aws/${path}/v1,AWS_BEARER_TOKEN_BEDROCK` : name);
+}
+// One screen, one state: `settings` as the app would start a daemon with, each provider's answer
+// (`checking`, a model count, or an error), and the list models are picked from.
+function setupState() { return S.setup ??= { open: false, settings: null, status: {}, list: [], adding: null, busy: null, error: null, listError: null }; }
+const hasProject = () => [...S.bots.keys()].some((n) => n.endsWith(LEAD));
+// A window with nothing in it opens setup when no provider is set up.
+async function offerSetup() {
+  // No agents yet: setup connects a provider or, with one already, opens the first project.
+  try { await openSetup(); } catch (_) {}
+}
+async function openSetup() {
+  S.setupSeen = true;
+  const st = setupState();
+  st.open = true; st.error = null;
+  $('setupwrap').classList.add('on'); renderSetup();
+  try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
+  if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
+  renderSetup();
+  await Promise.all([checkProviders(st.settings?.listing), readList()]);
+}
+// What this machine would start a daemon with. A window attached to a daemon it did not start shows
+// that daemon's providers instead, which are the ones its models come from.
+async function loadSettings() {
+  const set = await Daemon.settings();
+  if (set.restartable === false && S.attached) {
+    // The same answer says how each provider is doing, so it is not asked for twice.
+    try { set.listing = (await Daemon.request('provider_models', {})).providers ?? {}; set.providers = Object.keys(set.listing); } catch (_) {}
+  }
+  setupState().settings = set;
+  return set;
+}
+// Only models a connected provider can run: a list written before a removal may still name others.
+const connected = (list, set) => set ? list.filter((m) => set.providers.map(specName).includes(providerOf(m.id))) : list;
+function closeSetup() {
+  const st = S.setup; if (!st || st.busy) return;
+  st.open = false; st.adding = null; $('setupwrap').classList.remove('on'); render(); focusInput('main');
+}
+// Each provider's own answer, read without writing anything: the daemon keeps listings a while.
+async function checkProviders(listing) {
+  const st = setupState(); const names = (st.settings?.providers ?? []).map(specName);
+  if (!S.attached || !names.length) { st.status = {}; renderSetup(); return; }
+  st.status = Object.fromEntries(names.map((n) => [n, 'checking'])); renderSetup();
+  try { const providers = listing ?? (await Daemon.request('provider_models', {})).providers; st.status = Object.fromEntries(names.map((n) => [n, answerOf(providers?.[n])])); }
+  catch (e) { st.status = Object.fromEntries(names.map((n) => [n, { error: String(e?.message ?? e) }])); }
+  renderSetup();
+}
+const answerOf = (listed) => !listed ? { error: 'not running; restart to apply' } : Array.isArray(listed.models) ? { models: listed.models.length } : { error: listed.error ?? 'no listing', detail: listed.detail ?? null };
+async function readList() {
+  const st = setupState();
+  try { st.list = connected(await Daemon.models(), st.settings); st.listError = null; } catch (e) { st.list = []; st.listError = String(e?.message ?? e); }
+  renderSetup();
+}
+// Ask the providers again and write the list new agents pick from. A provider that fails keeps what
+// it listed last; nothing usable leaves the old list as it was.
+async function refreshModels() {
+  const st = setupState();
+  const names = (st.settings?.providers ?? []).map(specName);
+  // No provider, no daemon to ask: the list offers nothing until one is connected.
+  if (!names.length) { st.status = {}; st.list = []; st.listError = null; renderSetup(); return; }
+  st.status = Object.fromEntries(names.map((n) => [n, 'checking'])); st.busy = 'Asking your providers for their models…'; renderSetup();
+  let refused = null;
+  try {
+    const found = await Daemon.discoverModels();
+    st.status = Object.fromEntries(names.map((n) => [n, found.providers?.[n] ?? answerOf(null)]));
+    if (!found.written) refused = found.error;
+  } catch (e) { st.error = String(e?.message ?? e); }
+  finally { st.busy = null; }
+  await readList();
+  // Why nothing was written outlasts reading the old list back.
+  if (refused) { st.listError = refused; renderSetup(); }
+}
+// Apply saved settings: the daemon restarts (running turns stop) and the window attaches again.
+async function restartDaemon() {
+  const st = setupState();
+  st.busy = 'Restarting the daemon…'; renderSetup();
+  try {
+    await Daemon.restartDaemon();
+    // With every provider removed, a daemon that will not start for lack of one is the expected end.
+    if (!(await attach()) && !(await attach()) && !(/^no_provider/.test(S.lastReason ?? '') && !st.settings?.providers?.length)) throw new Error(S.lastReason ?? 'daemon_unavailable');
+  } finally { st.busy = null; }
+}
+async function connectProvider(id, values) {
+  const st = setupState(); const c = catalogOf(id); if (!c) return;
+  unrestartable();
+  // Read again, so a change another window saved meanwhile is kept.
+  await loadSettings();
+  // A key already set, saved here or exported by the shell, answers for an empty field.
+  for (const f of c.fields) if (f.required && !values[f.key] && !(f.secret && st.settings?.keys?.includes(f.key))) throw new Error(`${f.label} is required`);
+  const specs = (st.settings?.providers ?? []).filter((s) => catalogOf(specName(s)) !== c);
+  if ((st.settings?.providers ?? []).some((s) => catalogOf(specName(s)) === c && !editable(s))) throw new Error(`${c.label} is set up by hand; remove it to set it up here`);
+  // Bedrock signs in one way: with the AWS login, which drops a saved key, or with a key, typed or saved.
+  const saved = st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK');
+  const aws = values.AUTH ? values.AUTH === 'aws' : !values.AWS_BEARER_TOKEN_BEDROCK && !saved;
+  // The region names the endpoint and sits inside a space-separated provider list.
+  if (c.parts && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION ?? '')) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
+  if (c.parts && !aws && !values.AWS_BEARER_TOKEN_BEDROCK && !saved) throw new Error('Bedrock API key is required');
+  const keyed = c.parts ? { ...values, AWS_BEARER_TOKEN_BEDROCK: aws ? '' : values.AWS_BEARER_TOKEN_BEDROCK || 'saved' } : values;
+  const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
+  // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
+  for (const f of c.fields) if (!f.local && (!f.secret || values[f.key])) changes[f.key] = values[f.key] || '';
+  // Emptied rather than removed, so a key the shell exports stays out of it too.
+  if (c.parts && aws && saved) changes.AWS_BEARER_TOKEN_BEDROCK = '';
+  await applySettings(changes);
+  st.adding = null;
+  await refreshModels();
+}
+async function removeProvider(name) {
+  const st = setupState(); const c = catalogOf(name);
+  unrestartable();
+  await loadSettings();
+  const gone = c ? partsOf(c) : [name];
+  const specs = (st.settings?.providers ?? []).filter((s) => !gone.includes(specName(s)));
+  // Emptied rather than removed, so a list the shell exports does not come back.
+  const changes = { AGENT_PROVIDER: specs.join(' ') };
+  // Its key goes too, unless another provider still uses it; the region and profile stay.
+  const used = specs.flatMap(keysOf);
+  for (const f of c?.fields ?? []) if (f.secret && !used.includes(f.key)) changes[f.key] = null;
+  // With no provider named, a start detects one from any key the shell exports; an empty key hides it.
+  if (!specs.length) for (const key of DETECTED) if (key in changes || st.settings?.keys?.includes(key)) changes[key] = '';
+  await applySettings(changes);
+  // The list is not rewritten: the pickers leave its models out, and a hand-added line elsewhere stays.
+  await Promise.all([checkProviders(), readList()]);
+}
+// A window attached through a socket it did not start cannot apply a change, so none is saved.
+function unrestartable() {
+  if (setupState().settings?.restartable === false) throw new Error('restart_unavailable: this window did not start its daemon, so it cannot apply provider changes');
+}
+async function applySettings(changes) {
+  const st = setupState();
+  st.busy = 'Saving…'; st.error = null; renderSetup();
+  try { await Daemon.saveSettings(changes); st.settings = await Daemon.settings(); } finally { st.busy = null; }
+  await restartDaemon();
+}
+function setupHTML() {
+  const st = setupState(), set = st.settings, specs = set?.providers ?? [];
+  const busy = st.busy ? ' disabled' : '';
+  // One row per entry: an entry of several daemon providers counts their models together and names
+  // whichever of them failed.
+  const statusHTML = (names) => {
+    const all = names.map((n) => st.status[n]);
+    if (all.includes('checking')) return '<span class="st dim">checking…</span>';
+    if (all.some((s) => !s)) return `<span class="st dim">${S.attached ? '' : 'not running'}</span>`;
+    const models = all.reduce((sum, s) => sum + (s.models ?? 0), 0);
+    if (all.every((s) => s.error)) return '<span class="st bad">✘ not ready</span>';
+    return `<span class="st ok">✓ ${models} model${models === 1 ? '' : 's'}</span>`;
+  };
+  const errorsHTML = (names) => names.filter((n) => st.status[n]?.error).map((n) => { const s = st.status[n]; return `<div class="perr">${names.length > 1 ? `${esc(n)}: ` : ''}${esc(s.error)}${s.detail ? `: ${esc(String(s.detail).slice(0, 300))}` : ''}</div>`; }).join('');
+  const entries = []; for (const spec of specs) { const n = specName(spec), c = catalogOf(n), key = c?.id ?? n; if (!entries.some((e) => e.key === key)) entries.push({ key, label: c?.label ?? n, names: specs.map(specName).filter((m) => (catalogOf(m)?.id ?? m) === key) }); }
+  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}${catalogOf(key) && specs.filter((s) => names.includes(specName(s))).every(editable) ? `<button type="button" class="sbtn" data-act="setup-pick" data-v="${esc(key)}"${busy}>Edit</button>` : ''}<button type="button" class="sbtn${st.confirm === key ? ' danger' : ''}" data-act="setup-remove" data-v="${esc(key)}"${busy}>${st.confirm === key ? 'Remove anyway' : 'Remove'}</button></span>${errorsHTML(names)}${st.confirm === key ? '<div class="perr warn">Agents are working. Removing restarts the daemon, which stops them.</div>' : ''}</div>`; }).join('');
+  let add = '';
+  if (st.adding === null) add = `<button type="button" class="sbtn" data-act="setup-add"${busy}>＋ Add a provider</button>`;
+  else if (st.adding === '') add = `<div class="choices">${CATALOG.filter((c) => !specs.some((s) => catalogOf(specName(s)) === c)).map((c) => `<button type="button" class="choice" data-act="setup-pick" data-v="${c.id}"${busy}>${esc(c.label)}</button>`).join('')}</div>${specs.length ? `<button type="button" class="sbtn" data-act="setup-cancel">Cancel</button>` : ''}`;
+  else {
+    const c = catalogOf(st.adding);
+    const value = (f) => f.key === 'AWS_REGION' ? set?.region ?? '' : f.key === 'AWS_PROFILE' ? set?.profile ?? '' : '';
+    // How Bedrock signs in now, from its specs: a key only the shell exports does not change it.
+    const choice = (f) => { const on = (set?.providers ?? []).some((s) => catalogOf(specName(s))?.parts && s.endsWith(',AWS_BEARER_TOKEN_BEDROCK')) ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
+    const fields = c.fields.map((f) => f.choices ? choice(f) : `<label><span>${esc(f.label)}</span><input name="${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" value="${esc(value(f))}" placeholder="${esc(f.secret && set?.keys?.includes(f.key) ? 'saved; type to replace' : f.hint ?? '')}"></label>`).join('');
+    const working = anyActive() ? `<p class="warn">Agents are working. Connecting restarts the daemon, which stops them.</p>` : '';
+    add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;
+  }
+  const ready = Object.values(st.status).some((s) => s?.models > 0) || st.list.length > 0;
+  const refresh = specs.length && S.attached ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
+  const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
+  const projects = hasProject();
+  const project = projects ? '' : ready && specs.length && st.list.length
+    ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
+    : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
+  const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
+  return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
+    + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
+    + step(2, 'First project', projects, project)
+    + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
+}
+// Answers arrive while someone types a key: what the fields hold, and where the caret is, survive.
+function renderSetup() {
+  if (!S.setup?.open) return;
+  const box = $('setup'), kept = new Map();
+  for (const el of box.querySelectorAll('input, select')) kept.set(el.name || el.id, el.value);
+  const focused = box.contains?.(document.activeElement) ? document.activeElement.name || document.activeElement.id : null;
+  box.innerHTML = setupHTML();
+  for (const el of box.querySelectorAll('input, select')) { const v = kept.get(el.name || el.id); if (v !== undefined) el.value = v; if (focused && (el.name || el.id) === focused) el.focus(); }
+}
 
 // ---------- opening threads ----------
 // From the sidebar or the finder a thread takes the whole window, with nothing beside it.
@@ -1615,16 +1883,14 @@ async function openOnly(name) {
 async function openBeside(name) {
   if (!S.bots.has(name) || name === S.selected) return;
   S.ui.side = S.ui.side === name ? null : name;
-  // A draft belongs to the bot it was typed for, not to the pane.
-  $('sideinput').value = '';
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side ? 'side' : 'main');
 }
-// Ctrl-P puts the next peer beside; like any other bot opened there, it starts with an empty draft.
+// Ctrl-P puts the next peer beside, with its own draft.
 async function nextBeside() {
   const ps = peers().filter((who) => who !== S.selected); if (!ps.length) return;
   const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next === S.ui.side) return;
-  S.ui.side = next; $('sideinput').value = '';
+  S.ui.side = next;
   await enqueue(loadVisible); render(); save(); focusInput('side');
 }
 // Drafts travel with their bots.
@@ -1634,14 +1900,17 @@ function swap() {
   if (swarmOf(S.selected)) { openOnly(S.ui.side); return; }
   [S.selected, S.ui.side] = [S.ui.side, S.selected];
   const p = bot(S.selected).project; if (p && S.ui.folded.delete(p)) S.shapeGen += 1;
-  [$('input').value, $('sideinput').value] = [$('sideinput').value, $('input').value];
   render(); save(); focusInput('main');
 }
-function closeSide() { if (!S.ui.side) return; S.ui.side = null; $('sideinput').value = ''; render(); save(); focusInput('main'); }
+function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(); focusInput('main'); }
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
 function showNewProject(on) {
   $('projform').hidden = !on; $('newproj').hidden = on;
-  if (on) { $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus(); }
+  if (!on) return;
+  $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
+  // The lead's model, from every provider's list, read now so a refreshed list shows.
+  $('projmodel').innerHTML = '';
+  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
 }
 
 // ---------- input ----------
@@ -1649,18 +1918,24 @@ function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.he
 for (const [pane, ids] of Object.entries(PANE)) {
   $(ids.form).addEventListener('submit', async (e) => {
     e.preventDefault(); const input = $(ids.input); const v = input.value.trim(); if (!v) return; input.value = ''; grow(input);
-    // A failed send comes back only to the bot it was for, and never over new typing.
-    const who = PANE[pane].bot();
-    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); if (!err?.kept && PANE[pane].bot() === who && !input.value) { input.value = v; grow(input); } }
+    // The text goes to the bot it was typed for; a failed send comes back to that bot's draft,
+    // in whichever pane shows it now, never over new typing.
+    const who = input.dataset.for || PANE[pane].bot();
+    try { await submit(v, pane, who); } catch (err) {
+      toast(String(err?.message ?? err));
+      if (err?.kept) return;
+      const shown = Object.values(PANE).map((p) => $(p.input)).find((el) => el.dataset.for === who);
+      if (shown) { if (!shown.value) { shown.value = v; grow(shown); } } else if (who && !S.drafts.get(who)) S.drafts.set(who, v);
+    }
   });
   $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
   $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });
 }
 $('projform').addEventListener('submit', async (e) => {
   e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
-  try { await createProject(dir); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
+  try { await createProject(dir, $('projsel')?.value || null); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
 });
-$('projdir').addEventListener('keydown', (e) => { if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
+$('projform').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'projsel') { e.preventDefault(); $('projform').requestSubmit(); } else if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
   const rows = pickerRows();
@@ -1674,8 +1949,10 @@ const inputIds = new Set(['input', 'sideinput', 'projdir', 'pickerq']);
 document.addEventListener('keydown', async (e) => {
   if (S.ui.help) { hideHelp(); e.preventDefault(); return; }
   if (S.ui.sheet) { if (e.key === 'Escape') { closeSheet(); e.preventDefault(); } return; }
+  if (S.setup?.open) { if (e.key === 'Escape') { closeSetup(); e.preventDefault(); } return; }
+  if ((e.ctrlKey || e.metaKey) && e.key === ',') { await openSetup(); e.preventDefault(); return; }
   // The finder and the folder field handle their own keys; Escape there must not stop a turn.
-  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'pickerq') return;
+  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
@@ -1687,6 +1964,18 @@ document.addEventListener('keydown', async (e) => {
   const empty = e.target.id === 'input' && $('input').value === '';
   if (empty && (k === 'ArrowUp' || k === 'ArrowDown')) { const names = tree().filter((n) => n.b).map((n) => n.b.name); let i = names.indexOf(S.selected); if (i >= 0) { i = (i + (k === 'ArrowDown' ? 1 : names.length - 1)) % names.length; await openOnly(names[i]); } e.preventDefault(); return; }
   if (!inputIds.has(e.target.id) && k.length === 1 && !ctrl && !e.altKey) $('input').focus();
+});
+function failed(err) {
+  const text = String(err?.message ?? err);
+  if (S.setup?.open) { S.setup.error = text; renderSetup(); } else toast(text, 4000);
+}
+$('setup').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  try {
+    if (form.id === 'setupform') await connectProvider(S.setup.adding, Object.fromEntries([...form.querySelectorAll('input, select')].map((el) => [el.name, el.value.trim()])));
+    else if (form.id === 'setupproj') { const dir = $('setupdir').value.trim(), model = $('setupmodel').value; if (dir) { await createProject(dir, model); closeSetup(); } }
+  } catch (err) { failed(err); }
 });
 async function act(el) {
   const a = el.dataset.act, who = el.dataset.who, v = el.dataset.v, pane = el.dataset.pane, rect = el.getBoundingClientRect?.();
@@ -1713,6 +2002,14 @@ async function act(el) {
     case 'swarm-stop': await stopSwarm(swarmOf(who)); return;
     case 'swarm-add': await addAgent(swarmOf(who)); return;
     case 'swarm-tab': { const sw = swarmOf(S.selected); if (sw) { sw.tab = v; await enqueue(loadVisible); render(); } return; }
+    case 'settings': await openSetup(); return;
+    case 'setup-close': closeSetup(); return;
+    case 'setup-add': setupState().adding = ''; renderSetup(); return;
+    case 'setup-pick': setupState().adding = v; renderSetup(); $('setup').querySelector('#setupform input')?.focus(); return;
+    case 'setup-cancel': setupState().adding = null; renderSetup(); return;
+    // Removing restarts the daemon; with agents working, the first press says so and the second removes.
+    case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
+    case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     default: return;
   }
 }
@@ -1722,7 +2019,8 @@ document.addEventListener('click', async (e) => {
   if (e.target.closest('#pickerwrap') && !e.target.closest('.picker')) { closePicker(); return; }
   const button = e.target.closest('[data-act]');
   closeMenu();
-  if (button) { if (!button.disabled) { try { await act(button); } catch (err) { toast(String(err?.message ?? err), 4000); } } return; }
+  if (button) { if (!button.disabled) { try { await act(button); } catch (err) { failed(err); } } return; }
+  if (e.target.closest('#setupwrap')) return;
   if (e.target.closest('#menu')) return;
   const step = e.target.closest('[data-out], [data-run]'), task = e.target.closest('[data-task]'), row = e.target.closest('[data-bot]');
   if (step) toggleStep(step);

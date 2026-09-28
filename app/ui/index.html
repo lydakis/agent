@@ -9,10 +9,10 @@
 <body>
 <div id="app">
   <div class="pane sidebar">
-    <div class="pane-title">projects</div>
+    <div class="pane-title"><span>projects</span><button type="button" class="ibtn" data-act="settings" title="Settings (⌘,)" aria-label="Settings">⚙</button></div>
     <div class="scroll" id="bots"></div>
     <button type="button" class="newproj" id="newproj" data-act="new-project">＋ New project</button>
-    <form class="newproj" id="projform" hidden><span>＋</span><input id="projdir" autocomplete="off" spellcheck="false" aria-label="Project folder" placeholder="folder"></form>
+    <form class="newproj" id="projform" hidden><span>＋</span><input id="projdir" autocomplete="off" spellcheck="false" aria-label="Project folder" placeholder="folder"><div class="pm" id="projmodel"></div></form>
   </div>
   <div class="pane main">
     <div class="phead" id="title"></div>
@@ -35,6 +35,7 @@
 <div class="overlay" id="sheetwrap"><form class="sheet" id="sheet" autocomplete="off"></form></div>
 <div class="overlay" id="helpwrap"><div class="helpbox" id="helptext"></div></div>
 <div class="detached" id="detached"></div>
+<div class="setupwrap" id="setupwrap"><div class="setup" id="setup"></div></div>
 <script src="daemon.js"></script>
 <script src="app.js"></script>
 </body>

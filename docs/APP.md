@@ -13,7 +13,7 @@ covered it, so one state model exists, not two.
 
 ## Screenshots
 
-Demo mode in headless Chromium, 1280×780, captured 2026-09-27. The data is
+Demo mode in headless Chromium, 1280×780, captured 2026-09-28. The data is
 the synthetic `demo` project.
 
 The lead splits the work, build opens beside it, then build's ⋯ menu.
@@ -32,7 +32,7 @@ One menu per agent: side chat, stop, fork, delete, show all.
 
 ![The agent menu](app/menu.png)
 
-The model chip: models of the bot's family; others need a new agent.
+The model chip: models under their provider; other families need a new agent.
 
 ![The model chip's menu](app/model-chip.png)
 
@@ -49,9 +49,30 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
-New project takes a folder.
+New project takes a folder and the model its lead starts on.
 
 ![New project](app/new-project.png)
+
+A first run opens setup: connect providers, then open a first project on a
+model from any of them (demo `?first`).
+
+![Setup's provider choices](app/setup-providers.png)
+
+Each provider asks for what it needs to sign in; Bedrock takes a region and an
+AWS profile or a Bedrock API key, and serves Claude and its other models as
+one provider.
+
+![Connecting Amazon Bedrock](app/setup-bedrock.png)
+
+Once a provider answers, the first project takes a folder and a model, listed
+under its provider; nothing is chosen for you.
+
+![The first project and its model](app/setup-project.png)
+
+Settings (⚙ in the sidebar, or ⌘,) is the same screen. A provider that fails
+says why beside those that answered.
+
+![Settings with one provider failing](app/settings.png)
 
 A project's ⋯ menu starts a swarm: a goal, how many agents, their model,
 where they work, and the tokens they share. Captured 2026-09-28.
@@ -113,7 +134,9 @@ client/          agent-client: the socket protocol and the client policy
   `policy` composes the client policy for the workspace; `attach` connects
   and follows `*` from the page's cursor; `pull` hands the page the next
   batch of that session's notifications, at most 256, when it asks;
-  `request` relays any protocol op; `models` reads `~/.agent/models`, and
+  `request` relays any protocol op; `models` reads `~/.agent/models`;
+  `settings`, `save_settings`, `restart_daemon` and `discover_models` back
+  [Setup](#setup-and-settings); and
   `project` and `write_project` read and write a folder's
   `.agents/project.toml` ([project.rs](../app/src-tauri/src/project.rs));
   `policy` composes a folder's client policy, in a profile when named, and
@@ -159,10 +182,10 @@ the environment of the user's login shell (`$SHELL -l -i`), plus
 `~/.agent/env` for keys kept out of shell profiles: `KEY=VALUE` lines
 (`export` and quotes allowed, `#` comments), refused unless it is a regular
 file of at most 64 KiB that only its owner can read. That file is the app's; the CLI and the daemon never read it.
-The login shell is read once per app run, and without `--model` or
-`AGENT_MODEL` of its own the app takes its default model from the file, then
-the shell; the shell's is looked up beside the attach, so a slow profile never
-delays it. The
+[Settings](#setup-and-settings) writes it.
+The login shell is read once per app run. A value the file sets empty is
+unset for the start, so Settings can clear what the shell exports. There is
+no default model: a project or agent is given its own when it is made. The
 store and socket themselves are resolved from the app's own arguments and
 environment. A failed start shows the CLI's
 reason on the page and is not retried for 30 seconds. An explicit `--socket`
@@ -171,8 +194,7 @@ quits the app and runs the bundled `agent shutdown --store
 ~/.agent/state.sqlite --grace 30`, so the default store's daemon, whoever
 started it, lets running turns finish and exits before its binary is replaced.
 The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
-cannot point the shutdown elsewhere. A default model that appears only after
-launch, from a repaired `~/.agent/env`, is picked up on the next attach.
+cannot point the shutdown elsewhere.
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
@@ -212,14 +234,14 @@ write access to the tap.
 
 ```sh
 cargo build --release -p agent-app
-AGENT_MODEL=anthropic/claude-sonnet-5 .local/target/release/agent-app \
+.local/target/release/agent-app \
   --socket ~/.agent/state.sqlite.sock --workspace "$PWD"
 ```
 
 Without `--workspace` the workspace is the launching directory, or home when
 that is `/`, as for a window opened from the Dock. Arguments and environment
-are the CLI's: `--socket`, `--store`, `--model`,
-`--workspace`, `AGENT_SOCKET`, `AGENT_STORE`, `AGENT_MODEL`, and a store's
+are the CLI's: `--socket`, `--store`, `--workspace`, `AGENT_SOCKET`,
+`AGENT_STORE`, and a store's
 socket is resolved the way the CLI and the daemon resolve it (the shared
 client crate's rendezvous), so a deep store path meets the same short socket.
 The page draws with the machine's own monospace face and fetches nothing.
@@ -231,12 +253,61 @@ steer pick is remembered for every window. If the daemon is unreachable or close
 and retries every two seconds. Only one attachment runs at a time, including
 the snapshot pages. A connected peer must send its ready line within five seconds.
 
-Keys: `^k` find a bot, `^b` sidebar, `^p` next task beside, `^o` every
+Keys: `^k` find a bot, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
 run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
 empty message to move between bots, `^d` close the window, Enter to send and
-Shift-Enter for a new line, `/new NAME [PROVIDER/MODEL]` to create a bot, `?`
+Shift-Enter for a new line, `/new NAME PROVIDER/MODEL` to create a bot, `?`
 on an empty message for the list and the models in `~/.agent/models`, read
 each time. `⌘` works where `^` does.
+
+## Setup and settings
+
+What a daemon needs before anything runs is the app's to ask for, not the
+daemon's: it runs whatever providers it is started with and whatever model a
+turn names. There is no default model (George, 2026-09-28): a project's lead,
+and every agent, is given its model when it is made, from any provider
+connected, and forks and side chats keep their source's. One screen covers a
+first run and later changes:
+
+1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
+   plan uses the sign-in Codex saved; Amazon Bedrock takes a region and signs
+   in one of two ways, chosen on the form: the AWS CLI's credentials for an
+   optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
+   its other models over OpenAI's, so the daemon runs it as two providers,
+   `bedrock` and `bedrock-openai`; the app connects, lists and removes them
+   as one. Connecting writes `AGENT_PROVIDER` (the providers already running
+   kept, specs as `--provider` takes them) and the provider's fields to
+   `~/.agent/env`, restarts the daemon with `agent shutdown`, which stops
+   running turns and returns once the process is gone, attaches again, which
+   starts a daemon with the new settings, and asks every provider for its
+   models. Each row then shows its model count, or its refusal with a Retry.
+   Connect and Remove read the file again first, so a change another window
+   saved is kept.
+   A key is never read back into the page: the core reports only which keys
+   are set, and a key field left empty keeps the saved one; any other field
+   left empty is saved empty, which clears the shell's value too (an AWS
+   profile, say). Removing a provider drops its key unless another provider
+   uses it; removing the last one also empties each key the shell exports,
+   since a start with no provider named would otherwise detect one from it,
+   and the window then waits for a provider instead of retrying. Removing
+   rewrites no list; the pickers leave that provider's models out. A provider
+   set up by hand under a known name (a gateway named `openai`, say) has no
+   Edit, since the form would replace it with the provider's defaults.
+   Refresh models asks again and writes the answer to `~/.agent/models`, replacing
+   it: a provider that answers replaces its lines, one that fails keeps the
+   lines it had, one no longer running loses them, and an answer with no
+   usable model leaves the file as it was. A file that no longer reads is
+   replaced whole. Pickers offer only the models of connected providers. A
+   change that would make `~/.agent/env` larger than a start accepts
+   (64 KiB) is refused.
+2. **First project**, shown until one exists: a folder and a model, the
+   models listed under their providers, then New project's path.
+
+It opens on its own when a daemon cannot start for lack of a provider, and
+once when a window first attaches to a store with no agents. An
+`agent` the app did not bundle, or an explicit `--socket`, cannot be
+restarted, so Settings saves no provider change there and says why; it
+shows that daemon's providers instead of the ones this machine would start.
 
 ## Projects and panes
 
@@ -249,7 +320,8 @@ daemon learns nothing about projects; everything here is client work.
   under it: the coordinator's `created_by` lineage, plus any root bot named
   `<project>.<task>`. Bots in no project follow. A project row opens its
   coordinator; its chevron folds the tasks. **＋ New project** takes a
-  folder, reads its `project.toml` (unknown keys are refused) or names the
+  folder and a model from `~/.agent/models` under its provider's name (the
+  last one picked comes first), reads its `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
   own client policy, and then writes the file if there was none, so a model
   the daemon refuses is never saved. The file goes in through a temporary
@@ -260,7 +332,8 @@ daemon learns nothing about projects; everything here is client work.
 - **Panes.** A sidebar row opens that thread alone. A task card opens its
   bot in a side pane with its own composer; ⤢ swaps it into full view, ✕ or
   `Esc` closes it.
-- **Composer.** The model chip lists `~/.agent/models`, read on each open.
+- **Composer.** The model chip lists `~/.agent/models`, read on each open,
+  each provider under its own heading.
   Models of any provider in the bot's family (known from the fleet's bot
   records) switch the next turns (sent as `submit`'s `model`); other
   families, and providers no record places, show disabled as "new agent",
@@ -270,7 +343,11 @@ daemon learns nothing about projects; everything here is client work.
   no model or workspace, so it joins the running turn, and it names that
   turn (`expected_turn`): if the turn ended meanwhile, the daemon refuses it
   as `stale_turn` and the message stays in the composer. A model pick is
-  remembered for the bot's identity, not its name.
+  remembered for the bot's identity, not its name. Unsent text belongs to
+  the bot it was typed for: a pane that shows another bot puts it away and
+  brings back that bot's own, a closed side pane keeps it, and Enter sends
+  it to the bot it was typed for even if the pane is already switching.
+  Drafts live for the window's life and go with a deleted bot.
 - **One menu per agent**, from the head's ⋯, a sidebar row's or card's ⋯ on
   hover, or a right-click: side chat, stop, fork (an exact copy of a bot at rest in its
   folder, next to it in the tree, opened beside), delete (confirmed), and every run's

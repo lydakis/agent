@@ -27,46 +27,13 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MARKER: &str = "__agent_app_environment__";
 /// Keys, not documents: bounds the read that starts every daemon.
-const MAX_ENV_FILE: u64 = 64 * 1024;
+pub const MAX_ENV_FILE: u64 = 64 * 1024;
 const MAX_SHELL_OUTPUT: u64 = 1024 * 1024;
 
 static LOGIN: OnceCell<Option<Vec<(OsString, OsString)>>> = OnceCell::const_new();
 
-async fn login() -> Option<&'static [(OsString, OsString)]> {
+pub async fn login() -> Option<&'static [(OsString, OsString)]> {
     LOGIN.get_or_init(login_environment).await.as_deref()
-}
-
-/// `AGENT_MODEL` as a daemon this app starts would see it: `~/.agent/env`
-/// over the login shell.
-pub async fn model() -> Option<String> {
-    pick_model(file_pairs().as_deref(), login().await)
-}
-
-/// `~/.agent/env`'s `AGENT_MODEL` alone: no shell, so it is quick enough to
-/// be on the path to attaching.
-pub fn file_model() -> Option<String> {
-    pick_model(file_pairs().as_deref(), None)
-}
-
-fn file_pairs() -> Option<Vec<(String, String)>> {
-    env_file().and_then(|file| read_env_file(&file).ok())
-}
-
-fn pick_model(
-    file: Option<&[(String, String)]>,
-    login: Option<&[(OsString, OsString)]>,
-) -> Option<String> {
-    let model =
-        match file.and_then(|pairs| pairs.iter().rev().find(|(key, _)| key == "AGENT_MODEL")) {
-            Some((_, value)) => value.clone(),
-            None => login?
-                .iter()
-                .find(|(key, _)| key == "AGENT_MODEL")?
-                .1
-                .to_str()?
-                .to_owned(),
-        };
-    (!model.is_empty()).then_some(model)
 }
 
 /// The `agent` shipped beside this executable, if there is one.
@@ -93,6 +60,48 @@ impl Starts {
         self.failed = result.as_ref().err().map(|e| (Instant::now(), e.clone()));
         result
     }
+    /// Settings changed: the last failure's reason may no longer stand.
+    pub fn forget(&mut self) {
+        self.failed = None;
+    }
+}
+
+/// Stop the store's daemon with `agent shutdown`, which returns once the
+/// process is gone, so the next start is a new daemon, not the draining one.
+/// Turns still running are cancelled; none running is no daemon to stop.
+pub async fn stop(agent: &Path, store: &Path) -> Result<(), String> {
+    let mut command = Command::new(agent);
+    command
+        .arg("shutdown")
+        .arg("--store")
+        .arg(store)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(START_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "daemon_stop_timeout: agent shutdown did not return".to_owned())?
+        .map_err(|e| format!("daemon_stop_failed: {}: {e}", agent.display()))?;
+    let reason = cli_reason(&output.stderr);
+    match reason {
+        _ if output.status.success() => Ok(()),
+        Some(reason) if reason.starts_with("daemon_unavailable") => Ok(()),
+        Some(reason) => Err(reason),
+        None => Err(format!(
+            "daemon_stop_failed: agent shutdown exited with {}",
+            output.status
+        )),
+    }
+}
+
+/// The CLI's error line, `agent: CODE: DETAIL`.
+fn cli_reason(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("agent: "))
+        .map(str::to_owned)
 }
 
 async fn start(agent: &Path, store: &Path) -> Result<(), String> {
@@ -101,7 +110,7 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
         command.env_clear().envs(environment.iter().cloned());
     }
     if let Some(file) = env_file() {
-        command.envs(read_env_file(&file)?);
+        apply(&mut command, read_env_file(&file)?);
     }
     command
         .arg("start")
@@ -118,34 +127,39 @@ async fn start(agent: &Path, store: &Path) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
-    // The CLI's error line, `agent: CODE: DETAIL`, is the reason to show.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let reason = stderr
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("agent: "))
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            format!(
-                "daemon_start_failed: agent start exited with {}",
-                output.status
-            )
-        });
+    let reason = cli_reason(&output.stderr).unwrap_or_else(|| {
+        format!(
+            "daemon_start_failed: agent start exited with {}",
+            output.status
+        )
+    });
+    // Nothing to run yet: the page's setup is the answer, not the CLI's flags.
     Err(if reason.starts_with("usage: no provider") {
-        format!("{reason}; or put KEY=VALUE lines in ~/.agent/env")
+        "no_provider: connect a provider in Settings".to_owned()
     } else {
         reason
     })
 }
 
-fn env_file() -> Option<PathBuf> {
+/// The env file's settings over the command's environment. An empty value
+/// unsets what the login shell set: Settings writes one to clear it.
+fn apply(command: &mut Command, pairs: Vec<(String, String)>) {
+    for (key, value) in pairs {
+        match value.is_empty() {
+            true => command.env_remove(key),
+            false => command.env(key, value),
+        };
+    }
+}
+
+pub fn env_file() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".agent/env"))
 }
 
 /// `KEY=VALUE` lines, `export` optional, `#` comments, and values optionally
 /// in matching quotes. A missing file is empty. One others can read, or a line
 /// that is not an assignment, is refused by path and line, never by value.
-fn read_env_file(path: &Path) -> Result<Vec<(String, String)>, String> {
+pub fn read_env_file(path: &Path) -> Result<Vec<(String, String)>, String> {
     use std::{io::Read, os::unix::fs::PermissionsExt};
     let unreadable =
         |error: std::io::Error| format!("env_file_unreadable: {}: {error}", path.display());
@@ -287,26 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn the_model_is_the_env_files_then_the_login_shells() {
-        let file = |model: &str| vec![("AGENT_MODEL".to_owned(), model.to_owned())];
-        let login = vec![(
-            OsString::from("AGENT_MODEL"),
-            OsString::from("openai/login"),
-        )];
-        assert_eq!(
-            pick_model(Some(&file("anthropic/file")), Some(&login)).as_deref(),
-            Some("anthropic/file")
-        );
-        assert_eq!(
-            pick_model(Some(&[]), Some(&login)).as_deref(),
-            Some("openai/login")
-        );
-        assert_eq!(pick_model(None, None), None);
-        // An empty assignment in the file means no model, as it would for the daemon.
-        assert_eq!(pick_model(Some(&file("")), Some(&login)), None);
-    }
-
-    #[test]
     fn the_env_file_takes_assignments_and_refuses_anything_else() {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("agent-app-env-{}", std::process::id()));
@@ -369,6 +363,23 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn an_empty_setting_unsets_the_login_shells() {
+        let mut command = Command::new("agent");
+        command.env("AWS_PROFILE", "shell");
+        let pair = |key: &str, value: &str| (key.to_owned(), value.to_owned());
+        apply(
+            &mut command,
+            vec![pair("AWS_PROFILE", ""), pair("AWS_REGION", "eu-west-1")],
+        );
+        let set: Vec<_> = command.as_std().get_envs().collect();
+        assert!(set.contains(&(std::ffi::OsStr::new("AWS_PROFILE"), None)));
+        assert!(set.contains(&(
+            std::ffi::OsStr::new("AWS_REGION"),
+            Some(std::ffi::OsStr::new("eu-west-1"))
+        )));
+    }
+
     #[tokio::test]
     async fn a_failed_start_reports_the_cli_reason_and_is_not_repeated_at_once() {
         let root = std::env::temp_dir().join(format!("agent-app-start-{}", std::process::id()));
@@ -388,10 +399,44 @@ mod tests {
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut starts = Starts::default();
         let store = root.join("state.sqlite");
-        let reason = "usage: no provider; or put KEY=VALUE lines in ~/.agent/env";
+        let reason = "no_provider: connect a provider in Settings";
         assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
         assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "started\n");
+        // Changed settings try again at once.
+        starts.forget();
+        assert_eq!(starts.start(&agent, &store).await.unwrap_err(), reason);
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap(),
+            "started\nstarted\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_no_daemon_is_done_and_any_other_failure_is_its_reason() {
+        let root = std::env::temp_dir().join(format!("agent-app-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let agent = root.join("agent");
+        use std::os::unix::fs::PermissionsExt;
+        let store = root.join("state.sqlite");
+        for (said, stopped) in [
+            ("", Ok(())),
+            ("echo 'agent: daemon_unavailable' >&2; exit 1", Ok(())),
+            (
+                "echo 'agent: daemon_shutdown_timeout: 42' >&2; exit 1",
+                Err("daemon_shutdown_timeout: 42".to_owned()),
+            ),
+        ] {
+            std::fs::write(
+                &agent,
+                format!("#!/bin/sh\n[ \"$1 $2\" = 'shutdown --store' ] || exit 9\n{said}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(stop(&agent, &store).await, stopped);
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

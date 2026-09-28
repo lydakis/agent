@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -109,17 +109,6 @@ test('retries cannot overlap a slow snapshot and a lost attachment retries after
   assert.equal(attaches, 2);
   await settle();
   assert.equal(p.S.attached, true);
-});
-
-test('a slow login-shell model lookup never delays attaching, and a later answer fills the default', async () => {
-  const lookup = deferred(); let lookups = 0, setups = 0;
-  const p = page({ setup: async () => (++setups, {}), defaultModel: () => (++lookups, lookup.promise), attach: async () => ({ session: 1 }), pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
-  await p.attach(); await settle();
-  assert.equal(p.S.attached, true);
-  assert.equal(lookups, 1);
-  lookup.resolve('anthropic/model-x'); await settle();
-  assert.equal(p.S.config.model, 'anthropic/model-x');
-  assert.equal(setups, 1);
 });
 
 test('stream rendering appends only new characters and resets between messages', () => {
@@ -610,6 +599,8 @@ test('completed Responses and Anthropic thoughts retain observed thinking durati
 
 // ---------- the app shell: projects, panes, composers, menus, runs ----------
 const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
+// A window whose renders move drafts, as the real render does.
+const drafting = (daemon = {}) => { const p = shell(daemon); p.setRender(() => p.followDrafts()); return p; };
 const names = (rows) => Array.from(rows, (r) => r.label ?? r.b.name);
 
 test('projects list coordinators with their lineage and prefixed tasks, then other bots', () => {
@@ -901,12 +892,14 @@ test('a project name taken by another folder\'s coordinator is refused, and a re
   p.S.selected = '';
   await assert.rejects(p.createProject('/synthetic/taken'), /demo\.lead already belongs to \/synthetic\/first/);
   assert.equal(p.S.selected, ''); assert.equal(calls.length, 0);
-  await assert.rejects(p.createProject('/synthetic/weather'), /create_failed/);
+  await assert.rejects(p.createProject('/synthetic/weather'), /model_required/);
+  assert.equal(calls.length, 0, 'there is no default model to fall back on');
+  await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /create_failed/);
   assert.deepEqual(calls.map(([op]) => op), ['create'], 'a model the daemon refuses is not saved to the folder');
   fail = false; failWrite = true;
-  await assert.rejects(p.createProject('/synthetic/weather'), /project_unwritable/);
+  await assert.rejects(p.createProject('/synthetic/weather', 'alpha/one'), /project_unwritable/);
   assert.deepEqual(calls.map(([op]) => op), ['create', 'create', 'write'], 'the file follows an accepted coordinator');
-  failWrite = false; await p.createProject('/synthetic/weather');
+  failWrite = false; await p.createProject('/synthetic/weather', 'alpha/one');
   assert.deepEqual(calls.at(-1), ['write', '/synthetic/weather', 'alpha/one'], 'a retry writes the missing file with the coordinator\'s model');
   assert.equal(calls.filter(([op]) => op === 'create').length, 2);
   assert.equal(p.S.selected, 'weather.lead');
@@ -965,17 +958,19 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
 
 test('Escape in the finder never stops a turn, and a deleted bot takes its draft with it', async () => {
   const sent = [];
-  const p = shell({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
+  const p = drafting({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
   p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
-  p.tree(); p.S.selected = 'app.lead';
+  p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const doc = p.context.document;
   doc.getElementById('pickerq').value = '';
   await doc.listeners.keydown({ key: 'Escape', target: { id: 'pickerq' }, preventDefault() {} });
   assert.deepEqual(sent.filter((op) => op === 'interrupt'), []);
-  p.S.selected = 'app.task'; doc.getElementById('input').value = 'for task';
-  await p.onEvent({ event: 'deleted', bot: 'app.task' });
-  assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, '');
+  doc.getElementById('input').value = 'for lead';
+  await p.openOnly('app.task'); doc.getElementById('input').value = 'for task';
+  await p.onEvent({ event: 'deleted', bot: 'app.task' }); p.followDrafts();
+  assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, 'for lead');
+  assert.equal(p.S.drafts.has('app.task'), false, 'a deleted bot takes its draft with it');
 });
 
 test('the demo daemon ends a stopped turn quietly when its bot is deleted before the script wakes', async () => {
@@ -995,7 +990,7 @@ test('the demo daemon ends a stopped turn quietly when its bot is deleted before
 });
 
 test('a folded run names a timeout or a failed call; the finder reaches folded tasks; a side draft stays with its bot', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])
     assert.equal(p.entries({ type: 'function_call_output', call_id: 'c', output: JSON.stringify(out) })[0].err, want);
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
@@ -1004,14 +999,16 @@ test('a folded run names a timeout or a failed call; the finder reaches folded t
   assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.build'], 'a folded task is still found');
   const draft = p.context.document.getElementById('sideinput');
   await p.openBeside('app.build'); draft.value = 'for build only';
-  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside starts empty');
+  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside has its own draft');
   draft.value = 'for test only'; p.closeSide(); assert.equal(draft.value, '');
+  await p.openBeside('app.build'); assert.equal(draft.value, 'for build only', 'a closed pane keeps its bot\'s draft');
+  await p.openBeside('app.test'); assert.equal(draft.value, 'for test only');
 });
 
 test('swap carries each draft with its bot; a long wait list stays short in the head', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
-  p.tree(); p.S.selected = 'app.lead';
+  p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
   await p.openBeside('app.build'); main.value = 'to lead'; side.value = 'to build';
   p.swap();
@@ -1023,7 +1020,7 @@ test('swap carries each draft with its bot; a long wait list stays short in the 
   side.value = 'still to lead'; await p.nextBeside();
   assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'still to lead', 'Ctrl-P onto the same bot keeps its draft');
   p.transcript('app.build').peers = ['app.lead', 'app.test'];
-  await p.nextBeside(); assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'Ctrl-P starts the next bot with an empty draft');
+  await p.nextBeside(); assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'Ctrl-P shows the next bot\'s own draft');
   const b = p.S.bots.get('app.lead'); b.status = 'waiting';
   b.waitingOn = Array.from({ length: 5000 }, (_, i) => `turn:app.t${i}/1`);
   assert.equal(p.waitSummary(b), 'app.t0/1, app.t1/1, app.t2/1 +4997');
@@ -1231,4 +1228,294 @@ test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle o
   assert.deepEqual(Array.from(board.lines, (l) => l.from), ['user', 'user', 'latency-2']);
   assert.equal(board.lines[2].text, 'On it: look at fsync.');
   d.close();
+});
+
+test('a draft stays with the bot it was typed for, and Enter sends it there even mid-switch', async () => {
+  const sent = [];
+  let release; const slow = new Promise((r) => { release = r; });
+  const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], next_from: null }; } });
+  for (const [name, id] of [['app.lead', 1], ['app.lead-side', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.S.transcripts.get('app.lead-side') ?? p.transcript('app.lead-side').nodes;
+  p.tree(); await p.openOnly('app.lead');
+  const doc = p.context.document, main = doc.getElementById('input');
+  main.value = 'Ship it.';
+  // Sol's audit, step 7: the coordinator's text followed the selection to its side chat.
+  release(); await p.openOnly('app.lead-side');
+  assert.equal(main.value, '', 'the side chat has its own, empty composer');
+  main.value = 'Only for the side chat.';
+  await p.openOnly('app.lead');
+  assert.equal(main.value, 'Ship it.');
+  // Enter while another bot is being opened: the text goes to the bot it was typed for.
+  const opening = p.openOnly('app.lead-side');
+  await doc.getElementById('form').listeners.submit({ preventDefault() {} });
+  await opening;
+  assert.deepEqual(sent, [['app.lead', 1, 'Ship it.']]);
+  assert.equal(main.value, 'Only for the side chat.');
+});
+
+// A window over settings kept as the app keeps them: saved values, a daemon restarted to apply them,
+// and providers that answer with their models.
+function settingsShell({ env = {}, lists = {} } = {}) {
+  const calls = [];
+  const specs = () => (env.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
+  const answer = () => Object.fromEntries(specs().map((spec) => { const n = spec.split('=')[0]; return [n, lists[n] ?? { error: 'provider_http_401', detail: 'no' }]; }));
+  const p = shell({
+    settings: async () => ({ providers: specs(), region: env.AWS_REGION ?? null, profile: null, keys: Object.keys(env).filter((k) => k.endsWith('_KEY') || k.startsWith('AWS_BEARER')) }),
+    saveSettings: async (changes) => { calls.push(['save', { ...changes }]); for (const [k, v] of Object.entries(changes)) { if (v) env[k] = v; else delete env[k]; } },
+    restartDaemon: async () => { calls.push(['restart']); },
+    discoverModels: async () => { calls.push(['discover']); const a = answer(); return { providers: Object.fromEntries(Object.entries(a).map(([n, l]) => [n, l.models ? { models: l.models.length } : l])), written: true, error: null }; },
+    models: async () => Object.entries(answer()).flatMap(([n, l]) => (l.models ?? []).map((m) => ({ id: `${n}/${m.id}` }))),
+    attach: async () => { calls.push(['attach']); if (!specs().length) throw new Error('no_provider: connect a provider in Settings'); return { session: 2 }; },
+    pull: () => new Promise(() => {}),
+    project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
+    policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
+    writeProject: async (q) => { calls.push(['write', q.model]); },
+    request: async (op, q) => { if (op === 'provider_models') return { providers: answer() }; if (op === 'bots') return { bots: [], next_after: null }; if (op === 'create') { calls.push(['create', q.bot, q.model]); return { name: q.bot, id: 9, provider: q.model.split('/')[0], model: q.model.split('/')[1], workspace: q.workspace }; } return { nodes: [], next_from: null }; },
+  });
+  p.S.config.model = null; p.S.attached = true;
+  return { p, calls, env };
+}
+
+test('Bedrock is one provider running both its APIs, signed with the AWS login unless an API key is given', () => {
+  const p = shell();
+  assert.deepEqual([...p.providerSpecs('bedrock', { AWS_REGION: 'us-west-2' })], ['bedrock', 'bedrock-openai']);
+  assert.deepEqual([...p.providerSpecs('bedrock', { AWS_REGION: 'eu-west-1', AWS_BEARER_TOKEN_BEDROCK: 'k' })], [
+    'bedrock=anthropic,https://bedrock-mantle.eu-west-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK',
+    'bedrock-openai=responses,https://bedrock-mantle.eu-west-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK']);
+  assert.deepEqual([...p.providerSpecs('anthropic', { ANTHROPIC_API_KEY: 'k' })], ['anthropic']);
+});
+
+test('connecting a provider keeps the others, saves only what was typed, restarts the daemon and lists its models', async () => {
+  const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }, { id: 'haiku' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required/);
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: 'us east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region must look like us-east-1/);
+  assert.equal(calls.length, 0);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  // Only providers are saved; the empty key field keeps whatever key was saved.
+  assert.deepEqual(calls.map(([c]) => c), ['save', 'restart', 'attach', 'discover']);
+  // An empty profile is saved empty, so a start clears one the shell exports too.
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: '' });
+  assert.deepEqual(JSON.parse(JSON.stringify(p.S.setup.status)), { openai: { models: 1 }, bedrock: { models: 2 }, 'bedrock-openai': { models: 1 } });
+  assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt', 'bedrock/claude', 'bedrock/haiku', 'bedrock-openai/grok']);
+  // One row and one model group for Bedrock, whichever of its APIs serves a model.
+  const html = p.setupHTML();
+  // No model is chosen for the user: the first project's picker waits for one, by provider.
+  assert.match(html, /<option value="" selected disabled>Choose a model/);
+  assert.equal(html.match(/data-act="setup-remove"/g).length, 2);
+  assert.match(html, /Amazon Bedrock<\/span><span class="st ok">✓ 3 models/);
+  assert.equal(html.match(/<optgroup label="Amazon Bedrock">/g).length, 1);
+  assert.match(html, /<option value="bedrock-openai\/grok">grok<\/option>/);
+  // A Bedrock key, once saved, stays in use when the region changes and its field is left empty.
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: 'k' });
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-west-2', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.equal(env.AGENT_PROVIDER, 'openai bedrock=anthropic,https://bedrock-mantle.us-west-2.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-west-2.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK');
+  assert.equal(env.AWS_BEARER_TOKEN_BEDROCK, 'k');
+  // Removing Bedrock removes both of its APIs, its key, and a default model on either.
+  calls.length = 0;
+  await p.removeProvider('bedrock');
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai', AWS_BEARER_TOKEN_BEDROCK: null });
+});
+
+test('a provider that fails says why beside the ones that answered', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai openrouter' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.openSetup();
+  assert.deepEqual({ ...p.S.setup.status.openrouter }, { error: 'provider_http_401', detail: 'no' });
+  const html = p.setupHTML();
+  assert.match(html, /✘ not ready/); assert.match(html, /provider_http_401: no</); assert.match(html, /✓ 1 model</); assert.match(html, /data-act="setup-retry"/);
+  // Half of Bedrock failing keeps its row usable and names the half that failed.
+  const half = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai' }, lists: { bedrock: { models: [{ id: 'claude' }] } } });
+  await half.p.openSetup();
+  const row = half.p.setupHTML();
+  assert.match(row, /✓ 1 model</); assert.match(row, /bedrock-openai: provider_http_401: no</); assert.match(row, /data-act="setup-retry"/);
+});
+
+test('removing a provider drops its key unless another provider uses it', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai anthropic', OPENAI_API_KEY: 'k', ANTHROPIC_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, anthropic: { models: [{ id: 'claude' }] } } });
+  await p.openSetup();
+  await p.removeProvider('anthropic');
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai', ANTHROPIC_API_KEY: null });
+});
+
+test('removing the last provider hides a key the shell exports, so the next start detects nothing', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-west-2', OPENAI_API_KEY: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  await p.removeProvider('bedrock');
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: '', AWS_BEARER_TOKEN_BEDROCK: null, OPENAI_API_KEY: '' });
+  // The daemon then has nothing to run, which is where removing the last provider should end.
+  assert.equal(p.S.setup.error, null);
+  assert.equal(calls.filter(([c]) => c === 'discover').length, 0);
+  assert.match(p.setupHTML(), /Connect a provider first/);
+});
+
+test('a key a custom provider names stays when the catalog provider that shares it goes', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai corp=responses,https://corp.example/v1,OPENAI_API_KEY', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, corp: { models: [{ id: 'm' }] } } });
+  await p.openSetup();
+  await p.removeProvider('openai');
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'corp=responses,https://corp.example/v1,OPENAI_API_KEY' });
+});
+
+test('a first launch with a provider but no agents opens setup on the first project', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  p.S.attached = false; p.S.setupSeen = false;
+  await p.attach();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(p.S.setup.open, true);
+  assert.match(p.setupHTML(), /First project/);
+});
+
+test('the list offers only models of connected providers', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  p.context.Daemon.models = async () => [{ id: 'openai/gpt' }, { id: 'anthropic/claude' }];
+  await p.openSetup();
+  assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt']);
+});
+
+test('a window that cannot restart its daemon saves no provider change', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  const settings = p.context.Daemon.settings;
+  p.context.Daemon.settings = async () => ({ ...(await settings()), restartable: false });
+  await p.openSetup();
+  await assert.rejects(p.connectProvider('anthropic', { ANTHROPIC_API_KEY: 'k' }), /restart_unavailable/);
+  await assert.rejects(p.removeProvider('openai'), /restart_unavailable/);
+  assert.equal(calls.filter(([c]) => c === 'save').length, 0);
+  assert.match(p.setupHTML(), /cannot apply provider changes/);
+});
+
+test('a daemon with no provider is not started again until settings change', async () => {
+  let attaches = 0;
+  const p = shell({ attach: async () => { attaches += 1; throw new Error('no_provider: connect a provider in Settings'); }, settings: async () => ({ providers: [], keys: [] }), models: async () => [] });
+  p.S.attached = false;
+  await p.attach(); await settle();
+  await p.tick(); await p.tick();
+  assert.equal(attaches, 1);
+  assert.match(p.elements.get('detached').innerHTML, /waiting for a provider/);
+});
+
+test('Bedrock with a saved key switches to the AWS login when asked, and keeps the key otherwise', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /<option value="key" selected>Bedrock API key/);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'key', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.match(calls.filter(([c]) => c === 'save')[0][1].AGENT_PROVIDER, /^bedrock=anthropic,/);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'aws', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.deepEqual({ ...calls.filter(([c]) => c === 'save')[1][1] }, { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
+});
+
+test('Bedrock signing in with AWS stays so while the shell exports a Bedrock key', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] } } });
+  await p.openSetup();
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /<option value="aws" selected>AWS login/);
+});
+
+test('a change another window saved is kept when this one connects a provider', async () => {
+  const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.openSetup();
+  env.AGENT_PROVIDER = 'openai chatgpt';
+  await p.connectProvider('anthropic', { ANTHROPIC_API_KEY: 'k' });
+  assert.equal(calls.find(([c]) => c === 'save')[1].AGENT_PROVIDER, 'openai chatgpt anthropic');
+});
+
+test('a folder with a project file keeps its model when its coordinator is made again', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }, { id: 'mini' }] } } });
+  p.context.Daemon.project = async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: 'openai/gpt', file: true });
+  await p.createProject('/synthetic/weather', 'openai/mini');
+  assert.deepEqual(calls.filter(([c]) => c === 'create' || c === 'write'), [['create', 'weather.lead', 'openai/gpt']]);
+});
+
+test('a connected provider can be edited in place', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-west-2' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  assert.match(p.setupHTML(), /data-act="setup-pick" data-v="bedrock"[^>]*>Edit</);
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /name="AWS_REGION"[^>]*value="us-west-2"/);
+});
+
+test('a gateway set up by hand under a known name is not offered the catalog form, which would overwrite it', async () => {
+  const gateway = 'openai=responses,https://proxy.example/v1,PROXY_KEY';
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: `${gateway} bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK`, AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.openSetup();
+  const html = p.setupHTML();
+  assert.doesNotMatch(html, /data-act="setup-pick" data-v="openai"/);
+  assert.match(html, /data-act="setup-pick" data-v="bedrock"[^>]*>Edit</, 'a keyed Bedrock is what the form writes');
+  await assert.rejects(p.connectProvider('openai', { OPENAI_API_KEY: 'k' }), /set up by hand/);
+  assert.equal(calls.filter(([c]) => c === 'save').length, 0);
+});
+
+test('removing a provider asks nobody for models and rewrites no list', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai anthropic', OPENAI_API_KEY: 'k', ANTHROPIC_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, anthropic: { models: [{ id: 'claude' }] } } });
+  p.context.Daemon.models = async () => [{ id: 'openai/gpt' }, { id: 'openai/older-by-hand' }, { id: 'anthropic/claude' }];
+  await p.openSetup();
+  await p.removeProvider('anthropic');
+  assert.equal(calls.filter(([c]) => c === 'discover').length, 0);
+  assert.deepEqual(p.S.setup.list.map((m) => m.id), ['openai/gpt', 'openai/older-by-hand']);
+});
+
+test('the model chip offers only models of connected providers', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  p.context.Daemon.models = async () => [{ id: 'openai/gpt' }, { id: 'openrouter/gpt' }];
+  p.upsert({ name: 'lead', id: 1, provider: 'openai', family: 'openai', model: 'gpt' });
+  p.S.selected = 'lead';
+  await p.modelMenu('main', { x: 1, y: 1 });
+  const menu = p.elements.get('menu').innerHTML;
+  assert.match(menu, /OpenAI/); assert.doesNotMatch(menu, /OpenRouter|openrouter/);
+});
+
+test('a project starts on the model picked for it, and the pick is offered first next time', async () => {
+  const storage = new Map();
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai bedrock bedrock-openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  p.context.localStorage = { getItem: (k) => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v)) };
+  await assert.rejects(p.createProject('/synthetic/weather'), /model_required/);
+  assert.equal(calls.filter(([c]) => c === 'create').length, 0);
+  await p.createProject('/synthetic/weather', 'bedrock-openai/grok');
+  assert.deepEqual(calls.filter(([c]) => c === 'create' || c === 'write'), [['create', 'weather.lead', 'bedrock-openai/grok'], ['write', 'bedrock-openai/grok']]);
+  await p.openSetup();
+  p.S.bots.clear();
+  const html = p.setupHTML();
+  assert.match(html, /<option value="bedrock-openai\/grok" selected>grok/); assert.doesNotMatch(html, /Choose a model/);
+});
+
+test('the model chip names each provider above its models', () => {
+  const p = shell();
+  p.upsert({ name: 'lead', id: 1, provider: 'bedrock', family: 'anthropic', model: 'claude' });
+  const items = p.modelMenuItems(p.S.bots.get('lead'), [{ id: 'bedrock/claude' }, { id: 'openai/gpt' }]);
+  assert.deepEqual(Array.from(items, (i) => i.head ?? (i.sep ? '—' : i.label)), ['Amazon Bedrock', 'claude', '—', 'OpenAI', 'gpt']);
+});
+
+test('a daemon with no provider to run opens setup instead of an error', async () => {
+  const p = shell({ attach: async () => { throw new Error('no_provider: connect a provider in Settings'); }, settings: async () => ({ providers: [], model: null, keys: [] }), models: async () => [] });
+  p.S.attached = false;
+  await p.attach();
+  assert.equal(p.S.setup.open, true);
+  assert.equal(p.S.setup.adding, '');
+  assert.match(p.setupHTML(), /Set up Agent/); assert.match(p.setupHTML(), /data-v="bedrock">Amazon Bedrock</); assert.doesNotMatch(p.setupHTML(), /bedrock-openai/);
+});
+
+test('a refused model list says why and can be asked again; a key already set answers for an empty field', async () => {
+  const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai' }, lists: { openai: { models: [] } } });
+  p.context.Daemon.discoverModels = async () => ({ providers: { openai: { models: 0 } }, written: false, error: 'models_none_listed: openai: no usable models' });
+  await p.openSetup();
+  await p.refreshModels();
+  const html = p.setupHTML();
+  assert.match(html, /models_none_listed: openai: no usable models/);
+  assert.match(html, /data-act="setup-refresh"/); assert.match(html, /No models listed yet/);
+  // OPENAI_API_KEY from the shell: re-adding OpenAI with the field left empty keeps using it.
+  env.OPENAI_API_KEY = 'shell';
+  await p.connectProvider('openai', { OPENAI_API_KEY: '' });
+  assert.deepEqual({ ...calls.find(([c]) => c === 'save')[1] }, { AGENT_PROVIDER: 'openai' });
+  await assert.rejects(p.connectProvider('anthropic', { ANTHROPIC_API_KEY: '' }), /API key is required/);
+});
+
+test('removing a provider while agents work asks once more before the restart stops them', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai anthropic', ANTHROPIC_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, anthropic: { models: [{ id: 'claude' }] } } });
+  await p.openSetup();
+  p.upsert({ name: 'busy', id: 1, provider: 'openai', model: 'gpt', status: 'running', running_turn: 3 }); p.S.botsGen += 1;
+  const press = () => p.act({ dataset: { act: 'setup-remove', v: 'anthropic' } });
+  await press();
+  assert.equal(calls.filter(([c]) => c === 'save').length, 0);
+  assert.match(p.setupHTML(), /Remove anyway/); assert.match(p.setupHTML(), /Removing restarts the daemon/);
+  await press();
+  assert.equal(calls.filter(([c]) => c === 'save').length, 1);
 });

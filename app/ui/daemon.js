@@ -12,9 +12,12 @@ window.Daemon = (() => {
     return {
       log,
       setup: () => invoke('setup'),
-      defaultModel: () => invoke('default_model'),
       policy: (workspace, profile) => invoke('policy', { workspace: workspace ?? null, profile: profile ?? null }),
       models: () => invoke('models'),
+      settings: () => invoke('settings'),
+      saveSettings: (changes) => invoke('save_settings', { changes }),
+      restartDaemon: () => invoke('restart_daemon'),
+      discoverModels: () => invoke('discover_models'),
       project: (dir) => invoke('project', { dir }),
       writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
       branch: (dir) => invoke('branch', { dir }),
@@ -32,6 +35,20 @@ window.Daemon = (() => {
   }
 
   // ---------- demo daemon ----------
+  // `?first` opens as a first run: nothing connected, no model, no projects.
+  const FIRST = /[?&]first\b/.test(globalThis.location?.search ?? '');
+  // The settings a started daemon would get, and what each provider lists.
+  const ENV = FIRST ? {} : { AGENT_PROVIDER: 'openai anthropic', OPENAI_API_KEY: 'demo', ANTHROPIC_API_KEY: 'demo' };
+  const LISTS = {
+    openai: [{ id: 'gpt-6-luna' }, { id: 'gpt-6-sol' }],
+    anthropic: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }],
+    chatgpt: [{ id: 'gpt-6-luna' }],
+    bedrock: [{ id: 'anthropic.claude-opus-5', name: 'Claude Opus 5' }, { id: 'anthropic.claude-sonnet-5', name: 'Claude Sonnet 5' }, { id: 'anthropic.claude-haiku-5', name: 'Claude Haiku 5' }],
+    'bedrock-openai': [{ id: 'openai.gpt-6-luna' }, { id: 'qwen.qwen3-coder-480b' }],
+  };
+  const specs = () => (ENV.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
+  const listing = () => Object.fromEntries(specs().map((spec) => { const n = spec.split('=')[0]; return [n, n === 'openrouter' ? { error: 'provider_http_401', detail: 'invalid key' } : { models: LISTS[n] ?? [] }]; }));
+  let listed = FIRST ? [] : null;
   const S = { swarms: new Map(), bots: new Map(), nodes: new Map(), lineages: new Map(), nextNode: 1, nextTurn: 1, nextProc: 1, nextId: 1, cursor: 0, session: 0, queue: [], waiter: null, timers: new Set(), sides: new Set() };
   // Notifications wait in a queue for the page's next pull, as the core's transport holds them.
   const emit = (event) => { if (event.data?.node != null) { if (!S.lineages.has(event.bot)) S.lineages.set(event.bot, []); S.lineages.get(event.bot).push({node:event.data.node,turn:event.turn ?? null}); } if (event.durable !== false) event.cursor = ++S.cursor; S.queue.push(event); if (S.waiter) { const w = S.waiter; S.waiter = null; w(); } };
@@ -281,7 +298,17 @@ window.Daemon = (() => {
   }
 
   const api = {
-    setup: async () => ({ socket: 'demo', model: 'openai/gpt-6-luna', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    setup: async () => ({ socket: 'demo', workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
+    settings: async () => ({ providers: specs(), region: ENV.AWS_REGION ?? null, profile: ENV.AWS_PROFILE ?? null, keys: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK'].filter((k) => ENV[k]) }),
+    saveSettings: async (changes) => { for (const [k, v] of Object.entries(changes)) { if (v) ENV[k] = v; else delete ENV[k]; } },
+    restartDaemon: async () => { await wait(400); },
+    discoverModels: async () => {
+      await wait(700);
+      const answer = listing();
+      const found = Object.entries(answer).flatMap(([n, l]) => (l.models ?? []).map((m) => ({ id: `${n}/${m.id}`, ...(m.name ? { note: m.name } : {}) })));
+      if (found.length) listed = found;
+      return { providers: Object.fromEntries(Object.entries(answer).map(([n, l]) => [n, l.models ? { models: l.models.length } : l])), written: !!found.length, error: found.length ? null : 'models_none_listed' };
+    },
     policy: async () => ({ instructions: 'demo', compaction_instructions: 'demo summary policy', note: 'demo policy' }),
     project: async (dir) => { const name = String(dir).split('/').filter(Boolean).pop()?.replace(/[^A-Za-z0-9_-]+/g, '-') || 'project'; return { dir, name, coordinator: `${name}.lead`, model: null, file: false }; },
     writeProject: async () => {},
@@ -302,11 +329,12 @@ window.Daemon = (() => {
       deliver(sw, null, text);
       return { posted: true, steered: busy.map((m) => short(sw, m)), woke: [], missed: [] };
     },
-    models: async () => [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
+    models: async () => listed ?? [{ id: 'openai/gpt-6-luna' }, { id: 'openai/gpt-6-sol' }, { id: 'anthropic/claude-sonnet-5', note: 'Claude Sonnet 5' }],
     attach: async () => {
-      if (!S.bots.size) {
+      if (!specs().length) throw new Error('no_provider: connect a provider in Settings');
+      if (!S.bots.size && !FIRST) {
         // Two projects: a coordinator is a bot named `<project>.lead`, and its tasks nest under it.
-        const { model } = await api.setup();
+        const model = 'openai/gpt-6-luna';
         await create('demo.lead', model);
         const t = start('demo.lead', 'what does the daemon do when a bot is busy?');
         emit({ event: 'message', bot: 'demo.lead', turn: t, data: { node: node({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Three answers, chosen per submission: reject it, queue it behind the running turn, or steer it into that turn as a mid-flight message. The client sends the mode every time; the daemon has no default of its own.' }] }) } });
@@ -326,6 +354,7 @@ window.Daemon = (() => {
     },
     request: async (op, params = {}) => {
       switch (op) {
+        case 'provider_models': await wait(500); return { providers: listing() };
         // In name order after `after`, as the daemon pages them.
         case 'bots': return { bots: [...S.bots.values()].filter((b) => params.after == null || b.name > params.after).sort((a, c) => (a.name < c.name ? -1 : 1)).map((b) => ({ ...b })), next_after: null };
         case 'history_nodes': {
