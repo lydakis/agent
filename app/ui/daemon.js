@@ -263,6 +263,7 @@ window.Daemon = (() => {
     for (const [name, row] of rows) {
       const b = await api.request('create', { bot: name, model: sw.mix[row].model, workspace: sw.workspace, budget_tokens: each });
       sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
+      sw.made = Math.max(sw.made ?? 0, Number(name.split('-').pop()) || 0);
     }
     for (const [name] of rows) reply(name, `You are ${short(sw, name)}, one of ${sw.members.length} agents in the swarm ${short(sw, sw.name)}.${late ? ' You joined after the others started, so read the board first.' : ''}`);
     return bots;
@@ -276,7 +277,7 @@ window.Daemon = (() => {
     if (act.propose) { const id = `P${st.proposals.length + 1}`; st.proposals.push({ id, stream: act.propose, why: act.why, by: from, at: line.at, votes: {}, status: 'open', decided_by: null }); return [{ ...line, kind: 'propose', id, stream: act.propose, text: act.why }]; }
     const p = st.proposals.find((x) => x.id === act.vote); if (!p || p.status !== 'open') throw new Error(`decided: ${act.vote}`);
     p.votes[from] = { yes: act.yes, reason: act.reason ?? '' };
-    const n = seats(sw).length, need = Math.floor(n / 2) + 1, ayes = Object.values(p.votes).filter((v) => v.yes).length, noes = Object.keys(p.votes).length - ayes;
+    const n = sw.council, need = Math.floor(n / 2) + 1, ayes = Object.values(p.votes).filter((v) => v.yes).length, noes = Object.keys(p.votes).length - ayes;
     const decided = from === 'user' ? act.yes : ayes >= need ? true : n - noes < need ? false : null;
     const out = [{ ...line, kind: 'vote', id: p.id, yes: act.yes, text: act.reason ?? '' }];
     if (decided !== null) {
@@ -391,11 +392,12 @@ window.Daemon = (() => {
     },
     swarmAdd: async (swarm, row) => {
       const sw = S.swarms.get(swarm), each = Math.max(1, Math.floor(sw.budget / Math.max(1, sw.members.length)));
-      let i = sw.members.length + 1; while (sw.members.includes(`${swarm}-${i}`) || S.bots.has(`${swarm}-${i}`)) i++;
+      // A number no agent of the swarm ever had, as the app's own swarms do.
+      let i = (sw.made ?? 0) + 1; while (S.bots.has(`${swarm}-${i}`)) i++;
       const bots = await enlist(sw, [[`${swarm}-${i}`, row]], each, true); sw.budget += each;
       return { swarm: swarmRecord(sw), bots, failed: [] };
     },
-    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; delete sw.rows[member]; return swarmRecord(sw); },
+    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); if (sw.members.includes(member)) sw.budget -= Math.floor(sw.budget / sw.members.length); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; delete sw.rows[member]; return swarmRecord(sw); },
     swarmStop: async (swarm) => {
       const sw = S.swarms.get(swarm); sw.stopped = true;
       for (const m of sw.members) { const b = S.bots.get(m); if (b?.running_turn != null) { b.interrupted = true; finish(m, b.running_turn, 'interrupted'); } }

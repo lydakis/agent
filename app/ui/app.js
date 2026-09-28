@@ -1283,7 +1283,7 @@ function tally(sw, p) {
   const seats = new Set(sw.seats.map((m) => memberShort(sw, m)));
   const votes = Object.entries(p.votes ?? {}).filter(([seat]) => seats.has(seat)).map(([, v]) => v);
   const yes = votes.filter((v) => v.yes).length, no = votes.length - yes;
-  return `${yes} yes${no ? ` · ${no} no` : ''} of ${sw.seats.length}`;
+  return `${yes} yes${no ? ` · ${no} no` : ''} of ${sw.council}`;
 }
 // A board line: who, then the post, with the agents it names marked and its stream as a tag that
 // filters the board; an agent's name opens it beside. Roles, votes, decisions and joins are quieter.
@@ -1312,7 +1312,8 @@ function postHTML(sw, line) {
 function councilHTML(sw) {
   const who = (short) => `<button type="button" class="who" data-task="${esc(`${sw.project}.${short}`)}">${esc(short)}</button>`;
   const seats = sw.seats.map((m) => memberShort(sw, m));
-  const need = Math.floor(seats.length / 2) + 1;
+  // A majority of the council's size, however many seats are filled now.
+  const need = Math.floor(sw.council / 2) + 1;
   const card = (p) => {
     // Once decided, only the votes cast.
     const votes = seats.filter((seat) => p.status === 'open' || p.votes?.[seat]).map((seat) => { const v = p.votes?.[seat]; return `<div class="vote">${who(seat)} ${v ? `<b class="${v.yes ? 'yes' : 'no'}">${v.yes ? 'yes' : 'no'}</b> ${esc(v.reason)}` : '<span class="dim">not yet</span>'}</div>`; }).join('');
@@ -1322,7 +1323,7 @@ function councilHTML(sw) {
     return `<div class="prop ${esc(p.status)}"><div class="ph"><b>${esc(p.id)}</b> ${streamTag(p.stream)} <span class="dim">by</span> ${who(p.by)}<span class="tally">${esc(state)}</span></div><div class="why">${inline(p.why)}</div>${votes}${yours}${acts}</div>`;
   };
   const open = sw.state.proposals.filter((p) => p.status === 'open'), done = sw.state.proposals.filter((p) => p.status !== 'open').reverse();
-  return `<div class="line note">Seats: ${seats.map(esc).join(', ') || 'none yet'}. ${need} of ${seats.length} decide; you can decide any proposal yourself.</div>${open.length ? open.map(card).join('') : '<div class="line note">no open proposals</div>'}${done.map(card).join('')}`;
+  return `<div class="line note">Seats: ${seats.map(esc).join(', ') || 'none yet'}. ${need} of ${sw.council} decide; you can decide any proposal yourself.</div>${open.length ? open.map(card).join('') : '<div class="line note">no open proposals</div>'}${done.map(card).join('')}`;
 }
 // Streams: each approved proposal, its lead and the agents in it with their roles.
 function streamsHTML(sw) {

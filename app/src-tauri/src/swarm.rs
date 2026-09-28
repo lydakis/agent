@@ -75,6 +75,13 @@ pub struct Swarm {
     pub stopped: bool,
     /// Its council's seats: 0 for a flat board, where nobody proposes.
     pub council: usize,
+    /// The highest number an agent of it was made under: the next takes a
+    /// higher one, so a name, and what the board says of it, is never
+    /// someone else's.
+    pub made: usize,
+    /// The bot ids of members that left: helpers they made still count in
+    /// its tokens, and Stop still ends them.
+    pub left: Vec<i64>,
 }
 
 impl Swarm {
@@ -150,6 +157,16 @@ impl Swarm {
                 .and_then(toml::Value::as_integer)
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or_else(|| format!("{}: council is missing", path.display()))?,
+            made: table
+                .get("made")
+                .and_then(toml::Value::as_integer)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| format!("{}: made is missing", path.display()))?,
+            left: table
+                .get("left")
+                .and_then(toml::Value::as_array)
+                .and_then(|ids| ids.iter().map(toml::Value::as_integer).collect())
+                .ok_or_else(|| format!("{}: left is missing or not bot ids", path.display()))?,
         };
         // Every member is pinned to its bot: a post never steers a name.
         if !swarm.members.iter().all(|m| swarm.ids.contains_key(m)) {
@@ -200,6 +217,11 @@ impl Swarm {
             ),
         );
         table.insert("council".into(), (self.council as i64).into());
+        table.insert("made".into(), (self.made as i64).into());
+        table.insert(
+            "left".into(),
+            toml::Value::Array(self.left.iter().map(|id| (*id).into()).collect()),
+        );
         let text = toml::to_string(&table).map_err(|e| e.to_string())?;
         // Distinct per write, so two writes at once never share a temporary.
         static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -859,6 +881,8 @@ fn join_to(s: &mut Swarm, members: &[(String, i64, usize)], budget: Budget) -> R
         }
         s.ids.insert(member.clone(), *id);
         s.rows.insert(member.clone(), *row);
+        let number = member.rsplit('-').next().and_then(|n| n.parse().ok());
+        s.made = s.made.max(number.unwrap_or(0));
     }
     Ok(())
 }
@@ -890,6 +914,36 @@ async fn enlist(
     .await
     .map_err(|e| e.to_string())??;
     let failed = brief_all(client, &joined, dir, made, late).await;
+    if failed.is_empty() {
+        return Ok((joined, failed));
+    }
+    // An agent whose brief never arrived never learned the goal or the
+    // board: it goes, with its share, unless it cannot be deleted, when it
+    // stays a member so Stop still reaches it.
+    let share = match budget {
+        Budget::Set(total) => total / made.len().max(1) as u64,
+        Budget::Add(more) => more,
+    };
+    let mut dropped = Vec::new();
+    for (name, _) in &failed {
+        if client.request("delete", json!({"bot": name})).await.is_ok() {
+            dropped.push(name.clone());
+        }
+    }
+    let path = dir.to_path_buf();
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut s = Swarm::read(&path)?;
+        let gone = |m: &String| dropped.contains(m);
+        s.budget_tokens = (s.budget_tokens)
+            .saturating_sub(share * s.members.iter().filter(|m| gone(m)).count() as u64);
+        s.members.retain(|m| !gone(m));
+        s.ids.retain(|m, _| !gone(m));
+        s.rows.retain(|m, _| !gone(m));
+        s.write(&path)?;
+        Ok::<_, String>(s)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     Ok((joined, failed))
 }
 
@@ -909,23 +963,36 @@ pub fn leave(root: &Path, swarm: &str, member: &str) -> Result<Value, String> {
     Ok(depart(&dir, &[member.to_owned()])?.json(&dir))
 }
 
-/// Members leave, and what they left in the state goes with them: an agent
-/// later made under one of their names starts with no role, stream or vote.
+/// Members leave: their share of the budget goes with them, their helpers
+/// still count, and then what the state holds of anyone who is no longer
+/// a member goes too, so a change a crash cut short between the two files
+/// is finished by the next one.
 fn depart(dir: &Path, gone: &[String]) -> Result<Swarm, String> {
     let mut board = lock_board(dir)?;
     let mut s = Swarm::read(dir)?;
-    let shorts: Vec<String> = (s.members.iter())
+    let leaving: Vec<String> = (s.members.iter())
         .filter(|m| gone.contains(m))
-        .map(|m| s.short(m).to_owned())
+        .cloned()
         .collect();
+    if !leaving.is_empty() {
+        // Every member holds an even share of the budget.
+        let share = s.budget_tokens / s.members.len() as u64;
+        s.budget_tokens -= share * leaving.len() as u64;
+        s.left.extend(leaving.iter().filter_map(|m| s.ids.get(m)));
+        s.members.retain(|m| !leaving.contains(m));
+        s.ids.retain(|m, _| !leaving.contains(m));
+        s.rows.retain(|m, _| !leaving.contains(m));
+        s.write(dir)?;
+    }
+    let current: Vec<String> = (s.members.iter()).map(|m| s.short(m).to_owned()).collect();
     locked_with(&mut board, dir, |state| {
-        shorts.iter().for_each(|m| state.forget(m));
+        for name in state.named() {
+            if !current.contains(&name) {
+                state.forget(&name);
+            }
+        }
         Ok((vec![], ()))
     })?;
-    s.members.retain(|m| !gone.contains(m));
-    s.ids.retain(|m, _| !gone.contains(m));
-    s.rows.retain(|m, _| !gone.contains(m));
-    s.write(dir)?;
     Ok(s)
 }
 
@@ -1105,6 +1172,8 @@ pub async fn start(
         rows: BTreeMap::new(),
         stopped: false,
         council: start.council,
+        made: n,
+        left: Vec::new(),
     };
     if let Err(error) = fill(&dir, &swarm, app) {
         if start.shared {
@@ -1128,14 +1197,17 @@ pub async fn start(
     // A council fills its seats or does not start: fewer agents than seats
     // would change the majority it was started with.
     if made.len() < swarm.council.max(1) {
+        let mut kept = Vec::new();
         for (name, _, _) in &made {
-            let _ = client.request("delete", json!({"bot": name})).await;
+            if let Err(error) = client.request("delete", json!({"bot": name})).await {
+                kept.push(format!("{name} ({})", error.code));
+            }
         }
         let _ = discard(&dir, &swarm, start.shared).await;
         let why = failed
             .first()
             .map_or_else(String::new, |(_, e)| e.to_string());
-        return Err(if made.is_empty() {
+        let mut error = if made.is_empty() {
             why
         } else {
             format!(
@@ -1143,11 +1215,26 @@ pub async fn start(
                 made.len(),
                 swarm.council
             )
-        });
+        };
+        // Said, not hidden: a bot that outlived its swarm is the user's to delete.
+        if !kept.is_empty() {
+            error.push_str(&format!(
+                "; not deleted, delete by hand: {}",
+                kept.join(", ")
+            ));
+        }
+        return Err(error);
     }
     // The budget is what the agents made were given, not what was asked.
     let total = each.saturating_mul(made.len() as u64);
     let joined = match enlist(client, &dir, &made, Budget::Set(total), false).await {
+        // No agent got its brief: nothing started.
+        Ok((joined, briefs)) if joined.members.is_empty() => {
+            let _ = discard(&dir, &swarm, start.shared).await;
+            return Err(briefs
+                .first()
+                .map_or_else(String::new, |(_, e)| e.to_string()));
+        }
         Ok((joined, briefs)) => {
             failed.extend(briefs);
             joined
@@ -1168,8 +1255,8 @@ pub async fn start(
     }))
 }
 
-/// One more agent from `row` of the mix, under the next number no member
-/// has. Its budget adds to the swarm's.
+/// One more agent from `row` of the mix, under a number no agent of the
+/// swarm ever had. Its budget adds to the swarm's.
 pub async fn add(
     client: &Arc<Client>,
     root: &Path,
@@ -1188,17 +1275,14 @@ pub async fn add(
     }
     let policies = policies(&s, std::iter::once(row))?;
     let each = (s.budget_tokens / s.members.len().max(1) as u64).max(1);
-    let mut n = s.members.len() + 1;
+    let mut n = s.made + 1;
     let made = loop {
         let name = format!("{}-{n}", s.name);
         n += 1;
-        if s.members.contains(&name) {
-            continue;
-        }
         let (made, failed) = create(client, &s, &[(name, row)], &policies, each).await;
         match failed.into_iter().next() {
             // A bot of that name that is not a member: take the next number.
-            Some((_, error)) if error.code == "bot_exists" && n <= s.members.len() + 64 => {}
+            Some((_, error)) if error.code == "bot_exists" && n <= s.made + 64 => {}
             Some((_, error)) => return Err(error.to_string()),
             None => break made,
         }
@@ -1258,12 +1342,21 @@ pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Valu
                 }
             }
         }
+        // A member given a turn meanwhile, from another window, is ended
+        // again; a helper once.
         match scan(client, &s).await {
-            Ok(seen) => next.extend(
-                (seen.helpers.into_iter())
-                    .filter(|(h, _)| !ended.contains(h))
-                    .map(|(h, id)| (h, Some(id), false)),
-            ),
+            Ok(seen) => {
+                next.extend(
+                    (seen.turns.into_iter())
+                        .filter(|(_, turn)| turn.is_some())
+                        .map(|(m, _)| (m.clone(), s.ids.get(&m).copied(), true)),
+                );
+                next.extend(
+                    (seen.helpers.into_iter())
+                        .filter(|(h, _)| !ended.contains(h))
+                        .map(|(h, id)| (h, Some(id), false)),
+                );
+            }
             Err(error) => failed.push(json!({"agent": "helpers", "error": error})),
         }
         if next.is_empty() {
@@ -1271,7 +1364,9 @@ pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Valu
         }
     }
     if !next.is_empty() {
-        failed.push(json!({"agent": "helpers", "error": "helpers were still being made"}));
+        failed.push(
+            json!({"agent": "helpers", "error": "turns or helpers were still being started"}),
+        );
     }
     let s = if gone.is_empty() {
         s
@@ -1719,11 +1814,23 @@ impl State {
             .any(|p| p.stream == stream && p.status == "approved")
     }
 
-    /// A member that left takes its role, its place in a stream and its
-    /// votes on open proposals with it.
+    /// Every agent the state says something of.
+    fn named(&self) -> std::collections::BTreeSet<String> {
+        let open = self.proposals.iter().filter(|p| p.status == "open");
+        (self.roles.keys().chain(self.streams.keys()).cloned())
+            .chain(open.flat_map(|p| std::iter::once(p.by.clone()).chain(p.votes.keys().cloned())))
+            .filter(|name| name != "user")
+            .collect()
+    }
+
+    /// A member that left takes its role, its place in a stream, its votes
+    /// on open proposals and the open proposals it made with it; the board
+    /// keeps all of them.
     fn forget(&mut self, member: &str) {
         self.roles.remove(member);
         self.streams.remove(member);
+        self.proposals
+            .retain(|p| p.status != "open" || p.by != member);
         for p in self.proposals.iter_mut().filter(|p| p.status == "open") {
             p.votes.remove(member);
         }
@@ -2130,7 +2237,10 @@ fn plan(
                 Some(_) => words(&reason, "reason", MAX_POST)?,
                 None => reason.trim().to_owned(),
             };
-            let seats = swarm.seats().len();
+            // The council's size, not the seats filled now: a council short
+            // of seats needs the same majority, and waits for an added agent
+            // or for you.
+            let seats = swarm.council;
             let proposal = state.proposal(&id)?;
             if proposal.status != "open" {
                 return Err(format!(
@@ -2288,7 +2398,8 @@ async fn scan(client: &Client, swarm: &Swarm) -> Result<Scan, String> {
     let mut after = swarm.name.clone();
     let mut out = Scan::default();
     // A helper's maker sorts before it, so one pass finds helpers' helpers.
-    let mut makers: std::collections::HashSet<i64> = swarm.ids.values().copied().collect();
+    let mut makers: std::collections::HashSet<i64> =
+        (swarm.ids.values().chain(&swarm.left)).copied().collect();
     loop {
         let page = client
             .request("bots", json!({"after": after, "limit": 256}))
@@ -2833,6 +2944,8 @@ mod tests {
             rows: members.iter().map(|m| (m.to_string(), 0)).collect(),
             stopped: false,
             council: 0,
+            made: members.len(),
+            left: Vec::new(),
         }
     }
 
@@ -3130,6 +3243,25 @@ mod tests {
             9,
         )
         .unwrap();
+        // A council down to one seat needs the same two votes: one yes or one no decides nothing.
+        let lone = council(&["agent.latency-4"]);
+        let mut quiet = State::default();
+        plan(&lone, &mut quiet, Some(&agent(4)), propose("solo"), 10).unwrap();
+        let vote = |yes| Act::Vote {
+            id: "P1".into(),
+            yes,
+            reason: "alone".into(),
+        };
+        let (_, _, answer) = plan(&lone, &mut quiet, Some(&agent(4)), vote(true), 11).unwrap();
+        assert_eq!(answer["decided"], Value::Null);
+        // The open proposals latency-2 made go when it leaves; the board keeps them.
+        state.forget("latency-2");
+        assert!(
+            state
+                .proposals
+                .iter()
+                .all(|p| p.status != "open" || p.by != "latency-2")
+        );
         // latency-4 leaves: its role, its vote and its place go, and the stream it alone was in
         // closes; everything stays on the board.
         state.roles.insert("latency-4".into(), "lead".into());
@@ -3454,6 +3586,17 @@ mod tests {
             roles,
             BTreeMap::from([("latency-2".into(), "tester".into())])
         );
+        // Its share of the budget goes with it, and its id stays so its helpers still count.
+        assert_eq!(left["budget_tokens"], 1_500_500);
+        assert_eq!(Swarm::read(&dir).unwrap().left.len(), 1);
+        // What the state holds of a name that is no member any more goes at the next departure.
+        locked(&dir, |state| {
+            state.roles.insert("latency-9".into(), "ghost".into());
+            Ok((vec![], ()))
+        })
+        .unwrap();
+        leave(&root, &s.name, "agent.nobody").unwrap();
+        assert!(!State::read(&dir).unwrap().roles.contains_key("latency-9"));
         update(&dir, |s| {
             s.stopped = true;
             Ok(())
@@ -3720,9 +3863,11 @@ mod tests {
                     Err("provider_unknown".into())
                 }
                 "create" => Ok(made(request)),
+                "submit" if request["bot"] == "p.brief-2" => Err("busy".into()),
                 "submit" => Ok(json!({"status": "running"})),
                 "resume" => Err("bot_not_found".into()),
                 "bots" => Ok(json!({"bots": []})),
+                "delete" => Ok(json!({})),
                 _ => Err("unexpected".into()),
             }),
         );
@@ -3826,6 +3971,19 @@ mod tests {
         ));
         assert_eq!(out.unwrap_err(), "provider_unknown (fake)");
         assert!(!root.join("p.fail").exists());
+        // An agent whose brief did not arrive goes, with its share.
+        let out = rt
+            .block_on(super::start(
+                &client,
+                &root,
+                Path::new("/app"),
+                start("brief", 2, mix.clone()),
+            ))
+            .unwrap();
+        assert_eq!(out["swarm"]["members"], json!(["p.brief-1"]));
+        assert_eq!(out["swarm"]["budget_tokens"], 2_000);
+        assert_eq!(out["failed"][0]["agent"], "p.brief-2");
+        assert!(fake.ops("delete").iter().any(|d| d["bot"] == "p.brief-2"));
         // A council that cannot fill its three seats does not start, and its agents go.
         let mut council = start("seat", 3, mix.clone());
         council.council = 3;
@@ -3833,10 +3991,9 @@ mod tests {
             .block_on(super::start(&client, &root, Path::new("/app"), council))
             .unwrap_err();
         assert!(error.starts_with("invalid_council: only 2 of"), "{error}");
-        let deleted: Vec<Value> = fake
-            .ops("delete")
-            .iter()
+        let deleted: Vec<Value> = (fake.ops("delete").iter())
             .map(|d| d["bot"].clone())
+            .filter(|b| b.as_str().is_some_and(|b| b.starts_with("p.seat")))
             .collect();
         assert_eq!(deleted, vec![json!("p.seat-1"), json!("p.seat-3")]);
         assert!(!root.join("p.seat").exists());
@@ -4101,6 +4258,15 @@ mod tests {
                 .unwrap_err()
                 .starts_with("invalid_agents")
         );
+        // latency-4 leaves with its share; the next agent is latency-5, never a second latency-4.
+        let left = leave(&root, &s.name, &agent(4)).unwrap();
+        assert_eq!(left["budget_tokens"], 3_000_000);
+        let out = rt.block_on(add(&client, &root, &s.name, 0)).unwrap();
+        assert_eq!(
+            out["swarm"]["members"],
+            json!([agent(1), agent(2), agent(5)])
+        );
+        assert_eq!(out["swarm"]["budget_tokens"], 4_500_000);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -4124,8 +4290,10 @@ mod tests {
                     ("bots", _) => {
                         let first = looked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
                         let deep = json!({"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40});
+                        // Another window gave latency-1 a turn after its first end.
+                        let running = if first { json!(9) } else { Value::Null };
                         let mut bots = vec![
-                            json!({"name": agent(1), "id": 1, "tokens_used": 10}),
+                            json!({"name": agent(1), "id": 1, "tokens_used": 10, "running_turn": running}),
                             json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1}),
                         ];
                         bots.extend((!first).then_some(deep));
@@ -4167,13 +4335,14 @@ mod tests {
                 .map(|i| i["turn"].clone())
                 .collect()
         };
-        for bot in [
-            agent(1).as_str(),
-            "agent.latency-1.fix",
-            "agent.latency-1.fix.deep",
-        ] {
+        for bot in ["agent.latency-1.fix", "agent.latency-1.fix.deep"] {
             assert_eq!(ended(bot), vec![json!(7), json!(6)], "{bot}");
         }
+        // latency-1, running again at the first look, was ended again.
+        assert_eq!(
+            ended(&agent(1)),
+            vec![json!(7), json!(6), json!(7), json!(6)]
+        );
         let listed: std::collections::BTreeSet<String> = (fake.ops("turns").iter())
             .map(|t| t["bot"].as_str().unwrap().to_owned())
             .collect();

@@ -455,7 +455,9 @@ daemon learns nothing about projects; everything here is client work.
   STORE is the store identity the daemon announces when a window attaches,
   so a window sees only its store's swarms, whatever socket reaches it:
   `swarm.toml` (its project, goal, folder, budget, mix, members with each
-  one's bot id and row of the mix, and whether you stopped it; at most
+  one's bot id and row of the mix, whether you stopped it, the highest
+  number an agent of it was made under, and the bot ids of members that
+  left; at most
   1 MiB, read only when every member has an id and a row, changed only
   under the board's lock, synced, and replaced whole; written last when
   a swarm is made, so a folder without it is not listed), `board.jsonl` (one
@@ -497,9 +499,12 @@ daemon learns nothing about projects; everything here is client work.
   names its member's bot id, so a bot deleted and made again under a
   member's name is not a member: a post misses it, and the app keeps it in
   the sidebar and out of the swarm's cards and counts; a deleted agent
-  leaves its swarm when the app sees it go, and its role, stream and votes
-  on open proposals go with it, so an agent later made under its name
-  starts fresh. A swarm is one sidebar row
+  leaves its swarm when the app sees it go, taking its share of the budget,
+  its role, its stream, its votes on open proposals and the open proposals
+  it made (the board keeps them all); its helpers still count in the
+  swarm's tokens and Stop still ends them. A new agent always takes a
+  number no agent of the swarm had, so a name on the board is only ever
+  one agent's. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
   in the sidebar. Its view has two tabs: **Board**, read from where the
   last read ended whenever one of its agents does something durable, and
@@ -509,14 +514,16 @@ daemon learns nothing about projects; everything here is client work.
   budget, its helpers' tokens included. Its composer posts to the board.
   Its ⋯ menu stops every agent and helper
   (agents first, then the helpers they made, looked for again until a look
-  finds none it has not stopped; every unfinished turn, queued ones first, of each member that is still
+  finds none it has not stopped and no agent given a turn meanwhile; every unfinished turn, queued ones first, of each member that is still
   the bot that joined; a name now held by another bot leaves instead; and
   the swarm refuses its agents' posts until your next one is on the board)
   or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
   whose share of tokens the swarm's budget grows by. New agents join and
   get their briefs under the board's lock, so a Stop from another window
   comes first and they are refused (and deleted), or waits and ends the
-  turns their briefs started. A swarm's budget is what the agents it made
+  turns their briefs started. An agent whose brief did not arrive is
+  deleted with its share, and a start none of whose briefs arrived starts
+  nothing. A swarm's budget is what the agents it made
   were given: a start where some could not be made has the budget of those
   that were. Any agent says what it is doing with
   `role ROLE`, shown on the board and on its card. A helper is a bot an
@@ -559,10 +566,11 @@ daemon learns nothing about projects; everything here is client work.
   to coordinators and swarm agents made afterwards.
 - **Swarm councils.** The sheet's "Organized as" picks one board (every
   agent takes a piece) or a council of 3, which needs at least three
-  agents; a start that made fewer than three deletes them and starts
-  nothing. With a council, the seats are the swarm's first three agents; when
-  a seat is deleted the next agent takes it, and only the votes of the seats
-  as they are now count. An agent proposes a stream of work with
+  agents; a start that made fewer than three deletes them (naming any it
+  could not) and starts nothing. With a council, the seats are the swarm's
+  first three agents; when a seat is deleted the next agent takes it, and
+  only the votes of the seats as they are now count, still 2 of the
+  council's 3 however many seats are filled. An agent proposes a stream of work with
   `propose STREAM WHY`, which wakes the other seats; a seat votes with
   `vote ID yes|no REASON`, once. A majority of the seats (2 of 3) approves or
   denies; an approved proposal opens its stream with the proposer as lead
