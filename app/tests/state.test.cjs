@@ -1143,7 +1143,7 @@ function settingsShell({ env = {}, lists = {} } = {}) {
     restartDaemon: async () => { calls.push(['restart']); },
     discoverModels: async () => { calls.push(['discover']); const a = answer(); return { providers: Object.fromEntries(Object.entries(a).map(([n, l]) => [n, l.models ? { models: l.models.length } : l])), written: true, error: null }; },
     models: async () => Object.entries(answer()).flatMap(([n, l]) => (l.models ?? []).map((m) => ({ id: `${n}/${m.id}` }))),
-    attach: async () => { calls.push(['attach']); return { session: 2 }; },
+    attach: async () => { calls.push(['attach']); if (!specs().length) throw new Error('no_provider: connect a provider in Settings'); return { session: 2 }; },
     pull: () => new Promise(() => {}),
     project: async (dir) => ({ dir, name: 'weather', coordinator: 'weather.lead', model: null, file: false }),
     policy: async () => ({ instructions: 'rules', compaction_instructions: 'summary', note: 'test' }),
@@ -1218,6 +1218,17 @@ test('removing the last provider hides a key the shell exports, so the next star
   await p.openSetup();
   await p.removeProvider('bedrock');
   assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: null, AWS_BEARER_TOKEN_BEDROCK: null, OPENAI_API_KEY: '' });
+  // The daemon then has nothing to run, which is where removing the last provider should end.
+  assert.equal(p.S.setup.error, null);
+  assert.equal(calls.filter(([c]) => c === 'discover').length, 0);
+  assert.match(p.setupHTML(), /Connect a provider first/);
+});
+
+test('a key a custom provider names stays when the catalog provider that shares it goes', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai corp=responses,https://corp.example/v1,OPENAI_API_KEY', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, corp: { models: [{ id: 'm' }] } } });
+  await p.openSetup();
+  await p.removeProvider('openai');
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'corp=responses,https://corp.example/v1,OPENAI_API_KEY' });
 });
 
 test('a first launch with a provider but no agents opens setup on the first project', async () => {

@@ -1409,6 +1409,11 @@ const specName = (spec) => String(spec).split('=')[0];
 // The daemon providers an entry runs, and the entry a daemon provider belongs to.
 const partsOf = (c) => c.parts ? c.parts.map(([name]) => name) : [c.id];
 const catalogOf = (name) => CATALOG.find((c) => partsOf(c).includes(name));
+// The keys a spec signs with: its catalog entry's, or the one a `NAME=FAMILY,URL,KEY` spec names.
+const keysOf = (spec) => [
+  ...(catalogOf(specName(spec))?.fields ?? []).filter((f) => f.secret).map((f) => f.key),
+  ...String(spec).split('=').slice(1).join('=').split(',').slice(2, 3).filter(Boolean),
+];
 const providerLabel = (name) => catalogOf(name)?.label ?? name;
 // A model picker: every listed model under its provider's name, the last one picked chosen.
 function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
@@ -1468,6 +1473,8 @@ async function readList() {
 async function refreshModels() {
   const st = setupState();
   const names = (st.settings?.providers ?? []).map(specName);
+  // No provider, no daemon to ask: the list offers nothing until one is connected.
+  if (!names.length) { st.status = {}; st.list = []; st.listError = null; renderSetup(); return; }
   st.status = Object.fromEntries(names.map((n) => [n, 'checking'])); st.busy = 'Asking your providers for their models…'; renderSetup();
   let refused = null;
   try {
@@ -1486,7 +1493,8 @@ async function restartDaemon() {
   st.busy = 'Restarting the daemon…'; renderSetup();
   try {
     await Daemon.restartDaemon();
-    if (!(await attach()) && !(await attach())) throw new Error(S.lastReason ?? 'daemon_unavailable');
+    // With every provider removed, a daemon that will not start for lack of one is the expected end.
+    if (!(await attach()) && !(await attach()) && !(/^no_provider/.test(S.lastReason ?? '') && !st.settings?.providers?.length)) throw new Error(S.lastReason ?? 'daemon_unavailable');
   } finally { st.busy = null; }
 }
 async function connectProvider(id, values) {
@@ -1509,7 +1517,8 @@ async function removeProvider(name) {
   const specs = (st.settings?.providers ?? []).filter((s) => !gone.includes(specName(s)));
   const changes = { AGENT_PROVIDER: specs.join(' ') || null };
   // Its key goes too, unless another provider still uses it; the region and profile stay.
-  for (const f of c?.fields ?? []) if (f.secret && !specs.some((s) => catalogOf(specName(s))?.fields.some((g) => g.key === f.key))) changes[f.key] = null;
+  const used = specs.flatMap(keysOf);
+  for (const f of c?.fields ?? []) if (f.secret && !used.includes(f.key)) changes[f.key] = null;
   // With no provider named, a start detects one from any key the shell exports; an empty key hides it.
   if (!specs.length) for (const key of DETECTED) if (key in changes || st.settings?.keys?.includes(key)) changes[key] = '';
   await applySettings(changes);
@@ -1551,7 +1560,7 @@ function setupHTML() {
   const refresh = specs.length && S.attached ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
   const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
   const projects = hasProject();
-  const project = projects ? '' : ready && st.list.length
+  const project = projects ? '' : ready && specs.length && st.list.length
     ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
     : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
