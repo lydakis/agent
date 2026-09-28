@@ -335,6 +335,17 @@ function indexMembers() {
   S.memberOf = new Map(); for (const sw of S.swarms.values()) for (const m of sw.members) S.memberOf.set(m, sw.name);
   S.shapeGen += 1;
 }
+// A swarm's departures go one at a time, so each answer is newer than the one before it and the last
+// one applied has them all. The board is read after each: a stream or a seat may have changed hands.
+const leaving = new Map();
+function leave(swarm, name) {
+  const next = (leaving.get(swarm) ?? Promise.resolve()).then(() => Daemon.swarmLeave(swarm, name)).then(
+    (r) => { const sw = learnSwarm(r); boardSoon(sw); if (S.selected === swarmKey(swarm)) render(); },
+    (e) => toast(`leave ${swarm}: ${e?.message ?? e}`));
+  leaving.set(swarm, next);
+  next.then(() => { if (leaving.get(swarm) === next) leaving.delete(swarm); });
+  return next;
+}
 // Reads can overlap; only the newest one's answer is kept, so an older snapshot never removes a swarm a
 // newer read found.
 let swarmsRead = 0;
@@ -387,7 +398,8 @@ function readBoard(sw) {
 async function readUsage(sw) {
   if (sw.usage) return sw.usage;
   sw.usage = (async () => {
-    const prefix = sw.name + '-', makers = new Set([...Object.values(sw.ids), ...(sw.left ?? [])]), seen = new Set();
+    // Helpers seen before stand in for their maker once it is deleted.
+    const prefix = sw.name + '-', makers = new Set([...Object.values(sw.ids), ...(sw.left ?? []), ...Object.keys(sw.state?.roots ?? {}).map(Number)]), seen = new Set();
     let used = 0, after = sw.name;
     try {
       for (;;) {
@@ -422,7 +434,7 @@ function checkSoon(sw) {
 function swarmOfHelper(name) {
   let b = bot(name);
   for (let depth = 0; b && depth < 16; depth++) {
-    for (const sw of S.swarms.values()) if (b.parentId != null && sw.left?.includes(b.parentId)) return sw;
+    for (const sw of S.swarms.values()) if (b.parentId != null && (sw.left?.includes(b.parentId) || sw.state?.roots?.[b.parentId] != null)) return sw;
     const maker = creatorOf(b); if (!maker) return null; const sw = swarmOfBot(maker.name); if (sw) return sw; b = maker;
   }
   return null;
@@ -635,7 +647,7 @@ async function onEvent(ev) {
       // A deleted agent leaves its swarm, which stops counting it and posting to it.
       if (S.memberOf.has(name)) {
         const sw = S.memberOf.get(name); patchRailRow(swarmKey(sw));
-        Daemon.swarmLeave(sw, name).then((r) => { learnSwarm(r); if (S.selected === swarmKey(sw)) render(); }, (e) => toast(`leave ${sw}: ${e?.message ?? e}`));
+        leave(sw, name);
       }
       break;
     }
@@ -1329,6 +1341,7 @@ function postHTML(sw, line) {
     case 'role': return row('ev', `is now <i>${esc(line.role ?? '')}</i>`);
     case 'join': return row('ev', `joined ${streamTag(line.stream ?? '')}`);
     case 'vote': return row('ev', `votes <b>${line.yes ? 'yes' : 'no'}</b> on ${esc(line.id ?? '')}${line.text ? `: ${text}` : ''}`);
+    case 'lead': return row('ev', `${streamTag(line.stream ?? '')} ${esc(line.was ?? '')} left · ${esc(line.lead ?? '')} leads it`);
     case 'decision': return row(`ev decided ${line.approved ? 'yes' : 'no'}`, `${esc(line.id ?? '')} ${streamTag(line.stream ?? '')} ${line.approved ? `approved · ${esc(line.lead ?? '')} leads it` : 'denied'}`);
     case 'propose': {
       const p = sw.state.proposals.find((x) => x.id === line.id);
@@ -1361,7 +1374,7 @@ function streamsHTML(sw) {
   if (!approved.length) return '<div class="line note">no streams yet: an approved proposal opens one</div>';
   return approved.map((p) => {
     const members = Object.entries(sw.state.streams ?? {}).filter(([, st]) => st === p.stream).map(([m]) => m);
-    const people = members.map((m) => `<button type="button" class="member" data-task="${esc(`${sw.project}.${m}`)}">${esc(m)}${m === p.by ? ' <span class="dim">lead</span>' : ''}${sw.state.roles?.[m] ? ` <i>${esc(sw.state.roles[m])}</i>` : ''}</button>`).join('');
+    const people = members.map((m) => `<button type="button" class="member" data-task="${esc(`${sw.project}.${m}`)}">${esc(m)}${m === (p.lead ?? p.by) ? ' <span class="dim">lead</span>' : ''}${sw.state.roles?.[m] ? ` <i>${esc(sw.state.roles[m])}</i>` : ''}</button>`).join('');
     return `<div class="prop stream"><div class="ph">${streamTag(p.stream)} <span class="dim">${members.length} agent${members.length === 1 ? '' : 's'}</span><button type="button" class="sbtn" data-act="swarm-filter" data-v="${esc(p.stream)}">Posts</button></div><div class="why">${inline(p.why)}</div><div class="members">${people}</div></div>`;
   }).join('');
 }

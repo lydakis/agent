@@ -124,6 +124,11 @@ Streams: the approved proposals, each with its lead and the agents in it.
 
 ![Streams](app/swarm-streams.png)
 
+When a stream's lead leaves, the first agent left in it leads it, and the
+board says so.
+
+![A stream handed on when its lead left](app/swarm-lead.png)
+
 You can also ask a project's coordinator for one ("start a swarm of six, two
 of them reviewers, to halve the p99"). Its role tells it to run
 `~/.agent/swarms/start`, a script the app writes, which starts the swarm the
@@ -474,7 +479,8 @@ daemon learns nothing about projects; everything here is client work.
   one's bot id and row of the mix, whether you stopped it, the highest
   number an agent of it was made under, and the bot ids of members that
   left; at most
-  1 MiB, read only when every member has an id and a row, changed only
+  1 MiB, never written past it (an Add that would is refused and its agent
+  deleted), read only when every member has an id and a row, changed only
   under the board's lock, synced, and replaced whole; written last when
   a swarm is made, so a folder without it is not listed), `board.jsonl` (one
   line a post or act, appended under a lock and synced, your goal first;
@@ -507,8 +513,9 @@ daemon learns nothing about projects; everything here is client work.
   turns (a turn that ended meanwhile is skipped; the post waits on the
   board), and wakes an idle agent only when it names it with `@NAME`; your
   post wakes every agent, or only the ones it names. A post holds the
-  board's lock until its steers are sent, so Stop either refuses it or
-  ends what it started. So agents talking
+  board's lock until its steers are sent, and Stop holds it throughout, so
+  a post either comes first and Stop ends what it started, or waits for
+  Stop: an agent's is then refused, and yours resumes the swarm. So agents talking
   never wake a swarm that went quiet. A post is at most 16 KiB and comes
   only from a member, named by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and
   `AGENT_TURN`; the daemon records it as each steer's author. Every steer
@@ -519,7 +526,11 @@ daemon learns nothing about projects; everything here is client work.
   its role, its stream, its votes on open proposals and the open proposals
   it made (the board keeps them all); its helpers still count in the
   swarm's tokens and Stop still ends them (`swarm.toml` keeps its bot id
-  in `left` until a look at the daemon's list finds nothing it made). A new agent always takes a
+  in `left` until a look at the daemon's list finds nothing it made). A
+  stream it led goes to the first agent left in it (a `lead` line on the
+  board, and that agent is told); an agent that moves up into its council
+  seat is told it holds one, with the proposals open, if any. A stopped
+  swarm tells neither. A new agent always takes a
   number no agent of the swarm had, so a name on the board is only ever
   one agent's. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
@@ -556,7 +567,9 @@ daemon learns nothing about projects; everything here is client work.
   cannot post. The daemon forgets a deleted bot's tokens, so each act that
   reads its list keeps each helper's tokens in `state.json` (`helpers`), and
   a helper deleted since counts on (`gone`) with what that look saw it use;
-  what it used after that look is not counted. Each act that reads the daemon's list, and a check the page
+  what it used after that look is not counted. It keeps where each helper
+  comes from too (`roots`), so a helper whose maker was deleted still
+  counts and still stops, as long as a look saw its maker first. Each act that reads the daemon's list, and a check the page
   asks for at most every five seconds a swarm as its agents finish turns,
   tells the working agents when the swarm passes 50%, 75% or 90% of its
   budget: a `budget` line on the board, each share once (`state.json`

@@ -1799,6 +1799,35 @@ test('a swarm counts its helpers\' tokens, and the board says when it passes a s
   await p.readUsage(sw);
   assert.equal(sw.used, 1230 + 400 + 60 + 500);
   assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
+  // fix is deleted: deep, made by it, still counts through what the board knows of fix.
+  bots.splice(bots.findIndex((b) => b.id === 40), 1);
+  sw.state = { ...sw.state, helpers: { 41: 30 }, gone: 0, roots: { 40: 3, 41: 3 } };
+  await p.readUsage(sw);
+  assert.equal(sw.used, 1000 + 30 + 400);
+});
+
+test('a swarm\'s departures apply in order, and a stream that changed hands shows its new lead', async () => {
+  const answers = [deferred(), deferred()], calls = [];
+  const p = shell({
+    swarmLeave: (swarm, member) => { calls.push(member); return answers[calls.length - 1].promise; },
+    swarmBoard: async () => ({ lines: [], offset: 0, more: false, reset: true }),
+    request: async () => ({ bots: [], next_after: null }),
+  });
+  for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4], ['app.latency-3', 5]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3']));
+  await p.onEvent({ event: 'deleted', bot: 'app.latency-1', durable: true });
+  await p.onEvent({ event: 'deleted', bot: 'app.latency-2', durable: true });
+  await p.tick();
+  // The second waits for the first's answer, so the first's never lands after it.
+  assert.deepEqual(calls, ['app.latency-1']);
+  answers[0].resolve(swarmRecord(['app.latency-2', 'app.latency-3']));
+  await p.tick();
+  assert.deepEqual(calls, ['app.latency-1', 'app.latency-2']);
+  answers[1].resolve(swarmRecord(['app.latency-3']));
+  await p.tick();
+  assert.deepEqual(sw.members, ['app.latency-3']);
+  const lead = p.postHTML(sw, { from: 'council', kind: 'lead', stream: 'cache', lead: 'latency-3', was: 'latency-1' });
+  assert.match(lead, /latency-1 left · latency-3 leads it/);
 });
 
 test('an older daemon on the socket is replaced from the detached screen; a newer one is left to an app update', async () => {
