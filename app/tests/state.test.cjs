@@ -1260,6 +1260,25 @@ test('a daemon with no provider is not started again until settings change', asy
   assert.match(p.elements.get('detached').innerHTML, /waiting for a provider/);
 });
 
+test('Bedrock with a saved key switches to the AWS login when asked, and keeps the key otherwise', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock=anthropic,https://bedrock-mantle.us-east-1.api.aws/anthropic/v1,AWS_BEARER_TOKEN_BEDROCK bedrock-openai=responses,https://bedrock-mantle.us-east-1.api.aws/openai/v1,AWS_BEARER_TOKEN_BEDROCK', AWS_REGION: 'us-east-1', AWS_BEARER_TOKEN_BEDROCK: 'k' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  p.S.setup.adding = 'bedrock';
+  assert.match(p.setupHTML(), /<option value="key" selected>Bedrock API key/);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'key', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.match(calls.filter(([c]) => c === 'save')[0][1].AGENT_PROVIDER, /^bedrock=anthropic,/);
+  await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AUTH: 'aws', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: '' });
+  assert.deepEqual({ ...calls.filter(([c]) => c === 'save')[1][1] }, { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-east-1', AWS_PROFILE: 'work', AWS_BEARER_TOKEN_BEDROCK: null });
+});
+
+test('a change another window saved is kept when this one connects a provider', async () => {
+  const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  await p.openSetup();
+  env.AGENT_PROVIDER = 'openai chatgpt';
+  await p.connectProvider('anthropic', { ANTHROPIC_API_KEY: 'k' });
+  assert.equal(calls.find(([c]) => c === 'save')[1].AGENT_PROVIDER, 'openai chatgpt anthropic');
+});
+
 test('a project starts on the model picked for it, and the pick is offered first next time', async () => {
   const storage = new Map();
   const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai bedrock bedrock-openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
@@ -1291,7 +1310,7 @@ test('a daemon with no provider to run opens setup instead of an error', async (
 });
 
 test('a refused model list says why and can be asked again; a key already set answers for an empty field', async () => {
-  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai' }, lists: { openai: { models: [] } } });
+  const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai' }, lists: { openai: { models: [] } } });
   p.context.Daemon.discoverModels = async () => ({ providers: { openai: { models: 0 } }, written: false, error: 'models_none_listed: openai: no usable models' });
   await p.openSetup();
   await p.refreshModels();
@@ -1299,7 +1318,7 @@ test('a refused model list says why and can be asked again; a key already set an
   assert.match(html, /models_none_listed: openai: no usable models/);
   assert.match(html, /data-act="setup-refresh"/); assert.match(html, /No models listed yet/);
   // OPENAI_API_KEY from the shell: re-adding OpenAI with the field left empty keeps using it.
-  p.S.setup.settings.keys = ['OPENAI_API_KEY'];
+  env.OPENAI_API_KEY = 'shell';
   await p.connectProvider('openai', { OPENAI_API_KEY: '' });
   assert.deepEqual({ ...calls.find(([c]) => c === 'save')[1] }, { AGENT_PROVIDER: 'openai' });
   await assert.rejects(p.connectProvider('anthropic', { ANTHROPIC_API_KEY: '' }), /API key is required/);

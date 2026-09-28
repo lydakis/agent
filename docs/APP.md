@@ -253,8 +253,8 @@ first run and later changes:
 
 1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
    plan uses the sign-in Codex saved; Amazon Bedrock takes a region and signs
-   with the AWS CLI's credentials for an optional profile, or with a Bedrock
-   API key when one is given. Bedrock serves Claude over Anthropic's API and
+   in one of two ways, chosen on the form: the AWS CLI's credentials for an
+   optional profile (which drops a saved key), or a Bedrock API key. Bedrock serves Claude over Anthropic's API and
    its other models over OpenAI's, so the daemon runs it as two providers,
    `bedrock` and `bedrock-openai`; the app connects, lists and removes them
    as one. Connecting writes `AGENT_PROVIDER` (the providers already running
@@ -263,6 +263,8 @@ first run and later changes:
    running turns and returns once the process is gone, attaches again, which
    starts a daemon with the new settings, and asks every provider for its
    models. Each row then shows its model count, or its refusal with a Retry.
+   Connect and Remove read the file again first, so a change another window
+   saved is kept.
    A key is never read back into the page: the core reports only which keys
    are set, and a key field left empty keeps the saved one; any other field
    left empty is saved empty, which clears the shell's value too (an AWS
@@ -283,7 +285,8 @@ first run and later changes:
 It opens on its own when a daemon cannot start for lack of a provider, and
 once when a window first attaches to a store with no agents. An
 `agent` the app did not bundle, or an explicit `--socket`, cannot be
-restarted, so Settings saves no provider change there and says why.
+restarted, so Settings saves no provider change there and says why; it
+shows that daemon's providers instead of the ones this machine would start.
 
 ## Projects and panes
 

@@ -1387,9 +1387,11 @@ function detach() { save(); Daemon.close(); }
 // is no default model: each project or agent is given one when it is made, from any provider.
 // Onboarding is this screen opened on its own when no provider is set up; Settings is the same
 // screen opened from the sidebar.
-const AWS = 'Signs in with your AWS CLI login for the profile (aws configure, or aws sso login), or with a Bedrock API key if you give one.';
+const AWS = 'Signs in with your AWS CLI login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
+// A field that is `local` is the form's own choice, never saved.
 const BEDROCK = [
   { key: 'AWS_REGION', label: 'Region', hint: 'us-east-1', required: true },
+  { key: 'AUTH', label: 'Sign in with', local: true, choices: [['aws', 'AWS login'], ['key', 'Bedrock API key']] },
   { key: 'AWS_PROFILE', label: 'AWS profile', hint: 'default' },
   { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bedrock API key', hint: 'optional', secret: true },
 ];
@@ -1443,11 +1445,23 @@ async function openSetup() {
   const st = setupState();
   st.open = true; st.error = null;
   $('setupwrap').classList.add('on'); renderSetup();
-  try { st.settings = await Daemon.settings(); } catch (e) { st.error = String(e?.message ?? e); }
+  try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
   renderSetup();
   await Promise.all([checkProviders(), readList()]);
 }
+// What this machine would start a daemon with. A window attached to a daemon it did not start shows
+// that daemon's providers instead, which are the ones its models come from.
+async function loadSettings() {
+  const set = await Daemon.settings();
+  if (set.restartable === false && S.attached) {
+    try { set.providers = Object.keys((await Daemon.request('provider_models', {})).providers ?? {}); } catch (_) {}
+  }
+  setupState().settings = set;
+  return set;
+}
+// Only models a connected provider can run: a list written before a removal may still name others.
+const connected = (list, set) => set ? list.filter((m) => set.providers.map(specName).includes(providerOf(m.id))) : list;
 function closeSetup() {
   const st = S.setup; if (!st || st.busy) return;
   st.open = false; st.adding = null; $('setupwrap').classList.remove('on'); render(); focusInput('main');
@@ -1464,9 +1478,7 @@ async function checkProviders() {
 const answerOf = (listed) => !listed ? { error: 'not running; restart to apply' } : Array.isArray(listed.models) ? { models: listed.models.length } : { error: listed.error ?? 'no listing', detail: listed.detail ?? null };
 async function readList() {
   const st = setupState();
-  // Only what a connected provider can run: a list written before a removal may still name others.
-  const names = st.settings ? st.settings.providers.map(specName) : null;
-  try { st.list = (await Daemon.models()).filter((m) => !names || names.includes(providerOf(m.id))); st.listError = null; } catch (e) { st.list = []; st.listError = String(e?.message ?? e); }
+  try { st.list = connected(await Daemon.models(), st.settings); st.listError = null; } catch (e) { st.list = []; st.listError = String(e?.message ?? e); }
   renderSetup();
 }
 // Ask the providers again and write the list new agents pick from. A provider that fails keeps what
@@ -1501,14 +1513,20 @@ async function restartDaemon() {
 async function connectProvider(id, values) {
   const st = setupState(); const c = catalogOf(id); if (!c) return;
   unrestartable();
+  // Read again, so a change another window saved meanwhile is kept.
+  await loadSettings();
   // A key already set, saved here or exported by the shell, answers for an empty field.
   for (const f of c.fields) if (f.required && !values[f.key] && !(f.secret && st.settings?.keys?.includes(f.key))) throw new Error(`${f.label} is required`);
   const specs = (st.settings?.providers ?? []).filter((s) => catalogOf(specName(s)) !== c);
-  // A saved Bedrock key stays in use when its field is left empty.
-  const keyed = c.parts && !values.AWS_BEARER_TOKEN_BEDROCK && st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? { ...values, AWS_BEARER_TOKEN_BEDROCK: 'saved' } : values;
+  // Bedrock signs in one way: with the AWS login, which drops a saved key, or with a key, typed or saved.
+  const saved = st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK');
+  const aws = values.AUTH ? values.AUTH === 'aws' : !values.AWS_BEARER_TOKEN_BEDROCK && !saved;
+  if (c.parts && !aws && !values.AWS_BEARER_TOKEN_BEDROCK && !saved) throw new Error('Bedrock API key is required');
+  const keyed = c.parts ? { ...values, AWS_BEARER_TOKEN_BEDROCK: aws ? '' : values.AWS_BEARER_TOKEN_BEDROCK || 'saved' } : values;
   const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
   // A key left empty keeps the one saved; another field left empty is cleared, the shell's value too.
-  for (const f of c.fields) if (!f.secret || values[f.key]) changes[f.key] = values[f.key] || '';
+  for (const f of c.fields) if (!f.local && (!f.secret || values[f.key])) changes[f.key] = values[f.key] || '';
+  if (c.parts && aws && saved) changes.AWS_BEARER_TOKEN_BEDROCK = null;
   await applySettings(changes);
   st.adding = null;
   await refreshModels();
@@ -1516,6 +1534,7 @@ async function connectProvider(id, values) {
 async function removeProvider(name) {
   const st = setupState(); const c = catalogOf(name);
   unrestartable();
+  await loadSettings();
   const gone = c ? partsOf(c) : [name];
   const specs = (st.settings?.providers ?? []).filter((s) => !gone.includes(specName(s)));
   // Emptied rather than removed, so a list the shell exports does not come back.
@@ -1560,7 +1579,8 @@ function setupHTML() {
   else {
     const c = catalogOf(st.adding);
     const value = (f) => f.key === 'AWS_REGION' ? set?.region ?? '' : f.key === 'AWS_PROFILE' ? set?.profile ?? '' : '';
-    const fields = c.fields.map((f) => `<label><span>${esc(f.label)}</span><input name="${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" value="${esc(value(f))}" placeholder="${esc(f.secret && set?.keys?.includes(f.key) ? 'saved; type to replace' : f.hint ?? '')}"></label>`).join('');
+    const choice = (f) => { const on = set?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? 'key' : 'aws'; return `<label><span>${esc(f.label)}</span><select name="${f.key}">${f.choices.map(([v, l]) => `<option value="${v}"${v === on ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select></label>`; };
+    const fields = c.fields.map((f) => f.choices ? choice(f) : `<label><span>${esc(f.label)}</span><input name="${f.key}" type="${f.secret ? 'password' : 'text'}" autocomplete="off" spellcheck="false" value="${esc(value(f))}" placeholder="${esc(f.secret && set?.keys?.includes(f.key) ? 'saved; type to replace' : f.hint ?? '')}"></label>`).join('');
     const working = anyActive() ? `<p class="warn">Agents are working. Connecting restarts the daemon, which stops them.</p>` : '';
     add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;
   }
@@ -1581,10 +1601,10 @@ function setupHTML() {
 function renderSetup() {
   if (!S.setup?.open) return;
   const box = $('setup'), kept = new Map();
-  for (const el of box.querySelectorAll('input')) kept.set(el.name || el.id, el.value);
+  for (const el of box.querySelectorAll('input, select')) kept.set(el.name || el.id, el.value);
   const focused = box.contains?.(document.activeElement) ? document.activeElement.name || document.activeElement.id : null;
   box.innerHTML = setupHTML();
-  for (const el of box.querySelectorAll('input')) { const v = kept.get(el.name || el.id); if (v !== undefined) el.value = v; if (focused && (el.name || el.id) === focused) el.focus(); }
+  for (const el of box.querySelectorAll('input, select')) { const v = kept.get(el.name || el.id); if (v !== undefined) el.value = v; if (focused && (el.name || el.id) === focused) el.focus(); }
 }
 
 // ---------- opening threads ----------
@@ -1624,7 +1644,7 @@ function showNewProject(on) {
   $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
   // The lead's model, from every provider's list, read now so a refreshed list shows.
   $('projmodel').innerHTML = '';
-  Daemon.models().then((list) => { if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
+  Promise.all([Daemon.models(), S.setup?.settings ?? Daemon.settings?.().catch(() => null)]).then(([all, set]) => { const list = connected(all, set?.restartable === false && !S.setup?.settings ? null : set); if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
 }
 
 // ---------- input ----------
@@ -1686,7 +1706,7 @@ $('setup').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
   try {
-    if (form.id === 'setupform') await connectProvider(S.setup.adding, Object.fromEntries([...form.querySelectorAll('input')].map((el) => [el.name, el.value.trim()])));
+    if (form.id === 'setupform') await connectProvider(S.setup.adding, Object.fromEntries([...form.querySelectorAll('input, select')].map((el) => [el.name, el.value.trim()])));
     else if (form.id === 'setupproj') { const dir = $('setupdir').value.trim(), model = $('setupmodel').value; if (dir) { await createProject(dir, model); closeSetup(); } }
   } catch (err) { failed(err); }
 });
