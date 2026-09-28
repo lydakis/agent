@@ -25,6 +25,9 @@ const S = {
   // Each provider's model family, from the bot records that name both; a turn may run on any
   // provider of its bot's family.
   families: new Map(),
+  // Unsent text for each bot not on screen. A composer's text is its bot's own: when a pane shows
+  // another bot, the text stays behind with the one it was typed for (see `followDrafts`).
+  drafts: new Map(),
 };
 function loadSend() { try { const v = localStorage.getItem('agent:send'); return v === 'steer' || v === 'side' ? v : 'queue'; } catch (_) { return 'queue'; } }
 const sessionKey = () => `agent:${S.config?.socket}|${S.config?.workspace}`;
@@ -220,8 +223,9 @@ function forgetBot(name) {
   if (t) { t.items = t.items.filter(it => it.kind !== 'peer' || it.who !== name); t.peers = t.peers.filter(who => who !== name); t.gen += 1; }
   S.bots.delete(name); S.transcripts.delete(name); S.override.delete(name);
   // A draft belongs to its bot, so it goes with it.
-  if (S.ui.side === name) { S.ui.side = null; $('sideinput').value = ''; }
-  if (S.selected === name) $('input').value = '';
+  if (S.ui.side === name) S.ui.side = null;
+  S.drafts.delete(name);
+  for (const ids of Object.values(PANE)) { const input = $(ids.input); if (input.dataset.for === name) { input.value = ''; input.dataset.for = ''; } }
 }
 const ACTIVE = new Set(['running', 'waiting', 'paced', 'queued', 'ready']);
 const isActive = (status) => ACTIVE.has(status);
@@ -1099,6 +1103,19 @@ function keybarHTML(b) {
   else { keys.push('<kbd>^k</kbd> find'); if (S.ui.side) keys.push('<kbd>Esc</kbd> close'); else if (busy) keys.push('<kbd>Esc</kbd> stop'); }
   return `${dot}${S.ui.toast ? `<span class="toast">${esc(S.ui.toast)}</span>` : ''}<span class="spacer"></span>${keys.join('<span> </span>')}<span><kbd>?</kbd> keys</span>`;
 }
+// Each composer holds the text of the bot its pane shows. When a pane shows another bot, its text is
+// put away under the bot it was typed for, then the new bot's comes back: every pane is put away
+// before any is filled, so a swap trades the two texts.
+function followDrafts() {
+  const moved = [];
+  for (const ids of Object.values(PANE)) {
+    const input = $(ids.input), who = ids.bot() ?? '';
+    if ((input.dataset.for ?? '') === who) continue;
+    if (input.dataset.for) { if (input.value) S.drafts.set(input.dataset.for, input.value); else S.drafts.delete(input.dataset.for); }
+    moved.push([input, who]);
+  }
+  for (const [input, who] of moved) { input.value = S.drafts.get(who) ?? ''; S.drafts.delete(who); input.dataset.for = who; grow(input); }
+}
 function render() {
   const app = $('app');
   // The sidebar's rows also stamp each bot's project, which names and crumbs use.
@@ -1107,6 +1124,7 @@ function render() {
   if (S.ui.side && (!S.bots.has(S.ui.side) || S.ui.side === S.selected)) S.ui.side = null;
   const side = S.ui.side ? bot(S.ui.side) : null;
   app.classList.toggle('rail', S.ui.rail); app.classList.toggle('side', !!side);
+  followDrafts();
   renderHead($('title'), b, 'main');
   if (b) renderTranscript($('log'), b.name); else { $('log').innerHTML = ''; $('log').dataset.key = ''; }
   if (S.ui.rail) renderRail();
@@ -1247,7 +1265,9 @@ async function modelMenu(pane, anchor) {
 }
 
 // ---------- actions ----------
-async function submit(text, pane = 'main') {
+// `to` is the bot the text was typed for, which is the one it goes to even if the pane has since
+// been pointed at another.
+async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
@@ -1261,7 +1281,7 @@ async function submit(text, pane = 'main') {
     await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(pane); return; }
-  const b = bot(PANE[pane].bot()); if (!b) throw new Error('no bot selected; /new NAME creates one');
+  const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
@@ -1367,16 +1387,14 @@ async function openOnly(name) {
 async function openBeside(name) {
   if (!S.bots.has(name) || name === S.selected) return;
   S.ui.side = S.ui.side === name ? null : name;
-  // A draft belongs to the bot it was typed for, not to the pane.
-  $('sideinput').value = '';
   await enqueue(loadVisible); render(); save();
   focusInput(S.ui.side ? 'side' : 'main');
 }
-// Ctrl-P puts the next peer beside; like any other bot opened there, it starts with an empty draft.
+// Ctrl-P puts the next peer beside, with its own draft.
 async function nextBeside() {
   const ps = peers().filter((who) => who !== S.selected); if (!ps.length) return;
   const next = ps[(ps.indexOf(S.ui.side) + 1) % ps.length]; if (next === S.ui.side) return;
-  S.ui.side = next; $('sideinput').value = '';
+  S.ui.side = next;
   await enqueue(loadVisible); render(); save(); focusInput('side');
 }
 // Drafts travel with their bots.
@@ -1384,10 +1402,9 @@ function swap() {
   if (!S.ui.side) return;
   [S.selected, S.ui.side] = [S.ui.side, S.selected];
   const p = bot(S.selected).project; if (p && S.ui.folded.delete(p)) S.shapeGen += 1;
-  [$('input').value, $('sideinput').value] = [$('sideinput').value, $('input').value];
   render(); save(); focusInput('main');
 }
-function closeSide() { if (!S.ui.side) return; S.ui.side = null; $('sideinput').value = ''; render(); save(); focusInput('main'); }
+function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(); focusInput('main'); }
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
 function showNewProject(on) {
   $('projform').hidden = !on; $('newproj').hidden = on;
@@ -1399,9 +1416,15 @@ function grow(el) { if (!el.style) return; el.style.height = 'auto'; el.style.he
 for (const [pane, ids] of Object.entries(PANE)) {
   $(ids.form).addEventListener('submit', async (e) => {
     e.preventDefault(); const input = $(ids.input); const v = input.value.trim(); if (!v) return; input.value = ''; grow(input);
-    // A failed send comes back only to the bot it was for, and never over new typing.
-    const who = PANE[pane].bot();
-    try { await submit(v, pane); } catch (err) { toast(String(err?.message ?? err)); if (!err?.kept && PANE[pane].bot() === who && !input.value) { input.value = v; grow(input); } }
+    // The text goes to the bot it was typed for; a failed send comes back to that bot's draft,
+    // in whichever pane shows it now, never over new typing.
+    const who = input.dataset.for || PANE[pane].bot();
+    try { await submit(v, pane, who); } catch (err) {
+      toast(String(err?.message ?? err));
+      if (err?.kept) return;
+      const shown = Object.values(PANE).map((p) => $(p.input)).find((el) => el.dataset.for === who);
+      if (shown) { if (!shown.value) { shown.value = v; grow(shown); } } else if (who && !S.drafts.get(who)) S.drafts.set(who, v);
+    }
   });
   $(ids.input).addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $(ids.form).requestSubmit(); } });
   $(ids.input).addEventListener('input', () => { const input = $(ids.input); grow(input); if (pane === 'main' && input.value === '?') { input.value = ''; showHelp(); } });
