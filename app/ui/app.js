@@ -1349,6 +1349,7 @@ async function openSwarmSheet(project) {
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
     <div class="row"><div><label for="sw-n">Agents</label><input id="sw-n" type="number" min="1" max="${MAX_AGENTS}" step="1" value="4"></div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
+    <div id="sw-each" class="hint"></div>
     <label>Made of</label><div id="sw-mix" class="mix"></div>
     <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: each agent takes a piece'], [3, 'A council of 3 approves streams of work']], 0)}
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
@@ -1367,8 +1368,17 @@ function mixProblem(mix) {
   if (total !== 100) return `The shares add up to ${total}%, not 100%`;
   return null;
 }
+// What each agent gets of the budget, and past 16 agents what a flat board costs: every post reaches
+// every working agent, so its traffic grows with the square of the swarm.
+function renderEach(n) {
+  const el = $('sw-each'); if (!el) return;
+  const each = n ? Math.floor(Number($('sw-budget')?.value) / n) : 0;
+  el.textContent = n ? `about ${tokens(each)} tokens each${n > 16 ? ' · past 16 agents, board traffic grows with the square of the swarm' : ''}` : '';
+  el.classList.toggle('warn', n > 16);
+}
 function renderMix() {
   const n = agentCount(), problem = sheetProblem(n);
+  renderEach(n);
   const counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n));
   const identities = [['', 'Plain agent'], ...sheet.profiles.map((p) => [p.name, p.name])];
   const row = (r, i) => `<div class="mixrow"><select data-mix="${i}" data-f="identity" aria-label="Identity">${identities.map(([v, l]) => `<option value="${esc(v)}"${v === r.identity ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${modelSelectHTML(`sw-model-${i}`, sheet.models, r.model).replace('<select ', `<select data-mix="${i}" data-f="model" `)}<span class="share"><input type="number" min="1" max="100" step="1" value="${esc(r.share)}" data-mix="${i}" data-f="share" aria-label="Share in percent">%</span><span class="count${counts && !counts[i] ? ' none' : ''}">${counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''}</span>${sheet.mix.length > 1 ? `<button type="button" class="x" data-act="mix-remove" data-v="${i}" title="Remove this row">×</button>` : '<span class="x"></span>'}</div>`;
@@ -1396,7 +1406,7 @@ function mixChange(el) {
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
 function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n') renderMix(); });
+$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') renderMix(); });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
 $('sheet').addEventListener('input', (e) => { if (e.target.id === 'sw-n') { renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {

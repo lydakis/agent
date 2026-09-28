@@ -1173,13 +1173,15 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
   });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
   const el = (id) => p.context.document.getElementById(id);
-  el('sw-n').value = '4'; el('sw-n').id = 'sw-n';
+  el('sw-n').value = '4'; el('sw-n').id = 'sw-n'; el('sw-budget').value = '3000000';
   await p.openSwarmSheet('app');
   assert.match(el('sw-mix').innerHTML, /<option value="" selected>Plain agent<\/option><option value="reviewer">reviewer<\/option>/);
   assert.match(el('sw-mix').innerHTML, /4 agents/);
+  assert.equal(el('sw-each').textContent, 'about 750k tokens each');
   // Any whole number of agents can be typed; anything else says what it takes.
   el('sw-n').value = '23'; el('sheet').listeners.input({ target: el('sw-n') });
   assert.match(el('sw-mix').innerHTML, /23 agents/);
+  assert.match(el('sw-each').textContent, /past 16 agents/);
   el('sw-n').value = '2.5'; el('sheet').listeners.input({ target: el('sw-n') });
   assert.match(el('sw-mix').innerHTML, /Agents is a whole number from 1 to 64/);
   el('sw-n').value = '4'; el('sheet').listeners.input({ target: el('sw-n') });
