@@ -386,18 +386,22 @@ daemon learns nothing about projects; everything here is client work.
   project's ⋯ menu has **New swarm**: a goal, 2 to 16 agents, a model, where
   they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
   `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
-  project folder), and a token budget split evenly among them. Setup gets
-  ten minutes and the login shell's ordinary variables (PATH, HOME, USER,
-  LOGNAME, SHELL, LANG, LC_*, TMPDIR, TERM) and no others, so no provider
-  or cloud keys; its output is kept only to its last 64 KiB. A swarm whose
-  folder's policy cannot compose is removed with its worktree and branch.
+  project folder), and a token budget split evenly among them. A goal is
+  at most 16 KiB. A name whose worktree or branch another store's swarm
+  holds is skipped for the next. Setup gets ten minutes and the login
+  shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
+  TMPDIR, TERM) and no others, so no provider or cloud keys; past its time
+  its whole process group is killed, and its output is kept only to its
+  last 64 KiB. A swarm whose files or policy cannot be made is removed with
+  its worktree and branch.
   The swarm is a folder, `~/.agent/swarms/DAEMON/PROJECT.NAME/`, where
   DAEMON is a hash of the window's daemon socket, so a window on another
   store sees only that store's swarms: `swarm.toml` (its project, goal,
   folder, model, budget, members with each one's bot id, and whether you
-  stopped it; changed only under the board's lock), `board.jsonl` (one post
-  a line, appended under a lock, your goal first), and `post`, a script
-  that runs the app's own executable with `--swarm-post`. Its agents
+  stopped it; changed only under the board's lock, synced, and replaced
+  whole), `board.jsonl` (one post a line, appended under a lock, your goal
+  first), and `post`, a script that runs the app's own executable with
+  `--swarm-post` (replaced whole when the app moves). Its agents
   are ordinary bots named `PROJECT.NAME-N`, each created with its share of
   the budget and started in the `swarm` profile (the folder's, the user's,
   or the one the app ships, [swarm.md](../app/agents/swarm.md)); each joins
@@ -407,7 +411,9 @@ daemon learns nothing about projects; everything here is client work.
   agent's post reaches the agents working now, strictly into their running
   turns (a turn that ended meanwhile is skipped; the post waits on the
   board), and wakes an idle agent only when it names it with `@NAME`; your
-  post wakes every agent, or only the ones it names. So agents talking
+  post wakes every agent, or only the ones it names. A post holds the
+  board's lock until its steers are sent, so Stop either refuses it or
+  ends what it started. So agents talking
   never wake a swarm that went quiet. A post is at most 16 KiB and comes
   only from a member, named by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and
   `AGENT_TURN`; the daemon records it as each steer's author. Every steer
@@ -421,9 +427,11 @@ daemon learns nothing about projects; everything here is client work.
   board's last 256 KiB instead); and **Agents**, their cards, which open
   beside. The head counts working agents and tokens used against the
   budget. Its composer posts to the board. Its ⋯ menu stops every agent
-  (every unfinished turn, queued ones first, and the swarm refuses its
-  agents' posts until your next one) or adds one, told to read the board
-  first.
+  (every unfinished turn, queued ones first, of each member that is still
+  the bot that joined; a name now held by another bot leaves instead; and
+  the swarm refuses its agents' posts until your next one) or adds one,
+  told to read the board first, whose share of tokens the swarm's budget
+  grows by.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
   deleted task's worktree, a swarm's roles, council and streams, and
   approvals are later steps of item 47.

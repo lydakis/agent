@@ -324,7 +324,7 @@ const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slic
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
 function learnSwarm(record, batch = false) {
   const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null };
-  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, model: record.model, budget: record.budget_tokens, members: record.members ?? [], stopped: !!record.stopped });
+  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, model: record.model, budget: record.budget_tokens, members: record.members ?? [], ids: record.ids ?? {}, stopped: !!record.stopped });
   S.swarms.set(sw.name, sw); if (!batch) indexMembers();
   return sw;
 }
@@ -403,21 +403,23 @@ function brief(sw, m, late = false) {
 // A name from the goal: its longest word among the first few that say something, then -2, -3 ... until free.
 // `lock` too: Git refuses a branch named `agent/PROJECT.lock`.
 const PLAIN = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'make', 'keep', 'cut', 'all', 'our', 'its', 'half', 'every', 'each', 'add', 'fix', 'get', 'lock']);
-function swarmName(project, goal) {
+// `skip` holds names found taken elsewhere, as another store's worktree or branch.
+function swarmName(project, goal, skip = new Set()) {
   const words = (goal.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((w) => w.length >= 3 && !PLAIN.has(w)).slice(0, 6);
   const base = (words.reduce((a, w) => (w.length > a.length ? w : a), '') || 'swarm').slice(0, 24);
-  const taken = (n) => S.swarms.has(`${project}.${n}`) || [...S.bots.keys()].some((b) => b === `${project}.${n}` || b.startsWith(`${project}.${n}-`));
+  const taken = (n) => skip.has(n) || S.swarms.has(`${project}.${n}`) || [...S.bots.keys()].some((b) => b === `${project}.${n}` || b.startsWith(`${project}.${n}-`));
   let name = base; for (let k = 2; taken(name); k++) name = `${base}-${k}`;
   return name;
 }
 // Each agent is created, then joins, then gets its brief, so a post never reaches an agent the daemon
 // does not have and every agent is a member before any of them speaks.
+// A late agent's budget adds to the swarm's, so the budget shown is what its agents may spend.
 async function startAgents(sw, names, policy, each, late = false) {
   const session = S.session;
   const made = await Promise.allSettled(names.map((m) => Daemon.request('create', { bot: m, workspace: sw.workspace, model: sw.model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools, budget_tokens: each })));
   const records = made.filter((r) => r.status === 'fulfilled').map((r) => r.value);
   await enqueue(() => { if (S.session === session) for (const r of records) seat(r, session); });
-  if (records.length) learnSwarm(await Daemon.swarmJoin(sw.name, records.map((r) => [r.name, r.id])));
+  if (records.length) learnSwarm(await Daemon.swarmJoin(sw.name, records.map((r) => [r.name, r.id]), late ? each * records.length : 0));
   const sent = await Promise.allSettled(records.map((r) => Daemon.request('submit', { bot: r.name, bot_id: r.id, request_id: `app-${crypto.randomUUID()}`, prompt: brief(sw, r.name, late), delivery: 'reject' })));
   const failed = [...made, ...sent].find((r) => r.status === 'rejected');
   if (failed) toast(`${records.length} of ${names.length} agents started: ${failed.reason?.message ?? failed.reason}`, 6000);
@@ -425,7 +427,13 @@ async function startAgents(sw, names, policy, each, late = false) {
 async function createSwarm(project, { goal, n, model, shared, budget }) {
   const lead = bot(project + LEAD); if (!lead?.workspace) throw new Error(`no coordinator for ${project}`);
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
-  const sw = learnSwarm(await Daemon.swarmCreate({ project, name: swarmName(project, goal), folder: lead.workspace, goal, shared, model, budgetTokens: budget }));
+  // A name another store holds as a worktree or branch is taken here too: try the next.
+  const skip = new Set(); let sw;
+  for (;;) {
+    const name = swarmName(project, goal, skip);
+    try { sw = learnSwarm(await Daemon.swarmCreate({ project, name, folder: lead.workspace, goal, shared, model, budgetTokens: budget })); break; }
+    catch (e) { if (!/^swarm_exists/.test(e?.message ?? e) || skip.size >= 8) throw e; skip.add(name); }
+  }
   // Composed for the folder the agents work in, so its AGENTS.md and a `swarm` profile there apply.
   // A folder whose policy cannot compose gets no agents, so the swarm goes with its worktree.
   let policy;
@@ -442,12 +450,15 @@ async function addAgent(sw) {
 // Stopped, the swarm refuses its agents' posts, so nothing wakes them; your next post resumes it.
 async function stopSwarm(sw) {
   learnSwarm(await Daemon.swarmStop(sw.name, true));
-  const failed = (await Promise.allSettled(sw.members.map((m) => endTurns(m)))).find((r) => r.status === 'rejected');
+  const failed = (await Promise.allSettled(sw.members.map((m) => endTurns(sw, m)))).find((r) => r.status === 'rejected');
   toast(failed ? `stop: ${failed.reason?.message ?? failed.reason}` : 'stopped every agent; your next post resumes the swarm', failed ? 6000 : 4000);
 }
 // Every turn an agent has not finished, the queued ones included, newest first, so none of them is
-// started as an older one ends. A turn that ended meanwhile is already stopped.
-async function endTurns(name) {
+// started as an older one ends. A turn that ended meanwhile is already stopped. A name whose bot is
+// gone or is another bot now (deleted while no window watched) leaves the swarm, its turns untouched.
+async function endTurns(sw, name) {
+  const now = await Daemon.request('resume', { bot: name }).catch((e) => { if (/bot_not_found/.test(e?.message ?? e)) return null; throw e; });
+  if (now?.id !== sw.ids[name]) { learnSwarm(await Daemon.swarmLeave(sw.name, name)); return; }
   const open = []; let after = 0;
   do {
     const page = await Daemon.request('turns', { bot: name, after, limit: 256 });

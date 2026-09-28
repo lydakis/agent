@@ -1133,7 +1133,7 @@ test('a new swarm is made in the coordinator\'s folder, then its agents are crea
   const calls = [];
   const p = shell({
     swarmCreate: async (q) => { calls.push(['swarmCreate', q]); return swarmRecord([], { swarm: `${q.project}.${q.name}` }); },
-    swarmJoin: async (swarm, members) => { calls.push(['join', Array.from(members, (m) => Array.from(m))]); return swarmRecord(Array.from(members, ([m]) => m), { swarm }); },
+    swarmJoin: async (swarm, members, added) => { calls.push(['join', Array.from(members, (m) => Array.from(m)), added]); return swarmRecord(Array.from(members, ([m]) => m), { swarm }); },
     swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
     policy: async (dir, profile) => { calls.push(['policy', dir, profile]); return { instructions: 'swarm rules', compaction_instructions: 'summary', tools: ['shell'] }; },
     request: async (op, q) => { calls.push([op, q]); if (op === 'create') return { name: q.bot, id: calls.length, provider: 'alpha', model: 'one', workspace: q.workspace }; if (op === 'bots') return { bots: [], next_after: null }; return { nodes: [], next_from: null }; },
@@ -1142,6 +1142,8 @@ test('a new swarm is made in the coordinator\'s folder, then its agents are crea
   p.upsert({ name: 'app.latency-9', id: 2, provider: 'alpha', model: 'one' });
   await p.createSwarm('app', { goal: '  Cut the p99 latency of agent run in half.  ', n: 3, model: 'alpha/one', shared: true, budget: 3000000 });
   const made = calls.find(([op]) => op === 'swarmCreate')[1];
+  // Agents that start together share the budget; it grows only for one added later.
+  assert.equal(calls.find(([op]) => op === 'join')[2], 0);
   // Named from the goal, never a name a bot already starts with.
   assert.deepEqual({ ...made }, { project: 'app', name: 'latency-2', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, model: 'alpha/one', budgetTokens: 3000000 });
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/w/app.latency', 'swarm']);
@@ -1193,14 +1195,18 @@ test('a member\'s durable event reads the board only while the swarm is on scree
   await p.tick(); assert.equal(reads, 1, 'a burst reads once');
 });
 
-test('stopping a swarm marks it stopped and stops its working agents; a late agent joins with its brief', async () => {
+test('stopping a swarm stops its agents\' turns, not a bot that took a member\'s name; a late agent brings its budget', async () => {
   const calls = [];
+  const ids = { 'app.latency-1': 3, 'app.latency-2': 4, 'app.latency-3': 5 };
   const p = shell({
-    swarmStop: async (swarm, stopped) => { calls.push(['stop', stopped]); return swarmRecord(['app.latency-1', 'app.latency-2'], { stopped }); },
-    swarmJoin: async (swarm, members) => { calls.push(['join', Array.from(members)]); return swarmRecord(['app.latency-1', 'app.latency-2', ...Array.from(members, ([m]) => m)]); },
+    swarmStop: async (swarm, stopped) => { calls.push(['stop', stopped]); return swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3'], { stopped, ids }); },
+    swarmLeave: async (swarm, member) => { calls.push(['leave', member]); return swarmRecord(['app.latency-1', 'app.latency-2'], { stopped: true, ids }); },
+    swarmJoin: async (swarm, members, added) => { calls.push(['join', Array.from(members), added]); return swarmRecord(['app.latency-1', 'app.latency-2', ...Array.from(members, ([m]) => m)], { ids }); },
     policy: async () => ({ instructions: 'swarm rules' }),
     request: async (op, q) => {
       calls.push([op, q]);
+      // latency-3 was deleted while no window watched, and a new bot took its name.
+      if (op === 'resume') return { name: q.bot, id: q.bot === 'app.latency-3' ? 77 : ids[q.bot] };
       if (op === 'create') return { name: q.bot, id: 9, provider: 'alpha', model: 'one' };
       // latency-1 runs turn 7 with two turns queued behind it, one page at a time; 8 ended meanwhile.
       if (op === 'turns') return q.bot !== 'app.latency-1' ? { turns: [{ turn: 3, status: 'completed' }], next_after: null } : q.after === 0 ? { turns: [{ turn: 6, status: 'completed' }, { turn: 7, status: 'running' }], next_after: 7 } : { turns: [{ turn: 8, status: 'queued' }, { turn: 9, status: 'ready' }], next_after: null };
@@ -1210,15 +1216,33 @@ test('stopping a swarm marks it stopped and stops its working agents; a late age
   });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one', status: 'running', running_turn: 7 });
   p.upsert({ name: 'app.latency-2', id: 4, provider: 'alpha', model: 'one' });
-  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2']));
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3'], { ids }));
   await p.stopSwarm(sw);
   assert.equal(sw.stopped, true);
   // Newest first, so no queued turn starts as the one before it ends.
   assert.deepEqual(calls.filter(([op]) => op === 'interrupt').map(([, q]) => [q.bot, q.turn]), [['app.latency-1', 9], ['app.latency-1', 8], ['app.latency-1', 7]]);
+  assert.equal(calls.some(([op, q]) => op === 'turns' && q.bot === 'app.latency-3'), false);
+  assert.deepEqual(calls.filter(([op]) => op === 'leave'), [['leave', 'app.latency-3']]);
+  assert.deepEqual(sw.members, ['app.latency-1', 'app.latency-2']);
   await p.addAgent(sw);
   const create = calls.find(([op]) => op === 'create')[1];
   assert.deepEqual([create.bot, create.budget_tokens], ['app.latency-3', 1500000]);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.find(([op]) => op === 'join').slice(1))), [[['app.latency-3', 9]], 1500000]);
   assert.match(calls.find(([op]) => op === 'submit')[1].prompt, /You are latency-3, one of 3 agents[\s\S]*read the board first/);
+});
+
+test('a name another store holds as a worktree is skipped for the next', async () => {
+  const tried = [];
+  const p = shell({
+    swarmCreate: async (q) => { tried.push(q.name); if (q.name !== 'latency-3') throw new Error(`swarm_exists: app.${q.name} has a worktree or branch already`); return swarmRecord([], { swarm: `app.${q.name}` }); },
+    swarmJoin: async (swarm, members) => swarmRecord(Array.from(members, ([m]) => m), { swarm }),
+    swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
+    policy: async () => ({ instructions: 'swarm rules' }),
+    request: async (op, q) => (op === 'create' ? { name: q.bot, id: 7, provider: 'alpha', model: 'one' } : { bots: [], next_after: null, nodes: [], next_from: null }),
+  });
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
+  await p.createSwarm('app', { goal: 'Cut latency.', n: 1, model: 'alpha/one', shared: true, budget: 1000 });
+  assert.deepEqual(tried, ['latency', 'latency-2', 'latency-3']);
 });
 
 test('a swarm whose policy cannot compose is discarded, and a deleted agent leaves its swarm', async () => {

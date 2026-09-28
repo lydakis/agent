@@ -26,7 +26,7 @@ window.Daemon = (() => {
       request: (op, params = {}) => invoke('request', { op, params }),
       swarms: () => invoke('swarms'),
       swarmCreate: ({ project, name, folder, goal, shared, model, budgetTokens }) => invoke('swarm_create', { project, name, folder, goal, shared, model, budgetTokens }),
-      swarmJoin: (swarm, members) => invoke('swarm_join', { swarm, members }),
+      swarmJoin: (swarm, members, addedBudget = 0) => invoke('swarm_join', { swarm, members, addedBudget }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
       swarmDiscard: (swarm) => invoke('swarm_discard', { swarm }),
       swarmStop: (swarm, stopped) => invoke('swarm_stop', { swarm, stopped }),
@@ -251,7 +251,7 @@ window.Daemon = (() => {
   // The app's swarm folder, kept in memory: its record and its board. The offset is a line count.
   const memberOf = (name) => [...S.swarms.values()].find((sw) => sw.members.includes(name)) ?? null;
   const short = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
-  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, model: sw.model, budget_tokens: sw.budget, members: [...sw.members], stopped: sw.stopped });
+  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, model: sw.model, budget_tokens: sw.budget, members: [...sw.members], ids: { ...sw.ids }, stopped: sw.stopped });
   // Who hears a post, as the app's post tool decides: working agents, and idle ones only when named
   // (or, for your post, when it names nobody).
   function deliver(sw, from, text) {
@@ -319,11 +319,11 @@ window.Daemon = (() => {
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
     swarmCreate: async ({ project, name, folder, goal, shared, model, budgetTokens }) => {
       const full = `${project}.${name}`; if (S.swarms.has(full)) throw new Error(`swarm_exists: ${full}`);
-      const sw = { name: full, project, goal, model, budget: budgetTokens, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
+      const sw = { name: full, project, goal, model, budget: budgetTokens, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
       S.swarms.set(full, sw); await wait(300); return swarmRecord(sw);
     },
-    swarmJoin: async (swarm, members) => { const sw = S.swarms.get(swarm); for (const [m] of members) if (!sw.members.includes(m)) sw.members.push(m); return swarmRecord(sw); },
-    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); return swarmRecord(sw); },
+    swarmJoin: async (swarm, members, addedBudget = 0) => { const sw = S.swarms.get(swarm); for (const [m, id] of members) { if (!sw.members.includes(m)) sw.members.push(m); sw.ids[m] = id; } sw.budget += addedBudget; return swarmRecord(sw); },
+    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; return swarmRecord(sw); },
     swarmDiscard: async (swarm) => { if (S.swarms.get(swarm)?.members.length) throw new Error(`swarm_has_agents: ${swarm}`); S.swarms.delete(swarm); },
     swarmStop: async (swarm, stopped) => { const sw = S.swarms.get(swarm); sw.stopped = stopped; return swarmRecord(sw); },
     swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false, reset: offset == null }; },

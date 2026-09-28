@@ -530,7 +530,7 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
 /// readable swarms.
 #[tauri::command]
 fn swarms(state: State<'_, Shared>) -> Result<Value, String> {
-    Ok(swarm::list(&swarms_of(&state)?))
+    swarm::list(&swarms_of(&state)?)
 }
 
 /// The swarms of the daemon this window attaches to.
@@ -556,9 +556,7 @@ async fn swarm_create(
     let root = swarms_of(&state)?;
     let folder = workspace_path(std::path::Path::new(&folder))?;
     let full = format!("{project}.{name}");
-    if goal.trim().is_empty() {
-        return Err("goal_required: a swarm needs a goal".into());
-    }
+    swarm::valid_goal(&goal)?;
     let dir = swarm::claim(&root, &full)?;
     let workspace = match swarm::place(std::path::Path::new(&folder), &full, shared).await {
         Ok(workspace) => workspace,
@@ -578,19 +576,28 @@ async fn swarm_create(
         ids: Default::default(),
         stopped: false,
     };
-    let app = std::env::current_exe().map_err(|e| e.to_string())?;
-    swarm::fill(&dir, &s, &app)?;
+    let filled = std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|app| swarm::fill(&dir, &s, &app));
+    if let Err(error) = filled {
+        if shared {
+            let _ = swarm::unplace(&s.name).await;
+        }
+        return Err(error);
+    }
     Ok(s.json(&dir))
 }
 
-/// Agents the daemon made, by name and bot id.
+/// Agents the daemon made, by name and bot id, and the tokens their
+/// budgets add to the swarm's.
 #[tauri::command]
 fn swarm_join(
     state: State<'_, Shared>,
     swarm: String,
     members: Vec<(String, i64)>,
+    added_budget: u64,
 ) -> Result<Value, String> {
-    swarm::join(&swarms_of(&state)?, &swarm, &members)
+    swarm::join(&swarms_of(&state)?, &swarm, &members, added_budget)
 }
 
 #[tauri::command]

@@ -99,16 +99,16 @@ impl Swarm {
             ids: table
                 .get("ids")
                 .and_then(toml::Value::as_table)
-                .map(|ids| {
+                .and_then(|ids| {
                     ids.iter()
-                        .filter_map(|(m, id)| Some((m.clone(), id.as_integer()?)))
+                        .map(|(m, id)| Some((m.clone(), id.as_integer()?)))
                         .collect()
                 })
-                .unwrap_or_default(),
+                .ok_or_else(|| format!("{}: ids is missing or not bot ids", path.display()))?,
             stopped: table
                 .get("stopped")
                 .and_then(toml::Value::as_bool)
-                .unwrap_or(false),
+                .ok_or_else(|| format!("{}: stopped is missing", path.display()))?,
         })
     }
 
@@ -139,8 +139,7 @@ impl Swarm {
         static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temporary = dir.join(format!(".swarm.toml.{}.{n}", std::process::id()));
-        std::fs::write(&temporary, text).map_err(|e| e.to_string())?;
-        std::fs::rename(&temporary, dir.join("swarm.toml")).map_err(|e| e.to_string())
+        replace(&temporary, &dir.join("swarm.toml"), text.as_bytes(), 0o644)
     }
 
     pub fn json(&self, dir: &Path) -> Value {
@@ -170,6 +169,29 @@ pub fn home() -> Result<PathBuf, String> {
 
 /// The swarms of the daemon on `socket`. Their agents are that daemon's
 /// bots, so the same names in another store are other bots.
+/// Write `bytes` to `temporary`, then rename it over `path`, both synced:
+/// a reader sees the old file or the new one, and an acknowledged change
+/// survives a power loss.
+fn replace(temporary: &Path, path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(temporary, path)?;
+        std::fs::File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    written.map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub fn root(socket: &Path) -> Result<PathBuf, String> {
     Ok(home()?.join(daemon_key(socket)))
 }
@@ -182,6 +204,20 @@ fn daemon_key(socket: &Path) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// A goal is a brief's heart, not a document: it leaves each agent's first
+/// message far inside what the daemon takes.
+pub fn valid_goal(goal: &str) -> Result<(), String> {
+    if goal.trim().is_empty() {
+        return Err("goal_required: a swarm needs a goal".into());
+    }
+    if goal.len() > MAX_POST {
+        return Err(format!(
+            "goal_too_long: a goal is at most {MAX_POST} bytes; put the details in a file in the project and name it"
+        ));
+    }
+    Ok(())
 }
 
 /// A swarm's name is `PROJECT.NAME`, used for its folder, its worktree and
@@ -210,10 +246,15 @@ fn folder(root: &Path, swarm: &str) -> Result<PathBuf, String> {
 }
 
 /// Every swarm, and the folders that are not readable swarms with why.
-pub fn list(root: &Path) -> Value {
+pub fn list(root: &Path) -> Result<Value, String> {
     let mut swarms = Vec::new();
     let mut broken = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(root) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("{}: {error}", root.display())),
+    };
+    if let Some(entries) = entries {
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.join("swarm.toml").exists() {
@@ -225,7 +266,7 @@ pub fn list(root: &Path) -> Value {
             }
         }
     }
-    json!({"swarms": swarms, "broken": broken})
+    Ok(json!({"swarms": swarms, "broken": broken}))
 }
 
 /// Take a new swarm's name by making its folder, before anything else is
@@ -251,11 +292,7 @@ pub fn fill(dir: &Path, swarm: &Swarm, app: &Path) -> Result<(), String> {
             dir,
             &json!({"at": now_ms(), "from": "user", "text": swarm.goal}),
         )?;
-        let post = dir.join("post");
-        std::fs::write(&post, script(app, dir)).map_err(|e| e.to_string())?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&post, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| e.to_string())
+        write_script(dir, app)
     })();
     if made.is_err() {
         let _ = std::fs::remove_dir_all(dir);
@@ -296,6 +333,22 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
     let prefix = String::from_utf8_lossy(&prefix.stdout).trim().to_owned();
     let tree = worktrees()?.join(swarm);
     let branch = format!("agent/{swarm}");
+    // Worktrees and branches are shared by every store: a name another
+    // store's swarm holds is taken here too, and the page picks another.
+    let branched = git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}"),
+    ])
+    .output()
+    .await
+    .is_ok_and(|out| out.status.success());
+    if tree.exists() || branched {
+        return Err(format!(
+            "swarm_exists: {swarm} has a worktree or branch already"
+        ));
+    }
     let added = git(&["worktree", "add", "-b", &branch])
         .arg(&tree)
         .arg("HEAD")
@@ -360,7 +413,8 @@ fn setup_env(from: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString,
 }
 
 /// Runs setup for at most `limit`, keeping the end of its output: a script
-/// that hangs or never stops writing is killed, not waited on.
+/// that hangs or never stops writing is killed, not waited on, with every
+/// process it started (its own process group).
 async fn run_setup(
     mut command: tokio::process::Command,
     limit: std::time::Duration,
@@ -380,9 +434,11 @@ async fn run_setup(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| e.to_string())?;
+    let group = child.id();
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
     let ran = async {
         let (out, err, status) = tokio::join!(
@@ -396,7 +452,14 @@ async fn run_setup(
     };
     match tokio::time::timeout(limit, ran).await {
         Err(_) => {
+            if let Some(group) = group {
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{group}")])
+                    .status()
+                    .await;
+            }
             let _ = child.start_kill();
+            let _ = child.wait().await;
             Err(format!(
                 ".agents/setup ran past {} s and was stopped",
                 limit.as_secs()
@@ -446,11 +509,24 @@ pub fn refresh_scripts(home: &Path, app: &Path) {
         let Ok(entry) = entry else { continue };
         let dir = entry.path();
         let post = dir.join("post");
-        let want = script(app, &dir);
-        if post.exists() && std::fs::read_to_string(&post).is_ok_and(|have| have != want) {
-            let _ = std::fs::write(&post, want);
+        if post.exists()
+            && std::fs::read_to_string(&post).is_ok_and(|have| have != script(app, &dir))
+        {
+            let _ = write_script(&dir, app);
         }
     }
+}
+
+/// Replaced whole, so an agent running it meanwhile runs one version or
+/// the other, never half a file.
+fn write_script(dir: &Path, app: &Path) -> Result<(), String> {
+    let temporary = dir.join(format!(".post.{}", std::process::id()));
+    replace(
+        &temporary,
+        &dir.join("post"),
+        script(app, dir).as_bytes(),
+        0o755,
+    )
 }
 
 /// Read, change and write `swarm.toml` under the board's lock, so two
@@ -459,21 +535,25 @@ fn update(
     dir: &Path,
     change: impl FnOnce(&mut Swarm) -> Result<(), String>,
 ) -> Result<Swarm, String> {
-    let board = std::fs::OpenOptions::new()
-        .append(true)
-        .open(dir.join("board.jsonl"))
-        .map_err(|e| e.to_string())?;
-    board.lock().map_err(|e| e.to_string())?;
+    let _board = lock_board(dir)?;
     let mut s = Swarm::read(dir)?;
     change(&mut s)?;
     s.write(dir)?;
     Ok(s)
 }
 
-/// Members join in order and never twice, each pinned to its bot's id.
-pub fn join(root: &Path, swarm: &str, members: &[(String, i64)]) -> Result<Value, String> {
+/// Members join in order and never twice, each pinned to its bot's id. An
+/// agent added later brings its own budget, which the swarm's grows by, so
+/// the budget shown is always what its agents may spend.
+pub fn join(
+    root: &Path,
+    swarm: &str,
+    members: &[(String, i64)],
+    added_budget: u64,
+) -> Result<Value, String> {
     let dir = folder(root, swarm)?;
     let s = update(&dir, |s| {
+        s.budget_tokens = s.budget_tokens.saturating_add(added_budget);
         for (member, id) in members {
             if !member.starts_with(&format!("{swarm}-")) {
                 return Err(format!("invalid_member: {member} is not named {swarm}-N"));
@@ -519,33 +599,39 @@ pub async fn discard(root: &Path, swarm: &str) -> Result<(), String> {
             "swarm_has_agents: {swarm} has agents; stop it instead"
         ));
     }
-    let tree = worktrees()?.join(swarm);
-    if Path::new(&s.workspace).starts_with(&tree) {
-        // The repository the worktree came from, found before it goes.
-        let common = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&tree)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-            .await
-            .map_err(|e| format!("git: {e}"))?;
-        let common = String::from_utf8_lossy(&common.stdout).trim().to_owned();
-        if !common.is_empty() {
-            let git = |args: &[&str]| {
-                let mut command = tokio::process::Command::new("git");
-                command.arg("--git-dir").arg(&common).args(args);
-                command
-            };
-            let _ = git(&["worktree", "remove", "--force"])
-                .arg(&tree)
-                .output()
-                .await;
-            let _ = git(&["branch", "-D", &format!("agent/{swarm}")])
-                .output()
-                .await;
-        }
+    if Path::new(&s.workspace).starts_with(worktrees()?.join(swarm)) {
+        unplace(swarm).await?;
     }
     std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+}
+
+/// Remove a swarm's worktree and its branch, as `place` made them.
+pub async fn unplace(swarm: &str) -> Result<(), String> {
+    let tree = worktrees()?.join(swarm);
+    // The repository the worktree came from, found before it goes.
+    let common = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&tree)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .await
+        .map_err(|e| format!("git: {e}"))?;
+    let common = String::from_utf8_lossy(&common.stdout).trim().to_owned();
+    if !common.is_empty() {
+        let git = |args: &[&str]| {
+            let mut command = tokio::process::Command::new("git");
+            command.arg("--git-dir").arg(&common).args(args);
+            command
+        };
+        let _ = git(&["worktree", "remove", "--force"])
+            .arg(&tree)
+            .output()
+            .await;
+        let _ = git(&["branch", "-D", &format!("agent/{swarm}")])
+            .output()
+            .await;
+    }
+    Ok(())
 }
 
 /// The board's complete lines from `offset`, and where the next read
@@ -598,14 +684,24 @@ pub fn board(root: &Path, swarm: &str, offset: Option<u64>) -> Result<Value, Str
 
 /// One line, one write, under an exclusive lock, so posts never interleave.
 fn append(dir: &Path, line: &Value) -> Result<(), String> {
-    let mut bytes = serde_json::to_vec(line).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    let mut file = std::fs::OpenOptions::new()
+    append_to(&mut lock_board(dir)?, line)
+}
+
+/// The board open for appending, locked until it is dropped. The lock also
+/// guards `swarm.toml`.
+fn lock_board(dir: &Path) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
         .append(true)
         .open(dir.join("board.jsonl"))
         .map_err(|e| e.to_string())?;
     file.lock().map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())
+    Ok(file)
+}
+
+fn append_to(board: &mut std::fs::File, line: &Value) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(line).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    board.write_all(&bytes).map_err(|e| e.to_string())
 }
 
 fn now_ms() -> u64 {
@@ -725,6 +821,10 @@ pub async fn post(
         ));
     }
     let dir = folder(root, swarm)?;
+    // Held until every steer is sent. Stop changes `swarm.toml` under this
+    // lock, so it either comes first and this post is refused, or waits and
+    // then ends whatever turns this post started.
+    let mut board = lock_board(&dir)?;
     let mut s = Swarm::read(&dir)?;
     if let Some(author) = &author {
         if s.ids.get(&author.bot) != Some(&author.id) {
@@ -734,10 +834,8 @@ pub async fn post(
             return Err("swarm_stopped: the user stopped this swarm; end your turn".into());
         }
     } else if s.stopped {
-        s = update(&dir, |s| {
-            s.stopped = false;
-            Ok(())
-        })?;
+        s.stopped = false;
+        s.write(&dir)?;
     }
     let from = author
         .as_ref()
@@ -748,12 +846,15 @@ pub async fn post(
         line["bot"] = json!(author.bot);
         line["turn"] = json!(author.turn);
     }
-    append(&dir, &line)?;
+    append_to(&mut board, &line)?;
     let turns = running_turns(client, &s).await?;
     let running = |m: &str| turns.iter().find(|(n, _)| n == m).and_then(|(_, t)| *t);
     let readers = readers(&s, author.as_ref().map(|a| a.bot.as_str()), text, &running);
     let prompt = format!("[board] {from}: {text}");
-    let stamp = format!("swarm-{}-{}", now_ms(), std::process::id());
+    // Distinct per post, even for two in one millisecond from one process.
+    static POSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp = format!("swarm-{}-{}-{n}", now_ms(), std::process::id());
     let mut sends = tokio::task::JoinSet::new();
     for (i, (member, reach)) in readers.into_iter().enumerate() {
         let mut params = json!({
@@ -961,11 +1062,14 @@ mod tests {
                 ("agent.latency-1".into(), 11),
                 ("agent.latency-2".into(), 12),
             ],
+            0,
         )
         .unwrap();
-        join(&root, &s.name, &[("agent.latency-2".into(), 12)]).unwrap();
+        // An agent added later grows the budget by its own.
+        let grown = join(&root, &s.name, &[("agent.latency-2".into(), 12)], 1_000).unwrap();
+        assert_eq!(grown["budget_tokens"], 3_001_000);
         assert!(
-            join(&root, &s.name, &[("other.x-1".into(), 13)])
+            join(&root, &s.name, &[("other.x-1".into(), 13)], 0)
                 .unwrap_err()
                 .starts_with("invalid_member")
         );
@@ -986,10 +1090,32 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
-        let listed = list(&root);
+        let listed = list(&root).unwrap();
         assert_eq!(listed["swarms"][0]["swarm"], "agent.latency");
-        std::fs::write(root.join("agent.latency/swarm.toml"), "goal = 1").unwrap();
-        assert_eq!(list(&root)["broken"].as_array().unwrap().len(), 1);
+        // A stop state or member ids that cannot be read make the swarm unreadable, not active.
+        let toml = root.join("agent.latency/swarm.toml");
+        let good = std::fs::read_to_string(&toml).unwrap();
+        for bad in [
+            good.replace("stopped = true", ""),
+            good.replace("stopped = true", "stopped = \"no\""),
+            good.replace("\"agent.latency-2\" = 12", "\"agent.latency-2\" = \"x\""),
+            "goal = 1".into(),
+        ] {
+            std::fs::write(&toml, bad).unwrap();
+            assert_eq!(list(&root).unwrap()["broken"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(list(&home.join("absent")).unwrap()["swarms"], json!([]));
+        assert!(
+            list(&toml).is_err(),
+            "a root that cannot be read is an error, not no swarms"
+        );
+        for (goal, ok) in [
+            ("Halve p99.", true),
+            (" ", false),
+            (&"x".repeat(MAX_POST + 1), false),
+        ] {
+            assert_eq!(valid_goal(goal).is_ok(), ok);
+        }
         for bad in ["", ".x", "a..b", "a/b", "a.", "p.lock", &"a".repeat(101)] {
             assert!(valid_name(bad).is_err(), "{bad}");
         }
@@ -1074,7 +1200,7 @@ mod tests {
         let s = swarm(&[]);
         let dir = claim(&root, &s.name).unwrap();
         fill(&dir, &s, Path::new("/app")).unwrap();
-        join(&root, &s.name, &[("agent.latency-1".into(), 1)]).unwrap();
+        join(&root, &s.name, &[("agent.latency-1".into(), 1)], 0).unwrap();
         let kept = runtime.block_on(discard(&root, &s.name)).unwrap_err();
         assert!(kept.starts_with("swarm_has_agents"), "{kept}");
         leave(&root, &s.name, "agent.latency-1").unwrap();
@@ -1102,7 +1228,7 @@ mod tests {
             .map(|i| {
                 let (root, name) = (root.clone(), s.name.clone());
                 std::thread::spawn(move || {
-                    join(&root, &name, &[(format!("{name}-{i}"), i)]).unwrap();
+                    join(&root, &name, &[(format!("{name}-{i}"), i)], 0).unwrap();
                     set_stopped(&root, &name, i % 2 == 0).unwrap();
                 })
             })
@@ -1143,6 +1269,17 @@ mod tests {
             assert_eq!(run_setup(sh("true"), limit).await, Ok(()));
             let hung = run_setup(sh("sleep 30"), limit).await.unwrap_err();
             assert!(hung.contains("ran past"), "{hung}");
+            // What it started goes with it.
+            let pid =
+                std::env::temp_dir().join(format!("agent-setup-child-{}", std::process::id()));
+            let script = format!("sleep 30 & echo $! > '{}'; wait", pid.display());
+            assert!(run_setup(sh(&script), limit).await.is_err());
+            let child = std::fs::read_to_string(&pid).unwrap();
+            let _ = std::fs::remove_file(&pid);
+            // Gone, or a zombie nobody has reaped yet: either way not running.
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.trim()));
+            let running = stat.is_ok_and(|s| !s.contains(") Z "));
+            assert!(!running, "setup's background child outlived it");
             // A script that never stops writing is stopped too, holding only a tail.
             let noisy = run_setup(sh("yes"), limit).await.unwrap_err();
             assert!(noisy.contains("ran past"), "{noisy}");
