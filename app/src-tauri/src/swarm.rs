@@ -4,10 +4,12 @@
 //! DAEMON stands for the socket its agents' daemon listens on, so a window
 //! attached to another store never sees them:
 //!
-//! - `swarm.toml`: its project, goal, folder, model, token budget, members
-//!   with the id of the bot each one is, and whether you stopped it. Only the
-//!   app writes it, under the board's lock.
-//! - `board.jsonl`: one post a line, appended under a lock.
+//! - `swarm.toml`: its project, goal, folder, token budget, its mix (rows
+//!   of an identity, a model and a share of the agents), members with the id
+//!   of the bot each one is and the row it was made from, and whether you
+//!   stopped it. Only the app writes it, under the board's lock.
+//! - `board.jsonl`: one post a line, appended under a lock, each saying how
+//!   many agents it reached.
 //! - `state.json`: what the board's lines add up to (roles, proposals and
 //!   their votes, who is in which stream), rewritten under the board's lock
 //!   with each line that changes it.
@@ -60,12 +62,15 @@ pub struct Swarm {
     pub project: String,
     pub goal: String,
     pub workspace: String,
-    pub model: String,
     pub budget_tokens: u64,
+    /// What its agents are: each row an identity, a model and a share.
+    pub mix: Vec<Mix>,
     pub members: Vec<String>,
     /// Each member's bot id: a name can be deleted and made again, and the
     /// new bot is not a member.
     pub ids: BTreeMap<String, i64>,
+    /// Each member's row of the mix.
+    pub rows: BTreeMap<String, usize>,
     pub stopped: bool,
     /// Its council's seats: 0 for a flat board, where nobody proposes.
     pub council: usize,
@@ -95,7 +100,12 @@ impl Swarm {
             project: text("project")?,
             goal: text("goal")?,
             workspace: text("workspace")?,
-            model: text("model")?,
+            mix: table
+                .get("mix")
+                .and_then(toml::Value::as_array)
+                .and_then(|rows| rows.iter().map(Mix::from_toml).collect::<Option<Vec<_>>>())
+                .filter(|mix| valid_mix(mix).is_ok())
+                .ok_or_else(|| format!("{}: mix is missing or not a valid mix", path.display()))?,
             budget_tokens: table
                 .get("budget_tokens")
                 .and_then(toml::Value::as_integer)
@@ -119,6 +129,17 @@ impl Swarm {
                         .collect()
                 })
                 .ok_or_else(|| format!("{}: ids is missing or not bot ids", path.display()))?,
+            rows: table
+                .get("rows")
+                .and_then(toml::Value::as_table)
+                .and_then(|rows| {
+                    rows.iter()
+                        .map(|(m, row)| Some((m.clone(), usize::try_from(row.as_integer()?).ok()?)))
+                        .collect()
+                })
+                .ok_or_else(|| {
+                    format!("{}: rows is missing or not rows of the mix", path.display())
+                })?,
             stopped: table
                 .get("stopped")
                 .and_then(toml::Value::as_bool)
@@ -133,6 +154,13 @@ impl Swarm {
         if !swarm.members.iter().all(|m| swarm.ids.contains_key(m)) {
             return Err(format!("{}: a member has no bot id", path.display()));
         }
+        let placed = |m: &String| swarm.rows.get(m).is_some_and(|row| *row < swarm.mix.len());
+        if !swarm.members.iter().all(placed) {
+            return Err(format!(
+                "{}: a member has no row of the mix",
+                path.display()
+            ));
+        }
         Ok(swarm)
     }
 
@@ -142,8 +170,11 @@ impl Swarm {
         table.insert("project".into(), self.project.clone().into());
         table.insert("goal".into(), self.goal.clone().into());
         table.insert("workspace".into(), self.workspace.clone().into());
-        table.insert("model".into(), self.model.clone().into());
         table.insert("budget_tokens".into(), (self.budget_tokens as i64).into());
+        table.insert(
+            "mix".into(),
+            toml::Value::Array(self.mix.iter().map(Mix::to_toml).collect()),
+        );
         table.insert(
             "members".into(),
             toml::Value::Array(self.members.iter().map(|m| m.clone().into()).collect()),
@@ -155,6 +186,15 @@ impl Swarm {
                 self.ids
                     .iter()
                     .map(|(m, id)| (m.clone(), (*id).into()))
+                    .collect(),
+            ),
+        );
+        table.insert(
+            "rows".into(),
+            toml::Value::Table(
+                self.rows
+                    .iter()
+                    .map(|(m, row)| (m.clone(), (*row as i64).into()))
                     .collect(),
             ),
         );
@@ -170,8 +210,9 @@ impl Swarm {
     pub fn json(&self, dir: &Path) -> Value {
         json!({
             "swarm": self.name, "dir": dir.to_string_lossy(), "project": self.project,
-            "goal": self.goal, "workspace": self.workspace, "model": self.model,
-            "budget_tokens": self.budget_tokens, "members": self.members, "ids": self.ids,
+            "goal": self.goal, "workspace": self.workspace, "budget_tokens": self.budget_tokens,
+            "mix": self.mix.iter().map(Mix::json).collect::<Vec<_>>(),
+            "members": self.members, "ids": self.ids, "rows": self.rows,
             "stopped": self.stopped, "council": self.council, "seats": self.seats(),
         })
     }
@@ -188,6 +229,90 @@ impl Swarm {
     fn seats(&self) -> Vec<String> {
         self.members.iter().take(self.council).cloned().collect()
     }
+
+    /// A member's row of the mix.
+    fn row(&self, member: &str) -> Option<&Mix> {
+        self.rows.get(member).and_then(|row| self.mix.get(*row))
+    }
+}
+
+/// A row of a swarm's mix: its agents' identity (a profile, or none for a
+/// plain agent), their model, and their share of the agents in percent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mix {
+    pub identity: String,
+    pub model: String,
+    pub share: u32,
+}
+
+/// Rows of a mix; the page offers fewer.
+const MAX_MIX: usize = 8;
+/// Agents a swarm starts with at most; Add can go on from there.
+const MAX_START: usize = 64;
+
+impl Mix {
+    pub fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            identity: value["identity"].as_str()?.to_owned(),
+            model: value["model"].as_str()?.to_owned(),
+            share: u32::try_from(value["share"].as_u64()?).ok()?,
+        })
+    }
+
+    fn from_toml(value: &toml::Value) -> Option<Self> {
+        Some(Self {
+            identity: value.get("identity")?.as_str()?.to_owned(),
+            model: value.get("model")?.as_str()?.to_owned(),
+            share: u32::try_from(value.get("share")?.as_integer()?).ok()?,
+        })
+    }
+
+    fn to_toml(&self) -> toml::Value {
+        let mut row = toml::Table::new();
+        row.insert("identity".into(), self.identity.clone().into());
+        row.insert("model".into(), self.model.clone().into());
+        row.insert("share".into(), i64::from(self.share).into());
+        toml::Value::Table(row)
+    }
+
+    fn json(&self) -> Value {
+        json!({"identity": self.identity, "model": self.model, "share": self.share})
+    }
+}
+
+/// Up to eight rows whose shares add up to 100, each with a model, and an
+/// identity that is a profile's name or empty for a plain agent. The app's
+/// own roles are not identities: every agent already has the swarm's, and
+/// a coordinator is not a swarm's.
+pub fn valid_mix(mix: &[Mix]) -> Result<(), String> {
+    if mix.is_empty() || mix.len() > MAX_MIX {
+        return Err(format!("invalid_mix: a mix has 1 to {MAX_MIX} rows"));
+    }
+    for row in mix {
+        if row.model.trim().is_empty() {
+            return Err("invalid_mix: every row needs a model".into());
+        }
+        if row.share == 0 || row.share > 100 {
+            return Err(format!(
+                "invalid_mix: a share is 1 to 100 percent, not {}",
+                row.share
+            ));
+        }
+        let name = row.identity.as_str();
+        let word = name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+        if name.starts_with('.') || !word || ["swarm", "coordinator"].contains(&name) {
+            return Err(format!("invalid_mix: {name} is not an identity"));
+        }
+    }
+    let total: u32 = mix.iter().map(|row| row.share).sum();
+    if total != 100 {
+        return Err(format!(
+            "invalid_mix: the shares add up to {total}%, not 100%"
+        ));
+    }
+    Ok(())
 }
 
 /// `~/.agent/swarms`, which holds a folder of swarms per daemon.
@@ -637,30 +762,54 @@ fn update(
     Ok(s)
 }
 
-/// Members join in order and never twice, each pinned to its bot's id. An
-/// agent added later brings its own budget, which the swarm's grows by, so
-/// the budget shown is always what its agents may spend.
-pub fn join(
-    root: &Path,
-    swarm: &str,
-    members: &[(String, i64)],
-    added_budget: u64,
-) -> Result<Value, String> {
-    let dir = folder(root, swarm)?;
-    let s = update(&dir, |s| {
+/// Members join in order and never twice, each pinned to its bot's id and
+/// its row of the mix. An agent added later brings its own budget, which the
+/// swarm's grows by, so the budget shown is always what its agents may spend.
+fn join(dir: &Path, members: &[(String, i64, usize)], added_budget: u64) -> Result<Swarm, String> {
+    update(dir, |s| {
         s.budget_tokens = s.budget_tokens.saturating_add(added_budget);
-        for (member, id) in members {
-            if !member.starts_with(&format!("{swarm}-")) {
-                return Err(format!("invalid_member: {member} is not named {swarm}-N"));
+        for (member, id, row) in members {
+            if !member.starts_with(&format!("{}-", s.name)) {
+                return Err(format!(
+                    "invalid_member: {member} is not named {}-N",
+                    s.name
+                ));
+            }
+            if *row >= s.mix.len() {
+                return Err(format!("invalid_member: the mix has no row {row}"));
             }
             if !s.members.contains(member) {
                 s.members.push(member.clone());
             }
             s.ids.insert(member.clone(), *id);
+            s.rows.insert(member.clone(), *row);
         }
         Ok(())
-    })?;
-    Ok(s.json(&dir))
+    })
+}
+
+/// `join` and `update` from async code: the board's lock may wait on a
+/// post's sends, so the wait runs on the blocking pool, never on the
+/// executor those sends need.
+async fn join_async(
+    dir: &Path,
+    members: Vec<(String, i64, usize)>,
+    added_budget: u64,
+) -> Result<Swarm, String> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || join(&dir, &members, added_budget))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+async fn update_async(
+    dir: &Path,
+    change: impl FnOnce(&mut Swarm) -> Result<(), String> + Send + 'static,
+) -> Result<Swarm, String> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || update(&dir, change))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// A deleted agent leaves: the swarm stops counting it and posting to it.
@@ -669,35 +818,18 @@ pub fn leave(root: &Path, swarm: &str, member: &str) -> Result<Value, String> {
     let s = update(&dir, |s| {
         s.members.retain(|m| m != member);
         s.ids.remove(member);
+        s.rows.remove(member);
         Ok(())
     })?;
     Ok(s.json(&dir))
 }
 
-/// A stopped swarm refuses its agents' posts; your next post resumes it.
-pub fn set_stopped(root: &Path, swarm: &str, stopped: bool) -> Result<Value, String> {
-    let dir = folder(root, swarm)?;
-    let s = update(&dir, |s| {
-        s.stopped = stopped;
-        Ok(())
-    })?;
-    Ok(s.json(&dir))
-}
-
-/// A swarm that never got an agent goes with its worktree and branch, as
-/// when its start fails before any agent exists.
-pub async fn discard(root: &Path, swarm: &str) -> Result<(), String> {
-    let dir = folder(root, swarm)?;
-    let s = Swarm::read(&dir)?;
-    if !s.members.is_empty() {
-        return Err(format!(
-            "swarm_has_agents: {swarm} has agents; stop it instead"
-        ));
+/// A swarm that never got an agent goes with its worktree and branch.
+async fn discard(dir: &Path, swarm: &Swarm) -> Result<(), String> {
+    if Path::new(&swarm.workspace).starts_with(worktrees()?.join(&swarm.name)) {
+        unplace(&swarm.name).await?;
     }
-    if Path::new(&s.workspace).starts_with(worktrees()?.join(swarm)) {
-        unplace(swarm).await?;
-    }
-    std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+    std::fs::remove_dir_all(dir).map_err(|e| e.to_string())
 }
 
 /// Remove a swarm's worktree and its branch, as `place` made them.
@@ -727,6 +859,421 @@ pub async fn unplace(swarm: &str) -> Result<(), String> {
             .await;
     }
     Ok(())
+}
+
+/// What a new swarm is. The page picks its name and each agent's row of
+/// the mix, since it shows those counts before you start.
+pub struct Start {
+    pub project: String,
+    pub name: String,
+    pub folder: PathBuf,
+    pub goal: String,
+    pub shared: bool,
+    pub mix: Vec<Mix>,
+    pub rows: Vec<usize>,
+    pub budget_tokens: u64,
+    pub council: usize,
+}
+
+/// Start a swarm: take its name, make the place its agents share, write its
+/// folder, compose each identity's instructions, then create its agents,
+/// have them join, and send each its brief. A step that fails undoes the
+/// ones before it, so a swarm exists only with agents; an agent that could
+/// not be made or briefed is reported beside the ones that were.
+pub async fn start(
+    client: &Arc<Client>,
+    root: &Path,
+    app: &Path,
+    start: Start,
+) -> Result<Value, String> {
+    valid_goal(&start.goal)?;
+    valid_mix(&start.mix)?;
+    let n = start.rows.len();
+    if n == 0 || n > MAX_START || start.rows.iter().any(|row| *row >= start.mix.len()) {
+        return Err(format!(
+            "invalid_agents: a swarm starts with 1 to {MAX_START} agents, each from a row of its mix"
+        ));
+    }
+    let full = format!("{}.{}", start.project, start.name);
+    let dir = claim(root, &full)?;
+    let workspace = match place(&start.folder, &full, start.shared).await {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+    };
+    let swarm = Swarm {
+        name: full,
+        project: start.project,
+        goal: start.goal.trim().to_owned(),
+        workspace,
+        budget_tokens: start.budget_tokens,
+        mix: start.mix,
+        members: Vec::new(),
+        ids: BTreeMap::new(),
+        rows: BTreeMap::new(),
+        stopped: false,
+        council: start.council,
+    };
+    if let Err(error) = fill(&dir, &swarm, app) {
+        if start.shared {
+            let _ = unplace(&swarm.name).await;
+        }
+        return Err(error);
+    }
+    // A folder whose instructions cannot compose gets no agents.
+    let policies = match policies(&swarm, start.rows.iter().copied()) {
+        Ok(policies) => policies,
+        Err(error) => {
+            let _ = discard(&dir, &swarm).await;
+            return Err(error);
+        }
+    };
+    let each = (swarm.budget_tokens / n as u64).max(1);
+    let agents: Vec<(String, usize)> = (start.rows.iter().enumerate())
+        .map(|(i, row)| (format!("{}-{}", swarm.name, i + 1), *row))
+        .collect();
+    let (made, mut failed) = create(client, &swarm, &agents, &policies, each).await;
+    if made.is_empty() {
+        let _ = discard(&dir, &swarm).await;
+        return Err(failed
+            .first()
+            .map_or_else(String::new, |(_, e)| e.to_string()));
+    }
+    let joined = match join_async(&dir, pins(&made), 0).await {
+        Ok(joined) => joined,
+        Err(error) => {
+            // Agents no swarm holds would be strays: they go with it.
+            for (name, _, _) in &made {
+                let _ = client.request("delete", json!({"bot": name})).await;
+            }
+            let _ = discard(&dir, &swarm).await;
+            return Err(error);
+        }
+    };
+    failed.extend(brief_all(client, &joined, &dir, &made, false).await);
+    Ok(json!({
+        "swarm": joined.json(&dir),
+        "bots": made.iter().map(|(_, _, record)| record).collect::<Vec<_>>(),
+        "failed": reasons(&failed),
+    }))
+}
+
+/// One more agent from `row` of the mix, under the next number no member
+/// has. Its budget adds to the swarm's.
+pub async fn add(
+    client: &Arc<Client>,
+    root: &Path,
+    swarm: &str,
+    row: usize,
+) -> Result<Value, String> {
+    let dir = folder(root, swarm)?;
+    let s = Swarm::read(&dir)?;
+    if row >= s.mix.len() {
+        return Err(format!("invalid_agents: the mix has no row {row}"));
+    }
+    let policies = policies(&s, std::iter::once(row))?;
+    let each = (s.budget_tokens / s.members.len().max(1) as u64).max(1);
+    let mut n = s.members.len() + 1;
+    let made = loop {
+        let name = format!("{}-{n}", s.name);
+        n += 1;
+        if s.members.contains(&name) {
+            continue;
+        }
+        let (made, failed) = create(client, &s, &[(name, row)], &policies, each).await;
+        match failed.into_iter().next() {
+            // A bot of that name that is not a member: take the next number.
+            Some((_, error)) if error.code == "bot_exists" && n <= s.members.len() + 64 => {}
+            Some((_, error)) => return Err(error.to_string()),
+            None => break made,
+        }
+    };
+    let joined = join_async(&dir, pins(&made), each).await?;
+    let failed = brief_all(client, &joined, &dir, &made, true).await;
+    Ok(json!({
+        "swarm": joined.json(&dir),
+        "bots": made.iter().map(|(_, _, record)| record).collect::<Vec<_>>(),
+        "failed": reasons(&failed),
+    }))
+}
+
+/// Stop a swarm: it refuses its agents' posts from now on, and every turn
+/// its agents have not finished ends. Posts wait on the board's lock, so a
+/// post either comes first and its turns end here, or is refused. A name
+/// that is no longer its member's bot leaves, its turns untouched.
+pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Value, String> {
+    let dir = folder(root, swarm)?;
+    let s = update_async(&dir, |s| {
+        s.stopped = true;
+        Ok(())
+    })
+    .await?;
+    let mut ends = tokio::task::JoinSet::new();
+    for member in &s.members {
+        let (client, member, id) = (client.clone(), member.clone(), s.ids.get(member).copied());
+        ends.spawn(async move {
+            let ended = end_turns(&client, &member, id).await;
+            (member, ended)
+        });
+    }
+    let (mut gone, mut failed) = (Vec::new(), Vec::new());
+    while let Some(ended) = ends.join_next().await {
+        match ended.map_err(|e| e.to_string())? {
+            (member, Ok(false)) => gone.push(member),
+            (_, Ok(true)) => {}
+            (member, Err(error)) => failed.push(json!({"agent": s.short(&member), "error": error})),
+        }
+    }
+    let s = if gone.is_empty() {
+        s
+    } else {
+        update_async(&dir, move |s| {
+            s.members.retain(|m| !gone.contains(m));
+            s.ids.retain(|m, _| !gone.contains(m));
+            s.rows.retain(|m, _| !gone.contains(m));
+            Ok(())
+        })
+        .await?
+    };
+    Ok(json!({"swarm": s.json(&dir), "failed": failed}))
+}
+
+/// End every turn `member` has not finished, the queued ones included,
+/// newest first, so none starts as an older one ends; a turn that ended
+/// meanwhile is already stopped. False when the name is not the member's
+/// bot any more: deleted while no window watched, or made again.
+async fn end_turns(client: &Client, member: &str, id: Option<i64>) -> Result<bool, String> {
+    match client.request("resume", json!({"bot": member})).await {
+        Ok(bot) if bot["id"].as_i64() == id => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.code == "bot_not_found" => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    }
+    const ACTIVE: [&str; 5] = ["running", "waiting", "paced", "queued", "ready"];
+    let (mut open, mut after) = (Vec::new(), json!(0));
+    loop {
+        let page = client
+            .request(
+                "turns",
+                json!({"bot": member, "after": after, "limit": 256}),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        for turn in page["turns"].as_array().into_iter().flatten() {
+            if ACTIVE.contains(&turn["status"].as_str().unwrap_or_default()) {
+                open.extend(turn["turn"].as_i64());
+            }
+        }
+        match &page["next_after"] {
+            Value::Null => break,
+            next => after = next.clone(),
+        }
+    }
+    for turn in open.into_iter().rev() {
+        match client
+            .request("interrupt", json!({"bot": member, "turn": turn}))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if error.code == "stale_turn" || error.code == "no_active_turn" => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(true)
+}
+
+/// Each identity's instructions for the swarm's folder, composed once: a
+/// plain agent's are the `swarm` role's, and an identity's are its profile's
+/// with the `swarm` role's after them. The board is scripts its agents run,
+/// so an identity limited to tools without `shell` could not take part.
+fn policies(
+    swarm: &Swarm,
+    rows: impl Iterator<Item = usize>,
+) -> Result<BTreeMap<String, Value>, String> {
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let identity = &swarm.mix[row].identity;
+        if out.contains_key(identity) {
+            continue;
+        }
+        let workspace = Path::new(&swarm.workspace);
+        let policy = if identity.is_empty() {
+            crate::compose(workspace, Some("swarm"), None)?
+        } else {
+            crate::compose(workspace, Some(identity), Some("swarm"))?
+        };
+        if policy["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.iter().any(|tool| tool == "shell"))
+        {
+            let who = if identity.is_empty() {
+                "swarm"
+            } else {
+                identity
+            };
+            return Err(format!(
+                "identity_without_shell: the {who} profile's tools leave out shell, which the board's scripts run in"
+            ));
+        }
+        out.insert(identity.clone(), policy);
+    }
+    Ok(out)
+}
+
+type Made = (String, usize, Value);
+
+/// Create these agents at once, each with its row's model and identity.
+async fn create(
+    client: &Arc<Client>,
+    swarm: &Swarm,
+    agents: &[(String, usize)],
+    policies: &BTreeMap<String, Value>,
+    each: u64,
+) -> (Vec<Made>, Vec<(String, agent_client::Error)>) {
+    let mut creates = tokio::task::JoinSet::new();
+    for (i, (name, row)) in agents.iter().enumerate() {
+        let mix = &swarm.mix[*row];
+        let policy = &policies[&mix.identity];
+        let tools = match &policy["tools"] {
+            Value::Null => json!(crate::TOOLS),
+            tools => tools.clone(),
+        };
+        let params = json!({
+            "bot": name, "workspace": swarm.workspace, "model": mix.model,
+            "instructions": policy["instructions"],
+            "compaction_instructions": policy["compaction_instructions"],
+            "tools": tools, "budget_tokens": each,
+        });
+        let (client, name, row) = (client.clone(), name.clone(), *row);
+        creates.spawn(async move { (i, name, row, client.request("create", params).await) });
+    }
+    let mut done = Vec::new();
+    while let Some(created) = creates.join_next().await {
+        match created {
+            Ok(created) => done.push(created),
+            Err(error) => done.push((
+                usize::MAX,
+                String::new(),
+                0,
+                Err(agent_client::Error::new(&error.to_string())),
+            )),
+        }
+    }
+    done.sort_by_key(|(i, ..)| *i);
+    let (mut made, mut failed) = (Vec::new(), Vec::new());
+    for (_, name, row, result) in done {
+        match result {
+            Ok(record) => made.push((name, row, record)),
+            Err(error) => failed.push((name, error)),
+        }
+    }
+    (made, failed)
+}
+
+fn pins(made: &[Made]) -> Vec<(String, i64, usize)> {
+    made.iter()
+        .map(|(name, row, record)| (name.clone(), record["id"].as_i64().unwrap_or(-1), *row))
+        .collect()
+}
+
+fn reasons(failed: &[(String, agent_client::Error)]) -> Vec<Value> {
+    failed
+        .iter()
+        .map(|(agent, error)| json!({"agent": agent, "error": error.to_string()}))
+        .collect()
+}
+
+/// Send each new member its brief, as its first message.
+async fn brief_all(
+    client: &Arc<Client>,
+    swarm: &Swarm,
+    dir: &Path,
+    made: &[Made],
+    late: bool,
+) -> Vec<(String, agent_client::Error)> {
+    let stamp = format!("app-swarm-{}-{}", now_ms(), std::process::id());
+    let mut sends = tokio::task::JoinSet::new();
+    for (i, (name, _, record)) in made.iter().enumerate() {
+        let params = json!({
+            "bot": name, "bot_id": record["id"], "request_id": format!("{stamp}-{i}"),
+            "prompt": brief(swarm, dir, name, late), "delivery": "reject",
+        });
+        let (client, name) = (client.clone(), name.clone());
+        sends.spawn(async move { (name, client.request("submit", params).await) });
+    }
+    let mut failed = Vec::new();
+    while let Some(sent) = sends.join_next().await {
+        if let Ok((name, Err(error))) = sent {
+            failed.push((name, error));
+        }
+    }
+    failed
+}
+
+/// What an agent is told first: who it is, the goal, the scripts it acts on
+/// the board with, and who the others are. How to use them is its role's
+/// (`swarm`), so a folder can change it.
+fn brief(swarm: &Swarm, dir: &Path, member: &str, late: bool) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    let dir = dir.display();
+    let tool = |name: &str, args: &str| {
+        let mut title = name.to_owned();
+        title[..1].make_ascii_uppercase();
+        format!("{title}: {} {args}", quote(&format!("{dir}/{name}")))
+    };
+    let known = |m: &str| match swarm.row(m) {
+        Some(row) if !row.identity.is_empty() => format!("{} ({})", swarm.short(m), row.identity),
+        _ => swarm.short(m).to_owned(),
+    };
+    let others: Vec<String> = (swarm.members.iter())
+        .filter(|m| *m != member)
+        .map(|m| known(m))
+        .collect();
+    let mut lines = vec![
+        format!(
+            "You are {}, one of {} agents in the swarm {}, all working in this folder.",
+            swarm.short(member),
+            swarm.members.len(),
+            swarm.short(&swarm.name)
+        ),
+        format!("Goal: {}", swarm.goal),
+        tool("post", "TEXT"),
+        tool("role", "ROLE"),
+    ];
+    if swarm.council > 0 {
+        let seats = swarm.seats();
+        lines.push(tool("propose", "STREAM WHY"));
+        lines.push(tool("vote", "ID yes|no REASON"));
+        lines.push(tool("join", "STREAM"));
+        lines.push(format!(
+            "Council seats: {}{}",
+            seats
+                .iter()
+                .map(|m| swarm.short(m))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if seats.iter().any(|m| m == member) {
+                " (you hold one)"
+            } else {
+                ""
+            }
+        ));
+    }
+    lines.push(format!("Board: {}", quote(&format!("{dir}/board.jsonl"))));
+    lines.push(format!(
+        "The others: {}",
+        if others.is_empty() {
+            "none yet".to_owned()
+        } else {
+            others.join(", ")
+        }
+    ));
+    if late {
+        lines.push("You joined after the others started, so read the board first.".into());
+    }
+    lines.join("\n")
 }
 
 /// The board's complete lines from `offset`, where the next read starts,
@@ -1374,62 +1921,74 @@ pub async fn act(
         s.write(&dir)?;
     }
     let bot = author.as_ref().map(|a| a.bot.as_str());
-    let (notices, mut answer) = locked_with(&mut board, &dir, |state| {
+    // A swarm you stopped keeps what you decided on the board, and tells
+    // nobody; a role or a join tells nobody either.
+    let turns = if s.stopped || matches!(act, Act::Role(_) | Act::Join(_)) {
+        Vec::new()
+    } else {
+        running_turns(client, &s).await?
+    };
+    let running = |m: &str| turns.iter().find(|(n, _)| n == m).and_then(|(_, t)| *t);
+    // Each line says how many agents it reached, so what a swarm's posts
+    // cost in deliveries is on its board.
+    let (sends, mut answer) = locked_with(&mut board, &dir, |state| {
         let (mut lines, notices, answer) = plan(&s, state, bot, act, now_ms())?;
+        let mut sends = Vec::new();
+        let told = !notices.is_empty() && !s.stopped;
+        for notice in notices.into_iter().filter(|_| !s.stopped) {
+            let reach = match &notice.audience {
+                Audience::Post { scope, text } => {
+                    readers(&s, bot, text, scope.as_deref(), &running)
+                }
+                Audience::Wake { who, working } => s
+                    .members
+                    .iter()
+                    .filter(|m| Some(m.as_str()) != bot)
+                    .filter_map(|m| match (who.contains(m), running(m)) {
+                        (true, _) => Some((m.clone(), Reach::Wake)),
+                        (false, Some(turn)) if *working => Some((m.clone(), Reach::Running(turn))),
+                        _ => None,
+                    })
+                    .collect(),
+            };
+            sends.extend(
+                reach
+                    .into_iter()
+                    .map(|(m, r)| (m, r, notice.prompt.clone())),
+            );
+        }
+        if let Some(first) = lines.first_mut().filter(|_| told) {
+            first["reached"] = json!(sends.len());
+        }
         if let Some(author) = &author {
             for line in lines.iter_mut().filter(|line| line["from"] != "council") {
                 line["bot"] = json!(author.bot);
                 line["turn"] = json!(author.turn);
             }
         }
-        Ok((lines, (notices, answer)))
+        Ok((lines, (sends, answer)))
     })?;
-    // A swarm you stopped keeps what you decided on the board, and tells nobody.
-    let notices = if s.stopped { Vec::new() } else { notices };
-    let turns = if notices.is_empty() {
-        Vec::new()
-    } else {
-        running_turns(client, &s).await?
-    };
-    let running = |m: &str| turns.iter().find(|(n, _)| n == m).and_then(|(_, t)| *t);
     // Distinct per post, even for two in one millisecond from one process.
     static POSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stamp = format!("swarm-{}-{}-{n}", now_ms(), std::process::id());
-    let mut sends = tokio::task::JoinSet::new();
-    let mut i = 0;
-    for notice in notices {
-        let reach = match &notice.audience {
-            Audience::Post { scope, text } => readers(&s, bot, text, scope.as_deref(), &running),
-            Audience::Wake { who, working } => s
-                .members
-                .iter()
-                .filter(|m| Some(m.as_str()) != bot)
-                .filter_map(|m| match (who.contains(m), running(m)) {
-                    (true, _) => Some((m.clone(), Reach::Wake)),
-                    (false, Some(turn)) if *working => Some((m.clone(), Reach::Running(turn))),
-                    _ => None,
-                })
-                .collect(),
-        };
-        for (member, reach) in reach {
-            let mut params = json!({
-                "bot": member, "bot_id": s.ids.get(&member), "request_id": format!("{stamp}-{i}"),
-                "prompt": notice.prompt, "delivery": "steer",
-            });
-            i += 1;
-            if let Reach::Running(turn) = reach {
-                params["expected_turn"] = json!(turn);
-            }
-            if let Some(author) = &author {
-                params["from"] = json!({"bot": author.bot, "turn": author.turn});
-            }
-            let client = client.clone();
-            sends.spawn(async move { (member, reach, client.request("submit", params).await) });
+    let mut submits = tokio::task::JoinSet::new();
+    for (i, (member, reach, prompt)) in sends.into_iter().enumerate() {
+        let mut params = json!({
+            "bot": member, "bot_id": s.ids.get(&member), "request_id": format!("{stamp}-{i}"),
+            "prompt": prompt, "delivery": "steer",
+        });
+        if let Reach::Running(turn) = reach {
+            params["expected_turn"] = json!(turn);
         }
+        if let Some(author) = &author {
+            params["from"] = json!({"bot": author.bot, "turn": author.turn});
+        }
+        let client = client.clone();
+        submits.spawn(async move { (member, reach, client.request("submit", params).await) });
     }
     let (mut steered, mut woke, mut missed) = (Vec::new(), Vec::new(), Vec::new());
-    while let Some(sent) = sends.join_next().await {
+    while let Some(sent) = submits.join_next().await {
         let Ok((member, reach, result)) = sent else {
             missed.push(json!({"agent": "?", "error": "a send ended without an answer"}));
             continue;
@@ -1581,17 +2140,34 @@ mod tests {
             project: "agent".into(),
             goal: "Halve p99.".into(),
             workspace: "/w".into(),
-            model: "openai/gpt-6-luna".into(),
             budget_tokens: 3_000_000,
+            mix: vec![Mix {
+                identity: String::new(),
+                model: "openai/gpt-6-luna".into(),
+                share: 100,
+            }],
             members: members.iter().map(|m| m.to_string()).collect(),
             ids: members
                 .iter()
                 .zip(1..)
                 .map(|(m, id)| (m.to_string(), id))
                 .collect(),
+            rows: members.iter().map(|m| (m.to_string(), 0)).collect(),
             stopped: false,
             council: 0,
         }
+    }
+
+    /// Members joining from the mix's first row, as the swarm's JSON says.
+    fn enrol(
+        root: &Path,
+        swarm: &str,
+        members: &[(String, i64)],
+        added: u64,
+    ) -> Result<Value, String> {
+        let dir = folder(root, swarm)?;
+        let pinned: Vec<_> = members.iter().map(|(m, id)| (m.clone(), *id, 0)).collect();
+        join(&dir, &pinned, added).map(|s| s.json(&dir))
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1959,7 +2535,7 @@ mod tests {
                 .unwrap()
                 .contains("--swarm-post '")
         );
-        join(&root, &s.name, &[(agent(1), 1), (agent(2), 2)], 0).unwrap();
+        enrol(&root, &s.name, &[(agent(1), 1), (agent(2), 2)], 0).unwrap();
         let s = Swarm::read(&dir).unwrap();
         assert_eq!(s.council, 3);
         assert_eq!(s.seats(), vec![agent(1), agent(2)]);
@@ -2004,7 +2580,7 @@ mod tests {
         );
         let post = std::fs::read_to_string(dir.join("post")).unwrap();
         assert!(post.contains(r"exec '/Applications/It'\''s.app/agent-app' --swarm-post '"));
-        let joined = join(
+        let joined = enrol(
             &root,
             &s.name,
             &[
@@ -2015,10 +2591,10 @@ mod tests {
         )
         .unwrap();
         // An agent added later grows the budget by its own.
-        let grown = join(&root, &s.name, &[("agent.latency-2".into(), 12)], 1_000).unwrap();
+        let grown = enrol(&root, &s.name, &[("agent.latency-2".into(), 12)], 1_000).unwrap();
         assert_eq!(grown["budget_tokens"], 3_001_000);
         assert!(
-            join(&root, &s.name, &[("other.x-1".into(), 13)], 0)
+            enrol(&root, &s.name, &[("other.x-1".into(), 13)], 0)
                 .unwrap_err()
                 .starts_with("invalid_member")
         );
@@ -2034,11 +2610,11 @@ mod tests {
         let left = leave(&root, &s.name, "agent.latency-1").unwrap();
         assert_eq!(left["members"], json!(["agent.latency-2"]));
         assert_eq!(left["ids"], json!({"agent.latency-2": 12}));
-        assert!(
-            set_stopped(&root, &s.name, true).unwrap()["stopped"]
-                .as_bool()
-                .unwrap()
-        );
+        update(&dir, |s| {
+            s.stopped = true;
+            Ok(())
+        })
+        .unwrap();
         let listed = list(&root).unwrap();
         assert_eq!(listed["swarms"][0]["swarm"], "agent.latency");
         // A stop state or member ids that cannot be read make the swarm unreadable, not active.
@@ -2140,21 +2716,380 @@ mod tests {
     }
 
     #[test]
-    fn only_a_swarm_without_agents_is_discarded() {
-        let root = scratch("discard");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let s = swarm(&[]);
+    fn a_mix_is_rows_of_an_identity_a_model_and_shares_that_make_100() {
+        let row = |identity: &str, model: &str, share| Mix {
+            identity: identity.into(),
+            model: model.into(),
+            share,
+        };
+        assert!(valid_mix(&[row("", "a/x", 60), row("reviewer", "b/y", 40)]).is_ok());
+        for (bad, why) in [
+            (vec![], "rows"),
+            (vec![row("", "a/x", 60)], "add up to 60%"),
+            (vec![row("", " ", 100)], "model"),
+            (vec![row("", "a/x", 0), row("", "a/x", 100)], "share"),
+            (vec![row("../x", "a/x", 100)], "identity"),
+            (vec![row("swarm", "a/x", 100)], "identity"),
+            (vec![row("coordinator", "a/x", 100)], "identity"),
+            ((0..9).map(|_| row("", "a/x", 1)).collect(), "rows"),
+        ] {
+            let error = valid_mix(&bad).unwrap_err();
+            assert!(
+                error.starts_with("invalid_mix") && error.contains(why),
+                "{error}"
+            );
+        }
+        // A member with no row of the mix makes the swarm unreadable.
+        let root = scratch("mix");
+        let s = swarm(&[&agent(1)]);
         let dir = claim(&root, &s.name).unwrap();
         fill(&dir, &s, Path::new("/app")).unwrap();
-        join(&root, &s.name, &[("agent.latency-1".into(), 1)], 0).unwrap();
-        let kept = runtime.block_on(discard(&root, &s.name)).unwrap_err();
-        assert!(kept.starts_with("swarm_has_agents"), "{kept}");
-        leave(&root, &s.name, "agent.latency-1").unwrap();
-        runtime.block_on(discard(&root, &s.name)).unwrap();
-        assert!(!dir.exists());
+        assert_eq!(Swarm::read(&dir).unwrap(), s);
+        let good = std::fs::read_to_string(dir.join("swarm.toml")).unwrap();
+        for bad in [
+            good.replace("\"agent.latency-1\" = 0", "\"agent.latency-1\" = 1"),
+            good.replace("share = 100", "share = 90"),
+        ] {
+            std::fs::write(dir.join("swarm.toml"), bad).unwrap();
+            assert!(Swarm::read(&dir).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_brief_names_the_scripts_the_seats_and_the_others_identities() {
+        let mut s = council(&[&agent(1), &agent(2), &agent(3), &agent(4)]);
+        s.mix.push(Mix {
+            identity: "reviewer".into(),
+            model: "b/y".into(),
+            share: 0,
+        });
+        s.rows.insert(agent(2), 1);
+        let dir = Path::new("/h/.agent/swarms/abc/agent.latency");
+        let brief = brief(&s, dir, &agent(1), false);
+        assert_eq!(
+            brief,
+            [
+                "You are latency-1, one of 4 agents in the swarm latency, all working in this folder.",
+                "Goal: Halve p99.",
+                "Post: '/h/.agent/swarms/abc/agent.latency/post' TEXT",
+                "Role: '/h/.agent/swarms/abc/agent.latency/role' ROLE",
+                "Propose: '/h/.agent/swarms/abc/agent.latency/propose' STREAM WHY",
+                "Vote: '/h/.agent/swarms/abc/agent.latency/vote' ID yes|no REASON",
+                "Join: '/h/.agent/swarms/abc/agent.latency/join' STREAM",
+                "Council seats: latency-1, latency-2, latency-3 (you hold one)",
+                "Board: '/h/.agent/swarms/abc/agent.latency/board.jsonl'",
+                "The others: latency-2 (reviewer), latency-3, latency-4",
+            ]
+            .join("\n")
+        );
+        let late = super::brief(&swarm(&[&agent(1)]), Path::new("/it's"), &agent(1), true);
+        assert!(late.contains(r"Post: '/it'\''s/post' TEXT"), "{late}");
+        assert!(late.ends_with(
+            "The others: none yet\nYou joined after the others started, so read the board first."
+        ));
+    }
+
+    /// A daemon that answers each request with `answer`, and keeps them.
+    struct Fake {
+        socket: PathBuf,
+        seen: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    }
+
+    type Answer = dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync;
+
+    impl Fake {
+        fn start(tag: &str, answer: Box<Answer>) -> Self {
+            use std::io::BufRead;
+            let socket =
+                std::env::temp_dir().join(format!("agent-fake-{tag}-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&socket);
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let kept = seen.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let ready = json!({"event": "ready", "protocol": agent_client::PROTOCOL});
+                    writeln!(stream, "{ready}").unwrap();
+                    for line in reader.lines() {
+                        let Ok(line) = line else { break };
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        let op = request["op"].as_str().unwrap().to_owned();
+                        kept.lock().unwrap().push((op.clone(), request.clone()));
+                        let reply = match answer(&op, &request) {
+                            Ok(result) => json!({"id": request["id"], "result": result}),
+                            Err(code) => {
+                                json!({"id": request["id"], "error": code, "detail": "fake"})
+                            }
+                        };
+                        if writeln!(stream, "{reply}").is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self { socket, seen }
+        }
+
+        fn ops(&self, op: &str) -> Vec<Value> {
+            let seen = self.seen.lock().unwrap();
+            seen.iter()
+                .filter(|(o, _)| o == op)
+                .map(|(_, p)| p.clone())
+                .collect()
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// A bot record for `create`, numbered from its name.
+    fn made(request: &Value) -> Value {
+        let name = request["bot"].as_str().unwrap();
+        let n: i64 = name.rsplit('-').next().unwrap().parse().unwrap();
+        json!({"name": name, "id": 100 + n, "model": request["model"]})
+    }
+
+    #[test]
+    fn a_swarm_starts_its_agents_from_the_mix_and_one_that_fails_is_reported() {
+        let home = scratch("start");
+        let (root, project) = (home.join("swarms"), home.join("project"));
+        std::fs::create_dir_all(project.join(".agents/agents")).unwrap();
+        std::fs::write(
+            project.join(".agents/agents/reviewer.md"),
+            "---\ndescription: Reviews\ntools: shell, read\n---\nYou review changes.",
+        )
+        .unwrap();
+        let fake = Fake::start(
+            "start",
+            Box::new(|op, request| match op {
+                "create" if request["bot"] == "p.goal-3" || request["bot"] == "p.fail-1" => {
+                    Err("provider_unknown".into())
+                }
+                "create" => Ok(made(request)),
+                "submit" => Ok(json!({"status": "running"})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let mix = vec![
+            Mix {
+                identity: String::new(),
+                model: "a/x".into(),
+                share: 50,
+            },
+            Mix {
+                identity: "reviewer".into(),
+                model: "b/y".into(),
+                share: 50,
+            },
+        ];
+        let start = |name: &str, rows: Vec<usize>, mix: Vec<Mix>| Start {
+            project: "p".into(),
+            name: name.into(),
+            folder: project.clone(),
+            goal: "Ship it.".into(),
+            shared: false,
+            mix,
+            rows,
+            budget_tokens: 4_000,
+            council: 0,
+        };
+        let out = rt
+            .block_on(super::start(
+                &client,
+                &root,
+                Path::new("/app"),
+                start("goal", vec![0, 1, 0, 1], mix.clone()),
+            ))
+            .unwrap();
+        // Each agent has its row's model and identity, and a quarter of the budget.
+        let creates = fake.ops("create");
+        assert_eq!(creates.len(), 4);
+        for create in &creates {
+            let reviewer = create["bot"] == "p.goal-2" || create["bot"] == "p.goal-4";
+            assert_eq!(create["model"], if reviewer { "b/y" } else { "a/x" });
+            assert_eq!(create["budget_tokens"], 1_000);
+            assert_eq!(create["workspace"], project.to_str().unwrap());
+            let text = create["instructions"].as_str().unwrap();
+            assert!(text.contains("You are one of several agents"));
+            assert_eq!(
+                text.contains("You review changes."),
+                reviewer,
+                "{}",
+                create["bot"]
+            );
+            // An identity's own text comes first, the swarm's rules after it.
+            if reviewer {
+                assert!(
+                    text.find("You review changes.") < text.find("You are one of several agents")
+                );
+            }
+            assert_eq!(
+                create["tools"],
+                if reviewer {
+                    json!(["shell", "read"])
+                } else {
+                    json!(crate::TOOLS)
+                }
+            );
+        }
+        // The one that failed is reported; the others joined with their rows and got briefs.
+        assert_eq!(
+            out["failed"],
+            json!([{"agent": "p.goal-3", "error": "provider_unknown (fake)"}])
+        );
+        assert_eq!(
+            out["swarm"]["members"],
+            json!(["p.goal-1", "p.goal-2", "p.goal-4"])
+        );
+        assert_eq!(
+            out["swarm"]["rows"],
+            json!({"p.goal-1": 0, "p.goal-2": 1, "p.goal-4": 1})
+        );
+        assert_eq!(out["swarm"]["ids"]["p.goal-4"], 104);
+        let briefs = fake.ops("submit");
+        assert_eq!(briefs.len(), 3);
+        let first = briefs.iter().find(|b| b["bot"] == "p.goal-1").unwrap();
+        assert_eq!(first["bot_id"], 101);
+        assert_eq!(first["delivery"], "reject");
+        assert!(
+            first["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("The others: goal-2 (reviewer), goal-4")
+        );
+        // Nothing made at all: nothing is left, not even the name.
+        let out = rt.block_on(super::start(
+            &client,
+            &root,
+            Path::new("/app"),
+            start("fail", vec![0], mix.clone()),
+        ));
+        assert_eq!(out.unwrap_err(), "provider_unknown (fake)");
+        assert!(!root.join("p.fail").exists());
+        // An identity that cannot use the board is refused before any agent is made.
+        std::fs::write(
+            project.join(".agents/agents/reader.md"),
+            "---\ntools: read\n---\nRead.",
+        )
+        .unwrap();
+        let before = fake.ops("create").len();
+        let reader = vec![Mix {
+            identity: "reader".into(),
+            model: "a/x".into(),
+            share: 100,
+        }];
+        let error = rt
+            .block_on(super::start(
+                &client,
+                &root,
+                Path::new("/app"),
+                start("read", vec![0], reader),
+            ))
+            .unwrap_err();
+        assert!(error.starts_with("identity_without_shell"), "{error}");
+        assert_eq!(fake.ops("create").len(), before);
+        assert!(!root.join("p.read").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn an_added_agent_takes_the_next_free_name_and_brings_its_budget() {
+        let home = scratch("add");
+        let root = home.join("swarms");
+        let mut s = swarm(&[&agent(1), &agent(2)]);
+        s.workspace = home.to_string_lossy().into_owned();
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        // latency-3 is some other bot's name already.
+        let fake = Fake::start(
+            "add",
+            Box::new(|op, request| match op {
+                "create" if request["bot"] == "agent.latency-3" => Err("bot_exists".into()),
+                "create" => Ok(made(request)),
+                "submit" => Ok(json!({"status": "running"})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let out = rt.block_on(add(&client, &root, &s.name, 0)).unwrap();
+        assert_eq!(
+            out["swarm"]["members"],
+            json!([agent(1), agent(2), agent(4)])
+        );
+        assert_eq!(out["swarm"]["budget_tokens"], 4_500_000);
+        assert_eq!(
+            fake.ops("create").last().unwrap()["budget_tokens"],
+            1_500_000
+        );
+        let brief = fake.ops("submit").pop().unwrap();
+        assert_eq!(brief["bot"], agent(4));
+        assert!(
+            brief["prompt"]
+                .as_str()
+                .unwrap()
+                .ends_with("so read the board first.")
+        );
+        assert!(
+            rt.block_on(add(&client, &root, &s.name, 1))
+                .unwrap_err()
+                .starts_with("invalid_agents")
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn stop_ends_every_unfinished_turn_newest_first_and_a_reused_name_leaves() {
+        let root = scratch("stop");
+        let s = swarm(&[&agent(1), &agent(2), &agent(3)]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let fake = Fake::start(
+            "stop",
+            Box::new(|op, request| {
+                let bot = request["bot"].as_str().unwrap_or_default();
+                match (op, bot) {
+                    // latency-2 was deleted and made again: another bot now.
+                    ("resume", "agent.latency-2") => Ok(json!({"id": 99})),
+                    ("resume", "agent.latency-3") => Err("bot_not_found".into()),
+                    ("resume", _) => Ok(json!({"id": 1})),
+                    ("turns", _) if request["after"] == 0 => Ok(json!({
+                        "turns": [{"turn": 5, "status": "completed"}, {"turn": 6, "status": "running"}],
+                        "next_after": 6,
+                    })),
+                    ("turns", _) => {
+                        Ok(json!({"turns": [{"turn": 7, "status": "queued"}], "next_after": null}))
+                    }
+                    ("interrupt", _) if request["turn"] == 6 => Err("stale_turn".into()),
+                    ("interrupt", _) => Ok(json!({"interrupt_requested": true})),
+                    _ => Err("unexpected".into()),
+                }
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let out = rt.block_on(stop(&client, &root, &s.name)).unwrap();
+        assert_eq!(out["failed"], json!([]));
+        assert_eq!(out["swarm"]["stopped"], true);
+        assert_eq!(out["swarm"]["members"], json!([agent(1)]));
+        let ended: Vec<Value> = fake
+            .ops("interrupt")
+            .iter()
+            .map(|i| json!([i["bot"], i["turn"]]))
+            .collect();
+        assert_eq!(ended, vec![json!([agent(1), 7]), json!([agent(1), 6])]);
+        assert!(fake.ops("turns").iter().all(|t| t["bot"] == agent(1)));
+        let read = Swarm::read(&dir).unwrap();
+        assert!(read.stopped && read.rows.len() == 1 && read.ids.len() == 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2210,8 +3145,12 @@ mod tests {
             .map(|i| {
                 let (root, name) = (root.clone(), s.name.clone());
                 std::thread::spawn(move || {
-                    join(&root, &name, &[(format!("{name}-{i}"), i)], 0).unwrap();
-                    set_stopped(&root, &name, i % 2 == 0).unwrap();
+                    enrol(&root, &name, &[(format!("{name}-{i}"), i)], 0).unwrap();
+                    update(&root.join(&name), |s| {
+                        s.stopped = i % 2 == 0;
+                        Ok(())
+                    })
+                    .unwrap();
                 })
             })
             .collect();

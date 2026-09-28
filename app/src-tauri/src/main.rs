@@ -176,6 +176,9 @@ mod config_tests {
     }
 }
 
+/// The tools a bot gets unless its profile names its own.
+const TOOLS: [&str; 6] = ["shell", "read", "write", "edit", "wait", "history"];
+
 /// What the page needs to create bots and to say where it is. There is no
 /// default model: each project and agent is given its own.
 #[tauri::command]
@@ -183,7 +186,7 @@ fn setup(state: State<'_, Shared>) -> Result<Value, String> {
     Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
         "workspace": state.config.workspace,
-        "tools": ["shell", "read", "write", "edit", "wait", "history"],
+        "tools": TOOLS,
     }))
 }
 
@@ -200,7 +203,29 @@ fn policy(
         Some(dir) => workspace_path(std::path::Path::new(&dir))?,
         None => state.config.workspace.clone(),
     };
-    compose(std::path::Path::new(&dir), profile.as_deref())
+    compose(std::path::Path::new(&dir), profile.as_deref(), None)
+}
+
+/// The profiles a folder offers as identities for a swarm's agents, with
+/// what each says it is and the model it names: the folder's and the
+/// user's, not the roles the app gives a coordinator and a swarm's agents.
+#[tauri::command]
+fn profiles(dir: String) -> Result<Value, String> {
+    let dir = workspace_path(std::path::Path::new(&dir))?;
+    let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
+    let workspace = std::path::Path::new(&dir);
+    let listed = agent_client::policy::instructions(workspace, None).map_err(failed)?;
+    let mut out = Vec::new();
+    for entry in listed.profiles {
+        if BUILT_IN.iter().any(|(name, _)| *name == entry.name) {
+            continue;
+        }
+        let model = agent_client::policy::profile(workspace, &entry.name)
+            .map_err(failed)?
+            .and_then(|p| p.model);
+        out.push(json!({"name": entry.name, "summary": entry.summary, "model": model}));
+    }
+    Ok(json!(out))
 }
 
 /// The roles the app ships, used where neither the folder nor the user has
@@ -351,23 +376,35 @@ async fn discover_models(state: State<'_, Shared>) -> Result<Value, String> {
 
 /// Too much or unreadable text fails with the CLI's `--agents` code, and
 /// `/new` creates nothing: a bot without its workspace's rules is worse
-/// than no bot.
-fn compose(workspace: &std::path::Path, profile: Option<&str>) -> Result<Value, String> {
+/// than no bot. `also` names a role whose text follows the profile's, as a
+/// swarm's rules follow an identity's; the profile's model and tools stand.
+fn compose(
+    workspace: &std::path::Path,
+    profile: Option<&str>,
+    also: Option<&str>,
+) -> Result<Value, String> {
     use agent_client::policy::Profile;
     let failed = |error: agent_client::policy::Failure| format!("{}: {error}", error.code());
-    let role = match profile {
-        None => None,
-        Some(name) => Some(
-            match agent_client::policy::profile(workspace, name).map_err(failed)? {
-                Some(role) => role,
-                None => BUILT_IN
-                    .iter()
-                    .find(|(built, _)| *built == name)
-                    .map(|(_, text)| Profile::parse(name, None, text))
-                    .ok_or_else(|| format!("profile_not_found: no .agents/agents/{name}.md"))?,
-            },
-        ),
+    let find = |name: &str| -> Result<Profile, String> {
+        match agent_client::policy::profile(workspace, name).map_err(failed)? {
+            Some(role) => Ok(role),
+            None => BUILT_IN
+                .iter()
+                .find(|(built, _)| *built == name)
+                .map(|(_, text)| Profile::parse(name, None, text))
+                .ok_or_else(|| format!("profile_not_found: no .agents/agents/{name}.md")),
+        }
     };
+    let mut role = profile.map(find).transpose()?;
+    if let (Some(role), Some(also)) = (role.as_mut(), also) {
+        let also = find(also)?;
+        role.body = [role.body.as_str(), also.body.as_str()]
+            .iter()
+            .filter(|body| !body.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+    }
     let composed = agent_client::policy::instructions(workspace, role.as_ref()).map_err(failed)?;
     let mut note = format!(
         "preamble + {} AGENTS.md + {} skills + {} profiles",
@@ -403,15 +440,15 @@ mod policy_tests {
         let root = root.canonicalize().unwrap();
         let file = root.join("AGENTS.md");
         std::fs::write(&file, "rule").unwrap();
-        let composed = compose(&root, None).unwrap();
+        let composed = compose(&root, None, None).unwrap();
         let rule = format!("{}\n\nrule", file.display());
         assert!(composed["instructions"].as_str().unwrap().contains(&rule));
         std::fs::write(&file, "x".repeat(agent_client::policy::MAX_INSTRUCTIONS)).unwrap();
-        let error = compose(&root, None).unwrap_err();
+        let error = compose(&root, None, None).unwrap_err();
         assert!(error.starts_with("instructions_limit: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::write(&file, [0xff, 0xfe]).unwrap();
-        let error = compose(&root, None).unwrap_err();
+        let error = compose(&root, None, None).unwrap_err();
         assert!(error.starts_with("instructions_unreadable: "), "{error}");
         assert!(error.contains(file.to_str().unwrap()), "{error}");
         std::fs::remove_dir_all(root).unwrap();
@@ -423,7 +460,7 @@ mod policy_tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let built = compose(&root, Some("coordinator")).unwrap();
+        let built = compose(&root, Some("coordinator"), None).unwrap();
         let text = built["instructions"].as_str().unwrap();
         assert!(text.contains("# Role: coordinator\n\nYou coordinate the work in this folder."));
         assert!(text.contains("git worktree add -b agent/NAME"));
@@ -443,7 +480,7 @@ mod policy_tests {
             "---\nmodel: openai/gpt-6-luna\ntools: shell, wait\n---\nOur own way.",
         )
         .unwrap();
-        let own = compose(&root, Some("coordinator")).unwrap();
+        let own = compose(&root, Some("coordinator"), None).unwrap();
         assert!(
             own["instructions"]
                 .as_str()
@@ -453,7 +490,7 @@ mod policy_tests {
         assert_eq!(own["model"], "openai/gpt-6-luna");
         assert_eq!(own["tools"], serde_json::json!(["shell", "wait"]));
         assert!(
-            compose(&root, Some("nobody"))
+            compose(&root, Some("nobody"), None)
                 .unwrap_err()
                 .starts_with("profile_not_found: ")
         );
@@ -528,7 +565,6 @@ async fn pull(state: State<'_, Shared>, session: u64) -> Result<Value, String> {
     Ok(json!({"events": batch, "closed": false}))
 }
 
-/// Page diagnostics land on stderr, where a terminal can see them.
 /// Every swarm in `~/.agent/swarms`, and the folders there that are not
 /// readable swarms.
 #[tauri::command]
@@ -553,69 +589,47 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())?
 }
 
-/// A new swarm in a project folder: its name taken, the place its agents
-/// share made (a worktree, unless they work in the project folder), and its
-/// folder written. The page then creates the agents and has them join.
+/// Start a swarm in a project folder, agents and all (see `swarm::start`).
+/// `mix` is its rows of identity, model and share; `rows` is each agent's.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn swarm_create(
+async fn swarm_start(
     state: State<'_, Shared>,
     project: String,
     name: String,
     folder: String,
     goal: String,
     shared: bool,
-    model: String,
+    mix: Vec<Value>,
+    rows: Vec<usize>,
     budget_tokens: u64,
     council: usize,
 ) -> Result<Value, String> {
-    let root = swarms_of(&state)?;
-    let folder = workspace_path(std::path::Path::new(&folder))?;
-    let full = format!("{project}.{name}");
-    swarm::valid_goal(&goal)?;
-    let dir = swarm::claim(&root, &full)?;
-    let workspace = match swarm::place(std::path::Path::new(&folder), &full, shared).await {
-        Ok(workspace) => workspace,
-        Err(error) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(error);
-        }
-    };
-    let s = swarm::Swarm {
-        name: full,
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    let mix = (mix.iter())
+        .map(swarm::Mix::from_json)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("invalid_mix: each row is an identity, a model and a share")?;
+    let start = swarm::Start {
         project,
-        goal: goal.trim().to_owned(),
-        workspace,
-        model,
+        name,
+        folder: workspace_path(std::path::Path::new(&folder))?.into(),
+        goal,
+        shared,
+        mix,
+        rows,
         budget_tokens,
-        members: Vec::new(),
-        ids: Default::default(),
-        stopped: false,
         council,
     };
-    let filled = std::env::current_exe()
-        .map_err(|e| e.to_string())
-        .and_then(|app| swarm::fill(&dir, &s, &app));
-    if let Err(error) = filled {
-        if shared {
-            let _ = swarm::unplace(&s.name).await;
-        }
-        return Err(error);
-    }
-    Ok(s.json(&dir))
+    let app = std::env::current_exe().map_err(|e| e.to_string())?;
+    swarm::start(&client, &swarms_of(&state)?, &app, start).await
 }
 
-/// Agents the daemon made, by name and bot id, and the tokens their
-/// budgets add to the swarm's.
+/// One more agent, from `row` of the swarm's mix.
 #[tauri::command]
-async fn swarm_join(
-    state: State<'_, Shared>,
-    swarm: String,
-    members: Vec<(String, i64)>,
-    added_budget: u64,
-) -> Result<Value, String> {
-    let root = swarms_of(&state)?;
-    blocking(move || swarm::join(&root, &swarm, &members, added_budget)).await
+async fn swarm_add(state: State<'_, Shared>, swarm: String, row: usize) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    swarm::add(&client, &swarms_of(&state)?, &swarm, row).await
 }
 
 #[tauri::command]
@@ -629,18 +643,9 @@ async fn swarm_leave(
 }
 
 #[tauri::command]
-async fn swarm_discard(state: State<'_, Shared>, swarm: String) -> Result<(), String> {
-    swarm::discard(&swarms_of(&state)?, &swarm).await
-}
-
-#[tauri::command]
-async fn swarm_stop(
-    state: State<'_, Shared>,
-    swarm: String,
-    stopped: bool,
-) -> Result<Value, String> {
-    let root = swarms_of(&state)?;
-    blocking(move || swarm::set_stopped(&root, &swarm, stopped)).await
+async fn swarm_stop(state: State<'_, Shared>, swarm: String) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    swarm::stop(&client, &swarms_of(&state)?, &swarm).await
 }
 
 #[tauri::command]
@@ -682,6 +687,7 @@ async fn swarm_decide(
     swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
 }
 
+/// Page diagnostics land on stderr, where a terminal can see them.
 #[tauri::command]
 fn log(message: String) {
     eprintln!("agent-app page: {message}");
@@ -724,6 +730,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             setup,
             policy,
+            profiles,
             branch,
             models,
             project,
@@ -737,10 +744,9 @@ fn main() {
             request,
             log,
             swarms,
-            swarm_create,
-            swarm_join,
+            swarm_start,
+            swarm_add,
             swarm_leave,
-            swarm_discard,
             swarm_stop,
             swarm_board,
             swarm_post,

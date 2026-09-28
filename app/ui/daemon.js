@@ -25,11 +25,11 @@ window.Daemon = (() => {
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
       swarms: () => invoke('swarms'),
-      swarmCreate: ({ project, name, folder, goal, shared, model, budgetTokens, council }) => invoke('swarm_create', { project, name, folder, goal, shared, model, budgetTokens, council: council ?? 0 }),
-      swarmJoin: (swarm, members, addedBudget = 0) => invoke('swarm_join', { swarm, members, addedBudget }),
+      profiles: (dir) => invoke('profiles', { dir }),
+      swarmStart: ({ project, name, folder, goal, shared, mix, rows, budgetTokens, council }) => invoke('swarm_start', { project, name, folder, goal, shared, mix, rows, budgetTokens, council: council ?? 0 }),
+      swarmAdd: (swarm, row) => invoke('swarm_add', { swarm, row }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
-      swarmDiscard: (swarm) => invoke('swarm_discard', { swarm }),
-      swarmStop: (swarm, stopped) => invoke('swarm_stop', { swarm, stopped }),
+      swarmStop: (swarm) => invoke('swarm_stop', { swarm }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
       swarmPost: (swarm, text) => invoke('swarm_post', { swarm, text }),
       swarmDecide: (swarm, id, approve, reason) => invoke('swarm_decide', { swarm, id, approve, reason: reason ?? '' }),
@@ -253,7 +253,17 @@ window.Daemon = (() => {
   const memberOf = (name) => [...S.swarms.values()].find((sw) => sw.members.includes(name)) ?? null;
   const short = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
   const seats = (sw) => sw.members.slice(0, sw.council);
-  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, model: sw.model, budget_tokens: sw.budget, members: [...sw.members], ids: { ...sw.ids }, stopped: sw.stopped, council: sw.council, seats: seats(sw) });
+  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, budget_tokens: sw.budget, mix: sw.mix.map((r) => ({ ...r })), members: [...sw.members], ids: { ...sw.ids }, rows: { ...sw.rows }, stopped: sw.stopped, council: sw.council, seats: seats(sw) });
+  // Agents made from rows of the mix, each joined and then briefed, as the app's side does.
+  async function enlist(sw, rows, each, late = false) {
+    const bots = [];
+    for (const [name, row] of rows) {
+      const b = await api.request('create', { bot: name, model: sw.mix[row].model, workspace: sw.workspace, budget_tokens: each });
+      sw.members.push(name); sw.ids[name] = b.id; sw.rows[name] = row; bots.push(b);
+    }
+    for (const [name] of rows) reply(name, `You are ${short(sw, name)}, one of ${sw.members.length} agents in the swarm ${short(sw, sw.name)}.${late ? ' You joined after the others started, so read the board first.' : ''}`);
+    return bots;
+  }
   // The board's roles, proposals and streams, by the app's rules: a majority of the seats decides, you
   // decide alone, and an approved proposal opens its stream with its proposer in it.
   function councilAct(sw, from, act) {
@@ -361,15 +371,26 @@ window.Daemon = (() => {
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
-    swarmCreate: async ({ project, name, folder, goal, shared, model, budgetTokens, council = 0 }) => {
+    profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
+    swarmStart: async ({ project, name, folder, goal, shared, mix, rows, budgetTokens, council = 0 }) => {
       const full = `${project}.${name}`; if (S.swarms.has(full)) throw new Error(`swarm_exists: ${full}`);
-      const sw = { name: full, project, goal, model, budget: budgetTokens, council, state: { roles: {}, streams: {}, proposals: [] }, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
-      S.swarms.set(full, sw); await wait(300); return swarmRecord(sw);
+      const sw = { name: full, project, goal, mix, budget: budgetTokens, council, state: { roles: {}, streams: {}, proposals: [] }, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, rows: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
+      S.swarms.set(full, sw); await wait(300);
+      const bots = await enlist(sw, rows.map((row, i) => [`${full}-${i + 1}`, row]), Math.max(1, Math.floor(budgetTokens / rows.length)));
+      return { swarm: swarmRecord(sw), bots, failed: [] };
     },
-    swarmJoin: async (swarm, members, addedBudget = 0) => { const sw = S.swarms.get(swarm); for (const [m, id] of members) { if (!sw.members.includes(m)) sw.members.push(m); sw.ids[m] = id; } sw.budget += addedBudget; return swarmRecord(sw); },
-    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; return swarmRecord(sw); },
-    swarmDiscard: async (swarm) => { if (S.swarms.get(swarm)?.members.length) throw new Error(`swarm_has_agents: ${swarm}`); S.swarms.delete(swarm); },
-    swarmStop: async (swarm, stopped) => { const sw = S.swarms.get(swarm); sw.stopped = stopped; return swarmRecord(sw); },
+    swarmAdd: async (swarm, row) => {
+      const sw = S.swarms.get(swarm), each = Math.max(1, Math.floor(sw.budget / Math.max(1, sw.members.length)));
+      let i = sw.members.length + 1; while (sw.members.includes(`${swarm}-${i}`) || S.bots.has(`${swarm}-${i}`)) i++;
+      const bots = await enlist(sw, [[`${swarm}-${i}`, row]], each, true); sw.budget += each;
+      return { swarm: swarmRecord(sw), bots, failed: [] };
+    },
+    swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; delete sw.rows[member]; return swarmRecord(sw); },
+    swarmStop: async (swarm) => {
+      const sw = S.swarms.get(swarm); sw.stopped = true;
+      for (const m of sw.members) { const b = S.bots.get(m); if (b?.running_turn != null) { b.interrupted = true; finish(m, b.running_turn, 'interrupted'); } }
+      return { swarm: swarmRecord(sw), failed: [] };
+    },
     swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false, reset: offset == null, state: JSON.parse(JSON.stringify(sw.state)) }; },
     swarmDecide: async (swarm, id, approve) => { const sw = S.swarms.get(swarm); const lines = councilAct(sw, 'user', { vote: id, yes: approve }); sw.board.push(...lines); return { posted: true, id, decided: approve ? 'approved' : 'denied', steered: [], woke: [], missed: [] }; },
     swarmPost: async (swarm, text) => {

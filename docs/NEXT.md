@@ -1004,9 +1004,16 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     one board or a council of 3 (its first agents) that votes on proposed
     streams; you can decide any proposal; a stream's posts reach its own
     agents unless posted to everyone. Not built: curator digests, ✓ checks
-    from real results, and ⚠ same-file edits from the v12 prototype. Next:
-    the same goal three ways (a flat board, council and streams, one lead)
-    with equal models and budget, on George's Mac; Keep. Approvals in the app wait: George runs
+    from real results, and ⚠ same-file edits from the v12 prototype. Done
+    (2026-09-28): a swarm's mix, rows of an identity (a profile, such as a
+    reviewer), a model and a share, dealt to whole agents; Start, Add and
+    Stop as one call each to the app's Rust side, which undoes a failed
+    start (Astra's review of #60); and each board line's `reached` count.
+    Next: the same goal three ways (a flat board, council and streams, one
+    lead) with equal models and budget, on George's Mac, comparing tokens,
+    wall time, result, and deliveries from the board (Astra: in a flat
+    swarm every post reaches every working agent, so 16 posting once each
+    is 240 deliveries, each re-read as context); Keep. Approvals in the app wait: George runs
     with full access.
     A fork into another provider stays out: history is provider-native.
     Done (2026-09-28): setup and settings, the first items of an app audit

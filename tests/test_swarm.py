@@ -42,9 +42,12 @@ class SwarmPostTests(ModelFixture):
         listed = ', '.join(json.dumps(m) for m in members)
         ids = self.ids()
         pinned = ''.join(f'{json.dumps(m)} = {ids[m]}\n' for m in members)
+        rows = ''.join(f'{json.dumps(m)} = 0\n' for m in members)
         (folder / 'swarm.toml').write_text(
-            f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\nmodel = "openai/synthetic-model"\n'
-            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\ncouncil = {council}\n[ids]\n{pinned}')
+            f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\n'
+            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\ncouncil = {council}\n'
+            f'[[mix]]\nidentity = ""\nmodel = "openai/synthetic-model"\nshare = 100\n'
+            f'[ids]\n{pinned}[rows]\n{rows}')
         (folder / 'board.jsonl').write_text('')
         for tool, flag in [('post', ''), ('propose', ' --propose'), ('vote', ' --vote'), ('join', ' --join')]:
             script = folder / tool
@@ -86,6 +89,8 @@ class SwarmPostTests(ModelFixture):
         self.assertEqual(len(board), 1)
         self.assertEqual((board[0]['from'], board[0]['bot'], board[0]['text']), ('s-1', 'p.s-1', '@s-3 take the tests'))
         self.assertEqual(board[0]['turn'], self.turns('p.s-1')[-1]['turn'])
+        # The line says how many agents it reached: what a swarm's posts cost is on its board.
+        self.assertEqual(board[0]['reached'], 2)
         # The named idle agent got a turn of its own; the other idle one heard nothing.
         woken = self.turns('p.s-3')[-1]
         self.assertEqual((woken['prompt_preview'], woken['delivery']), ('[board] s-1: @s-3 take the tests', 'steer'))

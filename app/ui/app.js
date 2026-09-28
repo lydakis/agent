@@ -327,7 +327,7 @@ const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slic
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
 function learnSwarm(record, batch = false) {
   const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, proposals: [] }, filter: null };
-  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, model: record.model, budget: record.budget_tokens, members: record.members ?? [], ids: record.ids ?? {}, stopped: !!record.stopped, council: record.council ?? 0, seats: record.seats ?? [] });
+  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, budget: record.budget_tokens, mix: record.mix ?? [], members: record.members ?? [], ids: record.ids ?? {}, rows: record.rows ?? {}, stopped: !!record.stopped, council: record.council ?? 0, seats: record.seats ?? [] });
   S.swarms.set(sw.name, sw); if (!batch) indexMembers();
   return sw;
 }
@@ -398,21 +398,27 @@ function boardSoon(sw, usage) {
   if (boardTimers.has(sw.name)) return;
   boardTimers.set(sw.name, setTimeout(() => { boardTimers.delete(sw.name); if (S.selected !== swarmKey(sw.name)) return; readBoard(sw); if (sw.usageDue) { sw.usageDue = false; readUsage(sw); } }, 150));
 }
-const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
-// What an agent is told first: who it is, the goal, and the board's two paths. How to use them is its
-// profile's (`swarm`), so a folder can change it.
-function brief(sw, m, late = false) {
-  const others = sw.members.filter((x) => x !== m).map((x) => memberShort(sw, x));
-  const tool = (name, args) => `${name[0].toUpperCase()}${name.slice(1)}: ${shq(`${sw.dir}/${name}`)} ${args}`;
-  const council = sw.council ? [
-    tool('propose', 'STREAM WHY'), tool('vote', 'ID yes|no REASON'), tool('join', 'STREAM'),
-    `Council seats: ${sw.seats.map((x) => memberShort(sw, x)).join(', ')}${sw.seats.includes(m) ? ' (you hold one)' : ''}`,
-  ] : [];
-  return [
-    `You are ${memberShort(sw, m)}, one of ${sw.members.length} agents in the swarm ${memberShort(sw, sw.name)}, all working in this folder.`,
-    `Goal: ${sw.goal}`, tool('post', 'TEXT'), tool('role', 'ROLE'), ...council, `Board: ${shq(sw.dir + '/board.jsonl')}`,
-    `The others: ${others.join(', ') || 'none yet'}`, ...(late ? ['You joined after the others started, so read the board first.'] : []),
-  ].join('\n');
+// A swarm's mix is rows of an identity (a profile, or '' for a plain agent), a model and a share in
+// percent. Its agents are dealt one at a time, each to the row furthest below its share of the agents
+// so far, so any prefix of them is as close to the mix as whole agents allow: the council's seats (its
+// first agents) mix too, and an added agent keeps the swarm on its shares.
+function nextRow(mix, counts) {
+  const t = counts.reduce((a, c) => a + c, 0) + 1;
+  let best = 0; mix.forEach((row, i) => { if (row.share * t - 100 * counts[i] > mix[best].share * t - 100 * counts[best]) best = i; });
+  return best;
+}
+function mixRows(mix, n) {
+  const counts = mix.map(() => 0), rows = [];
+  for (let k = 0; k < n; k++) { const i = nextRow(mix, counts); counts[i] += 1; rows.push(i); }
+  return rows;
+}
+const mixCounts = (mix, rows) => { const counts = mix.map(() => 0); for (const r of rows) if (r in counts) counts[r] += 1; return counts; };
+const modelShort = (id) => String(id ?? '').slice(providerOf(id).length + 1) || String(id ?? '');
+// What a member is, where the swarm has more than one kind: its identity, and its model when they differ.
+function kindOf(sw, member) {
+  const row = sw.mix[sw.rows[member]]; if (!row) return '';
+  const models = new Set(sw.mix.map((r) => r.model));
+  return [row.identity, models.size > 1 && modelShort(row.model)].filter(Boolean).join(' · ');
 }
 // A name from the goal: its longest word among the first few that say something, then -2, -3 ... until free.
 // `lock` too: Git refuses a branch named `agent/PROJECT.lock`.
@@ -425,63 +431,40 @@ function swarmName(project, goal, skip = new Set()) {
   let name = base; for (let k = 2; taken(name); k++) name = `${base}-${k}`;
   return name;
 }
-// Each agent is created, then joins, then gets its brief, so a post never reaches an agent the daemon
-// does not have and every agent is a member before any of them speaks.
-// A late agent's budget adds to the swarm's, so the budget shown is what its agents may spend.
-async function startAgents(sw, names, policy, each, late = false) {
+// Starting, adding and stopping are one call each: the app's side makes the agents, has them join and
+// briefs them, or ends their turns, and undoes what a failed start made. The page learns the result.
+async function learnStarted(r, want) {
   const session = S.session;
-  const made = await Promise.allSettled(names.map((m) => Daemon.request('create', { bot: m, workspace: sw.workspace, model: sw.model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools, budget_tokens: each })));
-  const records = made.filter((r) => r.status === 'fulfilled').map((r) => r.value);
-  await enqueue(() => { if (S.session === session) for (const r of records) seat(r, session); });
-  if (records.length) learnSwarm(await Daemon.swarmJoin(sw.name, records.map((r) => [r.name, r.id]), late ? each * records.length : 0));
-  const sent = await Promise.allSettled(records.map((r) => Daemon.request('submit', { bot: r.name, bot_id: r.id, request_id: `app-${crypto.randomUUID()}`, prompt: brief(sw, r.name, late), delivery: 'reject' })));
-  const failed = [...made, ...sent].find((r) => r.status === 'rejected');
-  if (failed) toast(`${records.length} of ${names.length} agents started: ${failed.reason?.message ?? failed.reason}`, 6000);
+  await enqueue(() => { if (S.session === session) for (const b of r.bots ?? []) seat(b, session); });
+  const sw = learnSwarm(r.swarm);
+  const failed = r.failed ?? [];
+  if (failed.length) toast(`${want - failed.length} of ${want} agents started: ${failed[0].agent}: ${failed[0].error}`, 6000);
+  return sw;
 }
-async function createSwarm(project, { goal, n, model, shared, budget, council = 0 }) {
+async function createSwarm(project, { goal, n, mix, shared, budget, council = 0 }) {
   const lead = bot(project + LEAD); if (!lead?.workspace) throw new Error(`no coordinator for ${project}`);
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
+  const rows = mixRows(mix, n);
   // A name another store holds as a worktree or branch is taken here too: try the next.
-  const skip = new Set(); let sw;
+  const skip = new Set(); let r;
   for (;;) {
     const name = swarmName(project, goal, skip);
-    try { sw = learnSwarm(await Daemon.swarmCreate({ project, name, folder: lead.workspace, goal, shared, model, budgetTokens: budget, council })); break; }
+    try { r = await Daemon.swarmStart({ project, name, folder: lead.workspace, goal, shared, mix, rows, budgetTokens: budget, council }); break; }
     catch (e) { if (!/^swarm_exists/.test(e?.message ?? e) || skip.size >= 8) throw e; skip.add(name); }
   }
-  // Composed for the folder the agents work in, so its AGENTS.md and a `swarm` profile there apply.
-  // A folder whose policy cannot compose gets no agents, so the swarm goes with its worktree.
-  let policy;
-  try { policy = await Daemon.policy(sw.workspace, 'swarm'); }
-  catch (e) { await Daemon.swarmDiscard(sw.name).catch(() => {}); S.swarms.delete(sw.name); indexMembers(); throw e; }
-  await startAgents(sw, Array.from({ length: n }, (_, i) => `${sw.name}-${i + 1}`), policy, Math.max(1, Math.floor(budget / n)));
+  const sw = await learnStarted(r, n);
   await openOnly(swarmKey(sw.name));
 }
+// An added agent comes from the row furthest below its share.
 async function addAgent(sw) {
-  const used = new Set(sw.members); let i = sw.members.length + 1; while (used.has(`${sw.name}-${i}`) || S.bots.has(`${sw.name}-${i}`)) i++;
-  const policy = await Daemon.policy(sw.workspace, 'swarm');
-  await startAgents(sw, [`${sw.name}-${i}`], policy, Math.max(1, Math.floor(sw.budget / Math.max(1, sw.members.length))), true);
+  const row = nextRow(sw.mix, mixCounts(sw.mix, sw.members.map((m) => sw.rows[m])));
+  await learnStarted(await Daemon.swarmAdd(sw.name, row), 1);
 }
 // Stopped, the swarm refuses its agents' posts, so nothing wakes them; your next post resumes it.
 async function stopSwarm(sw) {
-  learnSwarm(await Daemon.swarmStop(sw.name, true));
-  const failed = (await Promise.allSettled(sw.members.map((m) => endTurns(sw, m)))).find((r) => r.status === 'rejected');
-  toast(failed ? `stop: ${failed.reason?.message ?? failed.reason}` : 'stopped every agent; your next post resumes the swarm', failed ? 6000 : 4000);
-}
-// Every turn an agent has not finished, the queued ones included, newest first, so none of them is
-// started as an older one ends. A turn that ended meanwhile is already stopped. A name whose bot is
-// gone or is another bot now (deleted while no window watched) leaves the swarm, its turns untouched.
-async function endTurns(sw, name) {
-  const now = await Daemon.request('resume', { bot: name }).catch((e) => { if (/bot_not_found/.test(e?.message ?? e)) return null; throw e; });
-  if (now?.id !== sw.ids[name]) { learnSwarm(await Daemon.swarmLeave(sw.name, name)); return; }
-  const open = []; let after = 0;
-  do {
-    const page = await Daemon.request('turns', { bot: name, after, limit: 256 });
-    for (const t of page.turns ?? []) if (ACTIVE.has(t.status)) open.push(t.turn);
-    after = page.next_after ?? null;
-  } while (after !== null);
-  for (const turn of open.reverse()) {
-    await Daemon.request('interrupt', { bot: name, turn }).catch((e) => { if (!/stale_turn|no_active_turn/.test(e?.message ?? e)) throw e; });
-  }
+  const r = await Daemon.swarmStop(sw.name); learnSwarm(r.swarm);
+  const failed = r.failed?.[0];
+  toast(failed ? `stop: ${failed.agent}: ${failed.error}` : 'stopped every agent; your next post resumes the swarm', failed ? 6000 : 4000);
 }
 // You decide an open proposal: approving opens its stream with its proposer as lead.
 async function decide(sw, id, approve) {
@@ -1279,7 +1262,9 @@ function tally(sw, p) {
 function postHTML(sw, line) {
   if (line.from == null) return `<div class="line note">${esc(line.text ?? '')}</div>`;
   const you = line.from === 'user', member = line.bot ?? `${sw.project}.${line.from}`;
-  const who = you ? '<span class="who you">you</span>' : line.from === 'council' ? '<span class="who council">council</span>' : `<button type="button" class="who" data-task="${esc(member)}">${esc(line.from)}</button>`;
+  // A swarm of more than one kind keeps a wider name column, so its posts still line up.
+  const kind = !you && kindOf(sw, member), w = sw.mix.length > 1 ? ' wide' : '';
+  const who = you ? `<span class="who you${w}">you</span>` : line.from === 'council' ? `<span class="who council${w}">council</span>` : `<button type="button" class="who${w}" data-task="${esc(member)}">${esc(line.from)}${kind ? ` <span class="kind">${esc(kind)}</span>` : ''}</button>`;
   const text = inline(String(line.text ?? '')).replace(/(^|[\s(])@([A-Za-z0-9_.-]*[A-Za-z0-9_-])/g, '$1<span class="at">@$2</span>');
   const row = (cls, body) => `<div class="line post ${cls}">${who}<span class="pt">${body}</span></div>`;
   switch (line.kind) {
@@ -1328,8 +1313,8 @@ function renderSwarm(el, sw) {
   if (el.dataset.key !== key) {
     el.dataset.key = key;
     if (sw.tab === 'agents') {
-      // Each card says what its agent took on, and the stream it works in.
-      const cards = sw.members.filter((m) => memberBot(sw, m)).map((m) => { const c = taskCard(m), short = memberShort(sw, m); if (c) c.name = [c.name, sw.state.roles?.[short], sw.state.streams?.[short] && `#${sw.state.streams[short]}`].filter(Boolean).join(' · '); return c; }).filter(Boolean);
+      // Each card says what its agent is, what it took on, and the stream it works in.
+      const cards = sw.members.filter((m) => memberBot(sw, m)).map((m) => { const c = taskCard(m), short = memberShort(sw, m); if (c) c.name = [c.name, kindOf(sw, m), sw.state.roles?.[short], sw.state.streams?.[short] && `#${sw.state.streams[short]}`].filter(Boolean).join(' · '); return c; }).filter(Boolean);
       el.innerHTML = cards.length ? cards.map(cardHTML).join('') : '<div class="line note">no agents yet</div>';
     } else if (sw.tab === 'council') el.innerHTML = councilHTML(sw);
     else if (sw.tab === 'streams') el.innerHTML = streamsHTML(sw);
@@ -1343,33 +1328,81 @@ function renderSwarm(el, sw) {
 }
 
 // ---------- the new swarm sheet ----------
-// A goal, how many agents, their model, where they work, and a budget they share.
+// A goal, how many agents, what they are, where they work, and a budget they share. What they are is
+// a mix: rows of an identity (a profile the folder offers, or a plain agent), a model, and a share,
+// shown as the whole agents it makes at the size picked.
 const SWARM_SIZES = [2, 4, 6, 8, 12, 16], SWARM_BUDGETS = [[1e6, '1M tokens'], [3e6, '3M tokens'], [1e7, '10M tokens']];
+const MIX_ROWS = 8;
 let sheetFor = null;
+const sheet = { models: [], profiles: [], mix: [] };
 async function openSwarmSheet(project) {
   closeMenu();
   const lead = bot(project + LEAD); if (!lead) return;
   // Its agents start on the project's model unless another is picked.
   let models = []; try { models = connected(await Daemon.models(), setupState().settings ?? await loadSettings().catch(() => null)); } catch (_) {}
+  let profiles = []; try { profiles = await Daemon.profiles(lead.workspace); } catch (e) { toast(`profiles: ${e?.message ?? e}`, 5000); }
+  const first = [lead.model, lastModel()].find((m) => m && models.some((x) => x.id === m)) ?? '';
+  Object.assign(sheet, { models, profiles, mix: [{ identity: '', model: first, share: 100 }] });
   sheetFor = project;
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
-    <div class="row"><div><label for="sw-n">Agents</label>${sel('sw-n', SWARM_SIZES.map((n) => [n, String(n)]), 4)}</div><div class="wide"><label for="sw-model">Model</label>${modelSelectHTML('sw-model', models, lead.model)}</div></div>
-    <div class="row"><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
+    <div class="row"><div><label for="sw-n">Agents</label>${sel('sw-n', SWARM_SIZES.map((n) => [n, String(n)]), 4)}</div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
+    <label>Made of</label><div id="sw-mix" class="mix"></div>
     <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: each agent takes a piece'], [3, 'A council of 3 approves streams of work']], 0)}
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
+  renderMix();
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
   setTimeout(() => $('sw-goal').focus?.(), 0);
 }
+// The mix's rows, each with how many agents it makes, and what is wrong with it if anything.
+function mixProblem(mix) {
+  const total = mix.reduce((a, r) => a + (Number(r.share) || 0), 0);
+  if (mix.some((r) => !r.model)) return 'Choose a model for every row';
+  if (mix.some((r) => !(r.share >= 1 && r.share <= 100))) return 'Each share is 1 to 100%';
+  if (total !== 100) return `The shares add up to ${total}%, not 100%`;
+  return null;
+}
+function renderMix() {
+  const n = Number($('sw-n')?.value ?? 4), problem = mixProblem(sheet.mix);
+  const counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n));
+  const identities = [['', 'Plain agent'], ...sheet.profiles.map((p) => [p.name, p.name])];
+  const row = (r, i) => `<div class="mixrow"><select data-mix="${i}" data-f="identity" aria-label="Identity">${identities.map(([v, l]) => `<option value="${esc(v)}"${v === r.identity ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${modelSelectHTML(`sw-model-${i}`, sheet.models, r.model).replace('<select ', `<select data-mix="${i}" data-f="model" `)}<span class="share"><input type="number" min="1" max="100" step="1" value="${esc(r.share)}" data-mix="${i}" data-f="share" aria-label="Share in percent">%</span><span class="count${counts && !counts[i] ? ' none' : ''}">${counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''}</span>${sheet.mix.length > 1 ? `<button type="button" class="x" data-act="mix-remove" data-v="${i}" title="Remove this row">×</button>` : '<span class="x"></span>'}</div>`;
+  const add = sheet.mix.length < MIX_ROWS ? '<button type="button" class="sbtn" data-act="mix-add">Add a row</button>' : '';
+  const note = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : '');
+  $('sw-mix').innerHTML = `${sheet.mix.map(row).join('')}<div class="mixfoot">${add}<span class="${problem || note ? 'warn' : ''}">${esc(note)}</span></div>`;
+}
+// A new row takes half the largest row's share; a removed row's share goes to the first row left.
+function mixAdd() {
+  const big = sheet.mix.reduce((b, r, i) => (r.share > sheet.mix[b].share ? i : b), 0), half = Math.floor(sheet.mix[big].share / 2);
+  sheet.mix[big].share -= half;
+  sheet.mix.push({ identity: '', model: sheet.mix[big].model, share: half });
+  renderMix();
+}
+function mixRemove(i) {
+  const [gone] = sheet.mix.splice(i, 1); sheet.mix[0].share += gone.share;
+  renderMix();
+}
+// Picking an identity picks the model its profile names, when that model is connected.
+function mixChange(el) {
+  const i = Number(el.dataset.mix), r = sheet.mix[i]; if (!r) return;
+  if (el.dataset.f === 'share') r.share = Math.round(Number(el.value));
+  else r[el.dataset.f] = el.value;
+  if (el.dataset.f === 'identity') { const m = sheet.profiles.find((p) => p.name === el.value)?.model; if (m && sheet.models.some((x) => x.id === m)) r.model = m; }
+  if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
+}
 function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); focusInput('main'); }
+$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n') renderMix(); });
+// A share typed updates the counts once it is a number, without redrawing the field being typed in.
+$('sheet').addEventListener('input', (e) => { if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = Number($('sw-n').value), problem = mixProblem(sheet.mix), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {
   e.preventDefault();
   const project = sheetFor, start = $('sw-start'); if (!project || start.disabled) return;
   start.disabled = true; start.textContent = 'Starting…';
   try {
-    if (!$('sw-model').value) throw new Error('Choose a model for its agents');
-    await createSwarm(project, { goal: $('sw-goal').value, n: Number($('sw-n').value), model: $('sw-model').value, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value), council: Number($('sw-org').value) });
+    const problem = mixProblem(sheet.mix); if (problem) throw new Error(problem);
+    const mix = sheet.mix.map((r) => ({ identity: r.identity, model: r.model, share: r.share }));
+    await createSwarm(project, { goal: $('sw-goal').value, n: Number($('sw-n').value), mix, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value), council: Number($('sw-org').value) });
     closeSheet();
   } catch (err) { toast(String(err?.message ?? err), 6000); start.disabled = false; start.textContent = 'Start swarm'; }
 });
@@ -2106,6 +2139,8 @@ async function act(el) {
     case 'new-project': showNewProject(true); return;
     case 'new-swarm': await openSwarmSheet(leadProject(who)); return;
     case 'close-sheet': closeSheet(); return;
+    case 'mix-add': mixAdd(); return;
+    case 'mix-remove': mixRemove(Number(v)); return;
     case 'swarm-stop': await stopSwarm(swarmOf(who)); return;
     case 'swarm-add': await addAgent(swarmOf(who)); return;
     case 'swarm-tab': { const sw = swarmOf(S.selected); if (sw) { sw.tab = v; await enqueue(loadVisible); render(); } return; }
