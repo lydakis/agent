@@ -170,8 +170,28 @@ fn unquote(value: &str) -> String {
     value.to_owned()
 }
 
-/// Split front matter from the body. Scalars are one line; `tools` is a
-/// comma-separated line, a `[a, b]` flow list, or `- a` items below it.
+/// `value` without a YAML comment: a `#` at its start or after whitespace,
+/// outside quotes.
+fn uncomment(value: &str) -> &str {
+    let mut quote = None;
+    let mut after_space = true;
+    for (i, c) in value.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '#' && after_space => return value[..i].trim_end(),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None => {}
+        }
+        after_space = c.is_whitespace();
+    }
+    value
+}
+
+/// Split front matter from the body, reading the subset of YAML agent files
+/// use. Scalars are one line or a `|`/`>` block below the key, joined by
+/// spaces; `tools` is a comma-separated line, a `[a, b]` flow list, or `- a`
+/// items below it. Comments are dropped.
 pub fn front_matter(text: &str) -> (Front, &str) {
     let mut front = Front::default();
     let Some(rest) = text
@@ -189,9 +209,13 @@ pub fn front_matter(text: &str) -> (Front, &str) {
         None => (rest, ""),
     };
     let mut in_tools = false;
-    for line in block.lines() {
+    let mut lines = block.lines().peekable();
+    while let Some(line) = lines.next() {
         if in_tools && let Some(item) = line.trim_start().strip_prefix("- ") {
-            front.tools.get_or_insert_with(Vec::new).push(unquote(item));
+            front
+                .tools
+                .get_or_insert_with(Vec::new)
+                .push(unquote(uncomment(item)));
             continue;
         }
         in_tools = false;
@@ -201,11 +225,25 @@ pub fn front_matter(text: &str) -> (Front, &str) {
         if line.starts_with(char::is_whitespace) {
             continue;
         }
-        let value = value.trim();
+        let value = uncomment(value.trim());
+        let scalar = |lines: &mut std::iter::Peekable<std::str::Lines>| {
+            if !value.starts_with(['|', '>']) {
+                return unquote(value);
+            }
+            let mut text = Vec::new();
+            while let Some(next) =
+                lines.next_if(|l| l.trim().is_empty() || l.starts_with(char::is_whitespace))
+            {
+                if !next.trim().is_empty() {
+                    text.push(next.trim());
+                }
+            }
+            text.join(" ")
+        };
         match key.trim() {
-            "name" => front.name = Some(unquote(value)),
-            "description" => front.description = Some(unquote(value)),
-            "model" => front.model = Some(unquote(value)),
+            "name" => front.name = Some(scalar(&mut lines)),
+            "description" => front.description = Some(scalar(&mut lines)),
+            "model" => front.model = Some(scalar(&mut lines)),
             "tools" if value.is_empty() => {
                 in_tools = true;
                 front.tools = Some(Vec::new());
@@ -272,8 +310,10 @@ impl Kind {
                 file.is_file().then(|| (name.to_owned(), file))
             }
             Kind::Profiles => {
+                // Only a name --profile accepts is offered as a role.
                 let stem = name.strip_suffix(".md")?;
-                (!stem.is_empty() && path.is_file()).then(|| (stem.to_owned(), path.to_path_buf()))
+                (profile_name(stem) && path.is_file())
+                    .then(|| (stem.to_owned(), path.to_path_buf()))
             }
         }
     }
@@ -399,16 +439,20 @@ impl Profile {
     }
 }
 
+/// A profile name is one file name, nothing that could reach another folder,
+/// and a word a shell passes unquoted.
+fn profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// The profile named `name` for a bot in `workspace`: the workspace's own
 /// file, else the user's; `None` when neither exists.
 pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure> {
-    // A name is one file name: nothing that could reach another folder.
-    if name.is_empty()
-        || name.starts_with('.')
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
+    if !profile_name(name) {
         return Err(Failure::Unreadable {
             path: PathBuf::from(name),
             reason: "a profile name is letters, digits, '-', '_' and '.'".into(),
@@ -673,7 +717,12 @@ mod tests {
             "---\nname: reviewer\ndescription: Reviews a diff for bugs\nmodel: openai/gpt-6-luna\ntools:\n  - read\n  - 'shell'\ncolor: red\n---\n\nYou review changes. Report bugs only.\n",
         )
         .unwrap();
+        // A file --profile cannot name is not offered as a role.
+        for unusable in ["my role.md", ".draft.md", "rôle.md"] {
+            std::fs::write(root.join(".agents/agents").join(unusable), "x").unwrap();
+        }
         let composed = instructions(&root, None).unwrap();
+        assert_eq!(composed.profiles.len(), 1);
         assert_eq!(composed.skills[0].name, "release");
         assert_eq!(
             composed.skills[0].summary,
@@ -726,6 +775,21 @@ mod tests {
         assert_eq!(
             Profile::parse("x", None, "---\nmodel: ''\n---\nhi").model,
             None
+        );
+        // Comments and block scalars are YAML, not part of the value.
+        let (front, _) = front_matter(
+            "---\ntools: [shell, wait] # defaults\nmodel: openai/foo # preferred\ndescription: >-\n  Reviews code,\n  #1 on\ntitle: 'a # b'\n---\n",
+        );
+        assert_eq!(
+            front.tools,
+            Some(vec!["shell".to_owned(), "wait".to_owned()])
+        );
+        assert_eq!(front.model.as_deref(), Some("openai/foo"));
+        assert_eq!(front.description.as_deref(), Some("Reviews code, #1 on"));
+        let (front, _) = front_matter("---\ntools:\n  - read # first\n  - 'edit'\n---\n");
+        assert_eq!(
+            front.tools,
+            Some(vec!["read".to_owned(), "edit".to_owned()])
         );
         let (front, body) = front_matter("# Title\n\ntext");
         assert_eq!(front, Front::default());
