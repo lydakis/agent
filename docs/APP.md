@@ -528,9 +528,10 @@ daemon learns nothing about projects; everything here is client work.
   swarm's tokens and Stop still ends them (`swarm.toml` keeps its bot id
   in `left` until a look at the daemon's list finds nothing it made). A
   stream it led goes to the first agent left in it (a `lead` line on the
-  board, and that agent is told); an agent that moves up into its council
-  seat is told it holds one, with the proposals open, if any. A stopped
-  swarm tells neither. A new agent always takes a
+  board, and that agent is told, never one leaving with it); an agent that
+  moves up into its council seat is named on the board (a `seat` line) and,
+  when proposals are open, told it holds one, with them. A stopped swarm
+  tells neither, and a send that fails is shown. A new agent always takes a
   number no agent of the swarm had, so a name on the board is only ever
   one agent's. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not

@@ -1828,6 +1828,7 @@ test('a swarm\'s departures apply in order, and a stream that changed hands show
   assert.deepEqual(sw.members, ['app.latency-3']);
   const lead = p.postHTML(sw, { from: 'council', kind: 'lead', stream: 'cache', lead: 'latency-3', was: 'latency-1' });
   assert.match(lead, /latency-1 left · latency-3 leads it/);
+  assert.match(p.postHTML(sw, { from: 'council', kind: 'seat', seat: 'latency-3', was: 'latency-1' }), /latency-1 left · latency-3 holds a council seat/);
 });
 
 test('an older daemon on the socket is replaced from the detached screen; a newer one is left to an app update', async () => {

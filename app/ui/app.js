@@ -340,7 +340,11 @@ function indexMembers() {
 const leaving = new Map();
 function leave(swarm, name) {
   const next = (leaving.get(swarm) ?? Promise.resolve()).then(() => Daemon.swarmLeave(swarm, name)).then(
-    (r) => { const sw = learnSwarm(r); boardSoon(sw); if (S.selected === swarmKey(swarm)) render(); },
+    (r) => {
+      const sw = learnSwarm(r); boardSoon(sw); if (S.selected === swarmKey(swarm)) render();
+      // Who was not told it leads or sits now; the board still says it.
+      if (r.missed?.length) toast(`${swarm}: not told: ${r.missed.map((m) => `${m.agent} (${m.error})`).join(', ')}`, 5000);
+    },
     (e) => toast(`leave ${swarm}: ${e?.message ?? e}`));
   leaving.set(swarm, next);
   next.then(() => { if (leaving.get(swarm) === next) leaving.delete(swarm); });
@@ -1341,6 +1345,7 @@ function postHTML(sw, line) {
     case 'role': return row('ev', `is now <i>${esc(line.role ?? '')}</i>`);
     case 'join': return row('ev', `joined ${streamTag(line.stream ?? '')}`);
     case 'vote': return row('ev', `votes <b>${line.yes ? 'yes' : 'no'}</b> on ${esc(line.id ?? '')}${line.text ? `: ${text}` : ''}`);
+    case 'seat': return row('ev', `${esc(line.was ?? '')} left · ${esc(line.seat ?? '')} holds a council seat`);
     case 'lead': return row('ev', `${streamTag(line.stream ?? '')} ${esc(line.was ?? '')} left · ${esc(line.lead ?? '')} leads it`);
     case 'decision': return row(`ev decided ${line.approved ? 'yes' : 'no'}`, `${esc(line.id ?? '')} ${streamTag(line.stream ?? '')} ${line.approved ? `approved · ${esc(line.lead ?? '')} leads it` : 'denied'}`);
     case 'propose': {
