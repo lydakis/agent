@@ -324,20 +324,46 @@ impl Kind {
         }
     }
     /// The file an entry of this directory stands for, and its name.
-    fn file(self, path: &Path) -> Option<(String, PathBuf)> {
-        let name = path.file_name()?.to_str()?;
-        match self {
+    fn file(self, path: &Path) -> Result<Option<(String, PathBuf)>, Failure> {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(None);
+        };
+        Ok(match self {
             Kind::Skills => {
                 let file = path.join("SKILL.md");
-                file.is_file().then(|| (name.to_owned(), file))
+                is_file(&file)?.then(|| (name.to_owned(), file))
             }
             Kind::Profiles => {
                 // Only a name --profile accepts is offered as a role.
-                let stem = name.strip_suffix(".md")?;
-                (profile_name(stem) && path.is_file())
-                    .then(|| (stem.to_owned(), path.to_path_buf()))
+                match name.strip_suffix(".md") {
+                    Some(stem) if profile_name(stem) && is_file(path)? => {
+                        Some((stem.to_owned(), path.to_path_buf()))
+                    }
+                    _ => None,
+                }
             }
+        })
+    }
+}
+
+/// Whether `path` is a file. Only an absent path is not one; any other error
+/// is reported, so an unreadable workspace file never lets the user's file of
+/// the same name stand in for it.
+fn is_file(path: &Path) -> Result<bool, Failure> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
         }
+        Err(error) => Err(Failure::Unreadable {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        }),
     }
 }
 
@@ -388,7 +414,7 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                     reason: error.to_string(),
                 })?
                 .path();
-            let Some((name, file)) = kind.file(&path) else {
+            let Some((name, file)) = kind.file(&path)? else {
                 continue;
             };
             if found.contains_key(&name) {
@@ -487,18 +513,8 @@ pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure>
     }
     for dir in search(workspace, Kind::Profiles) {
         let path = dir.join(format!("{name}.md"));
-        // Fall back to the user's file only when the workspace has none: a
-        // workspace file that cannot be read is an error, not an absence.
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => {}
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(Failure::Unreadable {
-                    path,
-                    reason: error.to_string(),
-                });
-            }
+        if !is_file(&path)? {
+            continue;
         }
         let Some(text) = read_bounded(&path, MAX_INSTRUCTIONS)? else {
             return Err(Failure::TooLong {
@@ -811,14 +827,33 @@ mod tests {
         .unwrap_err();
         assert!(matches!(&error, Failure::TooMany { .. }));
         assert_eq!(error.code(), "instructions_limit");
-        // A workspace profile path that errors other than by being absent
-        // is reported, never replaced by the user's file of the same name.
+        // A workspace file that errors other than by being absent is
+        // reported, never replaced by the user's file of the same name. A
+        // link to itself fails with ELOOP, even for root.
         std::fs::remove_dir_all(root.join(".agents/agents")).unwrap();
-        std::fs::write(root.join(".agents/agents"), "not a folder").unwrap();
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::os::unix::fs::symlink("reviewer.md", root.join(".agents/agents/reviewer.md")).unwrap();
         assert_eq!(
             profile(&root, "reviewer").unwrap_err().code(),
             "instructions_unreadable"
         );
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills/review")).unwrap();
+        std::os::unix::fs::symlink("SKILL.md", root.join(".agents/skills/review/SKILL.md"))
+            .unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        // A stray file where a skill folder would be is simply not a skill.
+        std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
+        std::fs::write(root.join(".agents/skills/README.md"), "notes").unwrap();
+        assert!(instructions(&root, None).unwrap().skills.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
