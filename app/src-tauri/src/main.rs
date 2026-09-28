@@ -7,10 +7,11 @@
 mod daemon;
 mod project;
 mod session;
+mod settings;
 mod worktree;
 
 use agent_client::Client;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use session::SessionSlot;
 use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
@@ -21,7 +22,6 @@ struct Config {
     /// The store the socket was derived from; a daemon is started only for
     /// a store, never behind an explicit socket.
     store: Option<PathBuf>,
-    model: Option<String>,
     workspace: String,
 }
 
@@ -49,7 +49,7 @@ const PULL: usize = 256;
 /// short socket the daemon listens on.
 fn config() -> Result<Config, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (mut socket, mut store, mut model, mut workspace) = (None, None, None, None);
+    let (mut socket, mut store, mut workspace) = (None, None, None);
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -70,7 +70,6 @@ fn config() -> Result<Config, String> {
         match flag {
             "--socket" => socket = Some(PathBuf::from(value()?)),
             "--store" => store = Some(PathBuf::from(value()?)),
-            "--model" => model = Some(value()?),
             "--workspace" => workspace = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -103,7 +102,6 @@ fn config() -> Result<Config, String> {
     Ok(Config {
         socket,
         store,
-        model: model.or_else(|| std::env::var("AGENT_MODEL").ok()),
         workspace,
     })
 }
@@ -173,16 +171,12 @@ mod config_tests {
     }
 }
 
-/// What the page needs to create bots and to say where it is.
-/// A window opened from the Dock has no `AGENT_MODEL` of its own; the model
-/// is then `~/.agent/env`'s. The login shell's comes later, from
-/// `default_model`, so a slow profile never delays attaching.
+/// What the page needs to create bots and to say where it is. There is no
+/// default model: each project and agent is given its own.
 #[tauri::command]
 fn setup(state: State<'_, Shared>) -> Result<Value, String> {
-    let model = state.config.model.clone().or_else(daemon::file_model);
     Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
-        "model": model,
         "workspace": state.config.workspace,
         "tools": ["shell", "read", "write", "edit", "wait", "history"],
     }))
@@ -227,13 +221,6 @@ fn write_project(dir: String, name: String, model: String) -> Result<(), String>
     )
 }
 
-/// `AGENT_MODEL` as a daemon this app starts would see it, the login shell's
-/// included. Read again on each call: `~/.agent/env` may have been repaired.
-#[tauri::command]
-async fn default_model() -> Option<String> {
-    daemon::model().await
-}
-
 /// The models to offer, read from `~/.agent/models` each time, so an edit
 /// shows without a restart. The daemon has no list.
 /// The branch a bot's folder has checked out when it is a linked git
@@ -249,6 +236,109 @@ fn models() -> Result<Value, String> {
     let models = agent_client::models::read(&path)
         .map_err(|error| format!("{}: {}", error.code, error.detail.unwrap_or_default()))?;
     Ok(models.iter().map(|model| model.json()).collect())
+}
+
+/// What a daemon this app starts would run with: its providers, the AWS
+/// region and profile, and which keys are set (never their values), and
+/// whether this window can restart its daemon to apply a change.
+#[tauri::command]
+async fn settings(state: State<'_, Shared>) -> Result<Value, String> {
+    // A daemon this window did not start runs its own settings: the page asks
+    // it for its providers, and this machine's shell is not read at all.
+    if state.agent.is_none() || state.config.store.is_none() {
+        return Ok(
+            json!({"providers": [], "region": null, "profile": null, "keys": [], "restartable": false}),
+        );
+    }
+    let file = match daemon::env_file() {
+        Some(path) => daemon::read_env_file(&path)?,
+        None => Vec::new(),
+    };
+    // Without a login shell a started daemon inherits this process's environment.
+    let inherited: Vec<_>;
+    let environment = match daemon::login().await {
+        Some(login) => login,
+        None => {
+            inherited = std::env::vars_os().collect();
+            &inherited
+        }
+    };
+    let mut view = settings::view(&file, Some(environment));
+    view["restartable"] = json!(true);
+    Ok(view)
+}
+
+/// Set or remove settings in `~/.agent/env`; they reach the daemon when it
+/// restarts.
+#[tauri::command]
+fn save_settings(changes: serde_json::Map<String, Value>) -> Result<(), String> {
+    let path = daemon::env_file().ok_or("no HOME for ~/.agent/env")?;
+    // An unreadable or unsafe file is reported, never replaced.
+    daemon::read_env_file(&path)?;
+    let text = match std::fs::read_to_string(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.map_err(|e| format!("env_file_unreadable: {}: {e}", path.display()))?,
+    };
+    let edited = settings::edit(&text, &changes)?;
+    // A file the next start would refuse is never written.
+    if edited.len() as u64 > daemon::MAX_ENV_FILE {
+        return Err(format!(
+            "env_file_invalid: {} would exceed {} bytes",
+            path.display(),
+            daemon::MAX_ENV_FILE
+        ));
+    }
+    settings::replace(&path, &edited, 0o600)
+}
+
+/// Stop the store's daemon so the next attach starts one with the current
+/// settings. Only a daemon this app would start can be restarted.
+#[tauri::command]
+async fn restart_daemon(state: State<'_, Shared>) -> Result<(), String> {
+    let (Some(agent), Some(store)) = (&state.agent, &state.config.store) else {
+        return Err("restart_unavailable: this window did not start its daemon".into());
+    };
+    if let Some(old) = state.client.lock().await.take() {
+        old.close().await;
+    }
+    daemon::stop(agent, store).await?;
+    state.starts.lock().await.forget();
+    Ok(())
+}
+
+/// Ask the daemon's providers what they offer and write `~/.agent/models`
+/// from it. A provider that fails keeps its lines from the last list, and a
+/// list with no model at all is not written. Answers per provider.
+#[tauri::command]
+async fn discover_models(state: State<'_, Shared>) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    let listing = client
+        .request("provider_models", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = agent_client::models::path().ok_or("no HOME for ~/.agent/models")?;
+    let failed = |error: agent_client::Error| {
+        format!("{}: {}", error.code, error.detail.unwrap_or_default())
+    };
+    // Refresh replaces the list, so one that no longer reads keeps nothing.
+    let kept = agent_client::models::read(&path).unwrap_or_default();
+    let text = agent_client::models::render(&listing, &kept).map_err(failed);
+    if let Ok(text) = &text {
+        settings::replace(&path, text, 0o644)?;
+    }
+    let providers: Map<String, Value> = listing["providers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, listed)| {
+            let answer = match listed["models"].as_array() {
+                Some(models) => json!({"models": models.len()}),
+                None => json!({"error": listed["error"], "detail": listed["detail"]}),
+            };
+            (name.clone(), answer)
+        })
+        .collect();
+    Ok(json!({"providers": providers, "written": text.is_ok(), "error": text.err()}))
 }
 
 /// Too much or unreadable text fails with the CLI's `--agents` code, and
@@ -461,12 +551,15 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             setup,
-            default_model,
             policy,
             branch,
             models,
             project,
             write_project,
+            settings,
+            save_settings,
+            restart_daemon,
+            discover_models,
             attach,
             pull,
             request,
