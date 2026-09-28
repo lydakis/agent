@@ -323,26 +323,25 @@ impl Kind {
             }
         }
     }
-    /// The file an entry of this directory stands for, and its name.
-    fn file(self, path: &Path) -> Result<Option<(String, PathBuf)>, Failure> {
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            return Ok(None);
+    /// The name an entry of this directory would index under. Only a name
+    /// --profile accepts is offered as a role.
+    fn name(self, path: &Path) -> Option<String> {
+        let name = path.file_name()?.to_str()?;
+        match self {
+            Kind::Skills => Some(name.to_owned()),
+            Kind::Profiles => name
+                .strip_suffix(".md")
+                .filter(|stem| profile_name(stem))
+                .map(str::to_owned),
+        }
+    }
+    /// The file the entry stands for, if it is one.
+    fn file(self, path: &Path) -> Result<Option<PathBuf>, Failure> {
+        let file = match self {
+            Kind::Skills => path.join("SKILL.md"),
+            Kind::Profiles => path.to_path_buf(),
         };
-        Ok(match self {
-            Kind::Skills => {
-                let file = path.join("SKILL.md");
-                is_file(&file)?.then(|| (name.to_owned(), file))
-            }
-            Kind::Profiles => {
-                // Only a name --profile accepts is offered as a role.
-                match name.strip_suffix(".md") {
-                    Some(stem) if profile_name(stem) && is_file(path)? => {
-                        Some((stem.to_owned(), path.to_path_buf()))
-                    }
-                    _ => None,
-                }
-            }
-        })
+        Ok(is_file(&file)?.then_some(file))
     }
 }
 
@@ -420,12 +419,17 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
                     reason: error.to_string(),
                 })?
                 .path();
-            let Some((name, file)) = kind.file(&path)? else {
+            // A shadowed entry is skipped before its file is probed, so an
+            // override can never be undone by the file it overrides.
+            let Some(name) = kind.name(&path) else {
                 continue;
             };
             if found.contains_key(&name) {
                 continue;
             }
+            let Some(file) = kind.file(&path)? else {
+                continue;
+            };
             let mut entry = Entry {
                 name,
                 path: file,
@@ -881,6 +885,19 @@ mod tests {
             assert_eq!(search(&root, Kind::Profiles).len(), 2);
             assert_eq!(search(&home, Kind::Profiles).len(), 1);
         }
+        // A broken file shadowed by an override is never probed.
+        let other = temp("shadowed");
+        std::fs::create_dir_all(other.join(".agents/agents")).unwrap();
+        std::fs::write(other.join(".agents/agents/reviewer.md"), "You review.").unwrap();
+        std::fs::create_dir_all(root.join(".agents/agents")).unwrap();
+        std::os::unix::fs::symlink("reviewer.md", root.join(".agents/agents/reviewer.md")).unwrap();
+        let dirs = vec![other.join(".agents/agents"), root.join(".agents/agents")];
+        assert_eq!(
+            index(dirs, Kind::Profiles, MAX_INSTRUCTIONS).unwrap().len(),
+            1
+        );
+        std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
+        let _ = std::fs::remove_dir_all(&other);
         // A stray file where a skill folder would be is simply not a skill.
         std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
