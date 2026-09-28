@@ -74,6 +74,16 @@ says why beside those that answered.
 
 ![Settings with one provider failing](app/settings.png)
 
+Once a project exists, Settings also lists the app's two roles: the
+coordinator's and a swarm agent's. **Edit** opens your own copy in
+`~/.agents/agents/` in your text editor, made from the app's text the first
+time, and from then on that file is the role in every project (a project's
+own `.agents/agents` file of the same name still comes first). An agent keeps
+the text it started with, so an edit reaches coordinators and swarm agents
+made after it. Captured 2026-09-28.
+
+![Settings with the roles](app/settings-roles.png)
+
 A project's ⋯ menu starts a swarm: a goal, how many agents, where they work,
 the tokens they share, what they are made of, and how they organize: one
 board, or a council of three that approves streams of work. What they are
@@ -113,6 +123,12 @@ approve or deny yourself, then the ones decided.
 Streams: the approved proposals, each with its lead and the agents in it.
 
 ![Streams](app/swarm-streams.png)
+
+You can also ask a project's coordinator for one ("start a swarm of six, two
+of them reviewers, to halve the p99"). Its role tells it to run
+`~/.agent/swarms/start`, a script the app writes, which starts the swarm the
+way the sheet does; the swarm shows under the project once its agents take
+their briefs.
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -426,8 +442,10 @@ daemon learns nothing about projects; everything here is client work.
   `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
   project folder), and a token budget typed in millions (0.1 to 1,000),
   split evenly among them, each agent's share shown beside it. A goal is
-  at most 16 KiB. A name whose worktree or branch another store's swarm
-  holds is skipped for the next. Setup gets ten minutes and the login
+  at most 16 KiB. The swarm is named after the goal's longest telling word
+  among its first six; a name a bot holds (or its agents' names), or whose
+  folder, worktree or branch another swarm or store holds, is skipped for
+  the next, `-2`, `-3` and so on. Setup gets ten minutes and the login
   shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
   TMPDIR, TERM) and no others, so no provider or cloud keys (as do the
   swarm's git commands, whose hooks run too; this process's own variables
@@ -443,7 +461,8 @@ daemon learns nothing about projects; everything here is client work.
   of them keeps the shares as well as whole agents can (the council's seats
   mix too), and the sheet shows each row's count, or that a row makes none
   at that size. Start, Add and Stop are one call each to the app's Rust
-  side, which makes or stops everything and undoes a failed start, so the
+  side, which names the swarm, deals its agents, makes or stops everything
+  and undoes a failed start, so the
   page only shows the outcome: a swarm whose files or instructions cannot
   be made, or none of whose agents can be created, is removed with its
   worktree and branch; an agent that could not be made or briefed beside
@@ -542,6 +561,34 @@ daemon learns nothing about projects; everything here is client work.
   tells the working agents when the swarm passes 50%, 75% or 90% of its
   budget: a `budget` line on the board, each share once (`state.json`
   keeps the last), and in the answer of the act that passed it.
+- **Swarms a coordinator starts.** The app writes `~/.agent/swarms/start`
+  each time it opens, a script that runs the app's executable with
+  `--swarm-start` and no window, as the board's scripts do. It takes
+  `--agents N` (4), `--budget MILLIONS` (3), `--council 3`, `--in-project`
+  (else one shared worktree) and any number of `--row MODEL,SHARE[,IDENTITY]`,
+  then `-- GOAL`; without rows every agent is a plain agent on the
+  coordinator's own model. It runs only in a coordinator's shell (its bot is
+  `PROJECT.lead`, the id its shell names still that bot's), reaches the
+  daemon that shell belongs to, starts the swarm in the coordinator's
+  project and folder through the same Rust start as the sheet, and prints
+  the swarm, its agents' names and its board's path. Without rows its
+  agents get the model of the coordinator's current turn (`AGENT_MODEL`).
+  The start runs in a process group of its own, so a shell that gives up
+  on it (its timeout, or its turn ending) cannot cut it off between making
+  a worktree and undoing it; the role asks for a ten-minute shell timeout.
+  When the goal's name and eight more are all taken it makes nothing. The app's
+  [coordinator.md](../app/agents/coordinator.md) says when and how to run
+  it. A window learns of a swarm it did not start when an agent it does
+  not know, named like an agent (`-N`), takes a turn: it reads the swarms
+  again once for a burst of those, and at most once for each such name.
+- **The roles as files.** Settings lists the app's `coordinator` and
+  `swarm` roles and whether you have your own file for each. Edit writes
+  `~/.agents/agents/NAME.md` from the app's text only when it is missing
+  (whole beside it, then linked into place),
+  then opens it with `open -t` (`xdg-open` elsewhere). The file is the
+  user's profile of that name, read in every folder that has none of its
+  own. A bot's instructions are fixed when it is made, so an edit applies
+  to coordinators and swarm agents made afterwards.
 - **Swarm councils.** The sheet's "Organized as" picks one board (every
   agent takes a piece) or a council of 3, which needs at least three
   agents; a start that made fewer than three deletes them (naming any it
@@ -674,7 +721,10 @@ bot that is not a member or while the swarm is stopped. A council swarm's
 proposal wakes its three seats, a second yes opens the stream and wakes the
 proposer, a non-seat's vote is refused, and a post from a stream carries its
 tag and reaches nobody outside it (same test file), and each post's line
-records how many agents it was sent to. Start, Add and Stop are tested in
+records how many agents it was sent to. A coordinator's `start` runs from its
+shell against a real daemon there too: two agents on its model in its folder
+with half the budget each, briefed, the board in that store's swarms, and
+the script refused from a bot that is not a coordinator. Start, Add and Stop are tested in
 `app/src-tauri/src/swarm.rs` against a stand-in daemon: each agent gets its
 row's model, identity and share of the budget, one that fails is reported
 while the rest start, a start with no agent leaves nothing behind, an

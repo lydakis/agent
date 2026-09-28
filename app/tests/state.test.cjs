@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage, tally };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1140,7 +1140,7 @@ test('a swarm is one row under its project; its agents and what they made stay i
 test('a new swarm is one call: its agents are dealt from the mix, and the page seats them and opens it', async () => {
   const calls = [];
   const p = shell({
-    swarmStart: async (q) => { calls.push(q); const members = q.rows.map((r, i) => `${q.project}.${q.name}-${i + 1}`); return { swarm: swarmRecord(members, { swarm: `${q.project}.${q.name}`, mix: q.mix }), bots: members.map((m, i) => ({ name: m, id: 10 + i, provider: 'alpha', model: 'one' })), failed: [{ agent: members[2], error: 'provider_unknown' }] }; },
+    swarmStart: async (q) => { calls.push(q); const members = Array.from({ length: q.agents }, (_, i) => `${q.project}.latency-2-${i + 1}`); return { swarm: swarmRecord(members, { swarm: `${q.project}.latency-2`, mix: q.mix }), bots: members.map((m, i) => ({ name: m, id: 10 + i, provider: 'alpha', model: 'one' })), failed: [{ agent: members[2], error: 'provider_unknown' }] }; },
     swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
     request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }),
   });
@@ -1148,8 +1148,8 @@ test('a new swarm is one call: its agents are dealt from the mix, and the page s
   p.upsert({ name: 'app.latency-9', id: 2, provider: 'alpha', model: 'one' });
   const mix = [{ identity: '', model: 'alpha/one', share: 75 }, { identity: 'reviewer', model: 'beta/two', share: 25 }];
   await p.createSwarm('app', { goal: '  Cut the p99 latency of agent run in half.  ', n: 4, mix, shared: true, budget: 3000000, council: 3 });
-  // Named from the goal, never a name a bot already starts with; the mix dealt so every prefix keeps its shares.
-  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ project: 'app', name: 'latency-2', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, mix, rows: [0, 0, 1, 0], budgetTokens: 3000000, council: 3 }]);
+  // The app's side names it and deals the agents; the page seats what it made.
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [{ project: 'app', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, mix, agents: 4, budgetTokens: 3000000, council: 3 }]);
   assert.equal(p.S.bots.get('app.latency-2-2').id, 11);
   assert.equal(p.S.selected, '⁂app.latency-2');
 });
@@ -1325,16 +1325,56 @@ test('Stop and Add are one call each; an added agent comes from the row furthest
   assert.match(log.innerHTML, /latency-2 · reviewer · two/);
 });
 
-test('a name another store holds as a worktree is skipped for the next', async () => {
-  const tried = [];
-  const p = shell({
-    swarmStart: async (q) => { tried.push(q.name); if (q.name !== 'latency-3') throw new Error(`swarm_exists: app.${q.name} has a worktree or branch already`); return { swarm: swarmRecord(['app.latency-3-1'], { swarm: 'app.latency-3' }), bots: [], failed: [] }; },
-    swarmBoard: async () => ({ lines: [], offset: 0, more: false }),
-    request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }),
-  });
-  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
-  await p.createSwarm('app', { goal: 'Cut latency.', n: 1, mix: PLAIN, shared: true, budget: 1000 });
-  assert.deepEqual(tried, ['latency', 'latency-2', 'latency-3']);
+test('a swarm a coordinator started from its shell shows once its first agent takes its brief', async () => {
+  let reads = 0, listed = [];
+  const p = shell({ swarms: async () => { reads += 1; return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  p.S.live = true;
+  p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one' });
+  // A task named like an agent is looked for once, however many turns it takes.
+  p.upsert({ name: 'app.fix-2', id: 2, provider: 'alpha', model: 'one' });
+  for (const turn of [1, 2]) await p.handle({ event: 'accepted', bot: 'app.fix-2', turn, durable: true }, 1);
+  await p.tick();
+  assert.equal(reads, 1);
+  assert.equal(p.S.swarms.size, 0);
+  // Once that task is deleted, a bot that takes its name is looked for again.
+  await p.handle({ event: 'deleted', bot: 'app.fix-2' }, 1);
+  p.upsert({ name: 'app.fix-2', id: 5, provider: 'alpha', model: 'one' });
+  await p.handle({ event: 'accepted', bot: 'app.fix-2', turn: 1, durable: true }, 1);
+  await p.tick();
+  assert.equal(reads, 2);
+  listed = [swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } })];
+  for (const [name, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
+  await p.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
+  await p.handle({ event: 'queued', bot: 'app.latency-2', turn: 1, durable: true }, 1);
+  await p.tick();
+  assert.equal(reads, 3, 'one read for the burst');
+  assert.deepEqual([...p.S.swarms.keys()], ['app.latency']);
+  // A read that failed is tried again at the agent's next turn.
+  let failing = true;
+  const q = shell({ swarms: async () => { reads += 1; if (failing) throw new Error('unavailable'); return { swarms: listed, broken: [] }; }, request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  q.S.live = true;
+  q.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
+  await q.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
+  await q.tick();
+  assert.equal(q.S.swarms.size, 0);
+  failing = false;
+  await q.handle({ event: 'accepted', bot: 'app.latency-1', turn: 2, durable: true }, 1);
+  await q.tick();
+  assert.deepEqual([...q.S.swarms.keys()], ['app.latency']);
+  assert.equal(p.S.memberOf.get('app.latency-2'), 'app.latency');
+  // Two reads at once: an older answer arriving last never removes a swarm the newer one found.
+  const answers = [];
+  const r = shell({ swarms: () => new Promise((resolve) => answers.push(resolve)), request: async () => ({ bots: [], next_after: null, nodes: [], next_from: null }) });
+  r.S.live = true;
+  for (const [name, id] of [['app.fix-1', 2], ['app.latency-1', 3]]) r.upsert({ name, id, provider: 'alpha', model: 'one' });
+  await r.handle({ event: 'accepted', bot: 'app.fix-1', turn: 1, durable: true }, 1);
+  await r.tick();
+  await r.handle({ event: 'accepted', bot: 'app.latency-1', turn: 1, durable: true }, 1);
+  await r.tick();
+  assert.equal(answers.length, 2);
+  answers[1]({ swarms: listed, broken: [] }); await r.tick();
+  answers[0]({ swarms: [], broken: [] }); await r.tick();
+  assert.deepEqual([...r.S.swarms.keys()], ['app.latency']);
 });
 
 test('a helper finishing a turn has its swarm check its budget, and only current seats are tallied', async () => {
@@ -1388,7 +1428,7 @@ test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle o
   const context = vm.createContext({ window: {}, setTimeout, clearTimeout, Math, JSON, Promise, Error, String, Set, Map, Infinity, Date });
   vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
   const d = context.window.Daemon;
-  const { swarm: sw } = await d.swarmStart({ project: 'demo', name: 'latency', folder: '/workspace', goal: 'Halve p99.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], rows: [0, 0], budgetTokens: 1000 });
+  const { swarm: sw } = await d.swarmStart({ project: 'demo', folder: '/workspace', goal: 'Halve p99 latency.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], agents: 2, budgetTokens: 1000 });
   assert.equal(sw.workspace, '~/.agent/worktrees/demo.latency');
   // Their briefs start them; the swarm is quiet again once both are done.
   const done = new Set();
@@ -1410,7 +1450,7 @@ test('the demo daemon\'s council opens a stream by the seats\' majority and leav
   vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
   const d = context.window.Daemon;
   const names = [1, 2, 3, 4].map((i) => `demo.latency-${i}`);
-  const { swarm: sw } = await d.swarmStart({ project: 'demo', name: 'latency', folder: '/workspace', goal: 'Halve p99.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], rows: [0, 0, 0, 0], budgetTokens: 1000, council: 3 });
+  const { swarm: sw } = await d.swarmStart({ project: 'demo', folder: '/workspace', goal: 'Halve p99 latency.', shared: true, mix: [{ identity: '', model: 'alpha/one', share: 100 }], agents: 4, budgetTokens: 1000, council: 3 });
   assert.deepEqual([sw.council, Array.from(sw.seats)], [3, names.slice(0, 3)]);
   const done = new Set();
   while (done.size < 4) for (const e of (await d.pull()).events) if (e.event === 'turn_finished') done.add(e.bot);
@@ -1522,6 +1562,29 @@ test('a provider that fails says why beside the ones that answered', async () =>
   await half.p.openSetup();
   const row = half.p.setupHTML();
   assert.match(row, /✓ 1 model</); assert.match(row, /bedrock-openai: provider_http_401: no</); assert.match(row, /data-act="setup-retry"/);
+});
+
+test('Settings edits the coordinator and swarm roles as your own files', async () => {
+  const edited = [], own = new Set();
+  const p = shell({
+    settings: async () => ({ providers: ['openai'], region: null, profile: null, keys: [] }),
+    request: async () => ({ providers: { openai: { models: [{ id: 'gpt' }] } } }),
+    models: async () => [{ id: 'openai/gpt' }],
+    roles: async () => ['coordinator', 'swarm'].map((name) => ({ name, file: own.has(name) ? `/home/u/.agents/agents/${name}.md` : null })),
+    editRole: async (name) => { edited.push(name); own.add(name); return `/home/u/.agents/agents/${name}.md`; },
+  });
+  // Onboarding has no roles to show; Settings, once a project exists, does.
+  await p.openSetup();
+  assert.doesNotMatch(p.setupHTML(), /Roles/);
+  p.upsert({ name: 'app.lead', id: 1, provider: 'openai', model: 'gpt' });
+  let html = p.setupHTML();
+  assert.match(html, /<h3>Roles<\/h3>/);
+  assert.match(html, /Coordinator<\/span><span class="st dim">the app's own/);
+  await p.act({ dataset: { act: 'edit-role', v: 'coordinator' } });
+  assert.deepEqual(edited, ['coordinator']);
+  html = p.setupHTML();
+  assert.match(html, /Coordinator<\/span><span class="st">~\/.agents\/agents\/coordinator.md/);
+  assert.match(html, /Swarm agent<\/span><span class="st dim">the app's own/);
 });
 
 test('removing a provider drops its key unless another provider uses it', async () => {

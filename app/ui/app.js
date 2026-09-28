@@ -335,9 +335,14 @@ function indexMembers() {
   S.memberOf = new Map(); for (const sw of S.swarms.values()) for (const m of sw.members) S.memberOf.set(m, sw.name);
   S.shapeGen += 1;
 }
+// Reads can overlap; only the newest one's answer is kept, so an older snapshot never removes a swarm a
+// newer read found.
+let swarmsRead = 0;
 async function loadSwarms() {
   if (!Daemon.swarms) return;
+  const read = ++swarmsRead;
   const { swarms = [], broken = [] } = await Daemon.swarms();
+  if (read !== swarmsRead) return;
   const seen = new Set(swarms.map((r) => r.swarm));
   for (const name of [...S.swarms.keys()]) if (!seen.has(name)) S.swarms.delete(name);
   for (const r of swarms) learnSwarm(r, true);
@@ -422,6 +427,23 @@ function swarmOfHelper(name) {
   }
   return null;
 }
+// A swarm a coordinator started from its shell shows once its first agent takes its brief: an agent's
+// first turn comes after it joined. Each name is looked for once while its bot lives, so a task named
+// like an agent costs one read of the swarms, not one per event.
+const BRIEFED = new Set(['accepted', 'queued']), SWARM_AGENT = /-\d+$/, looked = new Set();
+let swarmsTimer = null;
+let lookFor = [];
+function swarmsSoon(name) {
+  if (looked.has(name)) return; looked.add(name); lookFor.push(name);
+  if (swarmsTimer) return;
+  swarmsTimer = setTimeout(async () => {
+    swarmsTimer = null; const before = new Set(S.swarms.keys()), names = lookFor; lookFor = [];
+    // A read that failed looks again at these names' next turn.
+    try { await loadSwarms(); } catch (e) { for (const n of names) looked.delete(n); Daemon.log?.(`swarms: ${e?.message ?? e}`); return; }
+    const added = [...S.swarms.keys()].filter((n) => !before.has(n));
+    if (added.length) { toast(`swarm ${added.join(', ')} started`, 4000); render(); }
+  }, 200);
+}
 const boardTimers = new Map();
 function boardSoon(sw, usage) {
   if (usage) sw.usageDue = true;
@@ -450,17 +472,6 @@ function kindOf(sw, member) {
   const models = new Set(sw.mix.map((r) => r.model));
   return [row.identity, models.size > 1 && modelShort(row.model)].filter(Boolean).join(' · ');
 }
-// A name from the goal: its longest word among the first few that say something, then -2, -3 ... until free.
-// `lock` too: Git refuses a branch named `agent/PROJECT.lock`.
-const PLAIN = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'make', 'keep', 'cut', 'all', 'our', 'its', 'half', 'every', 'each', 'add', 'fix', 'get', 'lock']);
-// `skip` holds names found taken elsewhere, as another store's worktree or branch.
-function swarmName(project, goal, skip = new Set()) {
-  const words = (goal.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((w) => w.length >= 3 && !PLAIN.has(w)).slice(0, 6);
-  const base = (words.reduce((a, w) => (w.length > a.length ? w : a), '') || 'swarm').slice(0, 24);
-  const taken = (n) => skip.has(n) || S.swarms.has(`${project}.${n}`) || [...S.bots.keys()].some((b) => b === `${project}.${n}` || b.startsWith(`${project}.${n}-`));
-  let name = base; for (let k = 2; taken(name); k++) name = `${base}-${k}`;
-  return name;
-}
 // Starting, adding and stopping are one call each: the app's side makes the agents, has them join and
 // briefs them, or ends their turns, and undoes what a failed start made. The page learns the result.
 async function learnStarted(r, want) {
@@ -471,17 +482,12 @@ async function learnStarted(r, want) {
   if (failed.length) toast(`${want - failed.length} of ${want} agents started: ${failed[0].agent}: ${failed[0].error}`, 6000);
   return sw;
 }
+// The app's side names the swarm from its goal and deals its agents to the mix, as for a coordinator's
+// `start`, and the sheet's counts come from the same rule.
 async function createSwarm(project, { goal, n, mix, shared, budget, council = 0 }) {
   const lead = bot(project + LEAD); if (!lead?.workspace) throw new Error(`no coordinator for ${project}`);
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
-  const rows = mixRows(mix, n);
-  // A name another store holds as a worktree or branch is taken here too: try the next.
-  const skip = new Set(); let r;
-  for (;;) {
-    const name = swarmName(project, goal, skip);
-    try { r = await Daemon.swarmStart({ project, name, folder: lead.workspace, goal, shared, mix, rows, budgetTokens: budget, council }); break; }
-    catch (e) { if (!/^swarm_exists/.test(e?.message ?? e) || skip.size >= 8) throw e; skip.add(name); }
-  }
+  const r = await Daemon.swarmStart({ project, folder: lead.workspace, goal, shared, mix, agents: n, budgetTokens: budget, council });
   const sw = await learnStarted(r, n);
   await openOnly(swarmKey(sw.name));
 }
@@ -621,6 +627,8 @@ async function onEvent(ev) {
     }
     case 'deleted': {
       if (S.snapshot) S.deleted.add(name);
+      // A later bot may take the name as a swarm's agent, so it is looked for again.
+      looked.delete(name);
       const p = bot(name)?.project;
       forgetBot(name);
       if (S.selected === name) S.selected = p && S.bots.has(p + LEAD) ? p + LEAD : S.bots.keys().next().value ?? '';
@@ -853,6 +861,7 @@ async function handle(ev, session, paint = true) {
   if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
   const sw = ev.bot && (swarmOfBot(ev.bot) ?? (ev.event === 'turn_finished' ? swarmOfHelper(ev.bot) : null));
   if (sw) { if (FLEET_EVENTS.has(ev.event)) patchRailRow(swarmKey(sw.name)); if (ev.durable !== false) boardSoon(sw, ev.event === 'turn_finished'); if (ev.event === 'turn_finished') checkSoon(sw); }
+  else if (S.live && BRIEFED.has(ev.event) && SWARM_AGENT.test(ev.bot ?? '')) swarmsSoon(ev.bot);
   if (ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = session;
   // During replay nothing is fetched: a load per node-producing event would serialize a long history
   // into one request each. The first load runs once follow_live arrives.
@@ -1909,6 +1918,7 @@ async function openSetup() {
   st.open = true; st.error = null;
   $('setupwrap').classList.add('on'); renderSetup();
   try { await loadSettings(); } catch (e) { st.error = String(e?.message ?? e); }
+  try { st.roles = await Daemon.roles?.(); } catch (_) {}
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
   renderSetup();
   await Promise.all([checkProviders(st.settings?.listing), readList()]);
@@ -2065,7 +2075,22 @@ function setupHTML() {
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${set?.restartable === false ? '<p class="dim">This window uses a daemon it did not start, so it cannot apply provider changes.</p>' : add}${st.adding === null ? refresh : ''}</div>${listed}`)
     + step(2, 'First project', projects, project)
+    + (projects ? rolesHTML(st, busy) : '')
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
+}
+// The app's roles, each read from your own file in every project once you have one. Edit makes that
+// file from the app's text the first time and opens it in your editor.
+const ROLES = [['coordinator', 'Coordinator'], ['swarm', 'Swarm agent']];
+function rolesHTML(st, busy) {
+  const own = new Map((st.roles ?? []).map((r) => [r.name, r.file]));
+  const rows = ROLES.map(([name, label]) => `<div class="prow"><span class="pn">${label}</span><span class="st${own.get(name) ? '' : ' dim'}">${own.get(name) ? `~/.agents/agents/${name}.md` : 'the app\'s own'}</span><span class="acts"><button type="button" class="sbtn" data-act="edit-role" data-v="${name}"${busy}>Edit</button></span></div>`).join('');
+  return `<section><h3>Roles</h3>${rows}<p class="dim">A project's coordinator and a swarm's agents follow these in every project; a project's own .agents/agents file of that name comes first. An agent keeps the text it started with, so an edit reaches new projects and swarms.</p></section>`;
+}
+async function editRole(name) {
+  const st = setupState();
+  try { await Daemon.editRole(name); } catch (e) { toast(`edit ${name}: ${e?.message ?? e}`, 5000); }
+  try { st.roles = await Daemon.roles(); } catch (_) {}
+  renderSetup();
 }
 // Answers arrive while someone types a key: what the fields hold, and where the caret is, survive.
 function renderSetup() {
@@ -2230,6 +2255,7 @@ async function act(el) {
     // Removing restarts the daemon; with agents working, the first press says so and the second removes.
     case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
+    case 'edit-role': await editRole(v); return;
     default: return;
   }
 }

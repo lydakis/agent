@@ -27,7 +27,9 @@ window.Daemon = (() => {
       request: (op, params = {}) => invoke('request', { op, params }),
       swarms: () => invoke('swarms'),
       profiles: (dir) => invoke('profiles', { dir }),
-      swarmStart: ({ project, name, folder, goal, shared, mix, rows, budgetTokens, council }) => invoke('swarm_start', { project, name, folder, goal, shared, mix, rows, budgetTokens, council: council ?? 0 }),
+      roles: () => invoke('roles'),
+      editRole: (name) => invoke('edit_role', { name }),
+      swarmStart: ({ project, folder, goal, shared, mix, agents, budgetTokens, council }) => invoke('swarm_start', { project, folder, goal, shared, mix, agents, budgetTokens, council: council ?? 0 }),
       swarmAdd: (swarm, row) => invoke('swarm_add', { swarm, row }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
       swarmStop: (swarm) => invoke('swarm_stop', { swarm }),
@@ -376,9 +378,16 @@ window.Daemon = (() => {
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
+    // The demo has no editor to open: Edit only says your copy is now the one read.
+    roles: async () => [{ name: 'coordinator', file: S.ownRoles?.has('coordinator') ? '/home/you/.agents/agents/coordinator.md' : null }, { name: 'swarm', file: S.ownRoles?.has('swarm') ? '/home/you/.agents/agents/swarm.md' : null }],
+    editRole: async (name) => { (S.ownRoles ??= new Set()).add(name); return `/home/you/.agents/agents/${name}.md`; },
     profiles: async () => [{ name: 'reviewer', summary: 'Reviews changes and reports bugs only', model: 'anthropic/claude-sonnet-5' }, { name: 'tester', summary: 'Keeps the test suite green', model: null }],
-    swarmStart: async ({ project, name, folder, goal, shared, mix, rows, budgetTokens, council = 0 }) => {
-      const full = `${project}.${name}`; if (S.swarms.has(full)) throw new Error(`swarm_exists: ${full}`);
+    // Named from the goal's longest word and dealt as the app's side does it.
+    swarmStart: async ({ project, folder, goal, shared, mix, agents, budgetTokens, council = 0 }) => {
+      const word = (goal.toLowerCase().match(/[a-z0-9]{3,}/g) ?? []).slice(0, 6).reduce((a, w) => (w.length > a.length ? w : a), '') || 'swarm';
+      let full = `${project}.${word}`; for (let k = 2; S.swarms.has(full); k++) full = `${project}.${word}-${k}`;
+      const counts = mix.map(() => 0), rows = [];
+      for (let t = 1; t <= agents; t++) { let best = 0; mix.forEach((m, i) => { if (m.share * t - 100 * counts[i] > mix[best].share * t - 100 * counts[best]) best = i; }); counts[best] += 1; rows.push(best); }
       const sw = { name: full, project, goal, mix, budget: budgetTokens, council, state: { roles: {}, streams: {}, proposals: [] }, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, rows: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
       S.swarms.set(full, sw); await wait(300);
       const bots = await enlist(sw, rows.map((row, i) => [`${full}-${i + 1}`, row]), Math.max(1, Math.floor(budgetTokens / rows.length)));
