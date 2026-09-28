@@ -50,7 +50,9 @@ same requests. The AWS SDK's signer and credential chain (`aws-sigv4`,
 `aws-config`) measured 39 more crates, before the HTTP client its SSO and
 instance-role providers need; instead,
 credentials resolve in the chain's own order: static environment keys first,
-then the AWS CLI's `configure export-credentials`, which is the chain itself
+then the AWS CLI's `configure export-credentials` (AWS CLI 2.9 or later; an
+older CLI answers with its usage text, so the reason names its version and
+what to install instead), which is the chain itself
 (profiles, SSO, assumed roles, container and instance roles) in the standard
 `credential_process` format. Temporary keys are re-resolved five minutes before
 expiry by one background run while they keep signing, so no call waits on the

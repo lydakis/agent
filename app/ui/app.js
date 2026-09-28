@@ -1855,7 +1855,7 @@ function detach() { save(); Daemon.close(); }
 // is no default model: each project or agent is given one when it is made, from any provider.
 // Onboarding is this screen opened on its own when no provider is set up; Settings is the same
 // screen opened from the sidebar.
-const AWS = 'Signs in with your AWS CLI login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
+const AWS = 'Signs in with your AWS CLI (version 2) login for the profile (aws configure, or aws sso login), or with a Bedrock API key.';
 // A field that is `local` is the form's own choice, never saved.
 const BEDROCK = [
   { key: 'AWS_REGION', label: 'Region', hint: 'us-east-1', required: true },

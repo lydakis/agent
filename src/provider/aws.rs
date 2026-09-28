@@ -408,6 +408,11 @@ async fn resolve(argv: &[String]) -> Result<Keys> {
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // A CLI without the export (version 1, or 2 before 2.9) answers with
+        // its usage text, which says nothing of what to do.
+        if stderr.contains("Invalid choice") {
+            return Err(unavailable(too_old(version(&argv[0]).await)));
+        }
         let reason = stderr.trim();
         return Err(unavailable(if reason.is_empty() {
             format!("aws configure export-credentials exited {}", output.status)
@@ -417,6 +422,31 @@ async fn resolve(argv: &[String]) -> Result<Keys> {
     }
     parse_process(&output.stdout)
         .ok_or_else(|| unavailable("aws configure export-credentials printed no keys".into()))
+}
+
+/// What `aws --version` says it is (`aws-cli/1.22.34`), if it says.
+async fn version(aws: &str) -> Option<String> {
+    let mut command = tokio::process::Command::new(aws);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    // Version 1 on Python 2 printed it to stderr.
+    [output.stdout, output.stderr].iter().find_map(|text| {
+        String::from_utf8_lossy(text)
+            .split_whitespace()
+            .find(|word| word.starts_with("aws-cli/"))
+            .map(str::to_owned)
+    })
+}
+
+fn too_old(version: Option<String>) -> String {
+    let which = version.unwrap_or_else(|| "the aws CLI".into());
+    format!("{which} on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)")
 }
 
 /// The `credential_process` JSON: version 1, the key pair, an optional
@@ -721,6 +751,39 @@ echo '{{"Version":1,"AccessKeyId":"LATE","SecretAccessKey":"S"}}'"#,
         let aws = Arc::new(aws);
         std::fs::write(&ready, "").unwrap();
         assert_eq!(aws.current().await.unwrap().access, "LATE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// AWS CLI version 1 has no credential export and answers with its usage
+    /// text; the reason says which CLI it is and what it takes instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_without_the_export_is_named_not_quoted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("agent-aws-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aws = dir.join("aws");
+        // What aws-cli 1.x prints, trimmed of its list of choices.
+        std::fs::write(
+            &aws,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'aws-cli/1.22.34 Python/3.9.6 Darwin/23.6.0 botocore/1.24.0'; exit 0; fi
+printf 'usage: \rNote: AWS CLI version 2, the latest major version of the AWS CLI, is now stable and recommended for general use.\n\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\naws: error: argument subcommand: Invalid choice, valid choices are:\n\nadd-model | get\n' >&2
+exit 252
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&aws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut argv = AWS_CLI.map(str::to_owned);
+        argv[0] = aws.display().to_string();
+        let error = resolve(&argv).await.unwrap_err();
+        assert_eq!(error.code, "provider_aws_credentials_unavailable");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(
+                "aws-cli/1.22.34 on PATH cannot export credentials: install AWS CLI version 2 (2.9 or later)"
+            )
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
