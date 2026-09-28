@@ -499,6 +499,19 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
     Ok(json!({"session": session}))
 }
 
+/// An older daemon owns the store's socket, as after an upgrade: stop it so
+/// the next attach starts the one this app carries. Only for a store this
+/// app starts daemons for; a daemon it was pointed at is its owner's.
+#[tauri::command]
+async fn replace_daemon(state: State<'_, Shared>) -> Result<(), String> {
+    if state.agent.is_none() || state.config.store.is_none() {
+        return Err("daemon_not_ours: this window was given a daemon's socket; stop that daemon with its own agent".into());
+    }
+    daemon::replace_older(&state.config.socket).await?;
+    state.starts.lock().await.forget();
+    Ok(())
+}
+
 /// The next batch of a session's notifications: waits for one, then takes
 /// what else has already arrived, up to PULL. The page asks again once it
 /// has applied them, so the pipeline from the daemon to the screen is
@@ -702,6 +715,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             setup,
+            replace_daemon,
             policy,
             branch,
             models,

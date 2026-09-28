@@ -166,7 +166,20 @@ impl Client {
             None => return Err(Error::new("daemon_disconnected")),
         };
         if ready["event"] != "ready" || ready["protocol"].as_u64() != Some(PROTOCOL) {
-            return Err(Error::new("daemon_protocol_mismatch"));
+            // What the daemon announced, so a client that starts daemons can
+            // tell an older one it may replace from a newer one it must not.
+            let mut error = Error::with(
+                "daemon_protocol_mismatch",
+                &format!(
+                    "the daemon speaks protocol {}, this client {PROTOCOL}",
+                    ready["protocol"]
+                ),
+            );
+            let facts = ["protocol", "pid"]
+                .into_iter()
+                .filter_map(|key| Some((key.to_owned(), ready.get(key)?.clone())));
+            error.facts = Some(Box::new(facts.collect()));
+            return Err(error);
         }
         let store = ready["store"]["identity"].as_str().map(str::to_owned);
         let pending: Pending = Arc::default();

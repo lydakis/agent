@@ -22,6 +22,7 @@ window.Daemon = (() => {
       writeProject: ({ dir, name, model }) => invoke('write_project', { dir, name, model }),
       branch: (dir) => invoke('branch', { dir }),
       attach: (after) => invoke('attach', { after }),
+      replaceDaemon: () => invoke('replace_daemon'),
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
       swarms: () => invoke('swarms'),

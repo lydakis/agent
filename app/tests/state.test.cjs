@@ -1579,3 +1579,21 @@ test('removing a provider while agents work asks once more before the restart st
   await press();
   assert.equal(calls.filter(([c]) => c === 'save').length, 1);
 });
+
+test('an older daemon on the socket is replaced from the detached screen; a newer one is left to an app update', async () => {
+  let attaches = 0, replaced = 0; const stopping = deferred();
+  const p = page({ setup: async () => ({}), attach: async () => { attaches++; throw new Error('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)'); }, replaceDaemon: () => { replaced++; return stopping.promise; }, pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
+  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)');
+  const screen = p.context.document.getElementById('detached');
+  assert.match(screen.innerHTML, /A daemon from before this update is still running/);
+  assert.match(screen.innerHTML, /data-act="replace-daemon"/);
+  const button = { dataset: { act: 'replace-daemon' }, disabled: false, textContent: '' };
+  const pressed = p.act(button);
+  // No reattach runs while the old daemon closes.
+  await p.tick(); assert.equal(attaches, 0); assert.equal(button.textContent, 'Restarting…');
+  stopping.resolve(); await pressed; await settle();
+  assert.equal(replaced, 1); assert.equal(attaches, 1);
+  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 5, this client 4)');
+  assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
+  assert.match(screen.innerHTML, /newer than this app: update the app/);
+});
