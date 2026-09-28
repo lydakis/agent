@@ -485,6 +485,9 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
                 .await
                 .map_err(|e| e.to_string())?
         }
+        Err(error) if error.code == "daemon_protocol_mismatch" => {
+            return Err(daemon::age(&error));
+        }
         Err(error) => return Err(error.to_string()),
     };
     let session = state

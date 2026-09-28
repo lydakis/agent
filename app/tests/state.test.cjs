@@ -1582,8 +1582,8 @@ test('removing a provider while agents work asks once more before the restart st
 
 test('an older daemon on the socket is replaced from the detached screen; a newer one is left to an app update', async () => {
   let attaches = 0, replaced = 0; const stopping = deferred();
-  const p = page({ setup: async () => ({}), attach: async () => { attaches++; throw new Error('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)'); }, replaceDaemon: () => { replaced++; return stopping.promise; }, pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
-  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)');
+  const p = page({ setup: async () => ({}), attach: async () => { attaches++; throw new Error('daemon_older: the daemon speaks protocol 3, this app 4'); }, replaceDaemon: () => { replaced++; return stopping.promise; }, pull: () => new Promise(() => {}), request: async () => ({ bots: [] }) });
+  p.lost('daemon_older: the daemon speaks protocol 3, this app 4');
   const screen = p.context.document.getElementById('detached');
   assert.match(screen.innerHTML, /A daemon from before this update is still running/);
   assert.match(screen.innerHTML, /data-act="replace-daemon"/);
@@ -1596,7 +1596,7 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   // A newer daemon is not attached to again and again: only a newer app helps.
   await p.tick();
   const before = attaches;
-  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 5, this client 4)');
+  p.lost('daemon_newer: the daemon speaks protocol 5, this app 4; update the app');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
   assert.match(screen.innerHTML, /newer than this app: update the app/);
   assert.match(screen.innerHTML, /· stopped/);
@@ -1604,12 +1604,12 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   assert.equal(attaches, before);
   // A window given a socket did not start that daemon, so it offers no restart.
   p.S.config = { managed: false, socket: '/synthetic/agent.sock' };
-  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)');
+  p.lost('daemon_older: the daemon speaks protocol 3, this app 4');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
   assert.match(screen.innerHTML, /this window did not start it: stop it with its own agent/);
-  // Equal numbers name no older or newer daemon, so nothing is restarted and retrying goes on.
+  // A mismatch the app could not age names no older or newer daemon, so nothing is restarted and retrying goes on.
   p.S.config = { managed: true };
-  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 4, this client 4)');
+  p.lost('daemon_protocol_mismatch: the daemon speaks protocol "4", this client 4');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon|update the app/);
   assert.match(screen.innerHTML, /· retrying/);
 });

@@ -926,9 +926,8 @@ function idle() { return /^no_provider/.test(S.lastReason ?? '') || olderDaemon(
 // A daemon from before an upgrade still owns the socket: it speaks an older protocol, and the app can
 // stop it and start its own. One newer than the app is left alone.
 function olderDaemon(reason) {
-  const m = /^daemon_protocol_mismatch \(the daemon speaks protocol (\d+), this client (\d+)\)/.exec(reason ?? '');
-  if (!m || m[1] === m[2]) return null;
-  return Number(m[1]) < Number(m[2]) ? 'older' : 'newer';
+  // The app names the age by code, from what the daemon announced, not from the error's wording.
+  return /^daemon_older\b/.test(reason ?? '') ? 'older' : /^daemon_newer\b/.test(reason ?? '') ? 'newer' : null;
 }
 function showDetached(reason) {
   S.attached = false;

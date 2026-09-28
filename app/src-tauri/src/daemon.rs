@@ -95,6 +95,26 @@ pub async fn stop(agent: &Path, store: &Path) -> Result<(), String> {
     }
 }
 
+/// A protocol mismatch as the page acts on it: `daemon_older` when the
+/// daemon announced an older protocol than this app's, `daemon_newer` when
+/// it announced a newer one, from the error's facts rather than its text.
+pub fn age(error: &agent_client::Error) -> String {
+    let announced = (error.facts.as_ref())
+        .and_then(|facts| facts.get("protocol"))
+        .and_then(|p| p.as_u64());
+    match announced {
+        Some(p) if p < agent_client::PROTOCOL => format!(
+            "daemon_older: the daemon speaks protocol {p}, this app {}",
+            agent_client::PROTOCOL
+        ),
+        Some(p) if p > agent_client::PROTOCOL => format!(
+            "daemon_newer: the daemon speaks protocol {p}, this app {}; update the app",
+            agent_client::PROTOCOL
+        ),
+        _ => error.to_string(),
+    }
+}
+
 /// How long an older daemon gets to end its turns and close its store.
 const REPLACE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -386,6 +406,20 @@ mod tests {
             }
         });
         (pid, exit)
+    }
+
+    #[test]
+    fn a_mismatch_is_aged_by_the_protocol_the_daemon_announced() {
+        let mismatch = |protocol: Option<u64>| {
+            let mut error = agent_client::Error::with("daemon_protocol_mismatch", "any wording");
+            error.facts = protocol
+                .map(|p| Box::new(serde_json::Map::from_iter([("protocol".into(), p.into())])));
+            age(&error)
+        };
+        let now = agent_client::PROTOCOL;
+        assert!(mismatch(Some(now - 1)).starts_with("daemon_older:"));
+        assert!(mismatch(Some(now + 1)).starts_with("daemon_newer:"));
+        assert!(mismatch(None).starts_with("daemon_protocol_mismatch"));
     }
 
     #[test]
