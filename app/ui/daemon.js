@@ -289,12 +289,14 @@ window.Daemon = (() => {
   }
   // Who hears a post, as the app's post tool decides: working agents, and idle ones only when named
   // (or, for your post, when it names nobody).
-  function deliver(sw, from, text) {
+  // A stream's post reaches the working agents in its stream and whoever it names, as the app's does.
+  function deliver(sw, from, text, stream) {
     const named = [...text.matchAll(/@([\w.-]*\w)/g)].map((m) => m[1]);
     for (const m of sw.members) {
       const b = S.bots.get(m); if (!b || m === from) continue;
       const isNamed = named.includes(short(sw, m)) || named.includes(m);
       const prompt = `[board] ${from ? short(sw, from) : 'user'}: ${text}`;
+      if (stream && !isNamed && sw.state.streams[short(sw, m)] !== stream) continue;
       if (b.status !== 'idle') { (b.steers ??= []).push(prompt); emit({ event: 'steered', bot: m, turn: b.running_turn, data: {} }); }
       else if (isNamed || (!from && !named.length)) reply(m, prompt);
     }
@@ -307,7 +309,7 @@ window.Daemon = (() => {
     sw.board.push({ at: Date.now(), from: short(sw, name), bot: name, turn, text, ...(stream ? { stream } : {}) });
     b.tokens_used += 4000;
     emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stdout: '{"posted":true}\n', stderr: '', success: true }) }), artifacts: [] } });
-    deliver(sw, name, text);
+    deliver(sw, name, text, stream);
     await steerIn(name, turn);
   }
   // An agent's role, proposal, vote or join, run as its script.
