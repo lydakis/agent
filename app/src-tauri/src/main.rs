@@ -567,6 +567,7 @@ async fn swarm_create(
     shared: bool,
     model: String,
     budget_tokens: u64,
+    council: usize,
 ) -> Result<Value, String> {
     let root = swarms_of(&state)?;
     let folder = workspace_path(std::path::Path::new(&folder))?;
@@ -590,6 +591,7 @@ async fn swarm_create(
         members: Vec::new(),
         ids: Default::default(),
         stopped: false,
+        council,
     };
     let filled = std::env::current_exe()
         .map_err(|e| e.to_string())
@@ -658,7 +660,26 @@ async fn swarm_post(
     text: String,
 ) -> Result<Value, String> {
     let client = state.client.lock().await.clone().ok_or("detached")?;
-    swarm::post(&client, &swarms_of(&state)?, &swarm, None, &text).await
+    let act = swarm::Act::Post { text, all: true };
+    swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
+}
+
+/// You approve or deny an open proposal, which decides it.
+#[tauri::command]
+async fn swarm_decide(
+    state: State<'_, Shared>,
+    swarm: String,
+    id: String,
+    approve: bool,
+    reason: String,
+) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    let act = swarm::Act::Vote {
+        id,
+        yes: approve,
+        reason,
+    };
+    swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
 }
 
 #[tauri::command]
@@ -722,7 +743,8 @@ fn main() {
             swarm_discard,
             swarm_stop,
             swarm_board,
-            swarm_post
+            swarm_post,
+            swarm_decide
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");

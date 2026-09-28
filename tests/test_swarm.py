@@ -35,7 +35,7 @@ class SwarmPostTests(ModelFixture):
     def ids(self):
         return {b['name']: b['id'] for b in json.loads(self.agent('ls', '--store', str(self.store)).stdout)}
 
-    def swarm(self, members):
+    def swarm(self, members, council=0):
         # The folder the app writes for a swarm, by hand: each member pinned to its bot's id.
         folder = self.path / 'swarms' / 'p.s'
         folder.mkdir(parents=True)
@@ -44,23 +44,27 @@ class SwarmPostTests(ModelFixture):
         pinned = ''.join(f'{json.dumps(m)} = {ids[m]}\n' for m in members)
         (folder / 'swarm.toml').write_text(
             f'project = "p"\ngoal = "g"\nworkspace = "{self.path}"\nmodel = "openai/synthetic-model"\n'
-            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\n[ids]\n{pinned}')
+            f'budget_tokens = 1000000\nmembers = [{listed}]\nstopped = false\ncouncil = {council}\n[ids]\n{pinned}')
         (folder / 'board.jsonl').write_text('')
-        post = folder / 'post'
-        post.write_text(f'#!/bin/sh\nexec \'{APP}\' --swarm-post \'{folder}\' "$@"\n')
-        post.chmod(0o755)
+        for tool, flag in [('post', ''), ('propose', ' --propose'), ('vote', ' --vote'), ('join', ' --join')]:
+            script = folder / tool
+            script.write_text(f'#!/bin/sh\nexec \'{APP}\' --swarm-post \'{folder}\'{flag} "$@"\n')
+            script.chmod(0o755)
         return folder
 
     def turns(self, bot):
         return json.loads(self.agent('turns', '--store', str(self.store), '--bot', bot).stdout)
 
-    def post_from(self, bot, folder, text):
+    def post_from(self, bot, folder, text, tool='post'):
         # The agent runs the script from its shell tool; its output is kept for the test.
         out = self.path / f'posted-{bot}.json'
         ran = self.agent('run', '--store', str(self.store), '--bot', bot,
-                         f'shell:"{folder}/post" {text} > "{out}" 2>&1')
+                         f'shell:"{folder}/{tool}" {text} > "{out}" 2>&1')
         self.assertTrue(out.exists(), ran.stdout)
         return json.loads(out.read_text() or '{}')
+
+    def settle(self, bot):
+        self.agent('wait', '--store', str(self.store), f"turn:{bot}/{self.turns(bot)[-1]['turn']}")
 
     def test_a_post_reaches_working_agents_and_wakes_only_named_idle_ones(self):
         self.model.release_headers = threading.Event()
@@ -112,6 +116,33 @@ class SwarmPostTests(ModelFixture):
         self.agent('run', '--store', str(self.store), '--bot', 'p.s-1', f'shell:"{folder}/post" hi > "{stopped}" 2>&1')
         self.assertIn('swarm_stopped', stopped.read_text())
         self.assertEqual(len((folder / 'board.jsonl').read_text().splitlines()), 3)
+
+    def test_a_proposal_wakes_the_seats_and_their_majority_opens_a_stream(self):
+        members = ['p.s-1', 'p.s-2', 'p.s-3', 'p.s-4']
+        for bot in members:
+            self.agent('run', *self.common, '--new', '--bot', bot, 'hello')
+        folder = self.swarm(members, council=3)
+        proposed = self.post_from('p.s-4', folder, 'conn-pool "reuse provider connections"', 'propose')
+        self.assertEqual((proposed['id'], proposed['woke']), ('P1', ['s-1', 's-2', 's-3']))
+        for seat in members[:3]:
+            self.settle(seat)
+            self.assertTrue(self.turns(seat)[-1]['prompt_preview'].startswith('[board] s-4 proposes P1 #conn-pool'))
+        self.assertIsNone(self.post_from('p.s-1', folder, 'P1 yes "measured first"', 'vote')['decided'])
+        refused = self.post_from('p.s-4', folder, 'P1 yes "mine"', 'vote')
+        self.assertTrue(refused['error'].startswith('not_a_seat'))
+        decided = self.post_from('p.s-2', folder, 'P1 yes "worth it"', 'vote')
+        self.assertEqual((decided['decided'], decided['woke']), ('approved', ['s-4']))
+        self.settle('p.s-4')
+        self.assertTrue(self.turns('p.s-4')[-1]['prompt_preview'].startswith('[board] P1 #conn-pool approved'))
+        state = json.loads((folder / 'state.json').read_text())
+        self.assertEqual(state['streams'], {'s-4': 'conn-pool'})
+        self.assertEqual(state['proposals'][0]['status'], 'approved')
+        # A stream's post names its stream; nobody else is in it, so it reaches nobody.
+        self.post_from('p.s-1', folder, 'conn-pool', 'join')
+        streamed = self.post_from('p.s-4', folder, '"pool is in"')
+        self.assertEqual((streamed['stream'], streamed['steered'], streamed['woke']), ('conn-pool', [], []))
+        kinds = [json.loads(line).get('kind', 'post') for line in (folder / 'board.jsonl').read_text().splitlines()]
+        self.assertEqual(kinds, ['propose', 'vote', 'vote', 'decision', 'join', 'post'])
 
 
 if __name__ == '__main__':
