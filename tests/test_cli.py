@@ -925,23 +925,27 @@ class CliTests(ModelFixture):
             list(pool.map(lambda args: check(*args), [('run', False), ('ls', True)]))
 
     def test_cli_refuses_a_daemon_of_another_protocol(self):
-        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-            path = Path(directory)/'daemon.sock'
-            with socket.socket(socket.AF_UNIX) as listener:
-                listener.bind(str(path))
-                listener.listen(1)
-                listener.settimeout(3)
-                process = subprocess.Popen([str(self.binary), 'ls', '--store', str(Path(directory)/'state.db'),
-                                            '--socket', str(path)],
-                                           env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                try:
-                    with listener.accept()[0] as peer:
-                        peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1))+'\n').encode())
-                        _, stderr = process.communicate(timeout=5)
-                    self.assertEqual(process.returncode, 1)
-                    self.assertIn(b'daemon_protocol_mismatch', stderr)
-                finally:
-                    self.stop_process(process)
+        # `start` and `run` would otherwise start a daemon of their own
+        # beside the one that answered.
+        for command in (['ls'], ['start', '--provider', 'openai=responses,http://127.0.0.1:9/v1']):
+            with self.subTest(command=command[0]), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                path = Path(directory)/'daemon.sock'
+                with socket.socket(socket.AF_UNIX) as listener:
+                    listener.bind(str(path))
+                    listener.listen(1)
+                    listener.settimeout(3)
+                    process = subprocess.Popen([str(self.binary), *command, '--store', str(Path(directory)/'state.db'),
+                                                '--socket', str(path)],
+                                               env=clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    try:
+                        with listener.accept()[0] as peer:
+                            peer.sendall((json.dumps(dict(event='ready', protocol=PROTOCOL - 1))+'\n').encode())
+                            _, stderr = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 1)
+                        self.assertIn(b'daemon_protocol_mismatch', stderr)
+                        self.assertFalse((Path(directory)/'state.db').exists())
+                    finally:
+                        self.stop_process(process)
 
     def test_explicit_store_overrides_inherited_socket(self):
         client = SocketClient(self.binary, self.path/'first.db', self.url, 'echo')

@@ -580,7 +580,13 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
             check_daemon(options, &connection.ready)?;
             Ok(Some(connection))
         }
-        Err(error) if error.code == "daemon_start_timeout" => Err(error),
+        // A daemon that answers with another protocol is running; starting
+        // a second one for the same socket would not replace it.
+        Err(error)
+            if error.code == "daemon_start_timeout" || error.code == "daemon_protocol_mismatch" =>
+        {
+            Err(error)
+        }
         Err(_) => Ok(None),
     };
     if let Some(connection) = connect()? {
