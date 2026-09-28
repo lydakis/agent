@@ -339,11 +339,7 @@ impl Kind {
     /// The file the entry stands for, if it is one.
     fn file(self, path: &Path) -> Result<Option<PathBuf>, Failure> {
         let file = match self {
-            Kind::Skills => {
-                // A skill folder that is a dangling link is present too.
-                not_dangling(path)?;
-                path.join("SKILL.md")
-            }
+            Kind::Skills => path.join("SKILL.md"),
             Kind::Profiles => path.to_path_buf(),
         };
         // The index names what the folders hold; whether a role fits a bot's
@@ -375,16 +371,22 @@ fn is_file(path: &Path) -> Result<bool, Failure> {
     }
 }
 
-/// A link whose target is missing is present, so it is an error, not an
-/// absence another folder's file may stand in for.
+/// Called when `path` does not resolve. A link to a missing target, at
+/// `path` or at the nearest part of it that exists (a dangling `.agents` or
+/// skill folder), is present, so it is an error, not an absence another
+/// folder's file may stand in for. Usually one extra lookup: the parent.
 fn not_dangling(path: &Path) -> Result<(), Failure> {
-    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
-        && std::fs::metadata(path).is_err()
-    {
-        return Err(Failure::Unreadable {
-            path: path.to_path_buf(),
-            reason: "a link to a missing file".into(),
-        });
+    for part in path.ancestors() {
+        let Ok(meta) = std::fs::symlink_metadata(part) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() && std::fs::metadata(part).is_err() {
+            return Err(Failure::Unreadable {
+                path: part.to_path_buf(),
+                reason: "a link to a missing file".into(),
+            });
+        }
+        return Ok(());
     }
     Ok(())
 }
@@ -421,7 +423,10 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
     for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                not_dangling(&dir)?;
+                continue;
+            }
             Err(error) => {
                 return Err(Failure::Unreadable {
                     path: dir,
@@ -967,6 +972,24 @@ mod tests {
             "instructions_unreadable"
         );
         std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        // So is a dangling folder on the way: `.agents` itself, or the skills
+        // folder, whose absence would otherwise let home's entries stand in.
+        std::fs::rename(root.join(".agents"), root.join("agents.real")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join(".agents")).unwrap();
+        assert_eq!(
+            profile(&root, "reviewer").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents")).unwrap();
+        std::fs::rename(root.join("agents.real"), root.join(".agents")).unwrap();
+        std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join(".agents/skills")).unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/skills")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
         // A stray file where a skill folder would be is simply not a skill.
         std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
