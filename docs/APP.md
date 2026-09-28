@@ -266,16 +266,20 @@ first run and later changes:
    models. Each row then shows its model count, or its refusal with a Retry.
    A key is never read back into the page: the core reports only which keys
    are set, and a key field left empty keeps the saved one. Removing a
-   provider drops its key unless another provider uses it. Refresh models
-   asks again and writes the answer to `~/.agent/models`, replacing it: a
-   provider that answers replaces its lines, one that fails keeps the lines
-   it had, one no longer running loses them, and an answer with no usable
-   model leaves the file as it was.
+   provider drops its key unless another provider uses it; removing the last
+   one also writes an empty value for each key the shell exports, since a
+   start with no provider named would otherwise detect one from it. Refresh
+   models asks again and writes the answer to `~/.agent/models`, replacing
+   it: a provider that answers replaces its lines, one that fails keeps the
+   lines it had, one no longer running loses them, and an answer with no
+   usable model leaves the file as it was. A file that no longer reads is
+   replaced whole. A change that would make `~/.agent/env` larger than a
+   start accepts (64 KiB) is refused.
 2. **First project**, shown until one exists: a folder and a model, the
    models listed under their providers, then New project's path.
 
 It opens on its own when a daemon cannot start for lack of a provider, and
-once when a window attaches to an empty store with no provider set up. An
+once when a window first attaches to a store with no agents. An
 `agent` the app did not bundle, or an explicit `--socket`, cannot be
 restarted; Settings says so.
 

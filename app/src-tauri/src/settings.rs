@@ -70,8 +70,10 @@ fn assigned(line: &str) -> Option<&str> {
 }
 
 /// `text` with each named setting set to its value, or removed for null or
-/// an empty value. Every other line is kept as it was, and a setting given
-/// twice keeps only its first place.
+/// an empty value. An empty key is written empty instead: it hides a key the
+/// login shell exports, which a start would otherwise detect as a provider.
+/// Every other line is kept as it was, and a setting given twice keeps only
+/// its first place.
 pub fn edit(text: &str, changes: &Map<String, Value>) -> Result<String, String> {
     let mut wanted = Vec::new();
     for (key, value) in changes {
@@ -80,6 +82,9 @@ pub fn edit(text: &str, changes: &Map<String, Value>) -> Result<String, String> 
         }
         let value = match value {
             Value::Null => None,
+            Value::String(_) if SECRET.contains(&key.as_str()) && value.as_str() == Some("") => {
+                Some("")
+            }
             Value::String(value) if value.trim().is_empty() => None,
             Value::String(value) => Some(value.trim()),
             _ => return Err(format!("settings_invalid: {key} must be text")),
@@ -178,6 +183,10 @@ mod tests {
         assert_eq!(seen["providers"], json!(["anthropic", "openai"]));
         assert_eq!(seen["keys"], json!(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]));
         assert!(!seen.to_string().contains("sk-"));
+        // An empty key in the file hides the shell's, so nothing is detected.
+        let hidden = vec![("OPENAI_API_KEY".to_owned(), String::new())];
+        assert_eq!(view(&hidden, Some(&login))["providers"], json!([]));
+        assert_eq!(view(&hidden, Some(&login))["keys"], json!([]));
         // Named providers replace detection, as they do for the CLI.
         let named = vec![("AGENT_PROVIDER".to_owned(), " bedrock  chatgpt ".to_owned())];
         assert_eq!(
@@ -202,12 +211,13 @@ mod tests {
                 "OPENAI_API_KEY": null,
                 "AGENT_PROVIDER": "bedrock chatgpt",
                 "AWS_PROFILE": "  ",
+                "ANTHROPIC_API_KEY": "",
             })),
         )
         .unwrap();
         assert_eq!(
             edited,
-            "# mine\nAWS_REGION=\"us-west-2\"\nOTHER=1\nAGENT_PROVIDER=\"bedrock chatgpt\"\n"
+            "# mine\nAWS_REGION=\"us-west-2\"\nOTHER=1\nAGENT_PROVIDER=\"bedrock chatgpt\"\nANTHROPIC_API_KEY=\"\"\n"
         );
         // What is written reads back exactly, whatever quotes the value holds.
         let path = std::env::temp_dir().join(format!("agent-app-settings-{}", std::process::id()));

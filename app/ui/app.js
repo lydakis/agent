@@ -1394,6 +1394,8 @@ const BEDROCK = [
   { key: 'AWS_PROFILE', label: 'AWS profile', hint: 'default' },
   { key: 'AWS_BEARER_TOKEN_BEDROCK', label: 'Bedrock API key', hint: 'optional', secret: true },
 ];
+// Keys a start without AGENT_PROVIDER turns into providers, as the CLI detects them.
+const DETECTED = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY'];
 const CATALOG = [
   { id: 'anthropic', label: 'Anthropic', fields: [{ key: 'ANTHROPIC_API_KEY', label: 'API key', secret: true, required: true }] },
   { id: 'openai', label: 'OpenAI', fields: [{ key: 'OPENAI_API_KEY', label: 'API key', secret: true, required: true }] },
@@ -1429,7 +1431,8 @@ function setupState() { return S.setup ??= { open: false, settings: null, status
 const hasProject = () => [...S.bots.keys()].some((n) => n.endsWith(LEAD));
 // A window with nothing in it opens setup when no provider is set up.
 async function offerSetup() {
-  try { const set = await Daemon.settings(); if (!set.providers?.length) await openSetup(); } catch (_) {}
+  // No agents yet: setup connects a provider or, with one already, opens the first project.
+  try { await openSetup(); } catch (_) {}
 }
 async function openSetup() {
   S.setupSeen = true;
@@ -1507,6 +1510,8 @@ async function removeProvider(name) {
   const changes = { AGENT_PROVIDER: specs.join(' ') || null };
   // Its key goes too, unless another provider still uses it; the region and profile stay.
   for (const f of c?.fields ?? []) if (f.secret && !specs.some((s) => catalogOf(specName(s))?.fields.some((g) => g.key === f.key))) changes[f.key] = null;
+  // With no provider named, a start detects one from any key the shell exports; an empty key hides it.
+  if (!specs.length) for (const key of DETECTED) if (key in changes || st.settings?.keys?.includes(key)) changes[key] = '';
   await applySettings(changes);
   await refreshModels();
 }

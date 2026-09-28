@@ -260,7 +260,16 @@ async fn settings() -> Result<Value, String> {
         Some(path) => daemon::read_env_file(&path)?,
         None => Vec::new(),
     };
-    Ok(settings::view(&file, daemon::login().await))
+    // Without a login shell a started daemon inherits this process's environment.
+    let inherited: Vec<_>;
+    let environment = match daemon::login().await {
+        Some(login) => login,
+        None => {
+            inherited = std::env::vars_os().collect();
+            &inherited
+        }
+    };
+    Ok(settings::view(&file, Some(environment)))
 }
 
 /// Set or remove settings in `~/.agent/env`; they reach the daemon when it
@@ -274,7 +283,16 @@ fn save_settings(changes: serde_json::Map<String, Value>) -> Result<(), String> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         read => read.map_err(|e| format!("env_file_unreadable: {}: {e}", path.display()))?,
     };
-    settings::replace(&path, &settings::edit(&text, &changes)?, 0o600)
+    let edited = settings::edit(&text, &changes)?;
+    // A file the next start would refuse is never written.
+    if edited.len() as u64 > daemon::MAX_ENV_FILE {
+        return Err(format!(
+            "env_file_invalid: {} would exceed {} bytes",
+            path.display(),
+            daemon::MAX_ENV_FILE
+        ));
+    }
+    settings::replace(&path, &edited, 0o600)
 }
 
 /// Stop the store's daemon so the next attach starts one with the current
@@ -306,7 +324,8 @@ async fn discover_models(state: State<'_, Shared>) -> Result<Value, String> {
     let failed = |error: agent_client::Error| {
         format!("{}: {}", error.code, error.detail.unwrap_or_default())
     };
-    let kept = agent_client::models::read(&path).map_err(failed)?;
+    // Refresh replaces the list, so one that no longer reads keeps nothing.
+    let kept = agent_client::models::read(&path).unwrap_or_default();
     let text = agent_client::models::render(&listing, &kept).map_err(failed);
     if let Ok(text) = &text {
         settings::replace(&path, text, 0o644)?;

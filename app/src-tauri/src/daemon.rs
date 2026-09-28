@@ -27,7 +27,7 @@ const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 const MARKER: &str = "__agent_app_environment__";
 /// Keys, not documents: bounds the read that starts every daemon.
-const MAX_ENV_FILE: u64 = 64 * 1024;
+pub const MAX_ENV_FILE: u64 = 64 * 1024;
 const MAX_SHELL_OUTPUT: u64 = 1024 * 1024;
 
 static LOGIN: OnceCell<Option<Vec<(OsString, OsString)>>> = OnceCell::const_new();

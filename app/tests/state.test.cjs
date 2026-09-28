@@ -1213,6 +1213,22 @@ test('removing a provider drops its key unless another provider uses it', async 
   assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: 'openai', ANTHROPIC_API_KEY: null });
 });
 
+test('removing the last provider hides a key the shell exports, so the next start detects nothing', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'bedrock bedrock-openai', AWS_REGION: 'us-west-2', OPENAI_API_KEY: 'shell' }, lists: { bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
+  await p.openSetup();
+  await p.removeProvider('bedrock');
+  assert.deepEqual({ ...calls[0][1] }, { AGENT_PROVIDER: null, AWS_BEARER_TOKEN_BEDROCK: null, OPENAI_API_KEY: '' });
+});
+
+test('a first launch with a provider but no agents opens setup on the first project', async () => {
+  const { p } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] } } });
+  p.S.attached = false; p.S.setupSeen = false;
+  await p.attach();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(p.S.setup.open, true);
+  assert.match(p.setupHTML(), /First project/);
+});
+
 test('a project starts on the model picked for it, and the pick is offered first next time', async () => {
   const storage = new Map();
   const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai bedrock bedrock-openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
