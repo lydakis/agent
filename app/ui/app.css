@@ -238,6 +238,8 @@ form.newproj select{width:100%;height:24px;margin-top:4px;background:var(--t-bg)
 .detached.on{display:flex}
 .detached b{color:var(--t-ink);font-weight:500}
 .detached .k{color:var(--amber)}
+.detached .why{margin-top:10px;color:var(--t-ink)}
+.detached .hint{margin-top:6px;font-size:12px}
 /* Setup and Settings: one page over everything, each step a section, completed ones checked. */
 .setupwrap{position:fixed;inset:0;z-index:30;display:none;overflow-y:auto;background:var(--t-bg);padding:48px 16px}
 .setupwrap.on{display:block}

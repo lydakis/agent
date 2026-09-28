@@ -217,6 +217,22 @@ quits the app and runs the bundled `agent shutdown --store
 started it, lets running turns finish and exits before its binary is replaced.
 The store is named so the uninstalling shell's `AGENT_STORE` or `AGENT_SOCKET`
 cannot point the shutdown elsewhere.
+A daemon that survived an upgrade anyway, and speaks an older protocol than
+the app, leaves the window detached with **Restart the daemon**: the app
+sends SIGTERM to the process that daemon named in its `ready` line (running
+turns end as interrupted; the store keeps every chat), waits up to 30 seconds
+for it to exit (an exited process nobody has reaped yet counts as gone), and
+attaches, which starts the bundled daemon. Only a daemon whose `ready` greeting names
+a protocol strictly older than the app's is signalled. Reattaching pauses
+meanwhile, so nothing starts a daemon while the old one closes its store. A
+daemon newer than the app is left alone: the page says to update the app and
+stops trying to attach. A window given `--socket` or `AGENT_SOCKET` did not
+start that daemon, so it offers no restart and says to stop the daemon with
+its own agent and start one from this update's agent; it attaches when that
+one answers. An exited daemon its parent has not reaped yet counts as gone,
+on Linux from `/proc` and on macOS from `proc_pidinfo`.
+
+![An older daemon still owns the socket after an upgrade](app/daemon-replace.png)
 
 Releases follow Errand's: pushing a `vX.Y.Z` tag on `main` whose version both
 `Cargo.toml` and `app/src-tauri/Cargo.toml` carry runs
