@@ -175,11 +175,33 @@ fn running(pid: libc::pid_t) -> bool {
     // SAFETY: signal 0 only asks whether the process still exists.
     let exists = unsafe { libc::kill(pid, 0) } == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    exists
-        && std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.rsplit_once(") ")
-                .is_none_or(|(_, state)| !state.starts_with('Z'))
-        })
+    exists && !exited(pid)
+}
+
+/// A process that exited but that its parent has not reaped yet: it has
+/// closed its store, so it counts as gone.
+#[cfg(target_os = "linux")]
+fn exited(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, state)| state.starts_with('Z'))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn exited(pid: libc::pid_t) -> bool {
+    // SAFETY: plain data the kernel fills in, at most `size` bytes of it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is `size` bytes the call may write, and outlives it.
+    let got =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    got == size && info.pbi_status == libc::SZOMB
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn exited(_pid: libc::pid_t) -> bool {
+    false
 }
 
 /// The CLI's error line, `agent: CODE: DETAIL`.

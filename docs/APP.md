@@ -207,7 +207,9 @@ meanwhile, so nothing starts a daemon while the old one closes its store. A
 daemon newer than the app is left alone: the page says to update the app and
 stops trying to attach. A window given `--socket` or `AGENT_SOCKET` did not
 start that daemon, so it offers no restart and says to stop the daemon with
-its own agent; it attaches once that daemon is gone.
+its own agent and start one from this update's agent; it attaches when that
+one answers. An exited daemon its parent has not reaped yet counts as gone,
+on Linux from `/proc` and on macOS from `proc_pidinfo`.
 
 ![An older daemon still owns the socket after an upgrade](app/daemon-replace.png)
 

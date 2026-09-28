@@ -936,7 +936,7 @@ function showDetached(reason) {
   const age = olderDaemon(reason), ours = !!Daemon.replaceDaemon && S.config?.managed !== false;
   const settings = '<button type="button" class="sbtn" data-act="settings">Open Settings</button>';
   const what = age === 'older' && ours ? `<div class="why">A daemon from before this update is still running.</div><div style="margin-top:12px"><button type="button" class="sbtn primary" data-act="replace-daemon">Restart the daemon</button> ${settings}</div><div class="hint">Turns it is running end as interrupted. Every chat is kept.</div>`
-    : age === 'older' ? `<div class="why">A daemon from before this update holds this socket, and this window did not start it: stop it with its own agent (agent shutdown).</div><div style="margin-top:12px">${settings}</div>`
+    : age === 'older' ? `<div class="why">A daemon from before this update holds this socket, and this window did not start it: stop it with its own agent (agent shutdown), then start one from this update's agent. The window attaches when it answers.</div><div style="margin-top:12px">${settings}</div>`
     : `${age === 'newer' ? '<div class="why">The daemon is newer than this app: update the app.</div>' : ''}<div style="margin-top:12px">${settings}</div>`;
   const state = age === 'newer' ? 'stopped' : idle() ? 'waiting for a provider' : 'retrying';
   $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${state}</div>${what}`;

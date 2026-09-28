@@ -1606,7 +1606,7 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   p.S.config = { managed: false, socket: '/synthetic/agent.sock' };
   p.lost('daemon_older: the daemon speaks protocol 3, this app 4');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
-  assert.match(screen.innerHTML, /this window did not start it: stop it with its own agent/);
+  assert.match(screen.innerHTML, /this window did not start it: stop it with its own agent \(agent shutdown\), then start one from this update's agent/);
   // A mismatch the app could not age names no older or newer daemon, so nothing is restarted and retrying goes on.
   p.S.config = { managed: true };
   p.lost('daemon_protocol_mismatch: the daemon speaks protocol "4", this client 4');
