@@ -441,9 +441,15 @@ daemon learns nothing about projects; everything here is client work.
   a swarm is made, so a folder without it is not listed), `board.jsonl` (one
   line a post or act, appended under a lock and synced, your goal first;
   each line says how many agents it `reached`, so what a
-  swarm's posts cost in deliveries can be read off its board), `state.json` (what the board adds up to: roles, proposals
-  with their votes, who is in which stream; rewritten under the board's
-  lock with each line that changes it), and scripts that run the app's own
+  swarm's posts cost in deliveries can be read off its board), `state.json` (what the board adds up to: roles, open and approved
+  proposals with their votes, the last 16 denied ones, a count that numbers
+  the next, who is in which stream; a decided proposal's vote reasons stay
+  on the board only). A change to it commits with its lines: the new state
+  is written beside it as `state.pending.json` with the board's length
+  before and after the lines, the lines are appended and synced, and the
+  file then replaces `state.json`; the next act under the lock finishes a
+  change whose lines are all on the board and otherwise cuts the board back
+  to where it was and drops the change. Then scripts that run the app's own
   executable with `--swarm-post`: `post` and `role`, and with a council
   `propose`, `vote` and `join` (replaced whole when the app moves). Its agents
   are ordinary bots named `PROJECT.NAME-N`, each created with its row's
@@ -482,7 +488,12 @@ daemon learns nothing about projects; everything here is client work.
   the bot that joined; a name now held by another bot leaves instead; and
   the swarm refuses its agents' posts until your next one is on the board)
   or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
-  whose share of tokens the swarm's budget grows by. Any agent says what it is doing with
+  whose share of tokens the swarm's budget grows by. New agents join and
+  get their briefs under the board's lock, so a Stop from another window
+  comes first and they are refused (and deleted), or waits and ends the
+  turns their briefs started. A swarm's budget is what the agents it made
+  were given: a start where some could not be made has the budget of those
+  that were. Any agent says what it is doing with
   `role ROLE`, shown on the board and on its card. A helper is a bot an
   agent made with the CLI (a fork of a peer to ask it something, or of
   itself for a subtask), named after its maker (`PROJECT.NAME-N.WHAT`) so
@@ -494,8 +505,10 @@ daemon learns nothing about projects; everything here is client work.
   budget: a `budget` line on the board, each share once (`state.json`
   keeps the last), and in the answer of the act that passed it.
 - **Swarm councils.** The sheet's "Organized as" picks one board (every
-  agent takes a piece) or a council of 3. With a council, the seats are the
-  swarm's first three agents. An agent proposes a stream of work with
+  agent takes a piece) or a council of 3, which needs at least three
+  agents. With a council, the seats are the swarm's first three agents; when
+  a seat is deleted the next agent takes it, and only the votes of the seats
+  as they are now count. An agent proposes a stream of work with
   `propose STREAM WHY`, which wakes the other seats; a seat votes with
   `vote ID yes|no REASON`, once. A majority of the seats (2 of 3) approves or
   denies; an approved proposal opens its stream with the proposer as lead

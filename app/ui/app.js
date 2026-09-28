@@ -406,6 +406,13 @@ function checkSoon(sw) {
   if (sw.stopped || checkTimers.has(sw.name) || !Daemon.swarmCheck) return;
   checkTimers.set(sw.name, setTimeout(() => { checkTimers.delete(sw.name); Daemon.swarmCheck(sw.name).catch((e) => Daemon.log?.(`budget check ${sw.name}: ${e?.message ?? e}`)); }, 5000));
 }
+// A helper's tokens count in its swarm's, so its finished turn is accounted as a member's is: its maker,
+// or its maker's maker, is a member.
+function swarmOfHelper(name) {
+  let b = bot(name);
+  for (let depth = 0; b && depth < 16; depth++) { const maker = creatorOf(b); if (!maker) return null; const sw = swarmOfBot(maker.name); if (sw) return sw; b = maker; }
+  return null;
+}
 const boardTimers = new Map();
 function boardSoon(sw, usage) {
   if (usage) sw.usageDue = true;
@@ -835,7 +842,7 @@ async function handle(ev, session, paint = true) {
   const terminal = await onEvent(ev);
   if (S.session !== session) return;
   if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
-  const sw = ev.bot && swarmOfBot(ev.bot);
+  const sw = ev.bot && (swarmOfBot(ev.bot) ?? (ev.event === 'turn_finished' ? swarmOfHelper(ev.bot) : null));
   if (sw) { if (FLEET_EVENTS.has(ev.event)) patchRailRow(swarmKey(sw.name)); if (ev.durable !== false) boardSoon(sw, ev.event === 'turn_finished'); if (ev.event === 'turn_finished') checkSoon(sw); }
   if (ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = session;
   // During replay nothing is fetched: a load per node-producing event would serialize a long history
@@ -1267,8 +1274,11 @@ function renderSwarmHead(el, sw) {
 }
 const streamTag = (stream) => `<button type="button" class="tag" data-act="swarm-filter" data-v="${esc(stream)}">#${esc(stream)}</button>`;
 // A proposal's votes so far against the seats' majority.
+// Only the seats as they are now count: a seat that left gives its place, and its vote, to the next agent.
 function tally(sw, p) {
-  const yes = Object.values(p.votes ?? {}).filter((v) => v.yes).length, no = Object.keys(p.votes ?? {}).length - yes;
+  const seats = new Set(sw.seats.map((m) => memberShort(sw, m)));
+  const votes = Object.entries(p.votes ?? {}).filter(([seat]) => seats.has(seat)).map(([, v]) => v);
+  const yes = votes.filter((v) => v.yes).length, no = votes.length - yes;
   return `${yes} yes${no ? ` · ${no} no` : ''} of ${sw.seats.length}`;
 }
 // A board line: who, then the post, with the agents it names marked and its stream as a tag that
@@ -1375,7 +1385,7 @@ async function openSwarmSheet(project) {
 function agentCount() { const n = Number($('sw-n')?.value); return Number.isInteger(n) && n >= 1 && n <= MAX_AGENTS ? n : 0; }
 // The budget, typed in millions of tokens; 0 until it is a number in range.
 function budgetTokens() { const m = Number($('sw-budget')?.value); return m >= 0.1 && m <= MAX_BUDGET_M ? Math.round(m * 1e6) : 0; }
-const sheetProblem = (n) => (!n ? `Agents is a whole number from 1 to ${MAX_AGENTS}` : !budgetTokens() ? `Budget is 0.1 to ${MAX_BUDGET_M} million tokens` : mixProblem(sheet.mix));
+const sheetProblem = (n) => (!n ? `Agents is a whole number from 1 to ${MAX_AGENTS}` : !budgetTokens() ? `Budget is 0.1 to ${MAX_BUDGET_M} million tokens` : Number($('sw-org')?.value) > n ? 'A council of 3 needs at least 3 agents' : mixProblem(sheet.mix));
 // The mix's rows, each with how many agents it makes, and what is wrong with it if anything.
 function mixProblem(mix) {
   const total = mix.reduce((a, r) => a + (Number(r.share) || 0), 0);
@@ -1422,7 +1432,7 @@ function mixChange(el) {
   if (el.dataset.f !== 'share' || el.type !== 'number') renderMix();
 }
 function closeSheet() { if (!S.ui.sheet) return; S.ui.sheet = false; sheetFor = null; $('sheetwrap').classList.remove('on'); focusInput('main'); }
-$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') renderMix(); });
+$('sheet').addEventListener('change', (e) => { if (e.target.dataset?.mix != null) mixChange(e.target); else if (e.target.id === 'sw-n' || e.target.id === 'sw-budget' || e.target.id === 'sw-org') renderMix(); });
 // A share typed updates the counts once it is a number, without redrawing the field being typed in.
 $('sheet').addEventListener('input', (e) => { if (e.target.id === 'sw-n' || e.target.id === 'sw-budget') { renderMix(); return; } if (e.target.dataset?.f !== 'share') return; mixChange(e.target); const n = agentCount(), problem = sheetProblem(n), counts = problem ? null : mixCounts(sheet.mix, mixRows(sheet.mix, n)); $('sw-mix').querySelectorAll('.count').forEach((c, i) => { c.textContent = counts ? `${counts[i]} agent${counts[i] === 1 ? '' : 's'}` : ''; c.classList.toggle('none', !!counts && !counts[i]); }); const w = $('sw-mix').querySelector('.mixfoot span'); if (w) { w.textContent = problem ?? (counts.some((c) => !c) ? `A row makes no agent at ${n} agents` : ''); w.className = w.textContent ? 'warn' : ''; } });
 $('sheet').addEventListener('submit', async (e) => {

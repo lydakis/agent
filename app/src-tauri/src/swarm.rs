@@ -315,6 +315,21 @@ pub fn valid_mix(mix: &[Mix]) -> Result<(), String> {
     Ok(())
 }
 
+/// A council has three seats, its first agents, so it needs three agents;
+/// none is a flat board.
+pub const COUNCIL: usize = 3;
+
+fn valid_council(council: usize, agents: usize) -> Result<(), String> {
+    match council {
+        0 => Ok(()),
+        COUNCIL if agents >= COUNCIL => Ok(()),
+        COUNCIL => Err(format!(
+            "invalid_council: a council of {COUNCIL} needs at least {COUNCIL} agents"
+        )),
+        _ => Err(format!("invalid_council: a council has {COUNCIL} seats")),
+    }
+}
+
 /// `~/.agent/swarms`, which holds a folder of swarms per daemon.
 pub fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
@@ -777,44 +792,76 @@ fn update(
     Ok(s)
 }
 
-/// Members join in order and never twice, each pinned to its bot's id and
-/// its row of the mix. An agent added later brings its own budget, which the
-/// swarm's grows by, so the budget shown is always what its agents may spend.
-fn join(dir: &Path, members: &[(String, i64, usize)], added_budget: u64) -> Result<Swarm, String> {
-    update(dir, |s| {
-        s.budget_tokens = s.budget_tokens.saturating_add(added_budget);
-        for (member, id, row) in members {
-            if !member.starts_with(&format!("{}-", s.name)) {
-                return Err(format!(
-                    "invalid_member: {member} is not named {}-N",
-                    s.name
-                ));
-            }
-            if *row >= s.mix.len() {
-                return Err(format!("invalid_member: the mix has no row {row}"));
-            }
-            if !s.members.contains(member) {
-                s.members.push(member.clone());
-            }
-            s.ids.insert(member.clone(), *id);
-            s.rows.insert(member.clone(), *row);
-        }
-        Ok(())
-    })
+/// What joining does to a swarm's budget: a new swarm's is what its agents
+/// were made with, and an added agent's share grows it, so the budget shown
+/// is always what its agents may spend.
+#[derive(Clone, Copy)]
+enum Budget {
+    Set(u64),
+    Add(u64),
 }
 
-/// `join` and `update` from async code: the board's lock may wait on a
-/// post's sends, so the wait runs on the blocking pool, never on the
-/// executor those sends need.
-async fn join_async(
+/// Members join in order and never twice, each pinned to its bot's id and
+/// its row of the mix. A stopped swarm takes nobody.
+fn join_to(s: &mut Swarm, members: &[(String, i64, usize)], budget: Budget) -> Result<(), String> {
+    if s.stopped {
+        return Err(
+            "swarm_stopped: post to the board to resume the swarm, then add an agent".into(),
+        );
+    }
+    for (member, _, row) in members {
+        if !member.starts_with(&format!("{}-", s.name)) {
+            return Err(format!(
+                "invalid_member: {member} is not named {}-N",
+                s.name
+            ));
+        }
+        if *row >= s.mix.len() {
+            return Err(format!("invalid_member: the mix has no row {row}"));
+        }
+    }
+    s.budget_tokens = match budget {
+        Budget::Set(total) => total,
+        Budget::Add(more) => s.budget_tokens.saturating_add(more),
+    };
+    for (member, id, row) in members {
+        if !s.members.contains(member) {
+            s.members.push(member.clone());
+        }
+        s.ids.insert(member.clone(), *id);
+        s.rows.insert(member.clone(), *row);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn join(dir: &Path, members: &[(String, i64, usize)], added_budget: u64) -> Result<Swarm, String> {
+    update(dir, |s| join_to(s, members, Budget::Add(added_budget)))
+}
+
+/// New agents join and get their briefs under the board's lock, so Stop,
+/// which changes `swarm.toml` under it too, either comes first and they are
+/// refused, or waits and then ends the turns their briefs started. The lock
+/// is waited for off the async workers, which the briefs need.
+async fn enlist(
+    client: &Arc<Client>,
     dir: &Path,
-    members: Vec<(String, i64, usize)>,
-    added_budget: u64,
-) -> Result<Swarm, String> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || join(&dir, &members, added_budget))
-        .await
-        .map_err(|e| e.to_string())?
+    made: &[Made],
+    budget: Budget,
+    late: bool,
+) -> Result<(Swarm, Vec<(String, agent_client::Error)>), String> {
+    let _board = lock_board_async(dir).await?;
+    let (path, members) = (dir.to_path_buf(), pins(made));
+    let joined = tokio::task::spawn_blocking(move || {
+        let mut s = Swarm::read(&path)?;
+        join_to(&mut s, &members, budget)?;
+        s.write(&path)?;
+        Ok::<_, String>(s)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let failed = brief_all(client, &joined, dir, made, late).await;
+    Ok((joined, failed))
 }
 
 async fn update_async(
@@ -911,6 +958,7 @@ pub async fn start(
             "invalid_agents: a swarm starts with 1 to {MAX_START} agents, each from a row of its mix"
         ));
     }
+    valid_council(start.council, n)?;
     let full = format!("{}.{}", start.project, start.name);
     let dir = claim(root, &full)?;
     let workspace = match place(&start.folder, &full, start.shared).await {
@@ -958,8 +1006,13 @@ pub async fn start(
             .first()
             .map_or_else(String::new, |(_, e)| e.to_string()));
     }
-    let joined = match join_async(&dir, pins(&made), 0).await {
-        Ok(joined) => joined,
+    // The budget is what the agents made were given, not what was asked.
+    let total = each.saturating_mul(made.len() as u64);
+    let joined = match enlist(client, &dir, &made, Budget::Set(total), false).await {
+        Ok((joined, briefs)) => {
+            failed.extend(briefs);
+            joined
+        }
         Err(error) => {
             // Agents no swarm holds would be strays: they go with it.
             for (name, _, _) in &made {
@@ -969,7 +1022,6 @@ pub async fn start(
             return Err(error);
         }
     };
-    failed.extend(brief_all(client, &joined, &dir, &made, false).await);
     Ok(json!({
         "swarm": joined.json(&dir),
         "bots": made.iter().map(|(_, _, record)| record).collect::<Vec<_>>(),
@@ -1012,8 +1064,16 @@ pub async fn add(
             None => break made,
         }
     };
-    let joined = join_async(&dir, pins(&made), each).await?;
-    let failed = brief_all(client, &joined, &dir, &made, true).await;
+    let (joined, failed) = match enlist(client, &dir, &made, Budget::Add(each), true).await {
+        Ok(enlisted) => enlisted,
+        Err(error) => {
+            // Stopped meanwhile: the agent it was made for would be a stray.
+            for (name, _, _) in &made {
+                let _ = client.request("delete", json!({"bot": name})).await;
+            }
+            return Err(error);
+        }
+    };
     Ok(json!({
         "swarm": joined.json(&dir),
         "bots": made.iter().map(|(_, _, record)| record).collect::<Vec<_>>(),
@@ -1370,10 +1430,17 @@ pub fn board(root: &Path, swarm: &str, offset: Option<u64>) -> Result<Value, Str
 pub struct State {
     pub roles: BTreeMap<String, String>,
     pub streams: BTreeMap<String, String>,
+    /// Open and approved proposals whole, and the last few denied ones;
+    /// a decided proposal's vote reasons are on the board only.
     pub proposals: Vec<Proposal>,
+    /// Proposals ever made, which numbers the next one.
+    pub made: u32,
     /// The last share of the budget the board announced, in percent.
     pub spent: u8,
 }
+
+/// Denied proposals kept in the state; older ones are on the board only.
+const KEEP_DENIED: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Proposal {
@@ -1456,6 +1523,10 @@ impl State {
                         .flatten()
                         .filter_map(Proposal::from_json)
                         .collect(),
+                    made: value["made"]
+                        .as_u64()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .unwrap_or(0),
                     spent: value["spent"]
                         .as_u64()
                         .and_then(|n| u8::try_from(n).ok())
@@ -1471,14 +1542,8 @@ impl State {
         json!({
             "roles": self.roles, "streams": self.streams,
             "proposals": self.proposals.iter().map(Proposal::json).collect::<Vec<_>>(),
-            "spent": self.spent,
+            "made": self.made, "spent": self.spent,
         })
-    }
-
-    fn write(&self, dir: &Path) -> Result<(), String> {
-        let temporary = dir.join(format!(".state.json.{}", std::process::id()));
-        let bytes = serde_json::to_vec(&self.json()).map_err(|e| e.to_string())?;
-        replace(&temporary, &dir.join("state.json"), &bytes, 0o644)
     }
 
     fn proposal(&mut self, id: &str) -> Result<&mut Proposal, String> {
@@ -1511,6 +1576,7 @@ fn locked_with<T>(
     dir: &Path,
     change: impl FnOnce(&mut State) -> Result<(Vec<Value>, T), String>,
 ) -> Result<T, String> {
+    recover(board, dir)?;
     let before = State::read(dir)?;
     let mut state = before.clone();
     let (lines, out) = change(&mut state)?;
@@ -1519,14 +1585,64 @@ fn locked_with<T>(
         serde_json::to_writer(&mut bytes, line).map_err(|e| e.to_string())?;
         bytes.push(b'\n');
     }
+    // The lines and the state they change commit together: the new state
+    // waits beside the old one, naming the board's length before and after
+    // the lines, until they are on the board (see `recover`).
+    let from = board.metadata().map_err(|e| e.to_string())?.len();
+    let changed = state != before;
+    if changed {
+        // The state as it will be read, with where its lines go on the board.
+        let mut pending = state.json();
+        pending["from"] = json!(from);
+        pending["to"] = json!(from + bytes.len() as u64);
+        let bytes = serde_json::to_vec(&pending).map_err(|e| e.to_string())?;
+        let temporary = dir.join(format!(".{PENDING}.{}", std::process::id()));
+        replace(&temporary, &dir.join(PENDING), &bytes, 0o644)?;
+    }
     board.write_all(&bytes).map_err(|e| e.to_string())?;
     // Synced before anyone is told, so a post an agent heard survives a
     // power loss on the board too.
     board.sync_data().map_err(|e| e.to_string())?;
-    if state != before {
-        state.write(dir)?;
+    if changed {
+        commit(dir)?;
     }
     Ok(out)
+}
+
+/// A change to the state not yet known to be on the board.
+const PENDING: &str = "state.pending.json";
+
+fn commit(dir: &Path) -> Result<(), String> {
+    std::fs::rename(dir.join(PENDING), dir.join("state.json"))
+        .and_then(|()| std::fs::File::open(dir)?.sync_all())
+        .map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// Under the board's lock, finish what a write cut short: when the board
+/// holds all of a pending change's lines, its state becomes the state;
+/// otherwise the board goes back to its length before them, dropping any
+/// part of a line, and the change is forgotten, as if never made.
+fn recover(board: &std::fs::File, dir: &Path) -> Result<(), String> {
+    let path = dir.join(PENDING);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let pending: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let length = board.metadata().map_err(|e| e.to_string())?.len();
+    match (pending["from"].as_u64(), pending["to"].as_u64()) {
+        (_, Some(to)) if length == to => commit(dir),
+        (Some(from), Some(to)) if (from..to).contains(&length) => {
+            board.set_len(from).map_err(|e| e.to_string())?;
+            board.sync_data().map_err(|e| e.to_string())?;
+            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))
+        }
+        _ => Err(format!(
+            "{}: does not match the board; its lines and state disagree",
+            path.display()
+        )),
+    }
 }
 
 /// The board open for appending, locked until it is dropped. The lock also
@@ -1772,7 +1888,8 @@ fn plan(
                 ));
             }
             let why = words(&why, "proposal", MAX_POST)?;
-            let id = format!("P{}", state.proposals.len() + 1);
+            state.made += 1;
+            let id = format!("P{}", state.made);
             state.proposals.push(Proposal {
                 id: id.clone(),
                 stream: stream.clone(),
@@ -1827,8 +1944,14 @@ fn plan(
                 return Err(format!("already_voted: you voted on {}", proposal.id));
             }
             proposal.votes.insert(me.clone(), (yes, reason.clone()));
-            let ayes = proposal.votes.values().filter(|(yes, _)| *yes).count();
-            let noes = proposal.votes.len() - ayes;
+            // Only the seats as they are now count: a seat that left gives
+            // its place, and its vote, to the next agent.
+            let current: Vec<String> = (swarm.seats().iter())
+                .map(|m| swarm.short(m).to_owned())
+                .collect();
+            let counted = || (proposal.votes.iter()).filter(|(seat, _)| current.contains(seat));
+            let ayes = counted().filter(|(_, (yes, _))| *yes).count();
+            let noes = counted().count() - ayes;
             // A majority of the seats decides; you decide alone.
             let need = seats / 2 + 1;
             let decided = match author {
@@ -1855,8 +1978,24 @@ fn plan(
                 } else {
                     ""
                 };
+                // Its reasons are on the board; the state keeps the tally.
+                for (_, reason) in proposal.votes.values_mut() {
+                    reason.clear();
+                }
                 if approved {
                     state.streams.insert(by.clone(), stream.clone());
+                } else {
+                    let denied = state
+                        .proposals
+                        .iter()
+                        .filter(|p| p.status == "denied")
+                        .count();
+                    let mut drop = denied.saturating_sub(KEEP_DENIED);
+                    state.proposals.retain(|p| {
+                        let old = drop > 0 && p.status == "denied";
+                        drop -= usize::from(old);
+                        !old
+                    });
                 }
                 let mut decision = line(
                     json!({"kind": "decision", "id": pid, "stream": stream, "approved": approved, "lead": by}),
@@ -2481,6 +2620,120 @@ mod tests {
     }
 
     #[test]
+    fn only_the_seats_as_they_are_now_decide_and_old_denials_leave_the_state() {
+        let mut s = council(&[
+            "agent.latency-1",
+            "agent.latency-2",
+            "agent.latency-3",
+            "agent.latency-4",
+        ]);
+        let mut state = State::default();
+        let propose = |stream: &str| Act::Propose {
+            stream: stream.into(),
+            why: "why".into(),
+        };
+        plan(&s, &mut state, Some(&agent(4)), propose("fsync"), 1).unwrap();
+        let yes = || Act::Vote {
+            id: "P1".into(),
+            yes: true,
+            reason: "measured".into(),
+        };
+        plan(&s, &mut state, Some(&agent(1)), yes(), 2).unwrap();
+        // latency-1 leaves; latency-4 takes its seat, and latency-1's yes no longer counts.
+        s.members.remove(0);
+        let (_, _, answer) = plan(&s, &mut state, Some(&agent(2)), yes(), 3).unwrap();
+        assert_eq!(answer["decided"], Value::Null);
+        let (_, _, answer) = plan(&s, &mut state, Some(&agent(3)), yes(), 4).unwrap();
+        assert_eq!(answer["decided"], "approved");
+        // Decided, its reasons are on the board only.
+        assert!(
+            state.proposals[0]
+                .votes
+                .values()
+                .all(|(_, reason)| reason.is_empty())
+        );
+        // Denied proposals beyond the last few leave the state; numbers are never reused.
+        for k in 0..KEEP_DENIED + 3 {
+            let (_, _, made) = plan(&s, &mut state, Some(&agent(4)), propose("idea"), 5).unwrap();
+            let id = made["id"].as_str().unwrap().to_owned();
+            assert_eq!(id, format!("P{}", k + 2));
+            plan(
+                &s,
+                &mut state,
+                None,
+                Act::Vote {
+                    id,
+                    yes: false,
+                    reason: String::new(),
+                },
+                6,
+            )
+            .unwrap();
+        }
+        let denied = state
+            .proposals
+            .iter()
+            .filter(|p| p.status == "denied")
+            .count();
+        assert_eq!(denied, KEEP_DENIED);
+        assert_eq!(
+            state.proposals[0].stream, "fsync",
+            "an approved stream stays"
+        );
+        assert_eq!(
+            state.proposals.last().unwrap().id,
+            format!("P{}", KEEP_DENIED + 4)
+        );
+    }
+
+    #[test]
+    fn a_change_cut_short_is_finished_or_undone_at_the_next_lock() {
+        let root = scratch("pending");
+        let s = swarm(&[]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let length = || std::fs::metadata(dir.join("board.jsonl")).unwrap().len();
+        let role = |role: &str| {
+            let mut state = State::default();
+            state.roles.insert("latency-1".into(), role.into());
+            state
+        };
+        // Its lines never reached the board, or only half of one did: the board goes back and
+        // the state stays as it was.
+        let from = length();
+        let mut pending = role("lost").json();
+        pending["from"] = json!(from);
+        pending["to"] = json!(from + 40);
+        std::fs::write(dir.join(PENDING), pending.to_string()).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("board.jsonl"))
+            .unwrap()
+            .write_all(b"{\"half")
+            .unwrap();
+        locked(&dir, |_| Ok((vec![], ()))).unwrap();
+        assert_eq!(length(), from);
+        assert!(!dir.join(PENDING).exists());
+        assert!(State::read(&dir).unwrap().roles.is_empty());
+        // Its lines are all on the board: its state is the state.
+        let line = b"{\"kind\":\"role\"}\n";
+        let mut pending = role("kept").json();
+        pending["from"] = json!(from);
+        pending["to"] = json!(from + line.len() as u64);
+        std::fs::write(dir.join(PENDING), pending.to_string()).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("board.jsonl"))
+            .unwrap()
+            .write_all(line)
+            .unwrap();
+        locked(&dir, |_| Ok((vec![], ()))).unwrap();
+        assert_eq!(State::read(&dir).unwrap().roles["latency-1"], "kept");
+        assert!(!dir.join(PENDING).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_stream_member_posts_to_its_stream_unless_it_posts_to_everyone() {
         let s = council(&["agent.latency-1", "agent.latency-2", "agent.latency-3"]);
         let mut state = State::default();
@@ -3075,6 +3328,8 @@ mod tests {
             json!({"p.goal-1": 0, "p.goal-2": 1, "p.goal-4": 1})
         );
         assert_eq!(out["swarm"]["ids"]["p.goal-4"], 104);
+        // Three agents were made with a quarter each: the budget is theirs, not the four asked.
+        assert_eq!(out["swarm"]["budget_tokens"], 3_000);
         let briefs = fake.ops("submit");
         assert_eq!(briefs.len(), 3);
         let first = briefs.iter().find(|b| b["bot"] == "p.goal-1").unwrap();
@@ -3350,6 +3605,56 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_whose_swarm_stops_while_it_is_made_is_not_briefed_but_deleted() {
+        let root = scratch("add-stop");
+        let s = swarm(&[&agent(1)]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        enrol(&root, &s.name, &[(agent(1), 1)], 0).unwrap();
+        // Another window stops the swarm while the daemon makes the agent.
+        let stopping = dir.clone();
+        let fake = Fake::start(
+            "add-stop",
+            Box::new(move |op, request| match op {
+                "create" => {
+                    update(&stopping, |s| {
+                        s.stopped = true;
+                        Ok(())
+                    })
+                    .unwrap();
+                    Ok(made(request))
+                }
+                "delete" => Ok(json!({})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let refused = rt.block_on(add(&client, &root, &s.name, 0)).unwrap_err();
+        assert!(refused.starts_with("swarm_stopped"), "{refused}");
+        assert_eq!(fake.ops("submit").len(), 0);
+        assert_eq!(fake.ops("delete")[0]["bot"], agent(2));
+        assert_eq!(Swarm::read(&dir).unwrap().members, vec![agent(1)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_council_has_three_seats_and_needs_three_agents() {
+        assert!(valid_council(0, 1).is_ok());
+        assert!(valid_council(3, 3).is_ok());
+        assert!(
+            valid_council(3, 2)
+                .unwrap_err()
+                .starts_with("invalid_council")
+        );
+        assert!(
+            valid_council(2, 8)
+                .unwrap_err()
+                .starts_with("invalid_council")
+        );
+    }
+
+    #[test]
     fn a_stopped_swarm_takes_no_agent_and_resumes_only_with_a_post_on_the_board() {
         let root = scratch("resume");
         let mut s = swarm(&[&agent(1)]);
@@ -3444,7 +3749,7 @@ mod tests {
                 std::thread::spawn(move || {
                     enrol(&root, &name, &[(format!("{name}-{i}"), i)], 0).unwrap();
                     update(&root.join(&name), |s| {
-                        s.stopped = i % 2 == 0;
+                        s.council = (i % 2) as usize;
                         Ok(())
                     })
                     .unwrap();
