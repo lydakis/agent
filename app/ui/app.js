@@ -1004,7 +1004,7 @@ function renderHead(el, b, pane) {
   if (b) readBranch(b);
   const key = b ? `${b.name}|${b.status}|${waitSummary(b)}|${b.project}|${b.branch ?? ''}` : '-';
   if (el.dataset.k === key) return; el.dataset.k = key;
-  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME creates one</span></div>' : '';
+  el.innerHTML = b ? headHTML(b, pane) : pane === 'main' ? '<div class="crumbs"><span class="state">no bots · /new NAME PROVIDER/MODEL creates one</span></div>' : '';
 }
 const PANE = {
   main: { form: 'form', input: 'input', model: 'model', send: 'send', stop: 'stop', bot: () => S.selected },
@@ -1031,7 +1031,7 @@ function renderComposer(pane, b) {
   send.textContent = ACTION[mode];
   $(ids.model).textContent = b ? `${model.split('/').slice(1).join('/') || model} ▾` : '';
   $(ids.model).hidden = !b; $(ids.stop).hidden = !b || b.runningTurn === null;
-  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME [PROVIDER/MODEL]' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
+  $(ids.input).placeholder = !b ? (pane === 'main' ? '/new NAME PROVIDER/MODEL' : '') : mode === 'queue' ? 'queues after this turn' : mode === 'steer' ? 'steers into this turn' : mode === 'side' ? 'asks a side chat' : '';
 }
 
 // ---------- sidebar ----------
@@ -1168,7 +1168,7 @@ let helpPane = 'main';
 async function showHelp(pane = 'main') {
   helpPane = pane;
   // Open at once so Esc closes it; the list is read now, so an edited ~/.agent/models shows without a restart.
-  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n\n /new NAME [PROVIDER/MODEL]   create a bot\n${models}\n<i>any key closes this</i>`; };
+  const shown = S.ui.help = {}; const text = (models) => { $('helptext').innerHTML = `<b>keys</b>\n ^k   find a bot        ^b   sidebar\n ^p   next task beside  Esc  close beside · stop\n ^o   all steps         ^d   detach (close)\n ↑ ↓  previous / next bot   ^,   settings\n Enter sends · Shift-Enter a new line\n\n /new NAME PROVIDER/MODEL     create a bot\n${models}\n<i>any key closes this</i>`; };
   text('   reading ~/.agent/models'); $('helpwrap').classList.add('on');
   let models; try { const list = await Daemon.models(); models = list.length ? list.map((m) => `   ${esc(m.id)}`).join('\n') : '   none listed: Settings lists your providers\' models'; } catch (e) { models = `   ${esc(String(e?.message ?? e))}`; }
   if (S.ui.help === shown) text(models);
@@ -1285,7 +1285,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
     await openOnly(name); toast(`created ${name} · ${policy.note}`); return;
   }
   if (text === '/help' || text === '?') { showHelp(pane); return; }
-  const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME creates one');
+  const b = bot(to); if (!b) throw new Error('no bot selected; /new NAME PROVIDER/MODEL creates one');
   // An event can seat a bot before its snapshot identity arrives. Never send an unpinned name.
   if (b.id == null) throw new Error('bot_identity_pending: wait for attachment to finish');
   const mode = sendMode(b), model = S.override.get(b.name), delivery = mode === 'send' ? 'reject' : mode;
@@ -1522,6 +1522,8 @@ async function connectProvider(id, values) {
   // Bedrock signs in one way: with the AWS login, which drops a saved key, or with a key, typed or saved.
   const saved = st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK');
   const aws = values.AUTH ? values.AUTH === 'aws' : !values.AWS_BEARER_TOKEN_BEDROCK && !saved;
+  // The region names the endpoint and sits inside a space-separated provider list.
+  if (c.parts && !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(values.AWS_REGION ?? '')) throw new Error(`Region must look like us-east-1, not "${values.AWS_REGION}"`);
   if (c.parts && !aws && !values.AWS_BEARER_TOKEN_BEDROCK && !saved) throw new Error('Bedrock API key is required');
   const keyed = c.parts ? { ...values, AWS_BEARER_TOKEN_BEDROCK: aws ? '' : values.AWS_BEARER_TOKEN_BEDROCK || 'saved' } : values;
   const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };

@@ -243,6 +243,13 @@ fn models() -> Result<Value, String> {
 /// whether this window can restart its daemon to apply a change.
 #[tauri::command]
 async fn settings(state: State<'_, Shared>) -> Result<Value, String> {
+    // A daemon this window did not start runs its own settings: the page asks
+    // it for its providers, and this machine's shell is not read at all.
+    if state.agent.is_none() || state.config.store.is_none() {
+        return Ok(
+            json!({"providers": [], "region": null, "profile": null, "keys": [], "restartable": false}),
+        );
+    }
     let file = match daemon::env_file() {
         Some(path) => daemon::read_env_file(&path)?,
         None => Vec::new(),
@@ -257,7 +264,7 @@ async fn settings(state: State<'_, Shared>) -> Result<Value, String> {
         }
     };
     let mut view = settings::view(&file, Some(environment));
-    view["restartable"] = json!(state.agent.is_some() && state.config.store.is_some());
+    view["restartable"] = json!(true);
     Ok(view)
 }
 

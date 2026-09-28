@@ -237,7 +237,7 @@ the snapshot pages. A connected peer must send its ready line within five second
 Keys: `^k` find a bot, `^b` sidebar, `^,` settings, `^p` next task beside, `^o` every
 run's thoughts and output, `Esc` close the side pane then stop, `↑` `↓` on an
 empty message to move between bots, `^d` close the window, Enter to send and
-Shift-Enter for a new line, `/new NAME [PROVIDER/MODEL]` to create a bot, `?`
+Shift-Enter for a new line, `/new NAME PROVIDER/MODEL` to create a bot, `?`
 on an empty message for the list and the models in `~/.agent/models`, read
 each time. `⌘` works where `^` does.
 

@@ -1158,6 +1158,7 @@ test('connecting a provider keeps the others, saves only what was typed, restart
   const { p, calls, env } = settingsShell({ env: { AGENT_PROVIDER: 'openai', OPENAI_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, bedrock: { models: [{ id: 'claude' }, { id: 'haiku' }] }, 'bedrock-openai': { models: [{ id: 'grok' }] } } });
   await p.openSetup();
   await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: '', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region is required/);
+  await assert.rejects(p.connectProvider('bedrock', { AWS_REGION: 'us east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' }), /Region must look like us-east-1/);
   assert.equal(calls.length, 0);
   await p.connectProvider('bedrock', { AWS_REGION: 'us-east-1', AWS_PROFILE: '', AWS_BEARER_TOKEN_BEDROCK: '' });
   // Only providers are saved; the empty key field keeps whatever key was saved.
