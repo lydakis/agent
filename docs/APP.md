@@ -74,17 +74,24 @@ says why beside those that answered.
 
 ![Settings with one provider failing](app/settings.png)
 
-A project's ⋯ menu starts a swarm: a goal, how many agents, their model,
-where they work, and the tokens they share. Captured 2026-09-28.
+A project's ⋯ menu starts a swarm: a goal, how many agents, where they work,
+the tokens they share, what they are made of, and how they organize: one
+board, or a council of three that approves streams of work. What they are
+made of is a mix: rows of an identity (a plain agent, or a profile the
+folder offers, such as a reviewer), a model from any connected provider, and
+a share, each shown as the agents it makes at the size picked. Captured
+2026-09-28.
 
 ![The new swarm sheet](app/new-swarm.png)
 
 The swarm's board: your goal first, then its agents' posts, the ones they
-name marked. Its row in the sidebar is working while any agent works.
+name marked, each under what its agent is when the swarm mixes kinds (here
+three plain agents and a reviewer on another model). Its row in the sidebar
+is working while any agent works.
 
 ![A swarm's board while three of four agents work](app/swarm-board.png)
 
-Its agents as cards, each with its newest line.
+Its agents as cards, each with what it is and its newest line.
 
 ![A swarm's agents](app/swarm-agents.png)
 
@@ -92,6 +99,20 @@ Your post naming `@latency-3` woke that agent alone; clicking a name opens
 the agent beside, with the board's posts it heard.
 
 ![An agent beside the board](app/swarm-beside.png)
+
+With a council, the board also carries roles, proposals, the seats' votes and
+their decisions; a post in a stream wears its tag, which filters the board.
+
+![A council swarm's board](app/swarm-council-board.png)
+
+The Council tab: each open proposal with its votes so far, which you can
+approve or deny yourself, then the ones decided.
+
+![The council](app/swarm-council.png)
+
+Streams: the approved proposals, each with its lead and the agents in it.
+
+![Streams](app/swarm-streams.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -400,31 +421,68 @@ daemon learns nothing about projects; everything here is client work.
   linked worktree shows its branch after its name in the head, read once
   from the worktree's files when the head is first drawn.
 - **Swarms.** Also the app's opinion; the daemon learns nothing new. A
-  project's ⋯ menu has **New swarm**: a goal, 2 to 16 agents, a model, where
+  project's ⋯ menu has **New swarm**: a goal, any number of agents up to 64 (typed), a mix, where
   they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
   `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
-  project folder), and a token budget split evenly among them. A goal is
+  project folder), and a token budget typed in millions (0.1 to 1,000),
+  split evenly among them, each agent's share shown beside it. A goal is
   at most 16 KiB. A name whose worktree or branch another store's swarm
   holds is skipped for the next. Setup gets ten minutes and the login
   shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
-  TMPDIR, TERM) and no others, so no provider or cloud keys; past its time
+  TMPDIR, TERM) and no others, so no provider or cloud keys (as do the
+  swarm's git commands, whose hooks run too; this process's own variables
+  stand in only when there is no login shell); past its time
   its whole process group is killed, and its output is kept only to its
-  last 64 KiB. A swarm whose files or policy cannot be made is removed with
-  its worktree and branch.
+  last 64 KiB. A failed start removes a worktree and branch only when it
+  made them, never the project folder. The mix is up to eight rows of an identity, a model and a
+  share, the shares adding up to 100%. An identity is a profile in the
+  folder's or the user's `.agents/agents` other than the app's own
+  `coordinator` and `swarm`; picking one picks the model its profile names,
+  when that model is connected. The agents are dealt one at a time, each
+  to the row furthest below its share of the agents so far, so any prefix
+  of them keeps the shares as well as whole agents can (the council's seats
+  mix too), and the sheet shows each row's count, or that a row makes none
+  at that size. Start, Add and Stop are one call each to the app's Rust
+  side, which makes or stops everything and undoes a failed start, so the
+  page only shows the outcome: a swarm whose files or instructions cannot
+  be made, or none of whose agents can be created, is removed with its
+  worktree and branch; an agent that could not be made or briefed beside
+  others that were is reported by name.
   The swarm is a folder, `~/.agent/swarms/STORE/PROJECT.NAME/`, where
   STORE is the store identity the daemon announces when a window attaches,
   so a window sees only its store's swarms, whatever socket reaches it:
-  `swarm.toml` (its project, goal, folder, model, budget, members with each
-  one's bot id, and whether you stopped it; at most 1 MiB, read only when
-  every member has an id, changed only under the board's lock, synced, and
-  replaced whole), `board.jsonl` (one post a line, appended under a lock
-  and synced, your goal first), and `post`, a script that runs the app's own executable with
-  `--swarm-post` (replaced whole when the app moves). Its agents
-  are ordinary bots named `PROJECT.NAME-N`, each created with its share of
-  the budget and started in the `swarm` profile (the folder's, the user's,
-  or the one the app ships, [swarm.md](../app/agents/swarm.md)); each joins
-  the swarm once created, and then gets a first message naming it, the
-  goal, the others and the board's two paths. A post is written to the board, then
+  `swarm.toml` (its project, goal, folder, budget, mix, members with each
+  one's bot id and row of the mix, whether you stopped it, the highest
+  number an agent of it was made under, and the bot ids of members that
+  left; at most
+  1 MiB, read only when every member has an id and a row, changed only
+  under the board's lock, synced, and replaced whole; written last when
+  a swarm is made, so a folder without it is not listed), `board.jsonl` (one
+  line a post or act, appended under a lock and synced, your goal first;
+  each line says how many agents it was `sent` to, so what a
+  swarm's posts cost in deliveries can be read off its board; the line is
+  written before the sends, and a send that failed is in the poster's answer), `state.json` (what the board adds up to: roles, open and approved
+  proposals with their votes (at most 16 open at once, and an approved
+  stream closes when nobody is in it any more), the last 16 denied ones, a
+  count that numbers the next, who is in which stream; a decided proposal's
+  vote reasons stay on the board only). A change to it commits with its lines: the new state
+  is written beside it as `state.pending.json` with the board's length
+  before and after the lines, the lines are appended and synced, and the
+  file then replaces `state.json`; the next act under the lock, or the
+  next read of the board, finishes a change whose lines are all on the board and otherwise cuts the board back
+  to where it was and drops the change. Then scripts that run the app's own
+  executable with `--swarm-post`: `post` and `role`, and with a council
+  `propose`, `vote` and `join` (replaced whole when the app moves). Its agents
+  are ordinary bots named `PROJECT.NAME-N`, each created with its row's
+  model and its share of the budget, and started in the `swarm` profile
+  (the folder's, the user's, or the one the app ships,
+  [swarm.md](../app/agents/swarm.md)); an agent with an identity starts in
+  that profile, with the `swarm` profile's text after its own and the
+  identity's tools, which must include `shell` since the board's scripts
+  run in it. Each joins the swarm once created, and then gets a first
+  message naming it, the goal, the others with their identities, the board
+  and its scripts (and, with a council, the seats). A card and a post show
+  an agent's identity, and its model when the swarm has more than one. A post is written to the board, then
   steered into the agents it reaches over one daemon connection: an
   agent's post reaches the agents working now, strictly into their running
   turns (a turn that ended meanwhile is skipped; the post waits on the
@@ -438,22 +496,73 @@ daemon learns nothing about projects; everything here is client work.
   names its member's bot id, so a bot deleted and made again under a
   member's name is not a member: a post misses it, and the app keeps it in
   the sidebar and out of the swarm's cards and counts; a deleted agent
-  leaves its swarm when the app sees it go. A swarm is one sidebar row
+  leaves its swarm when the app sees it go, taking its share of the budget,
+  its role, its stream, its votes on open proposals and the open proposals
+  it made (the board keeps them all); its helpers still count in the
+  swarm's tokens and Stop still ends them (`swarm.toml` keeps its bot id
+  in `left` until a look at the daemon's list finds nothing it made). A new agent always takes a
+  number no agent of the swarm had, so a name on the board is only ever
+  one agent's. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
   in the sidebar. Its view has two tabs: **Board**, read from where the
   last read ended whenever one of its agents does something durable, and
   only while it is on screen (more than 256 KiB behind, it reads the
-  board's last 256 KiB instead); and **Agents**, their cards, which open
+  board's last 256 KiB instead; lines and state are read together under a
+  shared lock, so they always agree, and a budget check that adds a line
+  reads it too); and **Agents**, their cards, which open
   beside. The head counts working agents and tokens used against the
-  budget. Its composer posts to the board. Its ⋯ menu stops every agent
-  (every unfinished turn, queued ones first, of each member that is still
+  budget, its helpers' tokens included. Its composer posts to the board.
+  Its ⋯ menu stops every agent and helper
+  (agents first, then the helpers they made, looked for again until a look
+  finds none it has not stopped and no agent given a turn meanwhile; every unfinished turn, queued ones first, of each member that is still
   the bot that joined; a name now held by another bot leaves instead; and
-  the swarm refuses its agents' posts until your next one) or adds one,
-  told to read the board first, whose share of tokens the swarm's budget
-  grows by.
+  the swarm refuses its agents' posts until your next one the board takes; that post
+  resumes the swarm before it goes on the board, so a failure between leaves it
+  running with nothing new rather than your post on a stopped board)
+  or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
+  whose share of tokens the swarm's budget grows by. New agents join and
+  get their briefs under the board's lock, so a Stop from another window
+  comes first and they are refused (and deleted), or waits and ends the
+  turns their briefs started. An agent whose brief did not arrive is
+  deleted with its share, the agents briefed with it hear that it left,
+  and a start none of whose briefs arrived starts nothing. A swarm every
+  agent left takes no new one (`swarm_empty`); start another. A swarm's budget is what the agents it made
+  were given: a start where some could not be made has the budget of those
+  that were. Any agent says what it is doing with
+  `role ROLE`, shown on the board and on its card. A helper is a bot an
+  agent made with the CLI (a fork of a peer to ask it something, or of
+  itself for a subtask), named after its maker (`PROJECT.NAME-N.WHAT`) so
+  it sorts in the swarm's range of the daemon's list; one made by a member
+  or by another helper counts in the swarm's tokens and stops with it, and
+  cannot post. The daemon forgets a deleted bot's tokens, so each act that
+  reads its list keeps each helper's tokens in `state.json` (`helpers`), and
+  a helper deleted since counts on (`gone`) with what that look saw it use;
+  what it used after that look is not counted. Each act that reads the daemon's list, and a check the page
+  asks for at most every five seconds a swarm as its agents finish turns,
+  tells the working agents when the swarm passes 50%, 75% or 90% of its
+  budget: a `budget` line on the board, each share once (`state.json`
+  keeps the last), and in the answer of the act that passed it.
+- **Swarm councils.** The sheet's "Organized as" picks one board (every
+  agent takes a piece) or a council of 3, which needs at least three
+  agents; a start that made fewer than three deletes them (naming any it
+  could not) and starts nothing. With a council, the seats are the swarm's
+  first three agents; when a seat is deleted the next agent takes it, and
+  only the votes of the seats as they are now count, still 2 of the
+  council's 3 however many seats are filled. An agent proposes a stream of work with
+  `propose STREAM WHY`, which wakes the other seats; a seat votes with
+  `vote ID yes|no REASON`, once. A majority of the seats (2 of 3) approves or
+  denies; an approved proposal opens its stream with the proposer as lead
+  and in it, and wakes the proposer while the working agents hear it; a
+  denied one wakes only the proposer. You decide any open proposal alone
+  from the **Council** tab. `join STREAM` puts an agent in an approved
+  stream (one at a time). An agent in a stream posts to that stream: the
+  post carries its tag and reaches the stream's working agents and whoever
+  it names; `post --all` reaches everyone. Your posts reach everyone. The
+  head gains **Council**, with the open count, and **Streams**, the approved
+  ones with their lead and agents and their roles; a tag filters the board.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
-  deleted task's worktree, a swarm's roles, council and streams, and
-  approvals are later steps of item 47.
+  deleted task's worktree, deleting a swarm, and approvals are later steps
+  of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -561,7 +670,22 @@ Chromium: its agents posted, a post naming one woke it alone, and an agent
 opened beside from the board, with no page errors. The post tool itself runs
 against a real daemon in `tests/test_swarm.py`: an agent's post reaches the
 agent working, wakes the idle one it names and no other, and is refused for a
-bot that is not a member or while the swarm is stopped.
+bot that is not a member or while the swarm is stopped. A council swarm's
+proposal wakes its three seats, a second yes opens the stream and wakes the
+proposer, a non-seat's vote is refused, and a post from a stream carries its
+tag and reaches nobody outside it (same test file), and each post's line
+records how many agents it was sent to. Start, Add and Stop are tested in
+`app/src-tauri/src/swarm.rs` against a stand-in daemon: each agent gets its
+row's model, identity and share of the budget, one that fails is reported
+while the rest start, a start with no agent leaves nothing behind, an
+identity without `shell` is refused before any agent exists, Add skips a
+name another bot holds, and Stop ends unfinished turns newest first,
+its helpers' and their helpers' too, one made after its first look
+included, but not a bot no agent made, and
+lets a reused name leave; the board says 50% and then, past 90% at once,
+only 90%, each once, counting a helper's tokens. The council was also
+driven in demo mode: roles, two proposals, one approved by the seats, a
+stream two more agents joined, and the other left open for you.
 
 On 2026-09-27 the shell was driven in demo mode in headless Chromium:
 projects and tasks in the sidebar, a card opened beside and swapped, the three
