@@ -32,7 +32,7 @@ One menu per agent: side chat, stop, fork, delete, show all.
 
 ![The agent menu](app/menu.png)
 
-The model chip: models of the bot's family; others need a new agent.
+The model chip: models under their provider; other families need a new agent.
 
 ![The model chip's menu](app/model-chip.png)
 
@@ -49,23 +49,25 @@ A side chat asked while the lead works: a fork beside it, the lead untouched.
 
 ![A side chat beside the running lead](app/side-chat.png)
 
-New project takes a folder.
+New project takes a folder and the model its lead starts on.
 
 ![New project](app/new-project.png)
 
-A first run opens setup: connect a provider, choose the model new agents
-start on, open a first project (demo `?first`).
+A first run opens setup: connect providers, then open a first project on a
+model from any of them (demo `?first`).
 
 ![Setup's provider choices](app/setup-providers.png)
 
 Each provider asks for what it needs to sign in; Bedrock takes a region and an
-AWS profile or a Bedrock API key.
+AWS profile or a Bedrock API key, and serves Claude and its other models as
+one provider.
 
 ![Connecting Amazon Bedrock](app/setup-bedrock.png)
 
-Once a provider answers, its models are listed and nothing is chosen for you.
+Once a provider answers, the first project takes a folder and a model, listed
+under its provider; nothing is chosen for you.
 
-![Choosing a model](app/setup-model.png)
+![The first project and its model](app/setup-project.png)
 
 Settings (⚙ in the sidebar, or ⌘,) is the same screen. A provider that fails
 says why beside those that answered.
@@ -245,38 +247,37 @@ each time. `⌘` works where `^` does.
 
 What a daemon needs before anything runs is the app's to ask for, not the
 daemon's: it runs whatever providers it is started with and whatever model a
-turn names. One screen covers both a first run and later changes, in three
-steps, each checked once done:
+turn names. There is no default model (George, 2026-09-28): a project's lead,
+and every agent, is given its model when it is made, from any provider
+connected, and forks and side chats keep their source's. One screen covers a
+first run and later changes:
 
 1. **Providers.** Anthropic, OpenAI and OpenRouter take an API key; a ChatGPT
-   plan uses the sign-in Codex saved; Amazon Bedrock (Claude, or its other
-   models over the OpenAI-compatible endpoint) takes a region and signs with
-   the AWS CLI's credentials for an optional profile, or with a Bedrock API
-   key when one is given. Connecting writes `AGENT_PROVIDER` (the providers
-   already running kept, specs as `--provider` takes them) and the provider's
-   fields to `~/.agent/env`, restarts the daemon with `agent shutdown`, which
-   stops running turns and returns once the process is gone, attaches again,
-   which starts a daemon with the new settings, and asks every provider for
-   its models. Each row then shows its model count, or its refusal with a
-   Retry. A key is never read back into the page: the core reports only which
-   keys are set, and a key field left empty keeps the saved one. Removing a
-   provider drops its key (unless another provider uses it) and a default
-   model on it.
-2. **Model.** The list the providers gave, grouped by provider, with no
-   default picked. The choice is `AGENT_MODEL` in `~/.agent/env`: what new
-   projects and `/new` start on. Refresh list asks again. The answer is
-   written to `~/.agent/models`, replacing it: a provider that answers
-   replaces its lines, one that fails keeps the lines it had, one no longer
-   running loses them, and an answer with no usable model leaves the file
-   as it was.
-3. **First project**, shown until one exists: a folder, then New project's
-   path.
+   plan uses the sign-in Codex saved; Amazon Bedrock takes a region and signs
+   with the AWS CLI's credentials for an optional profile, or with a Bedrock
+   API key when one is given. Bedrock serves Claude over Anthropic's API and
+   its other models over OpenAI's, so the daemon runs it as two providers,
+   `bedrock` and `bedrock-openai`; the app connects, lists and removes them
+   as one. Connecting writes `AGENT_PROVIDER` (the providers already running
+   kept, specs as `--provider` takes them) and the provider's fields to
+   `~/.agent/env`, restarts the daemon with `agent shutdown`, which stops
+   running turns and returns once the process is gone, attaches again, which
+   starts a daemon with the new settings, and asks every provider for its
+   models. Each row then shows its model count, or its refusal with a Retry.
+   A key is never read back into the page: the core reports only which keys
+   are set, and a key field left empty keeps the saved one. Removing a
+   provider drops its key unless another provider uses it. Refresh models
+   asks again and writes the answer to `~/.agent/models`, replacing it: a
+   provider that answers replaces its lines, one that fails keeps the lines
+   it had, one no longer running loses them, and an answer with no usable
+   model leaves the file as it was.
+2. **First project**, shown until one exists: a folder and a model, the
+   models listed under their providers, then New project's path.
 
 It opens on its own when a daemon cannot start for lack of a provider, and
-once when a window attaches to an empty store without a provider or model.
-New project on a folder when no model is set opens it at the model step and
-creates the project in that folder once one is chosen. An `agent` the app did
-not bundle, or an explicit `--socket`, cannot be restarted; Settings says so.
+once when a window attaches to an empty store with no provider set up. An
+`agent` the app did not bundle, or an explicit `--socket`, cannot be
+restarted; Settings says so.
 
 ## Projects and panes
 
@@ -289,7 +290,8 @@ daemon learns nothing about projects; everything here is client work.
   under it: the coordinator's `created_by` lineage, plus any root bot named
   `<project>.<task>`. Bots in no project follow. A project row opens its
   coordinator; its chevron folds the tasks. **＋ New project** takes a
-  folder, reads its `project.toml` (unknown keys are refused) or names the
+  folder and a model from `~/.agent/models` under its provider's name (the
+  last one picked comes first), reads its `project.toml` (unknown keys are refused) or names the
   project after the folder, creates the coordinator there with the folder's
   own client policy, and then writes the file if there was none, so a model
   the daemon refuses is never saved. The file goes in through a temporary
@@ -300,7 +302,8 @@ daemon learns nothing about projects; everything here is client work.
 - **Panes.** A sidebar row opens that thread alone. A task card opens its
   bot in a side pane with its own composer; ⤢ swaps it into full view, ✕ or
   `Esc` closes it.
-- **Composer.** The model chip lists `~/.agent/models`, read on each open.
+- **Composer.** The model chip lists `~/.agent/models`, read on each open,
+  each provider under its own heading.
   Models of any provider in the bot's family (known from the fleet's bot
   records) switch the next turns (sent as `submit`'s `model`); other
   families, and providers no record places, show disabled as "new agent",

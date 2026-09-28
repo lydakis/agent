@@ -253,8 +253,7 @@ fn models() -> Result<Value, String> {
 }
 
 /// What a daemon this app starts would run with: its providers, the AWS
-/// region and profile, the default model, and which keys are set (never
-/// their values).
+/// region and profile, and which keys are set (never their values).
 #[tauri::command]
 async fn settings() -> Result<Value, String> {
     let file = match daemon::env_file() {

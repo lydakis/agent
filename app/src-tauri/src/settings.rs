@@ -1,7 +1,8 @@
 //! What the app keeps for the daemons it starts. `~/.agent/env`, which
 //! `daemon` applies over the login shell's environment on every start, holds
-//! the providers a daemon runs (`AGENT_PROVIDER`), what they need (keys, the
-//! AWS region and profile) and the model new agents take (`AGENT_MODEL`).
+//! the providers a daemon runs (`AGENT_PROVIDER`) and what they need (keys,
+//! the AWS region and profile). There is no default model to keep: each
+//! project or agent is given its own when it is made.
 //! The page reads what is set and writes new values; a key's value never
 //! goes back to the page. A change reaches the daemon when it next starts.
 use serde_json::{Map, Value, json};
@@ -9,7 +10,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 /// Settings the page may read back as values.
-const PLAIN: [&str; 4] = ["AGENT_PROVIDER", "AGENT_MODEL", "AWS_REGION", "AWS_PROFILE"];
+const PLAIN: [&str; 3] = ["AGENT_PROVIDER", "AWS_REGION", "AWS_PROFILE"];
 /// Keys the page may set, and learn only whether they are set.
 const SECRET: [&str; 4] = [
     "ANTHROPIC_API_KEY",
@@ -54,7 +55,6 @@ pub fn view(file: &[(String, String)], login: Option<&[(OsString, OsString)]>) -
         .collect();
     json!({
         "providers": providers,
-        "model": get("AGENT_MODEL"),
         "region": get("AWS_REGION").or_else(|| get("AWS_DEFAULT_REGION")),
         "profile": get("AWS_PROFILE"),
         "keys": keys,
@@ -171,14 +171,10 @@ mod tests {
         let login = vec![
             (OsString::from("AWS_REGION"), OsString::from("us-east-1")),
             (OsString::from("OPENAI_API_KEY"), OsString::from("sk-login")),
-            (
-                OsString::from("AGENT_MODEL"),
-                OsString::from("openai/gpt-6-luna"),
-            ),
         ];
         let seen = view(&file, Some(&login));
         assert_eq!(seen["region"], "eu-west-1");
-        assert_eq!(seen["model"], "openai/gpt-6-luna");
+        assert!(seen.get("model").is_none());
         assert_eq!(seen["providers"], json!(["anthropic", "openai"]));
         assert_eq!(seen["keys"], json!(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]));
         assert!(!seen.to_string().contains("sk-"));
@@ -237,6 +233,7 @@ mod tests {
     fn an_edit_refuses_what_is_not_a_setting_or_not_one_line() {
         for bad in [
             json!({"PATH": "/bin"}),
+            json!({"AGENT_MODEL": "openai/gpt-6-luna"}),
             json!({"AWS_REGION": 1}),
             json!({"OPENAI_API_KEY": "sk\nAGENT_PROVIDER=x"}),
         ] {

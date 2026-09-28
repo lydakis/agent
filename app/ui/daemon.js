@@ -39,7 +39,7 @@ window.Daemon = (() => {
     anthropic: [{ id: 'claude-sonnet-5', name: 'Claude Sonnet 5' }],
     chatgpt: [{ id: 'gpt-6-luna' }],
     bedrock: [{ id: 'anthropic.claude-opus-5', name: 'Claude Opus 5' }, { id: 'anthropic.claude-sonnet-5', name: 'Claude Sonnet 5' }, { id: 'anthropic.claude-haiku-5', name: 'Claude Haiku 5' }],
-    'bedrock-openai': [{ id: 'openai.gpt-oss-120b' }, { id: 'qwen.qwen3-coder-480b' }],
+    'bedrock-openai': [{ id: 'openai.gpt-6-luna' }, { id: 'qwen.qwen3-coder-480b' }],
   };
   const specs = () => (ENV.AGENT_PROVIDER ?? '').split(/\s+/).filter(Boolean);
   const listing = () => Object.fromEntries(specs().map((spec) => { const n = spec.split('=')[0]; return [n, n === 'openrouter' ? { error: 'provider_http_401', detail: 'invalid key' } : { models: LISTS[n] ?? [] }]; }));
@@ -232,7 +232,7 @@ window.Daemon = (() => {
 
   const api = {
     setup: async () => ({ socket: 'demo', model: ENV.AGENT_MODEL ?? null, workspace: '/workspace', tools: ['shell', 'read', 'write', 'edit', 'wait', 'history'] }),
-    settings: async () => ({ providers: specs(), model: ENV.AGENT_MODEL ?? null, region: ENV.AWS_REGION ?? null, profile: ENV.AWS_PROFILE ?? null, keys: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK'].filter((k) => ENV[k]) }),
+    settings: async () => ({ providers: specs(), region: ENV.AWS_REGION ?? null, profile: ENV.AWS_PROFILE ?? null, keys: ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'AWS_BEARER_TOKEN_BEDROCK'].filter((k) => ENV[k]) }),
     saveSettings: async (changes) => { for (const [k, v] of Object.entries(changes)) { if (v) ENV[k] = v; else delete ENV[k]; } },
     restartDaemon: async () => { await wait(400); },
     discoverModels: async () => {

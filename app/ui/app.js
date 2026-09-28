@@ -1236,11 +1236,12 @@ function modelChoices(b, list) {
   return [...mine.map((id) => ({ id, ok: true, on: id === current })), ...others.map((id) => ({ id, ok: false, on: false }))];
 }
 function modelMenuItems(b, list, error) {
+  // Each provider under its own heading, so the menu says where a model comes from.
   const items = []; let group = null;
   for (const c of modelChoices(b, list)) {
-    if (group !== null && providerOf(c.id) !== group) items.push({ sep: true });
-    group = providerOf(c.id);
-    items.push({ act: 'set-model', who: b.name, v: c.id, label: c.id, on: c.on, disabled: !c.ok, hint: c.ok ? '' : 'new agent' });
+    const p = providerOf(c.id);
+    if (p !== group) { if (group !== null) items.push({ sep: true }); items.push({ head: providerLabel(p) }); group = p; }
+    items.push({ act: 'set-model', who: b.name, v: c.id, label: c.id.slice(p.length + 1), on: c.on, disabled: !c.ok, hint: c.ok ? '' : 'new agent' });
   }
   if (error) items.push({ sep: true }, { act: 'none', label: error, disabled: true });
   return items;
@@ -1275,7 +1276,7 @@ async function submit(text, pane = 'main', to = PANE[pane].bot()) {
   if (pane === 'main' && text.startsWith('/new ')) {
     const [name, model] = text.slice(5).trim().split(/\s+/);
     if (!name) throw new Error('name_required');
-    const m = model || S.config?.model; if (!m) throw new Error('model_required: NAME PROVIDER/MODEL, or choose a model in Settings');
+    const m = model || S.config?.model; if (!m) throw new Error('model_required: /new NAME PROVIDER/MODEL');
     // Composed now, so an AGENTS.md edited since the window opened reaches this bot. One that
     // cannot be composed rejects here and nothing is created, as with the CLI's --agents.
     const policy = await Daemon.policy();
@@ -1360,7 +1361,7 @@ async function remove(name) { await Daemon.request('delete', { bot: name }); }
 // the file it lacks, with that coordinator's model, so a failed write retries.
 // The app's own opinion of how a coordinator works is its `coordinator` profile: the folder's
 // `.agents/agents/coordinator.md`, the user's, or the one the app ships (app/agents/coordinator.md).
-async function createProject(dir) {
+async function createProject(dir, picked = null) {
   const info = await Daemon.project(dir);
   const existing = bot(info.coordinator);
   if (existing) {
@@ -1369,9 +1370,10 @@ async function createProject(dir) {
     await openOnly(info.coordinator); return;
   }
   const policy = await Daemon.policy(info.dir, 'coordinator');
-  const model = info.model || policy.model || S.config?.model;
-  // No model yet: setup asks for one, and the folder becomes the project once it is chosen.
-  if (!model) { await openSetup({ pending: info.dir }); return; }
+  // The model picked when the project was made, else the folder's, its profile's, or the app's --model.
+  const model = picked || info.model || policy.model || S.config?.model;
+  if (!model) throw new Error('model_required: choose a model');
+  if (picked) try { localStorage.setItem('agent:model', picked); } catch (_) {}
   const session = S.session;
   const record = await Daemon.request('create', { bot: info.coordinator, workspace: info.dir, model, instructions: policy.instructions, compaction_instructions: policy.compaction_instructions, tools: policy.tools ?? S.config.tools });
   await enqueue(() => { if (S.session === session) seat(record, session); });
@@ -1381,10 +1383,11 @@ async function createProject(dir) {
 function detach() { save(); Daemon.close(); }
 
 // ---------- setup ----------
-// What a daemon needs before anything runs: providers, what each needs to sign in, and the model new
-// agents take. The app keeps them in `~/.agent/env` (read back without key values) and restarts the
-// daemon to apply them; nothing is picked for the user. Onboarding is this screen opened on its own
-// when nothing is set up; Settings is the same screen opened from the sidebar.
+// What a daemon needs before anything runs: providers, and what each needs to sign in. The app keeps
+// them in `~/.agent/env` (read back without key values) and restarts the daemon to apply them. There
+// is no default model: each project or agent is given one when it is made, from any provider.
+// Onboarding is this screen opened on its own when no provider is set up; Settings is the same
+// screen opened from the sidebar.
 const AWS = 'Signs in with your AWS CLI login for the profile (aws configure, or aws sso login), or with a Bedrock API key if you give one.';
 const BEDROCK = [
   { key: 'AWS_REGION', label: 'Region', hint: 'us-east-1', required: true },
@@ -1396,31 +1399,42 @@ const CATALOG = [
   { id: 'openai', label: 'OpenAI', fields: [{ key: 'OPENAI_API_KEY', label: 'API key', secret: true, required: true }] },
   { id: 'openrouter', label: 'OpenRouter', fields: [{ key: 'OPENROUTER_API_KEY', label: 'API key', secret: true, required: true }] },
   { id: 'chatgpt', label: 'ChatGPT plan', about: 'Uses the ChatGPT sign-in Codex saved on this computer (codex login).', fields: [] },
-  { id: 'bedrock', label: 'Amazon Bedrock · Claude', about: AWS, fields: BEDROCK, family: 'anthropic', path: 'anthropic' },
-  { id: 'bedrock-openai', label: 'Amazon Bedrock · other models', about: AWS, fields: BEDROCK, family: 'responses', path: 'openai' },
+  // Bedrock serves Claude over Anthropic's API and every other model over OpenAI's, each a provider of
+  // its own to the daemon; to the user it is one provider, connected and removed as one.
+  { id: 'bedrock', label: 'Amazon Bedrock', about: AWS, fields: BEDROCK, parts: [['bedrock', 'anthropic', 'anthropic'], ['bedrock-openai', 'responses', 'openai']] },
 ];
 const specName = (spec) => String(spec).split('=')[0];
-const catalogOf = (name) => CATALOG.find((c) => c.id === name);
-// A provider's `--provider` spec. Bedrock with an API key names its endpoint so the key can be named
+// The daemon providers an entry runs, and the entry a daemon provider belongs to.
+const partsOf = (c) => c.parts ? c.parts.map(([name]) => name) : [c.id];
+const catalogOf = (name) => CATALOG.find((c) => partsOf(c).includes(name));
+const providerLabel = (name) => catalogOf(name)?.label ?? name;
+// A model picker: every listed model under its provider's name, the last one picked chosen.
+function lastModel() { try { return localStorage.getItem('agent:model'); } catch (_) { return null; } }
+function modelSelectHTML(id, list) {
+  const pick = [lastModel(), S.config?.model].find((m) => m && list.some((x) => x.id === m)) ?? '';
+  const groups = new Map(); for (const m of list) { const label = providerLabel(providerOf(m.id)); if (!groups.has(label)) groups.set(label, []); groups.get(label).push(m); }
+  const options = [...groups].map(([label, ms]) => `<optgroup label="${esc(label)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === pick ? ' selected' : ''}>${esc(m.id.slice(providerOf(m.id).length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
+  return `<select id="${id}" aria-label="Model">${pick ? '' : '<option value="" selected disabled>Choose a model</option>'}${options}</select>`;
+}
+// An entry's `--provider` specs. Bedrock with an API key names each endpoint so the key can be named
 // after it; without one it signs with the AWS CLI's credentials in the region.
-function providerSpec(id, values) {
+function providerSpecs(id, values) {
   const c = catalogOf(id);
-  if (c?.path && values.AWS_BEARER_TOKEN_BEDROCK) return `${id}=${c.family},https://bedrock-mantle.${values.AWS_REGION}.api.aws/${c.path}/v1,AWS_BEARER_TOKEN_BEDROCK`;
-  return id;
+  if (!c?.parts) return [id];
+  return c.parts.map(([name, family, path]) => values.AWS_BEARER_TOKEN_BEDROCK ? `${name}=${family},https://bedrock-mantle.${values.AWS_REGION}.api.aws/${path}/v1,AWS_BEARER_TOKEN_BEDROCK` : name);
 }
 // One screen, one state: `settings` as the app would start a daemon with, each provider's answer
-// (`checking`, a model count, or an error), the list new agents pick from, and a folder waiting on a
-// model to become a project.
-function setupState() { return S.setup ??= { open: false, settings: null, status: {}, list: [], adding: null, busy: null, error: null, pending: null, listError: null }; }
+// (`checking`, a model count, or an error), and the list models are picked from.
+function setupState() { return S.setup ??= { open: false, settings: null, status: {}, list: [], adding: null, busy: null, error: null, listError: null }; }
 const hasProject = () => [...S.bots.keys()].some((n) => n.endsWith(LEAD));
-// A window with nothing in it opens setup when a provider or the model is missing.
+// A window with nothing in it opens setup when no provider is set up.
 async function offerSetup() {
-  try { const set = await Daemon.settings(); if (set.model && S.config && !S.config.model) S.config.model = set.model; if (!set.model || !set.providers?.length) await openSetup(); } catch (_) {}
+  try { const set = await Daemon.settings(); if (!set.providers?.length) await openSetup(); } catch (_) {}
 }
-async function openSetup({ pending = null } = {}) {
+async function openSetup() {
   S.setupSeen = true;
   const st = setupState();
-  st.open = true; st.error = null; if (pending) st.pending = pending;
+  st.open = true; st.error = null;
   $('setupwrap').classList.add('on'); renderSetup();
   try { st.settings = await Daemon.settings(); } catch (e) { st.error = String(e?.message ?? e); }
   if (!st.settings?.providers?.length) st.adding = st.adding ?? '';
@@ -1472,10 +1486,10 @@ async function restartDaemon() {
 async function connectProvider(id, values) {
   const st = setupState(); const c = catalogOf(id); if (!c) return;
   for (const f of c.fields) if (f.required && !values[f.key]) throw new Error(`${f.label} is required`);
-  const specs = (st.settings?.providers ?? []).filter((s) => specName(s) !== id);
+  const specs = (st.settings?.providers ?? []).filter((s) => catalogOf(specName(s)) !== c);
   // A saved Bedrock key stays in use when its field is left empty.
-  const keyed = c.path && !values.AWS_BEARER_TOKEN_BEDROCK && st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? { ...values, AWS_BEARER_TOKEN_BEDROCK: 'saved' } : values;
-  const changes = { AGENT_PROVIDER: [...specs, providerSpec(id, keyed)].join(' ') };
+  const keyed = c.parts && !values.AWS_BEARER_TOKEN_BEDROCK && st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? { ...values, AWS_BEARER_TOKEN_BEDROCK: 'saved' } : values;
+  const changes = { AGENT_PROVIDER: [...specs, ...providerSpecs(c.id, keyed)].join(' ') };
   // A key left empty keeps the one saved; other fields say what they say.
   for (const f of c.fields) if (!f.secret || values[f.key]) changes[f.key] = values[f.key] || null;
   await applySettings(changes);
@@ -1483,13 +1497,12 @@ async function connectProvider(id, values) {
   await refreshModels();
 }
 async function removeProvider(name) {
-  const st = setupState();
-  const specs = (st.settings?.providers ?? []).filter((s) => specName(s) !== name);
+  const st = setupState(); const c = catalogOf(name);
+  const gone = c ? partsOf(c) : [name];
+  const specs = (st.settings?.providers ?? []).filter((s) => !gone.includes(specName(s)));
   const changes = { AGENT_PROVIDER: specs.join(' ') || null };
-  const c = catalogOf(name);
   // Its key goes too, unless another provider still uses it; the region and profile stay.
   for (const f of c?.fields ?? []) if (f.secret && !specs.some((s) => catalogOf(specName(s))?.fields.some((g) => g.key === f.key))) changes[f.key] = null;
-  if (providerOf(st.settings?.model) === name) changes.AGENT_MODEL = null;
   await applySettings(changes);
   await refreshModels();
 }
@@ -1497,33 +1510,27 @@ async function applySettings(changes) {
   const st = setupState();
   st.busy = 'Saving…'; st.error = null; renderSetup();
   try { await Daemon.saveSettings(changes); st.settings = await Daemon.settings(); } finally { st.busy = null; }
-  if (S.config) S.config.model = st.settings.model ?? null;
   await restartDaemon();
-}
-// The model new agents and projects take; each can still run another. A folder that was waiting on
-// one becomes its project now.
-async function chooseModel(model) {
-  const st = setupState();
-  await Daemon.saveSettings({ AGENT_MODEL: model });
-  st.settings = { ...st.settings, model };
-  if (S.config) S.config.model = model;
-  renderSetup();
-  if (st.pending) { const dir = st.pending; st.pending = null; await createProject(dir); closeSetup(); }
 }
 function setupHTML() {
   const st = setupState(), set = st.settings, specs = set?.providers ?? [];
   const busy = st.busy ? ' disabled' : '';
-  const statusHTML = (name) => {
-    const s = st.status[name];
-    if (s === 'checking') return '<span class="st dim">checking…</span>';
-    if (!s) return `<span class="st dim">${S.attached ? '' : 'not running'}</span>`;
-    if (s.error) return '<span class="st bad">✘ not ready</span>';
-    return `<span class="st ok">✓ ${s.models} model${s.models === 1 ? '' : 's'}</span>`;
+  // One row per entry: an entry of several daemon providers counts their models together and names
+  // whichever of them failed.
+  const statusHTML = (names) => {
+    const all = names.map((n) => st.status[n]);
+    if (all.includes('checking')) return '<span class="st dim">checking…</span>';
+    if (all.some((s) => !s)) return `<span class="st dim">${S.attached ? '' : 'not running'}</span>`;
+    const models = all.reduce((sum, s) => sum + (s.models ?? 0), 0);
+    if (all.every((s) => s.error)) return '<span class="st bad">✘ not ready</span>';
+    return `<span class="st ok">✓ ${models} model${models === 1 ? '' : 's'}</span>`;
   };
-  const rows = specs.map((spec) => { const n = specName(spec), c = catalogOf(n); return `<div class="prow"><span class="pn">${esc(c?.label ?? n)}</span>${statusHTML(n)}<span class="acts">${st.status[n]?.error ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}<button type="button" class="sbtn" data-act="setup-remove" data-v="${esc(n)}"${busy}>Remove</button></span>${st.status[n]?.error ? `<div class="perr">${esc(st.status[n].error)}${st.status[n].detail ? `: ${esc(String(st.status[n].detail).slice(0, 300))}` : ''}</div>` : ''}</div>`; }).join('');
+  const errorsHTML = (names) => names.filter((n) => st.status[n]?.error).map((n) => { const s = st.status[n]; return `<div class="perr">${names.length > 1 ? `${esc(n)}: ` : ''}${esc(s.error)}${s.detail ? `: ${esc(String(s.detail).slice(0, 300))}` : ''}</div>`; }).join('');
+  const entries = []; for (const spec of specs) { const n = specName(spec), c = catalogOf(n), key = c?.id ?? n; if (!entries.some((e) => e.key === key)) entries.push({ key, label: c?.label ?? n, names: specs.map(specName).filter((m) => (catalogOf(m)?.id ?? m) === key) }); }
+  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}<button type="button" class="sbtn" data-act="setup-remove" data-v="${esc(key)}"${busy}>Remove</button></span>${errorsHTML(names)}</div>`; }).join('');
   let add = '';
   if (st.adding === null) add = `<button type="button" class="sbtn" data-act="setup-add"${busy}>＋ Add a provider</button>`;
-  else if (st.adding === '') add = `<div class="choices">${CATALOG.filter((c) => !specs.some((s) => specName(s) === c.id)).map((c) => `<button type="button" class="choice" data-act="setup-pick" data-v="${c.id}"${busy}>${esc(c.label)}</button>`).join('')}</div>${specs.length ? `<button type="button" class="sbtn" data-act="setup-cancel">Cancel</button>` : ''}`;
+  else if (st.adding === '') add = `<div class="choices">${CATALOG.filter((c) => !specs.some((s) => catalogOf(specName(s)) === c)).map((c) => `<button type="button" class="choice" data-act="setup-pick" data-v="${c.id}"${busy}>${esc(c.label)}</button>`).join('')}</div>${specs.length ? `<button type="button" class="sbtn" data-act="setup-cancel">Cancel</button>` : ''}`;
   else {
     const c = catalogOf(st.adding);
     const value = (f) => f.key === 'AWS_REGION' ? set?.region ?? '' : f.key === 'AWS_PROFILE' ? set?.profile ?? '' : '';
@@ -1532,22 +1539,16 @@ function setupHTML() {
     add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;
   }
   const ready = Object.values(st.status).some((s) => s?.models > 0) || st.list.length > 0;
-  const groups = new Map(); for (const m of st.list) { const p = providerOf(m.id); if (!groups.has(p)) groups.set(p, []); groups.get(p).push(m); }
-  const current = set?.model ?? '';
-  const options = [...groups].map(([p, ms]) => `<optgroup label="${esc(catalogOf(p)?.label ?? p)}">${ms.map((m) => `<option value="${esc(m.id)}"${m.id === current ? ' selected' : ''}>${esc(m.id.slice(p.length + 1))}${m.note ? ` · ${esc(m.note)}` : ''}</option>`).join('')}</optgroup>`).join('');
-  const orphan = current && !st.list.some((m) => m.id === current) ? `<option value="${esc(current)}" selected>${esc(current)}</option>` : '';
-  const model = ready || current
-    ? `<div class="row"><select id="setupmodel"${busy}>${current ? '' : '<option value="" selected disabled>Choose a model</option>'}${orphan}${options}</select><button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh list</button></div>${st.listError ? `<p class="bad">${esc(st.listError)}</p>` : ''}<p class="dim">New agents and projects start on it; any agent can switch.</p>`
-    : '<p class="dim">Connect a provider first.</p>';
+  const refresh = ready ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
+  const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
   const projects = hasProject();
-  const project = st.pending
-    ? `<p>${esc(st.pending)} becomes a project once you choose a model.</p>`
-    : projects ? '' : `<form class="row" id="setupproj"><input id="setupdir" autocomplete="off" spellcheck="false" aria-label="Project folder" value="${esc(S.config?.workspace ?? '')}"><button type="submit" class="sbtn primary"${current && S.attached ? '' : ' disabled'}${busy}>Create project</button></form>`;
+  const project = projects ? '' : ready && st.list.length
+    ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
+    : '<p class="dim">Connect a provider first.</p>';
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
-  return `<div class="shead"><b>${current && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
-    + step(1, 'Providers', ready, `${rows}${add}`)
-    + step(2, 'Model', !!current, model)
-    + step(3, 'First project', projects, project)
+  return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
+    + step(1, 'Providers', ready, `${rows}<div class="row">${add}${st.adding === null ? refresh : ''}</div>${listed}`)
+    + step(2, 'First project', projects, project)
     + (st.busy ? `<p class="busy">${esc(st.busy)}</p>` : '') + (st.error ? `<p class="bad">${esc(st.error)}</p>` : '');
 }
 // Answers arrive while someone types a key: what the fields hold, and where the caret is, survive.
@@ -1593,7 +1594,11 @@ function closeSide() { if (!S.ui.side) return; S.ui.side = null; render(); save(
 function focusInput(pane) { const el = $(PANE[pane].input); if (el) setTimeout(() => el.focus({ preventScroll: true }), 0); }
 function showNewProject(on) {
   $('projform').hidden = !on; $('newproj').hidden = on;
-  if (on) { $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus(); }
+  if (!on) return;
+  $('projdir').value = S.config?.workspace ?? ''; $('projdir').focus();
+  // The lead's model, from every provider's list, read now so a refreshed list shows.
+  $('projmodel').innerHTML = '';
+  Daemon.models().then((list) => { if (!$('projform').hidden) $('projmodel').innerHTML = list.length ? modelSelectHTML('projsel', list) : '<span class="dim">no models listed: see Settings</span>'; }, (e) => { $('projmodel').textContent = String(e?.message ?? e); });
 }
 
 // ---------- input ----------
@@ -1616,9 +1621,9 @@ for (const [pane, ids] of Object.entries(PANE)) {
 }
 $('projform').addEventListener('submit', async (e) => {
   e.preventDefault(); const dir = $('projdir').value.trim(); if (!dir) return;
-  try { await createProject(dir); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
+  try { await createProject(dir, $('projsel')?.value || null); showNewProject(false); focusInput('main'); } catch (err) { toast(String(err?.message ?? err), 5000); }
 });
-$('projdir').addEventListener('keydown', (e) => { if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
+$('projform').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'projsel') { e.preventDefault(); $('projform').requestSubmit(); } else if (e.key === 'Escape') { showNewProject(false); focusInput('main'); e.preventDefault(); e.stopPropagation(); } });
 $('pickerq').addEventListener('input', renderPicker);
 $('pickerq').addEventListener('keydown', async (e) => {
   const rows = pickerRows();
@@ -1634,7 +1639,7 @@ document.addEventListener('keydown', async (e) => {
   if (S.setup?.open) { if (e.key === 'Escape') { closeSetup(); e.preventDefault(); } return; }
   if ((e.ctrlKey || e.metaKey) && e.key === ',') { await openSetup(); e.preventDefault(); return; }
   // The finder and the folder field handle their own keys; Escape there must not stop a turn.
-  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'pickerq') return;
+  if (S.ui.picker || e.target.id === 'projdir' || e.target.id === 'projsel' || e.target.id === 'pickerq') return;
   const k = e.key, ctrl = e.ctrlKey || e.metaKey;
   if (S.ui.menu) { if (k === 'Escape') { closeMenu(); e.preventDefault(); } return; }
   if (ctrl && k === 'k') { openPicker(); e.preventDefault(); return; }
@@ -1656,12 +1661,8 @@ $('setup').addEventListener('submit', async (e) => {
   const form = e.target;
   try {
     if (form.id === 'setupform') await connectProvider(S.setup.adding, Object.fromEntries([...form.querySelectorAll('input')].map((el) => [el.name, el.value.trim()])));
-    else if (form.id === 'setupproj') { const dir = form.querySelector('input').value.trim(); if (dir) { await createProject(dir); closeSetup(); } }
+    else if (form.id === 'setupproj') { const dir = $('setupdir').value.trim(), model = $('setupmodel').value; if (dir) { await createProject(dir, model); closeSetup(); } }
   } catch (err) { failed(err); }
-});
-$('setup').addEventListener('change', async (e) => {
-  if (e.target.id !== 'setupmodel' || !e.target.value) return;
-  try { await chooseModel(e.target.value); } catch (err) { failed(err); }
 });
 async function act(el) {
   const a = el.dataset.act, who = el.dataset.who, v = el.dataset.v, pane = el.dataset.pane, rect = el.getBoundingClientRect?.();

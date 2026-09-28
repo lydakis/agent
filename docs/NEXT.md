@@ -995,13 +995,12 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     A fork into another provider stays out: history is provider-native.
     Done (2026-09-28): setup and settings, the first items of an app audit
     (Sol, 2026-09-28) George put before swarms. A draft stays with the bot
-    it was typed for. A first run connects a provider (keys, a ChatGPT
-    plan, or Bedrock with its region and AWS profile or API key), lists what
-    each provider offers and has the user choose the model new agents start
-    on, with none picked for them (George: the first real use is through
-    Bedrock), then opens a project; Settings is the same screen, and a
-    project asked for without a model waits on that choice in its folder
-    ([APP.md](APP.md#setup-and-settings)). Follow-up: a change restarts the
+    it was typed for. A first run connects providers (keys, a ChatGPT plan,
+    or Bedrock, one provider for Claude and its other models, with its
+    region and AWS profile or API key) and lists what each offers; there is
+    no default model (George, 2026-09-28): a project or agent is given one
+    when it is made, from any provider, listed under its provider's name.
+    Settings is the same screen ([APP.md](APP.md#setup-and-settings)). Follow-up: a change restarts the
     daemon and so stops running turns; a daemon that could take providers
     while running would not, but that is a daemon op for the app's sake and
     waits until restarts prove a cost. Follow-up: Settings shows the providers
