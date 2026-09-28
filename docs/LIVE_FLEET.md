@@ -520,8 +520,8 @@ turns and a fixed rate, the median turn waited 45 s for its slot, p95 46 s,
 the fair order at work. That is the honest shape of a fleet ten times larger
 than its allowance. The rate itself is the provider's, counted in its own
 accounting of in-flight requests, which reserves output tokens per request;
-`--max-output-tokens` lowers that reservation and is the knob for a workload
-that knows its replies are short.
+a bot's `--max-output-tokens` lowers that reservation and is the knob for a
+workload that knows its replies are short.
 
 Captures: ignored `.local/bench/fleet-screen-luna-10k-paced/` (first cut)
 and `fleet-screen-luna-10k-paced2/` (final).

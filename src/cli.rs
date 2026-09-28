@@ -2,7 +2,7 @@
 use agent_runtime::{Error, Result, fail_with};
 
 const CONNECTION: &str = "--store --socket";
-const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --max-output-tokens --stall-timeout --keep-warm --cache-ttl --idle-exit --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms";
+const STARTUP: &str = "--provider --max-processes --max-detached --max-active --max-connecting --max-pending --max-pending-bytes --stall-timeout --idle-exit";
 
 struct Command {
     name: &'static str,
@@ -15,7 +15,7 @@ const COMMANDS: &[Command] = &[
     Command {
         name: "run",
         usage: "run [OPTIONS] [--] PROMPT...",
-        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --pretty --no-spawn",
+        flags: "--bot --new --detach --delivery --turn --model --tools --workspace --instructions --instructions-file --reasoning --request-id --bot-id --budget-tokens --compaction-instructions --compaction-instructions-file --compaction-model --no-compaction --fallbacks --agents --approval --approve --context-bytes --context-items --note-turns --compact-at --compact-keep --retain-turns --approval-hold-ms --max-output-tokens --keep-warm --cache-ttl --pretty --no-spawn",
         startup: true,
     },
     Command {
@@ -217,30 +217,36 @@ fn print_flags(flags: &str) {
             "--max-connecting" => ("N", "Concurrent provider startup limit; 0 is unbounded"),
             "--max-pending" => ("N", "Submissions waiting to start; 0 is unbounded"),
             "--max-pending-bytes" => ("N", "Prompt bytes waiting to start; 0 is unbounded"),
-            "--max-output-tokens" => ("N", "Output token cap per model call"),
+            "--max-output-tokens" => (
+                "N",
+                "A new bot's output token cap per model call; default the model's limit",
+            ),
             "--stall-timeout" => (
                 "SECONDS",
                 "Retry a provider stream with no content this long; default 120",
             ),
             "--keep-warm" => (
                 "SECONDS",
-                "Refresh an idle Anthropic prompt cache during a tool call after this long; default 240, 0 disables",
+                "A new bot refreshes its idle Anthropic prompt cache during a tool call after this long; default 240, 0 disables",
             ),
             "--cache-ttl" => (
                 "5m|1h",
-                "Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
+                "A new bot's Anthropic prompt-cache lifetime; 1h bills writes at 2x input and sends no refresh; default 5m",
             ),
             "--idle-exit" => ("SECONDS", "Exit after idle time; 0 disables"),
-            "--context-bytes" => ("N", "Maximum model context bytes"),
-            "--context-items" => ("N", "Maximum model context items"),
-            "--note-turns" => ("N", "Omitted turns the context note lists; 0 lists none"),
+            "--context-bytes" => ("N", "A new bot's model context bytes; default 8 MiB"),
+            "--context-items" => ("N", "A new bot's model context items; default 4096"),
+            "--note-turns" => (
+                "N",
+                "Omitted turns a new bot's context note lists; 0 lists none; default 48",
+            ),
             "--compact-at" => (
                 "PERCENT",
-                "Elide answered tool results, then compact, once the context holds this share of its budget",
+                "A new bot elides answered tool results, then compacts, once its context holds this share of its budget; default 75",
             ),
             "--compact-keep" => (
                 "PERCENT",
-                "Share of the context budget kept verbatim by elision and compaction",
+                "Share of a new bot's context budget kept verbatim by elision and compaction; default 25",
             ),
             "--compaction-instructions" => (
                 "TEXT",
@@ -259,7 +265,10 @@ fn print_flags(flags: &str) {
                 "",
                 "A new bot's declined Anthropic requests rerun on the recommended model",
             ),
-            "--retain-turns" => ("N", "Automatically retain N turns' operational records"),
+            "--retain-turns" => (
+                "N",
+                "A new bot keeps N turns' operational records, pruning older ones as its turns finish",
+            ),
             "--grace" => (
                 "SECONDS",
                 "Let running turns finish for up to this long, starting none; default 0",
@@ -293,7 +302,7 @@ fn print_flags(flags: &str) {
             "--reason" => ("TEXT", "Why, shown to the model with a denial"),
             "--approval-hold-ms" => (
                 "N",
-                "Wait this long for a verdict before parking the turn; default 2000",
+                "A new bot's gated calls wait this long for a verdict before the turn parks; default 2000",
             ),
             _ => unreachable!("flag missing help"),
         };

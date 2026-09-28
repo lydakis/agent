@@ -98,8 +98,13 @@ an idle bot returns after replay. `follow --all` stays connected for future work
 - Time units are explicit: `--timeout-ms` is milliseconds; `--idle-exit`,
   `--stall-timeout`, and `--keep-warm` are seconds. `--after` is an exclusive event cursor for `follow` and an exclusive
   turn ID for `turns`. `--checkpoint` is a history node ID.
-  `--approval-hold-ms` is milliseconds: how long a gated call waits live for
-  its verdict before its turn parks (default 2,000; 0 parks at once).
+  `--approval-hold-ms` is milliseconds: how long a new bot's gated calls
+  wait live for a verdict before the turn parks (default 2,000; 0 parks at once).
+- `run` sets a new bot's own settings with `--context-bytes`, `--context-items`,
+  `--note-turns`, `--compact-at`, `--compact-keep`, `--retain-turns`,
+  `--approval-hold-ms`, `--max-output-tokens`, `--keep-warm`, and
+  `--cache-ttl`; they are not daemon options, and an existing bot
+  keeps its own (see [bot settings](RUST_PROTOTYPE.md#bot-settings)).
 
 The lightweight command registry in `src/cli.rs` supplies help and option scope
 for both client commands and `serve`. Keep that registry, the implementation,

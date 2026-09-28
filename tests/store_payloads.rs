@@ -38,6 +38,7 @@ fn binding(family: Family) -> Binding<'static> {
         compaction_model: None,
         fallbacks: false,
         gate: None,
+        settings: Default::default(),
     }
 }
 

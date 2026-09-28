@@ -38,7 +38,7 @@ class ElisionTests(ModelFixture):
     def test_a_long_turn_outgrows_its_budget_by_eliding_answered_results(self):
         # About 11 KiB a round for 24 rounds: four budgets of tool output in
         # one turn, with no summarizer configured.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '65536'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read']))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['turn']
@@ -92,7 +92,7 @@ class ElisionTests(ModelFixture):
         # Half the budget kept verbatim. Thirty-six small results, too small
         # to elide, then two large ones: the turn overflows while both large
         # results, answered, are still inside that tail.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '65536', '--compact-keep', '50'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 65536, 'compact_keep': 50})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'])
         turn = client.request('submit', bot='Bob', request_id='1',
                               prompt='long:36x40,2x600,10x40')['result']['turn']
@@ -111,7 +111,7 @@ class ElisionTests(ModelFixture):
         # inside the kept half: the turn alone fits the budget, but not
         # beside the note, and ordinary elision finds nothing to move.
         client = self.client(tools='shell,read,note',
-                             extra=('--context-bytes', '24576', '--compact-keep', '50'))
+                             settings={'context_bytes': 24576, 'compact_keep': 50})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'note'])
         self.model.note_text = 'N' * 8000
         noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
@@ -141,7 +141,7 @@ class ElisionTests(ModelFixture):
         # summarizer, a refused second move ended the turn with
         # `context_limit`.
         client = self.client(tools='shell,read,note',
-                             extra=('--context-bytes', '24576', '--compact-keep', '50'))
+                             settings={'context_bytes': 24576, 'compact_keep': 50})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read', 'note'])
         self.model.note_text = 'N' * 8000
         noted = client.request('submit', bot='Bob', request_id='1', prompt='note:')['result']['turn']
@@ -162,7 +162,7 @@ class ElisionTests(ModelFixture):
 
     def test_a_bot_without_read_never_elides(self):
         # A stub names a read the model could not make.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '65536'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell'])
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:24')['result']['turn']
         ended = client.finished(turn)
@@ -177,7 +177,7 @@ class ElisionTests(ModelFixture):
     def test_compaction_summarizes_elided_results_as_their_stubs(self):
         # Two long turns in 32 KiB: the second compacts the first, whose
         # results as stored are several budgets but as sent are stubs.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '32768'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 32768})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
         for n in range(2):
@@ -202,7 +202,7 @@ class ElisionTests(ModelFixture):
         # model reads it back with the default line limit. Whole, with its
         # escaping as a result, the page would not fit beside its call; it
         # stops where it fits.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'])
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:1x1200,2x1')['result']['turn']
         ended = client.finished(turn)
@@ -220,7 +220,7 @@ class ElisionTests(ModelFixture):
         # call made before the stub, and that summary is paced once; the
         # daemon restarts while it waits. The retry copies the same call,
         # not the view after the stub.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '65536'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 65536})
         client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                        compaction_instructions='Summarize.')
         self.model.compaction_refusals = 1
@@ -229,7 +229,7 @@ class ElisionTests(ModelFixture):
         client.receive(lambda m: m.get('event') == 'turn_paced' and m.get('turn') == turn)
         client.close(kill=True)
         client = Client(self.binary, self.path / 'state.sqlite', self.url,
-                        extra=('--context-bytes', '65536'), tools='shell,read')
+                        settings={'context_bytes': 65536}, tools='shell,read')
         self.addCleanup(client.close)
         ended = client.finished(turn)
         self.assertEqual(ended['data']['status'], 'completed', ended)
@@ -249,7 +249,7 @@ class ElisionTests(ModelFixture):
         # more than the three quarters of 24 KiB a steer may join. The next
         # boundary stubs the older one, and the steer goes in there, before
         # the model's next call, rather than failing when the turn ends.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['turn']
@@ -281,7 +281,7 @@ class ElisionTests(ModelFixture):
         # the summary sent ahead of it. It stays queued rather than pushing
         # the view over the budget, and the task finishes.
         self.model.compaction_text = 'S' * 7800
-        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:40x40')['result']['turn']
@@ -308,7 +308,7 @@ class ElisionTests(ModelFixture):
         # summary can take a round the model has not answered. The steer
         # fits the whole budget, so it goes in rather than failing when the
         # turn ends.
-        client = self.client(tools='shell,read', extra=('--context-bytes', '24576'))
+        client = self.client(tools='shell,read', settings={'context_bytes': 24576})
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path),
                                                tools=['shell', 'read'], compaction_instructions='Summarize.'))
         turn, ended, outcome, correction = self.steer_behind_a_large_result(client)
@@ -329,18 +329,17 @@ class ElisionTests(ModelFixture):
         # serves, or now serves in another family than the bot's stored
         # items, so no summary could take the rounds behind a steer let in
         # against the whole budget: it keeps the three-quarter share.
-        budget = ('--context-bytes', '24576')
         for restart in ((), ('--provider', f'other=anthropic,{self.url}')):
             with self.subTest(restart=restart):
                 store = Path(tempfile.mkdtemp(dir=self.path)) / 'state.sqlite'
                 client = Client(self.binary, store, self.url, 'shell,read',
-                                extra=('--provider', f'other=responses,{self.url}', *budget))
+                                extra=('--provider', f'other=responses,{self.url}'), settings={'context_bytes': 24576})
                 created = client.request('create', bot='Bob', workspace=str(self.path), tools=['shell', 'read'],
                                          compaction_instructions='Summarize.',
                                          compaction_model='other/synthetic-model')
                 client.close()
                 self.assertIn('result', created)
-                client = Client(self.binary, store, self.url, 'shell,read', extra=(*restart, *budget))
+                client = Client(self.binary, store, self.url, 'shell,read', extra=restart)
                 self.addCleanup(client.close)
                 _, ended, outcome, _ = self.steer_behind_a_large_result(client)
                 self.assertEqual(ended['status'], 'completed', ended)
@@ -399,7 +398,7 @@ class AnthropicElisionTests(ModelFixture):
                         tools='echo,shell,read', provider='anthropic', family='anthropic',
                         model='synthetic-claude', key_env='ANTHROPIC_TEST_KEY',
                         env={**clean_env(), 'ANTHROPIC_TEST_KEY': 'synthetic-anthropic-key'},
-                        extra=('--context-bytes', '65536'))
+                        settings={'context_bytes': 65536})
         self.addCleanup(client.close)
         self.assertIn('result', client.request('create', bot='Bob', workspace=str(self.path), reasoning='low'))
         turn = client.request('submit', bot='Bob', request_id='1', prompt='long:16')['result']['turn']

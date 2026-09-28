@@ -13,8 +13,8 @@ use agent_runtime::{
     output::{self, Output},
     provider::{Listed, Provider, STREAMS_PER_CONNECTION, Transport},
     store::{
-        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Started,
-        Store, TurnOptions, Waiting, Wake,
+        Answer, Binding, Bot, Decision, Delivery, Fork, Gate, MAX_GATES, Publication, Settings,
+        Started, Store, TurnOptions, Waiting, Wake,
     },
     tools::Registry,
 };
@@ -191,6 +191,10 @@ enum Command {
         approve: Option<Vec<String>>,
         approver: Option<String>,
         approve_expire_ms: Option<u64>,
+        /// Its context, history and approval settings; each one left out
+        /// takes the default. Forks keep their source's.
+        #[serde(default)]
+        settings: Box<Settings>,
     },
     Resume {
         bot: String,
@@ -523,38 +527,12 @@ pub struct Configuration {
     /// unbounded by default, since waiting work is durable rows.
     pub max_pending: Option<usize>,
     pub max_pending_bytes: Option<usize>,
-    /// Generated tokens per Responses call, including reasoning; none by default.
-    pub max_output_tokens: Option<u32>,
     /// Seconds an established provider stream may go without a content
     /// frame before the attempt fails and is retried; default 120.
     pub stall_timeout: Option<u64>,
-    /// Seconds an Anthropic prompt cache may sit unread while a tool runs
-    /// before it is refreshed; default 240, 0 disables.
-    pub keep_warm: Option<u64>,
-    /// Anthropic prompt caches last an hour instead of five minutes; their
-    /// writes bill twice the input rate instead of 1.25 times, and no
-    /// refresh is sent. Responses providers are unaffected.
-    pub cache_hour: bool,
     /// Exit a socket daemon after this many seconds with no sessions, no
     /// active turns, and no running background commands; none by default.
     pub idle_exit: Option<u64>,
-    /// Model context per request: newest turns within these bounds. Stored
-    /// history itself is unbounded. Defaults 8 MiB and 4,096 items.
-    pub context_bytes: Option<usize>,
-    pub context_items: Option<usize>,
-    /// Omitted turns the context note lists, newest first; zero lists none.
-    /// Default 48.
-    pub note_turns: Option<usize>,
-    /// Compaction threshold and verbatim tail as percentages of the context
-    /// budget; defaults 75 and 25.
-    pub compact_at: Option<usize>,
-    pub compact_keep: Option<usize>,
-    /// Prune every bot to this many turns' records after each of its turns
-    /// finishes; none by default.
-    pub retain_turns: Option<usize>,
-    /// Milliseconds a gated call waits live for its verdict before its turn
-    /// parks; default 2,000.
-    pub approval_hold_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -568,17 +546,7 @@ pub struct Limits {
     /// HTTP/2 connections per provider, enough for `active` turns to stream
     /// at once at the providers' advertised streams per connection.
     pub connections: usize,
-    pub context_bytes: usize,
-    pub context_items: usize,
-    pub note_turns: usize,
-    /// Compaction fires at a round boundary once the turns since the last
-    /// summary hold this percentage of `context_bytes`, keeping
-    /// `compact_keep` percent verbatim.
-    pub compact_at: usize,
-    pub compact_keep: usize,
 }
-pub const MIN_CONTEXT_BYTES: usize = 1024;
-pub const MIN_CONTEXT_ITEMS: usize = 2;
 
 impl Limits {
     pub fn resolve(config: &Configuration) -> Limits {
@@ -598,14 +566,6 @@ impl Limits {
             } else {
                 active.div_ceil(STREAMS_PER_CONNECTION).clamp(1, 256)
             },
-            context_bytes: config
-                .context_bytes
-                .unwrap_or(8 * 1024 * 1024)
-                .max(MIN_CONTEXT_BYTES),
-            context_items: config.context_items.unwrap_or(4096).max(MIN_CONTEXT_ITEMS),
-            note_turns: config.note_turns.unwrap_or(48),
-            compact_at: config.compact_at.unwrap_or(75),
-            compact_keep: config.compact_keep.unwrap_or(25),
         }
     }
 }
@@ -688,7 +648,6 @@ struct Service {
     limits: Limits,
     /// The store's identity, announced in `ready` and used for cache keys.
     identity: u128,
-    retain_turns: Option<usize>,
     /// Open client sessions, kept by the run loop for `stats`.
     sessions: usize,
     limit_active: usize,
@@ -714,7 +673,6 @@ struct Service {
     /// Shutting down with a grace period: running turns go on, no turn
     /// starts, and accepted submissions wait durably for the next start.
     draining: bool,
-    approval_hold: Duration,
     /// Admissions queued with the storage worker and not yet answered,
     /// oldest first: the worker answers in queue order.
     admissions: std::collections::VecDeque<Admission>,
@@ -887,12 +845,6 @@ pub async fn run(config: Configuration) -> Result<()> {
     let stall_timeout = config
         .stall_timeout
         .map_or(agent_runtime::provider::STALL_TIMEOUT, Duration::from_secs);
-    let keep_warm = match config.keep_warm {
-        Some(0) => None,
-        Some(seconds) => Some(Duration::from_secs(seconds)),
-        None => Some(agent_runtime::provider::KEEP_WARM),
-    };
-    let approval_hold = Duration::from_millis(config.approval_hold_ms.unwrap_or(2000));
     let registry = Registry::all()?;
     let mut providers = HashMap::new();
     let aws_start = agent_runtime::provider::aws::Start::new();
@@ -950,16 +902,10 @@ pub async fn run(config: Configuration) -> Result<()> {
             auth = Some(signed);
             provider = provider.with_aws(Arc::new(aws))?;
         }
-        if let Some(cap) = config.max_output_tokens {
-            provider = provider.with_max_output_tokens(cap)?;
-        }
         if spec.socket {
             provider = provider.with_socket()?;
         }
-        let provider = provider
-            .with_stall_timeout(stall_timeout)?
-            .with_keep_warm(keep_warm)?
-            .with_cache_hour(config.cache_hour);
+        let provider = provider.with_stall_timeout(stall_timeout)?;
         if providers.insert(spec.name.clone(), provider).is_some() {
             return fail_with("duplicate_provider", spec.name.as_str());
         }
@@ -1010,18 +956,13 @@ pub async fn run(config: Configuration) -> Result<()> {
     let hub = Hub::default();
     let lineage = store.op("store_identity", |db| db.store_identity()).await?;
     let identity = store.instance_identity(lineage)?;
-    let ready = json!({"event":"ready","protocol":3,"pid":std::process::id(),
+    let ready = json!({"event":"ready","protocol":agent_client::PROTOCOL,"pid":std::process::id(),
         "store":{"identity":format!("{identity:032x}"),"lineage":format!("{:016x}", lineage as u64)},
         "limits":{"processes":limits.processes,"detached":limits.detached,"active":limits.active,"connecting":limits.connecting,
             "pending":limits.pending,"pending_bytes":limits.pending_bytes,
             "connections":limits.connections,
-            "output_tokens":config.max_output_tokens,"idle_exit_seconds":config.idle_exit,
-            "stall_timeout_seconds":stall_timeout.as_secs(),
-            "keep_warm_seconds":keep_warm.map_or(0, |after| after.as_secs()),
-            "cache_ttl":if config.cache_hour { "1h" } else { "5m" },
-            "context_bytes":limits.context_bytes,"context_items":limits.context_items,
-            "note_turns":limits.note_turns,"compact_at":limits.compact_at,"compact_keep":limits.compact_keep,
-            "retain_turns":config.retain_turns,"approval_hold_ms":approval_hold.as_millis() as u64},
+            "idle_exit_seconds":config.idle_exit,
+            "stall_timeout_seconds":stall_timeout.as_secs()},
         "schema":agent_runtime::store::Database::SCHEMA,
         "tools":registry.names(),"providers":bindings,
         "durability":"sqlite_full","partial_text_durable":false});
@@ -1131,7 +1072,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         handles,
         background_failures: failure_sender,
         limits,
-        retain_turns: config.retain_turns,
         sessions: sessions.len(),
         limit_active: limits.active,
         active: HashMap::new(),
@@ -1144,7 +1084,6 @@ pub async fn run(config: Configuration) -> Result<()> {
         tokens: Arc::default(),
         wakes,
         draining: false,
-        approval_hold,
         admissions: std::collections::VecDeque::with_capacity(ADMISSION_WINDOW),
         reserved: 0,
         storage_backoff: Duration::ZERO,
@@ -1738,7 +1677,6 @@ impl Service {
 
     /// End a turn that never started; the worker answers its waiters.
     async fn end_queued(&mut self, bot: String, turn: i64, error: Error) -> Result<()> {
-        let keep = self.retain_turns;
         let steers = self.active.get(&bot).map(|active| active.steers.clone());
         self.store
             .op_pruning("end_queued", bot.clone(), move |db| {
@@ -1749,10 +1687,7 @@ impl Service {
                 if let Some(steers) = steers {
                     steers.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                if let Some(keep) = keep {
-                    db.prune_except(&bot, keep, Some(turn))?;
-                }
-                Ok(())
+                db.retain(&bot, Some(turn))
             })
             .await?;
         self.ready_hint = true;
@@ -1786,18 +1721,12 @@ impl Service {
             hub: self.hub.clone(),
             handles: self.handles.clone(),
             background_failures: self.background_failures.clone(),
-            context_bytes: self.limits.context_bytes,
-            context_items: self.limits.context_items,
-            note_turns: self.limits.note_turns,
-            compact_at: self.limits.compact_at,
-            compact_keep: self.limits.compact_keep,
+            settings: Default::default(),
             resumed,
-            approval_hold: self.approval_hold,
             steers,
             tokens: self.tokens.clone(),
             read_results: Default::default(),
         };
-        let keep = self.retain_turns;
         self.jobs.spawn(async move {
             let (bot, id) = (task.bot.clone(), task.turn);
             // Keep the cancellation receiver alive through completion so an
@@ -1806,7 +1735,7 @@ impl Service {
             let exit = task.execute(cancelled.clone()).await;
             let result = match &exit {
                 turn::Exit::Finished(error) => {
-                    commit_finish(&task.store, &bot, id, error.as_ref(), keep, &mut cancelled)
+                    commit_finish(&task.store, &bot, id, error.as_ref(), &mut cancelled)
                         .await
                         .map(|()| exit)
                 }
@@ -1877,6 +1806,7 @@ impl Service {
                 approve,
                 approver,
                 approve_expire_ms,
+                settings,
             } => {
                 if budget_tokens == Some(0) {
                     return fail("invalid_budget");
@@ -1896,11 +1826,15 @@ impl Service {
                 // says what it runs and what it is told, and the bot keeps both.
                 let reference = model.ok_or(Error::new("model_required"))?;
                 let (provider, model) = split_model(&reference)?;
-                let family = self
+                let served = self
                     .providers
                     .get(provider)
-                    .ok_or(Error::with("provider_unavailable", provider))?
-                    .family();
+                    .ok_or(Error::with("provider_unavailable", provider))?;
+                let family = served.family();
+                // What its family refuses, such as an Anthropic output bound
+                // with no room for thinking, is refused before the bot exists.
+                settings.validate()?;
+                turn::shaped(served, &settings)?;
                 if let Some(level) = &reasoning
                     && !matches!(level.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
                 {
@@ -1951,6 +1885,7 @@ impl Service {
                                 compaction_model: compaction_model.as_deref(),
                                 fallbacks,
                                 gate: gate.as_ref(),
+                                settings: *settings,
                             },
                         )?;
                         Ok((serde_json::to_value(created)?, event["cursor"].as_i64()))
@@ -2582,7 +2517,6 @@ impl Service {
                     return fail("stale_turn");
                 }
                 let name = bot.clone();
-                let keep = self.retain_turns;
                 store
                     .op_pruning("finish", name.clone(), move |db| {
                         turn::Finished::record(
@@ -2590,7 +2524,6 @@ impl Service {
                             &name,
                             turn,
                             Some(&Error::new(turn::INTERRUPTED)),
-                            keep,
                         )
                     })
                     .await?;
@@ -2623,7 +2556,6 @@ async fn commit_finish(
     bot: &str,
     turn: i64,
     error: Option<&Error>,
-    keep: Option<usize>,
     cancelled: &mut watch::Receiver<Option<&'static str>>,
 ) -> Result<()> {
     let mut error = error.cloned();
@@ -2632,7 +2564,7 @@ async fn commit_finish(
         let (name, attempt) = (bot.to_owned(), error.clone());
         let failure = match store
             .op_pruning("finish", bot.to_owned(), move |db| {
-                turn::Finished::record(db, &name, turn, attempt.as_ref(), keep)
+                turn::Finished::record(db, &name, turn, attempt.as_ref())
             })
             .await
         {
@@ -3035,6 +2967,7 @@ mod tests {
                         compaction_model: None,
                         fallbacks: false,
                         gate: None,
+                        settings: Default::default(),
                     },
                 )?;
                 let turn = db
@@ -3087,13 +3020,7 @@ mod tests {
                 active: 1024,
                 connecting: 64,
                 connections: 11,
-                context_bytes: 8 << 20,
-                context_items: 4096,
-                note_turns: 48,
-                compact_at: 75,
-                compact_keep: 25,
             },
-            retain_turns: None,
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1,
@@ -3114,7 +3041,6 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             draining: false,
-            approval_hold: Duration::from_secs(2),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
@@ -3206,7 +3132,7 @@ mod tests {
         service.ready_hint = false;
         store
             .op("finish", move |db| {
-                turn::Finished::record(db, "Bob", next, None, None)
+                turn::Finished::record(db, "Bob", next, None)
             })
             .await
             .unwrap();
@@ -3245,6 +3171,7 @@ mod tests {
             compaction_model: None,
             fallbacks: false,
             gate: None,
+            settings: Default::default(),
         };
         let turn = store
             .op("create", move |db| {
@@ -3289,13 +3216,7 @@ mod tests {
                 active: 1024,
                 connecting: 64,
                 connections: 11,
-                context_bytes: 8 << 20,
-                context_items: 4096,
-                note_turns: 48,
-                compact_at: 75,
-                compact_keep: 25,
             },
-            retain_turns: None,
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
@@ -3320,7 +3241,6 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             draining: false,
-            approval_hold: Duration::from_secs(2),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
@@ -3480,6 +3400,7 @@ mod tests {
                                 compaction_model: None,
                                 fallbacks: false,
                                 gate: None,
+                                settings: Default::default(),
                             },
                         )?;
                         let turn = db
@@ -3516,13 +3437,7 @@ mod tests {
                 active: 1024,
                 connecting: 64,
                 connections: 11,
-                context_bytes: 8 << 20,
-                context_items: 4096,
-                note_turns: 48,
-                compact_at: 75,
-                compact_keep: 25,
             },
-            retain_turns: None,
             sessions: 0,
             background_failures: mpsc::unbounded_channel().0,
             limit_active: 1024,
@@ -3535,7 +3450,6 @@ mod tests {
             tokens: Arc::default(),
             wakes: Wakes::default(),
             draining: false,
-            approval_hold: Duration::from_secs(2),
             admissions: std::collections::VecDeque::new(),
             unpublished: std::collections::VecDeque::new(),
             reserved: 0,
@@ -3669,9 +3583,16 @@ mod tests {
                 })
                 .unwrap()
         };
+        // Bob keeps one turn's records.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE bots SET settings='{\"retain_turns\":1}' WHERE name='Bob'",
+                [],
+            )
+            .unwrap();
         refuse(true);
         let mut service = bare_service(&store);
-        service.retain_turns = Some(1);
         service.spawn("Bob".into(), last, None, false);
         finish_errors(&store, 2).await;
         let status = || {
@@ -3771,6 +3692,7 @@ mod tests {
                         compaction_model: None,
                         fallbacks: false,
                         gate: None,
+                        settings: Default::default(),
                     },
                 )?;
                 // No slot was free when it was accepted, so it queued.
@@ -3855,6 +3777,7 @@ mod tests {
                         compaction_model: None,
                         fallbacks: false,
                         gate: None,
+                        settings: Default::default(),
                     },
                 )
                 .map(|_| ())
@@ -4096,6 +4019,7 @@ mod tests {
             approve: None,
             approver: None,
             approve_expire_ms: None,
+            settings: Box::default(),
         }
     }
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -4623,6 +4547,7 @@ mod tests {
                             compaction_model: None,
                             fallbacks: false,
                             gate: Some(&gate),
+                            settings: Default::default(),
                         },
                     )?;
                     creator = Some(bot);
@@ -4899,6 +4824,7 @@ mod tests {
                         compaction_model: None,
                         fallbacks: false,
                         gate: Some(&gate),
+                        settings: Default::default(),
                     },
                 )?;
                 let turn = db

@@ -93,6 +93,9 @@ struct Options {
     judge_url: Option<String>,
     /// Daemon limits forwarded when this client starts the daemon.
     daemon_flags: Vec<(String, String)>,
+    /// A new bot's settings, as `create` takes them, and the flags that set them.
+    settings: serde_json::Map<String, Value>,
+    settings_flags: Vec<String>,
     positional: Vec<String>,
     /// The `--store` and `--socket` flags, shell-quoted, that reach this
     /// daemon from any shell; empty when both are the defaults.
@@ -150,6 +153,8 @@ fn parse(args: &[String]) -> Result<Options> {
             .filter(|judge| !judge.is_empty()),
         judge_url: None,
         daemon_flags: Vec::new(),
+        settings: serde_json::Map::new(),
+        settings_flags: Vec::new(),
         positional: Vec::new(),
         target: String::new(),
     };
@@ -260,27 +265,38 @@ fn parse(args: &[String]) -> Result<Options> {
                     | "--max-connecting"
                     | "--max-pending"
                     | "--max-pending-bytes"
-                    | "--max-output-tokens"
                     | "--stall-timeout"
-                    | "--keep-warm"
-                    | "--idle-exit"
-                    | "--context-bytes"
-                    | "--context-items"
-                    | "--note-turns"
-                    | "--compact-at"
-                    | "--compact-keep"
-                    | "--retain-turns"
-                    | "--approval-hold-ms" => {
+                    | "--idle-exit" => {
                         value.parse::<usize>().map_err(|_| {
                             Error::with("usage", format!("{flag} needs an integer"))
                         })?;
                         options.daemon_flags.push((flag.to_owned(), value));
                     }
+                    "--context-bytes"
+                    | "--context-items"
+                    | "--note-turns"
+                    | "--compact-at"
+                    | "--compact-keep"
+                    | "--retain-turns"
+                    | "--approval-hold-ms"
+                    | "--max-output-tokens"
+                    | "--keep-warm" => {
+                        let number = value.parse::<u64>().map_err(|_| {
+                            Error::with("usage", format!("{flag} needs an integer"))
+                        })?;
+                        // The daemon checks each setting's range.
+                        let key = flag.trim_start_matches("--").replace('-', "_");
+                        options.settings.insert(key, json!(number));
+                        options.settings_flags.push(flag.to_owned());
+                    }
                     "--cache-ttl" => {
                         if !matches!(value.as_str(), "5m" | "1h") {
                             return fail_with("usage", "--cache-ttl needs 5m or 1h");
                         }
-                        options.daemon_flags.push((flag.to_owned(), value));
+                        options
+                            .settings
+                            .insert("cache_ttl".to_owned(), json!(value));
+                        options.settings_flags.push(flag.to_owned());
                     }
                     "--budget-tokens" => {
                         options.budget_tokens = Some(value.parse().map_err(|_| {
@@ -390,7 +406,9 @@ impl Connection {
             ready: Value::Null,
         };
         connection.ready = connection.read_ready(deadline)?;
-        if connection.ready["event"] != "ready" {
+        if connection.ready["event"] != "ready"
+            || connection.ready["protocol"].as_u64() != Some(agent_client::PROTOCOL)
+        {
             return fail("daemon_protocol_mismatch");
         }
         Ok(connection)
@@ -521,15 +539,6 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
         }
     }
     for (flag, value) in &options.daemon_flags {
-        if flag == "--cache-ttl" {
-            let running = ready["limits"]["cache_ttl"].as_str().unwrap_or("no value");
-            if running != value {
-                differences.push(format!(
-                    "{flag}: requested {value} but daemon has {running}"
-                ));
-            }
-            continue;
-        }
         let key = match flag.as_str() {
             "--max-processes" => "processes",
             "--max-detached" => "detached",
@@ -537,32 +546,14 @@ fn check_daemon(options: &Options, ready: &Value) -> Result<()> {
             "--max-connecting" => "connecting",
             "--max-pending" => "pending",
             "--max-pending-bytes" => "pending_bytes",
-            "--max-output-tokens" => "output_tokens",
             "--stall-timeout" => "stall_timeout_seconds",
-            "--keep-warm" => "keep_warm_seconds",
             "--idle-exit" => "idle_exit_seconds",
-            "--context-bytes" => "context_bytes",
-            "--context-items" => "context_items",
-            "--note-turns" => "note_turns",
-            "--compact-at" => "compact_at",
-            "--compact-keep" => "compact_keep",
-            "--retain-turns" => "retain_turns",
-            "--approval-hold-ms" => "approval_hold_ms",
             _ => continue,
         };
         let running = &ready["limits"][key];
         let requested = value
             .parse::<u64>()
             .ok()
-            .map(|value| match flag.as_str() {
-                "--context-bytes" if value > 0 => {
-                    value.max(crate::server::MIN_CONTEXT_BYTES as u64)
-                }
-                "--context-items" if value > 0 => {
-                    value.max(crate::server::MIN_CONTEXT_ITEMS as u64)
-                }
-                _ => value,
-            })
             .filter(|value| flag != "--idle-exit" || *value != 0);
         if running.as_u64() != requested {
             differences.push(format!(
@@ -589,7 +580,13 @@ fn ensure_daemon(options: &Options) -> Result<Connection> {
             check_daemon(options, &connection.ready)?;
             Ok(Some(connection))
         }
-        Err(error) if error.code == "daemon_start_timeout" => Err(error),
+        // A daemon that answers with another protocol is running; starting
+        // a second one for the same socket would not replace it.
+        Err(error)
+            if error.code == "daemon_start_timeout" || error.code == "daemon_protocol_mismatch" =>
+        {
+            Err(error)
+        }
         Err(_) => Ok(None),
     };
     if let Some(connection) = connect()? {
@@ -1117,6 +1114,15 @@ fn run(options: &Options) -> Result<i32> {
             "--instructions and --agents set a new bot's instructions; an existing bot keeps its own",
         );
     }
+    if !created && !options.settings_flags.is_empty() {
+        return fail_with(
+            "usage",
+            format!(
+                "{} set a new bot's settings; an existing bot keeps its own",
+                options.settings_flags.join(", ")
+            ),
+        );
+    }
     let bot = options.bot.clone().unwrap_or_else(|| unique("bot"));
     if created {
         // The client chooses; the bot retains. Nothing about a bot comes
@@ -1143,7 +1149,8 @@ fn run(options: &Options) -> Result<i32> {
             "budget_tokens":options.budget_tokens,"tools":tools,
             "created_by":created_by,"created_by_id":created_by_id,
             "compaction_instructions":options.compaction_instructions,
-            "compaction_model":options.compaction_model,"fallbacks":options.fallbacks});
+            "compaction_model":options.compaction_model,"fallbacks":options.fallbacks,
+            "settings":options.settings});
         if let Value::Object(gate) = requested_gate(options, &tools)? {
             // Its approver first, so a missing judge leaves no bot behind.
             if gate.get("approver").is_some_and(|tag| tag == "auto") {

@@ -39,7 +39,7 @@ def poll(client, bot, turn):
 
 class Client:
     def __init__(self, binary, path, url, tools="echo", model="synthetic-model", key_env=None, env=None,
-                 provider="openai", family="responses", extra=()):
+                 provider="openai", family="responses", extra=(), settings=None):
         self.process = subprocess.Popen([str(binary), *serve_args(path, url, key_env, provider, family, extra)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True, env=env or clean_env(),
@@ -52,6 +52,7 @@ class Client:
         self.model = f'{provider}/{model}'
         self.instructions = 'Test agent.'
         self.tools = tools.split(',')
+        self.settings = settings
         def read():
             for line in self.process.stdout:
                 message = json.loads(line)
@@ -85,6 +86,8 @@ class Client:
             params.setdefault('model', self.model)
             params.setdefault('instructions', self.instructions)
             params.setdefault('tools', self.tools)
+            if self.settings:
+                params.setdefault('settings', self.settings)
         self.next_id += 1
         self.process.stdin.write(json.dumps({'id': self.next_id, 'op': op, **params}) + '\n')
         self.process.stdin.flush()

@@ -572,6 +572,31 @@ impl Provider {
         self
     }
 
+    /// This provider with one bot's output bound, cache lifetime and
+    /// keep-warm; borrowed, with no copy, when they are its own.
+    pub fn shaped(
+        &self,
+        max_output_tokens: Option<u32>,
+        keep_warm: Option<Duration>,
+        cache_hour: bool,
+    ) -> Result<std::borrow::Cow<'_, Self>> {
+        let cache_hour = cache_hour && self.family == Family::Anthropic;
+        if (max_output_tokens, keep_warm, cache_hour)
+            == (self.max_output_tokens, self.keep_warm, self.cache_hour)
+        {
+            return Ok(std::borrow::Cow::Borrowed(self));
+        }
+        let mut shaped = self
+            .clone()
+            .with_keep_warm(keep_warm)?
+            .with_cache_hour(cache_hour);
+        shaped.max_output_tokens = None;
+        if let Some(limit) = max_output_tokens {
+            shaped = shaped.with_max_output_tokens(limit)?;
+        }
+        Ok(std::borrow::Cow::Owned(shaped))
+    }
+
     /// How long a turn may sit on a tool before its prompt cache is refreshed
     /// with [`Provider::keep_warm`], or `None` where that does not apply.
     /// Anthropic's own API only: a request with `max_tokens: 0` generates
@@ -2165,6 +2190,42 @@ mod tests {
             .unwrap()
             .with_cache_hour(true);
         assert!(!responses.cache_hour);
+    }
+
+    /// A bot's own call settings shape a copy of the shared provider; one
+    /// that keeps the defaults borrows it.
+    #[test]
+    fn a_bot_shapes_its_own_copy_and_defaults_borrow_the_shared_provider() {
+        let transport = Transport::new(64, 1).unwrap();
+        let anthropic = Provider::new(
+            transport.clone(),
+            Family::Anthropic,
+            "https://api.anthropic.com/v1",
+            None,
+        )
+        .unwrap();
+        let same = anthropic.shaped(None, Some(KEEP_WARM), false).unwrap();
+        assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
+        let own = anthropic.shaped(Some(4096), None, true).unwrap();
+        assert_eq!(
+            (own.max_output_tokens, own.keep_warm, own.cache_hour),
+            (Some(4096), None, true)
+        );
+        assert_eq!(anthropic.anthropic_max_tokens("claude-sonnet-5"), 128_000);
+        assert_eq!(own.anthropic_max_tokens("claude-sonnet-5"), 4096);
+        // Its family's own rules still hold.
+        assert_eq!(
+            anthropic
+                .shaped(Some(1024), None, false)
+                .err()
+                .unwrap()
+                .code,
+            "invalid_output_token_limit"
+        );
+        // Responses keeps no cache lifetime, so an hour asks for nothing.
+        let responses = Provider::new(transport, Family::Responses, "https://h/v1", None).unwrap();
+        let hour = responses.shaped(None, Some(KEEP_WARM), true).unwrap();
+        assert!(matches!(hour, std::borrow::Cow::Borrowed(_)));
     }
 
     /// Only Anthropic's own API refreshes: the Responses cache outlives a

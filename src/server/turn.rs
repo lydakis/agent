@@ -16,7 +16,7 @@ use agent_runtime::{
     codec::split_model,
     fail,
     provider::{Chain, Delta, Items, Provider, Report, Request as ModelRequest, ToolCall},
-    store::{Bot, ContextPrefix, ContextUsage, Gated, Store, Strip, Waiting, Window},
+    store::{Bot, ContextPrefix, ContextUsage, Gated, Settings, Store, Strip, Waiting, Window},
     tools::{Outcome, Prepared, ReadSource, Registry},
 };
 use bytes::Bytes;
@@ -163,18 +163,12 @@ pub struct Turn {
     pub hub: Hub,
     pub handles: Handles,
     pub background_failures: mpsc::UnboundedSender<Error>,
-    pub context_bytes: usize,
-    pub context_items: usize,
-    /// Omitted turns the context note lists; zero for the bare count.
-    pub note_turns: usize,
-    /// Compaction threshold and verbatim tail, as percentages of the budget.
-    pub compact_at: usize,
-    pub compact_keep: usize,
+    /// The bot's context, compaction and approval settings, read with its
+    /// record when the turn's rounds begin.
+    pub settings: std::sync::OnceLock<Settings>,
     /// The park this task continues, already claimed by the service: record
     /// its wait results, then keep going.
     pub resumed: Option<Waiting>,
-    /// How long a gated call waits live for its verdict before the turn parks.
-    pub approval_hold: Duration,
     /// A steer for this bot may be queued. Set by the service, cleared by
     /// the boundary before it reads, so unrelated bots never pay for one
     /// bot's pending steer.
@@ -331,7 +325,6 @@ impl Finished {
         bot: &str,
         turn: i64,
         error: Option<&Error>,
-        keep: Option<usize>,
     ) -> Result<()> {
         let outcome = db.atomic(|db| {
             db.finish(turn, error)?;
@@ -341,14 +334,25 @@ impl Finished {
             // A later steer may already be terminal, placing this completion
             // outside retention: the outcome is captured above, and the
             // turn's own records are kept so its terminal event is published.
-            if let Some(keep) = keep {
-                db.prune_except(bot, keep, Some(turn))?;
-            }
+            db.retain(bot, Some(turn))?;
             Ok(outcome)
         })?;
         db.announce(bot, turn, outcome);
         Ok(())
     }
+}
+
+/// The provider as a bot's settings shape its calls: its output bound,
+/// cache lifetime and keep-warm. The bot's defaults borrow it unchanged.
+pub fn shaped<'p>(
+    provider: &'p Provider,
+    settings: &Settings,
+) -> Result<std::borrow::Cow<'p, Provider>> {
+    provider.shaped(
+        settings.max_output_tokens,
+        settings.keep_warm(),
+        settings.cache_hour(),
+    )
 }
 
 impl Turn {
@@ -478,8 +482,8 @@ impl Turn {
         window: &agent_runtime::store::Window,
         budget: usize,
     ) -> Result<ContextPrefix> {
-        let listed = if window.omitted_items > 0 && self.note_turns > 0 {
-            let (start, limit) = (window.ids[0], self.note_turns);
+        let listed = if window.omitted_items > 0 && self.settings().note_turns() > 0 {
+            let (start, limit) = (window.ids[0], self.settings().note_turns());
             self.store
                 .read("omitted_turns", move |db| db.omitted_turns(start, limit))
                 .await?
@@ -489,12 +493,19 @@ impl Turn {
         window.prefix(&listed, budget)
     }
 
+    /// The bot's settings. Every use is inside `rounds`, which reads them
+    /// with the bot's record before anything else.
+    fn settings(&self) -> &Settings {
+        self.settings
+            .get()
+            .expect("rounds read the bot's settings first")
+    }
     /// The configured envelope bounds input. Completion headroom is a soft
     /// compaction trigger, not a tax on every request's usable history.
     fn input_limit(&self) -> ContextUsage {
         ContextUsage {
-            bytes: self.context_bytes,
-            items: self.context_items,
+            bytes: self.settings().context_bytes(),
+            items: self.settings().context_items(),
         }
     }
 
@@ -502,9 +513,9 @@ impl Turn {
     async fn fitted_context(&self) -> Result<Context> {
         let context = self
             .context(
-                self.context_bytes,
-                self.context_items,
-                self.context_bytes * 2 / 3,
+                self.settings().context_bytes(),
+                self.settings().context_items(),
+                self.settings().context_bytes() * 2 / 3,
             )
             .await?;
         self.fit_context(context, self.input_limit()).await
@@ -512,8 +523,8 @@ impl Turn {
 
     async fn fit_context(&self, mut context: Context, limit: ContextUsage) -> Result<Context> {
         let mut raw = ContextUsage {
-            bytes: self.context_bytes,
-            items: self.context_items,
+            bytes: self.settings().context_bytes(),
+            items: self.settings().context_items(),
         };
         let mut prefix_budget = limit.bytes * 2 / 3;
         while !context.usage().fits(limit) {
@@ -536,7 +547,7 @@ impl Turn {
                     raw = next;
                     context = resized;
                 }
-                Err(error) if error.code == "context_limit" && self.note_turns > 0 => {
+                Err(error) if error.code == "context_limit" && self.settings().note_turns() > 0 => {
                     // Normal trimming needs no extra lookup. Only a current
                     // turn that cannot fit beside the previews needs its
                     // indexed minimum and a smaller optional listing.
@@ -712,7 +723,8 @@ impl Turn {
         let limit = self.input_limit();
         let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
         context.usage().bytes
-            >= (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
+            >= (self.settings().context_bytes() / 100 * self.settings().compact_at())
+                .min(limit.bytes - reserve)
     }
 
     /// Elision at a round boundary: tool results the model has answered,
@@ -729,10 +741,13 @@ impl Turn {
         let (keep, min_saving) = if forced {
             (0, 1)
         } else {
-            let keep = (self.context_bytes / 100 * self.compact_keep)
-                .min(limit.bytes.saturating_sub(prefix) * self.compact_keep / self.compact_at)
+            let keep = (self.settings().context_bytes() / 100 * self.settings().compact_keep())
+                .min(
+                    limit.bytes.saturating_sub(prefix) * self.settings().compact_keep()
+                        / self.settings().compact_at(),
+                )
                 .max(1);
-            (keep as i64, (self.context_bytes / 16) as i64)
+            (keep as i64, (self.settings().context_bytes() / 16) as i64)
         };
         let bot = self.bot.clone();
         let Some(plan) = self
@@ -794,21 +809,26 @@ impl Turn {
         let pressure = context.pressure();
         let limit = self.input_limit();
         let reserve = output_bytes.unwrap_or(0).min(limit.bytes / 4);
-        if pressure.bytes < (self.context_bytes / 100 * self.compact_at).min(limit.bytes - reserve)
-            && pressure.items < (self.context_items * self.compact_at / 100).min(limit.items)
+        if pressure.bytes
+            < (self.settings().context_bytes() / 100 * self.settings().compact_at())
+                .min(limit.bytes - reserve)
+            && pressure.items
+                < (self.settings().context_items() * self.settings().compact_at() / 100)
+                    .min(limit.items)
         {
             return Ok(Compaction::Skipped);
         }
-        let keep = (self.context_bytes / 100 * self.compact_keep)
+        let keep = (self.settings().context_bytes() / 100 * self.settings().compact_keep())
             .min(
-                limit.bytes.saturating_sub(context.prefix.bytes.len()) * self.compact_keep
-                    / self.compact_at,
+                limit.bytes.saturating_sub(context.prefix.bytes.len())
+                    * self.settings().compact_keep()
+                    / self.settings().compact_at(),
             )
             .max(1) as i64;
-        let keep_items = (self.context_items * self.compact_keep / 100)
+        let keep_items = (self.settings().context_items() * self.settings().compact_keep() / 100)
             .min(
-                limit.items.saturating_sub(context.prefix.items) * self.compact_keep
-                    / self.compact_at,
+                limit.items.saturating_sub(context.prefix.items) * self.settings().compact_keep()
+                    / self.settings().compact_at(),
             )
             .max(1) as i64;
         let ahead = Some(context.prefix.bytes.clone());
@@ -840,9 +860,9 @@ impl Turn {
         if let Compaction::Done = compaction {
             *context = self
                 .context(
-                    self.context_bytes,
-                    self.context_items,
-                    self.context_bytes * 2 / 3,
+                    self.settings().context_bytes(),
+                    self.settings().context_items(),
+                    self.settings().context_bytes() * 2 / 3,
                 )
                 .await?;
         }
@@ -966,7 +986,9 @@ impl Turn {
         // bot's family, as creation checked; a provider name can be bound to
         // another since.
         let summarizer = match self.providers.get(name) {
-            Some(provider) if provider.family() == record.family()? => provider,
+            Some(provider) if provider.family() == record.family()? => {
+                shaped(provider, self.settings())?
+            }
             found => {
                 let (error, detail) = match found {
                     None => ("provider_unavailable", name),
@@ -1078,7 +1100,7 @@ impl Turn {
             };
             let completion = match self
                 .call_with(
-                    summarizer,
+                    &summarizer,
                     model,
                     &instructions,
                     summary_tools,
@@ -1153,7 +1175,7 @@ impl Turn {
         };
         let bot = self.bot.clone();
         let billed = usage.clone();
-        let note_turns = self.note_turns;
+        let note_turns = self.settings().note_turns();
         let input_limit = self.input_limit();
         let request = choice.event();
         if let Err(error) = self
@@ -1271,7 +1293,10 @@ impl Turn {
     /// the call's did.
     async fn view_of(&self, call: &LastCall) -> Result<Option<(Context, bool)>> {
         let (bot, floor) = (self.bot.clone(), call.floor);
-        let (bytes, items) = (self.context_bytes as i64, self.context_items as i64);
+        let (bytes, items) = (
+            self.settings().context_bytes() as i64,
+            self.settings().context_items() as i64,
+        );
         let window = self
             .store
             .op("window", move |db| {
@@ -1305,7 +1330,10 @@ impl Turn {
                 items: *items,
                 required: ContextUsage::default(),
             },
-            None => self.prefix(&window, self.context_bytes * 2 / 3).await?,
+            None => {
+                self.prefix(&window, self.settings().context_bytes() * 2 / 3)
+                    .await?
+            }
         };
         let view = Context {
             window: Some(window),
@@ -1436,6 +1464,7 @@ impl Turn {
     async fn rounds(&self, accounting: &mut Accounting) -> Result<Round> {
         let (bot, turn) = (self.bot.clone(), self.turn);
         let mut record = self.store.op("inspect", move |db| db.inspect(&bot)).await?;
+        self.settings.get_or_init(|| record.settings);
         let context = self.store.op("context", move |db| db.context(turn)).await?;
         let (provider, model) = split_model(&context.model)?;
         let provider = self
@@ -1450,6 +1479,8 @@ impl Turn {
                 context.model.as_str(),
             ));
         }
+        let shaped = shaped(provider, self.settings())?;
+        let provider: &Provider = &shaped;
         let workspace = PathBuf::from(&context.workspace);
         // What this turn's children inherit: the CLI a bot runs to delegate
         // needs a model for the peer (its own by default), the bot's own name
@@ -1577,9 +1608,9 @@ impl Turn {
             let mut made_room = false;
             let mut context = match self
                 .context(
-                    self.context_bytes,
-                    self.context_items,
-                    self.context_bytes * 2 / 3,
+                    self.settings().context_bytes(),
+                    self.settings().context_items(),
+                    self.settings().context_bytes() * 2 / 3,
                 )
                 .await
             {
@@ -1633,9 +1664,9 @@ impl Turn {
                 made_room = true;
                 let elided = self
                     .context(
-                        self.context_bytes,
-                        self.context_items,
-                        self.context_bytes * 2 / 3,
+                        self.settings().context_bytes(),
+                        self.settings().context_items(),
+                        self.settings().context_bytes() * 2 / 3,
                     )
                     .await?;
                 let sent = std::mem::replace(&mut context, elided);
@@ -1887,7 +1918,11 @@ impl Turn {
             return Ok(false);
         }
         let (mut steered, mut stayed) = (false, false);
-        let (turn, bytes, items) = (self.turn, self.context_bytes, self.context_items);
+        let (turn, bytes, items) = (
+            self.turn,
+            self.settings().context_bytes(),
+            self.settings().context_items(),
+        );
         let mut through = None;
         loop {
             let absorbed = self
@@ -2583,7 +2618,8 @@ impl Turn {
         route: Option<&str>,
     ) -> Result<Approval> {
         let turn = self.turn;
-        let hold = tokio::time::Instant::now() + self.approval_hold;
+        let hold =
+            tokio::time::Instant::now() + Duration::from_millis(self.settings().approval_hold_ms());
         // Announced by this round's own commit, so any verdict comes later
         // and wakes this wait: check after waiting, not before. The gates'
         // expiry counts from that commit, however long the calls before
@@ -3414,6 +3450,7 @@ mod tests {
                             compaction_model: None,
                             fallbacks: false,
                             gate: None,
+                            settings: Default::default(),
                         },
                     )?;
                     let turn = db
@@ -3493,13 +3530,8 @@ mod tests {
             hub,
             handles: handles.clone(),
             background_failures: mpsc::unbounded_channel().0,
-            context_bytes: 8 << 20,
-            context_items: 4096,
-            note_turns: 48,
-            compact_at: 75,
-            compact_keep: 25,
+            settings: Default::default(),
             resumed: None,
-            approval_hold: Duration::from_secs(2),
             steers: Arc::new(AtomicBool::new(true)),
             tokens: Arc::default(),
             read_results: Default::default(),
