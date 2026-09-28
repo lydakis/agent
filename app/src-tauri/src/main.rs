@@ -750,12 +750,14 @@ async fn swarm_stop(state: State<'_, Shared>, swarm: String) -> Result<Value, St
 }
 
 #[tauri::command]
-fn swarm_board(
+async fn swarm_board(
     state: State<'_, Shared>,
     swarm: String,
     offset: Option<u64>,
 ) -> Result<Value, String> {
-    swarm::board(&swarms_of(&state)?, &swarm, offset)
+    let root = swarms_of(&state)?;
+    // It may wait on the board's lock to settle a change a crash cut short.
+    blocking(move || swarm::board(&root, &swarm, offset)).await
 }
 
 /// Your post, over the window's own connection.

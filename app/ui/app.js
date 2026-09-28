@@ -1335,7 +1335,8 @@ function streamsHTML(sw) {
   }).join('');
 }
 function renderSwarm(el, sw) {
-  const key = `${SWARM}${sw.name}|${sw.tab}|${sw.offset}|${sw.lines.length}|${sw.filter}|${sw.stateGen}`;
+  // Members and seats are in the key: one leaving changes the council and agents views, not the board.
+  const key = `${SWARM}${sw.name}|${sw.tab}|${sw.offset}|${sw.lines.length}|${sw.filter}|${sw.stateGen}|${sw.members.join(',')}|${sw.seats.join(',')}`;
   const fresh = el.dataset.who !== swarmKey(sw.name); el.dataset.who = swarmKey(sw.name);
   const atBottom = fresh || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   if (el.dataset.key !== key) {
