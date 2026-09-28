@@ -16,6 +16,7 @@ class CaskTest(unittest.TestCase):
         self.assertIn('  version "0.1.0"', cask)
         self.assertIn("/releases/download/v#{version}/Agent_#{version}_universal.zip", cask)
         self.assertIn('  app "Agent.app"', cask)
+        self.assertIn('  binary "#{appdir}/Agent.app/Contents/MacOS/agent"\n', cask)
         # The bundled daemon is stopped before its binary goes.
         self.assertIn('Agent.app/Contents/MacOS/agent",', cask)
         self.assertIn('args:         ["shutdown", "--store", "#{Dir.home}/.agent/state.sqlite", "--grace", "30"]', cask)

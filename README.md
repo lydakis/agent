@@ -168,8 +168,8 @@ window. On macOS, install it with [Homebrew](https://brew.sh):
 brew install --cask lydakis/agent/agent
 ```
 
-The app carries its own copy of the runtime and starts the daemon when none
-is running. See [desktop client](docs/APP.md) to build and run it from
+The app carries its own copy of the runtime, which the cask also puts on
+`PATH` as `agent`, and starts the daemon when none is running. See [desktop client](docs/APP.md) to build and run it from
 source.
 
 ## How fast is it?
