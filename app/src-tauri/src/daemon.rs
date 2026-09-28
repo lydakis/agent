@@ -380,6 +380,28 @@ mod tests {
         )));
     }
 
+    /// An executable written by a child process. Had this process written
+    /// it, another test's child could inherit the open file between its fork
+    /// and exec, and Linux refuses to run a file open for writing ("Text file
+    /// busy").
+    fn script(path: &Path, text: &str) {
+        use std::io::Write;
+        let _ = std::fs::remove_file(path);
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+    }
+
     #[tokio::test]
     async fn a_failed_start_reports_the_cli_reason_and_is_not_repeated_at_once() {
         let root = std::env::temp_dir().join(format!("agent-app-start-{}", std::process::id()));
@@ -387,16 +409,13 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let agent = root.join("agent");
         let calls = root.join("calls");
-        std::fs::write(
+        script(
             &agent,
-            format!(
+            &format!(
                 "#!/bin/sh\necho started >> '{}'\necho 'agent: usage: no provider' >&2\nexit 2\n",
                 calls.display()
             ),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut starts = Starts::default();
         let store = root.join("state.sqlite");
         let reason = "no_provider: connect a provider in Settings";
@@ -419,7 +438,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let agent = root.join("agent");
-        use std::os::unix::fs::PermissionsExt;
         let store = root.join("state.sqlite");
         for (said, stopped) in [
             ("", Ok(())),
@@ -429,12 +447,10 @@ mod tests {
                 Err("daemon_shutdown_timeout: 42".to_owned()),
             ),
         ] {
-            std::fs::write(
+            script(
                 &agent,
-                format!("#!/bin/sh\n[ \"$1 $2\" = 'shutdown --store' ] || exit 9\n{said}\n"),
-            )
-            .unwrap();
-            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+                &format!("#!/bin/sh\n[ \"$1 $2\" = 'shutdown --store' ] || exit 9\n{said}\n"),
+            );
             assert_eq!(stop(&agent, &store).await, stopped);
         }
         std::fs::remove_dir_all(root).unwrap();
