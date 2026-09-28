@@ -554,44 +554,59 @@ async fn worktree(trees: &Path, project: &Path, swarm: &str) -> Result<String, S
     }
     let prefix = String::from_utf8_lossy(&prefix.stdout).trim().to_owned();
     let tree = trees.join(swarm);
-    let branch = format!("agent/{swarm}");
+    let short = format!("agent/{swarm}");
+    let branch = format!("refs/heads/{short}");
     // Worktrees and branches are shared by every store: a name another
     // store's swarm holds is taken here too, and the page picks another.
     let exists = || format!("swarm_exists: {swarm} has a worktree or branch already");
-    let branched = git(&[
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        &format!("refs/heads/{branch}"),
-    ])
-    .output()
-    .await
-    .is_ok_and(|out| out.status.success());
-    if branched {
-        return Err(exists());
+    let head = git(&["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .await
+        .map_err(|e| format!("git: {e}"))?;
+    if !head.status.success() {
+        return Err(format!("worktree_failed: {}", tail(&head.stderr)));
     }
-    // The worktree's folder is made first, empty and alone: of two starts
-    // racing for one name, one makes it and the other hears the name is
-    // taken. What a failed add leaves behind is then this start's own.
+    let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    // The folder and then the branch are each made only where absent: of
+    // two starts, or a start and another git client, racing for one name,
+    // one makes it and the other hears the name is taken. What a failed
+    // add leaves behind is then this start's own to remove.
     std::fs::create_dir_all(trees).map_err(|e| format!("{}: {e}", trees.display()))?;
     match std::fs::create_dir(&tree) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists()),
         Err(e) => return Err(format!("{}: {e}", tree.display())),
     }
-    let added = git(&["worktree", "add", "-b", &branch])
+    let claimed = git(&["update-ref", &branch, &head, ""])
+        .output()
+        .await
+        .map_err(|e| format!("git: {e}"));
+    if !claimed.as_ref().is_ok_and(|out| out.status.success()) {
+        let _ = std::fs::remove_dir(&tree);
+        let taken = git(&["rev-parse", "--verify", "--quiet", &branch])
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success());
+        return Err(match claimed {
+            _ if taken => exists(),
+            Ok(out) => format!("worktree_failed: {}", tail(&out.stderr)),
+            Err(error) => error,
+        });
+    }
+    let added = git(&["worktree", "add"])
         .arg(&tree)
-        .arg("HEAD")
+        .arg(&short)
         .output()
         .await
         .map_err(|e| format!("git: {e}"));
     if !added.as_ref().is_ok_and(|out| out.status.success()) {
-        // A hook can fail after the worktree and branch were made.
+        // A hook can fail after the worktree was made. The branch goes only
+        // while it is still where this start put it.
         let _ = git(&["worktree", "remove", "--force"])
             .arg(&tree)
             .output()
             .await;
-        let _ = git(&["branch", "-D", &branch]).output().await;
+        let _ = git(&["update-ref", "-d", &branch, &head]).output().await;
         let _ = std::fs::remove_dir_all(&tree);
         return Err(match added {
             Ok(out) => format!("worktree_failed: {}", tail(&out.stderr)),
@@ -4494,6 +4509,23 @@ mod tests {
         let held = rt.block_on(worktree(&trees, &repo, "p.held")).unwrap_err();
         assert!(held.starts_with("swarm_exists"), "{held}");
         assert!(trees.join("p.held").exists());
+        // So does a branch another git client made, and it is left alone.
+        assert!(run(&["branch", "agent/p.theirs"]).status.success());
+        let theirs = rt
+            .block_on(worktree(&trees, &repo, "p.theirs"))
+            .unwrap_err();
+        assert!(theirs.starts_with("swarm_exists"), "{theirs}");
+        assert!(!trees.join("p.theirs").exists());
+        assert!(
+            run(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/agent/p.theirs"
+            ])
+            .status
+            .success()
+        );
         let made = rt.block_on(worktree(&trees, &repo, "p.fix")).unwrap();
         assert!(Path::new(&made).join(".git").exists());
         std::fs::remove_dir_all(home).unwrap();

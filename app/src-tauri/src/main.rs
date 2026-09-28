@@ -251,10 +251,13 @@ fn own_role(home: &std::path::Path, name: &str) -> Result<PathBuf, String> {
     }
     // Written whole beside it, then linked into place only if still absent:
     // a failed write leaves no half a role that later reads take for yours.
-    let temporary = dir.join(format!(".{name}.md.{}", std::process::id()));
+    // Each call writes its own file, so two at once never share one.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = dir.join(format!(".{name}.md.{}.{call}", std::process::id()));
     let made = (|| {
         use std::io::Write;
-        let mut file = std::fs::File::create(&temporary)?;
+        let mut file = std::fs::File::create_new(&temporary)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         match std::fs::hard_link(&temporary, &path) {
@@ -548,12 +551,25 @@ mod policy_tests {
                 .unwrap_err()
                 .starts_with("profile_not_found")
         );
-        // Nothing but the role is left beside it.
-        let names: Vec<_> = std::fs::read_dir(home.join(".agents/agents"))
+        // Many made at once each write their own file, and the role is whole.
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let home = home.clone();
+                std::thread::spawn(move || own_role(&home, "swarm"))
+            })
+            .collect();
+        for call in calls {
+            call.join().unwrap().unwrap();
+        }
+        let swarm = home.join(".agents/agents/swarm.md");
+        assert_eq!(std::fs::read_to_string(swarm).unwrap(), BUILT_IN[1].1);
+        // Nothing but the roles is left beside them.
+        let mut names: Vec<_> = std::fs::read_dir(home.join(".agents/agents"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["coordinator.md"]);
+        names.sort();
+        assert_eq!(names, ["coordinator.md", "swarm.md"]);
         std::fs::remove_dir_all(home).unwrap();
     }
 
