@@ -892,7 +892,7 @@ function seat(record, session) {
 let attaching = null, retryTimer = null;
 function retryAttach(delay = 2000) {
   clearTimeout(retryTimer);
-  retryTimer = setTimeout(() => { retryTimer = null; if (!S.attached) attach(); }, delay);
+  retryTimer = setTimeout(() => { retryTimer = null; if (!S.attached && !S.replacing) attach(); }, delay);
 }
 function attach() {
   if (!attaching) {
@@ -960,12 +960,28 @@ async function attachOnce() {
   }
 }
 // No provider to run: starting again cannot help until Settings changes, which attaches itself.
-function idle() { return /^no_provider/.test(S.lastReason ?? ''); }
+// Attaching again cannot help until something changes: a provider in Settings, or a newer app.
+function idle() { return /^no_provider/.test(S.lastReason ?? '') || olderDaemon(S.lastReason) === 'newer'; }
+// A daemon from before an upgrade still owns the socket: it speaks an older protocol, and the app can
+// stop it and start its own. One newer than the app is left alone.
+function olderDaemon(reason) {
+  // The app names the age by code, from what the daemon announced, not from the error's wording.
+  return /^daemon_older\b/.test(reason ?? '') ? 'older' : /^daemon_newer\b/.test(reason ?? '') ? 'newer' : null;
+}
 function showDetached(reason) {
   S.attached = false;
-  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${idle() ? 'waiting for a provider' : 'retrying'}</div><div style="margin-top:12px"><button type="button" class="sbtn" data-act="settings">Open Settings</button></div>`;
+  // Only a daemon this window starts for its store can be replaced; one on a socket it was given is
+  // stopped with its own agent, and the window attaches once it is gone.
+  const age = olderDaemon(reason), ours = !!Daemon.replaceDaemon && S.config?.managed !== false;
+  const settings = '<button type="button" class="sbtn" data-act="settings">Open Settings</button>';
+  const what = age === 'older' && ours ? `<div class="why">A daemon from before this update is still running.</div><div style="margin-top:12px"><button type="button" class="sbtn primary" data-act="replace-daemon">Restart the daemon</button> ${settings}</div><div class="hint">Turns it is running end as interrupted. Every chat is kept.</div>`
+    : age === 'older' ? `<div class="why">A daemon from before this update holds this socket, and this window did not start it: stop it with its own agent (agent shutdown), then start one from this update's agent. The window attaches when it answers.</div><div style="margin-top:12px">${settings}</div>`
+    : `${age === 'newer' ? '<div class="why">The daemon is newer than this app: update the app.</div>' : ''}<div style="margin-top:12px">${settings}</div>`;
+  const state = age === 'newer' ? 'stopped' : idle() ? 'waiting for a provider' : 'retrying';
+  $('detached').innerHTML = `<div><b>not attached</b></div><div>${esc(reason)}</div><div style="margin-top:8px">daemon at <span class="k">${esc(S.config?.socket ?? '?')}</span> · ${state}</div>${what}`;
   $('detached').classList.add('on');
   if (!idle()) retryAttach();
+  else { clearTimeout(retryTimer); retryTimer = null; }
 }
 function restore() {
   let saved = null; try { saved = JSON.parse(localStorage.getItem(sessionKey()) || 'null'); } catch (_) {}
@@ -2224,6 +2240,14 @@ async function act(el) {
     case 'swarm-filter': { const sw = swarmOf(S.selected); if (sw) { sw.filter = v || null; sw.tab = 'board'; render(); } return; }
     case 'swarm-decide': { const sw = swarmOf(S.selected), [id, yes] = v.split(':'); if (sw) await decide(sw, id, yes === 'yes'); return; }
     case 'settings': await openSetup(); return;
+    case 'replace-daemon': {
+      if (el.disabled) return;
+      // No reattach starts a daemon while the old one is still closing its store.
+      el.disabled = true; el.textContent = 'Restarting…'; S.replacing = true; clearTimeout(retryTimer);
+      try { await Daemon.replaceDaemon(); S.replacing = false; attach(); }
+      catch (e) { S.replacing = false; el.disabled = false; el.textContent = 'Restart the daemon'; toast(String(e?.message ?? e), 6000); retryAttach(); }
+      return;
+    }
     case 'setup-close': closeSetup(); return;
     case 'setup-add': setupState().adding = ''; renderSetup(); return;
     case 'setup-pick': setupState().adding = v; renderSetup(); $('setup').querySelector('#setupform input')?.focus(); return;

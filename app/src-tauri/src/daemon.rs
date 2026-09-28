@@ -95,6 +95,115 @@ pub async fn stop(agent: &Path, store: &Path) -> Result<(), String> {
     }
 }
 
+/// A protocol mismatch as the page acts on it: `daemon_older` when the
+/// daemon announced an older protocol than this app's, `daemon_newer` when
+/// it announced a newer one, from the error's facts rather than its text.
+pub fn age(error: &agent_client::Error) -> String {
+    let announced = (error.facts.as_ref())
+        .and_then(|facts| facts.get("protocol"))
+        .and_then(|p| p.as_u64());
+    match announced {
+        Some(p) if p < agent_client::PROTOCOL => format!(
+            "daemon_older: the daemon speaks protocol {p}, this app {}",
+            agent_client::PROTOCOL
+        ),
+        Some(p) if p > agent_client::PROTOCOL => format!(
+            "daemon_newer: the daemon speaks protocol {p}, this app {}; update the app",
+            agent_client::PROTOCOL
+        ),
+        _ => error.to_string(),
+    }
+}
+
+/// How long an older daemon gets to end its turns and close its store.
+const REPLACE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stop the daemon at `socket` when it speaks an older protocol than this
+/// app, as after an upgrade, so the next attach starts the bundled one. It
+/// gets SIGTERM, which every protocol honours: running turns end as
+/// interrupted and the store keeps every chat. A newer daemon is left alone,
+/// and so is one this app can already talk to.
+pub async fn replace_older(socket: &Path) -> Result<(), String> {
+    let facts = match agent_client::Client::connect(socket).await {
+        Ok((client, _events)) => {
+            client.close().await;
+            return Ok(());
+        }
+        Err(error) if error.code == "daemon_unavailable" => return Ok(()),
+        Err(error) if error.code == "daemon_protocol_mismatch" => error.facts.unwrap_or_default(),
+        Err(error) => return Err(error.to_string()),
+    };
+    // Only a daemon that greeted as one and says it is older is signalled; a
+    // listener that did not greet as a daemon fails to connect otherwise.
+    match facts.get("protocol").and_then(|p| p.as_u64()) {
+        Some(protocol) if protocol < agent_client::PROTOCOL => {}
+        protocol => {
+            return Err(format!(
+                "daemon_newer: the daemon speaks protocol {}, this app {}; update the app",
+                protocol.map_or("unknown".into(), |p| p.to_string()),
+                agent_client::PROTOCOL
+            ));
+        }
+    }
+    let pid = (facts.get("pid").and_then(|p| p.as_i64()))
+        .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+        .ok_or(
+            "daemon_pid_unknown: the daemon did not say its process; stop it with its own agent",
+        )?;
+    // SAFETY: a signal to the process the daemon named as itself.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "daemon_stop_failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let deadline = Instant::now() + REPLACE_TIMEOUT;
+    while running(pid) {
+        if Instant::now() > deadline {
+            return Err("daemon_stop_timeout: the older daemon did not exit".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// Whether a process is still there, as the CLI's shutdown waits on it: an
+/// exited one nobody has reaped yet (a zombie, where `/proc` says so) has
+/// closed its store and counts as gone.
+fn running(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only asks whether the process still exists.
+    let exists = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    exists && !exited(pid)
+}
+
+/// A process that exited but that its parent has not reaped yet: it has
+/// closed its store, so it counts as gone.
+#[cfg(target_os = "linux")]
+fn exited(pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, state)| state.starts_with('Z'))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn exited(pid: libc::pid_t) -> bool {
+    // SAFETY: plain data the kernel fills in, at most `size` bytes of it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is `size` bytes the call may write, and outlives it.
+    let got =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    got == size && info.pbi_status == libc::SZOMB
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn exited(_pid: libc::pid_t) -> bool {
+    false
+}
+
 /// The CLI's error line, `agent: CODE: DETAIL`.
 fn cli_reason(stderr: &[u8]) -> Option<String> {
     String::from_utf8_lossy(stderr)
@@ -284,6 +393,114 @@ fn parse_environment(stdout: &[u8]) -> Option<Vec<(OsString, OsString)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon at `socket` announcing `protocol` and a stand-in process as
+    /// its own; the returned channel says when that process has exited.
+    fn announcing(
+        socket: &Path,
+        protocol: u64,
+    ) -> (u32, std::sync::mpsc::Receiver<std::process::ExitStatus>) {
+        greeting(socket, "ready", protocol)
+    }
+
+    /// A listener whose first line is `event` with a protocol and a process.
+    fn greeting(
+        socket: &Path,
+        event: &'static str,
+        protocol: u64,
+    ) -> (u32, std::sync::mpsc::Receiver<std::process::ExitStatus>) {
+        use std::io::Write;
+        let mut process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = process.id();
+        let (exited, exit) = std::sync::mpsc::channel();
+        // Reaped as it exits, so it does not linger as a zombie.
+        std::thread::spawn(move || exited.send(process.wait().unwrap()));
+        let _ = std::fs::remove_file(socket);
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let ready = serde_json::json!({"event": event, "protocol": protocol, "pid": pid});
+                let _ = writeln!(stream, "{ready}");
+            }
+        });
+        (pid, exit)
+    }
+
+    #[test]
+    fn a_mismatch_is_aged_by_the_protocol_the_daemon_announced() {
+        let mismatch = |protocol: Option<u64>| {
+            let mut error = agent_client::Error::with("daemon_protocol_mismatch", "any wording");
+            error.facts = protocol
+                .map(|p| Box::new(serde_json::Map::from_iter([("protocol".into(), p.into())])));
+            age(&error)
+        };
+        let now = agent_client::PROTOCOL;
+        assert!(mismatch(Some(now - 1)).starts_with("daemon_older:"));
+        assert!(mismatch(Some(now + 1)).starts_with("daemon_newer:"));
+        assert!(mismatch(None).starts_with("daemon_protocol_mismatch"));
+    }
+
+    #[test]
+    fn an_older_daemon_is_stopped_and_a_newer_one_left_alone() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("agent-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("older.sock");
+        let (_, exit) = announcing(&older, agent_client::PROTOCOL - 1);
+        runtime.block_on(replace_older(&older)).unwrap();
+        assert!(exit.recv_timeout(Duration::from_secs(5)).is_ok());
+        let newer = dir.join("newer.sock");
+        let (pid, exit) = announcing(&newer, agent_client::PROTOCOL + 1);
+        let refused = runtime.block_on(replace_older(&newer)).unwrap_err();
+        assert!(refused.starts_with("daemon_newer"), "{refused}");
+        assert!(exit.recv_timeout(Duration::from_millis(200)).is_err());
+        // SAFETY: the stand-in this test started.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // A listener that did not greet as a daemon is not signalled, whatever
+        // protocol it names.
+        for protocol in [agent_client::PROTOCOL - 1, agent_client::PROTOCOL] {
+            let foreign = dir.join(format!("foreign-{protocol}.sock"));
+            let (pid, exit) = greeting(&foreign, "hello", protocol);
+            let refused = runtime.block_on(replace_older(&foreign)).unwrap_err();
+            assert!(refused.starts_with("daemon_greeting_invalid"), "{refused}");
+            assert!(exit.recv_timeout(Duration::from_millis(200)).is_err());
+            // SAFETY: the stand-in this test started.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+        // Nothing listening is nothing to replace.
+        runtime
+            .block_on(replace_older(&dir.join("none.sock")))
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An exited daemon its parent has not reaped has closed its store: the
+    /// wait for it ends rather than timing out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_daemon_nobody_reaped_is_gone() {
+        let mut process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = process.id() as libc::pid_t;
+        assert!(running(pid));
+        // SAFETY: the stand-in this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!running(pid), "a zombie counts as exited");
+        process.wait().unwrap();
+    }
 
     #[test]
     fn the_environment_is_read_after_whatever_the_profile_printed() {
