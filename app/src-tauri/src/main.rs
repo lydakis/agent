@@ -40,6 +40,8 @@ struct Shared {
     /// The attached session's notifications. `pull` takes the receiver out
     /// while it waits and puts it back, so an attach never waits on a pull.
     events: Mutex<SessionSlot<agent_client::Events>>,
+    /// The attached daemon's store identity, which names its swarms' folder.
+    store: std::sync::Mutex<Option<String>>,
 }
 
 /// Notifications handed to the page per pull. Small enough that the page
@@ -491,6 +493,7 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
         .request("follow", json!({"bot": "*", "after": after}))
         .await
         .map_err(|e| e.to_string())?;
+    *state.store.lock().unwrap() = client.store().map(str::to_owned);
     *state.client.lock().await = Some(client);
     state.events.lock().await.replace(session, events);
     Ok(json!({"session": session}))
@@ -533,9 +536,21 @@ fn swarms(state: State<'_, Shared>) -> Result<Value, String> {
     swarm::list(&swarms_of(&state)?)
 }
 
-/// The swarms of the daemon this window attaches to.
+/// The swarms of the store this window's daemon runs.
 fn swarms_of(state: &Shared) -> Result<PathBuf, String> {
-    swarm::root(&state.config.socket)
+    let store = state.store.lock().unwrap().clone();
+    swarm::root(&store.ok_or("detached: swarms are read once the window is attached")?)
+}
+
+/// A change to a swarm's files waits for its board's lock, which an agent's
+/// post holds while it sends; it waits on the blocking pool, never on the
+/// window's thread or the async workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// A new swarm in a project folder: its name taken, the place its agents
@@ -591,18 +606,24 @@ async fn swarm_create(
 /// Agents the daemon made, by name and bot id, and the tokens their
 /// budgets add to the swarm's.
 #[tauri::command]
-fn swarm_join(
+async fn swarm_join(
     state: State<'_, Shared>,
     swarm: String,
     members: Vec<(String, i64)>,
     added_budget: u64,
 ) -> Result<Value, String> {
-    swarm::join(&swarms_of(&state)?, &swarm, &members, added_budget)
+    let root = swarms_of(&state)?;
+    blocking(move || swarm::join(&root, &swarm, &members, added_budget)).await
 }
 
 #[tauri::command]
-fn swarm_leave(state: State<'_, Shared>, swarm: String, member: String) -> Result<Value, String> {
-    swarm::leave(&swarms_of(&state)?, &swarm, &member)
+async fn swarm_leave(
+    state: State<'_, Shared>,
+    swarm: String,
+    member: String,
+) -> Result<Value, String> {
+    let root = swarms_of(&state)?;
+    blocking(move || swarm::leave(&root, &swarm, &member)).await
 }
 
 #[tauri::command]
@@ -611,8 +632,13 @@ async fn swarm_discard(state: State<'_, Shared>, swarm: String) -> Result<(), St
 }
 
 #[tauri::command]
-fn swarm_stop(state: State<'_, Shared>, swarm: String, stopped: bool) -> Result<Value, String> {
-    swarm::set_stopped(&swarms_of(&state)?, &swarm, stopped)
+async fn swarm_stop(
+    state: State<'_, Shared>,
+    swarm: String,
+    stopped: bool,
+) -> Result<Value, String> {
+    let root = swarms_of(&state)?;
+    blocking(move || swarm::set_stopped(&root, &swarm, stopped)).await
 }
 
 #[tauri::command]
@@ -672,6 +698,7 @@ fn main() {
             starts: Mutex::new(daemon::Starts::default()),
             session: std::sync::atomic::AtomicU64::new(0),
             events: Mutex::new(SessionSlot::default()),
+            store: std::sync::Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             setup,

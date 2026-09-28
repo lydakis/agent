@@ -59,8 +59,7 @@ pub struct Swarm {
 impl Swarm {
     fn read(dir: &Path) -> Result<Self, String> {
         let path = dir.join("swarm.toml");
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = read_capped(&path, MAX_SETTINGS)?;
         let table: toml::Table = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -76,7 +75,7 @@ impl Swarm {
             .and_then(|n| n.to_str())
             .ok_or("swarm folder name is not UTF-8")?
             .to_owned();
-        Ok(Self {
+        let swarm = Self {
             name,
             project: text("project")?,
             goal: text("goal")?,
@@ -109,7 +108,12 @@ impl Swarm {
                 .get("stopped")
                 .and_then(toml::Value::as_bool)
                 .ok_or_else(|| format!("{}: stopped is missing", path.display()))?,
-        })
+        };
+        // Every member is pinned to its bot: a post never steers a name.
+        if !swarm.members.iter().all(|m| swarm.ids.contains_key(m)) {
+            return Err(format!("{}: a member has no bot id", path.display()));
+        }
+        Ok(swarm)
     }
 
     /// Replaced whole, through a rename, so a post never reads half a file.
@@ -167,8 +171,6 @@ pub fn home() -> Result<PathBuf, String> {
         .ok_or_else(|| "no HOME for ~/.agent/swarms".into())
 }
 
-/// The swarms of the daemon on `socket`. Their agents are that daemon's
-/// bots, so the same names in another store are other bots.
 /// Write `bytes` to `temporary`, then rename it over `path`, both synced:
 /// a reader sees the old file or the new one, and an acknowledged change
 /// survives a power loss.
@@ -192,18 +194,31 @@ fn replace(temporary: &Path, path: &Path, bytes: &[u8], mode: u32) -> Result<(),
     written.map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn root(socket: &Path) -> Result<PathBuf, String> {
-    Ok(home()?.join(daemon_key(socket)))
+/// The swarms of the store whose identity the attached daemon announced.
+/// Their agents are that store's bots, so a daemon on another store, even on
+/// the same socket, never sees them.
+pub fn root(store: &str) -> Result<PathBuf, String> {
+    if store.is_empty() || !store.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid_store: {store} is not a store identity"));
+    }
+    Ok(home()?.join(store))
 }
 
-/// FNV-1a over the socket's path: a stable folder name, not a secret.
-fn daemon_key(socket: &Path) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in socket.as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+/// Bounds a read of `swarm.toml`: a swarm's settings and its members, not
+/// a document.
+const MAX_SETTINGS: u64 = 1024 * 1024;
+
+/// A file read whole only when it is no larger than `max`.
+fn read_capped(path: &Path, max: u64) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut text = String::new();
+    file.take(max + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if text.len() as u64 > max {
+        return Err(format!("{}: larger than {max} bytes", path.display()));
     }
-    format!("{hash:016x}")
+    Ok(text)
 }
 
 /// A goal is a brief's heart, not a document: it leaves each agent's first
@@ -698,10 +713,23 @@ fn lock_board(dir: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 
+/// Synced before anyone is told, so a post an agent heard survives a power
+/// loss on the board too.
+/// `lock_board` from async code: the wait runs on the blocking pool, so a
+/// lock held across another post's sends never stalls the executor that
+/// post needs.
+async fn lock_board_async(dir: &Path) -> Result<std::fs::File, String> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || lock_board(&dir))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn append_to(board: &mut std::fs::File, line: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(line).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    board.write_all(&bytes).map_err(|e| e.to_string())
+    board.write_all(&bytes).map_err(|e| e.to_string())?;
+    board.sync_data().map_err(|e| e.to_string())
 }
 
 fn now_ms() -> u64 {
@@ -823,8 +851,9 @@ pub async fn post(
     let dir = folder(root, swarm)?;
     // Held until every steer is sent. Stop changes `swarm.toml` under this
     // lock, so it either comes first and this post is refused, or waits and
-    // then ends whatever turns this post started.
-    let mut board = lock_board(&dir)?;
+    // then ends whatever turns this post started. Waited for off the async
+    // workers, which the holder needs to finish its sends.
+    let mut board = lock_board_async(&dir).await?;
     let mut s = Swarm::read(&dir)?;
     if let Some(author) = &author {
         if s.ids.get(&author.bot) != Some(&author.id) {
@@ -846,8 +875,10 @@ pub async fn post(
         line["bot"] = json!(author.bot);
         line["turn"] = json!(author.turn);
     }
-    append_to(&mut board, &line)?;
+    // Who is working is asked before the post is written, so a post on the
+    // board is never reported as failed.
     let turns = running_turns(client, &s).await?;
+    append_to(&mut board, &line)?;
     let running = |m: &str| turns.iter().find(|(n, _)| n == m).and_then(|(_, t)| *t);
     let readers = readers(&s, author.as_ref().map(|a| a.bot.as_str()), text, &running);
     let prompt = format!("[board] {from}: {text}");
@@ -872,7 +903,10 @@ pub async fn post(
     }
     let (mut steered, mut woke, mut missed) = (Vec::new(), Vec::new(), Vec::new());
     while let Some(sent) = sends.join_next().await {
-        let (member, reach, result) = sent.map_err(|e| e.to_string())?;
+        let Ok((member, reach, result)) = sent else {
+            missed.push(json!({"agent": "?", "error": "a send ended without an answer"}));
+            continue;
+        };
         let short = s.short(&member).to_owned();
         match result {
             Ok(done) if reach == Reach::Wake && done["status"] != "steered" => woke.push(short),
@@ -1210,12 +1244,45 @@ mod tests {
     }
 
     #[test]
-    fn each_daemon_has_its_own_swarms() {
-        let a = root(Path::new("/tmp/agent-501/v1-a.sock")).unwrap();
-        let b = root(Path::new("/tmp/agent-501/v1-b.sock")).unwrap();
+    fn each_store_has_its_own_swarms() {
+        let a = root("0123456789abcdef0123456789abcdef").unwrap();
+        let b = root("fedcba9876543210fedcba9876543210").unwrap();
         assert_ne!(a, b);
         assert_eq!(a.parent(), b.parent());
-        assert_eq!(a, root(Path::new("/tmp/agent-501/v1-a.sock")).unwrap());
+        assert_eq!(a, root("0123456789abcdef0123456789abcdef").unwrap());
+        for bad in ["", "../x", "ab/cd"] {
+            assert!(root(bad).unwrap_err().starts_with("invalid_store"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn settings_reads_are_bounded() {
+        let root = scratch("capped");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("swarm.toml");
+        std::fs::write(&path, "x".repeat(9)).unwrap();
+        assert_eq!(read_capped(&path, 9).unwrap().len(), 9);
+        assert!(
+            read_capped(&path, 8)
+                .unwrap_err()
+                .contains("larger than 8 bytes")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_member_without_a_bot_id_is_refused() {
+        let root = scratch("unpinned");
+        let s = swarm(&[]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        join(&root, &s.name, &[("agent.latency-1".into(), 1)], 0).unwrap();
+        let path = dir.join("swarm.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"agent.latency-1\" = 1", "")).unwrap();
+        let err = Swarm::read(&dir).unwrap_err();
+        assert!(err.contains("a member has no bot id"), "{err}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -394,13 +394,14 @@ daemon learns nothing about projects; everything here is client work.
   its whole process group is killed, and its output is kept only to its
   last 64 KiB. A swarm whose files or policy cannot be made is removed with
   its worktree and branch.
-  The swarm is a folder, `~/.agent/swarms/DAEMON/PROJECT.NAME/`, where
-  DAEMON is a hash of the window's daemon socket, so a window on another
-  store sees only that store's swarms: `swarm.toml` (its project, goal,
-  folder, model, budget, members with each one's bot id, and whether you
-  stopped it; changed only under the board's lock, synced, and replaced
-  whole), `board.jsonl` (one post a line, appended under a lock, your goal
-  first), and `post`, a script that runs the app's own executable with
+  The swarm is a folder, `~/.agent/swarms/STORE/PROJECT.NAME/`, where
+  STORE is the store identity the daemon announces when a window attaches,
+  so a window sees only its store's swarms, whatever socket reaches it:
+  `swarm.toml` (its project, goal, folder, model, budget, members with each
+  one's bot id, and whether you stopped it; at most 1 MiB, read only when
+  every member has an id, changed only under the board's lock, synced, and
+  replaced whole), `board.jsonl` (one post a line, appended under a lock
+  and synced, your goal first), and `post`, a script that runs the app's own executable with
   `--swarm-post` (replaced whole when the app moves). Its agents
   are ordinary bots named `PROJECT.NAME-N`, each created with its share of
   the budget and started in the `swarm` profile (the folder's, the user's,
@@ -418,7 +419,8 @@ daemon learns nothing about projects; everything here is client work.
   only from a member, named by its shell's `AGENT_BOT`, `AGENT_BOT_ID` and
   `AGENT_TURN`; the daemon records it as each steer's author. Every steer
   names its member's bot id, so a bot deleted and made again under a
-  member's name is not a member and a post misses it; a deleted agent
+  member's name is not a member: a post misses it, and the app keeps it in
+  the sidebar and out of the swarm's cards and counts; a deleted agent
   leaves its swarm when the app sees it go. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
   in the sidebar. Its view has two tabs: **Board**, read from where the

@@ -285,7 +285,7 @@ function tree(all = false) {
     return visited;
   };
   // A swarm's agents, and whatever they made, are drawn in the swarm's own view, not here.
-  for (const sw of S.swarms.values()) for (const m of sw.members) { const b = bot(m); if (b && !seen.has(m)) { stack.push([b, 1, true, '', sw.project]); walk(true); } }
+  for (const sw of S.swarms.values()) for (const m of sw.members) { const b = memberBot(sw, m); if (b && !seen.has(m)) { stack.push([b, 1, true, '', sw.project]); walk(true); } }
   const swarmRows = (list, depth) => [...(list ?? [])].sort((a, c) => a.name.localeCompare(c.name)).map((sw) => ({ swarm: sw, key: swarmKey(sw.name), depth, prefix: depth ? '├ ' : '' }));
   for (const p of [...projects.keys()].sort()) {
     const lead = projects.get(p); seen.add(lead.name); lead.project = p;
@@ -320,6 +320,9 @@ const SWARM = '⁂';
 const swarmKey = (name) => SWARM + name;
 const swarmOf = (key) => (typeof key === 'string' && key.startsWith(SWARM) ? S.swarms.get(key.slice(SWARM.length)) ?? null : null);
 const isOpen = (key) => S.bots.has(key) || !!swarmOf(key);
+// A member is the bot the swarm pinned: another bot later given its name is not the swarm's.
+const memberBot = (sw, m) => { const b = bot(m); return b && b.id != null && b.id === sw.ids[m] ? b : null; };
+const swarmOfBot = (name) => { const sw = S.swarms.get(S.memberOf.get(name)); return sw && memberBot(sw, name) ? sw : null; };
 const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
 function learnSwarm(record, batch = false) {
@@ -344,7 +347,7 @@ async function loadSwarms() {
 // A swarm works while any agent works, waits while any waits, and is otherwise at rest.
 function swarmStatus(sw) {
   let out = 'idle';
-  for (const m of sw.members) { const st = bot(m)?.status; if (st === 'running') return 'running'; if (st === 'waiting' || st === 'paced') out = 'waiting'; }
+  for (const m of sw.members) { const st = memberBot(sw, m)?.status; if (st === 'running') return 'running'; if (st === 'waiting' || st === 'paced') out = 'waiting'; }
   return out;
 }
 const BOARD_LINES = 500;
@@ -779,7 +782,7 @@ async function loadBatch(name) {
 async function loadVisible() {
   // A swarm's agents show their last lines on its Agents tab, so the first dozen load.
   const sw = swarmOf(S.selected);
-  if (sw) { if (sw.tab === 'agents') for (const m of sw.members.slice(0, 12)) if (S.bots.has(m) && m !== S.ui.side) await load(m); }
+  if (sw) { if (sw.tab === 'agents') for (const m of sw.members.slice(0, 12)) if (memberBot(sw, m) && m !== S.ui.side) await load(m); }
   else await load(S.selected);
   if (S.ui.side && S.ui.side !== S.selected) await load(S.ui.side);
   // Cards on screen show their peer's last line, so those peers load too.
@@ -818,7 +821,7 @@ async function handle(ev, session, paint = true) {
   const terminal = await onEvent(ev);
   if (S.session !== session) return;
   if (FLEET_EVENTS.has(ev.event)) { S.botsGen += 1; if (SHAPE_EVENTS.has(ev.event)) S.shapeGen += 1; else if (ev.bot) patchRailRow(ev.bot); }
-  const sw = ev.bot && S.swarms.get(S.memberOf.get(ev.bot));
+  const sw = ev.bot && swarmOfBot(ev.bot);
   if (sw) { if (FLEET_EVENTS.has(ev.event)) patchRailRow(swarmKey(sw.name)); if (ev.durable !== false) boardSoon(sw, ev.event === 'turn_finished'); }
   if (ev.bot && S.bots.has(ev.bot)) bot(ev.bot).touched = session;
   // During replay nothing is fetched: a load per node-producing event would serialize a long history
@@ -1176,7 +1179,7 @@ function headHTML(b, pane) {
   const waiting = b.waitingOn.length ? ` on ${esc(waitSummary(b))}` : '';
   const state = `<span class="glyph ${b.status}">${glyphOf(b.status)}</span><span class="state">${labelOf(b.status)}${waiting}</span>`;
   if (pane === 'side') return `<div class="crumbs"><b>${esc(shortName(b))}</b>${branchHTML(b)}${state}</div><div class="tools">${moreButton(b.name)}<button type="button" class="ibtn" data-act="swap" title="Full view" aria-label="Full view">⤢</button><button type="button" class="ibtn" data-act="close-side" title="Close (Esc)" aria-label="Close">✕</button></div>`;
-  const lead = b.project ? bot(b.project + LEAD) : null, sw = S.swarms.get(S.memberOf.get(b.name));
+  const lead = b.project ? bot(b.project + LEAD) : null, sw = swarmOfBot(b.name);
   // A swarm's agent goes back to its swarm.
   const crumbs = sw ? `<button type="button" class="back" data-act="open" data-who="${esc(swarmKey(sw.name))}" title="Back to the swarm">← ⁂ ${esc(memberShort(sw, sw.name))}</button><span class="sep">/</span><b>${esc(shortName(b))}</b>`
     : !lead ? `<b>${esc(b.name)}</b>` : lead === b ? `<b>${esc(b.project)}</b>`
@@ -1234,7 +1237,7 @@ function renderComposer(pane, b, sw = null) {
 // two tabs. The Board is its posts; Agents are its agents as cards, which open beside.
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '')}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 function renderSwarmHead(el, sw) {
-  const working = sw.members.filter((m) => RUNNING.has(bot(m)?.status)).length;
+  const working = sw.members.filter((m) => RUNNING.has(memberBot(sw, m)?.status)).length;
   const key = `${SWARM}${sw.name}|${working}|${sw.members.length}|${sw.stopped}|${sw.used}|${sw.tab}`;
   if (el.dataset.k === key) return; el.dataset.k = key;
   const lead = bot(sw.project + LEAD), st = swarmStatus(sw);
@@ -1259,7 +1262,7 @@ function renderSwarm(el, sw) {
   if (el.dataset.key !== key) {
     el.dataset.key = key;
     if (sw.tab === 'agents') {
-      const cards = sw.members.map(taskCard).filter(Boolean);
+      const cards = sw.members.filter((m) => memberBot(sw, m)).map(taskCard);
       el.innerHTML = cards.length ? cards.map(cardHTML).join('') : '<div class="line note">no agents yet</div>';
     } else {
       el.innerHTML = sw.lines.length ? sw.lines.map((l) => postHTML(sw, l)).join('') : `<div class="line note">${sw.offset === null ? 'reading the board' : 'nothing posted yet'}</div>`;
@@ -1487,7 +1490,7 @@ function refreshMenu() {
 function botMenuItems(name) {
   const sw = swarmOf(name);
   if (sw) return [
-    { act: 'swarm-stop', who: name, label: 'Stop every agent', disabled: sw.stopped && !sw.members.some((m) => bot(m)?.runningTurn != null) },
+    { act: 'swarm-stop', who: name, label: 'Stop every agent', disabled: sw.stopped && !sw.members.some((m) => memberBot(sw, m)?.runningTurn != null) },
     { act: 'swarm-add', who: name, label: 'Add an agent' },
   ];
   const b = bot(name); if (!b) return [];

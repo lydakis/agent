@@ -1108,19 +1108,23 @@ test('a swarm is one row under its project; its agents and what they made stay i
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
   for (const [n, id] of [['app.latency-1', 3], ['app.latency-2', 4]]) p.upsert({ name: n, id, provider: 'alpha', model: 'one' });
   p.upsert({ name: 'app.latency-1-side', id: 5, provider: 'alpha', model: 'one', created_by: 'app.latency-1', created_by_id: 3 });
-  p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2']));
+  // A bot that took a member's name after the member was deleted is not the swarm's: it stays in the tree.
+  p.upsert({ name: 'app.latency-3', id: 9, provider: 'alpha', model: 'one' });
+  p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4, 'app.latency-3': 6 } }));
   // A swarm whose project is gone still has a row, among the bots in no project.
   p.learnSwarm({ ...swarmRecord([]), swarm: 'gone.x', project: 'gone' });
   const rows = p.tree();
-  assert.deepEqual(rowsOf(rows), ['app.lead', '⁂app.latency', 'app.build', 'bots', '⁂gone.x']);
-  assert.equal(rows[1].prefix, '├ '); assert.equal(rows[0].tasks, 2);
+  assert.deepEqual(rowsOf(rows), ['app.lead', '⁂app.latency', 'app.build', 'app.latency-3', 'bots', '⁂gone.x']);
+  assert.equal(rows[1].prefix, '├ '); assert.equal(rows[0].tasks, 3);
+  p.S.bots.get('app.latency-3').status = 'running';
+  assert.match(p.botRowHTML(rows[1], true), /glyph idle/, 'the stranger does not count as working');
   assert.equal(p.S.bots.get('app.latency-1-side').project, 'app');
   p.S.bots.get('app.latency-2').status = 'running';
   const html = p.botRowHTML(rows[1], true);
   assert.match(html, /data-bot="⁂app.latency"/); assert.match(html, /glyph running/); assert.match(html, /⁂ latency/);
   assert.match(html, /data-act="more" data-who="⁂app.latency"/);
   // With no tasks after it, the last swarm closes the branch; folded, the project hides it.
-  p.S.bots.delete('app.build'); p.S.shapeGen++;
+  p.S.bots.delete('app.build'); p.S.bots.delete('app.latency-3'); p.S.shapeGen++;
   assert.equal(p.tree()[1].prefix, '└ ');
   p.S.ui.folded.add('app');
   assert.deepEqual(rowsOf(p.tree()), ['app.lead', 'bots', '⁂gone.x']);
@@ -1183,7 +1187,7 @@ test('a member\'s durable event reads the board only while the swarm is on scree
   let reads = 0;
   const p = shell({ swarmBoard: async () => { reads++; return { lines: [], offset: 0, more: false }; }, request: async () => ({ bots: [], next_after: null }) });
   p.upsert({ name: 'app.latency-1', id: 3, provider: 'alpha', model: 'one' });
-  p.learnSwarm(swarmRecord(['app.latency-1']));
+  p.learnSwarm(swarmRecord(['app.latency-1'], { ids: { 'app.latency-1': 3 } }));
   p.S.selected = 'app.latency-1';
   await p.handle({ event: 'tool_completed', bot: 'app.latency-1', turn: 1, data: { call_id: 'c', node: 1 } }, 1, false);
   await p.tick(); assert.equal(reads, 0);
