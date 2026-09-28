@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML, brief };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1149,7 +1149,7 @@ test('a new swarm is made in the coordinator\'s folder, then its agents are crea
   // Agents that start together share the budget; it grows only for one added later.
   assert.equal(calls.find(([op]) => op === 'join')[2], 0);
   // Named from the goal, never a name a bot already starts with.
-  assert.deepEqual({ ...made }, { project: 'app', name: 'latency-2', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, model: 'alpha/one', budgetTokens: 3000000 });
+  assert.deepEqual({ ...made }, { project: 'app', name: 'latency-2', folder: '/synthetic/app', goal: 'Cut the p99 latency of agent run in half.', shared: true, model: 'alpha/one', budgetTokens: 3000000, council: 0 });
   assert.deepEqual(calls.find(([op]) => op === 'policy').slice(1), ['/w/app.latency', 'swarm']);
   const creates = calls.filter(([op]) => op === 'create').map(([, q]) => q);
   assert.deepEqual(creates.map((q) => [q.bot, q.workspace, q.budget_tokens, q.instructions]), [1, 2, 3].map((i) => [`app.latency-2-${i}`, '/w/app.latency', 1000000, 'swarm rules']));
@@ -1160,8 +1160,68 @@ test('a new swarm is made in the coordinator\'s folder, then its agents are crea
   const brief = calls[submits[0]][1].prompt;
   assert.match(brief, /^You are latency-2-1, one of 3 agents in the swarm latency-2, all working in this folder\.\nGoal: Halve p99\./);
   assert.match(brief, /Post: '\/home\/u\/.agent\/swarms\/app.latency\/post' TEXT/);
+  assert.match(brief, /Role: '\/home\/u\/.agent\/swarms\/app.latency\/role' ROLE/);
+  assert.doesNotMatch(brief, /propose|Council/);
   assert.match(brief, /The others: latency-2-2, latency-2-3$/);
   assert.equal(p.S.selected, '⁂app.latency-2');
+});
+
+test('a council swarm briefs its agents on proposing, voting and joining, and names the seats', () => {
+  const p = shell();
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-1', 'app.latency-2', 'app.latency-3'] }));
+  const seat = p.brief(sw, 'app.latency-2'), other = p.brief(sw, 'app.latency-4');
+  assert.match(seat, /Propose: '[^']+\/propose' STREAM WHY\nVote: '[^']+\/vote' ID yes\|no REASON\nJoin: '[^']+\/join' STREAM/);
+  assert.match(seat, /Council seats: latency-1, latency-2, latency-3 \(you hold one\)/);
+  assert.match(other, /Council seats: latency-1, latency-2, latency-3\n/);
+});
+
+test('the board shows roles, proposals, votes and decisions, and a stream tag filters it', async () => {
+  const decided = [];
+  const state = { roles: { 'latency-1': 'profiler' }, streams: { 'latency-4': 'conn-pool', 'latency-2': 'conn-pool' }, proposals: [
+    { id: 'P1', stream: 'conn-pool', why: 'Handshake is 61%.', by: 'latency-4', at: 1, votes: { 'latency-1': { yes: true, reason: 'measured' }, 'latency-2': { yes: true, reason: 'small' } }, status: 'approved', decided_by: 'council' },
+    { id: 'P2', stream: 'batch-commits', why: 'Commits are 22%.', by: 'latency-3', at: 2, votes: { 'latency-1': { yes: false, reason: 'pool first' } }, status: 'open', decided_by: null }] };
+  const lines = [
+    { from: 'latency-1', bot: 'app.latency-1', kind: 'role', role: 'profiler' },
+    { from: 'latency-4', bot: 'app.latency-4', kind: 'propose', id: 'P1', stream: 'conn-pool', text: 'Handshake is 61%.' },
+    { from: 'latency-1', bot: 'app.latency-1', kind: 'vote', id: 'P1', yes: true, text: 'measured' },
+    { from: 'council', kind: 'decision', id: 'P1', stream: 'conn-pool', approved: true, lead: 'latency-4' },
+    { from: 'latency-2', bot: 'app.latency-2', kind: 'join', stream: 'conn-pool' },
+    { from: 'latency-2', bot: 'app.latency-2', text: 'Pooled: p99 142 → 71 ms.', stream: 'conn-pool' },
+    { from: 'latency-3', bot: 'app.latency-3', text: 'Store tests pass.' }];
+  const p = shell({ swarmBoard: async () => ({ lines, offset: 99, more: false, state }), swarmDecide: async (swarm, id, approve) => { decided.push([swarm, id, approve]); return { decided: approve ? 'approved' : 'denied' }; }, request: async () => ({ bots: [], next_after: null }) });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2', 'app.latency-3', 'app.latency-4'], { council: 3, seats: ['app.latency-1', 'app.latency-2', 'app.latency-3'] }));
+  await p.readBoard(sw);
+  assert.equal(sw.state.proposals.length, 2);
+  const html = sw.lines.map((l) => p.postHTML(sw, l)).join('\n');
+  assert.match(html, /latency-1<\/button><span class="pt">is now <i>profiler<\/i>/);
+  assert.match(html, /proposes <b>P1<\/b> <button type="button" class="tag" data-act="swarm-filter" data-v="conn-pool">#conn-pool<\/button>: Handshake is 61%\. <span class="tally">approved<\/span>/);
+  assert.match(html, /votes <b>yes<\/b> on P1: measured/);
+  assert.match(html, /<span class="who council">council<\/span><span class="pt">P1 <button[^>]*>#conn-pool<\/button> approved · latency-4 leads it/);
+  assert.match(html, /joined <button[^>]*>#conn-pool/);
+  p.S.selected = '⁂app.latency';
+  const log = { dataset: {}, innerHTML: '', scrollHeight: 0, scrollTop: 0, clientHeight: 0, querySelectorAll: () => [] }, title = { dataset: {}, innerHTML: '' };
+  const act = async (v) => { await p.act({ dataset: v }); p.renderSwarmHead(title, sw); p.renderSwarm(log, sw); };
+  await act({ act: 'swarm-filter', v: 'conn-pool' });
+  assert.match(log.innerHTML, /Pooled: p99/); assert.doesNotMatch(log.innerHTML, /Store tests pass/);
+  assert.match(title.innerHTML, /#conn-pool ×/); assert.match(title.innerHTML, /Council <span class="count">1<\/span>/); assert.match(title.innerHTML, /Streams 1/);
+  await act({ act: 'swarm-filter', v: '' });
+  assert.match(log.innerHTML, /Store tests pass/);
+  await act({ act: 'swarm-tab', v: 'council' });
+  assert.match(log.innerHTML, /Seats: latency-1, latency-2, latency-3\. 2 of 3 decide/);
+  assert.match(log.innerHTML, /<b>P2<\/b>[\s\S]*0 yes · 1 no of 3[\s\S]*pool first[\s\S]*not yet[\s\S]*data-v="P2:yes">Approve/);
+  assert.doesNotMatch(log.innerHTML, /data-v="P1:yes"/, 'a decided proposal takes no decision');
+  await act({ act: 'swarm-decide', v: 'P2:no' });
+  assert.deepEqual(decided, [['app.latency', 'P2', false]]);
+  await act({ act: 'swarm-tab', v: 'streams' });
+  assert.match(log.innerHTML, /#conn-pool<\/button> <span class="dim">2 agents<\/span>/);
+  assert.match(log.innerHTML, /data-task="app.latency-4">latency-4 <span class="dim">lead<\/span>/);
+});
+
+test('a flat swarm has no Council or Streams tab', async () => {
+  const p = shell({ swarmBoard: async () => ({ lines: [], offset: 0, more: false }), request: async () => ({ bots: [], next_after: null }) });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1']));
+  const title = { dataset: {}, innerHTML: '' }; p.renderSwarmHead(title, sw);
+  assert.doesNotMatch(title.innerHTML, /Council|Streams/);
 });
 
 test('the board is read on, a tail read afresh replaces what was read, and the composer posts to it', async () => {
@@ -1287,6 +1347,28 @@ test('the demo daemon\'s swarm: agents post, working ones hear it, and an idle o
   const board = await d.swarmBoard('demo.latency', null);
   assert.deepEqual(Array.from(board.lines, (l) => l.from), ['user', 'user', 'latency-2']);
   assert.equal(board.lines[2].text, 'On it: look at fsync.');
+  d.close();
+});
+
+test('the demo daemon\'s council opens a stream by the seats\' majority and leaves a proposal for you', async () => {
+  const context = vm.createContext({ window: {}, setTimeout, clearTimeout, Math, JSON, Promise, Error, String, Set, Map, Infinity, Date, structuredClone });
+  vm.runInContext(fs.readFileSync(require.resolve('../ui/daemon.js'), 'utf8'), context);
+  const d = context.window.Daemon;
+  const sw = await d.swarmCreate({ project: 'demo', name: 'latency', folder: '/workspace', goal: 'Halve p99.', shared: true, model: 'alpha/one', budgetTokens: 1000, council: 3 });
+  assert.deepEqual([sw.council, sw.seats.length], [3, 0]);
+  const names = [1, 2, 3, 4].map((i) => `demo.latency-${i}`);
+  for (const n of names) await d.request('create', { bot: n, model: 'alpha/one' });
+  assert.deepEqual(Array.from((await d.swarmJoin('demo.latency', names.map((n, i) => [n, i + 1]))).seats), names.slice(0, 3));
+  for (const n of names) await d.request('submit', { bot: n, prompt: 'You are one of them.', delivery: 'reject' });
+  const done = new Set();
+  while (done.size < 4) for (const e of (await d.pull()).events) if (e.event === 'turn_finished') done.add(e.bot);
+  const { state, lines } = await d.swarmBoard('demo.latency', null);
+  assert.deepEqual(state.proposals.map((p) => [p.id, p.stream, p.status]), [['P1', 'conn-pool', 'approved'], ['P2', 'batch-commits', 'open']]);
+  assert.deepEqual({ ...state.streams }, { 'latency-1': 'conn-pool', 'latency-2': 'conn-pool', 'latency-4': 'conn-pool' });
+  assert.ok(lines.some((l) => l.kind === 'decision' && l.from === 'council'));
+  assert.ok(lines.some((l) => l.stream === 'conn-pool' && !l.kind), 'a stream member posts to its stream');
+  await d.swarmDecide('demo.latency', 'P2', true);
+  assert.equal((await d.swarmBoard('demo.latency', null)).state.proposals[1].status, 'approved');
   d.close();
 });
 

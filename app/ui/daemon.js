@@ -25,13 +25,14 @@ window.Daemon = (() => {
       pull: (session) => invoke('pull', { session }),
       request: (op, params = {}) => invoke('request', { op, params }),
       swarms: () => invoke('swarms'),
-      swarmCreate: ({ project, name, folder, goal, shared, model, budgetTokens }) => invoke('swarm_create', { project, name, folder, goal, shared, model, budgetTokens }),
+      swarmCreate: ({ project, name, folder, goal, shared, model, budgetTokens, council }) => invoke('swarm_create', { project, name, folder, goal, shared, model, budgetTokens, council: council ?? 0 }),
       swarmJoin: (swarm, members, addedBudget = 0) => invoke('swarm_join', { swarm, members, addedBudget }),
       swarmLeave: (swarm, member) => invoke('swarm_leave', { swarm, member }),
       swarmDiscard: (swarm) => invoke('swarm_discard', { swarm }),
       swarmStop: (swarm, stopped) => invoke('swarm_stop', { swarm, stopped }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
       swarmPost: (swarm, text) => invoke('swarm_post', { swarm, text }),
+      swarmDecide: (swarm, id, approve, reason) => invoke('swarm_decide', { swarm, id, approve, reason: reason ?? '' }),
       close: () => tauri.window.getCurrentWindow().close(),
     };
   }
@@ -251,7 +252,27 @@ window.Daemon = (() => {
   // The app's swarm folder, kept in memory: its record and its board. The offset is a line count.
   const memberOf = (name) => [...S.swarms.values()].find((sw) => sw.members.includes(name)) ?? null;
   const short = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
-  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, model: sw.model, budget_tokens: sw.budget, members: [...sw.members], ids: { ...sw.ids }, stopped: sw.stopped });
+  const seats = (sw) => sw.members.slice(0, sw.council);
+  const swarmRecord = (sw) => ({ swarm: sw.name, dir: sw.dir, project: sw.project, goal: sw.goal, workspace: sw.workspace, model: sw.model, budget_tokens: sw.budget, members: [...sw.members], ids: { ...sw.ids }, stopped: sw.stopped, council: sw.council, seats: seats(sw) });
+  // The board's roles, proposals and streams, by the app's rules: a majority of the seats decides, you
+  // decide alone, and an approved proposal opens its stream with its proposer in it.
+  function councilAct(sw, from, act) {
+    const st = sw.state, line = { at: Date.now(), from };
+    if (act.role) { st.roles[from] = act.role; return [{ ...line, kind: 'role', role: act.role }]; }
+    if (act.join) { st.streams[from] = act.join; return [{ ...line, kind: 'join', stream: act.join }]; }
+    if (act.propose) { const id = `P${st.proposals.length + 1}`; st.proposals.push({ id, stream: act.propose, why: act.why, by: from, at: line.at, votes: {}, status: 'open', decided_by: null }); return [{ ...line, kind: 'propose', id, stream: act.propose, text: act.why }]; }
+    const p = st.proposals.find((x) => x.id === act.vote); if (!p || p.status !== 'open') throw new Error(`decided: ${act.vote}`);
+    p.votes[from] = { yes: act.yes, reason: act.reason ?? '' };
+    const n = seats(sw).length, need = Math.floor(n / 2) + 1, ayes = Object.values(p.votes).filter((v) => v.yes).length, noes = Object.keys(p.votes).length - ayes;
+    const decided = from === 'user' ? act.yes : ayes >= need ? true : n - noes < need ? false : null;
+    const out = [{ ...line, kind: 'vote', id: p.id, yes: act.yes, text: act.reason ?? '' }];
+    if (decided !== null) {
+      p.status = decided ? 'approved' : 'denied'; p.decided_by = from === 'user' ? 'user' : 'council';
+      if (decided) st.streams[p.by] = p.stream;
+      out.push({ at: line.at, from: p.decided_by, kind: 'decision', id: p.id, stream: p.stream, approved: decided, lead: p.by });
+    }
+    return out;
+  }
   // Who hears a post, as the app's post tool decides: working agents, and idle ones only when named
   // (or, for your post, when it names nobody).
   function deliver(sw, from, text) {
@@ -264,15 +285,26 @@ window.Daemon = (() => {
       else if (isNamed || (!from && !named.length)) reply(m, prompt);
     }
   }
-  async function agentPost(sw, name, turn, text) {
+  async function agentPost(sw, name, turn, text, stream) {
     const b = S.bots.get(name) ?? GONE; if (b.interrupted || sw.stopped) return;
     const call_id = `call_${++calls}`;
     emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: `"$SWARM/post" ${JSON.stringify(text.length > 40 ? text.slice(0, 39) + '…' : text)}` }), arguments_truncated: false } });
     await wait(200);
-    sw.board.push({ at: Date.now(), from: short(sw, name), bot: name, turn, text });
+    sw.board.push({ at: Date.now(), from: short(sw, name), bot: name, turn, text, ...(stream ? { stream } : {}) });
     b.tokens_used += 4000;
     emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stdout: '{"posted":true}\n', stderr: '', success: true }) }), artifacts: [] } });
     deliver(sw, name, text);
+    await steerIn(name, turn);
+  }
+  // An agent's role, proposal, vote or join, run as its script.
+  async function agentAct(sw, name, turn, script, args, act) {
+    const b = S.bots.get(name) ?? GONE; if (b.interrupted || sw.stopped) return;
+    const call_id = `call_${++calls}`;
+    emit({ event: 'tool_started', bot: name, turn, data: { call_id, name: 'shell', arguments: JSON.stringify({ command: `"$SWARM/${script}" ${args}` }), arguments_truncated: false } });
+    await wait(200);
+    sw.board.push(...councilAct(sw, short(sw, name), act).map((l) => (l.from === 'council' ? l : { ...l, bot: name, turn })));
+    b.tokens_used += 3000;
+    emit({ event: 'tool_completed', bot: name, turn, data: { call_id, node: node({ type: 'function_call_output', call_id, output: JSON.stringify({ exit_code: 0, stdout: '{"posted":true}\n', stderr: '', success: true }) }), artifacts: [] } });
     await steerIn(name, turn);
   }
   // Four scripted roles; `@N` names the swarm's Nth agent.
@@ -282,14 +314,26 @@ window.Daemon = (() => {
     [['wait', 1200], ['post', 'Taking one store commit per model round. Editing src/store/db.rs.'], ['edit', 'src/store/db.rs', '+48 −21', 1900], ['shell', 'cargo test -p agent-runtime store', 'test result: ok. 64 passed; 0 failed', 1300], ['post', 'Batched commits are in; the 64 store tests pass.']],
     [['wait', 1800], ['read', 'board.jsonl'], ['post', 'Keeping cargo test green: I will run the suite as changes land.'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 2200], ['post', 'Full suite after both changes: 212 passed.']],
   ];
+  // With a council: roles, two proposals, the seats' votes, and a stream the first one opens. The
+  // second waits on its last seat, so you can approve or deny it.
+  const COUNCIL = [
+    [['role', 'profiler'], ['shell', 'python3 bench/latency.py --runs 200', 'p99 142 ms · p50 61 ms', 1300], ['post', 'Profile: 61% of p99 is the TLS handshake and first byte, 22% store commits.'], ['propose', 'conn-pool', 'Pool provider connections: the handshake is 61% of p99.'], ['wait', 2600], ['vote', 'batch-commits', false, 'Commits are 22%; take the pool first and measure again.']],
+    [['wait', 900], ['role', 'provider sockets'], ['wait', 2400], ['vote', 'conn-pool', true, 'The profile shows it, and the change is local to socket.rs.'], ['wait', 900], ['join', 'conn-pool'], ['edit', 'src/provider/socket.rs', '+36 −12', 1500], ['post', 'Pooled connections: p99 142 → 71 ms on bench/latency.py.']],
+    [['wait', 1400], ['role', 'store'], ['wait', 900], ['propose', 'batch-commits', 'One store commit per model round: commits are 22% of p99.'], ['wait', 700], ['vote', 'conn-pool', true, 'Measured and small.']],
+    [['wait', 1900], ['role', 'keeps cargo test green'], ['read', 'board.jsonl'], ['wait', 2600], ['join', 'conn-pool'], ['shell', 'cargo test', 'test result: ok. 212 passed; 0 failed', 1800], ['post', 'Full suite with the pool: 212 passed.']],
+  ];
   async function member(sw, name, turn) {
-    const i = sw.members.indexOf(name), mine = ROLES[i % ROLES.length], b = S.bots.get(name);
+    const i = sw.members.indexOf(name), mine = (sw.council ? COUNCIL : ROLES)[i % ROLES.length], b = S.bots.get(name);
     const base = short(sw, sw.members[0]).replace(/-\d+$/, '');
     await think(name, turn, 'Read the goal and the board first, then take a piece nobody holds.');
     for (const [op, ...a] of mine) {
       if (b.interrupted) return;
       if (op === 'wait') await wait(a[0]);
-      else if (op === 'post') await agentPost(sw, name, turn, a[0].replace(/@(\d)/g, (_, n) => `@${base}-${n}`));
+      else if (op === 'post') await agentPost(sw, name, turn, a[0].replace(/@(\d)/g, (_, n) => `@${base}-${n}`), sw.state.streams[short(sw, name)]);
+      else if (op === 'role') await agentAct(sw, name, turn, 'role', JSON.stringify(a[0]), { role: a[0] });
+      else if (op === 'propose') await agentAct(sw, name, turn, 'propose', `${a[0]} ${JSON.stringify(a[1].slice(0, 30) + '…')}`, { propose: a[0], why: a[1] });
+      else if (op === 'vote') { const id = sw.state.proposals.find((x) => x.stream === a[0])?.id ?? '?'; await agentAct(sw, name, turn, 'vote', `${id} ${a[1] ? 'yes' : 'no'} …`, { vote: id, yes: a[1], reason: a[2] }).catch(() => {}); }
+      else if (op === 'join') await agentAct(sw, name, turn, 'join', a[0], { join: a[0] });
       else if (op === 'read') await tool(name, turn, 'read', { path: `${sw.dir}/${a[0]}` }, `${sw.board.length} posts`, 400);
       else if (op === 'edit') await tool(name, turn, 'edit', { path: a[0] }, a[1], a[2]);
       else await tool(name, turn, 'shell', { command: a[0] }, JSON.stringify({ exit_code: 0, stderr: '', stdout: a[1] + '\n', success: true }), a[2]);
@@ -317,16 +361,17 @@ window.Daemon = (() => {
     // A coordinator puts a task that edits in `~/.agent/worktrees/NAME` on branch agent/NAME.
     branch: async (dir) => { const m = /\/worktrees\/([^/]+)$/.exec(dir ?? ''); return m ? `agent/${m[1]}` : null; },
     swarms: async () => ({ swarms: [...S.swarms.values()].map(swarmRecord), broken: [] }),
-    swarmCreate: async ({ project, name, folder, goal, shared, model, budgetTokens }) => {
+    swarmCreate: async ({ project, name, folder, goal, shared, model, budgetTokens, council = 0 }) => {
       const full = `${project}.${name}`; if (S.swarms.has(full)) throw new Error(`swarm_exists: ${full}`);
-      const sw = { name: full, project, goal, model, budget: budgetTokens, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
+      const sw = { name: full, project, goal, model, budget: budgetTokens, council, state: { roles: {}, streams: {}, proposals: [] }, dir: `~/.agent/swarms/${full}`, workspace: shared ? `~/.agent/worktrees/${full}` : folder, members: [], ids: {}, stopped: false, board: [{ at: Date.now(), from: 'user', text: goal }] };
       S.swarms.set(full, sw); await wait(300); return swarmRecord(sw);
     },
     swarmJoin: async (swarm, members, addedBudget = 0) => { const sw = S.swarms.get(swarm); for (const [m, id] of members) { if (!sw.members.includes(m)) sw.members.push(m); sw.ids[m] = id; } sw.budget += addedBudget; return swarmRecord(sw); },
     swarmLeave: async (swarm, member) => { const sw = S.swarms.get(swarm); sw.members = sw.members.filter((m) => m !== member); delete sw.ids[member]; return swarmRecord(sw); },
     swarmDiscard: async (swarm) => { if (S.swarms.get(swarm)?.members.length) throw new Error(`swarm_has_agents: ${swarm}`); S.swarms.delete(swarm); },
     swarmStop: async (swarm, stopped) => { const sw = S.swarms.get(swarm); sw.stopped = stopped; return swarmRecord(sw); },
-    swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false, reset: offset == null }; },
+    swarmBoard: async (swarm, offset) => { const sw = S.swarms.get(swarm); const from = offset ?? Math.max(0, sw.board.length - 500); return { lines: sw.board.slice(from), offset: sw.board.length, more: false, reset: offset == null, state: JSON.parse(JSON.stringify(sw.state)) }; },
+    swarmDecide: async (swarm, id, approve) => { const sw = S.swarms.get(swarm); const lines = councilAct(sw, 'user', { vote: id, yes: approve }); sw.board.push(...lines); return { posted: true, id, decided: approve ? 'approved' : 'denied', steered: [], woke: [], missed: [] }; },
     swarmPost: async (swarm, text) => {
       const sw = S.swarms.get(swarm); sw.stopped = false; sw.board.push({ at: Date.now(), from: 'user', text });
       const busy = sw.members.filter((m) => S.bots.get(m)?.status !== 'idle');

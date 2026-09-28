@@ -75,7 +75,8 @@ says why beside those that answered.
 ![Settings with one provider failing](app/settings.png)
 
 A project's ⋯ menu starts a swarm: a goal, how many agents, their model,
-where they work, and the tokens they share. Captured 2026-09-28.
+where they work, the tokens they share, and how they organize: one board, or
+a council of three that approves streams of work. Captured 2026-09-28.
 
 ![The new swarm sheet](app/new-swarm.png)
 
@@ -92,6 +93,20 @@ Your post naming `@latency-3` woke that agent alone; clicking a name opens
 the agent beside, with the board's posts it heard.
 
 ![An agent beside the board](app/swarm-beside.png)
+
+With a council, the board also carries roles, proposals, the seats' votes and
+their decisions; a post in a stream wears its tag, which filters the board.
+
+![A council swarm's board](app/swarm-council-board.png)
+
+The Council tab: each open proposal with its votes so far, which you can
+approve or deny yourself, then the ones decided.
+
+![The council](app/swarm-council.png)
+
+Streams: the approved proposals, each with its lead and the agents in it.
+
+![Streams](app/swarm-streams.png)
 
 ## What the daemon speaks, and why the client speaks it directly
 
@@ -400,14 +415,19 @@ daemon learns nothing about projects; everything here is client work.
   `swarm.toml` (its project, goal, folder, model, budget, members with each
   one's bot id, and whether you stopped it; at most 1 MiB, read only when
   every member has an id, changed only under the board's lock, synced, and
-  replaced whole), `board.jsonl` (one post a line, appended under a lock
-  and synced, your goal first), and `post`, a script that runs the app's own executable with
-  `--swarm-post` (replaced whole when the app moves). Its agents
+  replaced whole), `board.jsonl` (one line a post or act, appended under a
+  lock and synced, your goal first), `state.json` (what the board adds up
+  to: roles, proposals with their votes, who is in which stream; rewritten
+  under the board's lock with each line that changes it), and scripts that
+  run the app's own executable with `--swarm-post`: `post` and `role`, and
+  with a council `propose`, `vote` and `join` (replaced whole when the app
+  moves). Its agents
   are ordinary bots named `PROJECT.NAME-N`, each created with its share of
   the budget and started in the `swarm` profile (the folder's, the user's,
   or the one the app ships, [swarm.md](../app/agents/swarm.md)); each joins
   the swarm once created, and then gets a first message naming it, the
-  goal, the others and the board's two paths. A post is written to the board, then
+  goal, the others, the board and its scripts (and, with a council, the
+  seats). A post is written to the board, then
   steered into the agents it reaches over one daemon connection: an
   agent's post reaches the agents working now, strictly into their running
   turns (a turn that ended meanwhile is skipped; the post waits on the
@@ -433,10 +453,25 @@ daemon learns nothing about projects; everything here is client work.
   the bot that joined; a name now held by another bot leaves instead; and
   the swarm refuses its agents' posts until your next one) or adds one,
   told to read the board first, whose share of tokens the swarm's budget
-  grows by.
+  grows by. Any agent says what it is doing with
+  `role ROLE`, shown on the board and on its card.
+- **Swarm councils.** The sheet's "Organized as" picks one board (every
+  agent takes a piece) or a council of 3. With a council, the seats are the
+  swarm's first three agents. An agent proposes a stream of work with
+  `propose STREAM WHY`, which wakes the other seats; a seat votes with
+  `vote ID yes|no REASON`, once. A majority of the seats (2 of 3) approves or
+  denies; an approved proposal opens its stream with the proposer as lead
+  and in it, and wakes the proposer while the working agents hear it; a
+  denied one wakes only the proposer. You decide any open proposal alone
+  from the **Council** tab. `join STREAM` puts an agent in an approved
+  stream (one at a time). An agent in a stream posts to that stream: the
+  post carries its tag and reaches the stream's working agents and whoever
+  it names; `post --all` reaches everyone. Your posts reach everyone. The
+  head gains **Council**, with the open count, and **Streams**, the approved
+  ones with their lead and agents and their roles; a tag filters the board.
 - **Not built yet.** Keep, which turns a side chat into a task, removing a
-  deleted task's worktree, a swarm's roles, council and streams, and
-  approvals are later steps of item 47.
+  deleted task's worktree, deleting a swarm, and approvals are later steps
+  of item 47.
 
 `python3 app/playground.py` starts a daemon on a synthetic streaming model
 and opens the app on it; prompt prefixes (`shell:`, `bg:`, `delegate:`,
@@ -544,7 +579,12 @@ Chromium: its agents posted, a post naming one woke it alone, and an agent
 opened beside from the board, with no page errors. The post tool itself runs
 against a real daemon in `tests/test_swarm.py`: an agent's post reaches the
 agent working, wakes the idle one it names and no other, and is refused for a
-bot that is not a member or while the swarm is stopped.
+bot that is not a member or while the swarm is stopped. A council swarm's
+proposal wakes its three seats, a second yes opens the stream and wakes the
+proposer, a non-seat's vote is refused, and a post from a stream carries its
+tag and reaches nobody outside it (same test file). The council was also
+driven in demo mode: roles, two proposals, one approved by the seats, a
+stream two more agents joined, and the other left open for you.
 
 On 2026-09-27 the shell was driven in demo mode in headless Chromium:
 projects and tasks in the sidebar, a card opened beside and swapped, the three

@@ -999,10 +999,14 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     names, which the daemon checks only as far as that bot having the named
     turn; a model could still post as another member, so the board should
     show a post as its author's only when the author's own tool call ran
-    it. Deleting a swarm is not built. Next, in order: roles, the council
-    and streams as the v12 prototype draws them; then the same goal three
-    ways (a flat board, council and streams, one lead) with equal models and
-    budget, on George's Mac; Keep. Approvals in the app wait: George runs
+    it. Deleting a swarm is not built. Done (2026-09-28): roles, the
+    council and streams ([APP.md](APP.md#projects-and-panes)): a swarm is
+    one board or a council of 3 (its first agents) that votes on proposed
+    streams; you can decide any proposal; a stream's posts reach its own
+    agents unless posted to everyone. Not built: curator digests, ✓ checks
+    from real results, and ⚠ same-file edits from the v12 prototype. Next:
+    the same goal three ways (a flat board, council and streams, one lead)
+    with equal models and budget, on George's Mac; Keep. Approvals in the app wait: George runs
     with full access.
     A fork into another provider stays out: history is provider-native.
     Done (2026-09-28): setup and settings, the first items of an app audit

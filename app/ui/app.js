@@ -326,8 +326,8 @@ const swarmOfBot = (name) => { const sw = S.swarms.get(S.memberOf.get(name)); re
 const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slice(sw.project.length + 1) : name);
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
 function learnSwarm(record, batch = false) {
-  const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null };
-  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, model: record.model, budget: record.budget_tokens, members: record.members ?? [], ids: record.ids ?? {}, stopped: !!record.stopped });
+  const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, proposals: [] }, filter: null };
+  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, model: record.model, budget: record.budget_tokens, members: record.members ?? [], ids: record.ids ?? {}, stopped: !!record.stopped, council: record.council ?? 0, seats: record.seats ?? [] });
   S.swarms.set(sw.name, sw); if (!batch) indexMembers();
   return sw;
 }
@@ -361,6 +361,8 @@ function readBoard(sw) {
         // The board's tail, read afresh: it was rewritten, or grew past what is kept since the last read.
         if (r.reset) sw.lines = [];
         sw.lines.push(...(r.lines ?? []));
+        // Roles, proposals and streams: what the whole board adds up to, not only the lines read.
+        if (r.state) { sw.state = r.state; sw.stateGen = (sw.stateGen ?? 0) + 1; }
         if (sw.lines.length > BOARD_LINES) sw.lines.splice(0, sw.lines.length - BOARD_LINES);
         sw.offset = r.offset;
         if (r.more) sw.again = true;
@@ -401,7 +403,16 @@ const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 // profile's (`swarm`), so a folder can change it.
 function brief(sw, m, late = false) {
   const others = sw.members.filter((x) => x !== m).map((x) => memberShort(sw, x));
-  return `You are ${memberShort(sw, m)}, one of ${sw.members.length} agents in the swarm ${memberShort(sw, sw.name)}, all working in this folder.\nGoal: ${sw.goal}\nPost: ${shq(sw.dir + '/post')} TEXT\nBoard: ${shq(sw.dir + '/board.jsonl')}\nThe others: ${others.join(', ') || 'none yet'}${late ? '\nYou joined after the others started, so read the board first.' : ''}`;
+  const tool = (name, args) => `${name[0].toUpperCase()}${name.slice(1)}: ${shq(`${sw.dir}/${name}`)} ${args}`;
+  const council = sw.council ? [
+    tool('propose', 'STREAM WHY'), tool('vote', 'ID yes|no REASON'), tool('join', 'STREAM'),
+    `Council seats: ${sw.seats.map((x) => memberShort(sw, x)).join(', ')}${sw.seats.includes(m) ? ' (you hold one)' : ''}`,
+  ] : [];
+  return [
+    `You are ${memberShort(sw, m)}, one of ${sw.members.length} agents in the swarm ${memberShort(sw, sw.name)}, all working in this folder.`,
+    `Goal: ${sw.goal}`, tool('post', 'TEXT'), tool('role', 'ROLE'), ...council, `Board: ${shq(sw.dir + '/board.jsonl')}`,
+    `The others: ${others.join(', ') || 'none yet'}`, ...(late ? ['You joined after the others started, so read the board first.'] : []),
+  ].join('\n');
 }
 // A name from the goal: its longest word among the first few that say something, then -2, -3 ... until free.
 // `lock` too: Git refuses a branch named `agent/PROJECT.lock`.
@@ -427,14 +438,14 @@ async function startAgents(sw, names, policy, each, late = false) {
   const failed = [...made, ...sent].find((r) => r.status === 'rejected');
   if (failed) toast(`${records.length} of ${names.length} agents started: ${failed.reason?.message ?? failed.reason}`, 6000);
 }
-async function createSwarm(project, { goal, n, model, shared, budget }) {
+async function createSwarm(project, { goal, n, model, shared, budget, council = 0 }) {
   const lead = bot(project + LEAD); if (!lead?.workspace) throw new Error(`no coordinator for ${project}`);
   goal = goal.trim(); if (!goal) throw new Error('goal_required: a swarm needs a goal');
   // A name another store holds as a worktree or branch is taken here too: try the next.
   const skip = new Set(); let sw;
   for (;;) {
     const name = swarmName(project, goal, skip);
-    try { sw = learnSwarm(await Daemon.swarmCreate({ project, name, folder: lead.workspace, goal, shared, model, budgetTokens: budget })); break; }
+    try { sw = learnSwarm(await Daemon.swarmCreate({ project, name, folder: lead.workspace, goal, shared, model, budgetTokens: budget, council })); break; }
     catch (e) { if (!/^swarm_exists/.test(e?.message ?? e) || skip.size >= 8) throw e; skip.add(name); }
   }
   // Composed for the folder the agents work in, so its AGENTS.md and a `swarm` profile there apply.
@@ -471,6 +482,12 @@ async function endTurns(sw, name) {
   for (const turn of open.reverse()) {
     await Daemon.request('interrupt', { bot: name, turn }).catch((e) => { if (!/stale_turn|no_active_turn/.test(e?.message ?? e)) throw e; });
   }
+}
+// You decide an open proposal: approving opens its stream with its proposer as lead.
+async function decide(sw, id, approve) {
+  const r = await Daemon.swarmDecide(sw.name, id, approve, '');
+  await readBoard(sw);
+  toast(`${id} ${r.decided ?? (approve ? 'approved' : 'denied')}`, 2200);
 }
 async function postToSwarm(sw, text) {
   const r = await Daemon.swarmPost(sw.name, text);
@@ -1234,38 +1251,91 @@ function renderComposer(pane, b, sw = null) {
 
 // ---------- swarm view ----------
 // A swarm's head: where it sits, how many of its agents work, its tokens against its budget, and its
-// two tabs. The Board is its posts; Agents are its agents as cards, which open beside.
+// tabs. The Board is its posts; Agents are its agents as cards, which open beside. A swarm with a
+// council also has the Council, its proposals and their votes, and Streams, the approved ones.
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1).replace(/\.0$/, '')}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 function renderSwarmHead(el, sw) {
   const working = sw.members.filter((m) => RUNNING.has(memberBot(sw, m)?.status)).length;
-  const key = `${SWARM}${sw.name}|${working}|${sw.members.length}|${sw.stopped}|${sw.used}|${sw.tab}`;
+  const open = sw.state.proposals.filter((p) => p.status === 'open').length, streams = sw.state.proposals.filter((p) => p.status === 'approved').length;
+  const key = `${SWARM}${sw.name}|${working}|${sw.members.length}|${sw.stopped}|${sw.used}|${sw.tab}|${open}|${streams}|${sw.filter}`;
   if (el.dataset.k === key) return; el.dataset.k = key;
   const lead = bot(sw.project + LEAD), st = swarmStatus(sw);
   const back = lead ? `<button type="button" class="back" data-act="open" data-who="${esc(lead.name)}" title="Back to the coordinator">← ${esc(sw.project)}</button><span class="sep">/</span>` : '';
   const state = sw.stopped ? 'stopped' : working ? `${working} of ${sw.members.length} working` : `${sw.members.length} agents`;
   const budget = `${sw.used == null ? '' : tokens(sw.used) + ' of '}${tokens(sw.budget)} tokens`;
   const tab = (v, label) => `<button type="button" class="tab${sw.tab === v ? ' on' : ''}" data-act="swarm-tab" data-v="${v}">${label}</button>`;
-  el.innerHTML = `<div class="crumbs">${back}<b>⁂ ${esc(memberShort(sw, sw.name))}</b><span class="glyph ${st}">${glyphOf(st)}</span><span class="state">${esc(state)}</span><span class="branch">${esc(budget)}</span></div><div class="tools">${tab('board', 'Board')}${tab('agents', `Agents ${sw.members.length}`)}${moreButton(swarmKey(sw.name))}</div>`;
+  const filter = sw.filter && sw.tab === 'board' ? `<button type="button" class="tag on" data-act="swarm-filter" data-v="" title="Show every post">#${esc(sw.filter)} ×</button>` : '';
+  const council = sw.council ? `${tab('council', `Council${open ? ` <span class="count">${open}</span>` : ''}`)}${tab('streams', `Streams ${streams}`)}` : '';
+  el.innerHTML = `<div class="crumbs">${back}<b>⁂ ${esc(memberShort(sw, sw.name))}</b><span class="glyph ${st}">${glyphOf(st)}</span><span class="state">${esc(state)}</span><span class="branch">${esc(budget)}</span></div><div class="tools">${filter}${tab('board', 'Board')}${council}${tab('agents', `Agents ${sw.members.length}`)}${moreButton(swarmKey(sw.name))}</div>`;
 }
-// A post: who, then the text, with the agents it names marked; an agent's name opens it beside.
+const streamTag = (stream) => `<button type="button" class="tag" data-act="swarm-filter" data-v="${esc(stream)}">#${esc(stream)}</button>`;
+// A proposal's votes so far against the seats' majority.
+function tally(sw, p) {
+  const yes = Object.values(p.votes ?? {}).filter((v) => v.yes).length, no = Object.keys(p.votes ?? {}).length - yes;
+  return `${yes} yes${no ? ` · ${no} no` : ''} of ${sw.seats.length}`;
+}
+// A board line: who, then the post, with the agents it names marked and its stream as a tag that
+// filters the board; an agent's name opens it beside. Roles, votes, decisions and joins are quieter.
 function postHTML(sw, line) {
   if (line.from == null) return `<div class="line note">${esc(line.text ?? '')}</div>`;
   const you = line.from === 'user', member = line.bot ?? `${sw.project}.${line.from}`;
-  const who = you ? '<span class="who you">you</span>' : `<button type="button" class="who" data-task="${esc(member)}">${esc(line.from)}</button>`;
+  const who = you ? '<span class="who you">you</span>' : line.from === 'council' ? '<span class="who council">council</span>' : `<button type="button" class="who" data-task="${esc(member)}">${esc(line.from)}</button>`;
   const text = inline(String(line.text ?? '')).replace(/(^|[\s(])@([A-Za-z0-9_.-]*[A-Za-z0-9_-])/g, '$1<span class="at">@$2</span>');
-  return `<div class="line post${you ? ' mine' : ''}">${who}<span class="pt">${text}</span></div>`;
+  const row = (cls, body) => `<div class="line post ${cls}">${who}<span class="pt">${body}</span></div>`;
+  switch (line.kind) {
+    case 'role': return row('ev', `is now <i>${esc(line.role ?? '')}</i>`);
+    case 'join': return row('ev', `joined ${streamTag(line.stream ?? '')}`);
+    case 'vote': return row('ev', `votes <b>${line.yes ? 'yes' : 'no'}</b> on ${esc(line.id ?? '')}${line.text ? `: ${text}` : ''}`);
+    case 'decision': return row(`ev decided ${line.approved ? 'yes' : 'no'}`, `${esc(line.id ?? '')} ${streamTag(line.stream ?? '')} ${line.approved ? `approved · ${esc(line.lead ?? '')} leads it` : 'denied'}`);
+    case 'propose': {
+      const p = sw.state.proposals.find((x) => x.id === line.id);
+      return row('prop', `proposes <b>${esc(line.id ?? '')}</b> ${streamTag(line.stream ?? '')}: ${text}${p ? ` <span class="tally">${p.status === 'open' ? tally(sw, p) : p.status}</span>` : ''}`);
+    }
+    default: return row(you ? 'mine' : '', `${line.stream ? `${streamTag(line.stream)} ` : ''}${text}`);
+  }
+}
+// The council: its seats, each open proposal with the seats' votes and your Approve and Deny, then
+// the ones decided.
+function councilHTML(sw) {
+  const who = (short) => `<button type="button" class="who" data-task="${esc(`${sw.project}.${short}`)}">${esc(short)}</button>`;
+  const seats = sw.seats.map((m) => memberShort(sw, m));
+  const need = Math.floor(seats.length / 2) + 1;
+  const card = (p) => {
+    // Once decided, only the votes cast.
+    const votes = seats.filter((seat) => p.status === 'open' || p.votes?.[seat]).map((seat) => { const v = p.votes?.[seat]; return `<div class="vote">${who(seat)} ${v ? `<b class="${v.yes ? 'yes' : 'no'}">${v.yes ? 'yes' : 'no'}</b> ${esc(v.reason)}` : '<span class="dim">not yet</span>'}</div>`; }).join('');
+    const yours = p.votes?.user ? `<div class="vote"><span class="who you">you</span> <b class="${p.votes.user.yes ? 'yes' : 'no'}">${p.votes.user.yes ? 'approved' : 'denied'}</b></div>` : '';
+    const acts = p.status === 'open' ? `<div class="acts"><button type="button" class="sbtn primary" data-act="swarm-decide" data-v="${esc(p.id)}:yes">Approve</button><button type="button" class="sbtn" data-act="swarm-decide" data-v="${esc(p.id)}:no">Deny</button></div>` : '';
+    const state = p.status === 'open' ? tally(sw, p) : `${p.status}${p.decided_by === 'user' ? ' by you' : ''}`;
+    return `<div class="prop ${esc(p.status)}"><div class="ph"><b>${esc(p.id)}</b> ${streamTag(p.stream)} <span class="dim">by</span> ${who(p.by)}<span class="tally">${esc(state)}</span></div><div class="why">${inline(p.why)}</div>${votes}${yours}${acts}</div>`;
+  };
+  const open = sw.state.proposals.filter((p) => p.status === 'open'), done = sw.state.proposals.filter((p) => p.status !== 'open').reverse();
+  return `<div class="line note">Seats: ${seats.map(esc).join(', ') || 'none yet'}. ${need} of ${seats.length} decide; you can decide any proposal yourself.</div>${open.length ? open.map(card).join('') : '<div class="line note">no open proposals</div>'}${done.map(card).join('')}`;
+}
+// Streams: each approved proposal, its lead and the agents in it with their roles.
+function streamsHTML(sw) {
+  const approved = sw.state.proposals.filter((p) => p.status === 'approved');
+  if (!approved.length) return '<div class="line note">no streams yet: an approved proposal opens one</div>';
+  return approved.map((p) => {
+    const members = Object.entries(sw.state.streams ?? {}).filter(([, st]) => st === p.stream).map(([m]) => m);
+    const people = members.map((m) => `<button type="button" class="member" data-task="${esc(`${sw.project}.${m}`)}">${esc(m)}${m === p.by ? ' <span class="dim">lead</span>' : ''}${sw.state.roles?.[m] ? ` <i>${esc(sw.state.roles[m])}</i>` : ''}</button>`).join('');
+    return `<div class="prop stream"><div class="ph">${streamTag(p.stream)} <span class="dim">${members.length} agent${members.length === 1 ? '' : 's'}</span><button type="button" class="sbtn" data-act="swarm-filter" data-v="${esc(p.stream)}">Posts</button></div><div class="why">${inline(p.why)}</div><div class="members">${people}</div></div>`;
+  }).join('');
 }
 function renderSwarm(el, sw) {
-  const key = `${SWARM}${sw.name}|${sw.tab}|${sw.offset}|${sw.lines.length}`;
+  const key = `${SWARM}${sw.name}|${sw.tab}|${sw.offset}|${sw.lines.length}|${sw.filter}|${sw.stateGen}`;
   const fresh = el.dataset.who !== swarmKey(sw.name); el.dataset.who = swarmKey(sw.name);
   const atBottom = fresh || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   if (el.dataset.key !== key) {
     el.dataset.key = key;
     if (sw.tab === 'agents') {
-      const cards = sw.members.filter((m) => memberBot(sw, m)).map(taskCard);
+      // Each card says what its agent took on, and the stream it works in.
+      const cards = sw.members.filter((m) => memberBot(sw, m)).map((m) => { const c = taskCard(m), short = memberShort(sw, m); if (c) c.name = [c.name, sw.state.roles?.[short], sw.state.streams?.[short] && `#${sw.state.streams[short]}`].filter(Boolean).join(' · '); return c; }).filter(Boolean);
       el.innerHTML = cards.length ? cards.map(cardHTML).join('') : '<div class="line note">no agents yet</div>';
-    } else {
-      el.innerHTML = sw.lines.length ? sw.lines.map((l) => postHTML(sw, l)).join('') : `<div class="line note">${sw.offset === null ? 'reading the board' : 'nothing posted yet'}</div>`;
+    } else if (sw.tab === 'council') el.innerHTML = councilHTML(sw);
+    else if (sw.tab === 'streams') el.innerHTML = streamsHTML(sw);
+    else {
+      const lines = sw.filter ? sw.lines.filter((l) => l.stream === sw.filter) : sw.lines;
+      el.innerHTML = lines.length ? lines.map((l) => postHTML(sw, l)).join('') : `<div class="line note">${sw.offset === null ? 'reading the board' : sw.filter ? `nothing on #${esc(sw.filter)} yet` : 'nothing posted yet'}</div>`;
     }
   }
   if (sw.tab === 'agents') refreshLive(el);
@@ -1287,6 +1357,7 @@ async function openSwarmSheet(project) {
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
     <div class="row"><div><label for="sw-n">Agents</label>${sel('sw-n', SWARM_SIZES.map((n) => [n, String(n)]), 4)}</div><div class="wide"><label for="sw-model">Model</label>${modelSelectHTML('sw-model', models, lead.model)}</div></div>
     <div class="row"><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label>${sel('sw-budget', SWARM_BUDGETS, 3e6)}</div></div>
+    <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: each agent takes a piece'], [3, 'A council of 3 approves streams of work']], 0)}
     <div class="foot"><button type="button" class="sbtn" data-act="close-sheet">Cancel</button><button type="submit" class="sbtn primary" id="sw-start">Start swarm</button></div>`;
   $('sheetwrap').classList.add('on'); S.ui.sheet = true;
   setTimeout(() => $('sw-goal').focus?.(), 0);
@@ -1298,7 +1369,7 @@ $('sheet').addEventListener('submit', async (e) => {
   start.disabled = true; start.textContent = 'Starting…';
   try {
     if (!$('sw-model').value) throw new Error('Choose a model for its agents');
-    await createSwarm(project, { goal: $('sw-goal').value, n: Number($('sw-n').value), model: $('sw-model').value, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value) });
+    await createSwarm(project, { goal: $('sw-goal').value, n: Number($('sw-n').value), model: $('sw-model').value, shared: $('sw-where').value === 'shared', budget: Number($('sw-budget').value), council: Number($('sw-org').value) });
     closeSheet();
   } catch (err) { toast(String(err?.message ?? err), 6000); start.disabled = false; start.textContent = 'Start swarm'; }
 });
@@ -2038,6 +2109,8 @@ async function act(el) {
     case 'swarm-stop': await stopSwarm(swarmOf(who)); return;
     case 'swarm-add': await addAgent(swarmOf(who)); return;
     case 'swarm-tab': { const sw = swarmOf(S.selected); if (sw) { sw.tab = v; await enqueue(loadVisible); render(); } return; }
+    case 'swarm-filter': { const sw = swarmOf(S.selected); if (sw) { sw.filter = v || null; sw.tab = 'board'; render(); } return; }
+    case 'swarm-decide': { const sw = swarmOf(S.selected), [id, yes] = v.split(':'); if (sw) await decide(sw, id, yes === 'yes'); return; }
     case 'settings': await openSetup(); return;
     case 'setup-close': closeSetup(); return;
     case 'setup-add': setupState().adding = ''; renderSetup(); return;
