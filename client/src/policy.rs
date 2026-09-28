@@ -146,26 +146,27 @@ const MAX_ENTRIES: usize = 4096;
 /// AGENTS.md files that apply to `workspace`: the global one first, then
 /// from the filesystem root down to the workspace, so the nearest file is
 /// read last and wins where they disagree.
-pub fn agents_files(workspace: &Path) -> Vec<PathBuf> {
+pub fn agents_files(workspace: &Path) -> Result<Vec<PathBuf>, Failure> {
     let mut files = Vec::new();
     if let Some(global) = home().map(|h| h.join(".agents").join("AGENTS.md"))
-        && global.is_file()
+        && is_file(&global)?
     {
         files.push(global);
     }
     let start = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let mut chain: Vec<PathBuf> = start
-        .ancestors()
-        .map(|dir| dir.join("AGENTS.md"))
-        .filter(|file| file.is_file())
-        .collect();
+    let mut chain = Vec::new();
+    for file in start.ancestors().map(|dir| dir.join("AGENTS.md")) {
+        if is_file(&file)? {
+            chain.push(file);
+        }
+    }
     chain.reverse();
     for file in chain {
         if !files.contains(&file) {
             files.push(file);
         }
     }
-    files
+    Ok(files)
 }
 
 /// The fields a skill or profile file may declare in YAML front matter
@@ -341,7 +342,13 @@ impl Kind {
             Kind::Skills => path.join("SKILL.md"),
             Kind::Profiles => path.to_path_buf(),
         };
-        Ok(is_file(&file)?.then_some(file))
+        let Some(meta) = file_meta(&file)? else {
+            return Ok(None);
+        };
+        // A role too large for any bot's instructions is not offered: it
+        // could never be started.
+        let fits = !matches!(self, Kind::Profiles) || meta.len() as usize <= MAX_INSTRUCTIONS;
+        Ok(fits.then_some(file))
     }
 }
 
@@ -349,15 +356,20 @@ impl Kind {
 /// is reported, so an unreadable workspace file never lets the user's file of
 /// the same name stand in for it.
 fn is_file(path: &Path) -> Result<bool, Failure> {
+    Ok(file_meta(path)?.is_some())
+}
+
+/// The metadata of `path` when it is a file, on the terms of [`is_file`].
+fn file_meta(path: &Path) -> Result<Option<std::fs::Metadata>, Failure> {
     match std::fs::metadata(path) {
-        Ok(meta) => Ok(meta.is_file()),
+        Ok(meta) => Ok(meta.is_file().then_some(meta)),
         Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            Ok(false)
+            Ok(None)
         }
         Err(error) => Err(Failure::Unreadable {
             path: path.to_path_buf(),
@@ -553,7 +565,7 @@ pub fn profile(workspace: &Path, name: &str) -> Result<Option<Profile>, Failure>
 pub fn instructions(workspace: &Path, role: Option<&Profile>) -> Result<Instructions, Failure> {
     let mut text = String::from(PREAMBLE);
     let mut sources = Vec::new();
-    for path in agents_files(workspace) {
+    for path in agents_files(workspace)? {
         // Read no more than what could still fit; a file past the budget
         // fails on its size, not after being copied into memory.
         let header = format!("\n\n# Instructions from {}\n\n", path.display());
@@ -654,7 +666,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(deep.join(".agents/skills/notes.md"), "not a skill").unwrap();
-        let files = agents_files(&deep);
+        let files = agents_files(&deep).unwrap();
         assert_eq!(
             files.iter().rev().take(2).collect::<Vec<_>>(),
             vec![&deep.join("AGENTS.md"), &root.join("AGENTS.md")]
@@ -717,6 +729,14 @@ mod tests {
         assert_eq!(error.code(), "instructions_unreadable");
         assert!(
             matches!(&error, Failure::Unreadable { path, .. } if *path == root.join("AGENTS.md"))
+        );
+        // An AGENTS.md whose metadata fails is reported, not skipped; the
+        // global file takes the same path.
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -885,6 +905,17 @@ mod tests {
             assert_eq!(search(&root, Kind::Profiles).len(), 2);
             assert_eq!(search(&home, Kind::Profiles).len(), 1);
         }
+        // A role too large to start is not offered.
+        let big = std::fs::File::create(root.join(".agents/agents/huge.md")).unwrap();
+        big.set_len(MAX_INSTRUCTIONS as u64 + 1).unwrap();
+        assert!(
+            instructions(&root, None)
+                .unwrap()
+                .profiles
+                .iter()
+                .all(|p| p.name != "huge")
+        );
+        std::fs::remove_file(root.join(".agents/agents/huge.md")).unwrap();
         // A broken file shadowed by an override is never probed.
         let other = temp("shadowed");
         std::fs::create_dir_all(other.join(".agents/agents")).unwrap();
