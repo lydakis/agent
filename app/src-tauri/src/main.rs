@@ -669,6 +669,21 @@ async fn swarm_post(
     swarm::act(&client, &swarms_of(&state)?, &swarm, None, act).await
 }
 
+/// Tell the swarm's working agents when it has passed a share of its
+/// budget, once each; the page asks as its agents finish turns.
+#[tauri::command]
+async fn swarm_check(state: State<'_, Shared>, swarm: String) -> Result<Value, String> {
+    let client = state.client.lock().await.clone().ok_or("detached")?;
+    swarm::act(
+        &client,
+        &swarms_of(&state)?,
+        &swarm,
+        None,
+        swarm::Act::Check,
+    )
+    .await
+}
+
 /// You approve or deny an open proposal, which decides it.
 #[tauri::command]
 async fn swarm_decide(
@@ -750,6 +765,7 @@ fn main() {
             swarm_stop,
             swarm_board,
             swarm_post,
+            swarm_check,
             swarm_decide
         ])
         .setup(|app| {

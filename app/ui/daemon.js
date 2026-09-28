@@ -32,6 +32,7 @@ window.Daemon = (() => {
       swarmStop: (swarm) => invoke('swarm_stop', { swarm }),
       swarmBoard: (swarm, offset) => invoke('swarm_board', { swarm, offset: offset ?? null }),
       swarmPost: (swarm, text) => invoke('swarm_post', { swarm, text }),
+      swarmCheck: (swarm) => invoke('swarm_check', { swarm }),
       swarmDecide: (swarm, id, approve, reason) => invoke('swarm_decide', { swarm, id, approve, reason: reason ?? '' }),
       close: () => tauri.window.getCurrentWindow().close(),
     };

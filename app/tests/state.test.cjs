@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels, modelMenu, learnSwarm, createSwarm, addAgent, stopSwarm, readBoard, swarmName, renderSwarm, renderSwarmHead, postHTML, mixRows, nextRow, openSwarmSheet, readUsage };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1130,6 +1130,9 @@ test('a swarm is one row under its project; its agents and what they made stay i
   p.S.ui.folded.add('app');
   assert.deepEqual(rowsOf(p.tree()), ['app.lead', 'bots', '⁂gone.x']);
   assert.deepEqual(Array.from(p.botMenuItems('⁂app.latency'), (i) => i.act), ['swarm-stop', 'swarm-add']);
+  // A stopped swarm takes no new agent until a post resumes it.
+  p.S.swarms.get('app.latency').stopped = true;
+  assert.equal(p.botMenuItems('⁂app.latency')[1].disabled, true);
   assert.equal(p.botMenuItems('app.lead')[0].act, 'new-swarm');
   assert.notEqual(p.botMenuItems('app.build-x')?.[0]?.act, 'new-swarm');
 });
@@ -1173,7 +1176,7 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
   });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', workspace: '/synthetic/app' });
   const el = (id) => p.context.document.getElementById(id);
-  el('sw-n').value = '4'; el('sw-n').id = 'sw-n'; el('sw-budget').value = '3000000';
+  el('sw-n').value = '4'; el('sw-n').id = 'sw-n'; el('sw-budget').value = '3'; el('sw-budget').id = 'sw-budget';
   await p.openSwarmSheet('app');
   assert.match(el('sw-mix').innerHTML, /<option value="" selected>Plain agent<\/option><option value="reviewer">reviewer<\/option>/);
   assert.match(el('sw-mix').innerHTML, /4 agents/);
@@ -1185,6 +1188,12 @@ test('the sheet offers the folder\'s profiles as identities and shows each row\'
   el('sw-n').value = '2.5'; el('sheet').listeners.input({ target: el('sw-n') });
   assert.match(el('sw-mix').innerHTML, /Agents is a whole number from 1 to 64/);
   el('sw-n').value = '4'; el('sheet').listeners.input({ target: el('sw-n') });
+  // The budget is typed in millions, and each agent's share follows it.
+  el('sw-budget').value = '12'; el('sheet').listeners.input({ target: el('sw-budget') });
+  assert.equal(el('sw-each').textContent, 'about 3M tokens each');
+  el('sw-budget').value = '0'; el('sheet').listeners.input({ target: el('sw-budget') });
+  assert.match(el('sw-mix').innerHTML, /Budget is 0.1 to 1000 million tokens/);
+  el('sw-budget').value = '3'; el('sheet').listeners.input({ target: el('sw-budget') });
   await p.act({ dataset: { act: 'mix-add' } });
   assert.equal((el('sw-mix').innerHTML.match(/2 agents/g) ?? []).length, 2);
   // Picking an identity picks the model its profile names.
@@ -1257,6 +1266,10 @@ test('the board is read on, a tail read afresh replaces what was read, and the c
   board = { lines: [{ from: 'user', text: 'again' }], offset: 900000, more: false, reset: true };
   await p.readBoard(sw);
   assert.deepEqual(Array.from(sw.lines, (l) => l.text), ['again']);
+  // A board ending in half a line says there is more but gets no further: one read, not a spin.
+  board = { lines: [], offset: 900000, more: true };
+  reads.length = 0; await p.readBoard(sw);
+  assert.deepEqual(reads, [900000]);
   const html = p.postHTML(sw, { from: 'latency-1', bot: 'app.latency-1', text: '<b> ask @latency-2.' });
   assert.match(html, /data-task="app.latency-1"/); assert.match(html, /&lt;b&gt;/); assert.match(html, /<span class="at">@latency-2<\/span>\./);
   p.S.selected = '⁂app.latency';
@@ -1662,4 +1675,20 @@ test('removing a provider while agents work asks once more before the restart st
   assert.match(p.setupHTML(), /Remove anyway/); assert.match(p.setupHTML(), /Removing restarts the daemon/);
   await press();
   assert.equal(calls.filter(([c]) => c === 'save').length, 1);
+});
+
+test('a swarm counts its helpers\' tokens, and the board says when it passes a share of its budget', async () => {
+  const bots = [
+    { name: 'app.latency-1', id: 3, tokens_used: 1000 },
+    { name: 'app.latency-1.fix', id: 40, created_by_id: 3, tokens_used: 200 },
+    { name: 'app.latency-1.fix.deep', id: 41, created_by_id: 40, tokens_used: 30 },
+    { name: 'app.latency-1.stray', id: 42, created_by_id: 77, tokens_used: 5000 },
+    { name: 'app.latency-2', id: 99, tokens_used: 7000 },
+    { name: 'app.other', id: 50, tokens_used: 9000 },
+  ];
+  const p = shell({ request: async (op) => (op === 'bots' ? { bots, next_after: null } : { bots: [], next_after: null }) });
+  const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } }));
+  await p.readUsage(sw);
+  assert.equal(sw.used, 1230);
+  assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
 });

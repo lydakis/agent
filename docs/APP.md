@@ -407,13 +407,16 @@ daemon learns nothing about projects; everything here is client work.
   project's ⋯ menu has **New swarm**: a goal, any number of agents up to 64 (typed), a mix, where
   they work (one worktree they share, `~/.agent/worktrees/PROJECT.NAME` on
   `agent/PROJECT.NAME` with the folder's `.agents/setup` run in it, or the
-  project folder), and a token budget split evenly among them. A goal is
+  project folder), and a token budget typed in millions (0.1 to 1,000),
+  split evenly among them, each agent's share shown beside it. A goal is
   at most 16 KiB. A name whose worktree or branch another store's swarm
   holds is skipped for the next. Setup gets ten minutes and the login
   shell's ordinary variables (PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*,
-  TMPDIR, TERM) and no others, so no provider or cloud keys; past its time
+  TMPDIR, TERM) and no others, so no provider or cloud keys (as do the
+  swarm's git commands, whose hooks run too); past its time
   its whole process group is killed, and its output is kept only to its
-  last 64 KiB. The mix is up to eight rows of an identity, a model and a
+  last 64 KiB. A failed start removes a worktree and branch only when it
+  made them, never the project folder. The mix is up to eight rows of an identity, a model and a
   share, the shares adding up to 100%. An identity is a profile in the
   folder's or the user's `.agents/agents` other than the app's own
   `coordinator` and `swarm`; picking one picks the model its profile names,
@@ -433,7 +436,8 @@ daemon learns nothing about projects; everything here is client work.
   `swarm.toml` (its project, goal, folder, budget, mix, members with each
   one's bot id and row of the mix, and whether you stopped it; at most
   1 MiB, read only when every member has an id and a row, changed only
-  under the board's lock, synced, and replaced whole), `board.jsonl` (one
+  under the board's lock, synced, and replaced whole; written last when
+  a swarm is made, so a folder without it is not listed), `board.jsonl` (one
   line a post or act, appended under a lock and synced, your goal first;
   each line says how many agents it `reached`, so what a
   swarm's posts cost in deliveries can be read off its board), `state.json` (what the board adds up to: roles, proposals
@@ -471,13 +475,23 @@ daemon learns nothing about projects; everything here is client work.
   only while it is on screen (more than 256 KiB behind, it reads the
   board's last 256 KiB instead); and **Agents**, their cards, which open
   beside. The head counts working agents and tokens used against the
-  budget. Its composer posts to the board. Its ⋯ menu stops every agent
+  budget, its helpers' tokens included. Its composer posts to the board.
+  Its ⋯ menu stops every agent and helper
   (every unfinished turn, queued ones first, of each member that is still
   the bot that joined; a name now held by another bot leaves instead; and
-  the swarm refuses its agents' posts until your next one) or adds one
-  from the row furthest below its share, told to read the board first,
+  the swarm refuses its agents' posts until your next one is on the board)
+  or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
   whose share of tokens the swarm's budget grows by. Any agent says what it is doing with
-  `role ROLE`, shown on the board and on its card.
+  `role ROLE`, shown on the board and on its card. A helper is a bot an
+  agent made with the CLI (a fork of a peer to ask it something, or of
+  itself for a subtask), named after its maker (`PROJECT.NAME-N.WHAT`) so
+  it sorts in the swarm's range of the daemon's list; one made by a member
+  or by another helper counts in the swarm's tokens and stops with it, and
+  cannot post. Each act that reads the daemon's list, and a check the page
+  asks for at most every five seconds a swarm as its agents finish turns,
+  tells the working agents when the swarm passes 50%, 75% or 90% of its
+  budget: a `budget` line on the board, each share once (`state.json`
+  keeps the last), and in the answer of the act that passed it.
 - **Swarm councils.** The sheet's "Organized as" picks one board (every
   agent takes a piece) or a council of 3. With a council, the seats are the
   swarm's first three agents. An agent proposes a stream of work with
@@ -611,8 +625,10 @@ records how many agents it reached. Start, Add and Stop are tested in
 row's model, identity and share of the budget, one that fails is reported
 while the rest start, a start with no agent leaves nothing behind, an
 identity without `shell` is refused before any agent exists, Add skips a
-name another bot holds, and Stop ends unfinished turns newest first and
-lets a reused name leave. The council was also
+name another bot holds, and Stop ends unfinished turns newest first,
+its helpers' and their helpers' too but not a bot no agent made, and
+lets a reused name leave; the board says 50% and then, past 90% at once,
+only 90%, each once, counting a helper's tokens. The council was also
 driven in demo mode: roles, two proposals, one approved by the seats, a
 stream two more agents joined, and the other left open for you.
 

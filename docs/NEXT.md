@@ -1009,7 +1009,11 @@ bytes per parked turn versus per live process, on the lifecycle screen.
     reviewer), a model and a share, dealt to whole agents; Start, Add and
     Stop as one call each to the app's Rust side, which undoes a failed
     start (Astra's review of #60); and each board line's `reached` count.
-    Next: the same goal three ways (a flat board, council and streams, one
+    Also: the agent count and the budget (in millions) typed; helpers an
+    agent forks, named after it, counted in the swarm's tokens and stopped
+    with it; the board saying 50%, 75% and 90% of the budget; and
+    `swarm.md` telling agents how to ask a peer's fork and check their
+    usage. Next: the same goal three ways (a flat board, council and streams, one
     lead) with equal models and budget, on George's Mac, comparing tokens,
     wall time, result, and deliveries from the board (Astra: in a flat
     swarm every post reaches every working agent, so 16 posting once each

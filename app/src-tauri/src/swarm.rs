@@ -444,15 +444,22 @@ pub fn claim(root: &Path, swarm: &str) -> Result<PathBuf, String> {
         std::io::ErrorKind::AlreadyExists => format!("swarm_exists: {swarm}"),
         _ => format!("{}: {e}", dir.display()),
     })?;
+    // The folder's entry, and the store's and swarms' own when they were
+    // just made, survive a power loss once the swarm is acknowledged.
+    for parent in root.ancestors().take(3) {
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
     Ok(dir)
 }
 
 /// A claimed folder's files, with your goal as the board's first post.
 /// Nobody is a member yet: the app adds each agent once the daemon has
-/// created it. A folder that cannot be filled goes, name and all.
+/// created it. `swarm.toml` comes last, since a folder without it is not
+/// listed as a swarm. A folder that cannot be filled goes, name and all.
 pub fn fill(dir: &Path, swarm: &Swarm, app: &Path) -> Result<(), String> {
     let made = (|| {
-        swarm.write(dir)?;
         std::fs::File::create(dir.join("board.jsonl")).map_err(|e| e.to_string())?;
         locked(dir, |_| {
             Ok((
@@ -463,7 +470,7 @@ pub fn fill(dir: &Path, swarm: &Swarm, app: &Path) -> Result<(), String> {
         for &tool in tools(swarm) {
             write_script(dir, app, tool)?;
         }
-        Ok(())
+        swarm.write(dir)
     })();
     if made.is_err() {
         let _ = std::fs::remove_dir_all(dir);
@@ -483,7 +490,7 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
         return Ok(project.to_string_lossy().into_owned());
     }
     let git = |args: &[&str]| {
-        let mut command = tokio::process::Command::new("git");
+        let mut command = git();
         command
             .arg("-C")
             .arg(project)
@@ -572,6 +579,14 @@ pub async fn place(project: &Path, swarm: &str, shared: bool) -> Result<String, 
 /// Setup is the project's code, run before any agent exists. It gets the
 /// login shell's ordinary variables, so its tools are on PATH, and nothing
 /// else: no provider or cloud keys, which the daemon's shell withholds too.
+/// Git with setup's environment: `git worktree add` runs the repository's
+/// hooks, which get no provider or cloud keys either.
+fn git() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command.env_clear().envs(setup_env(std::env::vars_os()));
+    command
+}
+
 fn setup_env(from: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
     const KEEP: &[&str] = &[
         "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TMPDIR", "TERM",
@@ -824,9 +839,11 @@ pub fn leave(root: &Path, swarm: &str, member: &str) -> Result<Value, String> {
     Ok(s.json(&dir))
 }
 
-/// A swarm that never got an agent goes with its worktree and branch.
-async fn discard(dir: &Path, swarm: &Swarm) -> Result<(), String> {
-    if Path::new(&swarm.workspace).starts_with(worktrees()?.join(&swarm.name)) {
+/// A swarm that never got an agent goes, with the worktree and branch
+/// `place` made for it when it made them; a project folder is never removed,
+/// wherever it lives.
+async fn discard(dir: &Path, swarm: &Swarm, placed: bool) -> Result<(), String> {
+    if placed {
         unplace(&swarm.name).await?;
     }
     std::fs::remove_dir_all(dir).map_err(|e| e.to_string())
@@ -836,7 +853,7 @@ async fn discard(dir: &Path, swarm: &Swarm) -> Result<(), String> {
 pub async fn unplace(swarm: &str) -> Result<(), String> {
     let tree = worktrees()?.join(swarm);
     // The repository the worktree came from, found before it goes.
-    let common = tokio::process::Command::new("git")
+    let common = git()
         .arg("-C")
         .arg(&tree)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
@@ -846,7 +863,7 @@ pub async fn unplace(swarm: &str) -> Result<(), String> {
     let common = String::from_utf8_lossy(&common.stdout).trim().to_owned();
     if !common.is_empty() {
         let git = |args: &[&str]| {
-            let mut command = tokio::process::Command::new("git");
+            let mut command = git();
             command.arg("--git-dir").arg(&common).args(args);
             command
         };
@@ -926,7 +943,7 @@ pub async fn start(
     let policies = match policies(&swarm, start.rows.iter().copied()) {
         Ok(policies) => policies,
         Err(error) => {
-            let _ = discard(&dir, &swarm).await;
+            let _ = discard(&dir, &swarm, start.shared).await;
             return Err(error);
         }
     };
@@ -936,7 +953,7 @@ pub async fn start(
         .collect();
     let (made, mut failed) = create(client, &swarm, &agents, &policies, each).await;
     if made.is_empty() {
-        let _ = discard(&dir, &swarm).await;
+        let _ = discard(&dir, &swarm, start.shared).await;
         return Err(failed
             .first()
             .map_or_else(String::new, |(_, e)| e.to_string()));
@@ -948,7 +965,7 @@ pub async fn start(
             for (name, _, _) in &made {
                 let _ = client.request("delete", json!({"bot": name})).await;
             }
-            let _ = discard(&dir, &swarm).await;
+            let _ = discard(&dir, &swarm, start.shared).await;
             return Err(error);
         }
     };
@@ -970,6 +987,11 @@ pub async fn add(
 ) -> Result<Value, String> {
     let dir = folder(root, swarm)?;
     let s = Swarm::read(&dir)?;
+    if s.stopped {
+        return Err(
+            "swarm_stopped: post to the board to resume the swarm, then add an agent".into(),
+        );
+    }
     if row >= s.mix.len() {
         return Err(format!("invalid_agents: the mix has no row {row}"));
     }
@@ -1000,7 +1022,7 @@ pub async fn add(
 }
 
 /// Stop a swarm: it refuses its agents' posts from now on, and every turn
-/// its agents have not finished ends. Posts wait on the board's lock, so a
+/// its agents and their helpers have not finished ends. Posts wait on the board's lock, so a
 /// post either comes first and its turns end here, or is refused. A name
 /// that is no longer its member's bot leaves, its turns untouched.
 pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Value, String> {
@@ -1010,20 +1032,33 @@ pub async fn stop(client: &Arc<Client>, root: &Path, swarm: &str) -> Result<Valu
         Ok(())
     })
     .await?;
+    let (mut gone, mut failed) = (Vec::new(), Vec::new());
+    // The helpers its agents made stop with them.
+    let helpers = match scan(client, &s).await {
+        Ok(seen) => seen.helpers,
+        Err(error) => {
+            failed.push(json!({"agent": "helpers", "error": error}));
+            Vec::new()
+        }
+    };
     let mut ends = tokio::task::JoinSet::new();
-    for member in &s.members {
-        let (client, member, id) = (client.clone(), member.clone(), s.ids.get(member).copied());
+    let members = s
+        .members
+        .iter()
+        .map(|m| (m.clone(), s.ids.get(m).copied(), true));
+    let helpers = helpers.into_iter().map(|(h, id)| (h, Some(id), false));
+    for (bot, id, member) in members.chain(helpers) {
+        let client = client.clone();
         ends.spawn(async move {
-            let ended = end_turns(&client, &member, id).await;
-            (member, ended)
+            let ended = end_turns(&client, &bot, id).await;
+            (bot, member, ended)
         });
     }
-    let (mut gone, mut failed) = (Vec::new(), Vec::new());
     while let Some(ended) = ends.join_next().await {
         match ended.map_err(|e| e.to_string())? {
-            (member, Ok(false)) => gone.push(member),
-            (_, Ok(true)) => {}
-            (member, Err(error)) => failed.push(json!({"agent": s.short(&member), "error": error})),
+            (member, true, Ok(false)) => gone.push(member),
+            (_, _, Ok(_)) => {}
+            (bot, _, Err(error)) => failed.push(json!({"agent": s.short(&bot), "error": error})),
         }
     }
     let s = if gone.is_empty() {
@@ -1336,6 +1371,8 @@ pub struct State {
     pub roles: BTreeMap<String, String>,
     pub streams: BTreeMap<String, String>,
     pub proposals: Vec<Proposal>,
+    /// The last share of the budget the board announced, in percent.
+    pub spent: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1419,6 +1456,10 @@ impl State {
                         .flatten()
                         .filter_map(Proposal::from_json)
                         .collect(),
+                    spent: value["spent"]
+                        .as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .unwrap_or(0),
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -1430,6 +1471,7 @@ impl State {
         json!({
             "roles": self.roles, "streams": self.streams,
             "proposals": self.proposals.iter().map(Proposal::json).collect::<Vec<_>>(),
+            "spent": self.spent,
         })
     }
 
@@ -1596,6 +1638,8 @@ pub enum Act {
         reason: String,
     },
     Join(String),
+    /// Nothing but the budget check every act ends with.
+    Check,
 }
 
 /// Who hears a line the board gained.
@@ -1855,39 +1899,97 @@ fn plan(
                 json!({"stream": stream}),
             ))
         }
+        Act::Check => Ok((vec![], vec![], json!({}))),
     }
 }
 
-/// Each member's running turn, from the daemon's list: members are named
-/// `SWARM-N`, so they sit together in its name order. A bot under a
-/// member's name that is not the member's bot is left out.
-async fn running_turns(
-    client: &Client,
-    swarm: &Swarm,
-) -> Result<Vec<(String, Option<i64>)>, String> {
+/// The shares of its budget a swarm is told it has spent.
+const SPENT: [u8; 3] = [50, 75, 90];
+
+/// A line for the highest share of the budget `used` has passed that the
+/// board has not announced yet: once each, however many windows check.
+fn spent(swarm: &Swarm, state: &mut State, used: u64, at: u64) -> Option<(Value, Notice)> {
+    let share = u128::from(used) * 100 / u128::from(swarm.budget_tokens.max(1));
+    let passed = SPENT.into_iter().rfind(|p| u128::from(*p) <= share)?;
+    if passed <= state.spent {
+        return None;
+    }
+    state.spent = passed;
+    let text = format!(
+        "the swarm has used {passed}% of its budget ({} of {} tokens)",
+        millions(used),
+        millions(swarm.budget_tokens)
+    );
+    let line = json!({"at": at, "from": "budget", "text": text, "spent": passed});
+    let notice = Notice {
+        prompt: format!("[board] budget: {text}"),
+        audience: Audience::Wake {
+            who: Vec::new(),
+            working: true,
+        },
+    };
+    Some((line, notice))
+}
+
+fn millions(tokens: u64) -> String {
+    let m = tokens as f64 / 1e6;
+    if m >= 10.0 {
+        format!("{m:.0}M")
+    } else {
+        format!("{m:.1}M").replace(".0M", "M")
+    }
+}
+
+/// What the daemon's list says of a swarm: each member's running turn, the
+/// helpers its members made, and the tokens all of them used. Members are
+/// named `SWARM-N` and a helper is named after the agent that made it
+/// (`SWARM-N.WHAT`), so they sit together in its name order. A bot under a
+/// member's name that is not the member's bot is left out, and so is a bot
+/// in that range no member or helper made.
+#[derive(Debug, Default)]
+struct Scan {
+    turns: Vec<(String, Option<i64>)>,
+    helpers: Vec<(String, i64)>,
+    used: u64,
+}
+
+async fn scan(client: &Client, swarm: &Swarm) -> Result<Scan, String> {
     let prefix = format!("{}-", swarm.name);
     let mut after = swarm.name.clone();
-    let mut out = Vec::new();
+    let mut out = Scan::default();
+    // A helper's maker sorts before it, so one pass finds helpers' helpers.
+    let mut makers: std::collections::HashSet<i64> = swarm.ids.values().copied().collect();
     loop {
         let page = client
             .request("bots", json!({"after": after, "limit": 256}))
             .await
             .map_err(|e| e.to_string())?;
-        let bots = page["bots"].as_array().cloned().unwrap_or_default();
-        for bot in &bots {
+        for bot in page["bots"].as_array().into_iter().flatten() {
             let name = bot["name"].as_str().unwrap_or_default();
             if name > prefix.as_str() && !name.starts_with(&prefix) {
                 return Ok(out);
             }
-            if swarm.members.iter().any(|m| m == name)
-                && swarm.ids.get(name).copied() == bot["id"].as_i64()
+            let (Some(id), used) = (bot["id"].as_i64(), bot["tokens_used"].as_u64()) else {
+                continue;
+            };
+            if swarm.members.iter().any(|m| m == name) {
+                if swarm.ids.get(name) == Some(&id) {
+                    out.turns
+                        .push((name.to_owned(), bot["running_turn"].as_i64()));
+                    out.used += used.unwrap_or(0);
+                }
+            } else if bot["created_by_id"]
+                .as_i64()
+                .is_some_and(|by| makers.contains(&by))
             {
-                out.push((name.to_owned(), bot["running_turn"].as_i64()));
+                makers.insert(id);
+                out.helpers.push((name.to_owned(), id));
+                out.used += used.unwrap_or(0);
             }
         }
         match page["next_after"].as_str() {
-            Some(next) if out.len() < swarm.members.len() => after = next.to_owned(),
-            _ => return Ok(out),
+            Some(next) => after = next.to_owned(),
+            None => return Ok(out),
         }
     }
 }
@@ -1915,34 +2017,31 @@ pub async fn act(
         if s.stopped {
             return Err("swarm_stopped: the user stopped this swarm; end your turn".into());
         }
-    } else if s.stopped && matches!(act, Act::Post { .. }) {
-        // Your post resumes a stopped swarm.
-        s.stopped = false;
-        s.write(&dir)?;
     }
+    // Your post resumes a stopped swarm, once it is on the board.
+    let resumed = author.is_none() && s.stopped && matches!(act, Act::Post { .. });
+    s.stopped &= !resumed;
     let bot = author.as_ref().map(|a| a.bot.as_str());
     // A swarm you stopped keeps what you decided on the board, and tells
     // nobody; a role or a join tells nobody either.
-    let turns = if s.stopped || matches!(act, Act::Role(_) | Act::Join(_)) {
-        Vec::new()
+    let seen = if s.stopped || matches!(act, Act::Role(_) | Act::Join(_)) {
+        Scan::default()
     } else {
-        running_turns(client, &s).await?
+        scan(client, &s).await?
     };
+    let turns = &seen.turns;
     let running = |m: &str| turns.iter().find(|(n, _)| n == m).and_then(|(_, t)| *t);
     // Each line says how many agents it reached, so what a swarm's posts
     // cost in deliveries is on its board.
     let (sends, mut answer) = locked_with(&mut board, &dir, |state| {
-        let (mut lines, notices, answer) = plan(&s, state, bot, act, now_ms())?;
-        let mut sends = Vec::new();
-        let told = !notices.is_empty() && !s.stopped;
-        for notice in notices.into_iter().filter(|_| !s.stopped) {
-            let reach = match &notice.audience {
+        let checked = !matches!(act, Act::Role(_) | Act::Join(_));
+        let (mut lines, notices, mut answer) = plan(&s, state, bot, act, now_ms())?;
+        let reach = |notice: &Notice| -> Vec<(String, Reach)> {
+            match &notice.audience {
                 Audience::Post { scope, text } => {
                     readers(&s, bot, text, scope.as_deref(), &running)
                 }
-                Audience::Wake { who, working } => s
-                    .members
-                    .iter()
+                Audience::Wake { who, working } => (s.members.iter())
                     .filter(|m| Some(m.as_str()) != bot)
                     .filter_map(|m| match (who.contains(m), running(m)) {
                         (true, _) => Some((m.clone(), Reach::Wake)),
@@ -1950,12 +2049,14 @@ pub async fn act(
                         _ => None,
                     })
                     .collect(),
-            };
-            sends.extend(
-                reach
-                    .into_iter()
-                    .map(|(m, r)| (m, r, notice.prompt.clone())),
-            );
+            }
+        };
+        // Each send: to whom, how, what, and whether the author sent it.
+        let mut sends = Vec::new();
+        let told = !notices.is_empty() && !s.stopped;
+        for notice in notices.iter().filter(|_| !s.stopped) {
+            let to = reach(notice).into_iter();
+            sends.extend(to.map(|(m, r)| (m, r, notice.prompt.clone(), true)));
         }
         if let Some(first) = lines.first_mut().filter(|_| told) {
             first["reached"] = json!(sends.len());
@@ -1966,14 +2067,33 @@ pub async fn act(
                 line["turn"] = json!(author.turn);
             }
         }
+        // Every act that asked the daemon also tells the working agents when
+        // the swarm passes a share of its budget; the author hears it in its
+        // answer.
+        if checked
+            && !s.stopped
+            && let Some((mut line, notice)) = spent(&s, state, seen.used, now_ms())
+        {
+            let to: Vec<_> = reach(&notice).into_iter().collect();
+            line["reached"] = json!(to.len());
+            answer["budget"] = line["text"].clone();
+            lines.push(line);
+            sends.extend(
+                to.into_iter()
+                    .map(|(m, r)| (m, r, notice.prompt.clone(), false)),
+            );
+        }
         Ok((lines, (sends, answer)))
     })?;
+    if resumed {
+        s.write(&dir)?;
+    }
     // Distinct per post, even for two in one millisecond from one process.
     static POSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let stamp = format!("swarm-{}-{}-{n}", now_ms(), std::process::id());
     let mut submits = tokio::task::JoinSet::new();
-    for (i, (member, reach, prompt)) in sends.into_iter().enumerate() {
+    for (i, (member, reach, prompt, authored)) in sends.into_iter().enumerate() {
         let mut params = json!({
             "bot": member, "bot_id": s.ids.get(&member), "request_id": format!("{stamp}-{i}"),
             "prompt": prompt, "delivery": "steer",
@@ -1981,7 +2101,7 @@ pub async fn act(
         if let Reach::Running(turn) = reach {
             params["expected_turn"] = json!(turn);
         }
-        if let Some(author) = &author {
+        if let Some(author) = author.as_ref().filter(|_| authored) {
             params["from"] = json!({"bot": author.bot, "turn": author.turn});
         }
         let client = client.clone();
@@ -3058,6 +3178,18 @@ mod tests {
             Box::new(|op, request| {
                 let bot = request["bot"].as_str().unwrap_or_default();
                 match (op, bot) {
+                    // latency-1 made a helper, which made its own; a bot in
+                    // the swarm's range that no agent made is not a helper.
+                    ("bots", _) => Ok(json!({"bots": [
+                        {"name": agent(1), "id": 1, "tokens_used": 10},
+                        {"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1},
+                        {"name": "agent.latency-1.fix.deep", "id": 41, "created_by_id": 40},
+                        {"name": "agent.latency-1.stray", "id": 42, "created_by_id": 77},
+                        {"name": agent(2), "id": 99},
+                        {"name": "agent.other", "id": 50},
+                    ], "next_after": null})),
+                    ("resume", "agent.latency-1.fix") => Ok(json!({"id": 40})),
+                    ("resume", "agent.latency-1.fix.deep") => Ok(json!({"id": 41})),
                     // latency-2 was deleted and made again: another bot now.
                     ("resume", "agent.latency-2") => Ok(json!({"id": 99})),
                     ("resume", "agent.latency-3") => Err("bot_not_found".into()),
@@ -3081,15 +3213,180 @@ mod tests {
         assert_eq!(out["failed"], json!([]));
         assert_eq!(out["swarm"]["stopped"], true);
         assert_eq!(out["swarm"]["members"], json!([agent(1)]));
-        let ended: Vec<Value> = fake
-            .ops("interrupt")
-            .iter()
-            .map(|i| json!([i["bot"], i["turn"]]))
+        let ended = |bot: &str| -> Vec<Value> {
+            (fake.ops("interrupt").iter())
+                .filter(|i| i["bot"] == bot)
+                .map(|i| i["turn"].clone())
+                .collect()
+        };
+        for bot in [
+            agent(1).as_str(),
+            "agent.latency-1.fix",
+            "agent.latency-1.fix.deep",
+        ] {
+            assert_eq!(ended(bot), vec![json!(7), json!(6)], "{bot}");
+        }
+        let listed: std::collections::BTreeSet<String> = (fake.ops("turns").iter())
+            .map(|t| t["bot"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(ended, vec![json!([agent(1), 7]), json!([agent(1), 6])]);
-        assert!(fake.ops("turns").iter().all(|t| t["bot"] == agent(1)));
+        assert_eq!(listed.len(), 3, "{listed:?}");
+        assert!(!listed.contains("agent.latency-1.stray"));
         let read = Swarm::read(&dir).unwrap();
         assert!(read.stopped && read.rows.len() == 1 && read.ids.len() == 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_board_says_each_share_of_the_budget_once() {
+        let root = scratch("spent");
+        let s = swarm(&[&agent(1), &agent(2)]);
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let used = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+        let now = used.clone();
+        let fake = Fake::start(
+            "spent",
+            Box::new(move |op, _| match op {
+                // latency-1 works; its helper's tokens count too.
+                "bots" => Ok(json!({"bots": [
+                    {"name": agent(1), "id": 1, "running_turn": 4, "tokens_used": now.load(std::sync::atomic::Ordering::Relaxed)},
+                    {"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1, "tokens_used": 600_000},
+                    {"name": agent(2), "id": 2},
+                ], "next_after": null})),
+                "submit" => Ok(json!({"status": "steered"})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let check = || {
+            rt.block_on(act(&client, &root, &s.name, None, Act::Check))
+                .unwrap()
+        };
+        // 1.6M of 3M: past half, once.
+        assert_eq!(
+            check()["budget"],
+            "the swarm has used 50% of its budget (1.6M of 3M tokens)"
+        );
+        assert_eq!(check()["budget"], Value::Null);
+        // Past 90% at once: only the highest share is said.
+        used.store(2_200_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            check()["budget"],
+            "the swarm has used 90% of its budget (2.8M of 3M tokens)"
+        );
+        let steers = fake.ops("submit");
+        assert_eq!(steers.len(), 2);
+        assert!(
+            steers
+                .iter()
+                .all(|q| q["bot"] == agent(1) && q["expected_turn"] == 4 && q["from"].is_null())
+        );
+        let board = std::fs::read_to_string(dir.join("board.jsonl")).unwrap();
+        let spent: Vec<Value> = (board.lines())
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|l| l["from"] == "budget")
+            .map(|l| json!([l["spent"], l["reached"]]))
+            .collect();
+        assert_eq!(spent, vec![json!([50, 1]), json!([90, 1])]);
+        assert_eq!(State::read(&dir).unwrap().spent, 90);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_hooks_get_no_keys() {
+        // Cargo gives a test run variables no ordinary shell has.
+        if std::env::var_os("CARGO_MANIFEST_DIR").is_none() {
+            return;
+        }
+        let repo = scratch("hooks");
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{status:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        let hook = repo.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nenv > '{}/seen'\n", repo.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let out = runtime().block_on(async {
+            git()
+                .arg("-C")
+                .arg(&repo)
+                .args(["checkout", "-q", "-b", "other"])
+                .output()
+                .await
+        });
+        assert!(out.unwrap().status.success());
+        let seen = std::fs::read_to_string(repo.join("seen")).unwrap();
+        assert!(seen.lines().any(|l| l.starts_with("PATH=")), "{seen}");
+        assert!(!seen.contains("CARGO_MANIFEST_DIR="), "{seen}");
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn a_failed_start_never_removes_a_project_folder() {
+        let root = scratch("owned");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut s = swarm(&[]);
+        s.workspace = project.display().to_string();
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        runtime().block_on(discard(&dir, &s, false)).unwrap();
+        assert!(!dir.exists() && project.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_stopped_swarm_takes_no_agent_and_resumes_only_with_a_post_on_the_board() {
+        let root = scratch("resume");
+        let mut s = swarm(&[&agent(1)]);
+        s.stopped = true;
+        let dir = claim(&root, &s.name).unwrap();
+        fill(&dir, &s, Path::new("/app")).unwrap();
+        let listing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let up = listing.clone();
+        let fake = Fake::start(
+            "resume",
+            Box::new(move |op, _| match op {
+                "bots" if up.load(std::sync::atomic::Ordering::Relaxed) => Ok(json!({
+                    "bots": [{"name": agent(1), "id": 1}], "next_after": null,
+                })),
+                "bots" => Err("unavailable".into()),
+                "submit" => Ok(json!({"status": "started"})),
+                _ => Err("unexpected".into()),
+            }),
+        );
+        let rt = runtime();
+        let (client, _events) = rt.block_on(Client::connect(&fake.socket)).unwrap();
+        let added = rt.block_on(add(&client, &root, &s.name, 0)).unwrap_err();
+        assert!(added.starts_with("swarm_stopped"), "{added}");
+        let post = || Act::Post {
+            text: "go on".into(),
+            all: true,
+        };
+        // A post that never reached the board leaves the swarm stopped.
+        assert!(
+            rt.block_on(act(&client, &root, &s.name, None, post()))
+                .is_err()
+        );
+        assert!(Swarm::read(&dir).unwrap().stopped);
+        listing.store(true, std::sync::atomic::Ordering::Relaxed);
+        rt.block_on(act(&client, &root, &s.name, None, post()))
+            .unwrap();
+        assert!(!Swarm::read(&dir).unwrap().stopped);
         std::fs::remove_dir_all(root).unwrap();
     }
 
