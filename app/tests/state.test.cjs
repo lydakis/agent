@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, setupHTML, refreshModels };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts, openSetup, connectProvider, removeProvider, providerSpecs, act, setupHTML, refreshModels };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -1241,4 +1241,31 @@ test('a daemon with no provider to run opens setup instead of an error', async (
   assert.equal(p.S.setup.open, true);
   assert.equal(p.S.setup.adding, '');
   assert.match(p.setupHTML(), /Set up Agent/); assert.match(p.setupHTML(), /data-v="bedrock">Amazon Bedrock</); assert.doesNotMatch(p.setupHTML(), /bedrock-openai/);
+});
+
+test('a refused model list says why and can be asked again; a key already set answers for an empty field', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai' }, lists: { openai: { models: [] } } });
+  p.context.Daemon.discoverModels = async () => ({ providers: { openai: { models: 0 } }, written: false, error: 'models_none_listed: openai: no usable models' });
+  await p.openSetup();
+  await p.refreshModels();
+  const html = p.setupHTML();
+  assert.match(html, /models_none_listed: openai: no usable models/);
+  assert.match(html, /data-act="setup-refresh"/); assert.match(html, /No models listed yet/);
+  // OPENAI_API_KEY from the shell: re-adding OpenAI with the field left empty keeps using it.
+  p.S.setup.settings.keys = ['OPENAI_API_KEY'];
+  await p.connectProvider('openai', { OPENAI_API_KEY: '' });
+  assert.deepEqual({ ...calls.find(([c]) => c === 'save')[1] }, { AGENT_PROVIDER: 'openai' });
+  await assert.rejects(p.connectProvider('anthropic', { ANTHROPIC_API_KEY: '' }), /API key is required/);
+});
+
+test('removing a provider while agents work asks once more before the restart stops them', async () => {
+  const { p, calls } = settingsShell({ env: { AGENT_PROVIDER: 'openai anthropic', ANTHROPIC_API_KEY: 'k' }, lists: { openai: { models: [{ id: 'gpt' }] }, anthropic: { models: [{ id: 'claude' }] } } });
+  await p.openSetup();
+  p.upsert({ name: 'busy', id: 1, provider: 'openai', model: 'gpt', status: 'running', running_turn: 3 }); p.S.botsGen += 1;
+  const press = () => p.act({ dataset: { act: 'setup-remove', v: 'anthropic' } });
+  await press();
+  assert.equal(calls.filter(([c]) => c === 'save').length, 0);
+  assert.match(p.setupHTML(), /Remove anyway/); assert.match(p.setupHTML(), /Removing restarts the daemon/);
+  await press();
+  assert.equal(calls.filter(([c]) => c === 'save').length, 1);
 });

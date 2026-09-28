@@ -1466,13 +1466,16 @@ async function refreshModels() {
   const st = setupState();
   const names = (st.settings?.providers ?? []).map(specName);
   st.status = Object.fromEntries(names.map((n) => [n, 'checking'])); st.busy = 'Asking your providers for their models…'; renderSetup();
+  let refused = null;
   try {
     const found = await Daemon.discoverModels();
     st.status = Object.fromEntries(names.map((n) => [n, found.providers?.[n] ?? answerOf(null)]));
-    st.listError = found.written ? null : found.error;
+    if (!found.written) refused = found.error;
   } catch (e) { st.error = String(e?.message ?? e); }
   finally { st.busy = null; }
   await readList();
+  // Why nothing was written outlasts reading the old list back.
+  if (refused) { st.listError = refused; renderSetup(); }
 }
 // Apply saved settings: the daemon restarts (running turns stop) and the window attaches again.
 async function restartDaemon() {
@@ -1485,7 +1488,8 @@ async function restartDaemon() {
 }
 async function connectProvider(id, values) {
   const st = setupState(); const c = catalogOf(id); if (!c) return;
-  for (const f of c.fields) if (f.required && !values[f.key]) throw new Error(`${f.label} is required`);
+  // A key already set, saved here or exported by the shell, answers for an empty field.
+  for (const f of c.fields) if (f.required && !values[f.key] && !(f.secret && st.settings?.keys?.includes(f.key))) throw new Error(`${f.label} is required`);
   const specs = (st.settings?.providers ?? []).filter((s) => catalogOf(specName(s)) !== c);
   // A saved Bedrock key stays in use when its field is left empty.
   const keyed = c.parts && !values.AWS_BEARER_TOKEN_BEDROCK && st.settings?.keys?.includes('AWS_BEARER_TOKEN_BEDROCK') ? { ...values, AWS_BEARER_TOKEN_BEDROCK: 'saved' } : values;
@@ -1527,7 +1531,7 @@ function setupHTML() {
   };
   const errorsHTML = (names) => names.filter((n) => st.status[n]?.error).map((n) => { const s = st.status[n]; return `<div class="perr">${names.length > 1 ? `${esc(n)}: ` : ''}${esc(s.error)}${s.detail ? `: ${esc(String(s.detail).slice(0, 300))}` : ''}</div>`; }).join('');
   const entries = []; for (const spec of specs) { const n = specName(spec), c = catalogOf(n), key = c?.id ?? n; if (!entries.some((e) => e.key === key)) entries.push({ key, label: c?.label ?? n, names: specs.map(specName).filter((m) => (catalogOf(m)?.id ?? m) === key) }); }
-  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}<button type="button" class="sbtn" data-act="setup-remove" data-v="${esc(key)}"${busy}>Remove</button></span>${errorsHTML(names)}</div>`; }).join('');
+  const rows = entries.map(({ key, label, names }) => { const failed = names.some((n) => st.status[n]?.error); return `<div class="prow"><span class="pn">${esc(label)}</span>${statusHTML(names)}<span class="acts">${failed ? `<button type="button" class="sbtn" data-act="setup-retry"${busy}>Retry</button>` : ''}<button type="button" class="sbtn${st.confirm === key ? ' danger' : ''}" data-act="setup-remove" data-v="${esc(key)}"${busy}>${st.confirm === key ? 'Remove anyway' : 'Remove'}</button></span>${errorsHTML(names)}${st.confirm === key ? '<div class="perr warn">Agents are working. Removing restarts the daemon, which stops them.</div>' : ''}</div>`; }).join('');
   let add = '';
   if (st.adding === null) add = `<button type="button" class="sbtn" data-act="setup-add"${busy}>＋ Add a provider</button>`;
   else if (st.adding === '') add = `<div class="choices">${CATALOG.filter((c) => !specs.some((s) => catalogOf(specName(s)) === c)).map((c) => `<button type="button" class="choice" data-act="setup-pick" data-v="${c.id}"${busy}>${esc(c.label)}</button>`).join('')}</div>${specs.length ? `<button type="button" class="sbtn" data-act="setup-cancel">Cancel</button>` : ''}`;
@@ -1539,12 +1543,12 @@ function setupHTML() {
     add = `<form class="pform" id="setupform"><b>${esc(c.label)}</b>${c.about ? `<p>${esc(c.about)}</p>` : ''}${fields}${working}<div class="row"><button type="submit" class="sbtn primary"${busy}>Connect</button><button type="button" class="sbtn" data-act="setup-cancel"${busy}>Cancel</button></div></form>`;
   }
   const ready = Object.values(st.status).some((s) => s?.models > 0) || st.list.length > 0;
-  const refresh = ready ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
+  const refresh = specs.length && S.attached ? `<button type="button" class="sbtn" data-act="setup-refresh"${busy}>Refresh models</button>` : '';
   const listed = st.listError ? `<p class="bad">${esc(st.listError)}</p>` : '';
   const projects = hasProject();
   const project = projects ? '' : ready && st.list.length
     ? `<form id="setupproj"><label><span>Folder</span><input id="setupdir" autocomplete="off" spellcheck="false" value="${esc(S.config?.workspace ?? '')}"></label><label><span>Model</span>${modelSelectHTML('setupmodel', st.list)}</label><div class="row"><button type="submit" class="sbtn primary"${S.attached ? '' : ' disabled'}${busy}>Create project</button></div><p class="dim">The project's lead runs on this model; every agent you start can use another.</p></form>`
-    : '<p class="dim">Connect a provider first.</p>';
+    : `<p class="dim">${specs.length ? 'No models listed yet: see the providers above, then Refresh models.' : 'Connect a provider first.'}</p>`;
   const step = (n, title, done, body) => body ? `<section class="${done ? 'done' : ''}"><h3><span class="num">${done ? '✓' : n}</span>${title}</h3>${body}</section>` : '';
   return `<div class="shead"><b>${ready && projects ? 'Settings' : 'Set up Agent'}</b><button type="button" class="ibtn" data-act="setup-close" title="Close" aria-label="Close"${busy}>✕</button></div>`
     + step(1, 'Providers', ready, `${rows}<div class="row">${add}${st.adding === null ? refresh : ''}</div>${listed}`)
@@ -1689,7 +1693,8 @@ async function act(el) {
     case 'setup-add': setupState().adding = ''; renderSetup(); return;
     case 'setup-pick': setupState().adding = v; renderSetup(); $('setup').querySelector('#setupform input')?.focus(); return;
     case 'setup-cancel': setupState().adding = null; renderSetup(); return;
-    case 'setup-remove': await removeProvider(v); return;
+    // Removing restarts the daemon; with agents working, the first press says so and the second removes.
+    case 'setup-remove': { const st = setupState(); if (anyActive() && st.confirm !== v) { st.confirm = v; renderSetup(); return; } st.confirm = null; await removeProvider(v); return; }
     case 'setup-retry': case 'setup-refresh': await refreshModels(); return;
     default: return;
   }
