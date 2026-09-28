@@ -1607,4 +1607,9 @@ test('an older daemon on the socket is replaced from the detached screen; a newe
   p.lost('daemon_protocol_mismatch (the daemon speaks protocol 3, this client 4)');
   assert.doesNotMatch(screen.innerHTML, /replace-daemon/);
   assert.match(screen.innerHTML, /this window did not start it: stop it with its own agent/);
+  // Equal numbers name no older or newer daemon, so nothing is restarted and retrying goes on.
+  p.S.config = { managed: true };
+  p.lost('daemon_protocol_mismatch (the daemon speaks protocol 4, this client 4)');
+  assert.doesNotMatch(screen.innerHTML, /replace-daemon|update the app/);
+  assert.match(screen.innerHTML, /· retrying/);
 });

@@ -201,7 +201,7 @@ the app, leaves the window detached with **Restart the daemon**: the app
 sends SIGTERM to the process that daemon named in its `ready` line (running
 turns end as interrupted; the store keeps every chat), waits up to 30 seconds
 for it to exit (an exited process nobody has reaped yet counts as gone), and
-attaches, which starts the bundled daemon. Only a daemon whose greeting names
+attaches, which starts the bundled daemon. Only a daemon whose `ready` greeting names
 a protocol strictly older than the app's is signalled. Reattaching pauses
 meanwhile, so nothing starts a daemon while the old one closes its store. A
 daemon newer than the app is left alone: the page says to update the app and

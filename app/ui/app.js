@@ -927,7 +927,8 @@ function idle() { return /^no_provider/.test(S.lastReason ?? '') || olderDaemon(
 // stop it and start its own. One newer than the app is left alone.
 function olderDaemon(reason) {
   const m = /^daemon_protocol_mismatch \(the daemon speaks protocol (\d+), this client (\d+)\)/.exec(reason ?? '');
-  return m ? (Number(m[1]) < Number(m[2]) ? 'older' : 'newer') : null;
+  if (!m || m[1] === m[2]) return null;
+  return Number(m[1]) < Number(m[2]) ? 'older' : 'newer';
 }
 function showDetached(reason) {
   S.attached = false;

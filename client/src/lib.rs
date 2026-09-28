@@ -165,7 +165,14 @@ impl Client {
             Some(line) => serde_json::from_str::<Value>(&line)?,
             None => return Err(Error::new("daemon_disconnected")),
         };
-        if ready["event"] != "ready" || ready["protocol"].as_u64() != Some(PROTOCOL) {
+        if ready["event"] != "ready" {
+            // Not a daemon's greeting, so nothing it says about itself counts.
+            return Err(Error::with(
+                "daemon_greeting_invalid",
+                &format!("{} did not greet as a daemon", socket.display()),
+            ));
+        }
+        if ready["protocol"].as_u64() != Some(PROTOCOL) {
             // What the daemon announced, so a client that starts daemons can
             // tell an older one it may replace from a newer one it must not.
             let mut error = Error::with(

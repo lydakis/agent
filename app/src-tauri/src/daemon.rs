@@ -113,16 +113,10 @@ pub async fn replace_older(socket: &Path) -> Result<(), String> {
         Err(error) if error.code == "daemon_protocol_mismatch" => error.facts.unwrap_or_default(),
         Err(error) => return Err(error.to_string()),
     };
-    // Only a daemon that says it is older is signalled: a listener that did
-    // not greet as a daemon of this protocol, or of any, is not this app's.
+    // Only a daemon that greeted as one and says it is older is signalled; a
+    // listener that did not greet as a daemon fails to connect otherwise.
     match facts.get("protocol").and_then(|p| p.as_u64()) {
         Some(protocol) if protocol < agent_client::PROTOCOL => {}
-        Some(protocol) if protocol == agent_client::PROTOCOL => {
-            return Err(
-                "daemon_not_older: what answers on the socket did not greet as a daemon; stop it by hand"
-                    .into(),
-            );
-        }
         protocol => {
             return Err(format!(
                 "daemon_newer: the daemon speaks protocol {}, this app {}; update the app",
@@ -413,14 +407,17 @@ mod tests {
         assert!(exit.recv_timeout(Duration::from_millis(200)).is_err());
         // SAFETY: the stand-in this test started.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-        // A listener of this very protocol that did not greet as a daemon is not signalled.
-        let same = dir.join("same.sock");
-        let (pid, exit) = greeting(&same, "hello", agent_client::PROTOCOL);
-        let refused = runtime.block_on(replace_older(&same)).unwrap_err();
-        assert!(refused.starts_with("daemon_not_older"), "{refused}");
-        assert!(exit.recv_timeout(Duration::from_millis(200)).is_err());
-        // SAFETY: the stand-in this test started.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // A listener that did not greet as a daemon is not signalled, whatever
+        // protocol it names.
+        for protocol in [agent_client::PROTOCOL - 1, agent_client::PROTOCOL] {
+            let foreign = dir.join(format!("foreign-{protocol}.sock"));
+            let (pid, exit) = greeting(&foreign, "hello", protocol);
+            let refused = runtime.block_on(replace_older(&foreign)).unwrap_err();
+            assert!(refused.starts_with("daemon_greeting_invalid"), "{refused}");
+            assert!(exit.recv_timeout(Duration::from_millis(200)).is_err());
+            // SAFETY: the stand-in this test started.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
         // Nothing listening is nothing to replace.
         runtime
             .block_on(replace_older(&dir.join("none.sock")))
