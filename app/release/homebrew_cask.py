@@ -36,6 +36,7 @@ def render_cask(version: str, archive: Path) -> str:
   depends_on :macos
 
   app "Agent.app"
+  binary "#{{appdir}}/Agent.app/Contents/MacOS/agent"
 
   # The app starts a daemon from its bundle that outlives the window. Stop it
   # (letting running turns finish) before the bundle goes, as on an upgrade.

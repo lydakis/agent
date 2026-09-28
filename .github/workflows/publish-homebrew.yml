@@ -122,6 +122,9 @@ jobs:
         if: steps.prepare.outputs.changed == 'true'
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          # brew audit --online calls the GitHub API; unauthenticated calls
+          # share the runner's per-address limit and can fail the release.
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ruby -c tap/Casks/agent.rb
           tap_parent="$(brew --repository)/Library/Taps/lydakis"

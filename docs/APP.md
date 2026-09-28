@@ -192,8 +192,9 @@ The app is published as a Homebrew cask for macOS (Apple silicon and Intel):
 brew install --cask lydakis/agent/agent
 ```
 
-The bundle carries the `agent` runtime as `Agent.app/Contents/MacOS/agent`;
-the cask does not put it on `PATH`. When the app finds no daemon on its
+The bundle carries the `agent` runtime as `Agent.app/Contents/MacOS/agent`,
+and the cask links it onto `PATH` as `agent`, so the terminal's CLI is always
+the app's own version. When the app finds no daemon on its
 store's socket, it runs that binary as `agent start --store STORE`, which
 starts the daemon exactly as a CLI command would: providers from
 `AGENT_PROVIDER` or the keys that are set, the log beside the store, a
@@ -641,12 +642,11 @@ A task's runs rendered while it worked matched a full redraw of the same pane.
 
 1. Run it against a real daemon and model by eye; fix what the screenshot
    shows.
-2. The first release: create the tap, set the secrets, tag `v0.1.0`.
-3. Refuse a `~/.agent/env` that a macOS ACL makes readable by other
+2. Refuse a `~/.agent/env` that a macOS ACL makes readable by other
    accounts; today only its POSIX mode is checked.
-4. Stop a daemon the app started for a store other than `~/.agent`'s when
+3. Stop a daemon the app started for a store other than `~/.agent`'s when
    the cask is uninstalled; the uninstall hook stops only the default one.
-5. The rest of the projects design (the "Agent App Concepts" prototype), in
+4. The rest of the projects design (the "Agent App Concepts" prototype), in
    the order [NEXT item 47](NEXT.md) gives.
 
 ## Regression checks
