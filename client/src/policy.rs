@@ -361,6 +361,7 @@ fn is_file(path: &Path) -> Result<bool, Failure> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
+            not_dangling(path)?;
             Ok(false)
         }
         Err(error) => Err(Failure::Unreadable {
@@ -368,6 +369,26 @@ fn is_file(path: &Path) -> Result<bool, Failure> {
             reason: error.to_string(),
         }),
     }
+}
+
+/// Called when `path` does not resolve. A link to a missing target, at
+/// `path` or at the nearest part of it that exists (a dangling `.agents` or
+/// skill folder), is present, so it is an error, not an absence another
+/// folder's file may stand in for. Usually one extra lookup: the parent.
+fn not_dangling(path: &Path) -> Result<(), Failure> {
+    for part in path.ancestors() {
+        let Ok(meta) = std::fs::symlink_metadata(part) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() && std::fs::metadata(part).is_err() {
+            return Err(Failure::Unreadable {
+                path: part.to_path_buf(),
+                reason: "a link to a missing file".into(),
+            });
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn entry_row(entry: &Entry) -> String {
@@ -402,7 +423,10 @@ fn index(dirs: Vec<PathBuf>, kind: Kind, budget: usize) -> Result<Vec<Entry>, Fa
     for dir in dirs {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                not_dangling(&dir)?;
+                continue;
+            }
             Err(error) => {
                 return Err(Failure::Unreadable {
                     path: dir,
@@ -927,6 +951,45 @@ mod tests {
         );
         std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
         let _ = std::fs::remove_dir_all(&other);
+        // A link to nothing is present, so it is reported rather than
+        // letting the user's entry of the same name stand in for it.
+        std::os::unix::fs::symlink("gone.md", root.join(".agents/agents/reviewer.md")).unwrap();
+        assert_eq!(
+            profile(&root, "reviewer").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/agents/reviewer.md")).unwrap();
+        std::fs::remove_dir_all(root.join(".agents/skills/review")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join(".agents/skills/review")).unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/skills/review")).unwrap();
+        std::os::unix::fs::symlink("gone.md", root.join("AGENTS.md")).unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join("AGENTS.md")).unwrap();
+        // So is a dangling folder on the way: `.agents` itself, or the skills
+        // folder, whose absence would otherwise let home's entries stand in.
+        std::fs::rename(root.join(".agents"), root.join("agents.real")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join(".agents")).unwrap();
+        assert_eq!(
+            profile(&root, "reviewer").unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents")).unwrap();
+        std::fs::rename(root.join("agents.real"), root.join(".agents")).unwrap();
+        std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join(".agents/skills")).unwrap();
+        assert_eq!(
+            instructions(&root, None).unwrap_err().code(),
+            "instructions_unreadable"
+        );
+        std::fs::remove_file(root.join(".agents/skills")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
         // A stray file where a skill folder would be is simply not a skill.
         std::fs::remove_dir_all(root.join(".agents/skills")).unwrap();
         std::fs::create_dir_all(root.join(".agents/skills")).unwrap();
