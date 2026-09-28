@@ -638,11 +638,21 @@ async fn worktree(trees: &Path, project: &Path, swarm: &str) -> Result<String, S
             Err(error) => Some(format!("setup_failed: {error}")),
         };
         if let Some(failed) = failed {
+            // The branch goes from where its worktree has it, which setup may
+            // have moved with a commit.
+            let at = git(&["rev-parse", "--verify", "--quiet", &branch])
+                .output()
+                .await
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
             let _ = git(&["worktree", "remove", "--force"])
                 .arg(&tree)
                 .output()
                 .await;
-            let _ = git(&["update-ref", "-d", &branch, &head]).output().await;
+            if let Some(at) = at {
+                let _ = git(&["update-ref", "-d", &branch, &at]).output().await;
+            }
             return Err(failed);
         }
     }
@@ -4682,7 +4692,12 @@ mod tests {
         // A setup that fails takes the worktree and its branch with it.
         let setup = repo.join(".agents/setup");
         std::fs::create_dir_all(setup.parent().unwrap()).unwrap();
-        std::fs::write(&setup, "#!/bin/sh\nexit 3\n").unwrap();
+        // It commits first, moving the branch.
+        std::fs::write(
+            &setup,
+            "#!/bin/sh\ngit -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m setup\nexit 3\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&setup, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         let failed = rt.block_on(worktree(&trees, &repo, "p.setup")).unwrap_err();
