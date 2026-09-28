@@ -33,7 +33,7 @@ function page(daemon = {}, storage = null) {
   });
   let source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   source = source.slice(0, source.indexOf('// ---------- boot ----------')) +
-    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead };\n})();';
+    'globalThis.app = { setRender: fn => { render = fn; }, S, rail, renderRail, transcript, upsert, onEvent, handle, pump, loadBatch, evict, itemsHTML, attach, lost, enqueue, load, cssEsc, esc, submit, interrupt, seat, botRowHTML, renderTail, tree, shortName, runStart, runHTML, botMenuItems, modelChoices, modelMenuItems, sendMenuItems, setSend, setModel, fork, remove, createProject, openOnly, openBeside, swap, save, restore, showMenu, refreshMenu, entries, pickerRows, closeSide, waitSummary, nextBeside, sideChat, renderHead, followDrafts };\n})();';
   vm.runInContext(source, context);
   return { ...context.app, context, elements, async tick() { const jobs = [...timers.values()]; timers.clear(); jobs.forEach(fn => fn()); await settle(); } };
 }
@@ -610,6 +610,8 @@ test('completed Responses and Anthropic thoughts retain observed thinking durati
 
 // ---------- the app shell: projects, panes, composers, menus, runs ----------
 const shell = (daemon = {}, storage = null) => { const p = page(daemon, storage); p.setRender(() => {}); p.S.session = 1; p.S.config = { workspace: '/synthetic', model: 'alpha/one', tools: [] }; return p; };
+// A window whose renders move drafts, as the real render does.
+const drafting = (daemon = {}) => { const p = shell(daemon); p.setRender(() => p.followDrafts()); return p; };
 const names = (rows) => Array.from(rows, (r) => r.label ?? r.b.name);
 
 test('projects list coordinators with their lineage and prefixed tasks, then other bots', () => {
@@ -965,17 +967,19 @@ test('the demo daemon delivers a steer at the next round boundary and refuses a 
 
 test('Escape in the finder never stops a turn, and a deleted bot takes its draft with it', async () => {
   const sent = [];
-  const p = shell({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
+  const p = drafting({ request: async (op, q) => { sent.push(op); return { nodes: [], next_from: null }; } });
   p.upsert({ name: 'app.lead', id: 1, provider: 'alpha', model: 'one', status: 'running', running_turn: 1 });
   p.upsert({ name: 'app.task', id: 2, provider: 'alpha', model: 'one', created_by: 'app.lead', created_by_id: 1 });
-  p.tree(); p.S.selected = 'app.lead';
+  p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const doc = p.context.document;
   doc.getElementById('pickerq').value = '';
   await doc.listeners.keydown({ key: 'Escape', target: { id: 'pickerq' }, preventDefault() {} });
   assert.deepEqual(sent.filter((op) => op === 'interrupt'), []);
-  p.S.selected = 'app.task'; doc.getElementById('input').value = 'for task';
-  await p.onEvent({ event: 'deleted', bot: 'app.task' });
-  assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, '');
+  doc.getElementById('input').value = 'for lead';
+  await p.openOnly('app.task'); doc.getElementById('input').value = 'for task';
+  await p.onEvent({ event: 'deleted', bot: 'app.task' }); p.followDrafts();
+  assert.equal(p.S.selected, 'app.lead'); assert.equal(doc.getElementById('input').value, 'for lead');
+  assert.equal(p.S.drafts.has('app.task'), false, 'a deleted bot takes its draft with it');
 });
 
 test('the demo daemon ends a stopped turn quietly when its bot is deleted before the script wakes', async () => {
@@ -995,7 +999,7 @@ test('the demo daemon ends a stopped turn quietly when its bot is deleted before
 });
 
 test('a folded run names a timeout or a failed call; the finder reaches folded tasks; a side draft stays with its bot', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [out, want] of [[{ stdout: '', exit_code: null, success: false, timed_out: true }, 'timed out'], [{ stdout: '', exit_code: null, success: false }, 'failed'], [{ stdout: 'ok', exit_code: 0, success: true }, null]])
     assert.equal(p.entries({ type: 'function_call_output', call_id: 'c', output: JSON.stringify(out) })[0].err, want);
   for (const [name, id] of [['app.lead', 1], ['app.build', 2], ['app.test', 3]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
@@ -1004,14 +1008,16 @@ test('a folded run names a timeout or a failed call; the finder reaches folded t
   assert.deepEqual(Array.from(p.pickerRows(), (r) => r.b.name), ['app.build'], 'a folded task is still found');
   const draft = p.context.document.getElementById('sideinput');
   await p.openBeside('app.build'); draft.value = 'for build only';
-  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside starts empty');
+  await p.openBeside('app.test'); assert.equal(draft.value, '', 'another bot beside has its own draft');
   draft.value = 'for test only'; p.closeSide(); assert.equal(draft.value, '');
+  await p.openBeside('app.build'); assert.equal(draft.value, 'for build only', 'a closed pane keeps its bot\'s draft');
+  await p.openBeside('app.test'); assert.equal(draft.value, 'for test only');
 });
 
 test('swap carries each draft with its bot; a long wait list stays short in the head', async () => {
-  const p = shell({ request: async () => ({ nodes: [], next_from: null }) });
+  const p = drafting({ request: async () => ({ nodes: [], next_from: null }) });
   for (const [name, id] of [['app.lead', 1], ['app.build', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
-  p.tree(); p.S.selected = 'app.lead';
+  p.tree(); p.S.selected = 'app.lead'; p.followDrafts();
   const main = p.context.document.getElementById('input'), side = p.context.document.getElementById('sideinput');
   await p.openBeside('app.build'); main.value = 'to lead'; side.value = 'to build';
   p.swap();
@@ -1023,7 +1029,7 @@ test('swap carries each draft with its bot; a long wait list stays short in the 
   side.value = 'still to lead'; await p.nextBeside();
   assert.equal(p.S.ui.side, 'app.lead'); assert.equal(side.value, 'still to lead', 'Ctrl-P onto the same bot keeps its draft');
   p.transcript('app.build').peers = ['app.lead', 'app.test'];
-  await p.nextBeside(); assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'Ctrl-P starts the next bot with an empty draft');
+  await p.nextBeside(); assert.equal(p.S.ui.side, 'app.test'); assert.equal(side.value, '', 'Ctrl-P shows the next bot\'s own draft');
   const b = p.S.bots.get('app.lead'); b.status = 'waiting';
   b.waitingOn = Array.from({ length: 5000 }, (_, i) => `turn:app.t${i}/1`);
   assert.equal(p.waitSummary(b), 'app.t0/1, app.t1/1, app.t2/1 +4997');
@@ -1100,4 +1106,27 @@ test('a bot in a linked worktree shows its branch in its head, read once per fol
   p.upsert({ name: 'app.build', id: 2, provider: 'alpha', model: 'one', workspace: '/synthetic', created_by: 'app.lead', created_by_id: 1 });
   p.renderHead(head, b, 'main'); await new Promise((r) => setImmediate(r));
   assert.doesNotMatch(head.innerHTML, /⎇/, 'a new folder is read again');
+});
+
+test('a draft stays with the bot it was typed for, and Enter sends it there even mid-switch', async () => {
+  const sent = [];
+  let release; const slow = new Promise((r) => { release = r; });
+  const p = drafting({ request: async (op, q) => { if (op === 'history_nodes') await slow; if (op === 'submit') sent.push([q.bot, q.bot_id, q.prompt]); return { nodes: [], next_from: null }; } });
+  for (const [name, id] of [['app.lead', 1], ['app.lead-side', 2]]) p.upsert({ name, id, provider: 'alpha', model: 'one', created_by: id > 1 ? 'app.lead' : null, created_by_id: id > 1 ? 1 : null });
+  p.S.transcripts.get('app.lead-side') ?? p.transcript('app.lead-side').nodes;
+  p.tree(); await p.openOnly('app.lead');
+  const doc = p.context.document, main = doc.getElementById('input');
+  main.value = 'Ship it.';
+  // Sol's audit, step 7: the coordinator's text followed the selection to its side chat.
+  release(); await p.openOnly('app.lead-side');
+  assert.equal(main.value, '', 'the side chat has its own, empty composer');
+  main.value = 'Only for the side chat.';
+  await p.openOnly('app.lead');
+  assert.equal(main.value, 'Ship it.');
+  // Enter while another bot is being opened: the text goes to the bot it was typed for.
+  const opening = p.openOnly('app.lead-side');
+  await doc.getElementById('form').listeners.submit({ preventDefault() {} });
+  await opening;
+  assert.deepEqual(sent, [['app.lead', 1, 'Ship it.']]);
+  assert.equal(main.value, 'Only for the side chat.');
 });

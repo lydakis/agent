@@ -251,7 +251,11 @@ daemon learns nothing about projects; everything here is client work.
   no model or workspace, so it joins the running turn, and it names that
   turn (`expected_turn`): if the turn ended meanwhile, the daemon refuses it
   as `stale_turn` and the message stays in the composer. A model pick is
-  remembered for the bot's identity, not its name.
+  remembered for the bot's identity, not its name. Unsent text belongs to
+  the bot it was typed for: a pane that shows another bot puts it away and
+  brings back that bot's own, a closed side pane keeps it, and Enter sends
+  it to the bot it was typed for even if the pane is already switching.
+  Drafts live for the window's life and go with a deleted bot.
 - **One menu per agent**, from the head's ⋯, a sidebar row's or card's ⋯ on
   hover, or a right-click: side chat, stop, fork (an exact copy of a bot at rest in its
   folder, next to it in the tree, opened beside), delete (confirmed), and every run's
