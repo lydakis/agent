@@ -1362,7 +1362,7 @@ async function openSwarmSheet(project) {
   const sel = (id, opts, on) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(on) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
   $('sheet').innerHTML = `<h4>New swarm in ${esc(project)}</h4>
     <label for="sw-goal">Goal</label><textarea id="sw-goal" rows="3" placeholder="What should they get done together?"></textarea>
-    <div class="row"><div><label for="sw-n">Agents</label><input id="sw-n" type="number" min="1" max="${MAX_AGENTS}" step="1" value="4"></div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget</label><span class="unit"><input id="sw-budget" type="number" min="0.1" max="${MAX_BUDGET_M}" step="any" value="3" aria-label="Budget in millions of tokens">M tokens</span></div></div>
+    <div class="row"><div><label for="sw-n">Agents</label><input id="sw-n" type="number" min="1" max="${MAX_AGENTS}" step="1" value="4"></div><div class="wide"><label for="sw-where">They work in</label>${sel('sw-where', [['shared', 'One shared worktree'], ['project', 'The project folder']], 'shared')}</div><div><label for="sw-budget">Budget (M)</label><input id="sw-budget" type="number" min="0.1" max="${MAX_BUDGET_M}" step="any" value="3" aria-label="Budget in millions of tokens"></div></div>
     <div id="sw-each" class="hint"></div>
     <label>Made of</label><div id="sw-mix" class="mix"></div>
     <label for="sw-org">Organized as</label>${sel('sw-org', [[0, 'One board: each agent takes a piece'], [3, 'A council of 3 approves streams of work']], 0)}
