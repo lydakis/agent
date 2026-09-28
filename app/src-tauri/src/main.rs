@@ -183,6 +183,8 @@ fn setup(state: State<'_, Shared>) -> Result<Value, String> {
     Ok(json!({
         "socket": state.config.socket.to_string_lossy(),
         "workspace": state.config.workspace,
+        // Whether this window starts the daemon for its store, and so may replace it.
+        "managed": state.agent.is_some() && state.config.store.is_some(),
         "tools": ["shell", "read", "write", "edit", "wait", "history"],
     }))
 }
@@ -483,6 +485,9 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
                 .await
                 .map_err(|e| e.to_string())?
         }
+        Err(error) if error.code == "daemon_protocol_mismatch" => {
+            return Err(daemon::age(&error));
+        }
         Err(error) => return Err(error.to_string()),
     };
     let session = state
@@ -497,6 +502,19 @@ async fn attach(state: State<'_, Shared>, after: i64) -> Result<Value, String> {
     *state.client.lock().await = Some(client);
     state.events.lock().await.replace(session, events);
     Ok(json!({"session": session}))
+}
+
+/// An older daemon owns the store's socket, as after an upgrade: stop it so
+/// the next attach starts the one this app carries. Only for a store this
+/// app starts daemons for; a daemon it was pointed at is its owner's.
+#[tauri::command]
+async fn replace_daemon(state: State<'_, Shared>) -> Result<(), String> {
+    if state.agent.is_none() || state.config.store.is_none() {
+        return Err("daemon_not_ours: this window was given a daemon's socket; stop that daemon with its own agent".into());
+    }
+    daemon::replace_older(&state.config.socket).await?;
+    state.starts.lock().await.forget();
+    Ok(())
 }
 
 /// The next batch of a session's notifications: waits for one, then takes
@@ -702,6 +720,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             setup,
+            replace_daemon,
             policy,
             branch,
             models,

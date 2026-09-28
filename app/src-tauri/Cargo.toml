@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 agent-client = { path = "../../client" }
+libc = "0.2"
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["rt", "sync", "macros", "process", "time"] }
