@@ -483,7 +483,8 @@ daemon learns nothing about projects; everything here is client work.
   leaves its swarm when the app sees it go, taking its share of the budget,
   its role, its stream, its votes on open proposals and the open proposals
   it made (the board keeps them all); its helpers still count in the
-  swarm's tokens and Stop still ends them. A new agent always takes a
+  swarm's tokens and Stop still ends them (`swarm.toml` keeps its bot id
+  in `left` until a look at the daemon's list finds nothing it made). A new agent always takes a
   number no agent of the swarm had, so a name on the board is only ever
   one agent's. A swarm is one sidebar row
   under its project (⁂, working while any agent works); its agents are not
@@ -497,7 +498,9 @@ daemon learns nothing about projects; everything here is client work.
   (agents first, then the helpers they made, looked for again until a look
   finds none it has not stopped and no agent given a turn meanwhile; every unfinished turn, queued ones first, of each member that is still
   the bot that joined; a name now held by another bot leaves instead; and
-  the swarm refuses its agents' posts until your next one is on the board)
+  the swarm refuses its agents' posts until your next one; that post
+  resumes the swarm before it goes on the board, so a failure between leaves it
+  running with nothing new rather than your post on a stopped board)
   or, unless it is stopped, adds one from the row furthest below its share, told to read the board first,
   whose share of tokens the swarm's budget grows by. New agents join and
   get their briefs under the board's lock, so a Stop from another window
@@ -512,7 +515,10 @@ daemon learns nothing about projects; everything here is client work.
   itself for a subtask), named after its maker (`PROJECT.NAME-N.WHAT`) so
   it sorts in the swarm's range of the daemon's list; one made by a member
   or by another helper counts in the swarm's tokens and stops with it, and
-  cannot post. Each act that reads the daemon's list, and a check the page
+  cannot post. The daemon forgets a deleted bot's tokens, so each act that
+  reads its list keeps each helper's tokens in `state.json` (`helpers`), and
+  a helper deleted since counts on (`gone`) with what that look saw it use;
+  what it used after that look is not counted. Each act that reads the daemon's list, and a check the page
   asks for at most every five seconds a swarm as its agents finish turns,
   tells the working agents when the swarm passes 50%, 75% or 90% of its
   budget: a `budget` line on the board, each share once (`state.json`

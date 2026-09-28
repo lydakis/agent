@@ -327,7 +327,7 @@ const memberShort = (sw, name) => (name.startsWith(sw.project + '.') ? name.slic
 // `batch` defers the member index to its caller, which builds it once for all the records it learns.
 function learnSwarm(record, batch = false) {
   const sw = S.swarms.get(record.swarm) ?? { lines: [], offset: null, tab: 'board', used: null, reading: null, again: false, usage: null, state: { roles: {}, streams: {}, proposals: [] }, filter: null };
-  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, budget: record.budget_tokens, mix: record.mix ?? [], members: record.members ?? [], ids: record.ids ?? {}, rows: record.rows ?? {}, stopped: !!record.stopped, council: record.council ?? 0, seats: record.seats ?? [] });
+  Object.assign(sw, { name: record.swarm, dir: record.dir, project: record.project, goal: record.goal, workspace: record.workspace, budget: record.budget_tokens, mix: record.mix ?? [], members: record.members ?? [], ids: record.ids ?? {}, rows: record.rows ?? {}, stopped: !!record.stopped, council: record.council ?? 0, seats: record.seats ?? [], left: record.left ?? [] });
   S.swarms.set(sw.name, sw); if (!batch) indexMembers();
   return sw;
 }
@@ -376,23 +376,28 @@ function readBoard(sw) {
   return sw.reading;
 }
 // Tokens its agents and their helpers have used, from the daemon's list: they sit together in its
-// name order, a helper named after the agent that made it, so after its maker.
+// name order, a helper named after the agent that made it, so after its maker. A member that left
+// still makes its helpers count, and a helper deleted since the board last looked counts with what
+// the board saw it use, as the swarm's budget notices count them.
 async function readUsage(sw) {
   if (sw.usage) return sw.usage;
   sw.usage = (async () => {
-    const prefix = sw.name + '-', makers = new Set(Object.values(sw.ids)); let used = 0, after = sw.name;
+    const prefix = sw.name + '-', makers = new Set([...Object.values(sw.ids), ...(sw.left ?? [])]), seen = new Set();
+    let used = 0, after = sw.name;
     try {
       for (;;) {
         const page = await Daemon.request('bots', { after, limit: 256 }); let past = false;
         for (const r of page.bots ?? []) {
           if (r.name > prefix && !r.name.startsWith(prefix)) { past = true; break; }
           const member = sw.members.includes(r.name);
-          if (member ? sw.ids[r.name] === r.id : makers.has(r.created_by_id)) { if (!member) makers.add(r.id); used += r.tokens_used ?? 0; }
+          if (member ? sw.ids[r.name] === r.id : makers.has(r.created_by_id)) { if (!member) { makers.add(r.id); seen.add(String(r.id)); } used += r.tokens_used ?? 0; }
         }
         if (past || !page.next_after) break;
         after = page.next_after;
       }
-      sw.used = used;
+      const kept = sw.state?.helpers ?? {};
+      for (const id in kept) if (!seen.has(id)) used += kept[id];
+      sw.used = used + (sw.state?.gone ?? 0);
     } catch (_) { sw.used = null; }
     finally { sw.usage = null; }
     if (S.selected === swarmKey(sw.name)) render();

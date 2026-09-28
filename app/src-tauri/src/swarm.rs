@@ -236,6 +236,7 @@ impl Swarm {
             "mix": self.mix.iter().map(Mix::json).collect::<Vec<_>>(),
             "members": self.members, "ids": self.ids, "rows": self.rows,
             "stopped": self.stopped, "council": self.council, "seats": self.seats(),
+            "left": self.left,
         })
     }
 
@@ -933,6 +934,15 @@ async fn update_async(
         .map_err(|e| e.to_string())?
 }
 
+/// The records of the agents made that are members: one whose brief
+/// failed was deleted and is not shown.
+fn kept<'a>(made: &'a [(String, usize, Value)], joined: &Swarm) -> Vec<&'a Value> {
+    (made.iter())
+        .filter(|(name, _, _)| joined.members.contains(name))
+        .map(|(_, _, record)| record)
+        .collect()
+}
+
 /// A deleted agent leaves: the swarm stops counting it and posting to it.
 pub fn leave(root: &Path, swarm: &str, member: &str) -> Result<Value, String> {
     let dir = folder(root, swarm)?;
@@ -1145,7 +1155,7 @@ pub async fn start(
     };
     Ok(json!({
         "swarm": joined.json(&dir),
-        "bots": made.iter().map(|(_, _, record)| record).collect::<Vec<_>>(),
+        "bots": kept(&made, &joined),
         "failed": reasons(&failed),
     }))
 }
@@ -1194,7 +1204,7 @@ pub async fn add(
     };
     Ok(json!({
         "swarm": joined.json(&dir),
-        "bots": made.iter().map(|(_, _, record)| record).collect::<Vec<_>>(),
+        "bots": kept(&made, &joined),
         "failed": reasons(&failed),
     }))
 }
@@ -1584,6 +1594,11 @@ pub struct State {
     pub made: u32,
     /// The last share of the budget the board announced, in percent.
     pub spent: u8,
+    /// Each helper's tokens as the last scan saw them, by bot id: a helper
+    /// deleted since keeps counting with what it had used by then.
+    pub helpers: BTreeMap<i64, u64>,
+    /// Tokens used by helpers that are gone.
+    pub gone: u64,
 }
 
 /// Denied proposals kept in the state; older ones are on the board only.
@@ -1681,6 +1696,10 @@ impl State {
                         .as_u64()
                         .and_then(|n| u8::try_from(n).ok())
                         .unwrap_or(0),
+                    helpers: (value["helpers"].as_object().into_iter().flatten())
+                        .filter_map(|(id, used)| Some((id.parse().ok()?, used.as_u64()?)))
+                        .collect(),
+                    gone: value["gone"].as_u64().unwrap_or(0),
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -1692,7 +1711,7 @@ impl State {
         json!({
             "roles": self.roles, "streams": self.streams,
             "proposals": self.proposals.iter().map(Proposal::json).collect::<Vec<_>>(),
-            "made": self.made, "spent": self.spent,
+            "made": self.made, "spent": self.spent, "helpers": self.helpers, "gone": self.gone,
         })
     }
 
@@ -2286,15 +2305,60 @@ struct Scan {
     turns: Vec<(String, Option<i64>)>,
     helpers: Vec<(String, i64)>,
     used: u64,
+    /// Whether the daemon was asked at all.
+    listed: bool,
+    /// Each helper's tokens, by bot id.
+    spent: BTreeMap<i64, u64>,
+    /// The members that left and still have a helper, or a helper's helper.
+    rooted: std::collections::HashSet<i64>,
+}
+
+impl Scan {
+    /// Tokens used by the swarm's agents and its helpers, counting helpers
+    /// that are gone, once the state has taken this scan in.
+    fn used(&self, state: &State) -> u64 {
+        let gone: u64 = (state.helpers.iter())
+            .filter(|(id, _)| !self.spent.contains_key(id))
+            .map(|(_, used)| used)
+            .sum();
+        self.used + state.gone + gone
+    }
+
+    /// Keep what this scan saw of helpers: one gone since the last scan
+    /// counts from now on with what it had used when last seen.
+    fn record(&self, state: &mut State) {
+        if !self.listed {
+            return;
+        }
+        let spent = &self.spent;
+        let mut gone = 0;
+        state.helpers.retain(|id, used| {
+            let kept = spent.contains_key(id);
+            if !kept {
+                gone += *used;
+            }
+            kept
+        });
+        state.gone = state.gone.saturating_add(gone);
+        for (id, used) in spent {
+            let at = state.helpers.entry(*id).or_default();
+            *at = (*at).max(*used);
+        }
+    }
 }
 
 async fn scan(client: &Client, swarm: &Swarm) -> Result<Scan, String> {
     let prefix = format!("{}-", swarm.name);
     let mut after = swarm.name.clone();
-    let mut out = Scan::default();
-    // A helper's maker sorts before it, so one pass finds helpers' helpers.
-    let mut makers: std::collections::HashSet<i64> =
-        (swarm.ids.values().chain(&swarm.left)).copied().collect();
+    let mut out = Scan {
+        listed: true,
+        ..Scan::default()
+    };
+    // A helper's maker sorts before it, so one pass finds helpers' helpers;
+    // each maker is kept with the member, or member that left, it comes from.
+    let mut makers: std::collections::HashMap<i64, i64> = (swarm.ids.values().chain(&swarm.left))
+        .map(|id| (*id, *id))
+        .collect();
     loop {
         let page = client
             .request("bots", json!({"after": after, "limit": 256}))
@@ -2314,12 +2378,14 @@ async fn scan(client: &Client, swarm: &Swarm) -> Result<Scan, String> {
                         .push((name.to_owned(), bot["running_turn"].as_i64()));
                     out.used += used.unwrap_or(0);
                 }
-            } else if bot["created_by_id"]
-                .as_i64()
-                .is_some_and(|by| makers.contains(&by))
+            } else if let Some(root) = (bot["created_by_id"].as_i64())
+                .and_then(|by| makers.get(&by))
+                .copied()
             {
-                makers.insert(id);
+                makers.insert(id, root);
+                out.rooted.insert(root);
                 out.helpers.push((name.to_owned(), id));
+                out.spent.insert(id, used.unwrap_or(0));
                 out.used += used.unwrap_or(0);
             }
         }
@@ -2365,12 +2431,25 @@ pub async fn act(
     } else {
         scan(client, &s).await?
     };
+    // A member that left stops being a maker once nothing it made is left.
+    let rooted = &seen.rooted;
+    let before = s.left.len();
+    if seen.listed {
+        s.left.retain(|id| rooted.contains(id));
+    }
+    // The swarm resumes before your post goes on the board: a failure or a
+    // crash between leaves it running with nothing new to do until you post
+    // again, never your post on the board and the swarm still stopped.
+    if resumed || s.left.len() != before {
+        s.write(&dir)?;
+    }
     let turns = &seen.turns;
     let running = |m: &str| turns.iter().find(|(n, _)| n == m).and_then(|(_, t)| *t);
     // Each line says how many agents it is sent to, so what a swarm's posts
     // cost in deliveries is on its board. The line is written before the
     // sends; a send that failed, or found its turn over, is in the answer.
     let (sends, mut answer) = locked_with(&mut board, &dir, |state| {
+        seen.record(state);
         let checked = !matches!(act, Act::Role(_) | Act::Join(_));
         let (mut lines, notices, mut answer) = plan(&s, state, bot, act, now_ms())?;
         let reach = |notice: &Notice| -> Vec<(String, Reach)> {
@@ -2409,7 +2488,7 @@ pub async fn act(
         // answer.
         if checked
             && !s.stopped
-            && let Some((mut line, notice)) = spent(&s, state, seen.used, now_ms())
+            && let Some((mut line, notice)) = spent(&s, state, seen.used(state), now_ms())
         {
             let to: Vec<_> = reach(&notice).into_iter().collect();
             line["sent"] = json!(to.len());
@@ -2422,9 +2501,6 @@ pub async fn act(
         }
         Ok((lines, (sends, answer)))
     })?;
-    if resumed {
-        s.write(&dir)?;
-    }
     // Distinct per post, even for two in one millisecond from one process.
     static POSTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3649,6 +3725,10 @@ mod tests {
         assert_eq!(out["swarm"]["members"], json!(["p.brief-1"]));
         assert_eq!(out["swarm"]["budget_tokens"], 2_000);
         assert_eq!(out["failed"][0]["agent"], "p.brief-2");
+        let shown: Vec<&Value> = (out["bots"].as_array().unwrap().iter())
+            .map(|b| &b["name"])
+            .collect();
+        assert_eq!(shown, [&json!("p.brief-1")]);
         assert!(fake.ops("delete").iter().any(|d| d["bot"] == "p.brief-2"));
         // A council that cannot fill its three seats does not start, and its agents go.
         let mut council = start("seat", vec![0, 0, 0], mix.clone());
@@ -3832,20 +3912,31 @@ mod tests {
     #[test]
     fn the_board_says_each_share_of_the_budget_once() {
         let root = scratch("spent");
-        let s = swarm(&[&agent(1), &agent(2)]);
+        let mut s = swarm(&[&agent(1), &agent(2)]);
+        // latency-3 left with a helper still at work; latency-7 left with none.
+        s.left = vec![3, 7];
         let dir = claim(&root, &s.name).unwrap();
         fill(&dir, &s, Path::new("/app")).unwrap();
         let used = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
         let now = used.clone();
+        let helpers = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive = helpers.clone();
         let fake = Fake::start(
             "spent",
             Box::new(move |op, _| match op {
                 // latency-1 works; its helper's tokens count too.
-                "bots" => Ok(json!({"bots": [
-                    {"name": agent(1), "id": 1, "running_turn": 4, "tokens_used": now.load(std::sync::atomic::Ordering::Relaxed)},
-                    {"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1, "tokens_used": 600_000},
-                    {"name": agent(2), "id": 2},
-                ], "next_after": null})),
+                "bots" => {
+                    let mut bots = vec![
+                        json!({"name": agent(1), "id": 1, "running_turn": 4, "tokens_used": now.load(std::sync::atomic::Ordering::Relaxed)}),
+                        json!({"name": "agent.latency-1.fix", "id": 40, "created_by_id": 1, "tokens_used": 600_000}),
+                        json!({"name": agent(2), "id": 2}),
+                        json!({"name": "agent.latency-3.fix", "id": 43, "created_by_id": 3}),
+                    ];
+                    if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                        bots.retain(|b| b["created_by_id"].is_null());
+                    }
+                    Ok(json!({"bots": bots, "next_after": null}))
+                }
                 "submit" => Ok(json!({"status": "steered"})),
                 _ => Err("unexpected".into()),
             }),
@@ -3862,6 +3953,10 @@ mod tests {
             "the swarm has used 50% of its budget (1.6M of 3M tokens)"
         );
         assert_eq!(check()["budget"], Value::Null);
+        // A member that left stays a maker only while something it made is.
+        assert_eq!(Swarm::read(&dir).unwrap().left, vec![3]);
+        // The helpers are deleted: what they used still counts.
+        helpers.store(false, std::sync::atomic::Ordering::Relaxed);
         // Past 90% at once: only the highest share is said.
         used.store(2_200_000, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
@@ -3882,7 +3977,12 @@ mod tests {
             .map(|l| json!([l["spent"], l["sent"]]))
             .collect();
         assert_eq!(spent, vec![json!([50, 1]), json!([90, 1])]);
-        assert_eq!(State::read(&dir).unwrap().spent, 90);
+        let state = State::read(&dir).unwrap();
+        assert_eq!(
+            (state.spent, state.helpers.len(), state.gone),
+            (90, 0, 600_000)
+        );
+        assert_eq!(Swarm::read(&dir).unwrap().left, Vec::<i64>::new());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -1712,5 +1712,13 @@ test('a swarm counts its helpers\' tokens, and the board says when it passes a s
   const sw = p.learnSwarm(swarmRecord(['app.latency-1', 'app.latency-2'], { ids: { 'app.latency-1': 3, 'app.latency-2': 4 } }));
   await p.readUsage(sw);
   assert.equal(sw.used, 1230);
+  // A member that left still makes its helpers count; a helper deleted since the board saw it
+  // counts with what the board recorded, and helpers gone before that with the board's total.
+  bots.push({ name: 'app.latency-3.fix', id: 43, created_by_id: 8, tokens_used: 400 });
+  bots.sort((a, b) => (a.name < b.name ? -1 : 1));
+  sw.left = [8];
+  sw.state = { ...sw.state, helpers: { 40: 150, 44: 60 }, gone: 500 };
+  await p.readUsage(sw);
+  assert.equal(sw.used, 1230 + 400 + 60 + 500);
   assert.match(p.postHTML(sw, { from: 'budget', text: 'the swarm has used 50% of its budget (1.5M of 3M tokens)', spent: 50 }), /<span class="who council">budget<\/span><span class="pt">the swarm has used 50%/);
 });
